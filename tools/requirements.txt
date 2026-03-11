@@ -1,0 +1,21 @@
+# ps3recomp tools dependencies
+#
+# Install with: pip install -r requirements.txt
+
+# ELF/SELF decryption
+pycryptodome>=3.19
+
+# PowerPC disassembly
+capstone>=5.0
+
+# Structured binary parsing
+construct>=2.10
+
+# Pretty CLI output
+tabulate>=0.9
+
+# TOML config parsing (Python 3.11+ has tomllib built-in)
+tomli>=2.0; python_version < "3.11"
+
+# Progress bars for long operations
+tqdm>=4.65

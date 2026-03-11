@@ -1,0 +1,218 @@
+# ps3recomp -- Example recompiler configuration
+#
+# This file shows all available options with their default values.
+# Copy this to your project directory and edit as needed.
+
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+[input]
+# Path to the decrypted PS3 ELF binary.
+# The recompiler expects a raw ELF, not a SELF/ESELF.  Use the decrypt tool
+# (tools/decrypt_self.py) to convert EBOOT.BIN first.
+elf_path = "game/EBOOT.ELF"
+
+# Optional: PARAM.SFO for game metadata (title, ID, version)
+sfo_path = "game/PARAM.SFO"
+
+# Optional: additional PRX modules to include in recompilation
+# prx_paths = ["game/module1.sprx", "game/module2.sprx"]
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+[output]
+# Directory for generated C source files
+output_dir = "recompiled/"
+
+# Function name prefix
+func_prefix = "recomp_"
+
+# Generate a combined function table source file
+generate_func_table = true
+
+# Split output into multiple files (one per function)
+split_functions = false
+
+# Maximum functions per output file (when split_functions = false)
+functions_per_file = 500
+
+# ---------------------------------------------------------------------------
+# Recompiler options
+# ---------------------------------------------------------------------------
+[recompiler]
+# Optimization level: 0 = none, 1 = basic, 2 = full
+optimization_level = 1
+
+# Handle paired-single (PS) floating-point instructions
+handle_paired_singles = true
+
+# Inline small leaf functions
+inline_leaf_functions = true
+
+# Maximum inline depth
+max_inline_depth = 2
+
+# Emit boundary checks on memory accesses (slower but catches bugs)
+bounds_checking = false
+
+# Generate comments with original disassembly
+emit_comments = true
+
+# Detect and recompile switch/jump tables
+detect_jump_tables = true
+
+# ---------------------------------------------------------------------------
+# Module resolution
+# ---------------------------------------------------------------------------
+[modules]
+# Per-module strategy: "hle", "lle", or "auto"
+# "hle"  = use ps3recomp's built-in HLE stubs
+# "lle"  = recompile the PRX and use native code
+# "auto" = prefer HLE if available, fall back to LLE
+
+cellSysutil      = "hle"
+cellSysmodule    = "hle"
+sysPrxForUser    = "hle"
+cellFs           = "hle"
+cellPad          = "hle"
+cellAudio        = "hle"
+cellGcmSys       = "hle"
+cellSpurs        = "auto"
+cellSync         = "hle"
+cellPngDec       = "hle"
+cellJpgDec       = "hle"
+cellFont         = "hle"
+cellL10n         = "hle"
+cellResc         = "hle"
+cellSaveData     = "hle"
+cellGame         = "hle"
+cellNetCtl       = "hle"
+cellPamf         = "hle"
+cellVdec         = "hle"
+cellAdec         = "hle"
+cellDmux         = "hle"
+
+# ---------------------------------------------------------------------------
+# Memory layout
+# ---------------------------------------------------------------------------
+[memory]
+# Main RAM in MB (PS3: 256 MB)
+main_ram_mb = 256
+
+# Video RAM in MB (PS3: 256 MB)
+vram_mb = 256
+
+# Per-thread stack size in KB
+thread_stack_kb = 1024
+
+# Base address for guest memory in host address space (0 = auto)
+# base_address = 0
+
+# ---------------------------------------------------------------------------
+# Threading
+# ---------------------------------------------------------------------------
+[threading]
+# Max simultaneous PPU threads
+max_ppu_threads = 64
+
+# Max simultaneous SPU threads (0 = no SPU support)
+max_spu_threads = 6
+
+# Map each PPU thread to a host OS thread
+use_host_threads = true
+
+# SPU emulation strategy: "interpreter", "recompiler", "disabled"
+spu_backend = "interpreter"
+
+# ---------------------------------------------------------------------------
+# Graphics
+# ---------------------------------------------------------------------------
+[graphics]
+# Rendering backend
+# Options: "vulkan", "d3d12", "opengl", "null"
+backend = "vulkan"
+
+# Window dimensions (0 = use game's native resolution)
+width = 0
+height = 0
+
+# VSync: "on", "off", "adaptive"
+vsync = "on"
+
+# Resolution scale multiplier
+scale_factor = 1
+
+# Anisotropic filtering override (0 = game default, 2/4/8/16)
+aniso_filter = 0
+
+# Force 16:9 aspect ratio
+force_widescreen = false
+
+# ---------------------------------------------------------------------------
+# Audio
+# ---------------------------------------------------------------------------
+[audio]
+# Audio backend
+# Options: "wasapi" (Windows), "pulseaudio" (Linux), "coreaudio" (macOS),
+#          "sdl" (cross-platform), "null" (silent)
+backend = "sdl"
+
+# Output sample rate in Hz
+sample_rate = 48000
+
+# Audio buffer size in samples (lower = less latency, higher = less stutter)
+buffer_size = 512
+
+# Master volume (0.0 - 1.0)
+volume = 1.0
+
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+[input_mapping]
+# Controller backend: "sdl", "xinput", "dinput", "null"
+backend = "sdl"
+
+# Keyboard fallback mapping (scancode = PS3 button)
+# See CELL_PAD_CTRL_* constants for button names
+[input_mapping.keyboard]
+up      = "W"
+down    = "S"
+left    = "A"
+right   = "D"
+cross   = "Space"
+circle  = "E"
+square  = "Q"
+triangle = "R"
+l1      = "1"
+r1      = "2"
+l2      = "3"
+r2      = "4"
+start   = "Return"
+select  = "Backspace"
+
+# ---------------------------------------------------------------------------
+# Debug / development
+# ---------------------------------------------------------------------------
+[debug]
+# Log every HLE function call to stdout
+log_hle_calls = true
+
+# Warn on unresolved NID imports
+log_missing_nids = true
+
+# Trap into debugger on unimplemented syscall
+break_on_unimplemented = false
+
+# Dump generated assembly for each recompiled function
+dump_disassembly = false
+
+# Set a breakpoint at a guest address (0 = none)
+breakpoint_address = 0
+
+# Trace file for function call recording (empty = disabled)
+trace_file = ""
+
+# Performance counter sampling interval in ms (0 = disabled)
+perf_sample_interval_ms = 0

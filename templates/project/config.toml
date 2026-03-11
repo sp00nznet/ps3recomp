@@ -1,0 +1,111 @@
+# ps3recomp -- Game recompilation project configuration
+#
+# Copy this file to your project and adjust the paths and settings.
+
+[input]
+# Path to the decrypted PS3 ELF (EBOOT.BIN after SELF decryption)
+elf_path = "path/to/EBOOT.ELF"
+
+# Optional: path to the game's PARAM.SFO for metadata
+# sfo_path = "path/to/PARAM.SFO"
+
+[output]
+# Directory for generated recompiled C/C++ source files
+output_dir = "recompiled/"
+
+# Prefix for generated function names
+func_prefix = "recomp_"
+
+# Generate a function table (g_recompiled_funcs) source file
+generate_func_table = true
+
+[modules]
+# For each PS3 system module, choose HLE (high-level emulation stub) or
+# LLE (low-level emulation -- recompile the actual PRX).
+#
+# HLE is faster to develop and sufficient for most modules.
+# LLE may be needed for modules with complex internal state.
+#
+# Supported values: "hle", "lle", "auto"
+#   "auto" uses HLE if a stub exists, otherwise attempts LLE.
+
+cellSysutil      = "hle"
+cellSysmodule    = "hle"
+sysPrxForUser    = "hle"
+cellFs           = "hle"
+cellPad          = "hle"
+cellAudio        = "hle"
+cellGcmSys       = "hle"
+cellSpurs        = "hle"
+cellSync         = "hle"
+cellSync2        = "hle"
+cellPngDec       = "hle"
+cellJpgDec       = "hle"
+cellFont         = "hle"
+cellFreeType     = "hle"
+cellL10n         = "hle"
+cellResc         = "hle"
+cellSaveData     = "hle"
+cellGame         = "hle"
+cellNetCtl       = "hle"
+cellSysutilNp    = "hle"
+
+[memory]
+# Main memory size in megabytes (PS3 has 256 MB main RAM)
+main_ram_mb = 256
+
+# RSX video memory size in megabytes (PS3 has 256 MB VRAM)
+vram_mb = 256
+
+# Stack size per PPU thread in kilobytes
+thread_stack_kb = 1024
+
+[threading]
+# Maximum number of PPU threads
+max_ppu_threads = 64
+
+# Maximum number of SPU threads (set to 0 to disable SPU emulation)
+max_spu_threads = 6
+
+# Use host threads for PPU thread emulation (true = 1:1 mapping)
+use_host_threads = true
+
+[graphics]
+# Graphics backend: "vulkan", "d3d12", "opengl", "null"
+backend = "vulkan"
+
+# Window resolution (0 = match the game's native resolution)
+width = 0
+height = 0
+
+# VSync mode: "on", "off", "adaptive"
+vsync = "on"
+
+# Upscaling factor (1 = native, 2 = 2x, etc.)
+scale_factor = 1
+
+[audio]
+# Audio backend: "wasapi", "pulseaudio", "coreaudio", "sdl", "null"
+backend = "sdl"
+
+# Sample rate (PS3 native is 48000)
+sample_rate = 48000
+
+# Buffer size in samples
+buffer_size = 512
+
+[debug]
+# Enable verbose logging of HLE function calls
+log_hle_calls = true
+
+# Log all unimplemented NID lookups
+log_missing_nids = true
+
+# Break on unimplemented syscall (useful with debugger attached)
+break_on_unimplemented = false
+
+# Dump recompiled function disassembly
+dump_disassembly = false
+
+# Guest address to break at (0 = disabled)
+breakpoint_address = 0

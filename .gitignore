@@ -1,0 +1,87 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exp
+*.pdb
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Precompiled headers
+*.gch
+*.pch
+
+# IDE / Editor files
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln
+*.vcxproj*
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+*.egg
+.venv/
+venv/
+env/
+
+# Recompiled output (generated, not tracked)
+recompiled/
+
+# Game files (never commit these)
+*.elf
+*.ELF
+*.self
+*.SELF
+*.bin
+*.BIN
+*.pkg
+*.PKG
+*.sfo
+*.SFO
+*.sprx
+*.SPRX
+
+# Decryption keys
+*.keys
+*.rap
+
+# OS files
+.DS_Store
+Desktop.ini
+Thumbs.db
+ehthumbs.db
+
+# Logs
+*.log
