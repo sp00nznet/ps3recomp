@@ -4,7 +4,8 @@
       "WebFetch(domain:github.com)",
       "WebSearch",
       "WebFetch(domain:deepwiki.com)",
-      "WebFetch(domain:www.copetti.org)"
+      "WebFetch(domain:www.copetti.org)",
+      "Bash(find D:/recomp/ps3 -type f -not -path '*/.claude/*' -not -path '*/.git/*' | wc -l && echo \"---\" && find D:/recomp/ps3 -type f -not -path '*/.claude/*' -not -path '*/.git/*' -name '*.c' -o -name '*.h' | wc -l && echo \"---\" && find D:/recomp/ps3 -type f -not -path '*/.claude/*' -not -path '*/.git/*' | xargs wc -l 2>/dev/null | tail -1)"
     ]
   }
 }

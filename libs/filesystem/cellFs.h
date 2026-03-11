@@ -1,7 +1,8 @@
 /*
- * ps3recomp - cellFs HLE stub
+ * ps3recomp - cellFs HLE
  *
- * PS3 filesystem operations: open/close/read/write, stat, directory listing.
+ * PS3 filesystem operations: open/close/read/write, stat, directory listing,
+ * truncate, block size, chmod.
  */
 
 #ifndef PS3RECOMP_CELL_FS_H
@@ -13,6 +14,12 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ---------------------------------------------------------------------------
+ * FS-specific error codes
+ * -----------------------------------------------------------------------*/
+#define CELL_FS_ERROR_EBADF         (s32)0x80010009
+#define CELL_FS_ERROR_EMFILE        (s32)0x80010018
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -79,6 +86,16 @@ typedef s32 CellFsFd;
 typedef s32 CellFsDir;
 
 /* ---------------------------------------------------------------------------
+ * Path configuration
+ * -----------------------------------------------------------------------*/
+
+/* Set the root directory for all path translations (default: ".") */
+void cellfs_set_root_path(const char* root);
+
+/* Add or override a PS3 prefix -> host path mapping */
+void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path);
+
+/* ---------------------------------------------------------------------------
  * File operations
  * -----------------------------------------------------------------------*/
 
@@ -102,6 +119,21 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb);
 
 /* NID: 0x2CB51F0D */
 s32 cellFsStat(const char* path, CellFsStat* sb);
+
+/* NID: 0x6D3BB15B */
+s32 cellFsTruncate(const char* path, u64 size);
+
+/* NID: 0x82D3AB53 */
+s32 cellFsFtruncate(CellFsFd fd, u64 size);
+
+/* NID: 0xC1C507E7 */
+s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size);
+
+/* NID: 0x2C2C5F71 */
+s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count);
+
+/* NID: 0x3F61245C */
+s32 cellFsChmod(const char* path, s32 mode);
 
 /* ---------------------------------------------------------------------------
  * Directory operations

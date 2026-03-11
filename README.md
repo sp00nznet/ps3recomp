@@ -177,21 +177,28 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. Each PS3 system library gets a native implementation:
+We're building HLE implementations based on RPCS3's module system. **33 modules complete, 5 partial, 109 files, 29,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
-| **Core System** | cellSysutil, cellSysmodule, sysPrxForUser | 🔨 In Progress |
-| **Filesystem** | cellFs, cellGame, cellSaveData | 🔨 In Progress |
-| **Graphics** | cellGcmSys, cellResc, cellVideoOut | 📋 Planned |
-| **Audio** | cellAudio, cellAdec, libmixer | 📋 Planned |
-| **Input** | cellPad, cellKb, cellMouse | 📋 Planned |
-| **Threading** | sys_ppu_thread, sys_mutex, sys_cond | 🔨 In Progress |
-| **Memory** | sys_memory, sys_mmapper | 🔨 In Progress |
-| **SPURS** | cellSpurs, cellFiber | 📋 Planned |
-| **Network** | cellNetCtl, sceNp, cellHttp | 📋 Planned |
-| **Codecs** | cellPngDec, cellJpgDec, cellVdec, cellDmux | 📋 Planned |
-| **Font** | cellFont, cellFontFT | 📋 Planned |
+| **Kernel Threading** | sys_ppu_thread, sys_mutex, sys_cond, sys_semaphore, sys_rwlock | ✅ Complete |
+| **Kernel Events** | sys_event (queues, ports, flags), sys_timer | ✅ Complete |
+| **Kernel Memory** | sys_memory, sys_mmapper (containers, shared mem) | ✅ Complete |
+| **Kernel Filesystem** | sys_fs (path mapping, real I/O) | ✅ Complete |
+| **Filesystem** | cellFs (real file I/O, dir ops, stat, path translation) | ✅ Complete |
+| **Save System** | cellSaveData (callback-driven, PARAM.SFO), cellGame | ✅ Complete |
+| **Input** | cellPad (XInput/SDL2), cellKb, cellMouse | ✅ Complete |
+| **Audio** | cellAudio (WASAPI/SDL2, mixing thread, multi-port) | ✅ Complete |
+| **Video Output** | cellVideoOut (resolution config, 720p default) | ✅ Complete |
+| **Codecs** | cellPngDec, cellJpgDec, cellGifDec (stb_image) | ✅ Complete |
+| **Font** | cellFont (stb_truetype backend + fallback metrics) | ✅ Complete |
+| **Network** | cellNetCtl (real IP), sceNp, sceNpTrophy (JSON persist) | ✅ Complete |
+| **Sync** | cellSync (atomic spinlocks, LF queue), cellSync2 (OS-backed) | ✅ Complete |
+| **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo | ✅ Complete |
+| **Graphics** | cellGcmSys (init, flip, display bufs — no cmd buffer yet) | 🔨 Partial |
+| **SPURS** | cellSpurs (management APIs, no SPU execution yet) | 🔨 Partial |
+| **Core Runtime** | cellSysutil, cellSysmodule, sysPrxForUser | 🔨 Partial |
+| **Video Decode** | cellPamf, cellVdec, cellAdec, cellDmux | 📋 Planned |
 
 Full status tracking: [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md)
 
@@ -266,6 +273,26 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.2.0 — *"Now We're Cooking with Cell"* (March 2026)
+- **33 complete module implementations** — up from 7 stubs
+- **Real threading**: sys_ppu_thread creates actual host threads (CreateThread/pthreads)
+- **Full synchronization suite**: Mutexes with deadlock detection, condvars, semaphores, rwlocks, event queues/flags
+- **Functional filesystem**: cellFs and sys_fs with configurable PS3-to-host path mapping, real file I/O, directory enumeration
+- **Save data system**: cellSaveData with full callback-driven save/load flow, directory management
+- **Game utilities**: cellGame boot check, content paths, PARAM.SFO reading
+- **Real gamepad input**: cellPad with XInput (Windows) and SDL2 (cross-platform) backends, analog sticks, triggers, rumble
+- **Keyboard & mouse**: cellKb with raw/ASCII modes, cellMouse with delta accumulation and ring buffer
+- **Real audio output**: cellAudio with WASAPI/SDL2 backends, background mixing thread @ 5.33ms, multi-port mixing, 7.1 downmix
+- **Image decoders**: cellPngDec, cellJpgDec, cellGifDec with stb_image backend
+- **Font rendering**: cellFont with stb_truetype backend and fallback metrics
+- **Network**: cellNetCtl with real host IP detection, sceNp with configurable PSN identity
+- **Trophy system**: sceNpTrophy with persistent JSON storage, unlock timestamps, progress tracking
+- **SPURS framework**: cellSpurs management APIs (workloads, tasks, tasksets, event flags)
+- **Sync primitives**: cellSync (atomic spinlocks, barriers, lock-free queues), cellSync2 (OS-backed mutex/cond/sem)
+- **System utilities**: cellRtc (real clock with PS3 epoch), cellVideoOut, cellMsgDialog, cellOskDialog, cellUserInfo, cellScreenshot
+- **Memory management**: sys_memory with bump allocator, containers, shared memory, mmapper
+- **Timers**: sys_timer with QueryPerformanceCounter/clock_gettime, periodic events, PS3 timebase frequency
 
 ### v0.1.0 — *"Hello, Cell"* (March 2026)
 - Initial project structure and architecture

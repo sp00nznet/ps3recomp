@@ -1,7 +1,8 @@
 /*
- * ps3recomp - cellAudio HLE stub
+ * ps3recomp - cellAudio HLE
  *
- * Audio output: port management, initialization, event notification.
+ * Audio output: port management, mixing thread, event notification.
+ * Backend: WASAPI on Windows, SDL2 audio elsewhere.
  */
 
 #ifndef PS3RECOMP_CELL_AUDIO_H
@@ -30,6 +31,17 @@ extern "C" {
 
 /* Sample rate (always 48 kHz on PS3) */
 #define CELL_AUDIO_SAMPLE_RATE              48000
+
+/* Maximum event queues that can be registered */
+#define CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES  8
+
+/* Audio port status */
+#define CELL_AUDIO_STATUS_CLOSE             0
+#define CELL_AUDIO_STATUS_READY             1
+#define CELL_AUDIO_STATUS_RUN               2
+
+/* Audio period in microseconds (~5.333ms for 256 samples @ 48kHz) */
+#define CELL_AUDIO_PERIOD_US                5333
 
 /* ---------------------------------------------------------------------------
  * Structures
@@ -78,8 +90,20 @@ s32 cellAudioPortStop(u32 portNum);
 /* NID: 0x74A66AF0 */
 s32 cellAudioSetNotifyEventQueue(u64 key);
 
+/* NID: 0x02B9B9F8 */
+s32 cellAudioRemoveNotifyEventQueue(u64 key);
+
 /* NID: 0x4109D08C */
 s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config);
+
+/* NID: 0x7EECFF1D */
+s32 cellAudioPortGetStatus(u32 portNum, u32* status);
+
+/* NID: 0x3EEFAF96 */
+s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
+
+/* NID: 0x96A7B2F4 */
+s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
 #ifdef __cplusplus
 }

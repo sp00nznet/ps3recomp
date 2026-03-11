@@ -291,6 +291,14 @@ static inline void lv2_syscall(ppu_context* ctx)
 #define LV2_REGISTER_SYSCALL(num, func) \
     lv2_syscall_register(&g_lv2_syscalls, (num), (lv2_syscall_fn)(func))
 
+/* ---------------------------------------------------------------------------
+ * Register all HLE syscall modules
+ *
+ * Initializes and registers handlers for all implemented LV2 subsystems:
+ * ppu_thread, mutex, cond, semaphore, rwlock, event, timer, memory, fs.
+ * -----------------------------------------------------------------------*/
+void lv2_register_all_syscalls(lv2_syscall_table* tbl);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

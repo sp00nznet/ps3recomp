@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(ps3recomp_runtime
-    VERSION 0.1.0
+    VERSION 0.2.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
@@ -22,18 +22,22 @@ option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 # Collect source files
 # ---------------------------------------------------------------------------
 
-# HLE library stubs
-set(HLE_SOURCES
-    libs/system/cellSysutil.c
-    libs/system/cellSysmodule.c
-    libs/system/sysPrxForUser.c
-    libs/filesystem/cellFs.c
-    libs/input/cellPad.c
-    libs/audio/cellAudio.c
-    libs/video/cellGcmSys.c
+# HLE library sources
+file(GLOB_RECURSE HLE_SOURCES
+    "libs/system/*.c"
+    "libs/filesystem/*.c"
+    "libs/input/*.c"
+    "libs/audio/*.c"
+    "libs/video/*.c"
+    "libs/network/*.c"
+    "libs/spurs/*.c"
+    "libs/sync/*.c"
+    "libs/codec/*.c"
+    "libs/font/*.c"
+    "libs/misc/*.c"
 )
 
-# Runtime core (add files here as they are created)
+# Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
     "runtime/*.c"
     "runtime/*.cpp"
@@ -51,15 +55,30 @@ target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
-# HLE stubs include their own headers relative to the project
+# HLE modules include their own headers
 target_include_directories(ps3recomp_runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/filesystem"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/input"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/audio"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/network"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/sync"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/codec"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/font"
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+
+# Platform-specific link libraries
+if(WIN32)
+    target_link_libraries(ps3recomp_runtime PRIVATE
+        ws2_32      # Winsock for network modules
+        xinput      # XInput for gamepad
+        ole32       # COM for WASAPI audio
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # Compiler flags
