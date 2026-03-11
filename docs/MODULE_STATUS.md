@@ -86,7 +86,8 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellNet | Network Core | Not Started | Socket-level networking |
+| sys_net | BSD Sockets | **Complete** | Full BSD socket API — socket, bind, listen, accept, connect, send/recv/sendto/recvfrom, poll, select, setsockopt/getsockopt, shutdown, close, gethostbyname, inet_aton, errno |
+| cellNet | Network Core | Not Started | Higher-level network utilities |
 | cellNetCtl | Network Control | **Complete** | Real host IP detection, NAT type, connection state, handler callbacks |
 | cellHttp | HTTP Client | Partial | Client/transaction management, config APIs work, actual HTTP returns CONNECTION_FAILED |
 | cellHttpUtil | HTTP Utility | Not Started | URL parsing, cookie management |
@@ -160,11 +161,11 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Status | Count |
 |---|---|
-| **Complete** | 33 |
+| **Complete** | 34 |
 | Partial | 5 |
 | Stubbed | 1 |
 | Not Started | ~58 |
-| **Total** | **~97** |
+| **Total** | **~98** |
 
 ## Next Priorities
 

@@ -177,7 +177,7 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **33 modules complete, 5 partial, 109 files, 29,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **34 modules complete, 5 partial, 110+ files, 30,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -192,7 +192,7 @@ We're building HLE implementations based on RPCS3's module system. **33 modules 
 | **Video Output** | cellVideoOut (resolution config, 720p default) | ✅ Complete |
 | **Codecs** | cellPngDec, cellJpgDec, cellGifDec (stb_image) | ✅ Complete |
 | **Font** | cellFont (stb_truetype backend + fallback metrics) | ✅ Complete |
-| **Network** | cellNetCtl (real IP), sceNp, sceNpTrophy (JSON persist) | ✅ Complete |
+| **Network** | sys_net (BSD sockets), cellNetCtl (real IP), sceNp, sceNpTrophy | ✅ Complete |
 | **Sync** | cellSync (atomic spinlocks, LF queue), cellSync2 (OS-backed) | ✅ Complete |
 | **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo | ✅ Complete |
 | **Graphics** | cellGcmSys (init, flip, display bufs — no cmd buffer yet) | 🔨 Partial |
@@ -230,6 +230,14 @@ cmake --build build
 ```
 
 See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
+
+## Game Ports Using ps3recomp
+
+| Game | Title ID | Status | Repo |
+|------|----------|--------|------|
+| **flOw** (thatgamecompany) | NPUA80001 | Binary analysis complete, 139/140 imports resolved | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+
+Want to port a game? Start with the [Getting Started](#getting-started) section and check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) to see which system libraries are already implemented.
 
 ## Relationship to Other Projects
 
@@ -273,6 +281,14 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.2.1 — *"Now With Sockets"* (March 2026)
+- **sys_net**: Full BSD socket API — socket, bind, listen, accept, connect, send, recv, sendto, recvfrom, poll, select, setsockopt/getsockopt, getsockname, shutdown, close, gethostbyname, inet_aton, errno
+- Wraps Winsock2 (Windows) and POSIX sockets (Linux/macOS) with PS3 error code translation
+- PS3-specific SO_NBIO non-blocking mode support
+- 128-socket descriptor table with host FD mapping
+- **34 complete modules** (up from 33)
+- First game port target: **flOw** (NPUA80001) — see [sp00nznet/flow](https://github.com/sp00nznet/flow)
 
 ### v0.2.0 — *"Now We're Cooking with Cell"* (March 2026)
 - **33 complete module implementations** — up from 7 stubs
