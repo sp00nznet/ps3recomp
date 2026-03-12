@@ -177,7 +177,7 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **49 modules complete, 5 partial, 140+ files, 40,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **62 modules complete, 5 partial, 170+ files, 45,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -192,7 +192,8 @@ We're building HLE implementations based on RPCS3's module system. **49 modules 
 | **Video Output** | cellVideoOut (resolution config, 720p default) | ✅ Complete |
 | **Codecs** | cellPngDec, cellJpgDec, cellGifDec (stb_image) | ✅ Complete |
 | **Font** | cellFont (stb_truetype backend + fallback metrics) | ✅ Complete |
-| **Network** | sys_net (BSD sockets), cellNet, cellNetCtl, cellHttpUtil, cellSsl, sceNp, sceNpBasic, sceNpTus, sceNpTrophy | ✅ Complete |
+| **Network** | sys_net (BSD sockets), cellNet, cellNetCtl, cellHttpUtil, cellSsl, sceNp*, sceNpTrophy | ✅ Complete |
+| **Hardware** | cellUsbd (USB), cellCamera (PS Eye), cellGem (PS Move) — stub, no devices | ✅ Complete |
 | **Sync** | cellSync (atomic spinlocks, LF queue), cellSync2 (OS-backed) | ✅ Complete |
 | **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo, cellGameExec | ✅ Complete |
 | **Localization** | cellL10n (UTF-8/16/32/UCS-2, ISO-8859-1, generic converter) | ✅ Complete |
@@ -286,6 +287,23 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.2.4 — *"Peripheral Vision"* (March 2026)
+- **13 new modules** in one batch — biggest single release yet
+- **sceNpUtil**: Bandwidth test (fake 100 Mbps), NP environment, online ID validation, parental control
+- **sceNpCommerce**: Commerce context management, store operations return NOT_CONNECTED
+- **sceNpMatching2**: Matchmaking contexts with start/stop, signaling/room callbacks (offline stub)
+- **sceNpSignaling**: P2P signaling contexts, connection ops return NOT_CONNECTED
+- **sceNpSns**: Facebook/Twitter social integration stubs
+- **cellVpost**: Video post-processing handle management, query/exec stubs
+- **cellJpgEnc**: JPEG encoder handles (encode needs stb_image_write)
+- **cellPngEnc**: PNG encoder handles (encode needs stb_image_write)
+- **sys_interrupt**: Interrupt tag/thread tracking (no real interrupts in HLE)
+- **cellSheap**: Shared heap bump allocator with block tracking, alloc/free/query
+- **cellUsbd**: USB device driver — LDD registration, empty device list
+- **cellCamera**: PlayStation Eye — reports no camera attached
+- **cellGem**: PlayStation Move — reports no controllers connected
+- **62 complete modules** (up from 49), new `libs/hardware/` directory
 
 ### v0.2.3 — *"Half a Hundred"* (March 2026)
 - **sysPrxForUser**: Upgraded from stub to real — lwmutex backed by CRITICAL_SECTION/pthread_mutex, lwcond backed by CONDITION_VARIABLE/pthread_cond, real host threads, heap management, snprintf, string/mem ops

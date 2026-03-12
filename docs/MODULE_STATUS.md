@@ -24,7 +24,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | sys_semaphore | Kernel Semaphore | **Complete** | Win32 Semaphore/POSIX sem_t, timeout, multi-count post |
 | sys_rwlock | Kernel RWLock | **Complete** | SRWLock/pthread_rwlock, full read/write/try variants |
 | sys_timer | Kernel Timer | **Complete** | QueryPerformanceCounter/clock_gettime, periodic event timers, usleep, timebase freq |
-| sys_interrupt | Kernel Interrupt | Not Started | Interrupt thread management |
+| sys_interrupt | Kernel Interrupt | **Complete** | Interrupt tag/thread management, EOI (stub — no real interrupts) |
 
 ## Filesystem
 
@@ -65,12 +65,12 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellVdec | Video Decode | Partial | Open/close, start/end seq, AU submit with AUDONE callback (no actual H.264/MPEG2 decode) |
 | cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE callback (no actual AAC/ATRAC3+ decode) |
 | cellDmux | Demuxer | Partial | Open/close, ES enable/disable, stream set/reset, AU retrieval stubs, flush callbacks |
-| cellVpost | Video Post | Not Started | Video post-processing |
+| cellVpost | Video Post | **Complete** | Handle management, query, exec stub (no actual color conversion/scaling) |
 | cellJpgDec | JPEG Decode | **Complete** | Header parsing + stb_image decode, file/buffer sources |
 | cellPngDec | PNG Decode | **Complete** | Header parsing + stb_image decode, RGBA/ARGB/RGB output |
 | cellGifDec | GIF Decode | **Complete** | Header parsing + stb_image decode |
-| cellJpgEnc | JPEG Encode | Not Started | JPEG encoding |
-| cellPngEnc | PNG Encode | Not Started | PNG encoding |
+| cellJpgEnc | JPEG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
+| cellPngEnc | PNG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
 | cellSail | Media Player | Not Started | High-level media playback |
 
 ## Font / Text
@@ -100,14 +100,14 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 |---|---|---|---|
 | sceNp | NP Core | **Complete** | Configurable username, fake NP IDs, account region/age |
 | sceNpBasic | NP Basic | **Complete** | Friends list, presence, messaging, invitations, block list (offline stub) |
-| sceNpCommerce | NP Commerce | Not Started | In-game store |
+| sceNpCommerce | NP Commerce | **Complete** | Context management, store operations return NOT_CONNECTED (offline stub) |
 | sceNpClans | NP Clans | Not Started | Clan system |
 | sceNpTus | NP TUS | **Complete** | Local variable/data storage, set/get/add/delete, per-slot with async polling |
-| sceNpMatching2 | NP Matching | Not Started | Online matchmaking |
-| sceNpSignaling | NP Signaling | Not Started | P2P connection signaling |
-| sceNpSns | NP SNS | Not Started | Social networking integration |
+| sceNpMatching2 | NP Matching | **Complete** | Context start/stop, signaling/room callbacks, operations return SERVER_NOT_AVAILABLE |
+| sceNpSignaling | NP Signaling | **Complete** | Context management, connection ops return NOT_CONNECTED, local net info |
+| sceNpSns | NP SNS | **Complete** | Facebook/Twitter stubs, operations return NOT_CONNECTED |
 | sceNpTrophy | NP Trophies | **Complete** | Persistent JSON storage, unlock with timestamps, progress tracking |
-| sceNpUtil | NP Utility | Not Started | Utility functions |
+| sceNpUtil | NP Utility | **Complete** | Bandwidth test (fake 100Mbps), NP environment, online ID validation, parental control |
 
 ## System Utilities (cellSysutil sub-modules)
 
@@ -136,9 +136,9 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellUsbd | USB Driver | Not Started | USB device access |
-| cellCamera | Camera | Not Started | PlayStation Eye camera |
-| cellGem | Move Controller | Not Started | PlayStation Move |
+| cellUsbd | USB Driver | **Complete** | LDD registration, device list returns empty, pipe/transfer ops return NO_DEVICE |
+| cellCamera | Camera | **Complete** | Init/end, all device queries return DEVICE_NOT_FOUND / not attached |
+| cellGem | Move Controller | **Complete** | Init/end, GetInfo reports 0 connected, all queries return NOT_CONNECTED |
 | cellAvconfExt | AV Config | **Complete** | Audio output device info, sound availability, configuration, gamma control |
 
 ## Miscellaneous
@@ -147,7 +147,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 |---|---|---|---|
 | cellRtc | Real-Time Clock | **Complete** | Host time -> PS3 ticks, DateTime, time arithmetic, RFC formatting, day-of-week |
 | cellOvis | Overlay | Not Started | |
-| cellSheap | Shared Heap | Not Started | Shared memory heap |
+| cellSheap | Shared Heap | **Complete** | Bump allocator with block tracking, alloc/free/query, up to 8 heaps |
 | cellKey2char | Key to Char | **Complete** | HID scancode to Unicode, US-101 layout, shift/caps handling, dead key mode |
 | cellSubdisplay | Sub-display | Not Started | Vita remote play |
 | cellImeJp | IME Japanese | Not Started | Japanese input method |
@@ -161,9 +161,9 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Status | Count |
 |---|---|
-| **Complete** | 49 |
+| **Complete** | 62 |
 | Partial | 5 |
-| Not Started | ~44 |
+| Not Started | ~31 |
 | **Total** | **~98** |
 
 ## Next Priorities
