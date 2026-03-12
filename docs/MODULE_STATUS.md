@@ -45,7 +45,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellGcmSys | RSX System | Partial | Init, flip control, display buffers, addr translation (no command buffer processing) |
+| cellGcmSys | RSX System | **Complete** | Command buffer control, local mem allocator, IO mapping with offset tables, flip handler/VBlank callbacks, tile/zcull config, report/label areas, timestamps, 27+ functions |
 | cellResc | Resolution | **Complete** | Init, display modes, buffer management, aspect ratio, interlace, flip/vblank handlers |
 | cellVideoOut | Video Output | **Complete** | Resolution config, device info, all PS3 resolution IDs, default 720p |
 
@@ -89,7 +89,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | sys_net | BSD Sockets | **Complete** | Full BSD socket API — socket, bind, listen, accept, connect, send/recv/sendto/recvfrom, poll, select, setsockopt/getsockopt, shutdown, close, gethostbyname, inet_aton, errno |
 | cellNet | Network Core | **Complete** | Winsock/POSIX init, DNS resolver with real getaddrinfo, async poll |
 | cellNetCtl | Network Control | **Complete** | Real host IP detection, NAT type, connection state, handler callbacks |
-| cellHttp | HTTP Client | Partial | Client/transaction management, config APIs work, actual HTTP returns CONNECTION_FAILED |
+| cellHttp | HTTP Client | **Complete** | Real HTTP/1.1 via native sockets (Winsock2/POSIX), DNS resolve, send/recv, header parsing, Content-Length, custom headers, timeouts |
 | cellHttpUtil | HTTP Utility | **Complete** | URL parsing/building, percent-encoding, form encoding, Base64 codec |
 | cellSsl | SSL/TLS | **Complete** | Init/end lifecycle, certificate stubs, RNG via BCryptGenRandom/urandom |
 | cellRudp | Reliable UDP | **Complete** | Context management, bind/close work, connect/send/recv return NOT_CONNECTED |
@@ -126,7 +126,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags (no actual SPU execution) |
+| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). No actual SPU execution |
 | cellSpursJq | SPURS Job Queue | Not Started | SPURS job queue extension |
 | cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext, create/delete/switch/yield/sleep/wakeup |
 | cellSync | Sync Primitives | **Complete** | Atomic spinlock mutex, counter barrier, RWM, bounded queue, lock-free queue |
@@ -161,8 +161,8 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Status | Count |
 |---|---|
-| **Complete** | 75 |
-| Partial | 4 |
+| **Complete** | 77 |
+| Partial | 2 |
 | Not Started | ~19 |
 | **Total** | **~98** |
 

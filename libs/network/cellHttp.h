@@ -75,6 +75,9 @@ typedef struct CellHttpUri {
 #define CELL_HTTP_MAX_CLIENTS       8
 #define CELL_HTTP_MAX_TRANSACTIONS  32
 
+/* Max custom request headers per transaction */
+#define CELL_HTTP_MAX_CUSTOM_HEADERS 16
+
 /* ---------------------------------------------------------------------------
  * Functions
  * -----------------------------------------------------------------------*/
@@ -101,6 +104,11 @@ s32 cellHttpSetResolveTimeOut(CellHttpTransId transId, u32 usec);
 s32 cellHttpSetConnectTimeOut(CellHttpTransId transId, u32 usec);
 s32 cellHttpSetSendTimeOut(CellHttpTransId transId, u32 usec);
 s32 cellHttpSetRecvTimeOut(CellHttpTransId transId, u32 usec);
+
+s32 cellHttpSetRequestContentLength(CellHttpTransId transId, u64 length);
+s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
+                             const char* value);
+s32 cellHttpAbortTransaction(CellHttpTransId transId);
 
 #ifdef __cplusplus
 }

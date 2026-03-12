@@ -13,6 +13,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
+
 /* ---------------------------------------------------------------------------
  * Internal workload tracking
  * -----------------------------------------------------------------------*/
@@ -42,6 +49,107 @@ typedef struct {
 static SpursWorkload s_workloads[CELL_SPURS_MAX_WORKLOAD];
 static SpursTask     s_tasks[CELL_SPURS_MAX_TASK];
 static u32           s_next_task_id = 0;
+
+/* ---------------------------------------------------------------------------
+ * Event flag sync side table
+ *
+ * We can't embed OS handles in CellSpursEventFlag (game code controls its
+ * layout), so we keep a small side table that maps event flag pointers to
+ * their host mutex + condition variable.
+ * -----------------------------------------------------------------------*/
+#define MAX_EVENT_FLAGS 64
+
+typedef struct {
+    CellSpursEventFlag* ef;
+#ifdef _WIN32
+    CRITICAL_SECTION    cs;
+    CONDITION_VARIABLE  cv;
+#else
+    pthread_mutex_t     mtx;
+    pthread_cond_t      cond;
+#endif
+    int                 initialized;
+} EventFlagSync;
+
+static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
+
+static EventFlagSync* ef_sync_find(CellSpursEventFlag* ef)
+{
+    for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
+        if (s_ef_sync[i].initialized && s_ef_sync[i].ef == ef)
+            return &s_ef_sync[i];
+    }
+    return NULL;
+}
+
+static EventFlagSync* ef_sync_alloc(CellSpursEventFlag* ef)
+{
+    for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
+        if (!s_ef_sync[i].initialized) {
+            s_ef_sync[i].ef = ef;
+            s_ef_sync[i].initialized = 1;
+#ifdef _WIN32
+            InitializeCriticalSection(&s_ef_sync[i].cs);
+            InitializeConditionVariable(&s_ef_sync[i].cv);
+#else
+            pthread_mutex_init(&s_ef_sync[i].mtx, NULL);
+            pthread_cond_init(&s_ef_sync[i].cond, NULL);
+#endif
+            return &s_ef_sync[i];
+        }
+    }
+    return NULL;
+}
+
+static void ef_sync_free(EventFlagSync* sync)
+{
+    if (!sync) return;
+#ifdef _WIN32
+    DeleteCriticalSection(&sync->cs);
+    /* CONDITION_VARIABLE has no destroy on Windows */
+#else
+    pthread_mutex_destroy(&sync->mtx);
+    pthread_cond_destroy(&sync->cond);
+#endif
+    sync->ef = NULL;
+    sync->initialized = 0;
+}
+
+static inline void ef_lock(EventFlagSync* s)
+{
+#ifdef _WIN32
+    EnterCriticalSection(&s->cs);
+#else
+    pthread_mutex_lock(&s->mtx);
+#endif
+}
+
+static inline void ef_unlock(EventFlagSync* s)
+{
+#ifdef _WIN32
+    LeaveCriticalSection(&s->cs);
+#else
+    pthread_mutex_unlock(&s->mtx);
+#endif
+}
+
+static inline void ef_wait(EventFlagSync* s)
+{
+#ifdef _WIN32
+    SleepConditionVariableCS(&s->cv, &s->cs, INFINITE);
+#else
+    pthread_cond_wait(&s->cond, &s->mtx);
+#endif
+}
+
+static inline void ef_broadcast(EventFlagSync* s)
+{
+#ifdef _WIN32
+    WakeAllConditionVariable(&s->cv);
+#else
+    pthread_cond_broadcast(&s->cond);
+#endif
+}
 
 /* =========================================================================
  * SPURS core
@@ -511,11 +619,21 @@ s32 cellSpursEventFlagInitialize(CellSpursTaskset* taskset,
     if (!eventFlag)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
+    /* If this event flag was previously initialized, free old sync slot */
+    EventFlagSync* old = ef_sync_find(eventFlag);
+    if (old) ef_sync_free(old);
+
     memset(eventFlag, 0, sizeof(CellSpursEventFlag));
     eventFlag->initialized = 1;
     eventFlag->clearMode = (u16)clearMode;
     eventFlag->direction = (u16)direction;
     eventFlag->bits = 0;
+
+    EventFlagSync* sync = ef_sync_alloc(eventFlag);
+    if (!sync) {
+        printf("[cellSpurs] EventFlagInitialize: no free sync slots!\n");
+        return CELL_SPURS_TASK_ERROR_NOMEM;
+    }
 
     printf("[cellSpurs] EventFlagInitialize(clearMode=%u, direction=%u)\n",
            clearMode, direction);
@@ -537,7 +655,15 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
     if (!eventFlag->initialized)
         return CELL_SPURS_TASK_ERROR_STAT;
 
+    EventFlagSync* sync = ef_sync_find(eventFlag);
+    if (!sync)
+        return CELL_SPURS_TASK_ERROR_STAT;
+
+    ef_lock(sync);
     eventFlag->bits |= bits;
+    ef_broadcast(sync);
+    ef_unlock(sync);
+
     return CELL_OK;
 }
 
@@ -550,26 +676,37 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     if (!eventFlag->initialized)
         return CELL_SPURS_TASK_ERROR_STAT;
 
-    /*
-     * Simplified: return immediately with current bits.
-     * A full implementation would block until the condition is met.
-     */
+    EventFlagSync* sync = ef_sync_find(eventFlag);
+    if (!sync)
+        return CELL_SPURS_TASK_ERROR_STAT;
+
     u16 pattern = *bits;
-    u16 current = eventFlag->bits;
 
-    if (mode == CELL_SPURS_EVENT_FLAG_AND) {
-        /* All requested bits must be set */
-        if ((current & pattern) != pattern) {
-            /* Would block -- just return current state for now */
+    ef_lock(sync);
+
+    /* Block until the requested bit pattern is satisfied */
+    for (;;) {
+        u16 current = eventFlag->bits;
+
+        if (mode == CELL_SPURS_EVENT_FLAG_AND) {
+            if ((current & pattern) == pattern)
+                break;
+        } else {
+            /* OR mode: any requested bit set */
+            if ((current & pattern) != 0)
+                break;
         }
-    }
-    /* OR mode: any requested bit set */
 
-    *bits = current;
+        ef_wait(sync);
+    }
+
+    *bits = eventFlag->bits;
 
     /* Auto-clear if configured */
     if (eventFlag->clearMode == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
         eventFlag->bits &= ~pattern;
+
+    ef_unlock(sync);
 
     return CELL_OK;
 }
@@ -583,15 +720,26 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
     if (!eventFlag->initialized)
         return CELL_SPURS_TASK_ERROR_STAT;
 
+    EventFlagSync* sync = ef_sync_find(eventFlag);
+    if (!sync)
+        return CELL_SPURS_TASK_ERROR_STAT;
+
     u16 pattern = *bits;
+
+    ef_lock(sync);
+
     u16 current = eventFlag->bits;
 
     if (mode == CELL_SPURS_EVENT_FLAG_AND) {
-        if ((current & pattern) != pattern)
+        if ((current & pattern) != pattern) {
+            ef_unlock(sync);
             return CELL_SPURS_TASK_ERROR_BUSY;
+        }
     } else {
-        if ((current & pattern) == 0)
+        if ((current & pattern) == 0) {
+            ef_unlock(sync);
             return CELL_SPURS_TASK_ERROR_BUSY;
+        }
     }
 
     *bits = current;
@@ -599,6 +747,7 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
     if (eventFlag->clearMode == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
         eventFlag->bits &= ~pattern;
 
+    ef_unlock(sync);
     return CELL_OK;
 }
 
@@ -610,7 +759,14 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
     if (!eventFlag->initialized)
         return CELL_SPURS_TASK_ERROR_STAT;
 
+    EventFlagSync* sync = ef_sync_find(eventFlag);
+    if (!sync)
+        return CELL_SPURS_TASK_ERROR_STAT;
+
+    ef_lock(sync);
     eventFlag->bits &= ~bits;
+    ef_unlock(sync);
+
     return CELL_OK;
 }
 

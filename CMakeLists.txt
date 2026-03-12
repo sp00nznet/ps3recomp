@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(ps3recomp_runtime
-    VERSION 0.2.5
+    VERSION 0.3.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )

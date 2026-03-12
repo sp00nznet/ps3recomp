@@ -177,7 +177,7 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **75 modules complete, 4 partial, 200+ files, 50,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **77 modules complete, 2 partial, 200+ files, 55,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -201,10 +201,11 @@ We're building HLE implementations based on RPCS3's module system. **75 modules 
 | **Fibers** | cellFiber (PPU fibers via Windows Fibers/ucontext) | ✅ Complete |
 | **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
 | **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
-| **Graphics** | cellGcmSys (init, flip, display bufs — no cmd buffer yet) | 🔨 Partial |
+| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps) | ✅ Complete |
 | **SPURS** | cellSpurs (management APIs, no SPU execution yet) | 🔨 Partial |
 | **Core Runtime** | cellSysutil (BGM, cache, disc), cellSysmodule, sysPrxForUser (real lwmutex/lwcond/threads) | ✅ Complete |
-| **Media Pipeline** | cellPamf (PAMF parser), cellDmux, cellVdec, cellAdec (API stubs, needs FFmpeg) | 🔨 Partial |
+| **Media Pipeline** | cellPamf, cellDmux, cellVdec, cellAdec (API stubs, actual decode needs FFmpeg), cellSail | 🔨 Partial |
+| **HTTP** | cellHttp (real HTTP/1.1 via native sockets, DNS, headers, timeouts) | ✅ Complete |
 
 Full status tracking: [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md)
 
@@ -287,6 +288,12 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.3.0 — *"Full Metal RSX"* (March 2026)
+- **cellGcmSys**: Major upgrade from Partial to Complete — command buffer control (put/get/ref), local memory bump allocator, IO memory mapping with proper offset table population (1MB page granularity), flip handler + VBlank callbacks, 15 tile slots + 8 zcull regions, 256 report data + label slots, platform-native timestamps, GetTiledPitchSize, 27+ functions total
+- **cellHttp**: Major upgrade from Partial to Complete — real HTTP/1.1 via native sockets (Winsock2/POSIX), DNS resolution via getaddrinfo, TCP connect, request formatting with custom headers, response header parsing (status code, Content-Length, Connection: close), streaming body receive, per-transaction socket lifecycle, SO_RCVTIMEO/SO_SNDTIMEO timeouts
+- **cellSpurs**: Event flags now use real OS blocking — CRITICAL_SECTION + CONDITION_VARIABLE (Windows) / pthread_mutex + pthread_cond (POSIX) via side table, EventFlagWait truly blocks until condition met, broadcast on EventFlagSet
+- **77 complete modules** (up from 75), 2 remaining partial (cellVdec/cellAdec need FFmpeg, cellDmux/cellSpurs management-only)
 
 ### v0.2.5 — *"The Long Tail"* (March 2026)
 - **13 more modules** — mopping up the remaining "Not Started" list
