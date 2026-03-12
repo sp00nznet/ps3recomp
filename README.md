@@ -177,7 +177,7 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **62 modules complete, 5 partial, 170+ files, 45,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **75 modules complete, 4 partial, 200+ files, 50,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -287,6 +287,22 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.2.5 — *"The Long Tail"* (March 2026)
+- **13 more modules** — mopping up the remaining "Not Started" list
+- **cellFsUtility**: Recursive mkdir, file read/write/copy/size/exists helpers
+- **cellSail**: Media player lifecycle — state machine with immediate finish (stub, no actual playback)
+- **cellVoice**: Voice chat port management — create/delete/connect, no actual voice data
+- **cellMic**: Microphone — reports no device attached
+- **cellRudp**: Reliable UDP — context management, connect/send return NOT_CONNECTED
+- **sceNpClans**: NP clan system — create/join/leave/search (offline stub)
+- **cellMusicDecode** / **cellMusicDecode2**: Background music decode stubs
+- **cellBGDL**: Background download manager — empty download list
+- **cellVideoUpload**: Video upload — returns NOT_SUPPORTED
+- **cellLicenseArea**: License verification — Americas default, all areas valid
+- **cellOvis**: Overlay system — no-op stubs
+- **cellScreenshot**: Upgraded from Partial to Complete
+- **75 complete modules** (up from 62), only ~19 "Not Started" remain
 
 ### v0.2.4 — *"Peripheral Vision"* (March 2026)
 - **13 new modules** in one batch — biggest single release yet

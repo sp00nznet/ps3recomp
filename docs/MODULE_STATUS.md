@@ -31,7 +31,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellFs | Filesystem | **Complete** | Real file I/O, configurable path mapping, dir enumeration, stat, truncate, chmod |
-| cellFsUtility | FS Utility | Not Started | High-level file utilities |
+| cellFsUtility | FS Utility | **Complete** | MkdirAll, GetFileSize, ReadFile, WriteFile, CopyFile, Exists |
 
 ## Input
 
@@ -54,8 +54,8 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellAudio | Audio Output | **Complete** | WASAPI (Win) / SDL2 backends, mixing thread @ 5.33ms, multi-port mixing, 7.1 downmix |
-| cellVoice | Voice Chat | Not Started | |
-| cellMic | Microphone | Not Started | |
+| cellVoice | Voice Chat | **Complete** | Port management, connect/disconnect, start/stop, read/write (no actual voice data) |
+| cellMic | Microphone | **Complete** | Init/end, all queries report no microphone attached |
 
 ## Media / Codec
 
@@ -71,7 +71,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellGifDec | GIF Decode | **Complete** | Header parsing + stb_image decode |
 | cellJpgEnc | JPEG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
 | cellPngEnc | PNG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
-| cellSail | Media Player | Not Started | High-level media playback |
+| cellSail | Media Player | **Complete** | Player lifecycle/state machine, open/start/stop/pause, immediate finish (no actual playback) |
 
 ## Font / Text
 
@@ -92,7 +92,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellHttp | HTTP Client | Partial | Client/transaction management, config APIs work, actual HTTP returns CONNECTION_FAILED |
 | cellHttpUtil | HTTP Utility | **Complete** | URL parsing/building, percent-encoding, form encoding, Base64 codec |
 | cellSsl | SSL/TLS | **Complete** | Init/end lifecycle, certificate stubs, RNG via BCryptGenRandom/urandom |
-| cellRudp | Reliable UDP | Not Started | Sony's reliable UDP protocol |
+| cellRudp | Reliable UDP | **Complete** | Context management, bind/close work, connect/send/recv return NOT_CONNECTED |
 
 ## PSN / NP
 
@@ -101,7 +101,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | sceNp | NP Core | **Complete** | Configurable username, fake NP IDs, account region/age |
 | sceNpBasic | NP Basic | **Complete** | Friends list, presence, messaging, invitations, block list (offline stub) |
 | sceNpCommerce | NP Commerce | **Complete** | Context management, store operations return NOT_CONNECTED (offline stub) |
-| sceNpClans | NP Clans | Not Started | Clan system |
+| sceNpClans | NP Clans | **Complete** | Create/join/leave/search clans, all return NOT_CONNECTED (offline stub) |
 | sceNpTus | NP TUS | **Complete** | Local variable/data storage, set/get/add/delete, per-slot with async polling |
 | sceNpMatching2 | NP Matching | **Complete** | Context start/stop, signaling/room callbacks, operations return SERVER_NOT_AVAILABLE |
 | sceNpSignaling | NP Signaling | **Complete** | Context management, connection ops return NOT_CONNECTED, local net info |
@@ -117,9 +117,9 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellGame | Game Utility | **Complete** | Boot check, content permit, param read, data directory management |
 | cellMsgDialog | Message Dialog | **Complete** | Prints to stdout, auto-responds YES/OK, progress bar tracking |
 | cellOskDialog | OSK Dialog | **Complete** | UTF-16 support, configurable default response, async pattern |
-| cellVideoUpload | Video Upload | Not Started | |
-| cellScreenshot | Screenshot | Partial | Enable/disable, parameter/overlay tracking (no actual capture) |
-| cellBGDL | Background DL | Not Started | Background download manager |
+| cellVideoUpload | Video Upload | **Complete** | Init/term, upload returns NOT_SUPPORTED |
+| cellScreenshot | Screenshot | **Complete** | Enable/disable, parameter/overlay tracking (capture via GCM integration) |
+| cellBGDL | Background DL | **Complete** | Init/term, download list always empty, start returns BUSY |
 | cellUserInfo | User Info | **Complete** | Default user (00000001/"User"), GetStat/GetList/SelectUser |
 
 ## SPU / Multi-core
@@ -146,24 +146,24 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellRtc | Real-Time Clock | **Complete** | Host time -> PS3 ticks, DateTime, time arithmetic, RFC formatting, day-of-week |
-| cellOvis | Overlay | Not Started | |
+| cellOvis | Overlay | **Complete** | Init/term, overlay create/destroy/invalidate (no-op stubs) |
 | cellSheap | Shared Heap | **Complete** | Bump allocator with block tracking, alloc/free/query, up to 8 heaps |
 | cellKey2char | Key to Char | **Complete** | HID scancode to Unicode, US-101 layout, shift/caps handling, dead key mode |
 | cellSubdisplay | Sub-display | Not Started | Vita remote play |
 | cellImeJp | IME Japanese | Not Started | Japanese input method |
 | cellDaisy | Daisy Chain | Not Started | SPU pipeline framework |
 | cellGameExec | Game Execute | **Complete** | Exit params, boot game info, ExitToShelf |
-| cellLicenseArea | License Area | Not Started | License verification |
-| cellMusicDecode | Music Decode | Not Started | Background music decoding |
-| cellMusicDecode2 | Music Decode 2 | Not Started | Extended music decoding |
+| cellLicenseArea | License Area | **Complete** | Region check (Americas default), all areas valid |
+| cellMusicDecode | Music Decode | **Complete** | Init/finish, decode returns NOT_SUPPORTED |
+| cellMusicDecode2 | Music Decode 2 | **Complete** | Init/finalize, decode returns NOT_SUPPORTED, format info stub |
 
 ## Summary
 
 | Status | Count |
 |---|---|
-| **Complete** | 62 |
-| Partial | 5 |
-| Not Started | ~31 |
+| **Complete** | 75 |
+| Partial | 4 |
+| Not Started | ~19 |
 | **Total** | **~98** |
 
 ## Next Priorities
