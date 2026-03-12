@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(ps3recomp_runtime
-    VERSION 0.2.0
+    VERSION 0.2.3
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
@@ -77,6 +77,7 @@ if(WIN32)
         ws2_32      # Winsock for network modules
         xinput      # XInput for gamepad
         ole32       # COM for WASAPI audio
+        bcrypt      # BCryptGenRandom for SSL RNG
     )
 endif()
 

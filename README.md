@@ -177,7 +177,7 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **34 modules complete, 5 partial, 110+ files, 30,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **49 modules complete, 5 partial, 140+ files, 40,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -192,13 +192,18 @@ We're building HLE implementations based on RPCS3's module system. **34 modules 
 | **Video Output** | cellVideoOut (resolution config, 720p default) | ✅ Complete |
 | **Codecs** | cellPngDec, cellJpgDec, cellGifDec (stb_image) | ✅ Complete |
 | **Font** | cellFont (stb_truetype backend + fallback metrics) | ✅ Complete |
-| **Network** | sys_net (BSD sockets), cellNetCtl (real IP), sceNp, sceNpTrophy | ✅ Complete |
+| **Network** | sys_net (BSD sockets), cellNet, cellNetCtl, cellHttpUtil, cellSsl, sceNp, sceNpBasic, sceNpTus, sceNpTrophy | ✅ Complete |
 | **Sync** | cellSync (atomic spinlocks, LF queue), cellSync2 (OS-backed) | ✅ Complete |
-| **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo | ✅ Complete |
+| **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo, cellGameExec | ✅ Complete |
+| **Localization** | cellL10n (UTF-8/16/32/UCS-2, ISO-8859-1, generic converter) | ✅ Complete |
+| **Resolution** | cellResc (display modes, scaling, interlace, aspect ratio) | ✅ Complete |
+| **Fibers** | cellFiber (PPU fibers via Windows Fibers/ucontext) | ✅ Complete |
+| **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
+| **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
 | **Graphics** | cellGcmSys (init, flip, display bufs — no cmd buffer yet) | 🔨 Partial |
 | **SPURS** | cellSpurs (management APIs, no SPU execution yet) | 🔨 Partial |
-| **Core Runtime** | cellSysutil, cellSysmodule, sysPrxForUser | 🔨 Partial |
-| **Video Decode** | cellPamf, cellVdec, cellAdec, cellDmux | 📋 Planned |
+| **Core Runtime** | cellSysutil (BGM, cache, disc), cellSysmodule, sysPrxForUser (real lwmutex/lwcond/threads) | ✅ Complete |
+| **Media Pipeline** | cellPamf (PAMF parser), cellDmux, cellVdec, cellAdec (API stubs, needs FFmpeg) | 🔨 Partial |
 
 Full status tracking: [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md)
 
@@ -281,6 +286,30 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.2.3 — *"Half a Hundred"* (March 2026)
+- **sysPrxForUser**: Upgraded from stub to real — lwmutex backed by CRITICAL_SECTION/pthread_mutex, lwcond backed by CONDITION_VARIABLE/pthread_cond, real host threads, heap management, snprintf, string/mem ops
+- **cellSysutil**: Upgraded — BGM playback control, system cache mount/clear, disc game check, license area
+- **cellSysmodule**: Upgraded to complete — all module names mapped
+- **cellPamf**: PAMF container parser — big-endian header parsing, stream queries, AVC/ATRAC3+/LPCM/AC3 codec info, entry point navigation
+- **cellDmux**: AV demuxer — open/close, ES management, stream feed/reset, AU retrieval, flush callbacks
+- **cellVdec**: Video decoder API — H.264/MPEG2 codec types, AU submit with AUDONE callback (actual decode needs FFmpeg)
+- **cellAdec**: Audio decoder API — AAC/ATRAC3+/MP3 codec types, AU submit with AUDONE callback (actual decode needs FFmpeg)
+- **cellNet**: Network core — Winsock/POSIX initialization, DNS resolver with real getaddrinfo
+- **cellSsl**: SSL/TLS lifecycle — init/end, certificate stubs, cryptographic RNG (BCryptGenRandom/urandom)
+- **sceNpTus**: NP Title User Storage — local variable/data storage with set/get/add/delete per slot
+- **49 complete modules** (up from 42), 3 partial modules upgraded to complete
+
+### v0.2.2 — *"Fiber Optics"* (March 2026)
+- **cellL10n**: Full Unicode conversion — UTF-8 ↔ UTF-16 ↔ UTF-32 ↔ UCS-2, ISO-8859-1, ASCII, generic `l10n_convert()` API
+- **cellFiber**: Cooperative multitasking with native OS fibers (Windows `CreateFiber`/POSIX `ucontext`), 64 concurrent fibers, sleep/wakeup
+- **cellResc**: Resolution scaling/conversion — display mode config, buffer management, interlace tables, aspect ratio, flip/vblank handlers
+- **cellHttpUtil**: URL parsing/building, percent-encoding/decoding, form URL encoding, Base64 codec
+- **sceNpBasic**: Friends list, presence management, messaging, game invitations, block list (offline stub)
+- **cellKey2char**: HID keyboard scancode → Unicode character conversion, US-101 layout, shift/caps handling
+- **cellAvconfExt**: Audio output device info, sound availability queries, LPCM/AC3/DTS config, video gamma
+- **cellGameExec**: Boot parameters, exit to shelf, boot game info
+- **42 complete modules** (up from 34)
 
 ### v0.2.1 — *"Now With Sockets"* (March 2026)
 - **sys_net**: Full BSD socket API — socket, bind, listen, accept, connect, send, recv, sendto, recvfrom, poll, select, setsockopt/getsockopt, getsockname, shutdown, close, gethostbyname, inet_aton, errno

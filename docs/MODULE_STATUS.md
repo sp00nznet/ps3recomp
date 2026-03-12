@@ -12,9 +12,9 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| sysPrxForUser | Core Runtime | Stubbed | Thread create/join, lwmutex, lwcond, printf |
-| cellSysmodule | Module Loader | Partial | Load/unload tracking, 55+ module ID constants |
-| cellSysutil | System Utility | Partial | Callbacks, system params (lang, region, timezone) |
+| sysPrxForUser | Core Runtime | **Complete** | Real host threads, lwmutex (CRITICAL_SECTION/pthread), lwcond (CV/pthread_cond), heap alloc, printf/snprintf, string/mem ops |
+| cellSysmodule | Module Loader | **Complete** | Load/unload tracking, 55+ module ID constants, name lookup |
+| cellSysutil | System Utility | **Complete** | Callbacks, system params, BGM playback, system cache, disc game check, license area |
 | sys_ppu_thread | Kernel Threading | **Complete** | Real host threads (CreateThread/pthreads), join, detach, priority, rename |
 | sys_fs | Kernel Filesystem | **Complete** | Full file I/O with PS3-to-host path mapping, directory ops, stat, big-endian output |
 | sys_memory | Kernel Memory | **Complete** | Bump allocator from VM, containers, shared memory, mmapper |
@@ -46,7 +46,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellGcmSys | RSX System | Partial | Init, flip control, display buffers, addr translation (no command buffer processing) |
-| cellResc | Resolution | Not Started | Resolution scaling/conversion |
+| cellResc | Resolution | **Complete** | Init, display modes, buffer management, aspect ratio, interlace, flip/vblank handlers |
 | cellVideoOut | Video Output | **Complete** | Resolution config, device info, all PS3 resolution IDs, default 720p |
 
 ## Audio
@@ -61,10 +61,10 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellPamf | PAMF Container | Not Started | PlayStation media file parsing |
-| cellVdec | Video Decode | Not Started | H.264/MPEG2 video decoding |
-| cellAdec | Audio Decode | Not Started | AAC/ATRAC3+ audio decoding |
-| cellDmux | Demuxer | Not Started | AV stream demultiplexing |
+| cellPamf | PAMF Container | **Complete** | Big-endian PAMF header parser, stream queries, entry points, AVC/ATRAC3+/LPCM/AC3 info |
+| cellVdec | Video Decode | Partial | Open/close, start/end seq, AU submit with AUDONE callback (no actual H.264/MPEG2 decode) |
+| cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE callback (no actual AAC/ATRAC3+ decode) |
+| cellDmux | Demuxer | Partial | Open/close, ES enable/disable, stream set/reset, AU retrieval stubs, flush callbacks |
 | cellVpost | Video Post | Not Started | Video post-processing |
 | cellJpgDec | JPEG Decode | **Complete** | Header parsing + stb_image decode, file/buffer sources |
 | cellPngDec | PNG Decode | **Complete** | Header parsing + stb_image decode, RGBA/ARGB/RGB output |
@@ -80,18 +80,18 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellFont | Font Rendering | **Complete** | Full lifecycle, stb_truetype backend, fallback metrics without STB |
 | cellFontFT | FreeType Font | Not Started | FreeType-based rendering |
 | cellFreeType | FreeType | Not Started | FreeType library wrapper |
-| cellL10n | Localization | Not Started | Character encoding conversion |
+| cellL10n | Localization | **Complete** | UTF-8/16/32/UCS-2 bidirectional, ISO-8859-1, ASCII, generic converter API |
 
 ## Network
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | sys_net | BSD Sockets | **Complete** | Full BSD socket API — socket, bind, listen, accept, connect, send/recv/sendto/recvfrom, poll, select, setsockopt/getsockopt, shutdown, close, gethostbyname, inet_aton, errno |
-| cellNet | Network Core | Not Started | Higher-level network utilities |
+| cellNet | Network Core | **Complete** | Winsock/POSIX init, DNS resolver with real getaddrinfo, async poll |
 | cellNetCtl | Network Control | **Complete** | Real host IP detection, NAT type, connection state, handler callbacks |
 | cellHttp | HTTP Client | Partial | Client/transaction management, config APIs work, actual HTTP returns CONNECTION_FAILED |
-| cellHttpUtil | HTTP Utility | Not Started | URL parsing, cookie management |
-| cellSsl | SSL/TLS | Not Started | Secure socket layer |
+| cellHttpUtil | HTTP Utility | **Complete** | URL parsing/building, percent-encoding, form encoding, Base64 codec |
+| cellSsl | SSL/TLS | **Complete** | Init/end lifecycle, certificate stubs, RNG via BCryptGenRandom/urandom |
 | cellRudp | Reliable UDP | Not Started | Sony's reliable UDP protocol |
 
 ## PSN / NP
@@ -99,10 +99,10 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | sceNp | NP Core | **Complete** | Configurable username, fake NP IDs, account region/age |
-| sceNpBasic | NP Basic | Not Started | Friends, messaging |
+| sceNpBasic | NP Basic | **Complete** | Friends list, presence, messaging, invitations, block list (offline stub) |
 | sceNpCommerce | NP Commerce | Not Started | In-game store |
 | sceNpClans | NP Clans | Not Started | Clan system |
-| sceNpTus | NP TUS | Not Started | Title user storage |
+| sceNpTus | NP TUS | **Complete** | Local variable/data storage, set/get/add/delete, per-slot with async polling |
 | sceNpMatching2 | NP Matching | Not Started | Online matchmaking |
 | sceNpSignaling | NP Signaling | Not Started | P2P connection signaling |
 | sceNpSns | NP SNS | Not Started | Social networking integration |
@@ -128,7 +128,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 |---|---|---|---|
 | cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags (no actual SPU execution) |
 | cellSpursJq | SPURS Job Queue | Not Started | SPURS job queue extension |
-| cellFiber | Fiber | Not Started | Cooperative multitasking fibers |
+| cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext, create/delete/switch/yield/sleep/wakeup |
 | cellSync | Sync Primitives | **Complete** | Atomic spinlock mutex, counter barrier, RWM, bounded queue, lock-free queue |
 | cellSync2 | Sync Primitives 2 | **Complete** | OS-backed mutex/cond/semaphore/queue with timeouts |
 
@@ -139,7 +139,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellUsbd | USB Driver | Not Started | USB device access |
 | cellCamera | Camera | Not Started | PlayStation Eye camera |
 | cellGem | Move Controller | Not Started | PlayStation Move |
-| cellAvconfExt | AV Config | Not Started | Audio/video output config |
+| cellAvconfExt | AV Config | **Complete** | Audio output device info, sound availability, configuration, gamma control |
 
 ## Miscellaneous
 
@@ -148,11 +148,11 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellRtc | Real-Time Clock | **Complete** | Host time -> PS3 ticks, DateTime, time arithmetic, RFC formatting, day-of-week |
 | cellOvis | Overlay | Not Started | |
 | cellSheap | Shared Heap | Not Started | Shared memory heap |
-| cellKey2char | Key to Char | Not Started | Keycode conversion |
+| cellKey2char | Key to Char | **Complete** | HID scancode to Unicode, US-101 layout, shift/caps handling, dead key mode |
 | cellSubdisplay | Sub-display | Not Started | Vita remote play |
 | cellImeJp | IME Japanese | Not Started | Japanese input method |
 | cellDaisy | Daisy Chain | Not Started | SPU pipeline framework |
-| cellGameExec | Game Execute | Not Started | Boot other games |
+| cellGameExec | Game Execute | **Complete** | Exit params, boot game info, ExitToShelf |
 | cellLicenseArea | License Area | Not Started | License verification |
 | cellMusicDecode | Music Decode | Not Started | Background music decoding |
 | cellMusicDecode2 | Music Decode 2 | Not Started | Extended music decoding |
@@ -161,17 +161,15 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Status | Count |
 |---|---|
-| **Complete** | 34 |
+| **Complete** | 49 |
 | Partial | 5 |
-| Stubbed | 1 |
-| Not Started | ~58 |
+| Not Started | ~44 |
 | **Total** | **~98** |
 
 ## Next Priorities
 
 1. **cellGcmSys** — Full RSX command buffer processing (the graphics mountain)
 2. **cellSpurs** — Actual SPU program execution on host threads
-3. **cellPamf / cellVdec / cellAdec / cellDmux** — Video cutscene playback pipeline
-4. **cellNet** — Socket-level networking for multiplayer
-5. **cellFiber** — Cooperative multitasking
-6. **cellL10n** — Character encoding conversion
+3. **cellVdec / cellAdec** — Integrate FFmpeg for actual video/audio decoding
+4. **cellHttp** — Real HTTP requests via host sockets
+5. **cellSail** — High-level media playback wrapper

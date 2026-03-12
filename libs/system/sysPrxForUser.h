@@ -1,8 +1,9 @@
 /*
- * ps3recomp - sysPrxForUser HLE stub
+ * ps3recomp - sysPrxForUser HLE
  *
  * Core PRX runtime: threads, process management, printf, lightweight
- * mutexes and condition variables.
+ * mutexes/condvars (backed by real host primitives), heap allocation,
+ * and TLS support.
  */
 
 #ifndef PS3RECOMP_SYS_PRX_FOR_USER_H
@@ -31,7 +32,7 @@ typedef struct sys_ppu_thread_attr {
 /* Lightweight mutex attribute */
 typedef struct sys_lwmutex_attribute {
     u32 protocol;        /* SYS_SYNC_FIFO = 1, SYS_SYNC_PRIORITY = 2 */
-    u32 recursive;       /* SYS_SYNC_RECURSIVE = 1, SYS_SYNC_NOT_RECURSIVE = 2 */
+    u32 recursive;       /* SYS_SYNC_RECURSIVE = 0x10, SYS_SYNC_NOT_RECURSIVE = 0x20 */
     char name[8];
 } sys_lwmutex_attribute_t;
 
@@ -70,7 +71,6 @@ typedef struct sys_lwcond {
  * Thread management
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x24A1EA07 */
 s32 sys_ppu_thread_create(sys_ppu_thread_t* thread_id,
                           sys_ppu_thread_entry_t entry,
                           u64 arg,
@@ -78,65 +78,78 @@ s32 sys_ppu_thread_create(sys_ppu_thread_t* thread_id,
                           u32 stacksize,
                           u64 flags,
                           const char* threadname);
-
-/* NID: 0xAFF080A4 */
 void sys_ppu_thread_exit(u64 exitcode);
-
-/* NID: 0x1D3EE43E */
 s32 sys_ppu_thread_join(sys_ppu_thread_t thread_id, u64* exitstatus);
+s32 sys_ppu_thread_detach(sys_ppu_thread_t thread_id);
+s32 sys_ppu_thread_get_id(sys_ppu_thread_t* thread_id);
+s32 sys_ppu_thread_yield(void);
 
 /* ---------------------------------------------------------------------------
  * Process management
  * -----------------------------------------------------------------------*/
 
-/* NID: 0xE6F2C1E7 */
 void sys_process_exit(s32 exitcode);
-
-/* NID: 0xE9572E5B */
 s32 sys_process_getpid(void);
+s32 sys_process_get_number_of_object(u32 object_type, u32* count);
+s32 sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags);
 
 /* ---------------------------------------------------------------------------
- * Printf / sprintf
+ * Printf / sprintf / snprintf
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x9FB6228E */
 s32 _sys_printf(const char* fmt, ...);
-
-/* NID: 0xFA7F693D */
 s32 _sys_sprintf(char* buf, const char* fmt, ...);
+s32 _sys_snprintf(char* buf, u32 size, const char* fmt, ...);
+s32 _sys_strlen(const char* str);
+s32 _sys_strncpy(char* dst, const char* src, u32 size);
+s32 _sys_strcat(char* dst, const char* src);
+s32 _sys_strcmp(const char* s1, const char* s2);
+void* _sys_memset(void* dst, s32 val, u32 size);
+void* _sys_memcpy(void* dst, const void* src, u32 size);
+s32 _sys_memcmp(const void* s1, const void* s2, u32 size);
+s32 _sys_toupper(s32 c);
+s32 _sys_tolower(s32 c);
 
 /* ---------------------------------------------------------------------------
  * Lightweight mutex
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x1573DC3F */
 s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr);
-
-/* NID: 0x1BC200F4 */
 s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout);
-
-/* NID: 0x1A1BC3B0 */
+s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex);
 s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex);
-
-/* NID: 0xC3B0A8A4 */
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex);
 
 /* ---------------------------------------------------------------------------
  * Lightweight condition variable
  * -----------------------------------------------------------------------*/
 
-/* NID: 0xDA0EB71A */
 s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
                       const sys_lwcond_attribute_t* attr);
-
-/* NID: 0xEF87A695 */
 s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond);
-
-/* NID: 0x2A6D9D51 */
+s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond);
 s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout);
-
-/* NID: 0x1B434AFC */
 s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond);
+
+/* ---------------------------------------------------------------------------
+ * Heap management
+ * -----------------------------------------------------------------------*/
+
+typedef u32 sys_heap_t;
+
+s32 sys_heap_create_heap(sys_heap_t* heap, u32 start_addr, u32 size,
+                          u32 flags, void* alloc_func, void* free_func);
+s32 sys_heap_destroy_heap(sys_heap_t heap);
+void* sys_heap_malloc(sys_heap_t heap, u32 size);
+s32 sys_heap_free(sys_heap_t heap, void* ptr);
+void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
+
+/* ---------------------------------------------------------------------------
+ * PRX utilities
+ * -----------------------------------------------------------------------*/
+
+s32 sys_prx_exitspawn_with_level(void);
+s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
 
 #ifdef __cplusplus
 }

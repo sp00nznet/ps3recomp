@@ -1,7 +1,8 @@
 /*
- * ps3recomp - cellSysutil HLE stub
+ * ps3recomp - cellSysutil HLE
  *
- * Core system utility functions: callbacks, system parameters.
+ * Core system utility functions: callbacks, system parameters,
+ * BGM playback control, disc check, system cache, and overlay.
  */
 
 #ifndef PS3RECOMP_CELL_SYSUTIL_H
@@ -73,31 +74,69 @@ extern "C" {
 #define CELL_SYSUTIL_SYSTEM_MENU_CLOSE        0x0132
 #define CELL_SYSUTIL_BGMPLAYBACK_PLAY         0x0141
 #define CELL_SYSUTIL_BGMPLAYBACK_STOP         0x0142
+#define CELL_SYSUTIL_NP_INVITATION_SELECTED   0x0151
 
 /* Maximum callback slots */
 #define CELL_SYSUTIL_MAX_CALLBACKS  4
+
+/* BGM playback */
+#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP     0
+#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_PLAY     1
+#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_PAUSE    2
+
+/* System cache path size */
+#define CELL_SYSCACHE_PATH_MAX  1055
+
+/* Disc game types */
+#define CELL_DISCGAME_TYPE_DISC    1
+#define CELL_DISCGAME_TYPE_HDD     2
 
 /* Callback function type */
 typedef void (*CellSysutilCallback)(u64 status, u64 param, void* userdata);
 
 /* ---------------------------------------------------------------------------
- * Functions
+ * Core callbacks & params
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x9D848F34 */
 s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userdata);
-
-/* NID: 0x02FF3C1B */
 s32 cellSysutilUnregisterCallback(s32 slot);
-
-/* NID: 0x189A74DA */
 s32 cellSysutilCheckCallback(void);
 
-/* NID: 0x40E895D3 */
 s32 cellSysutilGetSystemParamInt(s32 id, s32* value);
-
-/* NID: 0x938013A0 */
 s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize);
+
+/* ---------------------------------------------------------------------------
+ * BGM playback control
+ * -----------------------------------------------------------------------*/
+
+s32 cellSysutilEnableBgmPlayback(void);
+s32 cellSysutilDisableBgmPlayback(void);
+s32 cellSysutilGetBgmPlaybackStatus(s32* status);
+s32 cellSysutilSetBgmPlaybackExtraParam(void* param);
+s32 cellSysutilEnableBgmPlaybackEx(s32 param);
+s32 cellSysutilDisableBgmPlaybackEx(void);
+
+/* ---------------------------------------------------------------------------
+ * System cache
+ * -----------------------------------------------------------------------*/
+
+s32 cellSysCacheMount(char* cachePath);
+s32 cellSysCacheClear(void);
+
+/* ---------------------------------------------------------------------------
+ * Disc game check
+ * -----------------------------------------------------------------------*/
+
+s32 cellDiscGameGetBootDiscInfo(u32* type, char* titleId, u32 titleIdSize);
+s32 cellDiscGameRegisterDiscChangeCallback(void (*callback)(void*), void* arg);
+s32 cellDiscGameUnregisterDiscChangeCallback(void);
+
+/* ---------------------------------------------------------------------------
+ * Misc utilities
+ * -----------------------------------------------------------------------*/
+
+s32 cellSysutilGetLicenseArea(void);
+s32 cellSysutilIsMeetingApp(void);
 
 #ifdef __cplusplus
 }
