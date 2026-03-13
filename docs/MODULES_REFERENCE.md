@@ -465,6 +465,26 @@ Parses the PS3's native media container format:
 - GIF decoding via stb_image backend
 - Single-frame decode (no animation)
 
+### Codec Variants
+
+**cellAdecAtrac3p** (`libs/codec/cellAdecAtrac3p.c`):
+- ATRAC3plus audio decoder — Sony's advanced lossy codec used for game audio/BGM
+- Open/close/decode/reset lifecycle with up to 8 handles
+- Outputs silence (zero-filled PCM): 2048 samples per frame, 16-bit
+- Supports mono/stereo, 44.1 kHz and 48 kHz sample rates
+
+**cellAdecCelp8** (`libs/codec/cellAdecCelp8.c`):
+- CELP8 (Code-Excited Linear Prediction) voice codec — low-bandwidth voice chat audio
+- 8 kHz mono, 160 samples per frame (20 ms)
+- Multiple bitrate modes: 5700, 6200, 7700, 14400 bps
+- Outputs silence (zero-filled 16-bit PCM)
+
+**cellVdecDivx** (`libs/codec/cellVdecDivx.c`):
+- DivX/Xvid video decoder for media playback
+- Open/close/decode/reset lifecycle with up to 4 handles
+- Profiles: Mobile, Home Theater, HD
+- Outputs black frames (zero-filled YUV data)
+
 ### Image Encoders
 
 **cellJpgEnc** / **cellPngEnc** (`libs/codec/cellJpg/PngEnc.c`):
@@ -510,6 +530,47 @@ State machine-driven media player:
 - Glyph metrics (advance width, bearing, bounding box)
 - Fallback metrics when stb_truetype is not available
 - Multiple font instances (up to 16 concurrent)
+
+### cellFontFT
+
+**File:** `libs/font/cellFontFT.c`
+**Purpose:** FreeType-based font rendering
+
+An alternative font rendering path that wraps FreeType2 (as opposed to cellFont which uses stb_truetype).
+
+**Features:**
+- Up to 16 concurrent font instances
+- Fallback metrics when no real FreeType library is present:
+  - Ascender = 0.8 × requested size
+  - Descender = -0.2 × requested size
+  - Line height = ascender - descender
+  - Advance width = 0.6 × size (monospace approximation)
+- Empty glyph bitmaps (zeroed pixel data) for rendering stubs
+- Kerning queries return zero offset (no kerning data without FreeType)
+
+**Key Functions:**
+- `cellFontFTInit(config, &lib)` — initialize FreeType font library
+- `cellFontFTEnd(lib)` — shutdown
+- `cellFontFTOpenFontFile(lib, path, index, &font)` — open from file
+- `cellFontFTOpenFontMemory(lib, data, size, index, &font)` — open from buffer
+- `cellFontFTCloseFont(font)` — close font instance
+- `cellFontFTGetGlyphMetrics(font, glyph, &metrics)` — get glyph dimensions
+- `cellFontFTGetFontMetrics(font, &metrics)` — get font-wide dimensions
+- `cellFontFTRenderGlyph(font, glyph, &image)` — render glyph to bitmap
+- `cellFontFTGetKerning(font, left, right, &kern)` — get kerning offset
+
+### cellFreeType
+
+**File:** `libs/font/cellFreeType.c`
+**Purpose:** Low-level FreeType2 library wrapper
+
+Minimal wrapper that provides direct access to FreeType2. Reports FreeType 2.4.12 (the version shipped with PS3 firmware 4.x).
+
+**Key Functions:**
+- `cellFreeTypeInit(config, &lib)` — initialize FreeType library
+- `cellFreeTypeEnd(lib)` — shutdown
+- `cellFreeTypeGetVersion(&version)` — returns {major=2, minor=4, patch=12}
+- `cellFreeTypeGetLibrary(&lib)` — get current library handle
 
 ### cellL10n
 
@@ -593,6 +654,29 @@ Wraps the host OS socket API with PS3 error code translation:
 - Handler callbacks for network state changes
 - Reports real network interface info
 
+### cellHttps
+
+**File:** `libs/network/cellHttps.c`
+**Purpose:** HTTPS (HTTP over TLS) client
+
+Extends cellHttp with SSL/TLS support. No actual TLS handshake or encryption — certificate management APIs accept data but verification always succeeds.
+
+**Features:**
+- Up to 8 concurrent HTTPS handles
+- SSL version configuration (SSLv3, TLSv1)
+- CA certificate and client certificate management (accepted but not processed)
+- Verify level configuration (peer and host verification flags)
+- Certificate info queries (returns NOT_SUPPORTED — no real TLS connection)
+
+**Key Functions:**
+- `cellHttpsInit(config, &handle)` — initialize with SSL config (version, verify flags)
+- `cellHttpsEnd(handle)` — shutdown
+- `cellHttpsSetCACert(handle, cert, size, type)` — set CA certificate (X.509 or PKCS12)
+- `cellHttpsSetClientCert(handle, cert, certSize, key, keySize)` — set client certificate
+- `cellHttpsClearCerts(handle)` — clear all certificates
+- `cellHttpsSetVerifyLevel(handle, verifyPeer, verifyHost)` — configure verification
+- `cellHttpsGetCertInfo(handle, &info)` — get peer certificate info (returns NOT_SUPPORTED)
+
 ### cellSsl
 
 **File:** `libs/network/cellSsl.c`
@@ -672,6 +756,61 @@ SPURS (SPU Runtime System) is Sony's framework for distributing work across SPUs
 - Actual SPU program execution on host threads
 - SPU job scheduling and dispatch
 - DMA coordination between SPU tasks
+
+### cellSpursJq
+
+**File:** `libs/spurs/cellSpursJq.c`
+**Purpose:** SPURS Job Queue — advanced SPU job dispatch
+
+Built on top of cellSpurs, provides a higher-level job submission and tracking interface. Jobs are submitted to queues and would normally be dispatched to SPUs for execution.
+
+**Implementation:**
+- Up to 16 concurrent job queues
+- Jobs are accepted via `Push` and immediately marked complete (no SPU execution)
+- `Wait` and `TryWait` return immediately since jobs are instantly "done"
+- Port system connects event queues to job queues for push synchronization
+
+**Key Functions:**
+- `cellSpursJobQueueAttributeInitialize(&attr)` — set defaults (64 max jobs, grab=1, normal priority)
+- `cellSpursCreateJobQueue(spurs, &jq, &attr, buffer, size)` — create queue
+- `cellSpursDestroyJobQueue(&jq)` — destroy queue
+- `cellSpursJobQueuePush(&jq, job, size, tag, &id)` — submit job (completes immediately)
+- `cellSpursJobQueuePushJob(&jq, &job256, tag, &id)` — submit 256-byte job
+- `cellSpursJobQueueWait(&jq, id)` — wait for job (returns immediately)
+- `cellSpursJobQueueGetCount(&jq, &count)` — returns 0 (all jobs complete)
+- `cellSpursJobQueuePort2Create/Destroy/PushSync` — port-based submission
+
+**Job Types:**
+- `CellSpursJob256` — 256-byte job descriptor with DMA list, work area, binary EA
+- `CellSpursJob128` — 128-byte compact variant
+
+### cellDaisy
+
+**File:** `libs/spurs/cellDaisy.c`
+**Purpose:** SPURS Daisy Chain — lock-free FIFO pipes
+
+Producer-consumer pipeline framework for streaming data between PPU and SPU. Unlike the other SPURS stubs, cellDaisy has a **real ring buffer implementation** that actually stores and delivers data.
+
+**Implementation:**
+- Up to 32 concurrent pipes
+- Each pipe has a configurable entry size and depth (max 256 entries)
+- Real ring buffer with head/tail pointers and count tracking
+- `Push` copies data into the ring buffer; `Pop` retrieves it
+- `malloc`/`free` for ring buffer allocation
+
+**Key Functions:**
+- `cellDaisyPipeAttributeInitialize(&attr, direction, entrySize, depth)` — configure pipe
+- `cellDaisyCreatePipe(spurs, &pipe, &attr, buffer, size)` — create pipe with ring buffer
+- `cellDaisyDestroyPipe(&pipe)` — destroy and free ring buffer
+- `cellDaisyPipePush(&pipe, data)` / `cellDaisyPipeTryPush(&pipe, data)` — enqueue data
+- `cellDaisyPipePop(&pipe, data)` / `cellDaisyPipeTryPop(&pipe, data)` — dequeue data
+- `cellDaisyPipeGetCount(&pipe, &count)` — number of entries in pipe
+- `cellDaisyPipeGetFreeCount(&pipe, &count)` — available slots
+
+**Pipe Directions:**
+- `PPU_TO_SPU` — PPU produces, SPU consumes
+- `SPU_TO_PPU` — SPU produces, PPU consumes
+- `SPU_TO_SPU` — inter-SPU pipeline
 
 ### cellFiber
 
@@ -819,6 +958,85 @@ PS3 save data uses a callback pattern:
 - `cellUserInfoGetStat(id, &stat)` — get user info
 - `cellUserInfoGetList(&list)` — list all users (returns just the default)
 - `cellUserInfoSelectUser(&id)` — select user (returns default)
+
+### cellSubdisplay
+
+**File:** `libs/misc/cellSubdisplay.c`
+**Purpose:** PS Vita Remote Play sub-display
+
+Handles second-screen output for PS Vita Remote Play. In a recompiled environment, no Vita is ever connected.
+
+**Features:**
+- Init/end/start/stop lifecycle
+- Video mode configuration (480p, 272p)
+- `cellSubdisplayIsConnected()` — always returns 0 (not connected)
+- `cellSubdisplayGetTouchData(&data)` — returns empty touch data (0 points)
+- `cellSubdisplayGetRequiredMemory(&size)` — reports 1 MB requirement
+
+### cellImeJp
+
+**File:** `libs/misc/cellImeJp.c`
+**Purpose:** Japanese Input Method Editor
+
+Handles kana-to-kanji conversion for Japanese text input. In this stub, input passes through without conversion (raw Unicode characters in = same characters out).
+
+**Features:**
+- Up to 4 concurrent IME handles
+- Input modes: Hiragana, Katakana, Half-width Katakana, Alphanumeric
+- Character-by-character input with `cellImeJpAddChar(handle, ch)`
+- Backspace and reset support
+- Max 256 input characters per session
+- `cellImeJpGetConvertedString()` returns raw input (passthrough — no kanji dictionary)
+
+### cellVideoExport / cellMusicExport / cellPhotoExport / cellPhotoImport
+
+Export/import utilities for saving game content to or loading content from the XMB (PS3's system menu).
+
+| Module | File | What It Does |
+|--------|------|-------------|
+| **cellVideoExport** | `libs/misc/cellVideoExport.c` | Save captured video to XMB video column. Returns NOT_SUPPORTED with callback. |
+| **cellMusicExport** | `libs/misc/cellMusicExport.c` | Save audio to XMB music column. Returns NOT_SUPPORTED with callback. |
+| **cellPhotoExport** | `libs/misc/cellPhotoExport.c` | Save screenshots to XMB photo column. Returns NOT_SUPPORTED with callback. |
+| **cellPhotoImport** | `libs/misc/cellPhotoImport.c` | Browse/import photos from XMB. Returns NOT_SUPPORTED with callback. |
+
+All follow the same pattern:
+- `Init()` / `End()` lifecycle with guard checks
+- `Start(param, callback, userdata)` — immediately fires callback with NOT_SUPPORTED
+- Progress queries return 0.0
+
+### cellGameRecording
+
+**File:** `libs/misc/cellGameRecording.c`
+**Purpose:** In-game video recording
+
+Captures framebuffer output for replay and sharing. In the stub, recording state is tracked but no actual video capture occurs.
+
+**Features:**
+- Init with quality/resolution/FPS configuration
+- Start/stop/pause/resume with state tracking
+- `cellGameRecordingIsRecording()` — returns current recording state
+- `cellGameRecordingGetDuration(&duration)` — always returns 0.0 (no real recording)
+
+### cellPrint
+
+**File:** `libs/misc/cellPrint.c`
+**Purpose:** USB printer support
+
+Stub for PS3 printing to compatible USB printers. No printers are ever detected.
+
+- `cellPrintInit()` / `cellPrintEnd()` — lifecycle
+- `cellPrintGetPrinterCount(&count)` — always returns 0
+
+### cellRemotePlay
+
+**File:** `libs/misc/cellRemotePlay.c`
+**Purpose:** Remote Play for PS Vita / PSP
+
+Checks whether Remote Play streaming is available. Always reports unavailable in a recompiled environment.
+
+- `cellRemotePlayInit()` / `cellRemotePlayEnd()` — lifecycle
+- `cellRemotePlayIsAvailable()` — always returns 0
+- `cellRemotePlayGetStatus(&status)` — reports disconnected (status = 0)
 
 ### Other Miscellaneous Modules
 

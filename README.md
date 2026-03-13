@@ -85,14 +85,14 @@ ps3recomp/
 │   ├── audio/                # cellAudio, cellAdec, libmixer, libsnd3, libsynth2
 │   ├── video/                # cellGcmSys, cellResc, cellVideoOut, cellVpost, cellVdec
 │   ├── input/                # cellPad, cellKb, cellMouse, cellGem
-│   ├── network/              # cellNetCtl, cellHttp, cellSsl, sceNp*
+│   ├── network/              # cellNetCtl, cellHttp, cellHttps, cellSsl, sceNp*
 │   ├── filesystem/           # cellFs, cellGame, cellSaveData, cellStorage
 │   ├── system/               # cellSysutil, cellSysmodule, cellRtc, sysPrxForUser
-│   ├── spurs/                # cellSpurs, cellFiber (SPU task management)
+│   ├── spurs/                # cellSpurs, cellFiber, cellSpursJq, cellDaisy (SPU task management)
 │   ├── sync/                 # cellSync, cellSync2 (cross-PPU/SPU synchronization)
-│   ├── codec/                # cellJpgDec, cellPngDec, cellGifDec, cellPamf, cellDmux
-│   ├── font/                 # cellFont, cellFontFT, cell_FreeType2, cellL10n
-│   └── misc/                 # Everything else: cellScreenshot, cellWebBrowser, etc.
+│   ├── codec/                # cellJpgDec, cellPngDec, cellGifDec, cellPamf, cellDmux, cellAdecAtrac3p, cellAdecCelp8, cellVdecDivx
+│   ├── font/                 # cellFont, cellFontFT, cellFreeType, cellL10n
+│   └── misc/                 # cellScreenshot, cellSubdisplay, cellImeJp, cellVideoExport, cellMusicExport, cellGameRecording, etc.
 │
 ├── include/ps3emu/           # Public API headers
 │   ├── ps3types.h            # Fundamental PS3 types (u8-u128, s8-s64, be_t<>)
@@ -113,7 +113,7 @@ ps3recomp/
 ├── patches/                  # Patches for upstream tools
 │   └── xenonrecomp-ppu.patch # XenonRecomp adaptations for PPU (Cell != Xenon)
 │
-└── docs/                     # Documentation (10 documents, 50K+ words)
+└── docs/                     # Documentation (11 documents, 50K+ words)
     ├── ARCHITECTURE.md        # Cell processor and recomp pipeline deep-dive
     ├── GETTING_STARTED.md     # How to recompile your first PS3 game
     ├── MODULE_STATUS.md       # Implementation status of all HLE modules
@@ -185,7 +185,7 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **77 modules complete, 2 partial, 200+ files, 55,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **93 modules complete, 3 partial, 230+ files, 60,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -210,10 +210,11 @@ We're building HLE implementations based on RPCS3's module system. **77 modules 
 | **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
 | **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
 | **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps) | ✅ Complete |
-| **SPURS** | cellSpurs (management APIs, no SPU execution yet) | 🔨 Partial |
+| **SPURS** | cellSpurs (management APIs, no SPU execution yet), cellSpursJq (job queues), cellDaisy (FIFO pipes with real ring buffer) | 🔨 Partial |
 | **Core Runtime** | cellSysutil (BGM, cache, disc), cellSysmodule, sysPrxForUser (real lwmutex/lwcond/threads) | ✅ Complete |
-| **Media Pipeline** | cellPamf, cellDmux, cellVdec, cellAdec (API stubs, actual decode needs FFmpeg), cellSail | 🔨 Partial |
-| **HTTP** | cellHttp (real HTTP/1.1 via native sockets, DNS, headers, timeouts) | ✅ Complete |
+| **Media Pipeline** | cellPamf, cellDmux, cellVdec, cellAdec (API stubs, actual decode needs FFmpeg), cellSail, cellAdecAtrac3p, cellAdecCelp8, cellVdecDivx | 🔨 Partial |
+| **HTTP/HTTPS** | cellHttp (real HTTP/1.1 via native sockets), cellHttps (TLS stub with cert management) | ✅ Complete |
+| **Misc/Export** | cellSubdisplay, cellImeJp, cellVideoExport, cellMusicExport, cellPhotoExport/Import, cellGameRecording, cellPrint, cellRemotePlay | ✅ Complete |
 
 Full status tracking: [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md)
 
@@ -230,7 +231,7 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[Runtime Reference](docs/RUNTIME.md)** | Virtual memory manager, PPU/SPU execution contexts, type system, endianness, syscall dispatch, DMA engine |
 | **[Syscall Reference](docs/SYSCALLS.md)** | All LV2 kernel syscalls: threading, sync, events, timers, memory, filesystem |
 | **[NID System](docs/NID_SYSTEM.md)** | How PS3 function linking works, NID computation, module registration framework |
-| **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for all 77+ HLE modules — what they do and how they're implemented |
+| **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for all 93+ HLE modules — what they do and how they're implemented |
 | **[Module Status](docs/MODULE_STATUS.md)** | Quick-reference status table for all modules |
 | **[Tools Reference](docs/TOOLS.md)** | Every recompiler pipeline tool documented: ELF parser, disassembler, lifter, NID database |
 | **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | How we handle Win32 vs POSIX: threading, sockets, timers, audio, memory, fibers |
@@ -315,11 +316,31 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Changelog
 
+### v0.3.1 — *"Finishing the Sweep"* (March 2026)
+- **16 new modules** — clearing out nearly every remaining "Not Started" module
+- **cellFontFT**: FreeType font rendering — 16 font slots, fallback metrics (ascender=0.8×size), glyph bitmap stubs, kerning
+- **cellFreeType**: FreeType2 library wrapper — reports version 2.4.12 (PS3 firmware 4.x)
+- **cellSpursJq**: SPURS Job Queue — queue create/destroy, job push (completes immediately), wait, port system, 16 max queues
+- **cellDaisy**: SPURS Daisy Chain FIFO pipes — **real ring buffer** with push/pop, 32 max pipes, 256 max depth, count/free queries
+- **cellHttps**: HTTPS client — TLS stub with CA cert and client cert management, verify level config, 8 handles
+- **cellSubdisplay**: PS Vita Remote Play — init/start/stop lifecycle, always reports not connected, empty touch data
+- **cellImeJp**: Japanese IME — character input, backspace, confirm, passthrough conversion (no kanji dictionary), 4 handles
+- **cellVideoExport**: Video export to XMB — init/end, export fires NOT_SUPPORTED callback
+- **cellMusicExport**: Music export to XMB — init/end, export fires NOT_SUPPORTED callback
+- **cellGameRecording**: In-game video recording — start/stop/pause/resume state tracking, no actual capture
+- **cellAdecAtrac3p**: ATRAC3+ audio decoder — 2048 samples/frame, mono/stereo, 44.1/48kHz, outputs silence
+- **cellAdecCelp8**: CELP8 voice codec — 160 samples/frame @ 8kHz mono, multiple bitrate modes, outputs silence
+- **cellVdecDivx**: DivX video decoder — Mobile/Home/HD profiles, outputs black frames
+- **cellPhotoExport / cellPhotoImport**: Photo export/import to/from XMB — NOT_SUPPORTED stubs with callbacks
+- **cellPrint**: USB printer support — init/end, reports 0 printers
+- **cellRemotePlay**: Remote Play availability — init/end, always unavailable
+- **93 complete modules** (up from 77), only ~3 niche modules remain unstarted
+
 ### v0.3.0 — *"Full Metal RSX"* (March 2026)
 - **cellGcmSys**: Major upgrade from Partial to Complete — command buffer control (put/get/ref), local memory bump allocator, IO memory mapping with proper offset table population (1MB page granularity), flip handler + VBlank callbacks, 15 tile slots + 8 zcull regions, 256 report data + label slots, platform-native timestamps, GetTiledPitchSize, 27+ functions total
 - **cellHttp**: Major upgrade from Partial to Complete — real HTTP/1.1 via native sockets (Winsock2/POSIX), DNS resolution via getaddrinfo, TCP connect, request formatting with custom headers, response header parsing (status code, Content-Length, Connection: close), streaming body receive, per-transaction socket lifecycle, SO_RCVTIMEO/SO_SNDTIMEO timeouts
 - **cellSpurs**: Event flags now use real OS blocking — CRITICAL_SECTION + CONDITION_VARIABLE (Windows) / pthread_mutex + pthread_cond (POSIX) via side table, EventFlagWait truly blocks until condition met, broadcast on EventFlagSet
-- **77 complete modules** (up from 75), 2 remaining partial (cellVdec/cellAdec need FFmpeg, cellDmux/cellSpurs management-only)
+- **77 complete modules** (up from 75), 3 remaining partial (cellVdec/cellAdec need FFmpeg, cellDmux/cellSpurs management-only)
 
 ### v0.2.5 — *"The Long Tail"* (March 2026)
 - **13 more modules** — mopping up the remaining "Not Started" list

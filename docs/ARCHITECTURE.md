@@ -168,7 +168,7 @@ For deeper dives into specific subsystems, see:
 - **[RUNTIME.md](RUNTIME.md)** — Complete runtime reference (VM, PPU/SPU contexts, type system, endianness, syscall dispatch, DMA)
 - **[SYSCALLS.md](SYSCALLS.md)** — All LV2 kernel syscall implementations documented
 - **[NID_SYSTEM.md](NID_SYSTEM.md)** — How PS3 function linking works, NID computation, module registration
-- **[MODULES_REFERENCE.md](MODULES_REFERENCE.md)** — Detailed per-module documentation for all 77+ HLE modules
+- **[MODULES_REFERENCE.md](MODULES_REFERENCE.md)** — Detailed per-module documentation for all 93+ HLE modules
 - **[TOOLS.md](TOOLS.md)** — Recompiler pipeline tools reference
 - **[PLATFORM_ABSTRACTION.md](PLATFORM_ABSTRACTION.md)** — How Win32/POSIX differences are handled
 - **[BUILDING.md](BUILDING.md)** — Build system reference and troubleshooting

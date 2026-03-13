@@ -72,14 +72,17 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellJpgEnc | JPEG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
 | cellPngEnc | PNG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
 | cellSail | Media Player | **Complete** | Player lifecycle/state machine, open/start/stop/pause, immediate finish (no actual playback) |
+| cellAdecAtrac3p | ATRAC3+ Decode | **Complete** | ATRAC3plus audio decoder — open/close/decode/reset, outputs silence (2048 samples/frame), mono/stereo, 44.1/48kHz |
+| cellAdecCelp8 | CELP8 Decode | **Complete** | CELP8 voice codec — open/close/decode/reset, outputs silence (160 samples/frame @ 8kHz mono), multiple bitrate modes |
+| cellVdecDivx | DivX Decode | **Complete** | DivX video decoder — open/close/decode/reset, outputs black frames, Mobile/Home/HD profiles |
 
 ## Font / Text
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellFont | Font Rendering | **Complete** | Full lifecycle, stb_truetype backend, fallback metrics without STB |
-| cellFontFT | FreeType Font | Not Started | FreeType-based rendering |
-| cellFreeType | FreeType | Not Started | FreeType library wrapper |
+| cellFontFT | FreeType Font | **Complete** | FreeType-based rendering, 16 font slots, fallback metrics (ascender=0.8×size, descender=-0.2×size), empty glyph bitmaps, kerning stub |
+| cellFreeType | FreeType | **Complete** | FreeType2 library wrapper, reports version 2.4.12 (PS3 firmware 4.x), init/end lifecycle |
 | cellL10n | Localization | **Complete** | UTF-8/16/32/UCS-2 bidirectional, ISO-8859-1, ASCII, generic converter API |
 
 ## Network
@@ -90,6 +93,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellNet | Network Core | **Complete** | Winsock/POSIX init, DNS resolver with real getaddrinfo, async poll |
 | cellNetCtl | Network Control | **Complete** | Real host IP detection, NAT type, connection state, handler callbacks |
 | cellHttp | HTTP Client | **Complete** | Real HTTP/1.1 via native sockets (Winsock2/POSIX), DNS resolve, send/recv, header parsing, Content-Length, custom headers, timeouts |
+| cellHttps | HTTPS Client | **Complete** | TLS/SSL client stub — init/end lifecycle, CA cert and client cert management, verify level config, no actual TLS (needs crypto lib) |
 | cellHttpUtil | HTTP Utility | **Complete** | URL parsing/building, percent-encoding, form encoding, Base64 codec |
 | cellSsl | SSL/TLS | **Complete** | Init/end lifecycle, certificate stubs, RNG via BCryptGenRandom/urandom |
 | cellRudp | Reliable UDP | **Complete** | Context management, bind/close work, connect/send/recv return NOT_CONNECTED |
@@ -127,7 +131,8 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). No actual SPU execution |
-| cellSpursJq | SPURS Job Queue | Not Started | SPURS job queue extension |
+| cellSpursJq | SPURS Job Queue | **Complete** | Job queue create/destroy, push (jobs complete immediately — no SPU execution), wait returns immediately, port create/destroy, semaphore, 16 max queues |
+| cellDaisy | Daisy Chain | **Complete** | Lock-free FIFO pipes with real ring buffer, push/pop/try variants, 32 max pipes, 256 max depth, count/free queries |
 | cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext, create/delete/switch/yield/sleep/wakeup |
 | cellSync | Sync Primitives | **Complete** | Atomic spinlock mutex, counter barrier, RWM, bounded queue, lock-free queue |
 | cellSync2 | Sync Primitives 2 | **Complete** | OS-backed mutex/cond/semaphore/queue with timeouts |
@@ -149,27 +154,33 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellOvis | Overlay | **Complete** | Init/term, overlay create/destroy/invalidate (no-op stubs) |
 | cellSheap | Shared Heap | **Complete** | Bump allocator with block tracking, alloc/free/query, up to 8 heaps |
 | cellKey2char | Key to Char | **Complete** | HID scancode to Unicode, US-101 layout, shift/caps handling, dead key mode |
-| cellSubdisplay | Sub-display | Not Started | Vita remote play |
-| cellImeJp | IME Japanese | Not Started | Japanese input method |
-| cellDaisy | Daisy Chain | Not Started | SPU pipeline framework |
+| cellSubdisplay | Sub-display | **Complete** | PS Vita Remote Play stub — init/end/start/stop lifecycle, always reports not connected, touch data returns empty |
+| cellImeJp | IME Japanese | **Complete** | Japanese IME — open/close/reset, input mode config, add/backspace/confirm, passthrough conversion (no kanji), 4 handles |
 | cellGameExec | Game Execute | **Complete** | Exit params, boot game info, ExitToShelf |
 | cellLicenseArea | License Area | **Complete** | Region check (Americas default), all areas valid |
 | cellMusicDecode | Music Decode | **Complete** | Init/finish, decode returns NOT_SUPPORTED |
 | cellMusicDecode2 | Music Decode 2 | **Complete** | Init/finalize, decode returns NOT_SUPPORTED, format info stub |
+| cellVideoExport | Video Export | **Complete** | Video export to XMB — init/end, export/abort/progress, returns NOT_SUPPORTED with callback |
+| cellMusicExport | Music Export | **Complete** | Music export to XMB — init/end, export/progress, returns NOT_SUPPORTED with callback |
+| cellGameRecording | Game Recording | **Complete** | In-game recording — init/end/start/stop/pause/resume, IsRecording, duration query (no actual capture) |
+| cellPhotoExport | Photo Export | **Complete** | Photo export to XMB — init/end, export returns NOT_SUPPORTED with callback |
+| cellPhotoImport | Photo Import | **Complete** | Photo import from XMB — init/end, import returns NOT_SUPPORTED with callback |
+| cellPrint | Print Utility | **Complete** | USB printer support — init/end, GetPrinterCount always returns 0 |
+| cellRemotePlay | Remote Play | **Complete** | Remote Play availability — init/end, IsAvailable returns 0, status reports disconnected |
 
 ## Summary
 
 | Status | Count |
 |---|---|
-| **Complete** | 77 |
-| Partial | 2 |
-| Not Started | ~19 |
-| **Total** | **~98** |
+| **Complete** | 93 |
+| Partial | 3 |
+| Not Started | ~3 |
+| **Total** | **~99** |
 
 ## Next Priorities
 
-1. **cellGcmSys** — Full RSX command buffer processing (the graphics mountain)
+1. **RSX command buffer processing** — Translate NV47xx methods to Vulkan/D3D12 draw calls (the graphics mountain)
 2. **cellSpurs** — Actual SPU program execution on host threads
-3. **cellVdec / cellAdec** — Integrate FFmpeg for actual video/audio decoding
-4. **cellHttp** — Real HTTP requests via host sockets
-5. **cellSail** — High-level media playback wrapper
+3. **cellVdec / cellAdec / cellDmux** — Integrate FFmpeg for actual video/audio decoding and demuxing
+4. **cellJpgEnc / cellPngEnc** — Integrate stb_image_write for actual encoding
+5. **Remaining niche modules** — cellAdecExt, cellAudioExt, and any other game-specific needs
