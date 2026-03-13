@@ -175,3 +175,19 @@ The game is calling a PS3 API function that does not have an HLE stub. Options:
 - Ensure your compiler supports C17 and C++20.
 - On MSVC, add `/Zc:__cplusplus` to correctly report the C++ standard.
 - Some generated code may need manual fixup for complex instruction patterns.
+
+---
+
+## Next Steps
+
+Once you have a basic build working, dive deeper into the documentation:
+
+- **[BUILDING.md](BUILDING.md)** — Full build system reference, platform-specific notes, troubleshooting
+- **[GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md)** — Comprehensive step-by-step guide covering all 12 phases of a game port
+- **[TOOLS.md](TOOLS.md)** — Detailed reference for every recompiler pipeline tool
+- **[MODULES_REFERENCE.md](MODULES_REFERENCE.md)** — What each HLE module does and how it works
+- **[MODULE_STATUS.md](MODULE_STATUS.md)** — Quick status check for which modules are implemented
+- **[RUNTIME.md](RUNTIME.md)** — Deep dive into the runtime layer (memory, contexts, types, syscalls)
+- **[NID_SYSTEM.md](NID_SYSTEM.md)** — Understanding PS3 function linking and NID resolution
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Technical overview of the Cell processor and recompilation pipeline
+- **[PLATFORM_ABSTRACTION.md](PLATFORM_ABSTRACTION.md)** — How cross-platform support works

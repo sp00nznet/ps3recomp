@@ -158,3 +158,18 @@ The NID database is derived from the RPCS3 project's function tables and Sony SD
 | **Use case** | General-purpose emulator | Targeted game ports and mods |
 
 The key tradeoff: RPCS3 aims for broad compatibility across the PS3 library. ps3recomp trades that breadth for potentially higher performance and easier game-specific customization (modding, patching, porting to new platforms).
+
+---
+
+## Further Reading
+
+For deeper dives into specific subsystems, see:
+
+- **[RUNTIME.md](RUNTIME.md)** — Complete runtime reference (VM, PPU/SPU contexts, type system, endianness, syscall dispatch, DMA)
+- **[SYSCALLS.md](SYSCALLS.md)** — All LV2 kernel syscall implementations documented
+- **[NID_SYSTEM.md](NID_SYSTEM.md)** — How PS3 function linking works, NID computation, module registration
+- **[MODULES_REFERENCE.md](MODULES_REFERENCE.md)** — Detailed per-module documentation for all 77+ HLE modules
+- **[TOOLS.md](TOOLS.md)** — Recompiler pipeline tools reference
+- **[PLATFORM_ABSTRACTION.md](PLATFORM_ABSTRACTION.md)** — How Win32/POSIX differences are handled
+- **[BUILDING.md](BUILDING.md)** — Build system reference and troubleshooting
+- **[GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md)** — Step-by-step guide to porting a PS3 game
