@@ -94,6 +94,7 @@ elseif(MSVC)
     target_compile_options(ps3recomp_runtime PRIVATE
         /W3 /wd4100 /wd4244 /wd4267 /wd4996
         /Zc:__cplusplus
+        /experimental:c11atomics   # Enable C11 <stdatomic.h> support
     )
     target_compile_definitions(ps3recomp_runtime PRIVATE
         _CRT_SECURE_NO_WARNINGS

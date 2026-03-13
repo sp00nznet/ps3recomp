@@ -45,7 +45,8 @@
 #define CELL_ENOTDIR                    0x80010022  /* Not a directory */
 #define CELL_ERANGE                     0x80010023  /* Result out of range */
 #define CELL_ENAMETOOLONG               0x80010024  /* Name too long */
-#define CELL_EFSSPECIFIC                0x80010025  /* FS-specific error */
+#define CELL_EBADF                      0x80010025  /* Bad file descriptor */
+#define CELL_EFSSPECIFIC                0x80010025  /* FS-specific error (alias) */
 #define CELL_EOVERFLOW                  0x80010026  /* Overflow */
 #define CELL_ENOTMOUNTED                0x80010027  /* Not mounted */
 #define CELL_ENOTSUP                    0x80010028  /* Not supported */

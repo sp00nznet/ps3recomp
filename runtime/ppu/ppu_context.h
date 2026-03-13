@@ -46,7 +46,11 @@ typedef struct ppu_context {
 
     /* Vector registers (vr0-vr31) for VMX/AltiVec
      * Each is 128 bits, aligned to 16 bytes. */
+#ifdef _MSC_VER
+    __declspec(align(16)) u128 vr[32];
+#else
     u128     vr[32] __attribute__((aligned(16)));
+#endif
 
     /* Condition register -- 8 x 4-bit fields packed into 32 bits.
      * CR0 is bits 31:28, CR1 is 27:24, ..., CR7 is 3:0. */

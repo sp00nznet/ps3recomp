@@ -23,6 +23,11 @@
     #define HOST_SOCKET_ERROR   SOCKET_ERROR
     #define host_closesocket    closesocket
     #define host_errno          WSAGetLastError()
+    /* MSG_DONTWAIT is not available on Windows; non-blocking mode is set via
+       ioctlsocket(FIONBIO) instead.  Define to 0 so flag masking compiles. */
+    #ifndef MSG_DONTWAIT
+    #define MSG_DONTWAIT 0
+    #endif
 #else
     #include <sys/types.h>
     #include <sys/socket.h>

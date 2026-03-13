@@ -89,8 +89,15 @@ class be_t
     static_assert(std::is_arithmetic<T>::value || std::is_enum<T>::value,
                   "be_t<T> requires an arithmetic or enum type");
 
-    using storage_t = std::conditional_t<std::is_enum<T>::value,
-                                         std::underlying_type_t<T>, T>;
+    /* MSVC eagerly evaluates both branches of conditional_t, so we must
+       defer underlying_type_t behind a helper to avoid instantiating it
+       for non-enum types. */
+    template <typename U, bool IsEnum = std::is_enum<U>::value>
+    struct storage_helper { using type = U; };
+    template <typename U>
+    struct storage_helper<U, true> { using type = std::underlying_type_t<U>; };
+
+    using storage_t = typename storage_helper<T>::type;
     storage_t m_data; /* stored in big-endian order */
 
 public:
