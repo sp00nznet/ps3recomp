@@ -114,13 +114,18 @@ static inline void ps3_sha1_final(ps3_sha1_ctx* ctx, uint8_t digest[20])
  * NID computation
  * -----------------------------------------------------------------------*/
 
-/* Default NID suffix (used by most firmware libraries). */
-#define PS3_NID_SUFFIX      "\x67\x59\x65\x99"
-#define PS3_NID_SUFFIX_LEN  4
+/* Default NID suffix (used by most firmware libraries).
+ * This is the standard 16-byte suffix used in PS3 firmware NID computation.
+ * Earlier documentation incorrectly listed only the first 4 bytes. */
+#define PS3_NID_SUFFIX      "\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
+#define PS3_NID_SUFFIX_LEN  16
 
 /*
  * Compute the 32-bit NID for a function or variable name.
- * NID = first 4 bytes of SHA-1(name + suffix), interpreted big-endian.
+ * NID = first 4 bytes of SHA-1(name + suffix), interpreted little-endian.
+ *
+ * This matches the NID values found in PS3 ELF import/export tables as
+ * used by the Cell OS Lv-2 linker and RPCS3.
  */
 static inline uint32_t ps3_compute_nid(const char* name)
 {
@@ -132,10 +137,11 @@ static inline uint32_t ps3_compute_nid(const char* name)
     ps3_sha1_update(&ctx, PS3_NID_SUFFIX, PS3_NID_SUFFIX_LEN);
     ps3_sha1_final(&ctx, digest);
 
-    return ((uint32_t)digest[0] << 24) |
-           ((uint32_t)digest[1] << 16) |
-           ((uint32_t)digest[2] << 8)  |
-           ((uint32_t)digest[3]);
+    /* Little-endian interpretation of first 4 bytes */
+    return ((uint32_t)digest[0])       |
+           ((uint32_t)digest[1] << 8)  |
+           ((uint32_t)digest[2] << 16) |
+           ((uint32_t)digest[3] << 24);
 }
 
 /*
@@ -151,10 +157,11 @@ static inline uint32_t ps3_compute_nid_ex(const char* name, const void* suffix, 
     ps3_sha1_update(&ctx, suffix, suffix_len);
     ps3_sha1_final(&ctx, digest);
 
-    return ((uint32_t)digest[0] << 24) |
-           ((uint32_t)digest[1] << 16) |
-           ((uint32_t)digest[2] << 8)  |
-           ((uint32_t)digest[3]);
+    /* Little-endian interpretation of first 4 bytes */
+    return ((uint32_t)digest[0])       |
+           ((uint32_t)digest[1] << 8)  |
+           ((uint32_t)digest[2] << 16) |
+           ((uint32_t)digest[3] << 24);
 }
 
 /* ---------------------------------------------------------------------------
