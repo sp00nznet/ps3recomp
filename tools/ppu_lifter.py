@@ -337,6 +337,48 @@ class PPULifter:
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
             return f"ctx->gpr[{ra}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{rs}] >> {_imm(ops[2])});"
 
+        # ------- 64-bit Rotate / Shift -------
+        if mn.startswith("rldicl"):
+            # rldicl rA, rS, sh, mb  -- rotate left dword then clear left
+            ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
+            sh, mb = int(ops[2]), int(ops[3])
+            return (f"ctx->gpr[{ra}] = ppc_rldicl(ctx->gpr[{rs}], {sh}, {mb});")
+
+        if mn.startswith("rldicr"):
+            # rldicr rA, rS, sh, me  -- rotate left dword then clear right
+            ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
+            sh, me = int(ops[2]), int(ops[3])
+            return (f"ctx->gpr[{ra}] = ppc_rldicr(ctx->gpr[{rs}], {sh}, {me});")
+
+        if mn.startswith("rldic") and not mn.startswith("rldicl") and not mn.startswith("rldicr"):
+            # rldic rA, rS, sh, mb
+            ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
+            sh, mb = int(ops[2]), int(ops[3])
+            return (f"ctx->gpr[{ra}] = ppc_rldic(ctx->gpr[{rs}], {sh}, {mb});")
+
+        if mn.startswith("rldimi"):
+            # rldimi rA, rS, sh, mb  -- rotate left dword then insert mask
+            ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
+            sh, mb = int(ops[2]), int(ops[3])
+            return (f"ctx->gpr[{ra}] = ppc_rldimi(ctx->gpr[{ra}], ctx->gpr[{rs}], {sh}, {mb});")
+
+        # 64-bit shifts
+        if mn in ("sld", "sld."):
+            ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return f"ctx->gpr[{ra}] = (ctx->gpr[{rb}] & 64) ? 0 : (ctx->gpr[{rs}] << (ctx->gpr[{rb}] & 63));"
+
+        if mn in ("srd", "srd."):
+            ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return f"ctx->gpr[{ra}] = (ctx->gpr[{rb}] & 64) ? 0 : (ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 63));"
+
+        if mn in ("srad", "srad."):
+            ra, rs, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return f"ctx->gpr[{ra}] = (uint64_t)((int64_t)ctx->gpr[{rs}] >> (ctx->gpr[{rb}] & 63));"
+
+        if mn in ("sradi", "sradi."):
+            ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
+            return f"ctx->gpr[{ra}] = (uint64_t)((int64_t)ctx->gpr[{rs}] >> {_imm(ops[2])});"
+
         # ------- Loads -------
         load_map = {
             "lbz": ("vm_read8", False), "lbzu": ("vm_read8", False),
@@ -374,6 +416,56 @@ class PPULifter:
                     line += f" ctx->gpr[{base}] += {disp};"
                 return line
             return f"/* {mn} unhandled operands: {insn.operands} */;"
+
+        # ------- Indexed Loads -------
+        idx_load_map = {
+            "lbzx": "vm_read8", "lhzx": "vm_read16", "lwzx": "vm_read32", "ldx": "vm_read64",
+            "lhax": "vm_read16", "lwax": "vm_read32",
+            "lbzux": "vm_read8", "lhzux": "vm_read16", "lwzux": "vm_read32",
+        }
+        if mn in idx_load_map:
+            helper = idx_load_map[mn]
+            rd_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
+            expr = f"{helper}({ea})"
+            if mn in ("lhax", "lwax"):
+                cast = "(int16_t)" if "h" in mn else "(int32_t)"
+                expr = f"(int64_t){cast}{expr}"
+            return f"ctx->gpr[{rd_i}] = {expr};"
+
+        if mn == "lwa":
+            rd_i = _reg_idx(ops[0])
+            disp, base = _disp_base(ops[1])
+            if disp is not None:
+                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32(ctx->gpr[{base}] + {disp});"
+
+        # ------- Indexed Stores -------
+        idx_store_map = {
+            "stbx": "vm_write8", "sthx": "vm_write16", "stwx": "vm_write32", "stdx": "vm_write64",
+            "stbux": "vm_write8", "sthux": "vm_write16", "stwux": "vm_write32",
+        }
+        if mn in idx_store_map:
+            helper = idx_store_map[mn]
+            rs_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
+            return f"{helper}({ea}, ctx->gpr[{rs_i}]);"
+
+        # ------- Indexed FP Loads/Stores -------
+        if mn in ("lfsx", "lfdx"):
+            frd, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
+            if "s" in mn:
+                return f"{{ uint32_t tmp = vm_read32({ea}); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}"
+            else:
+                return f"{{ uint64_t tmp = vm_read64({ea}); memcpy(&ctx->fpr[{frd}], &tmp, 8); }}"
+
+        if mn in ("stfsx", "stfdx"):
+            frs, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
+            if "s" in mn:
+                return f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32({ea}, tmp); }}"
+            else:
+                return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64({ea}, tmp); }}"
 
         # ------- Compare -------
         if mn in ("cmpwi", "cmpdi"):
@@ -562,6 +654,76 @@ class PPULifter:
             frb = _reg_idx(ops[1])
             return f"ctx->fpr[{frd}] = fabs(ctx->fpr[{frb}]);"
 
+        if mn_base in ("fnabs",):
+            frd = _reg_idx(ops[0])
+            frb = _reg_idx(ops[1])
+            return f"ctx->fpr[{frd}] = -fabs(ctx->fpr[{frb}]);"
+
+        if mn_base in ("fmadd", "fmadds"):
+            frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
+            return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}];"
+
+        if mn_base in ("fmsub", "fmsubs"):
+            frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
+            return f"ctx->fpr[{frd}] = ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}];"
+
+        if mn_base in ("fnmadd", "fnmadds"):
+            frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
+            return f"ctx->fpr[{frd}] = -(ctx->fpr[{fra}] * ctx->fpr[{frc}] + ctx->fpr[{frb}]);"
+
+        if mn_base in ("fnmsub", "fnmsubs"):
+            frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
+            return f"ctx->fpr[{frd}] = -(ctx->fpr[{fra}] * ctx->fpr[{frc}] - ctx->fpr[{frb}]);"
+
+        if mn_base in ("frsp",):
+            frd = _reg_idx(ops[0])
+            frb = _reg_idx(ops[1])
+            return f"ctx->fpr[{frd}] = (float)ctx->fpr[{frb}];"
+
+        if mn_base in ("fctiwz",):
+            frd = _reg_idx(ops[0])
+            frb = _reg_idx(ops[1])
+            return (f"{{ int32_t iv = (int32_t)ctx->fpr[{frb}]; uint64_t tmp; "
+                    f"memcpy(&tmp, &ctx->fpr[{frd}], 8); "
+                    f"tmp = (tmp & 0xFFFFFFFF00000000ULL) | (uint32_t)iv; "
+                    f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
+
+        if mn_base in ("fctid", "fctidz"):
+            frd = _reg_idx(ops[0])
+            frb = _reg_idx(ops[1])
+            return (f"{{ int64_t iv = (int64_t)ctx->fpr[{frb}]; "
+                    f"memcpy(&ctx->fpr[{frd}], &iv, 8); }}")
+
+        if mn_base in ("fcfid",):
+            frd = _reg_idx(ops[0])
+            frb = _reg_idx(ops[1])
+            return (f"{{ int64_t iv; memcpy(&iv, &ctx->fpr[{frb}], 8); "
+                    f"ctx->fpr[{frd}] = (double)iv; }}")
+
+        if mn_base == "fsqrt" or mn_base == "fsqrts":
+            frd = _reg_idx(ops[0])
+            frb = _reg_idx(ops[1])
+            return f"ctx->fpr[{frd}] = sqrt(ctx->fpr[{frb}]);"
+
+        if mn_base == "fsel":
+            frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
+            return f"ctx->fpr[{frd}] = (ctx->fpr[{fra}] >= 0.0) ? ctx->fpr[{frc}] : ctx->fpr[{frb}];"
+
+        # ------- FP compare -------
+        if mn_base == "fcmpu" or mn_base == "fcmpo":
+            if ops[0].startswith("cr"):
+                bf = int(ops[0][2:])
+                fra = _reg_idx(ops[1])
+                frb = _reg_idx(ops[2])
+            else:
+                bf = 0
+                fra = _reg_idx(ops[0])
+                frb = _reg_idx(ops[1])
+            shift = (7 - bf) * 4
+            return (f"{{ double a = ctx->fpr[{fra}]; double b = ctx->fpr[{frb}]; "
+                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
+
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
 
@@ -642,6 +804,38 @@ class PPULifter:
         lines.append("        mask = ((uint32_t)-1 >> mb) | ((uint32_t)-1 << (31 - me));")
         lines.append("    }")
         lines.append("    return (rotated & mask) | (ra & ~mask);")
+        lines.append("}")
+        lines.append("")
+        # 64-bit rotate helpers
+        lines.append("/* 64-bit rotate helpers */")
+        lines.append("static inline uint64_t ppc_rotl64(uint64_t v, int n) {")
+        lines.append("    n &= 63;")
+        lines.append("    return (v << n) | (v >> (64 - n));")
+        lines.append("}")
+        lines.append("static inline uint64_t ppc_mask64(int mb, int me) {")
+        lines.append("    uint64_t mask;")
+        lines.append("    if (mb <= me) {")
+        lines.append("        mask = (mb == 0) ? ~0ULL : (~0ULL >> mb);")
+        lines.append("        mask &= (me == 63) ? ~0ULL : (~0ULL << (63 - me));")
+        lines.append("    } else {")
+        lines.append("        mask = (~0ULL >> mb) | (~0ULL << (63 - me));")
+        lines.append("    }")
+        lines.append("    return mask;")
+        lines.append("}")
+        lines.append("static inline uint64_t ppc_rldicl(uint64_t rs, int sh, int mb) {")
+        lines.append("    return ppc_rotl64(rs, sh) & ppc_mask64(mb, 63);")
+        lines.append("}")
+        lines.append("static inline uint64_t ppc_rldicr(uint64_t rs, int sh, int me) {")
+        lines.append("    return ppc_rotl64(rs, sh) & ppc_mask64(0, me);")
+        lines.append("}")
+        lines.append("static inline uint64_t ppc_rldic(uint64_t rs, int sh, int mb) {")
+        lines.append("    int me = 63 - sh;")
+        lines.append("    return ppc_rotl64(rs, sh) & ppc_mask64(mb, me);")
+        lines.append("}")
+        lines.append("static inline uint64_t ppc_rldimi(uint64_t ra, uint64_t rs, int sh, int mb) {")
+        lines.append("    int me = 63 - sh;")
+        lines.append("    uint64_t mask = ppc_mask64(mb, me);")
+        lines.append("    return (ppc_rotl64(rs, sh) & mask) | (ra & ~mask);")
         lines.append("}")
         lines.append("")
 
