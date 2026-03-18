@@ -1058,6 +1058,122 @@ class PPULifter:
                     f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
                     f"d[0] = a[0] | b[0]; d[1] = a[1] | b[1]; }}")
 
+        # ------- VMX floating-point arithmetic -------
+        if mn == "vmaddfp":
+            # Vector Multiply-Add Floating-Point: vD = vA * vC + vB
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])  # Note: vmaddfp operand order is vD, vA, vC, vB
+            vc = int(ops[3][1:])
+            return (f"{{ float* d = (float*)&ctx->vr[{vd}]; "
+                    f"float* a = (float*)&ctx->vr[{va}]; "
+                    f"float* b = (float*)&ctx->vr[{vb}]; "
+                    f"float* c = (float*)&ctx->vr[{vc}]; "
+                    f"d[0]=a[0]*c[0]+b[0]; d[1]=a[1]*c[1]+b[1]; "
+                    f"d[2]=a[2]*c[2]+b[2]; d[3]=a[3]*c[3]+b[3]; }}")
+
+        if mn == "vnmsubfp":
+            # Vector Negative Multiply-Subtract: vD = -(vA * vC - vB) = vB - vA*vC
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            vc = int(ops[3][1:])
+            return (f"{{ float* d = (float*)&ctx->vr[{vd}]; "
+                    f"float* a = (float*)&ctx->vr[{va}]; "
+                    f"float* b = (float*)&ctx->vr[{vb}]; "
+                    f"float* c = (float*)&ctx->vr[{vc}]; "
+                    f"d[0]=b[0]-a[0]*c[0]; d[1]=b[1]-a[1]*c[1]; "
+                    f"d[2]=b[2]-a[2]*c[2]; d[3]=b[3]-a[3]*c[3]; }}")
+
+        if mn == "vaddfp":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
+                    f"float* b=(float*)&ctx->vr[{vb}]; "
+                    f"d[0]=a[0]+b[0]; d[1]=a[1]+b[1]; d[2]=a[2]+b[2]; d[3]=a[3]+b[3]; }}")
+
+        if mn == "vsubfp":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
+                    f"float* b=(float*)&ctx->vr[{vb}]; "
+                    f"d[0]=a[0]-b[0]; d[1]=a[1]-b[1]; d[2]=a[2]-b[2]; d[3]=a[3]-b[3]; }}")
+
+        if mn == "vmulfp":
+            # Not a real PPC instruction but some disassemblers emit it
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
+                    f"float* b=(float*)&ctx->vr[{vb}]; "
+                    f"d[0]=a[0]*b[0]; d[1]=a[1]*b[1]; d[2]=a[2]*b[2]; d[3]=a[3]*b[3]; }}")
+
+        # VMX select (vsel) — bitwise select: vD = (vA & ~vC) | (vB & vC)
+        if mn == "vsel":
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            vc = int(ops[3][1:])
+            return (f"{{ uint64_t* d=(uint64_t*)&ctx->vr[{vd}]; "
+                    f"uint64_t* a=(uint64_t*)&ctx->vr[{va}]; "
+                    f"uint64_t* b=(uint64_t*)&ctx->vr[{vb}]; "
+                    f"uint64_t* c=(uint64_t*)&ctx->vr[{vc}]; "
+                    f"d[0]=(a[0]&~c[0])|(b[0]&c[0]); d[1]=(a[1]&~c[1])|(b[1]&c[1]); }}")
+
+        # VMX compare (vcmpequw, vcmpeqfp, vcmpgefp, vcmpgtfp)
+        if mn.startswith("vcmpeqfp"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
+                    f"d[0]=a[0]==b[0]?~0u:0; d[1]=a[1]==b[1]?~0u:0; "
+                    f"d[2]=a[2]==b[2]?~0u:0; d[3]=a[3]==b[3]?~0u:0; }}")
+
+        if mn.startswith("vcmpgefp"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
+                    f"d[0]=a[0]>=b[0]?~0u:0; d[1]=a[1]>=b[1]?~0u:0; "
+                    f"d[2]=a[2]>=b[2]?~0u:0; d[3]=a[3]>=b[3]?~0u:0; }}")
+
+        if mn.startswith("vcmpgtfp"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
+                    f"d[0]=a[0]>b[0]?~0u:0; d[1]=a[1]>b[1]?~0u:0; "
+                    f"d[2]=a[2]>b[2]?~0u:0; d[3]=a[3]>b[3]?~0u:0; }}")
+
+        # VMX shift (vsldoi) — shift left double by octet immediate
+        if mn == "vsldoi":
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            sh = int(ops[3])
+            return (f"{{ uint8_t tmp[32]; "
+                    f"memcpy(tmp, &ctx->vr[{va}], 16); memcpy(tmp+16, &ctx->vr[{vb}], 16); "
+                    f"memcpy(&ctx->vr[{vd}], tmp + {sh}, 16); }}")
+
+        # VMX integer multiply-accumulate
+        if mn == "vmsumshm":
+            # vmsumshm vD, vA, vB, vC: multiply s16×s16 pairs, add to s32 accumulator
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            vc = int(ops[3][1:])
+            return (f"{{ int16_t* a=(int16_t*)&ctx->vr[{va}]; "
+                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
+                    f"int32_t* c=(int32_t*)&ctx->vr[{vc}]; "
+                    f"int32_t* d=(int32_t*)&ctx->vr[{vd}]; "
+                    f"for(int i=0;i<4;i++) d[i]=c[i]+(int32_t)a[i*2]*(int32_t)b[i*2]+(int32_t)a[i*2+1]*(int32_t)b[i*2+1]; }}")
+
+        # VMX integer compare
+        if mn.startswith("vcmpequh"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
+                    f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; "
+                    f"for(int i=0;i<8;i++) d[i]=a[i]==b[i]?(uint16_t)~0:0; }}")
+
+        if mn.startswith("vcmpequw"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint32_t* a=(uint32_t*)&ctx->vr[{va}]; uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
+
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
 
