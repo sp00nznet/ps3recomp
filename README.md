@@ -113,7 +113,7 @@ ps3recomp/
 ├── patches/                  # Patches for upstream tools
 │   └── xenonrecomp-ppu.patch # XenonRecomp adaptations for PPU (Cell != Xenon)
 │
-└── docs/                     # Documentation (11 documents, 50K+ words)
+└── docs/                     # Documentation (14 documents, 60K+ words)
     ├── ARCHITECTURE.md        # Cell processor and recomp pipeline deep-dive
     ├── GETTING_STARTED.md     # How to recompile your first PS3 game
     ├── MODULE_STATUS.md       # Implementation status of all HLE modules
@@ -227,7 +227,10 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[Getting Started](docs/GETTING_STARTED.md)** | Prerequisites, installation, first recompilation walkthrough |
 | **[Architecture](docs/ARCHITECTURE.md)** | Cell processor overview, recomp pipeline stages, memory model, comparison with RPCS3 |
 | **[Building](docs/BUILDING.md)** | CMake build system, compiler support, platform-specific notes, troubleshooting |
-| **[Game Porting Guide](docs/GAME_PORTING_GUIDE.md)** | Full 12-phase walkthrough for porting a PS3 game — from selection to polish |
+| **[Game Porting Guide](docs/GAME_PORTING_GUIDE.md)** | Full 12-phase walkthrough for porting a PS3 game — with [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) |
+| **[Custom Modules](docs/CUSTOM_MODULES.md)** | Step-by-step tutorial for writing new HLE modules — NID system, calling convention bridge, patterns |
+| **[FAQ & Troubleshooting](docs/FAQ.md)** | Common questions, build errors, runtime crashes, lifter issues, performance tips |
+| **[Contributing](CONTRIBUTING.md)** | Development setup, code style, PR guidelines, ways to contribute |
 | **[Runtime Reference](docs/RUNTIME.md)** | Virtual memory manager, PPU/SPU execution contexts, type system, endianness, syscall dispatch, DMA engine |
 | **[Syscall Reference](docs/SYSCALLS.md)** | All LV2 kernel syscalls: threading, sync, events, timers, memory, filesystem |
 | **[NID System](docs/NID_SYSTEM.md)** | How PS3 function linking works, NID computation, module registration framework |
