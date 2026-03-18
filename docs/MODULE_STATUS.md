@@ -46,6 +46,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellGcmSys | RSX System | **Complete** | Command buffer control, local mem allocator, IO mapping with offset tables, flip handler/VBlank callbacks, tile/zcull config, report/label areas, timestamps, 27+ functions |
+| RSX Command Processor | GPU Commands | **Scaffold** | NV47xx method parsing, state tracking (surfaces, viewport, blend, depth, textures, draw), backend callback interface (D3D12/Vulkan/null), FIFO command buffer parser. No rendering yet — needs a backend implementation. |
 | cellResc | Resolution | **Complete** | Init, display modes, buffer management, aspect ratio, interlace, flip/vblank handlers |
 | cellVideoOut | Video Output | **Complete** | Resolution config, device info, all PS3 resolution IDs, default 720p |
 
