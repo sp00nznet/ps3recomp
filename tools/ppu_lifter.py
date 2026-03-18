@@ -69,6 +69,11 @@ SOURCE_PREAMBLE = """\
 #include "ppu_recomp.h"
 #include <stdio.h>
 
+/* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
+ * Looks up the guest address in CTR via a hash table and calls the
+ * corresponding host function. Handles OPD resolution. */
+extern void ps3_indirect_call(ppu_context* ctx);
+
 """
 
 # ---------------------------------------------------------------------------
@@ -582,10 +587,13 @@ class PPULifter:
                 return f"/* {mn} {insn.operands} */;"
 
         if mn == "bctr":
-            return "/* bctr -- indirect branch via CTR */;"
+            return "ps3_indirect_call(ctx); return;"
 
         if mn == "bctrl":
-            return "((void(*)(ppu_context*))ctx->ctr)(ctx);"
+            # Indirect call through CTR register. The CTR value is a GUEST
+            # address (or OPD pointer). We dispatch through a hash table
+            # that maps guest addresses to host function pointers.
+            return "ps3_indirect_call(ctx);"
 
         # ------- SPR -------
         if mn == "mflr":
