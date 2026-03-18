@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -232,10 +233,11 @@ typedef struct lv2_syscall_table {
 
 extern lv2_syscall_table g_lv2_syscalls;
 
-/* Default handler for unimplemented syscalls */
+/* Default handler for unimplemented syscalls — logs the call for debugging */
 static inline int64_t lv2_syscall_unimplemented(ppu_context* ctx)
 {
-    (void)ctx;
+    uint32_t num = (uint32_t)ctx->gpr[11];
+    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
     return (int64_t)(int32_t)CELL_ENOSYS;
 }
 

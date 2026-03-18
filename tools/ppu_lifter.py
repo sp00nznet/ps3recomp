@@ -839,10 +839,41 @@ class PPULifter:
         lines.append("}")
         lines.append("")
 
-        for func in self.functions:
+        # Build address-to-function map for fallthrough resolution
+        func_by_addr = {f.start_addr: f for f in self.functions}
+        sorted_addrs = sorted(func_by_addr.keys())
+
+        for i, func in enumerate(self.functions):
             lines.append(f"void {func.name}(ppu_context* ctx) {{")
             for bline in func.body_lines:
                 lines.append(f"    {bline}" if not bline.endswith(":") else bline)
+
+            # Check if this function needs a fallthrough call to the next function.
+            # On PPC, if a function doesn't end with blr/b/bctr (a return or
+            # unconditional branch), execution falls through to the next address.
+            # The lifter may split one logical function into multiple pieces at
+            # function boundary points, so we need to chain them.
+            needs_fallthrough = True
+            if func.body_lines:
+                last_line = func.body_lines[-1].strip().rstrip(';')
+                if (last_line.startswith('return') or
+                    'goto ' in last_line or
+                    last_line.startswith('func_') or
+                    last_line.startswith('lv2_syscall') or
+                    '{ func_' in last_line):
+                    needs_fallthrough = False
+
+            if needs_fallthrough:
+                # Find the next function by address
+                try:
+                    addr_idx = sorted_addrs.index(func.start_addr)
+                    if addr_idx + 1 < len(sorted_addrs):
+                        next_addr = sorted_addrs[addr_idx + 1]
+                        next_func = func_by_addr[next_addr]
+                        lines.append(f"        {next_func.name}(ctx);")
+                except ValueError:
+                    pass
+
             lines.append("}")
             lines.append("")
 
