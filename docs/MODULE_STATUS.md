@@ -46,7 +46,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellGcmSys | RSX System | **Complete** | Command buffer control, local mem allocator, IO mapping with offset tables, flip handler/VBlank callbacks, tile/zcull config, report/label areas, timestamps, 27+ functions |
-| RSX Command Processor | GPU Commands | **Scaffold** | NV47xx method parsing, state tracking (surfaces, viewport, blend, depth, textures, draw), backend callback interface (D3D12/Vulkan/null), FIFO command buffer parser. No rendering yet — needs a backend implementation. |
+| RSX Command Processor | GPU Commands | **Complete** | NV47xx FIFO parsing, state tracking (surfaces, viewport, scissor, blend, depth/stencil, cull, color mask, alpha test, 16 texture units, 16 vertex attribs, shader programs), draw arrays/indexed dispatch, rsx_backend callback interface. Null backend (Win32 window + clear color). Needs D3D12/Vulkan for actual rendering. |
 | cellResc | Resolution | **Complete** | Init, display modes, buffer management, aspect ratio, interlace, flip/vblank handlers |
 | cellVideoOut | Video Output | **Complete** | Resolution config, device info, all PS3 resolution IDs, default 720p |
 
@@ -63,9 +63,9 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellPamf | PAMF Container | **Complete** | Big-endian PAMF header parser, stream queries, entry points, AVC/ATRAC3+/LPCM/AC3 info |
-| cellVdec | Video Decode | Partial | Open/close, start/end seq, AU submit with AUDONE callback (no actual H.264/MPEG2 decode) |
-| cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE callback (no actual AAC/ATRAC3+ decode) |
-| cellDmux | Demuxer | Partial | Open/close, ES enable/disable, stream set/reset, AU retrieval stubs, flush callbacks |
+| cellVdec | Video Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PICOUT callbacks (populated PicItem), no actual H.264/MPEG2 decode (needs FFmpeg) |
+| cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PCMOUT callbacks (populated PcmItem), no actual AAC/ATRAC3+ decode (needs FFmpeg) |
+| cellDmux | Demuxer | Partial | Open/close, ES enable/disable, stream set with callback sequencing, AU retrieval, flush |
 | cellVpost | Video Post | **Complete** | Handle management, query, exec stub (no actual color conversion/scaling) |
 | cellJpgDec | JPEG Decode | **Complete** | Header parsing + stb_image decode, file/buffer sources |
 | cellPngDec | PNG Decode | **Complete** | Header parsing + stb_image decode, RGBA/ARGB/RGB output |
@@ -132,7 +132,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). No actual SPU execution |
-| cellSpursJq | SPURS Job Queue | **Complete** | Job queue create/destroy, push (jobs complete immediately — no SPU execution), wait returns immediately, port create/destroy, semaphore, 16 max queues |
+| cellSpursJq | SPURS Job Queue | **Complete** | Job queue create/destroy, push with completion tracking, wait/tryWait with proper BUSY returns, port create/destroy, 16 max queues |
 | cellDaisy | Daisy Chain | **Complete** | Lock-free FIFO pipes with real ring buffer, push/pop/try variants, 32 max pipes, 256 max depth, count/free queries |
 | cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext, create/delete/switch/yield/sleep/wakeup |
 | cellSync | Sync Primitives | **Complete** | Atomic spinlock mutex, counter barrier, RWM, bounded queue, lock-free queue |
