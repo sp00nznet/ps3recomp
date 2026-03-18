@@ -356,6 +356,18 @@ class PPULifter:
             sh, mb = int(ops[2]), int(ops[3])
             return (f"ctx->gpr[{ra}] = ppc_rldic(ctx->gpr[{rs}], {sh}, {mb});")
 
+        if mn.startswith("rldcl"):
+            # rldcl rA, rS, rB, mb — rotate left dword then clear left (register shift)
+            ra, rs, rb_r = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            mb = int(ops[3])
+            return (f"ctx->gpr[{ra}] = ppc_rldicl(ctx->gpr[{rs}], (int)(ctx->gpr[{rb_r}] & 63), {mb});")
+
+        if mn.startswith("rldcr"):
+            # rldcr rA, rS, rB, me — rotate left dword then clear right (register shift)
+            ra, rs, rb_r = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            me = int(ops[3])
+            return (f"ctx->gpr[{ra}] = ppc_rldicr(ctx->gpr[{rs}], (int)(ctx->gpr[{rb_r}] & 63), {me});")
+
         if mn.startswith("rldimi"):
             # rldimi rA, rS, sh, mb  -- rotate left dword then insert mask
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])

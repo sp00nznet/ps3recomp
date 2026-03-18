@@ -436,18 +436,38 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         result.operands = f"r{ra}, r{rd}, {sh}, {mb}, {me}"
         return result
 
-    # 64-bit rotate (opcd 30 = rldic*)
+    # 64-bit rotate (opcd 30 = rldic*/rldc*)
     if opcd == 30:
-        sub = bits(insn, 27, 30)
-        sh = (bits(insn, 16, 20) | (bit(insn, 30) << 5))
-        mb = (bits(insn, 21, 25) | (bit(insn, 26) << 5))
         rc = bit(insn, 31)
-        rld_ops = {0: "rldicl", 1: "rldicr", 2: "rldic", 3: "rldimi"}
-        if sub in rld_ops:
-            mne = rld_ops[sub] + ("." if rc else "")
+
+        # The sub-opcode encoding is different for immediate vs register forms:
+        # Bits 27-30 for immediate forms (rldicl, rldicr, rldic, rldimi)
+        # Bits 27-29 for register forms (rldcl, rldcr) where bit 30 is part of sh
+        sub4 = bits(insn, 27, 30)  # 4-bit sub-opcode
+        sub3 = bits(insn, 27, 29)  # 3-bit sub-opcode (for register forms)
+
+        rld_imm_ops = {0: "rldicl", 1: "rldicr", 2: "rldic", 3: "rldimi"}
+        if sub4 in rld_imm_ops:
+            sh = (bits(insn, 16, 20) | (bit(insn, 30) << 5))
+            mb = (bits(insn, 21, 25) | (bit(insn, 26) << 5))
+            mne = rld_imm_ops[sub4] + ("." if rc else "")
             result.mnemonic = mne
             result.operands = f"r{ra}, r{rd}, {sh}, {mb}"
+        elif sub3 == 4:  # rldcl (sub bits 27-29 = 100)
+            rb = bits(insn, 16, 20)
+            mb = (bits(insn, 21, 25) | (bit(insn, 26) << 5))
+            mne = "rldcl" + ("." if rc else "")
+            result.mnemonic = mne
+            result.operands = f"r{ra}, r{rd}, r{rb}, {mb}"
+        elif sub3 == 5:  # rldcr (sub bits 27-29 = 101)
+            rb = bits(insn, 16, 20)
+            me = (bits(insn, 21, 25) | (bit(insn, 26) << 5))
+            mne = "rldcr" + ("." if rc else "")
+            result.mnemonic = mne
+            result.operands = f"r{ra}, r{rd}, r{rb}, {me}"
         else:
+            sh = (bits(insn, 16, 20) | (bit(insn, 30) << 5))
+            mb = (bits(insn, 21, 25) | (bit(insn, 26) << 5))
             result.mnemonic = "rld??"
             result.operands = f"r{ra}, r{rd}, {sh}, {mb}"
         return result
