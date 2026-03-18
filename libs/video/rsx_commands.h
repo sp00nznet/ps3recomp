@@ -91,7 +91,16 @@ extern "C" {
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
 #define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF0
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
-#define NV4097_SET_TRANSFORM_PROGRAM            0x00001E9C
+#define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
+#define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
+
+/* Color mask */
+#define NV4097_SET_COLOR_MASK                   0x00000028
+
+/* Alpha test */
+#define NV4097_SET_ALPHA_TEST_ENABLE            0x00000104
+#define NV4097_SET_ALPHA_FUNC                   0x00000108
+#define NV4097_SET_ALPHA_REF                    0x0000010C
 
 /* Blending */
 #define NV4097_SET_BLEND_ENABLE                 0x00000310
@@ -201,6 +210,16 @@ typedef struct rsx_state {
     u32 cull_face;
     u32 front_face;
 
+    /* Color mask — bits: [0] B, [8] G, [16] R, [24] A */
+    u32 color_mask;
+    int color_mask_dirty;
+
+    /* Alpha test */
+    int alpha_test_enable;
+    u32 alpha_func;
+    u32 alpha_ref;
+    int alpha_dirty;
+
     /* Textures */
     rsx_texture_state textures[RSX_MAX_TEXTURES];
 
@@ -212,8 +231,12 @@ typedef struct rsx_state {
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
 
     /* Shader state */
-    u32 shader_program;
+    u32 shader_program;       /* fragment program address (offset | location in bits [0:1]) */
+    u32 fragment_program_addr;
     u32 vertex_attrib_output_mask;
+    u32 transform_program_load; /* vertex program load slot index */
+    u32 transform_constant_load;
+    int shader_dirty;
 
     /* Dirty flags for incremental state updates */
     int surface_dirty;
@@ -265,6 +288,10 @@ typedef struct rsx_backend {
     void (*set_viewport)(void* userdata, const rsx_state* state);
     void (*set_blend)(void* userdata, const rsx_state* state);
     void (*set_depth_stencil)(void* userdata, const rsx_state* state);
+    void (*set_color_mask)(void* userdata, const rsx_state* state);
+    void (*set_alpha_test)(void* userdata, const rsx_state* state);
+    void (*set_shader)(void* userdata, const rsx_state* state);
+    void (*set_vertex_attribs)(void* userdata, const rsx_state* state);
 
     /* Clear */
     void (*clear)(void* userdata, u32 flags, u32 color, float depth, u8 stencil);
