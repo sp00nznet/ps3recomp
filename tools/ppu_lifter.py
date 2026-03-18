@@ -724,6 +724,139 @@ class PPULifter:
                     f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
+        # ------- 64-bit multiply / divide -------
+        if mn == "mulld":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return f"ctx->gpr[{rd}] = (int64_t)ctx->gpr[{ra}] * (int64_t)ctx->gpr[{rb}];"
+
+        if mn == "mullw":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)ctx->gpr[{ra}] * (int32_t)ctx->gpr[{rb}]);"
+
+        if mn == "divd":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"ctx->gpr[{rd}] = (ctx->gpr[{rb}] != 0) ? "
+                    f"(int64_t)ctx->gpr[{ra}] / (int64_t)ctx->gpr[{rb}] : 0;")
+
+        if mn == "divdu":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"ctx->gpr[{rd}] = (ctx->gpr[{rb}] != 0) ? "
+                    f"ctx->gpr[{ra}] / ctx->gpr[{rb}] : 0;")
+
+        # ------- Add/subtract extended (with carry) -------
+        if mn == "adde":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
+                    f"uint64_t result = ctx->gpr[{ra}] + ctx->gpr[{rb}] + ca; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((result < ctx->gpr[{ra}] || (ca && result == ctx->gpr[{ra}])) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = result; }}")
+
+        if mn == "addze":
+            rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
+                    f"uint64_t result = ctx->gpr[{ra}] + ca; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((result < ctx->gpr[{ra}]) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = result; }}")
+
+        if mn == "subfe":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
+                    f"uint64_t result = ~ctx->gpr[{ra}] + ctx->gpr[{rb}] + ca; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((result <= ctx->gpr[{rb}] && ca) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = result; }}")
+
+        # ------- Condition register logical ops -------
+        if mn == "cror":
+            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
+            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
+                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
+                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a | b) << (31 - {bt})); }}")
+
+        if mn == "crand":
+            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
+            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
+                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
+                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a & b) << (31 - {bt})); }}")
+
+        if mn == "crnand":
+            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
+            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
+                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
+                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((~(a & b) & 1) << (31 - {bt})); }}")
+
+        if mn == "crxor":
+            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
+            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
+                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
+                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a ^ b) << (31 - {bt})); }}")
+
+        if mn == "crnor":
+            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
+            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
+                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
+                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((~(a | b) & 1) << (31 - {bt})); }}")
+
+        # ------- Store/load with update indexed -------
+        if mn == "stdux":
+            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"vm_write64(ea, ctx->gpr[{rs}]); ctx->gpr[{ra}] = ea; }}")
+
+        if mn == "stwux":
+            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); ctx->gpr[{ra}] = ea; }}")
+
+        if mn == "ldux":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = vm_read64(ea); ctx->gpr[{ra}] = ea; }}")
+
+        if mn == "lwzux":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = vm_read32(ea); ctx->gpr[{ra}] = ea; }}")
+
+        # ------- Atomic load/store with reservation -------
+        if mn == "lwarx":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = vm_read32(ea); "
+                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+
+        if mn == "stwcx" or mn == "stwcx.":
+            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
+                    f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "  # CR0 = EQ
+                    f"}} else {{ "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)); "  # CR0 = 0
+                    f"}} ctx->reserve_addr = 0; }}")
+
+        if mn == "ldarx":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = vm_read64(ea); "
+                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+
+        if mn == "stdcx" or mn == "stdcx.":
+            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
+                    f"vm_write64(ea, ctx->gpr[{rs}]); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "
+                    f"}} else {{ "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)); "
+                    f"}} ctx->reserve_addr = 0; }}")
+
+        # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
+        if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
+            return f"/* trap: {mn} {insn.operands} — ignored */;"
+
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
 
