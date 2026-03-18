@@ -331,7 +331,10 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
     case MFC_RdListStallStat:
         return 0; /* no stalls in synchronous mode */
     case MFC_RdAtomicStat:
-        return 0; /* TODO: atomic operation status */
+        /* Atomic operation status: 0 = success (MFC_PUTLLC_SUCCESS),
+         * 1 = failed (MFC_PUTLLC_FAILURE). In single-threaded recomp,
+         * atomic ops always succeed. */
+        return 0; /* MFC_PUTLLC_SUCCESS */
     default:
         return 0;
     }

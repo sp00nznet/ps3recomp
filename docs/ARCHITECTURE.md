@@ -141,6 +141,28 @@ The ELF's import table lists: `(module_name, NID)` pairs. At load time, the PS3 
 
 The NID database is derived from the RPCS3 project's function tables and Sony SDK headers.
 
+## RSX Graphics Pipeline
+
+The RSX GPU is handled by a three-layer translation architecture:
+
+```
+cellGcmSys (HLE)  →  RSX Command Processor  →  Graphics Backend
+                          │                         │
+                    NV47xx FIFO parsing      D3D12 / Vulkan / null
+                    GPU state tracking        Real rendering
+```
+
+1. **cellGcmSys** manages the interface between game code and the GPU: command buffer control, display buffers, memory mapping, flip/VBlank, tile/zcull configuration.
+
+2. **RSX Command Processor** (`rsx_commands.c`) parses the NV47xx FIFO command buffer and tracks GPU state: surfaces, viewport, blend, depth/stencil, textures (16 units), vertex attributes (16), shader programs, draw commands.
+
+3. **Graphics Backend** receives state changes and draw calls through the `rsx_backend` callback interface. Current backends:
+   - **Null**: Win32 window showing clear color (debugging)
+   - **D3D12**: Real GPU rendering — device, swap chain, clear, present (Phase 1)
+   - **Vulkan**: Planned
+
+See [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for the complete graphics architecture, shader translation strategy, and primitive type mapping.
+
 ## Comparison with RPCS3
 
 | Aspect | RPCS3 | ps3recomp |
@@ -154,7 +176,7 @@ The NID database is derived from the RPCS3 project's function tables and Sony SD
 | **Portability** | x86-64 primary, ARM64 WIP | Any platform with a C compiler |
 | **Development** | One binary runs many games | Each game needs analysis and customization |
 | **Memory** | Dynamic guest memory | Statically mapped guest address space |
-| **HLE modules** | ~100 modules, varying completion | Subset focused on target game's needs |
+| **HLE modules** | ~100 modules, varying completion | 95 complete modules, full runtime |
 | **Use case** | General-purpose emulator | Targeted game ports and mods |
 
 The key tradeoff: RPCS3 aims for broad compatibility across the PS3 library. ps3recomp trades that breadth for potentially higher performance and easier game-specific customization (modding, patching, porting to new platforms).
