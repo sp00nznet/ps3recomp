@@ -149,12 +149,21 @@ The lifter references a function that wasn't in the function list. Add it manual
 ```
 
 **`TODO: unimplemented instruction`**
-The lifter doesn't support this instruction yet. Common gaps:
-- VMX/AltiVec SIMD (`vaddfp`, `vmaddfp`, etc.)
-- Some `rld*` rotate variants
-- Condition register logical ops (`cror`, `crand`)
+The lifter doesn't support this instruction yet. Common remaining gaps:
+- VMX/AltiVec SIMD (`vaddfp`, `vmaddfp`, `vsel`, `vsldoi`, etc.) — the largest category
+- Some `rld*` rotate variants with uncommon operand patterns
+- Extended opcode 31 forms (`op31_x202`, `op31_x231`)
+
+Recently added (may still show as TODO in older lifter output):
+- `mulld`/`divd` (64-bit arithmetic), `adde`/`subfe` (carry ops)
+- `cror`/`crand`/`crnand`/`crxor`/`crnor` (CR logical)
+- `lwarx`/`stwcx.` (atomic reservation), `stdux`/`ldux` (update indexed)
+- `tw`/`td` (trap — no-oped)
 
 Fix in `tools/ppu_lifter.py` to benefit all game ports.
+
+**Split-function crash (prologue returns without executing body)**
+The lifter may split one PPC function into multiple C functions at boundary points. If the first piece (prologue) returns without calling the second piece (body), the function never executes. Fix: the lifter now emits fallthrough calls when a function doesn't end with `blr`/`b`. If you see this in older output, re-run the lifter or patch with a fallthrough call script.
 
 ---
 
