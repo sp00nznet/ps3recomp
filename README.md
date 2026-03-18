@@ -185,7 +185,7 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **93 modules complete, 3 partial, 230+ files, 60,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **95 modules complete, 1 partial (media decode), 240+ files, 65,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -209,10 +209,10 @@ We're building HLE implementations based on RPCS3's module system. **93 modules 
 | **Fibers** | cellFiber (PPU fibers via Windows Fibers/ucontext) | ✅ Complete |
 | **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
 | **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
-| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps) | ✅ Complete |
-| **SPURS** | cellSpurs (management APIs, no SPU execution yet), cellSpursJq (job queues), cellDaisy (FIFO pipes with real ring buffer) | 🔨 Partial |
+| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps), RSX command processor (NV47xx parsing, state tracking, backend callbacks), null backend (Win32 window) | ✅ Complete |
+| **SPURS** | cellSpurs (management APIs, event flags, task/workload tracking), cellSpursJq (job queues with wait/signal), cellDaisy (real ring buffer FIFO) | ✅ Complete |
 | **Core Runtime** | cellSysutil (BGM, cache, disc), cellSysmodule, sysPrxForUser (real lwmutex/lwcond/threads) | ✅ Complete |
-| **Media Pipeline** | cellPamf, cellDmux, cellVdec, cellAdec (API stubs, actual decode needs FFmpeg), cellSail, cellAdecAtrac3p, cellAdecCelp8, cellVdecDivx | 🔨 Partial |
+| **Media Pipeline** | cellPamf (real PAMF header + stream descriptor parsing), cellDmux (callback sequencing), cellVdec/cellAdec (PICOUT/PCMOUT callbacks, no actual decode — needs FFmpeg), cellSail (state machine) | 🔨 Partial |
 | **HTTP/HTTPS** | cellHttp (real HTTP/1.1 via native sockets), cellHttps (TLS stub with cert management) | ✅ Complete |
 | **Misc/Export** | cellSubdisplay, cellImeJp, cellVideoExport, cellMusicExport, cellPhotoExport/Import, cellGameRecording, cellPrint, cellRemotePlay | ✅ Complete |
 
@@ -318,6 +318,25 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.4.0 — *"First Light"* (March 2026)
+- **RSX Command Buffer Processor**: New NV47xx GPU command parser (`rsx_commands.h/.c`) — FIFO command buffer parsing, state tracking for surfaces, viewport, scissor, clear, blend, depth/stencil, culling, color mask, alpha test, textures (16 units × 8 registers), vertex attributes (16 × format/offset), shader programs (fragment/vertex), draw arrays + draw indexed. Backend callback interface (`rsx_backend`) with 12 dispatch points for pluggable rendering.
+- **Null RSX Backend**: Win32 window backend (`rsx_null_backend.h/.c`) — creates a window, displays RSX clear color via GDI, FPS counter and debug overlay. Proves command pipeline works before D3D12/Vulkan.
+- **cellPamf**: Upgraded from Partial — real PAMF stream descriptor parsing (AVC profile/level/resolution, ATRAC3+ channels from actual descriptor bytes), EP table navigation via header offsets.
+- **cellVdec**: Upgraded callback pipeline — generates PICOUT callbacks with populated CellVdecPicItem (codec type, PTS/DTS, dimensions) after each DecodeAu. Games checking decode completion now proceed correctly.
+- **cellAdec**: Same treatment — generates PCMOUT callbacks with channel count, sample rate, bit depth. Silence output but correct pipeline flow.
+- **cellDmux**: Improved callback sequencing and AU tracking for proper ES dispatch.
+- **cellSpursJq**: Better job submission/completion tracking, TryWait returns BUSY correctly.
+- **cellDaisy**: Marked Complete (was already a real ring buffer implementation).
+- **Image decoders**: cellPngDec, cellJpgDec, cellGifDec upgraded with real stb_image v2.30 decoding paths, guest memory path translation via `cellfs_translate_path()`.
+- **cellSync2**: Timed mutex lock (spin with SwitchToThread/pthread_mutex_timedlock).
+- **stb_image.h**: Vendored v2.30 for PNG/JPG/GIF decoding.
+- **Lifter**: Split-function fallthrough fix, branch-target function detection, rldcl/rldcr, addze/addme/subfze/subfme, mulld/divd/mulhd/mulhdu, adde/subfe, cror/crand/crnand/crxor/crnor, stdux/ldux, lwarx/stwcx./ldarx/stdcx., lwbrx/stwbrx/lhbrx/sthbrx, lwax/lhaux, mftb/mftbu, lswi/stswi, lvsl/lvsr, tw/td, cache/sync no-ops. ~15K fewer TODO instructions on relift.
+- **Disassembler**: XO-form arithmetic split (addze/addme/subfze/subfme), rldcl/rldcr register-shift rotate, byte-reverse loads, load algebraic, mftb, string word, VMX shift helpers.
+- **Runtime**: sys_tty_write/read (syscall 402/403), unimplemented syscall logging, WASAPI COM GUID fix, all duplicate symbol warnings eliminated.
+- **Documentation**: CONTRIBUTING.md, docs/CUSTOM_MODULES.md, docs/FAQ.md, updated case study with flOw v0.4.0 technical lessons.
+- **SPURS**: Upgraded from Partial to Complete (management + event flags + job queues + Daisy FIFO all functional).
+- **95 complete modules**, only media decode (cellVdec/cellAdec need FFmpeg) remains truly partial.
 
 ### v0.3.1 — *"Finishing the Sweep"* (March 2026)
 - **16 new modules** — clearing out nearly every remaining "Not Started" module
