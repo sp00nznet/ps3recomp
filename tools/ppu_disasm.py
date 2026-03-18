@@ -481,26 +481,34 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         oe = bit(insn, 21)
 
         # --- XO-form integer arithmetic (xo_9) ---
-        xo_arith = {
+        # Instructions with only 2 register operands (rD, rA — no rB)
+        xo_arith_2op = {
+            202: "addze", 234: "addme",
+            200: "subfze", 232: "subfme",
+            104: "neg",
+        }
+        # Instructions with 3 register operands (rD, rA, rB)
+        xo_arith_3op = {
             266: "add", 10: "addc", 138: "adde",
             40: "subf", 8: "subfc", 136: "subfe",
             235: "mullw", 75: "mulhw", 11: "mulhwu",
             491: "divw", 459: "divwu",
-            104: "neg",
             233: "mulld", 73: "mulhd",
             489: "divd", 457: "divdu",
         }
-        if xo_9 in xo_arith:
-            mne = xo_arith[xo_9]
-            if oe:
-                mne += "o"
-            if rc:
-                mne += "."
+        if xo_9 in xo_arith_2op:
+            mne = xo_arith_2op[xo_9]
+            if oe: mne += "o"
+            if rc: mne += "."
             result.mnemonic = mne
-            if xo_9 == 104:  # neg
-                result.operands = f"r{rd}, r{ra}"
-            else:
-                result.operands = f"r{rd}, r{ra}, r{rb}"
+            result.operands = f"r{rd}, r{ra}"
+            return result
+        if xo_9 in xo_arith_3op:
+            mne = xo_arith_3op[xo_9]
+            if oe: mne += "o"
+            if rc: mne += "."
+            result.mnemonic = mne
+            result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
 
         # --- X-form logical ---
