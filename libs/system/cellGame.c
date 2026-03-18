@@ -286,17 +286,8 @@ s32 cellGameDeleteGameData(const char* dirName)
     return CELL_OK;
 }
 
-s32 cellGameSetExitParam(const char* param)
-{
-    printf("[cellGame] SetExitParam(param='%s')\n", param ? param : "<null>");
-
-    if (param) {
-        strncpy(s_exit_param, param, sizeof(s_exit_param) - 1);
-        s_exit_param[sizeof(s_exit_param) - 1] = '\0';
-    }
-
-    return CELL_OK;
-}
+/* cellGameSetExitParam is implemented in cellGameExec.c with the correct
+ * PS3 SDK signature (CellGameExecBootParam*). Not duplicated here. */
 
 s32 cellGameGetSizeKB(s32* sizeKB)
 {

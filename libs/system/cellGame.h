@@ -112,7 +112,7 @@ s32 cellGameCreateGameData(CellGameContentSize* size, char* dirName);
 
 s32 cellGameDeleteGameData(const char* dirName);
 
-s32 cellGameSetExitParam(const char* param);
+/* cellGameSetExitParam — see cellGameExec.h for correct signature */
 
 s32 cellGameGetSizeKB(s32* sizeKB);
 

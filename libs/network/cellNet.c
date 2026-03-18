@@ -38,54 +38,11 @@ static ResolverSlot s_resolvers[MAX_RESOLVERS];
 
 /* ---------------------------------------------------------------------------
  * Core network init/term
+ *
+ * cellNetCtlInit, cellNetCtlTerm are implemented in cellNetCtl.c.
+ * sys_net_initialize_network_ex, sys_net_finalize_network are in sysNet.c.
+ * We do NOT redefine them here to avoid duplicate symbol errors.
  * -----------------------------------------------------------------------*/
-
-s32 cellNetCtlInit(void)
-{
-    printf("[cellNet] CtlInit()\n");
-    /* Already handled by cellNetCtl module, just accept */
-    return CELL_OK;
-}
-
-s32 cellNetCtlTerm(void)
-{
-    printf("[cellNet] CtlTerm()\n");
-    return CELL_OK;
-}
-
-s32 sys_net_initialize_network_ex(u32 poolSize)
-{
-    printf("[cellNet] sys_net_initialize_network_ex(poolSize=%u)\n", poolSize);
-
-    if (s_net_pool_initialized)
-        return (s32)CELL_NET_ERROR_ALREADY_INITIALIZED;
-
-#ifdef _WIN32
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        printf("[cellNet] WSAStartup failed\n");
-        return (s32)CELL_NET_ERROR_NO_MEMORY;
-    }
-#endif
-
-    s_net_pool_initialized = 1;
-    return CELL_OK;
-}
-
-s32 sys_net_finalize_network(void)
-{
-    printf("[cellNet] sys_net_finalize_network()\n");
-
-    if (!s_net_pool_initialized)
-        return (s32)CELL_NET_ERROR_NOT_INITIALIZED;
-
-#ifdef _WIN32
-    WSACleanup();
-#endif
-
-    s_net_pool_initialized = 0;
-    return CELL_OK;
-}
 
 s32 cellNetInitialize(void)
 {
