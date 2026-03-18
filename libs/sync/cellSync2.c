@@ -123,17 +123,49 @@ s32 cellSync2MutexInit(CellSync2Mutex* mutex, const CellSync2MutexAttribute* att
 
 s32 cellSync2MutexLock(CellSync2Mutex* mutex, u64 timeoutUsec)
 {
-    (void)timeoutUsec; /* TODO: implement timeout */
-
     if (!mutex) return CELL_SYNC2_ERROR_NULL_POINTER;
     Sync2MutexInternal* m = (Sync2MutexInternal*)mutex;
     if (!m->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
+    if (timeoutUsec == 0) {
+        /* Non-blocking: try once */
 #ifdef _WIN32
-    EnterCriticalSection(&m->cs);
+        if (!TryEnterCriticalSection(&m->cs))
+            return CELL_SYNC2_ERROR_BUSY;
 #else
-    pthread_mutex_lock(&m->mtx);
+        if (pthread_mutex_trylock(&m->mtx) != 0)
+            return CELL_SYNC2_ERROR_BUSY;
 #endif
+    } else if (timeoutUsec == (u64)-1) {
+        /* Infinite wait */
+#ifdef _WIN32
+        EnterCriticalSection(&m->cs);
+#else
+        pthread_mutex_lock(&m->mtx);
+#endif
+    } else {
+        /* Timed wait: spin with yield until timeout */
+#ifdef _WIN32
+        ULONGLONG start = GetTickCount64();
+        ULONGLONG deadline_ms = timeoutUsec / 1000;
+        while (!TryEnterCriticalSection(&m->cs)) {
+            if (GetTickCount64() - start >= deadline_ms)
+                return CELL_SYNC2_ERROR_BUSY;
+            SwitchToThread();
+        }
+#else
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (time_t)(timeoutUsec / 1000000);
+        ts.tv_nsec += (long)((timeoutUsec % 1000000) * 1000);
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        if (pthread_mutex_timedlock(&m->mtx, &ts) != 0)
+            return CELL_SYNC2_ERROR_BUSY;
+#endif
+    }
 
     return CELL_OK;
 }

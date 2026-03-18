@@ -869,6 +869,94 @@ class PPULifter:
         if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
             return f"/* trap: {mn} {insn.operands} — ignored */;"
 
+        # ------- Byte-reverse loads/stores -------
+        if mn == "lwbrx":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"uint32_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 4); "
+                    f"ctx->gpr[{rd}] = raw; }}") # NOTE: no bswap — reads in host (LE) order
+
+        if mn == "stwbrx":
+            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
+                    f"memcpy(vm_base + (uint32_t)ea, &raw, 4); }}")
+
+        if mn == "lhbrx":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"uint16_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 2); "
+                    f"ctx->gpr[{rd}] = raw; }}")
+
+        if mn == "sthbrx":
+            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
+                    f"memcpy(vm_base + (uint32_t)ea, &raw, 2); }}")
+
+        # ------- Load algebraic -------
+        if mn == "lwax":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = (int64_t)(int32_t)vm_read32(ea); }}")
+
+        if mn == "lhaux":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = (int64_t)(int16_t)vm_read16(ea); ctx->gpr[{ra}] = ea; }}")
+
+        # ------- Move from time base -------
+        if mn == "mftb":
+            rd = _reg_idx(ops[0])
+            return (f"{{ static uint64_t tb = 79800000ULL; tb += 16667; "
+                    f"ctx->gpr[{rd}] = tb; }}")
+
+        if mn == "mftbu":
+            rd = _reg_idx(ops[0])
+            return (f"{{ static uint64_t tb = 79800000ULL; tb += 16667; "
+                    f"ctx->gpr[{rd}] = (tb >> 32); }}")
+
+        # ------- Cache/sync ops (safe to no-op) -------
+        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcbz", "dcba", "icbi",
+                  "sync", "eieio", "isync", "lwsync", "ptesync"):
+            return f"/* {mn}: cache/sync — no-op */;"
+
+        # ------- addme/subfme/subfze (carry arithmetic, 2-op) -------
+        if mn.startswith("addme"):
+            rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
+                    f"uint64_t result = ctx->gpr[{ra}] + ca - 1; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((result >= ctx->gpr[{ra}]) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = result; }}")
+
+        if mn.startswith("subfme"):
+            rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
+                    f"uint64_t result = ~ctx->gpr[{ra}] + ca - 1; "
+                    f"ctx->gpr[{rd}] = result; }}")
+
+        if mn.startswith("subfze"):
+            rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            return (f"{{ uint64_t ca = (ctx->xer >> 29) & 1; "
+                    f"uint64_t result = ~ctx->gpr[{ra}] + ca; "
+                    f"ctx->xer = (ctx->xer & ~(1u << 29)) | "
+                    f"((ca && result == 0) ? (1u << 29) : 0); "
+                    f"ctx->gpr[{rd}] = result; }}")
+
+        # ------- mulhd / mulhdu (multiply high doubleword) -------
+        if mn.startswith("mulhd") and not mn.startswith("mulhdu"):
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ __int128 r = (__int128)(int64_t)ctx->gpr[{ra}] * "
+                    f"(__int128)(int64_t)ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = (uint64_t)(r >> 64); }}")
+
+        if mn.startswith("mulhdu"):
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ unsigned __int128 r = (unsigned __int128)ctx->gpr[{ra}] * "
+                    f"(unsigned __int128)ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = (uint64_t)(r >> 64); }}")
+
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
 

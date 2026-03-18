@@ -652,6 +652,73 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"{rd}, r{ra}, r{rb}"
             return result
 
+        # --- Byte-reverse loads/stores ---
+        if xo_full == 534:  # lwbrx (Load Word Byte-Reverse Indexed)
+            result.mnemonic = "lwbrx"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 662:  # stwbrx (Store Word Byte-Reverse Indexed)
+            result.mnemonic = "stwbrx"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 790:  # lhbrx (Load Halfword Byte-Reverse Indexed)
+            result.mnemonic = "lhbrx"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 918:  # sthbrx (Store Halfword Byte-Reverse Indexed)
+            result.mnemonic = "sthbrx"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 827:  # lhaux (Load Halfword Algebraic with Update Indexed)
+            result.mnemonic = "lhaux"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+
+        # --- Load/store algebraic ---
+        if xo_full == 341:  # lwax (Load Word Algebraic Indexed)
+            result.mnemonic = "lwax"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 373:  # lwaux (Load Word Algebraic with Update Indexed)
+            result.mnemonic = "lwaux"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+
+        # --- Move from/to timebase ---
+        if xo_full == 371:  # mftb (Move From Time Base)
+            tbr_raw = bits(insn, 11, 20)
+            tbr = ((tbr_raw & 0x1F) << 5) | ((tbr_raw >> 5) & 0x1F)
+            if tbr == 268:
+                result.mnemonic = "mftb"
+            elif tbr == 269:
+                result.mnemonic = "mftbu"
+            else:
+                result.mnemonic = "mftb"
+            result.operands = f"r{rd}"
+            return result
+
+        # --- String word load/store ---
+        if xo_full == 597:  # lswi (Load String Word Immediate)
+            nb = rb  # nb field reuses rb position
+            result.mnemonic = "lswi"
+            result.operands = f"r{rd}, r{ra}, {nb}"
+            return result
+        if xo_full == 725:  # stswi (Store String Word Immediate)
+            nb = rb
+            result.mnemonic = "stswi"
+            result.operands = f"r{rd}, r{ra}, {nb}"
+            return result
+
+        # --- VMX scalar helpers ---
+        if xo_full == 6:  # lvsl (Load Vector for Shift Left)
+            result.mnemonic = "lvsl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 38:  # lvsr (Load Vector for Shift Right)
+            result.mnemonic = "lvsr"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+
         # Fall through – unknown ext opcode 31
         result.mnemonic = f"op31_x{xo_full}"
         result.operands = f"r{rd}, r{ra}, r{rb}"
