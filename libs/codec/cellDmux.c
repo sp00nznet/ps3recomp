@@ -19,6 +19,11 @@ typedef struct {
     CellDmuxCbMsg cbFunc;
     void* cbArg;
     u32 streamType;
+    /* Stream data tracking for demux processing */
+    u32 streamAddr;
+    u32 streamSize;
+    u64 userData;
+    u32 auSeqNo;        /* running AU sequence counter */
 } DmuxSlot;
 
 typedef struct {
@@ -55,6 +60,10 @@ s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
             s_dmux[i].cbFunc = cbFunc;
             s_dmux[i].cbArg = cbArg;
             s_dmux[i].streamType = type->streamType;
+            s_dmux[i].streamAddr = 0;
+            s_dmux[i].streamSize = 0;
+            s_dmux[i].userData = 0;
+            s_dmux[i].auSeqNo = 0;
             *handle = (u32)i;
             printf("[cellDmux] Open -> handle=%u\n", i);
             return CELL_OK;
@@ -135,21 +144,67 @@ s32 cellDmuxDisableEs(CellDmuxEsHandle esHandle)
 s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddr, u32 streamSize,
                        b8 discontinuity, u64 userData)
 {
-    (void)discontinuity;
-    (void)userData;
-
-    printf("[cellDmux] SetStream(handle=%u, addr=0x%X, size=%u)\n",
-           handle, streamAddr, streamSize);
+    printf("[cellDmux] SetStream(handle=%u, addr=0x%X, size=%u, discont=%d)\n",
+           handle, streamAddr, streamSize, discontinuity);
 
     if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
         return (s32)CELL_DMUX_ERROR_ARG;
 
-    /* In a full implementation, this would parse the MPEG-TS stream
-       and deliver AU_FOUND callbacks to enabled ES handles.
-       For now, notify completion. */
-    if (s_dmux[handle].cbFunc)
-        s_dmux[handle].cbFunc(handle, CELL_DMUX_MSG_TYPE_DEMUX_DONE,
-                               0, s_dmux[handle].cbArg);
+    DmuxSlot* dmux = &s_dmux[handle];
+
+    /* Track the stream data */
+    dmux->streamAddr = streamAddr;
+    dmux->streamSize = streamSize;
+    dmux->userData = userData;
+
+    if (discontinuity) {
+        /* On discontinuity, reset AU sequence and clear pending AUs */
+        dmux->auSeqNo = 0;
+        for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+            if (s_es[i].in_use && s_es[i].dmuxId == handle)
+                s_es[i].hasAu = 0;
+        }
+    }
+
+    /*
+     * Synthesize one AU per enabled ES from the entire stream buffer.
+     * Real demux would parse PES/MPEG-TS headers; here we present the
+     * whole input as a single Access Unit per elementary stream, which
+     * is sufficient for games that simply shuttle data through the
+     * demux -> vdec/adec pipeline.
+     */
+    for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+        if (!s_es[i].in_use || s_es[i].dmuxId != handle)
+            continue;
+
+        DmuxEsSlot* es = &s_es[i];
+
+        /* Fill in AU info — treat entire stream as one AU */
+        es->currentAu.auAddr = streamAddr;
+        es->currentAu.auSize = streamSize;
+        es->currentAu.pts    = (u64)dmux->auSeqNo * 3003; /* ~29.97 fps tick */
+        es->currentAu.dts    = es->currentAu.pts;
+        es->currentAu.userData = userData;
+        es->currentAu.isRap  = (dmux->auSeqNo == 0) ? 1 : 0;
+        es->currentAu.reserved = 0;
+        es->hasAu = 1;
+
+        printf("[cellDmux] ES %d: AU_FOUND (addr=0x%X, size=%u, pts=%llu)\n",
+               i, streamAddr, streamSize, (unsigned long long)es->currentAu.pts);
+
+        /* Fire AU_FOUND callback */
+        if (es->esCbFunc)
+            es->esCbFunc(handle, (u32)i,
+                         CELL_DMUX_ES_MSG_TYPE_AU_FOUND,
+                         0, es->esCbArg);
+    }
+
+    dmux->auSeqNo++;
+
+    /* Signal demux completion after all ES callbacks have fired */
+    if (dmux->cbFunc)
+        dmux->cbFunc(handle, CELL_DMUX_MSG_TYPE_DEMUX_DONE,
+                     0, dmux->cbArg);
 
     return CELL_OK;
 }
@@ -161,11 +216,14 @@ s32 cellDmuxResetStream(CellDmuxHandle handle)
     if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
         return (s32)CELL_DMUX_ERROR_ARG;
 
-    /* Clear pending AUs from all ES handles */
+    /* Clear pending AUs from all ES handles and reset stream tracking */
     for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
         if (s_es[i].in_use && s_es[i].dmuxId == handle)
             s_es[i].hasAu = 0;
     }
+    s_dmux[handle].streamAddr = 0;
+    s_dmux[handle].streamSize = 0;
+    s_dmux[handle].auSeqNo = 0;
 
     return CELL_OK;
 }

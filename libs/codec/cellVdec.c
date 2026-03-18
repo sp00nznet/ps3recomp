@@ -23,6 +23,9 @@ typedef struct {
     int seqStarted;
     CellVdecPicItem lastPic;
     int hasPic;
+    u32 auCount;        /* total AUs decoded */
+    u16 width;          /* configured resolution (0 = use default) */
+    u16 height;
 } VdecSlot;
 
 static VdecSlot s_vdec[MAX_VDEC];
@@ -104,17 +107,38 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     if (!auInfo)
         return (s32)CELL_VDEC_ERROR_ARG;
 
+    VdecSlot* v = &s_vdec[handle];
+
     printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
            handle, auInfo->startAddr, auInfo->size,
            (unsigned long long)auInfo->pts);
 
-    /* Report AU consumed */
-    if (s_vdec[handle].cbFunc)
-        s_vdec[handle].cbFunc(handle, CELL_VDEC_MSG_TYPE_AUDONE,
-                               CELL_OK, s_vdec[handle].cbArg);
+    /* Step 1: Report AU consumed */
+    if (v->cbFunc)
+        v->cbFunc(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK, v->cbArg);
 
-    /* In a real implementation, decoded picture data would be placed
-       in memory and PICOUT callback delivered. For now, skip actual decode. */
+    /* Step 2: Generate a dummy PICOUT callback.
+     * Without FFmpeg, we can't actually decode video. But games expect the
+     * PICOUT callback to fire for each AU, so we generate a placeholder
+     * picture. Games that only check for completion (not pixel data) will
+     * proceed correctly. */
+    v->auCount++;
+    memset(&v->lastPic, 0, sizeof(v->lastPic));
+    v->lastPic.codecType = v->codecType;
+    v->lastPic.startAddr = auInfo->startAddr;
+    v->lastPic.size      = auInfo->size;
+    v->lastPic.auNum     = v->auCount;
+    v->lastPic.pts       = auInfo->pts;
+    v->lastPic.dts       = auInfo->dts;
+    v->lastPic.userData  = auInfo->userData;
+    v->lastPic.status    = 0; /* OK */
+    v->lastPic.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
+    v->lastPic.width     = v->width ? v->width : 1280;
+    v->lastPic.height    = v->height ? v->height : 720;
+    v->hasPic = 1;
+
+    if (v->cbFunc)
+        v->cbFunc(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK, v->cbArg);
 
     return CELL_OK;
 }

@@ -23,6 +23,7 @@ typedef struct {
     int seqStarted;
     CellAdecPcmItem lastPcm;
     int hasPcm;
+    u32 auCount;        /* total AUs decoded */
 } AdecSlot;
 
 static AdecSlot s_adec[MAX_ADEC];
@@ -102,13 +103,29 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
     if (!auInfo)
         return (s32)CELL_ADEC_ERROR_ARG;
 
+    AdecSlot* a = &s_adec[handle];
+
     printf("[cellAdec] DecodeAu(handle=%u, addr=0x%X, size=%u)\n",
            handle, auInfo->startAddr, auInfo->size);
 
-    /* Report AU consumed */
-    if (s_adec[handle].cbFunc)
-        s_adec[handle].cbFunc(handle, CELL_ADEC_MSG_TYPE_AUDONE,
-                               CELL_OK, s_adec[handle].cbArg);
+    /* Step 1: Report AU consumed */
+    if (a->cbFunc)
+        a->cbFunc(handle, CELL_ADEC_MSG_TYPE_AUDONE, CELL_OK, a->cbArg);
+
+    /* Step 2: Generate PCMOUT callback with dummy PCM info.
+     * Without FFmpeg, we produce silence. But games that check for
+     * decode completion via callbacks will proceed correctly. */
+    a->auCount++;
+    memset(&a->lastPcm, 0, sizeof(a->lastPcm));
+    a->lastPcm.pcmSize       = 256 * 2 * sizeof(float); /* 256 samples, stereo, float */
+    a->lastPcm.channelNumber = 2;
+    a->lastPcm.samplingRate  = 48000;
+    a->lastPcm.bitsPerSample = 32; /* float */
+    a->lastPcm.status        = 0;
+    a->hasPcm = 1;
+
+    if (a->cbFunc)
+        a->cbFunc(handle, CELL_ADEC_MSG_TYPE_PCMOUT, CELL_OK, a->cbArg);
 
     return CELL_OK;
 }

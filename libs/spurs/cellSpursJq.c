@@ -16,11 +16,42 @@
 typedef struct {
     int in_use;
     u32 maxJobs;
-    u32 jobCount;
+    u32 jobCount;       /* number of pending (not-yet-completed) jobs */
     u32 nextJobId;
+    u32 submitCount;    /* total jobs submitted over lifetime */
+    u32 completeCount;  /* total jobs completed over lifetime */
+    /*
+     * Per-job completion ring: tracks the last CELL_SPURS_JQ_MAX_JOBS
+     * job IDs that have completed.  Wait/TryWait check this.
+     */
+    u32 completedIds[CELL_SPURS_JQ_MAX_JOBS];
+    u32 completedHead;  /* next write position in the ring */
 } JqState;
 
 static JqState s_queues[CELL_SPURS_JQ_MAX_QUEUES];
+
+/* Check whether a job ID has completed in the given queue */
+static int jq_is_completed(const JqState* q, CellSpursJobId id)
+{
+    /* Job ID 0 is invalid / never assigned */
+    if (id == 0) return 0;
+
+    for (int i = 0; i < CELL_SPURS_JQ_MAX_JOBS; i++) {
+        if (q->completedIds[i] == id)
+            return 1;
+    }
+    return 0;
+}
+
+/* Record a job as completed */
+static void jq_mark_completed(JqState* q, CellSpursJobId id)
+{
+    q->completedIds[q->completedHead] = id;
+    q->completedHead = (q->completedHead + 1) % CELL_SPURS_JQ_MAX_JOBS;
+    q->completeCount++;
+    if (q->jobCount > 0)
+        q->jobCount--;
+}
 
 static int jq_alloc(void)
 {
@@ -65,10 +96,14 @@ s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
     int slot = jq_alloc();
     if (slot < 0) return (s32)CELL_SPURS_JQ_ERROR_OUT_OF_MEMORY;
 
+    memset(&s_queues[slot], 0, sizeof(JqState));
     s_queues[slot].in_use = 1;
     s_queues[slot].maxJobs = attr->maxJobs;
     s_queues[slot].jobCount = 0;
     s_queues[slot].nextJobId = 1;
+    s_queues[slot].submitCount = 0;
+    s_queues[slot].completeCount = 0;
+    s_queues[slot].completedHead = 0;
 
     *jq = (u32)slot;
     return CELL_OK;
@@ -105,10 +140,16 @@ s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
 
     u32 jobId = q->nextJobId++;
     q->jobCount++;
+    q->submitCount++;
 
     if (id) *id = jobId;
 
-    /* Job is immediately "complete" since we don't execute SPU code */
+    /*
+     * Job is immediately "complete" since we don't execute SPU code,
+     * but we now record completion so Wait/TryWait can track it.
+     */
+    jq_mark_completed(q, jobId);
+
     return CELL_OK;
 }
 
@@ -149,15 +190,45 @@ s32 cellSpursJobQueueSendSignal(CellSpursJobQueue* jq, CellSpursJobId id)
 
 s32 cellSpursJobQueueWait(CellSpursJobQueue* jq, CellSpursJobId id)
 {
-    (void)jq; (void)id;
-    /* Jobs complete immediately, nothing to wait for */
+    if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+
+    u32 slot = *jq;
+    if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
+        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+
+    const JqState* q = &s_queues[slot];
+
+    /*
+     * If no jobs have ever been submitted, treat as an error —
+     * nothing can complete if nothing was pushed.
+     */
+    if (q->submitCount == 0)
+        return (s32)CELL_SPURS_JQ_ERROR_JOB_NOT_FOUND;
+
+    if (!jq_is_completed(q, id))
+        return (s32)CELL_SPURS_JQ_ERROR_JOB_NOT_FOUND;
+
     return CELL_OK;
 }
 
 s32 cellSpursJobQueueTryWait(CellSpursJobQueue* jq, CellSpursJobId id)
 {
-    (void)jq; (void)id;
-    return CELL_OK; /* Already done */
+    if (!jq) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+
+    u32 slot = *jq;
+    if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
+        return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
+
+    const JqState* q = &s_queues[slot];
+
+    /* No jobs submitted yet — return BUSY */
+    if (q->submitCount == 0)
+        return (s32)CELL_SPURS_JQ_ERROR_BUSY;
+
+    if (!jq_is_completed(q, id))
+        return (s32)CELL_SPURS_JQ_ERROR_BUSY;
+
+    return CELL_OK;
 }
 
 s32 cellSpursJobQueueGetCount(CellSpursJobQueue* jq, u32* count)
@@ -168,7 +239,7 @@ s32 cellSpursJobQueueGetCount(CellSpursJobQueue* jq, u32* count)
     if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
         return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
-    *count = 0; /* All jobs complete instantly */
+    *count = s_queues[slot].jobCount;
     return CELL_OK;
 }
 
