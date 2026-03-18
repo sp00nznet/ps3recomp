@@ -57,6 +57,7 @@ typedef struct CellPamfReader {
     u32   pamfSize;       /* total size */
     u32   dataOffset;     /* offset to mux data */
     u32   dataSize;       /* mux data size */
+    u32   streamTableOffset; /* offset to stream descriptor table */
     u8    numStreams;      /* number of streams */
     u8    currentStream;  /* current stream index */
     u8    reserved[2];
