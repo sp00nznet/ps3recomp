@@ -269,9 +269,9 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 
 | Game | Title ID | Status | Repo |
 |------|----------|--------|------|
-| **flOw** (thatgamecompany) | NPUA80001 | Binary analysis complete, 139/140 imports resolved | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+| **flOw** (thatgamecompany) | NPUA80001 | 51K functions lifted, CRT boot working, 7/12 real HLE bridges | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
 
-Want to port a game? Start with the [Getting Started](#getting-started) section and check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) to see which system libraries are already implemented.
+Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough of the porting process.
 
 ## Relationship to Other Projects
 
