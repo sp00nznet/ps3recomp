@@ -113,7 +113,7 @@ ps3recomp/
 ├── patches/                  # Patches for upstream tools
 │   └── xenonrecomp-ppu.patch # XenonRecomp adaptations for PPU (Cell != Xenon)
 │
-└── docs/                     # Documentation (14 documents, 60K+ words)
+└── docs/                     # Documentation (15 documents, 65K+ words)
     ├── ARCHITECTURE.md        # Cell processor and recomp pipeline deep-dive
     ├── GETTING_STARTED.md     # How to recompile your first PS3 game
     ├── MODULE_STATUS.md       # Implementation status of all HLE modules
@@ -236,6 +236,7 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[NID System](docs/NID_SYSTEM.md)** | How PS3 function linking works, NID computation, module registration framework |
 | **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for all 93+ HLE modules — what they do and how they're implemented |
 | **[Module Status](docs/MODULE_STATUS.md)** | Quick-reference status table for all modules |
+| **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, D3D12/Vulkan backends, shader strategy |
 | **[Tools Reference](docs/TOOLS.md)** | Every recompiler pipeline tool documented: ELF parser, disassembler, lifter, NID database |
 | **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | How we handle Win32 vs POSIX: threading, sockets, timers, audio, memory, fibers |
 
