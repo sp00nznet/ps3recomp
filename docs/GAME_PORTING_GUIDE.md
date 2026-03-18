@@ -377,21 +377,36 @@ RSX graphics is the hardest part of any PS3 port. The game writes NV47xx GPU com
 - Start with basic triangle rendering
 - Progressively add shader translation, texture sampling, blending modes
 
-### What cellGcmSys Provides
+### What's Implemented
 
-The HLE module already handles:
-- Command buffer management (put/get pointers)
+**cellGcmSys** (HLE module — state management):
+- Command buffer control (put/get pointers)
 - Local memory allocation (VRAM heap)
 - IO memory mapping (main memory → GPU accessible)
 - Tile and zcull configuration
-- Display buffer registration
-- Flip and VBlank callbacks
+- Display buffer registration, flip and VBlank callbacks
 - Timestamps and report data
 
-What it does NOT do (yet):
-- Parse and execute NV47xx method commands
-- Translate vertex/fragment programs to host shaders
-- Actually render anything to the screen
+**RSX Command Processor** (`libs/video/rsx_commands.h/.c`):
+- NV47xx FIFO command buffer parsing (type 0 increasing, type 2 non-increasing)
+- State tracking: surfaces, viewport, scissor, clear, blend, depth/stencil, cull, color mask, alpha test
+- Texture state: 16 units with offset/format/address/filter/rect
+- Vertex attributes: 16 attribs with format/offset/stride
+- Shader program registers (fragment address, vertex load slot)
+- Draw dispatch: draw_arrays, draw_indexed
+- Backend callback interface (`rsx_backend`) with 12 dispatch points
+
+**Null backend** (`libs/video/rsx_null_backend.h/.c`):
+- Win32 window creation
+- Displays RSX clear color via GDI
+- FPS counter and debug overlay
+- Proves command flow works before implementing a real backend
+
+**What's NOT done yet:**
+- D3D12/Vulkan backend (actual triangle rendering)
+- Vertex/fragment program translation (RSX shaders → HLSL/SPIR-V)
+- Texture upload and sampling
+- Framebuffer management and resolve
 
 ---
 
