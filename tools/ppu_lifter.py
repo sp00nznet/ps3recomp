@@ -965,6 +965,99 @@ class PPULifter:
                     f"(unsigned __int128)ctx->gpr[{rb}]; "
                     f"ctx->gpr[{rd}] = (uint64_t)(r >> 64); }}")
 
+        # ------- VMX/AltiVec vector load/store -------
+        # These are the foundation for all SIMD code. Vector registers
+        # are 128-bit (ctx->vr[N], type u128 or uint8_t[16]).
+        if mn == "lvx":
+            vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0xFULL; "
+                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, 16); }}")
+
+        if mn == "stvx":
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0xFULL; "
+                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
+
+        if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
+            vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            # These load a single element into the vector register.
+            # For simplicity, zero the register and load at the element position.
+            size = {"lvebx": 1, "lvehx": 2, "lvewx": 4}[mn]
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"memset(&ctx->vr[{vd}], 0, 16); "
+                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, {size}); }}")
+
+        if mn == "stvebx" or mn == "stvehx" or mn == "stvewx":
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], {size}); }}")
+
+        if mn == "lvsl" or mn == "lvsr":
+            vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            # lvsl/lvsr generate permutation vectors for unaligned loads.
+            # lvsl: for byte offset b, generates {b, b+1, b+2, ..., b+15}
+            # lvsr: generates {16-b, 17-b, ..., 31-b}
+            if mn == "lvsl":
+                return (f"{{ uint8_t b = (uint8_t)((ctx->gpr[{ra}] + ctx->gpr[{rb}]) & 0xF); "
+                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
+            else:
+                return (f"{{ uint8_t b = (uint8_t)(16 - ((ctx->gpr[{ra}] + ctx->gpr[{rb}]) & 0xF)); "
+                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
+
+        # VMX permute (vperm) — critical for unaligned loads
+        if mn == "vperm":
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            vc = int(ops[3][1:])
+            return (f"{{ uint8_t* a = (uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b = (uint8_t*)&ctx->vr[{vb}]; "
+                    f"uint8_t* c = (uint8_t*)&ctx->vr[{vc}]; "
+                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
+                    f"uint8_t tmp[16]; "
+                    f"for (int i = 0; i < 16; i++) {{ "
+                    f"uint8_t sel = c[i] & 0x1F; "
+                    f"tmp[i] = (sel < 16) ? a[sel] : b[sel - 16]; }} "
+                    f"memcpy(d, tmp, 16); }}")
+
+        # VMX splat (vspltw, vsplth, vspltb) — duplicate one element across vector
+        if mn == "vspltw":
+            vd = int(ops[0][1:])
+            vb = int(ops[1][1:])
+            uimm = int(ops[2]) & 3
+            return (f"{{ uint32_t* d = (uint32_t*)&ctx->vr[{vd}]; "
+                    f"uint32_t val = ((uint32_t*)&ctx->vr[{vb}])[{uimm}]; "
+                    f"d[0] = d[1] = d[2] = d[3] = val; }}")
+
+        if mn == "vxor":
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            return (f"{{ uint64_t* d = (uint64_t*)&ctx->vr[{vd}]; "
+                    f"uint64_t* a = (uint64_t*)&ctx->vr[{va}]; "
+                    f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
+                    f"d[0] = a[0] ^ b[0]; d[1] = a[1] ^ b[1]; }}")
+
+        if mn == "vor":
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            return (f"{{ uint64_t* d = (uint64_t*)&ctx->vr[{vd}]; "
+                    f"uint64_t* a = (uint64_t*)&ctx->vr[{va}]; "
+                    f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
+                    f"d[0] = a[0] | b[0]; d[1] = a[1] | b[1]; }}")
+
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
 
