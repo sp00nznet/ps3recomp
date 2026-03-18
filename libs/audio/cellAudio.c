@@ -41,6 +41,32 @@
   #include <mmdeviceapi.h>
   #include <audioclient.h>
   #include <process.h>
+
+  /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
+  #ifdef __cplusplus
+    #define GUID_SECT
+  #else
+    #define GUID_SECT
+  #endif
+  #ifndef DEFINE_AUDIO_GUID
+    #ifdef INITGUID
+      #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
+              const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
+    #else
+      #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
+              const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
+    #endif
+  #endif
+  DEFINE_AUDIO_GUID(ps3r_CLSID_MMDeviceEnumerator, 0xBCDE0395,0xE52F,0x467C,0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E);
+  DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
+  DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient,         0x1CB9AD4C,0xDBFA,0x4c32,0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2);
+  DEFINE_AUDIO_GUID(ps3r_IID_IAudioRenderClient,   0xF294ACFC,0x3146,0x4483,0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2);
+
+  /* Map to the names used in the code */
+  #define IID_IMMDeviceEnumerator  ps3r_IID_IMMDeviceEnumerator
+  #define CLSID_MMDeviceEnumerator ps3r_CLSID_MMDeviceEnumerator
+  #define IID_IAudioClient         ps3r_IID_IAudioClient
+  #define IID_IAudioRenderClient   ps3r_IID_IAudioRenderClient
 #endif
 
 #if AUDIO_BACKEND_SDL2

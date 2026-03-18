@@ -513,23 +513,88 @@ void hle_spu_audio_mixer(spu_context* ctx)
 
 ## Case Study: flOw
 
-The first game port in progress using ps3recomp.
+The first game port actively in progress using ps3recomp. This section tracks real-world progress and lessons learned.
 
 **Game:** flOw by thatgamecompany (NPUA80001)
-**Engine:** PhyreEngine
+**Engine:** PhyreEngine (Sony first-party)
 **Repository:** [sp00nznet/flow](https://github.com/sp00nznet/flow)
 
-**Analysis results:**
-- 140 total imports across all modules
-- 139 out of 140 resolved (99.3% coverage)
-- Modules used: cellSysutil, cellGcmSys, cellPad, cellFs, cellFont, cellL10n, cellNet, cellNetCtl, sceNp, sceNpTrophy, cellSpurs, cellSync, sysPrxForUser
+### Why flOw?
 
-**What makes flOw a good first target:**
-- Small PSN title (~50 MB)
-- Simple gameplay (2D physics-based)
-- Well-documented engine (PhyreEngine)
-- Works perfectly in RPCS3
-- Limited SPU usage (audio only)
-- No complex graphics (no 3D, no advanced shaders)
+- Small PSN title (~10 MB ELF, ~50 MB total)
+- Simple gameplay (2D physics-based, no complex 3D)
+- Works perfectly in RPCS3 (behavior reference available)
+- Limited SPU usage (audio only, no physics/compute)
+- 140 imports across 12 modules — excellent ps3recomp coverage
 
-**Status:** Binary analysis complete, project scaffolded, ready for disassembly and lifting phase.
+### Current Status (v0.4.0)
+
+| Milestone | Status |
+|-----------|--------|
+| ELF analysis & import resolution | **Complete** — 140/140 NIDs resolved |
+| Function boundary detection | **Complete** — 51,658 functions found (OPD + heuristic) |
+| PPU code lifting | **Complete** — all 51,658 functions lifted to C++ |
+| Build & link | **Complete** — 37 MB native x86-64 executable |
+| CRT startup | **Working** — TLS init, mutex creation, enters game code |
+| HLE module bridges | **7/12 real** — cellSysutil, cellGcmSys, cellAudio, cellPad, cellFs, cellSysmodule, sysPrxForUser |
+| Game main loop | **In progress** — crashes in early init due to address sign-extension |
+| Graphics (RSX → D3D12) | Not started |
+| Audio (cellAudio → WASAPI) | **Wired** — real WASAPI backend via ps3recomp |
+| Input (cellPad → XInput) | **Wired** — real XInput backend via ps3recomp |
+
+### Key Technical Lessons
+
+**1. TOC Save in Import Stubs**
+
+The PPC64 ELF ABI requires saving the TOC (r2) to `sp+40` before inter-module calls. The lifter doesn't emit this instruction, so after an import stub call, the caller's `ld r2, 40(r1)` reads garbage. **Fix:** The `nid_dispatch()` function in `import_stubs.cpp` saves the current TOC:
+
+```c
+static void nid_dispatch(ppu_context* ctx, uint32_t nid, const char* name) {
+    vm_write64((uint32_t)ctx->gpr[1] + 0x28, ctx->gpr[2]); /* save TOC */
+    void* handler = ps3_resolve_func_nid(nid);
+    if (handler) ((int64_t(*)(ppu_context*))handler)(ctx);
+}
+```
+
+**2. HLE Bridge Pattern**
+
+ps3recomp's HLE functions take explicit C parameters, but recompiled code passes everything through `ppu_context` GPRs. Bridge functions extract parameters per the PPC64 ABI (r3-r10 = args, r3 = return), translate guest pointers (`vm_base + addr`), and byte-swap struct output for big-endian guest memory:
+
+```c
+static int64_t bridge_cellVideoOutGetResolution(ppu_context* ctx) {
+    uint32_t resId    = (uint32_t)ctx->gpr[3];
+    uint32_t res_addr = (uint32_t)ctx->gpr[4];
+    CellVideoOutResolution host_res;
+    s32 rc = cellVideoOutGetResolution(resId, &host_res);
+    if (rc == CELL_OK && res_addr) {
+        vm_write16(res_addr,     host_res.width);   /* big-endian write */
+        vm_write16(res_addr + 2, host_res.height);
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+    return rc;
+}
+```
+
+**3. 32-bit vs 64-bit Address Space**
+
+The PS3 uses 32-bit effective addresses in 64-bit GPRs. Arithmetic like `sp -= 0xA0` can sign-extend the result to 64 bits. The `vm_bridge.cpp` truncates addresses with `(uint32_t)addr`, but code that uses GPRs for address comparison or branching may need masking in the lifter.
+
+**4. WASAPI COM GUIDs**
+
+When linking cellAudio's WASAPI backend on MSVC, the COM interface GUIDs (`IID_IAudioClient`, etc.) aren't automatically defined. **Fix:** Define them manually in `cellAudio.c` using `DEFINE_GUID()` macros rather than relying on `uuid.lib`.
+
+### Analysis Numbers
+
+```
+Binary:          EBOOT.elf (10.1 MB, ELF64 big-endian PowerPC64)
+Functions found: 51,658 (36,827 OPD + 14,831 heuristic)
+Functions lifted: 51,658 (100%)
+Generated C++:   156 MB (3.14 million lines)
+Native binary:   37 MB (x86-64 Windows)
+Import libraries: 12 (cellSysutil, cellGcmSys, cellSysmodule, cellSpurs,
+                      cellAudio, cellSync, cellNetCtl, sceNp, sys_net,
+                      sys_io, sys_fs, sysPrxForUser)
+Import functions: 140 (all resolved)
+Empty stubs:     16,718 (branch targets not in function list)
+Unlifted insns:  ~24,660 (VMX/AltiVec SIMD — needed for PhyreEngine)
+```
