@@ -274,10 +274,72 @@ class FunctionFinder:
                 if call_target in self.functions:
                     self.functions[call_target].callers.append(addr)
 
+    def find_branch_target_functions(self) -> None:
+        """Third pass: find branch targets that fall outside known function boundaries.
+
+        When the lifter generates code, any branch target that isn't inside a
+        known function becomes a missing stub (empty function). This pass scans
+        all instructions for branch targets (b, bc, etc.) and creates minimal
+        function entries for any that aren't already covered.
+        """
+        all_targets: set[int] = set()
+
+        for insn in self.instructions:
+            mn = insn.mnemonic
+            # Collect targets of conditional and unconditional branches
+            if mn.startswith("b") and mn not in ("bl", "blr", "bctr", "bctrl", "blrl"):
+                ops = insn.operands.strip()
+                # Target is usually the last operand
+                parts = [p.strip() for p in ops.split(",")]
+                for p in parts:
+                    if p.startswith("0x"):
+                        try:
+                            all_targets.add(int(p, 16))
+                        except ValueError:
+                            pass
+
+        # Filter out targets that are already inside known functions
+        new_targets: list[int] = []
+        sorted_funcs = sorted(self.functions.values(), key=lambda f: f.start)
+
+        for target in sorted_targets := sorted(all_targets):
+            inside = False
+            for func in sorted_funcs:
+                if func.start <= target < func.end:
+                    inside = True
+                    break
+            if not inside and target not in self.functions:
+                new_targets.append(target)
+
+        # Create minimal functions for uncovered targets
+        for target in new_targets:
+            idx = self._addr_to_idx.get(target)
+            if idx is None:
+                continue
+
+            func = Function(start=target)
+            # Scan forward for blr or next known function
+            found_end = False
+            for j in range(idx, min(idx + 500, len(self.instructions))):
+                curr = self.instructions[j]
+                if _is_blr(curr):
+                    func.end = curr.addr + 4
+                    found_end = True
+                    break
+                # Stop at known function boundaries
+                if curr.addr != target and curr.addr in self.functions:
+                    func.end = curr.addr
+                    found_end = True
+                    break
+
+            if found_end and func.size >= 4:
+                self.functions[target] = func
+
     def run(self) -> list[Function]:
         """Run all detection passes and return sorted function list."""
         self.find_prologue_functions()
         self.find_leaf_functions()
+        self.find_branch_target_functions()
         self.build_call_graph()
         return sorted(self.functions.values(), key=lambda f: f.start)
 
