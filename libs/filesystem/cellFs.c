@@ -93,7 +93,8 @@ void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path)
     }
 }
 
-/* Translate a PS3 path to a host path. Returns 0 on success, -1 if no mapping found. */
+/* Translate a PS3 path to a host path. Returns 0 on success, -1 if no mapping found.
+ * Also exposed publicly as cellfs_translate_path() for use by other modules. */
 static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 {
     init_default_mappings();
@@ -131,6 +132,12 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
     }
 
     return 0;
+}
+
+/* Public wrapper for translate_path, usable by other modules (e.g. codec libs). */
+int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
+{
+    return translate_path(ps3_path, host_buf, buf_size);
 }
 
 /* ---------------------------------------------------------------------------
