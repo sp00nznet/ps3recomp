@@ -29,6 +29,7 @@
 /* D3D12 headers */
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <d3dcompiler.h>
 
 /* We need these GUIDs — define them here to avoid uuid.lib dependency */
 #include <initguid.h>
@@ -36,6 +37,7 @@
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -73,7 +75,15 @@ typedef struct {
 
     /* Pipeline */
     ID3D12RootSignature*  root_signature;
-    ID3D12PipelineState*  pipeline_state;
+    ID3D12PipelineState*  pipeline_state;  /* basic vertex-colored */
+
+    /* Dynamic vertex buffer (upload heap) */
+    ID3D12Resource*       vertex_buffer;
+    D3D12_VERTEX_BUFFER_VIEW vb_view;
+    void*                 vb_mapped;      /* persistently mapped */
+    u32                   vb_offset;      /* current write position */
+
+    int                   pipeline_ready; /* 1 if root sig + PSO created */
 
     /* Current frame state */
     float clear_color[4];  /* RGBA float */
@@ -271,8 +281,145 @@ static int init_d3d12(u32 width, u32 height)
     s_d3d.fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     memset(s_d3d.fence_values, 0, sizeof(s_d3d.fence_values));
 
-    printf("[D3D12] Initialization complete (%ux%u, %u buffers)\n",
-           width, height, FRAME_COUNT);
+    /* ---------------------------------------------------------------
+     * Create root signature (empty — no CBV/SRV/UAV for basic shader)
+     * ---------------------------------------------------------------*/
+    {
+        D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
+        rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ID3DBlob* signature_blob = NULL;
+        ID3DBlob* error_blob = NULL;
+        hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                          &signature_blob, &error_blob);
+        if (FAILED(hr)) {
+            printf("[D3D12] Root signature serialization failed\n");
+            if (error_blob) error_blob->lpVtbl->Release(error_blob);
+            return -1;
+        }
+
+        hr = s_d3d.device->lpVtbl->CreateRootSignature(
+            s_d3d.device, 0,
+            signature_blob->lpVtbl->GetBufferPointer(signature_blob),
+            signature_blob->lpVtbl->GetBufferSize(signature_blob),
+            &IID_ID3D12RootSignature, (void**)&s_d3d.root_signature);
+        signature_blob->lpVtbl->Release(signature_blob);
+        if (FAILED(hr)) {
+            printf("[D3D12] Root signature creation failed\n");
+            return -1;
+        }
+    }
+
+    /* ---------------------------------------------------------------
+     * Compile shaders and create PSO
+     * ---------------------------------------------------------------*/
+    {
+        /* Basic vertex-colored shader */
+        static const char vs_hlsl[] =
+            "struct VSInput { float3 pos : POSITION; float4 col : COLOR; };\n"
+            "struct VSOutput { float4 pos : SV_POSITION; float4 col : COLOR; };\n"
+            "VSOutput main(VSInput i) { VSOutput o; o.pos = float4(i.pos, 1.0); o.col = i.col; return o; }\n";
+        static const char ps_hlsl[] =
+            "struct PSInput { float4 pos : SV_POSITION; float4 col : COLOR; };\n"
+            "float4 main(PSInput i) : SV_TARGET { return i.col; }\n";
+
+        ID3DBlob* vs_blob = NULL;
+        ID3DBlob* ps_blob = NULL;
+        ID3DBlob* err = NULL;
+
+        hr = D3DCompile(vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL, NULL,
+                        "main", "vs_5_0", 0, 0, &vs_blob, &err);
+        if (FAILED(hr)) {
+            printf("[D3D12] VS compile failed: %s\n",
+                   err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "unknown");
+            if (err) err->lpVtbl->Release(err);
+        }
+
+        hr = D3DCompile(ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL, NULL,
+                        "main", "ps_5_0", 0, 0, &ps_blob, &err);
+        if (FAILED(hr)) {
+            printf("[D3D12] PS compile failed: %s\n",
+                   err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "unknown");
+            if (err) err->lpVtbl->Release(err);
+        }
+
+        if (vs_blob && ps_blob) {
+            D3D12_INPUT_ELEMENT_DESC input_layout[] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
+                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            };
+
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {0};
+            pso_desc.pRootSignature = s_d3d.root_signature;
+            pso_desc.VS.pShaderBytecode = vs_blob->lpVtbl->GetBufferPointer(vs_blob);
+            pso_desc.VS.BytecodeLength = vs_blob->lpVtbl->GetBufferSize(vs_blob);
+            pso_desc.PS.pShaderBytecode = ps_blob->lpVtbl->GetBufferPointer(ps_blob);
+            pso_desc.PS.BytecodeLength = ps_blob->lpVtbl->GetBufferSize(ps_blob);
+            pso_desc.InputLayout.pInputElementDescs = input_layout;
+            pso_desc.InputLayout.NumElements = 2;
+            pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_ALL;
+            pso_desc.SampleMask = UINT_MAX;
+            pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            pso_desc.NumRenderTargets = 1;
+            pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            pso_desc.SampleDesc.Count = 1;
+
+            hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+                s_d3d.device, &pso_desc,
+                &IID_ID3D12PipelineState, (void**)&s_d3d.pipeline_state);
+            if (SUCCEEDED(hr)) {
+                s_d3d.pipeline_ready = 1;
+                printf("[D3D12] Pipeline state created (vertex-colored)\n");
+            } else {
+                printf("[D3D12] PSO creation failed (0x%08lX)\n", hr);
+            }
+
+            vs_blob->lpVtbl->Release(vs_blob);
+            ps_blob->lpVtbl->Release(ps_blob);
+        }
+    }
+
+    /* ---------------------------------------------------------------
+     * Create dynamic vertex buffer (upload heap, 4MB)
+     * ---------------------------------------------------------------*/
+    {
+        D3D12_HEAP_PROPERTIES heap_props = {0};
+        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC buf_desc = {0};
+        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Width = MAX_VERTICES * 28; /* 28 bytes per vertex (pos3+col4) */
+        buf_desc.Height = 1;
+        buf_desc.DepthOrArraySize = 1;
+        buf_desc.MipLevels = 1;
+        buf_desc.SampleDesc.Count = 1;
+        buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &heap_props, D3D12_HEAP_FLAG_NONE,
+            &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&s_d3d.vertex_buffer);
+        if (SUCCEEDED(hr)) {
+            D3D12_RANGE read_range = {0, 0};
+            s_d3d.vertex_buffer->lpVtbl->Map(
+                s_d3d.vertex_buffer, 0, &read_range, &s_d3d.vb_mapped);
+            s_d3d.vb_view.BufferLocation =
+                s_d3d.vertex_buffer->lpVtbl->GetGPUVirtualAddress(s_d3d.vertex_buffer);
+            s_d3d.vb_view.StrideInBytes = 28;
+            s_d3d.vb_view.SizeInBytes = MAX_VERTICES * 28;
+            printf("[D3D12] Vertex buffer created (%u KB)\n",
+                   (MAX_VERTICES * 28) / 1024);
+        }
+    }
+
+    printf("[D3D12] Initialization complete (%ux%u, %u buffers, pipeline=%s)\n",
+           width, height, FRAME_COUNT,
+           s_d3d.pipeline_ready ? "ready" : "NOT ready");
     return 0;
 }
 
@@ -528,6 +675,12 @@ void rsx_d3d12_backend_shutdown(void)
     wait_for_gpu();
 
     /* Release D3D12 resources */
+    if (s_d3d.vertex_buffer) {
+        s_d3d.vertex_buffer->lpVtbl->Unmap(s_d3d.vertex_buffer, 0, NULL);
+        s_d3d.vertex_buffer->lpVtbl->Release(s_d3d.vertex_buffer);
+    }
+    if (s_d3d.pipeline_state) s_d3d.pipeline_state->lpVtbl->Release(s_d3d.pipeline_state);
+    if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
     if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
