@@ -1143,7 +1143,7 @@ class PPULifter:
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
-            sh = int(ops[3])
+            sh = int(ops[3])  # numeric shift count (disasm emits plain number)
             return (f"{{ uint8_t tmp[32]; "
                     f"memcpy(tmp, &ctx->vr[{va}], 16); memcpy(tmp+16, &ctx->vr[{vb}], 16); "
                     f"memcpy(&ctx->vr[{vd}], tmp + {sh}, 16); }}")

@@ -827,7 +827,10 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         }
         if xo_6 in vmx_va:
             result.mnemonic = vmx_va[xo_6]
-            result.operands = f"v{vd}, v{va}, v{vb}, v{vc}"
+            if xo_6 == 42:  # vsldoi — 4th operand is shift count, not vector reg
+                result.operands = f"v{vd}, v{va}, v{vb}, {vc}"
+            else:
+                result.operands = f"v{vd}, v{va}, v{vb}, v{vc}"
             return result
 
         # VX-form (11-bit xo)
