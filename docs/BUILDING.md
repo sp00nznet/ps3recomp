@@ -305,9 +305,27 @@ target_include_directories(my_game PRIVATE
 On Windows, your game project must also link:
 ```cmake
 target_link_libraries(my_game PRIVATE
-    ws2_32 xinput ole32 bcrypt
+    ws2_32 xinput ole32 bcrypt d3d12 dxgi d3dcompiler uuid
 )
 ```
+
+**Why each library:**
+| Library | Required By |
+|---------|------------|
+| `ws2_32` | sys_net BSD sockets, cellHttp |
+| `xinput` | cellPad gamepad input |
+| `ole32` | COM initialization (WASAPI audio) |
+| `bcrypt` | NID SHA-1 computation |
+| `d3d12` | RSX D3D12 backend |
+| `dxgi` | Swap chain creation |
+| `d3dcompiler` | Runtime HLSL shader compilation |
+| `uuid` | COM interface GUIDs |
+
+**Vendored dependencies** (in-tree, no external install needed):
+- `stb_image.h` v2.30 — PNG/JPG/GIF decoding for cellPngDec/cellJpgDec/cellGifDec
+- `stb_truetype.h` v1.26 — TTF font rendering for cellFont
+
+Both are single-header public domain libraries from [nothings/stb](https://github.com/nothings/stb).
 
 On Linux with SDL2:
 ```cmake
