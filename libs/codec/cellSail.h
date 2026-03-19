@@ -98,6 +98,40 @@ s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index);
 
 s32 cellSailPlayerCancel(CellSailPlayerHandle handle);
 s32 cellSailPlayerIsPaused(CellSailPlayerHandle handle);
+s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode);
+
+/* Descriptor management (for multi-stream sources) */
+typedef u32 CellSailDescriptorHandle;
+
+s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
+                                     s32 streamType, void* arg,
+                                     CellSailDescriptorHandle* desc);
+s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
+                                      CellSailDescriptorHandle desc);
+s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
+                                  CellSailDescriptorHandle desc);
+s32 cellSailPlayerRemoveDescriptor(CellSailPlayerHandle handle,
+                                     CellSailDescriptorHandle desc);
+
+s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
+                                       void* dbAddr, u32 dbSize,
+                                       u64 arg);
+s32 cellSailDescriptorDestroyDatabase(CellSailDescriptorHandle desc);
+s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc, s32* type);
+s32 cellSailDescriptorSetAutoSelection(CellSailDescriptorHandle desc, s32 enable);
+s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLen);
+
+/* Memory allocator */
+typedef struct CellSailMemAllocator {
+    void* (*alloc)(void* arg, u32 boundary, u32 size);
+    void  (*free)(void* arg, u32 boundary, void* ptr);
+    void* arg;
+} CellSailMemAllocator;
+
+s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
+                                     void* (*allocFunc)(void*, u32, u32),
+                                     void  (*freeFunc)(void*, u32, void*),
+                                     void* arg);
 
 #ifdef __cplusplus
 }

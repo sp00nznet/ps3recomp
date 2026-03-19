@@ -194,3 +194,134 @@ s32 cellSailPlayerIsPaused(CellSailPlayerHandle handle)
         return 0;
     return (s_players[handle].state == CELL_SAIL_PLAYER_STATE_PAUSE) ? 1 : 0;
 }
+
+s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode)
+{
+    (void)repeatMode;
+    printf("[cellSail] SetRepeatMode(%u, %d)\n", handle, repeatMode);
+    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Descriptor management
+ * -----------------------------------------------------------------------*/
+
+#define MAX_DESCRIPTORS 16
+
+typedef struct {
+    int in_use;
+    s32 streamType;
+    CellSailPlayerHandle player;
+    char uri[512];
+} SailDescriptor;
+
+static SailDescriptor s_descs[MAX_DESCRIPTORS];
+
+s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
+                                     s32 streamType, void* arg,
+                                     CellSailDescriptorHandle* desc)
+{
+    (void)arg;
+    printf("[cellSail] CreateDescriptor(player=%u, type=%d)\n", handle, streamType);
+    if (!desc) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+
+    for (int i = 0; i < MAX_DESCRIPTORS; i++) {
+        if (!s_descs[i].in_use) {
+            memset(&s_descs[i], 0, sizeof(SailDescriptor));
+            s_descs[i].in_use = 1;
+            s_descs[i].streamType = streamType;
+            s_descs[i].player = handle;
+            *desc = (u32)i;
+            return CELL_OK;
+        }
+    }
+    return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;
+}
+
+s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
+                                      CellSailDescriptorHandle desc)
+{
+    (void)handle;
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    s_descs[desc].in_use = 0;
+    return CELL_OK;
+}
+
+s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
+                                  CellSailDescriptorHandle desc)
+{
+    (void)handle;
+    printf("[cellSail] AddDescriptor(player=%u, desc=%u)\n", handle, desc);
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return CELL_OK;
+}
+
+s32 cellSailPlayerRemoveDescriptor(CellSailPlayerHandle handle,
+                                     CellSailDescriptorHandle desc)
+{
+    (void)handle;
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return CELL_OK;
+}
+
+s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
+                                       void* dbAddr, u32 dbSize, u64 arg)
+{
+    (void)dbAddr; (void)dbSize; (void)arg;
+    printf("[cellSail] DescriptorCreateDatabase(desc=%u)\n", desc);
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return CELL_OK;
+}
+
+s32 cellSailDescriptorDestroyDatabase(CellSailDescriptorHandle desc)
+{
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return CELL_OK;
+}
+
+s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc, s32* type)
+{
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use || !type)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    *type = s_descs[desc].streamType;
+    return CELL_OK;
+}
+
+s32 cellSailDescriptorSetAutoSelection(CellSailDescriptorHandle desc, s32 enable)
+{
+    (void)enable;
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return CELL_OK;
+}
+
+s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLen)
+{
+    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use || !uri)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    strncpy(uri, s_descs[desc].uri, maxLen - 1);
+    uri[maxLen - 1] = '\0';
+    return CELL_OK;
+}
+
+/* Memory allocator */
+
+s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
+                                     void* (*allocFunc)(void*, u32, u32),
+                                     void  (*freeFunc)(void*, u32, void*),
+                                     void* arg)
+{
+    printf("[cellSail] MemAllocatorInitialize()\n");
+    if (!allocator) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    allocator->alloc = allocFunc;
+    allocator->free = freeFunc;
+    allocator->arg = arg;
+    return CELL_OK;
+}
