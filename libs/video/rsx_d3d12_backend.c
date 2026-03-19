@@ -90,6 +90,9 @@ typedef struct {
     int                   frame_recording; /* 1 if cmd list is open for recording */
     u32                   draw_count;      /* draws this frame */
 
+    /* Pointer to current RSX state (set before draw calls) */
+    const rsx_state*      current_rsx_state;
+
     /* Current frame state */
     float clear_color[4];  /* RGBA float */
 
@@ -595,6 +598,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 static void d3d12_set_render_target(void* ud, const rsx_state* state)
 {
     (void)ud;
+    s_d3d.current_rsx_state = state;
     printf("[D3D12] set_render_target(%ux%u)\n",
            state->surface_clip_w, state->surface_clip_h);
 }
@@ -604,6 +608,98 @@ static void d3d12_set_viewport(void* ud, const rsx_state* state)
     (void)ud;
     /* TODO: update D3D12 viewport from RSX state */
     (void)state;
+}
+
+/* Helper: read RSX vertex data from guest memory and convert to our BasicVertex format.
+ * Reads position (float3) from attrib 0 and color (float4) from attrib 3.
+ * If attribs aren't available, generates placeholder geometry. */
+static void upload_vertices_from_rsx(u32 first, u32 count)
+{
+    extern uint8_t* vm_base;
+    typedef struct { float x, y, z; float r, g, b, a; } BasicVertex;
+    BasicVertex* verts = (BasicVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
+    u32 max_verts = (MAX_VERTICES * 28 - s_d3d.vb_offset) / sizeof(BasicVertex);
+    if (count > max_verts) count = max_verts;
+
+    const rsx_state* state = s_d3d.current_rsx_state;
+    int has_position = 0;
+    int has_color = 0;
+
+    /* Check if position attrib (typically attrib 0) is enabled and is float */
+    if (state) {
+        const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
+        if (pos->enabled && pos->type == 2 /* float */ && pos->size >= 3) {
+            has_position = 1;
+        }
+        /* Color is typically attrib 3 (diffuse) */
+        const rsx_vertex_attrib* col = &state->vertex_attribs[3];
+        if (col->enabled && col->size >= 3) {
+            has_color = 1;
+        }
+    }
+
+    for (u32 i = 0; i < count; i++) {
+        if (has_position && vm_base) {
+            /* Read position from guest memory.
+             * RSX stores vertices in big-endian. For float type, each component
+             * is a 32-bit BE float. We need to byte-swap. */
+            const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
+            u32 addr = pos->offset + (first + i) * pos->stride;
+            if (addr < 0x20000000) { /* sanity check */
+                u8* src = vm_base + addr;
+                /* Byte-swap each float component (BE → LE) */
+                u32 fx, fy, fz;
+                memcpy(&fx, src,     4); fx = ((fx>>24)&0xFF)|((fx>>8)&0xFF00)|((fx<<8)&0xFF0000)|((fx<<24)&0xFF000000);
+                memcpy(&fy, src + 4, 4); fy = ((fy>>24)&0xFF)|((fy>>8)&0xFF00)|((fy<<8)&0xFF0000)|((fy<<24)&0xFF000000);
+                memcpy(&fz, src + 8, 4); fz = ((fz>>24)&0xFF)|((fz>>8)&0xFF00)|((fz<<8)&0xFF0000)|((fz<<24)&0xFF000000);
+                memcpy(&verts[i].x, &fx, 4);
+                memcpy(&verts[i].y, &fy, 4);
+                memcpy(&verts[i].z, &fz, 4);
+            } else {
+                verts[i].x = verts[i].y = verts[i].z = 0.0f;
+            }
+        } else {
+            /* Placeholder: distribute vertices in a circle */
+            float t = (float)(first + i) / 100.0f;
+            verts[i].x = sinf(t * 6.28f) * 0.5f;
+            verts[i].y = cosf(t * 6.28f) * 0.5f;
+            verts[i].z = 0.0f;
+        }
+
+        if (has_color && vm_base) {
+            const rsx_vertex_attrib* col = &state->vertex_attribs[3];
+            u32 addr = col->offset + (first + i) * col->stride;
+            if (addr < 0x20000000 && col->type == 4 /* ubyte */) {
+                u8* src = vm_base + addr;
+                /* RGBA bytes, normalized to 0-1 */
+                verts[i].r = src[0] / 255.0f;
+                verts[i].g = src[1] / 255.0f;
+                verts[i].b = src[2] / 255.0f;
+                verts[i].a = (col->size >= 4) ? src[3] / 255.0f : 1.0f;
+            } else if (addr < 0x20000000 && col->type == 2 /* float */) {
+                u8* src = vm_base + addr;
+                u32 fr, fg, fb, fa;
+                memcpy(&fr, src,     4); fr = ((fr>>24)&0xFF)|((fr>>8)&0xFF00)|((fr<<8)&0xFF0000)|((fr<<24)&0xFF000000);
+                memcpy(&fg, src + 4, 4); fg = ((fg>>24)&0xFF)|((fg>>8)&0xFF00)|((fg<<8)&0xFF0000)|((fg<<24)&0xFF000000);
+                memcpy(&fb, src + 8, 4); fb = ((fb>>24)&0xFF)|((fb>>8)&0xFF00)|((fb<<8)&0xFF0000)|((fb<<24)&0xFF000000);
+                memcpy(&verts[i].r, &fr, 4);
+                memcpy(&verts[i].g, &fg, 4);
+                memcpy(&verts[i].b, &fb, 4);
+                if (col->size >= 4) {
+                    memcpy(&fa, src + 12, 4); fa = ((fa>>24)&0xFF)|((fa>>8)&0xFF00)|((fa<<8)&0xFF0000)|((fa<<24)&0xFF000000);
+                    memcpy(&verts[i].a, &fa, 4);
+                } else {
+                    verts[i].a = 1.0f;
+                }
+            } else {
+                verts[i].r = 1.0f; verts[i].g = 1.0f; verts[i].b = 1.0f; verts[i].a = 1.0f;
+            }
+        } else {
+            /* Default white */
+            verts[i].r = 1.0f; verts[i].g = 1.0f; verts[i].b = 1.0f; verts[i].a = 1.0f;
+        }
+    }
+    s_d3d.vb_offset += count * sizeof(BasicVertex);
 }
 
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
@@ -619,33 +715,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
     if (count == 0 || count > MAX_VERTICES) return;
 
-    /* Get the current RSX state from the backend's perspective.
-     * The RSX command processor passes state through the rsx_backend callbacks
-     * before draw calls, but we need the vertex attribute info here.
-     * For now, generate solid-colored placeholder vertices to prove the pipeline works.
-     * TODO: Read actual vertex data from guest memory using RSX vertex attrib state. */
-
-    /* Write placeholder triangle vertices to the VB (position + color) */
-    typedef struct { float x, y, z; float r, g, b, a; } BasicVertex;
-    BasicVertex* verts = (BasicVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
-    u32 max_verts = (MAX_VERTICES * 28 - s_d3d.vb_offset) / sizeof(BasicVertex);
-    if (count > max_verts) count = max_verts;
-
-    /* Generate a simple colored shape based on RSX draw parameters.
-     * This is a placeholder — real implementation reads from guest memory. */
-    for (u32 i = 0; i < count && i < max_verts; i++) {
-        /* Map vertex index to NDC position (simple distribution) */
-        float t = (float)(first + i) / 100.0f;
-        verts[i].x = sinf(t * 6.28f) * 0.5f;
-        verts[i].y = cosf(t * 6.28f) * 0.5f;
-        verts[i].z = 0.0f;
-        /* Color based on primitive type */
-        verts[i].r = (primitive == 5) ? 1.0f : 0.5f; /* triangles = red */
-        verts[i].g = (primitive == 6) ? 1.0f : 0.3f; /* strips = green */
-        verts[i].b = (primitive == 2) ? 1.0f : 0.2f; /* lines = blue */
-        verts[i].a = 1.0f;
-    }
-    s_d3d.vb_offset += count * sizeof(BasicVertex);
+    upload_vertices_from_rsx(first, count);
     s_d3d.draw_count++;
 }
 
@@ -664,23 +734,61 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 offset, u32 count)
 static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
 {
     (void)ud;
+    extern uint8_t* vm_base;
+
+    u32 width  = (tex->image_rect >> 16) & 0xFFFF;
+    u32 height = tex->image_rect & 0xFFFF;
+    u32 format = (tex->format >> 8) & 0xFF;
+    u32 offset = tex->offset;
+
     static int log_count = 0;
     if (log_count < 10) {
-        printf("[D3D12] bind_texture(unit=%u, offset=0x%X, fmt=0x%X, %ux%u)\n",
-               unit, tex->offset, tex->format,
-               (tex->image_rect >> 16) & 0xFFFF,
-               tex->image_rect & 0xFFFF);
+        printf("[D3D12] bind_texture(unit=%u, offset=0x%X, fmt=0x%02X, %ux%u)\n",
+               unit, offset, format, width, height);
         log_count++;
     }
-    /* TODO: create SRV from RSX texture data. Steps needed:
-     * 1. Determine texture dimensions from image_rect
-     * 2. Determine pixel format from tex->format (NV40 texture format → DXGI)
-     * 3. Read texture data from guest memory (vm_base + tex->offset)
-     * 4. Create D3D12 texture resource (DEFAULT heap)
-     * 5. Upload via upload buffer → CopyTextureRegion
-     * 6. Create SRV in descriptor heap
-     * 7. Bind SRV to shader register t{unit}
+
+    /* Texture upload is complex and requires:
+     * 1. Matching DXGI format from RSX format
+     * 2. Creating a texture resource in DEFAULT heap
+     * 3. Creating an upload buffer in UPLOAD heap
+     * 4. Copying pixel data from guest memory (with potential deswizzle)
+     * 5. Recording CopyTextureRegion into the command list
+     * 6. Creating a SRV descriptor
+     * 7. Binding to the shader
+     *
+     * For now we log the texture parameters. The infrastructure is ready:
+     * - rsx_texture_formats.h provides format mapping
+     * - rsx_to_dxgi_texture_format() converts RSX → DXGI
+     * - Guest memory is accessible via vm_base + offset
+     *
+     * Full implementation requires:
+     * - A texture cache (avoid re-uploading unchanged textures)
+     * - A SRV descriptor heap (CBV_SRV_UAV type)
+     * - Root signature update to include SRV table
+     * - A textured PSO (with sampler state)
      */
+
+    /* Validate that we CAN read this texture */
+    if (!vm_base || width == 0 || height == 0) return;
+    if (offset >= 0x20000000) return; /* out of range */
+
+    /* Log format details for debugging */
+    static int detail_log = 0;
+    if (detail_log < 5) {
+        const char* fmt_name = "unknown";
+        switch (format) {
+        case 0x85: fmt_name = "A8R8G8B8"; break;
+        case 0x84: fmt_name = "R5G6B5"; break;
+        case 0x86: fmt_name = "DXT1"; break;
+        case 0x88: fmt_name = "DXT5"; break;
+        case 0x81: fmt_name = "B8"; break;
+        case 0x9E: fmt_name = "D8R8G8B8"; break;
+        }
+        printf("[D3D12]   texture: %s (%ux%u) at guest 0x%08X\n",
+               fmt_name, width, height, offset);
+        detail_log++;
+    }
 }
 
 static void d3d12_set_blend(void* ud, const rsx_state* state)
