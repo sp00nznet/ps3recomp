@@ -59,8 +59,11 @@ int64_t sys_memory_allocate(ppu_context* ctx)
 
     /* Initialize bump pointer on first call */
     if (g_sys_mem_bump_ptr == 0) {
-        /* Start allocations at 0x02000000 to leave room for ELF segments */
-        g_sys_mem_bump_ptr = 0x02000000;
+        /* Start allocations at 0x20000000 to avoid overlapping with:
+         *   - ELF segments (0x00010000 - 0x00900000)
+         *   - CRT malloc heap (0x00A00000 - 0x10000000)
+         *   - RSX/rodata region (0x10000000 - 0x20000000) */
+        g_sys_mem_bump_ptr = 0x20000000;
     }
 
     /* Align bump pointer */
