@@ -719,6 +719,56 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"v{rd}, r{ra}, r{rb}"
             return result
 
+        # VMX vector load/store (opcode 31, X-form)
+        if xo_full == 103:  # lvx
+            result.mnemonic = "lvx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 231:  # stvx
+            result.mnemonic = "stvx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 7:    # lvebx
+            result.mnemonic = "lvebx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 39:   # lvehx
+            result.mnemonic = "lvehx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 71:   # lvewx
+            result.mnemonic = "lvewx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 135:  # stvebx
+            result.mnemonic = "stvebx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 167:  # stvehx
+            result.mnemonic = "stvehx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 199:  # stvewx
+            result.mnemonic = "stvewx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 359:  # lvxl
+            result.mnemonic = "lvxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 487:  # stvxl
+            result.mnemonic = "stvxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 6:    # lvsl
+            result.mnemonic = "lvsl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 38:   # lvsr
+            result.mnemonic = "lvsr"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+
         # Fall through – unknown ext opcode 31
         result.mnemonic = f"op31_x{xo_full}"
         result.operands = f"r{rd}, r{ra}, r{rb}"
@@ -939,25 +989,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         result.operands = f"v{vd}, v{va}, v{vb}"
         return result
 
-    # lvx/stvx are actually under opcode 31
-    if opcd == 31:
-        xo_full = bits(insn, 21, 30)
-        if xo_full == 103:  # lvx
-            result.mnemonic = "lvx"
-            result.operands = f"v{rd}, r{ra}, r{bits(insn, 16, 20)}"
-            return result
-        if xo_full == 231:  # stvx
-            result.mnemonic = "stvx"
-            result.operands = f"v{rd}, r{ra}, r{bits(insn, 16, 20)}"
-            return result
-        if xo_full == 359:  # lvxl
-            result.mnemonic = "lvxl"
-            result.operands = f"v{rd}, r{ra}, r{bits(insn, 16, 20)}"
-            return result
-        if xo_full == 487:  # stvxl
-            result.mnemonic = "stvxl"
-            result.operands = f"v{rd}, r{ra}, r{bits(insn, 16, 20)}"
-            return result
+    # lvx/stvx now handled inside the main opcode 31 block above
 
     # twi (3)
     if opcd == 3:
