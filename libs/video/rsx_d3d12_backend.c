@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -84,6 +85,10 @@ typedef struct {
     u32                   vb_offset;      /* current write position */
 
     int                   pipeline_ready; /* 1 if root sig + PSO created */
+
+    /* Per-frame draw recording */
+    int                   frame_recording; /* 1 if cmd list is open for recording */
+    u32                   draw_count;      /* draws this frame */
 
     /* Current frame state */
     float clear_color[4];  /* RGBA float */
@@ -495,7 +500,21 @@ static void render_frame(void)
     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &viewport);
     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &scissor);
 
-    /* TODO: Draw geometry here once we have vertex buffers and shaders */
+    /* Bind pipeline state if available */
+    if (s_d3d.pipeline_ready) {
+        s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.root_signature);
+        s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, s_d3d.pipeline_state);
+        s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(
+            s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &s_d3d.vb_view);
+    }
+
+    /* Draw accumulated geometry */
+    if (s_d3d.vb_offset > 0 && s_d3d.pipeline_ready) {
+        u32 vertex_count = s_d3d.vb_offset / 28; /* 28 bytes per vertex */
+        s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list, vertex_count, 1, 0, 0);
+    }
+    s_d3d.vb_offset = 0; /* reset for next frame */
 
     /* Transition render target to PRESENT state */
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -596,7 +615,38 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                primitive, first, count);
         log_count++;
     }
-    /* TODO: actual D3D12 draw calls once we have vertex buffers + shaders */
+
+    if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
+    if (count == 0 || count > MAX_VERTICES) return;
+
+    /* Get the current RSX state from the backend's perspective.
+     * The RSX command processor passes state through the rsx_backend callbacks
+     * before draw calls, but we need the vertex attribute info here.
+     * For now, generate solid-colored placeholder vertices to prove the pipeline works.
+     * TODO: Read actual vertex data from guest memory using RSX vertex attrib state. */
+
+    /* Write placeholder triangle vertices to the VB (position + color) */
+    typedef struct { float x, y, z; float r, g, b, a; } BasicVertex;
+    BasicVertex* verts = (BasicVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
+    u32 max_verts = (MAX_VERTICES * 28 - s_d3d.vb_offset) / sizeof(BasicVertex);
+    if (count > max_verts) count = max_verts;
+
+    /* Generate a simple colored shape based on RSX draw parameters.
+     * This is a placeholder — real implementation reads from guest memory. */
+    for (u32 i = 0; i < count && i < max_verts; i++) {
+        /* Map vertex index to NDC position (simple distribution) */
+        float t = (float)(first + i) / 100.0f;
+        verts[i].x = sinf(t * 6.28f) * 0.5f;
+        verts[i].y = cosf(t * 6.28f) * 0.5f;
+        verts[i].z = 0.0f;
+        /* Color based on primitive type */
+        verts[i].r = (primitive == 5) ? 1.0f : 0.5f; /* triangles = red */
+        verts[i].g = (primitive == 6) ? 1.0f : 0.3f; /* strips = green */
+        verts[i].b = (primitive == 2) ? 1.0f : 0.2f; /* lines = blue */
+        verts[i].a = 1.0f;
+    }
+    s_d3d.vb_offset += count * sizeof(BasicVertex);
+    s_d3d.draw_count++;
 }
 
 static void d3d12_draw_indexed(void* ud, u32 primitive, u32 offset, u32 count)
@@ -606,6 +656,55 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 offset, u32 count)
     if (log_count < 20) {
         printf("[D3D12] draw_indexed(prim=%u, offset=%u, count=%u)\n",
                primitive, offset, count);
+        log_count++;
+    }
+    /* TODO: create index buffer and call DrawIndexedInstanced */
+}
+
+static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+{
+    (void)ud;
+    static int log_count = 0;
+    if (log_count < 10) {
+        printf("[D3D12] bind_texture(unit=%u, offset=0x%X, fmt=0x%X, %ux%u)\n",
+               unit, tex->offset, tex->format,
+               (tex->image_rect >> 16) & 0xFFFF,
+               tex->image_rect & 0xFFFF);
+        log_count++;
+    }
+    /* TODO: create SRV from RSX texture data. Steps needed:
+     * 1. Determine texture dimensions from image_rect
+     * 2. Determine pixel format from tex->format (NV40 texture format → DXGI)
+     * 3. Read texture data from guest memory (vm_base + tex->offset)
+     * 4. Create D3D12 texture resource (DEFAULT heap)
+     * 5. Upload via upload buffer → CopyTextureRegion
+     * 6. Create SRV in descriptor heap
+     * 7. Bind SRV to shader register t{unit}
+     */
+}
+
+static void d3d12_set_blend(void* ud, const rsx_state* state)
+{
+    (void)ud;
+    /* TODO: modify PSO blend state or use dynamic state.
+     * D3D12 requires PSO recreation for blend state changes,
+     * so we'd need a PSO cache keyed by blend configuration. */
+    static int log_count = 0;
+    if (log_count < 5) {
+        printf("[D3D12] set_blend(enable=%d, sfactor=0x%X, dfactor=0x%X)\n",
+               state->blend_enable, state->blend_sfactor, state->blend_dfactor);
+        log_count++;
+    }
+}
+
+static void d3d12_set_depth_stencil(void* ud, const rsx_state* state)
+{
+    (void)ud;
+    static int log_count = 0;
+    if (log_count < 5) {
+        printf("[D3D12] set_depth_stencil(depth=%d, stencil=%d, func=0x%X)\n",
+               state->depth_test_enable, state->stencil_test_enable,
+               state->depth_func);
         log_count++;
     }
 }
@@ -653,11 +752,11 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     s_d3d12_backend.clear             = d3d12_clear;
     s_d3d12_backend.set_render_target = d3d12_set_render_target;
     s_d3d12_backend.set_viewport      = d3d12_set_viewport;
-    s_d3d12_backend.set_blend         = NULL;
-    s_d3d12_backend.set_depth_stencil = NULL;
+    s_d3d12_backend.set_blend         = d3d12_set_blend;
+    s_d3d12_backend.set_depth_stencil = d3d12_set_depth_stencil;
     s_d3d12_backend.draw_arrays       = d3d12_draw_arrays;
     s_d3d12_backend.draw_indexed      = d3d12_draw_indexed;
-    s_d3d12_backend.bind_texture      = NULL;
+    s_d3d12_backend.bind_texture      = d3d12_bind_texture;
 
     rsx_set_backend(&s_d3d12_backend);
 
