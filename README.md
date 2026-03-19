@@ -185,7 +185,7 @@ This mirrors how RPCS3 handles SPU but at compile time rather than runtime.
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **95 modules complete, 1 partial (media decode), 240+ files, 65,000+ lines of code.**
+We're building HLE implementations based on RPCS3's module system. **97 modules complete, 1 partial (media decode), 250+ files, 70,000+ lines of code.**
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -273,8 +273,8 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 
 | Game | Title ID | Status | Repo |
 |------|----------|--------|------|
-| **flOw** (thatgamecompany) | NPUA80001 | 92K functions, CRT complete, PhyreEngine init running, 12 bctrl dispatches | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
-| **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 24K functions lifted, 18 MB exe compiles, boot sequence in progress | (local) |
+| **flOw** (thatgamecompany) | NPUA80001 | 92K functions, CRT + static constructors + engine init running, ~20K TODOs, D3D12 window | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+| **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 24K functions lifted, 18 MB exe, all 24 modules covered by ps3recomp | (local) |
 
 Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
 
