@@ -833,33 +833,100 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"v{vd}, v{va}, v{vb}, v{vc}"
             return result
 
-        # VX-form (11-bit xo)
+        # VX-form (11-bit xo in bits 21-30, but bit 21 = Rc for compares)
+        # For non-compare instructions, xo is bits 21-30 (10 bits effectively)
+        # For compare instructions, bit 21 is Rc flag
+
+        # Compare instructions (bit 21 = Rc): strip Rc to get base xo
+        xo_10 = bits(insn, 22, 30)  # 9-bit sub-opcode ignoring Rc
+        vmx_cmp_rc = bit(insn, 21)  # Rc bit for compare instructions
+
+        vmx_cmp = {
+            6: "vcmpequb", 70: "vcmpequh", 134: "vcmpequw",
+            198: "vcmpeqfp", 326: "vcmpbfp", 454: "vcmpgefp",
+            710: "vcmpgtfp",
+            518: "vcmpgtsb", 582: "vcmpgtsh", 646: "vcmpgtsw",
+            774: "vcmpgtub", 838: "vcmpgtuh", 902: "vcmpgtuw",
+        }
+        # Check if this is a compare (xo_10 matches a compare, with or without Rc)
+        cmp_xo = xo_10 | (vmx_cmp_rc << 9)  # reconstruct with Rc=0 to check
+        # Actually, the compare xo values above are the FULL 10-bit values (without Rc)
+        # So check xo_full with Rc masked off: xo_full & ~(1 << 9) = bits 22-30
+        base_cmp_xo = xo_full & ~(1 << 9)  # strip Rc bit
+        if base_cmp_xo in vmx_cmp:
+            mne = vmx_cmp[base_cmp_xo]
+            if vmx_cmp_rc:
+                mne += "."
+            result.mnemonic = mne
+            result.operands = f"v{vd}, v{va}, v{vb}"
+            return result
+
+        # Non-compare VX instructions (full 11-bit xo, no Rc ambiguity)
         vmx_vx = {
+            # Float arithmetic
             10: "vaddfp", 74: "vsubfp",
+            842: "vrefp", 778: "vrsqrtefp",
+            266: "vmaxfp", 1034: "vminfp",
+
+            # Integer add/sub
             0: "vaddubm", 64: "vadduhm", 128: "vadduwm",
             1024: "vsububm", 1088: "vsubuhm", 1152: "vsubuwm",
             512: "vaddubs", 576: "vadduhs", 640: "vadduws",
             768: "vaddsbs", 832: "vaddshs", 896: "vaddsws",
             1536: "vsububs", 1600: "vsubuhs", 1664: "vsubuws",
             1792: "vsubsbs", 1856: "vsubshs", 1920: "vsubsws",
-            1028: "vand", 1156: "vandc", 1220: "vor", 1284: "vxor",
+
+            # Integer min/max
+            256: "vmaxub", 320: "vmaxuh", 384: "vmaxuw",
+            258: "vmaxsb", 322: "vmaxsh", 386: "vmaxsw",
+            514: "vminub", 578: "vminuh", 642: "vminuw",
+            770: "vminsb", 834: "vminsh", 898: "vminsw",
+
+            # Logical
+            1028: "vand", 1092: "vandc", 1220: "vor", 1284: "vxor",
             1348: "vnor",
-            268: "vslb", 332: "vslh", 388: "vslw",
-            780: "vsrb", 844: "vsrh", 900: "vsrw",
-            908: "vsrab", 972: "vsrah", 964: "vsraw",
-            198: "vcmpequb", 70: "vcmpequh", 134: "vcmpequw",
-            774: "vcmpgtub", 838: "vcmpgtuh", 902: "vcmpgtuw",
-            518: "vcmpgtsb", 582: "vcmpgtsh", 646: "vcmpgtsw",
-            966: "vcmpbfp", 454: "vcmpgefp", 198: "vcmpeqfp",
-            710: "vcmpgtfp",
-            842: "vrefp", 778: "vrsqrtefp",
-            266: "vmaxfp", 1034: "vminfp",
+
+            # Shift
+            260: "vslb", 324: "vslh", 388: "vslw",
+            516: "vsrb", 580: "vsrh", 644: "vsrw",
+            772: "vsrab", 836: "vsrah", 900: "vsraw",
+
+            # Splat
             1098: "vspltb", 1162: "vsplth", 1226: "vspltw",
             780: "vspltisb", 844: "vspltish", 908: "vspltisw",
+
+            # Merge
             12: "vmrghb", 76: "vmrghh", 140: "vmrghw",
             268: "vmrglb", 332: "vmrglh", 396: "vmrglw",
-            846: "vctsxs", 778: "vctuxs",
+
+            # Convert
             394: "vcfsx", 330: "vcfux",
+            970: "vctsxs", 906: "vctuxs",
+
+            # Pack/unpack
+            782: "vpkuhum", 846: "vpkuwum",
+            14: "vpkuhus", 78: "vpkuwus",
+            398: "vpkshus", 462: "vpkswus",
+            270: "vpkshss", 334: "vpkswss",
+            526: "vupkhsb", 590: "vupkhsh",
+            654: "vupklsb", 718: "vupklsh",
+
+            # Rotate
+            4: "vrlb", 68: "vrlh", 132: "vrlw",
+
+            # Average
+            1026: "vavgub", 1090: "vavguh", 1154: "vavguw",
+            1282: "vavgsb", 1346: "vavgsh", 1410: "vavgsw",
+
+            # Multiply
+            8: "vmuloub", 72: "vmulouh",
+            264: "vmulosb", 328: "vmulosh",
+            520: "vmuleub", 584: "vmuleuh",
+            776: "vmulesb", 840: "vmulesh",
+
+            # Sum across
+            1032: "vsumsws", 1672: "vsum2sws",
+            1544: "vsum4ubs", 1608: "vsum4sbs", 1800: "vsum4shs",
         }
         if xo_full in vmx_vx:
             result.mnemonic = vmx_vx[xo_full]

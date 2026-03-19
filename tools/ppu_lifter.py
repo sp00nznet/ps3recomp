@@ -819,6 +819,40 @@ class PPULifter:
                     f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
                     f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((~(a | b) & 1) << (31 - {bt})); }}")
 
+        if mn == "creqv":
+            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
+            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
+                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
+                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((~(a ^ b) & 1) << (31 - {bt})); }}")
+
+        # mcrf — move condition register field
+        if mn == "mcrf":
+            # mcrf crD, crS — copy 4-bit CR field
+            bf = int(ops[0][2:]) if ops[0].startswith("cr") else int(ops[0])
+            bfa = int(ops[1][2:]) if ops[1].startswith("cr") else int(ops[1])
+            dst_shift = (7 - bf) * 4
+            src_shift = (7 - bfa) * 4
+            return (f"{{ uint32_t field = (ctx->cr >> {src_shift}) & 0xF; "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << {dst_shift})) | (field << {dst_shift}); }}")
+
+        # rlwnm — rotate left word then AND with mask (register shift)
+        if mn.startswith("rlwnm"):
+            ra = _reg_idx(ops[0])
+            rs = _reg_idx(ops[1])
+            rb = _reg_idx(ops[2])
+            mb = int(ops[3])
+            me = int(ops[4])
+            return f"ctx->gpr[{ra}] = ppc_rlwinm((uint32_t)ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 31), {mb}, {me});"
+
+        # mffs — move from FPSCR
+        if mn == "mffs" or mn == "mffs.":
+            frd = _reg_idx(ops[0])
+            return f"{{ uint64_t fpscr64 = ctx->fpscr; memcpy(&ctx->fpr[{frd}], &fpscr64, 8); }}"
+
+        # mtfsf — move to FPSCR fields
+        if mn == "mtfsf":
+            return f"/* mtfsf: FPSCR update — ignored for now */;"
+
         # ------- Store/load with update indexed -------
         if mn == "stdux":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -1173,6 +1207,132 @@ class PPULifter:
             return (f"{{ uint32_t* a=(uint32_t*)&ctx->vr[{va}]; uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
                     f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
+
+        # ------- VMX integer arithmetic (generated from disasm decode table) -------
+        # These are simple per-element operations on vector registers.
+
+        # Integer add/sub (unsigned byte/halfword/word modulo)
+        vmx_int_binop = {
+            "vaddubm": ("uint8_t",  16, "+"), "vadduhm": ("uint16_t", 8, "+"),
+            "vadduwm": ("uint32_t", 4,  "+"),
+            "vsububm": ("uint8_t",  16, "-"), "vsubuhm": ("uint16_t", 8, "-"),
+            "vsubuwm": ("uint32_t", 4,  "-"),
+            "vand":    ("uint64_t", 2,  "&"), "vandc":   None, # special
+            "vnor":    None, # special
+            "vmaxub":  None, "vmaxuh": None, "vmaxuw": None,
+            "vminub":  None, "vminuh": None, "vminuw": None,
+            "vmaxsb":  None, "vmaxsh": None, "vmaxsw": None,
+            "vminsb":  None, "vminsh": None, "vminsw": None,
+        }
+
+        if mn in ("vaddubm", "vadduhm", "vadduwm", "vsububm", "vsubuhm", "vsubuwm"):
+            ty, cnt, op = vmx_int_binop[mn]
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
+                    f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<{cnt};i++) d[i]=a[i]{op}b[i]; }}")
+
+        if mn == "vandc":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint64_t* d=(uint64_t*)&ctx->vr[{vd}]; "
+                    f"uint64_t* a=(uint64_t*)&ctx->vr[{va}]; "
+                    f"uint64_t* b=(uint64_t*)&ctx->vr[{vb}]; "
+                    f"d[0]=a[0]&~b[0]; d[1]=a[1]&~b[1]; }}")
+
+        if mn == "vnor":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint64_t* d=(uint64_t*)&ctx->vr[{vd}]; "
+                    f"uint64_t* a=(uint64_t*)&ctx->vr[{va}]; "
+                    f"uint64_t* b=(uint64_t*)&ctx->vr[{vb}]; "
+                    f"d[0]=~(a[0]|b[0]); d[1]=~(a[1]|b[1]); }}")
+
+        # Integer min/max
+        for prefix in ("vmax", "vmin"):
+            for suffix, ty, cnt, signed in [("ub","uint8_t",16,0),("uh","uint16_t",8,0),
+                                             ("uw","uint32_t",4,0),("sb","int8_t",16,1),
+                                             ("sh","int16_t",8,1),("sw","int32_t",4,1)]:
+                iname = prefix + suffix
+                if mn == iname:
+                    vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+                    cmp = ">" if prefix == "vmax" else "<"
+                    return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
+                            f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
+                            f"for(int i=0;i<{cnt};i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+
+        # Float min/max
+        if mn == "vmaxfp" or mn == "vminfp":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            cmp = ">" if mn == "vmaxfp" else "<"
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
+                    f"float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+
+        # Splat immediate (vspltisb/h/w) — splat a 5-bit signed immediate
+        if mn in ("vspltisb", "vspltish", "vspltisw"):
+            vd = int(ops[0][1:])
+            simm = int(ops[1]) if not ops[1].startswith("v") else int(ops[1][1:])
+            # Sign extend 5-bit to appropriate type
+            if simm > 15: simm -= 32
+            if mn == "vspltisb":
+                return (f"{{ memset(&ctx->vr[{vd}], (uint8_t){simm}, 16); }}")
+            elif mn == "vspltish":
+                return (f"{{ int16_t* d=(int16_t*)&ctx->vr[{vd}]; "
+                        f"for(int i=0;i<8;i++) d[i]={simm}; }}")
+            else:
+                return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; "
+                        f"for(int i=0;i<4;i++) d[i]={simm}; }}")
+
+        # Merge (vmrghb/h/w, vmrglb/h/w) — interleave elements
+        if mn.startswith("vmrg"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            high = "h" in mn[4:5]
+            if "b" in mn[4:]:
+                ty, cnt = "uint8_t", 16
+            elif "h" in mn[4:]:
+                ty, cnt = "uint16_t", 8
+            else:
+                ty, cnt = "uint32_t", 4
+            half = cnt // 2
+            off = 0 if high else half
+            return (f"{{ {ty} tmp[{cnt}]; {ty}* a=({ty}*)&ctx->vr[{va}]; {ty}* b=({ty}*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<{half};i++) {{ tmp[i*2]=a[{off}+i]; tmp[i*2+1]=b[{off}+i]; }} "
+                    f"memcpy(&ctx->vr[{vd}], tmp, 16); }}")
+
+        # Float reciprocal estimate / reciprocal sqrt estimate
+        if mn == "vrefp":
+            vd, vb = int(ops[0][1:]), int(ops[1][1:]) if len(ops) > 1 else int(ops[0][1:])
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=1.0f/b[i]; }}")
+
+        if mn == "vrsqrtefp":
+            vd, vb = int(ops[0][1:]), int(ops[1][1:]) if len(ops) > 1 else int(ops[0][1:])
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); }}")
+
+        # Float/int convert
+        if mn == "vcfsx" or mn == "vcfux":
+            vd, vb = int(ops[0][1:]), int(ops[1][1:])
+            uimm = int(ops[2]) if len(ops) > 2 else 0
+            src_ty = "int32_t" if mn == "vcfsx" else "uint32_t"
+            scale = f" / {1 << uimm}.0f" if uimm > 0 else ""
+            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; {src_ty}* b=({src_ty}*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=(float)b[i]{scale}; }}")
+
+        if mn == "vctsxs" or mn == "vctuxs":
+            vd, vb = int(ops[0][1:]), int(ops[1][1:])
+            uimm = int(ops[2]) if len(ops) > 2 else 0
+            dst_ty = "int32_t" if mn == "vctsxs" else "uint32_t"
+            scale = f" * {1 << uimm}.0f" if uimm > 0 else ""
+            return (f"{{ {dst_ty}* d=({dst_ty}*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=({dst_ty})(b[i]{scale}); }}")
+
+        # Compare with Rc (vcmpeqfp., vcmpgefp., etc.)
+        if mn.startswith("vcmpbfp"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
+                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
+                    f"for(int i=0;i<4;i++) {{ uint32_t r=0; "
+                    f"if(a[i]>b[i]) r|=0x80000000u; if(a[i]<-b[i]) r|=0x40000000u; d[i]=r; }} }}")
 
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
