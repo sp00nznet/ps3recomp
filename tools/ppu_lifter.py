@@ -959,7 +959,16 @@ class PPULifter:
                     f"ctx->gpr[{rd}] = (tb >> 32); }}")
 
         # ------- Cache/sync ops (safe to no-op) -------
-        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcbz", "dcba", "icbi",
+        # dcbz zeros a 128-byte cache line — MUST be implemented, not no-oped!
+        # Games use dcbz loops to zero large memory regions. If we no-op dcbz,
+        # the loop runs trillions of iterations doing nothing.
+        if mn == "dcbz":
+            ra = _reg_idx(ops[0])
+            rb = _reg_idx(ops[1])
+            return (f"{{ uint64_t ea = (ctx->gpr[{ra}] + ctx->gpr[{rb}]) & ~0x7FULL; "
+                    f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
+
+        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi",
                   "sync", "eieio", "isync", "lwsync", "ptesync"):
             return f"/* {mn}: cache/sync — no-op */;"
 
