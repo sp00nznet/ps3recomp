@@ -273,9 +273,10 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 
 | Game | Title ID | Status | Repo |
 |------|----------|--------|------|
-| **flOw** (thatgamecompany) | NPUA80001 | 51K functions lifted, CRT boot working, 7/12 real HLE bridges | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+| **flOw** (thatgamecompany) | NPUA80001 | 92K functions, CRT complete, PhyreEngine init running, 12 bctrl dispatches | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+| **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 24K functions lifted, 18 MB exe compiles, boot sequence in progress | (local) |
 
-Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough of the porting process.
+Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
 
 ## Relationship to Other Projects
 
