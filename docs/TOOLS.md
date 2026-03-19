@@ -183,52 +183,85 @@ The disassembler performs basic block analysis:
 
 ### Translation Strategy
 
-Each PowerPC instruction maps to one or more C statements. The lifter maintains the PPU context as local C variables:
+Each PowerPC instruction maps to one or more C statements. The lifter operates directly on the `ppu_context` struct — registers are accessed via `ctx->gpr[N]`, `ctx->lr`, `ctx->cr`, etc.:
 
 ```c
-void recomp_func_00010000(ppu_context* ctx)
-{
-    uint64_t r0 = ctx->gpr[0];
-    uint64_t r1 = ctx->gpr[1];
-    // ... all used registers
-    uint32_t cr = ctx->cr;
-    uint64_t lr = ctx->lr;
+void func_00010000(ppu_context* ctx) {
+    // mflr r0
+    ctx->gpr[0] = ctx->lr;
 
-    // Instruction: mflr r0
-    r0 = lr;
+    // std r0, 0x10(r1)
+    vm_write64(ctx->gpr[1] + 0x10, ctx->gpr[0]);
 
-    // Instruction: std r0, 0x10(r1)
-    vm_write64(r1 + 0x10, r0);
+    // stdu r1, -0x90(r1)
+    vm_write64(ctx->gpr[1] + -0x90, ctx->gpr[1]);
+    ctx->gpr[1] += -0x90;
 
-    // Instruction: stdu r1, -0x90(r1)
-    vm_write64(r1 - 0x90, r1);
-    r1 = r1 - 0x90;
+    // bl func_00010200
+    func_00010200(ctx);
 
-    // ... more instructions
-
-    // Write back modified registers
-    ctx->gpr[0] = r0;
-    ctx->gpr[1] = r1;
-    ctx->cr = cr;
-    ctx->lr = lr;
+    // blr
+    return;
 }
 ```
+
+Functions are named `func_XXXXXXXX` where `XXXXXXXX` is the guest address in hex. Internal branches become `goto` labels; external branches become function calls.
+
+### Important Lifter Behaviors
+
+**Split-function fallthrough:** When a function ends without `blr` or `b`, the lifter emits a call to the next function by address. This handles cases where the function boundary detector splits a PPC function into multiple C functions at address boundaries.
+
+**Indirect calls (bctrl):** Emitted as `ps3_indirect_call(ctx)` which dispatches through a hash table mapping guest addresses to host function pointers. The game project must provide this function. It also handles OPD (Official Procedure Descriptor) resolution.
+
+**TOC save:** The lifter does NOT emit `std r2, 40(r1)` before import stub calls (the PS3 linker normally inserts this). Game projects must save the TOC in their `nid_dispatch()` function.
+
+**VMX/AltiVec:** Vector instructions operate on `ctx->vr[N]` (128-bit registers). Vector loads/stores access guest memory via `vm_base + addr` with 16-byte alignment. Float operations treat each register as 4×float32.
 
 ### Key Translations
 
 | PowerPC | C Output | Notes |
 |---------|----------|-------|
-| `add r3, r4, r5` | `r3 = r4 + r5;` | — |
-| `addi r3, r4, 100` | `r3 = r4 + 100;` | — |
-| `lwz r3, 0x10(r4)` | `r3 = vm_read32(r4 + 0x10);` | Big-endian load |
-| `stw r3, 0x10(r4)` | `vm_write32(r4 + 0x10, (uint32_t)r3);` | Big-endian store |
-| `bl 0x10200` | `recomp_func_00010200(ctx);` | Direct function call |
+| `add r3, r4, r5` | `ctx->gpr[3] = ctx->gpr[4] + ctx->gpr[5];` | — |
+| `addi r3, r4, 100` | `ctx->gpr[3] = (int64_t)(int32_t)(ctx->gpr[4] + 100);` | Sign-extended |
+| `lwz r3, 0x10(r4)` | `ctx->gpr[3] = vm_read32(ctx->gpr[4] + 0x10);` | Big-endian load |
+| `stw r3, 0x10(r4)` | `vm_write32(ctx->gpr[4] + 0x10, (uint32_t)ctx->gpr[3]);` | Big-endian store |
+| `bl 0x10200` | `func_00010200(ctx);` | Direct function call |
+| `bctrl` | `ps3_indirect_call(ctx);` | Indirect call via hash table |
 | `blr` | `return;` | Function return |
-| `cmpwi cr0, r3, 0` | `cr0 = CMP_S32(r3, 0);` | Set CR field |
-| `beq target` | `if (cr0 & CR_EQ) goto label;` | Conditional branch |
-| `sc` | `lv2_syscall(ctx);` | System call |
-| `lwarx r3, 0, r4` | Atomic reservation | Sets reserve_addr |
-| `stwcx. r3, 0, r4` | Atomic store conditional | Checks/clears reserve |
+| `cmpwi cr0, r3, 0` | `{ int64_t a = ...; int64_t b = ...; cr_val = ...; }` | Inline CR update |
+| `beq target` | `if (((ctx->cr >> shift) & 2)) goto loc_XXXX;` | CR EQ bit check |
+| `sc` | `lv2_syscall(ctx);` | System call dispatch |
+| `lwarx r3, 0, r4` | `ctx->gpr[3] = vm_read32(ea); ctx->reserve_addr = ea;` | Atomic reservation |
+| `stwcx. r3, 0, r4` | `if (reserve_addr == ea) { store; CR0=EQ; } else { CR0=0; }` | Conditional store |
+| `lvx v3, r4, r5` | `memcpy(&ctx->vr[3], vm_base + (ea & ~0xF), 16);` | VMX vector load |
+| `vmaddfp v3, v4, v5, v6` | `d[i] = a[i] * c[i] + b[i]; (4× float)` | VMX multiply-add |
+| `vperm v3, v4, v5, v6` | Byte permutation across two source vectors | VMX shuffle |
+
+### Instruction Coverage
+
+The lifter handles **100+ instruction mnemonics** across these categories:
+
+| Category | Instructions | Count |
+|----------|------------|-------|
+| Integer arithmetic | add, addi, addis, subf, neg, mulld, divd, adde, addze, ... | ~25 |
+| Integer logical | and, or, xor, nand, nor, andc, orc, extsb, extsh, ... | ~15 |
+| Loads/stores | lwz, lbz, lhz, ld, stw, stb, sth, std, lwa, lwbrx, ... | ~30 |
+| Branches | b, bl, blr, bctrl, bctr, beq, bne, blt, bgt, ... | ~20 |
+| Rotate/shift | rlwinm, rlwimi, rldicl, rldicr, rldic, rldimi, rldcl, rlwnm, ... | ~10 |
+| Compare | cmpw, cmpd, cmplw, cmpld, cmpwi, cmplwi, ... | ~8 |
+| CR logical | cror, crand, crnand, crxor, crnor, creqv, mcrf | 7 |
+| FP arithmetic | fadd, fsub, fmul, fdiv, fmadd, fmsub, fneg, fabs, ... | ~20 |
+| FP convert | fcfid, fctid, fctiw, frsp, fsel, fsqrt, fres, ... | ~10 |
+| VMX load/store | lvx, stvx, lvebx, stvebx, lvsl, lvsr, ... | ~12 |
+| VMX float | vmaddfp, vnmsubfp, vaddfp, vsubfp, vmaxfp, vrefp, vrsqrtefp | 7 |
+| VMX integer | vaddubm-uwm, vsububm-uwm, vmax/vmin (all types), ... | ~30 |
+| VMX logical | vand, vandc, vor, vxor, vnor, vsel, vperm, vsldoi | 8 |
+| VMX compare | vcmpeqfp, vcmpgefp, vcmpgtfp, vcmpbfp, vcmpequb-w, ... | ~12 |
+| VMX convert | vcfsx, vcfux, vctsxs, vctuxs | 4 |
+| VMX misc | vspltw, vspltisb/h/w, vmrghb-w, vmrglb-w, vmsumshm | ~10 |
+| Atomics | lwarx, stwcx., ldarx, stdcx. | 4 |
+| System | sc, tw, mflr, mtlr, mfcr, mtcrf, mfctr, mtctr, mftb | ~10 |
+| Cache/sync | dcbt, dcbf, sync, eieio, isync (all no-ops) | ~10 |
 
 ### Memory Access Macros
 
