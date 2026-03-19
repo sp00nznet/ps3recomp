@@ -296,6 +296,25 @@ s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch);
 /* NID: 0xBC982946 */
 void cellGcmSetDebugOutputLevel(u32 level);
 
+/* --- Additional functions needed by Tokyo Jungle --- */
+
+/* Tile info (alternative to cellGcmSetTile) */
+s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size,
+                       u32 pitch, u8 comp, u16 base, u8 bank);
+
+/* Notify data area (similar to report data) */
+void* cellGcmGetNotifyDataAddress(u32 index);
+
+/* Timestamp location query */
+u32 cellGcmGetTimeStampLocation(u32 index, u32* location);
+
+/* Default FIFO size configuration */
+s32 cellGcmSetDefaultFifoSize(u32 size);
+
+/* Internal flip commands (called by game code directly) */
+s32 _cellGcmSetFlipCommand(u32 bufferId);
+s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue);
+
 #ifdef __cplusplus
 }
 #endif

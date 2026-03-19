@@ -775,3 +775,52 @@ void cellGcmSetDebugOutputLevel(u32 level)
     printf("[cellGcmSys] SetDebugOutputLevel(level=%u)\n", level);
     s_debug_level = level;
 }
+
+/* ---------------------------------------------------------------------------
+ * Additional functions needed by Tokyo Jungle
+ * -----------------------------------------------------------------------*/
+
+/* Notify data area — similar to report data, 16 bytes per slot */
+static u8 s_notify_data[256 * 16];
+
+void* cellGcmGetNotifyDataAddress(u32 index)
+{
+    if (index >= 256) return NULL;
+    return &s_notify_data[index * 16];
+}
+
+/* Timestamp location — returns CELL_GCM_LOCATION_LOCAL or MAIN */
+u32 cellGcmGetTimeStampLocation(u32 index, u32* location)
+{
+    if (location) *location = CELL_GCM_LOCATION_LOCAL;
+    return 0;
+}
+
+/* SetTileInfo — alternative to SetTile with same parameters */
+s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size,
+                       u32 pitch, u8 comp, u16 base, u8 bank)
+{
+    /* Delegates to existing SetTile */
+    return cellGcmSetTile(index, location, offset, size, pitch, comp, base, bank);
+}
+
+/* Default FIFO size — configures command buffer size before init */
+static u32 s_default_fifo_size = 0x40000; /* 256KB default */
+
+s32 cellGcmSetDefaultFifoSize(u32 size)
+{
+    printf("[cellGcmSys] SetDefaultFifoSize(0x%X)\n", size);
+    s_default_fifo_size = size;
+    return CELL_OK;
+}
+
+/* Internal flip commands — called directly by some games */
+s32 _cellGcmSetFlipCommand(u32 bufferId)
+{
+    return cellGcmSetFlipCommand(bufferId);
+}
+
+s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue)
+{
+    return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
+}
