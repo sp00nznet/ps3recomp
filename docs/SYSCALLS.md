@@ -538,3 +538,46 @@ PRX management is handled by the HLE module system rather than true LLE module l
 | 491 | `sys_prx_get_module_list` | List loaded modules |
 | 492 | `sys_prx_get_module_info` | Query module info (name, version) |
 | 493 | `sys_prx_get_module_id_by_name` | Find module ID by name |
+
+---
+
+## TTY Console I/O
+
+**Syscall numbers:** 402–403
+
+Used by the PS3 CRT for debug console output during startup. These are among the first syscalls called after TLS initialization.
+
+| # | Name | Description |
+|---|------|-------------|
+| 402 | `sys_tty_read` | Read from TTY input — returns 0 bytes (no input available) |
+| 403 | `sys_tty_write` | Write to TTY output — forwards to host `stderr` via `fwrite` |
+
+### sys_tty_write Details
+
+```
+r3 = channel number (ignored)
+r4 = guest address of buffer
+r5 = length in bytes
+r6 = guest address of u32 to receive bytes written
+```
+
+The implementation reads raw bytes from guest memory (`vm_base + buf_addr`) and writes them to the host's `stderr`. The byte count is written back to the output pointer in big-endian format.
+
+**Why this matters:** The PS3 CRT prints diagnostic messages via `sys_tty_write` during initialization. Without this syscall, CRT error messages (like "not enough memory to initialize mutex") are silently lost, making debugging much harder.
+
+---
+
+## Memory Layout
+
+The `sys_memory_allocate` bump allocator uses the following address space layout:
+
+```
+0x00010000 - 0x00900000    ELF code + data segments
+0x00A00000 - 0x10000000    CRT malloc heap (game project's bump allocator)
+0x10000000 - 0x20000000    RSX region (ELF rodata + RSX local memory)
+0x20000000 - 0x30000000    sys_memory_allocate region (GPU memory, etc.)
+0xD0000000 - 0xD0200000    Stack region (vm_stack_alloc)
+0x0F000000 - 0x0F100000    TLS allocation region
+```
+
+**Important:** The CRT malloc heap (0x00A00000+) is managed by the game project's `hle_guest_malloc`, NOT by `sys_memory_allocate`. The two regions must not overlap. `sys_memory_allocate` starts at 0x20000000 to ensure separation.
