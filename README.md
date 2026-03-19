@@ -273,8 +273,8 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 
 | Game | Title ID | Status | Repo |
 |------|----------|--------|------|
-| **flOw** (thatgamecompany) | NPUA80001 | 92K functions, CRT + static constructors + engine init running, ~20K TODOs, D3D12 window | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
-| **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 24K functions lifted, 18 MB exe, all 24 modules covered by ps3recomp | (local) |
+| **flOw** (thatgamecompany) | NPUA80001 | 92K functions, CRT complete, engine init running, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+| **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 33K functions lifted, CRT init + HLE framework wired, indirect call dispatch | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
 
 Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
 
