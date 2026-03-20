@@ -151,6 +151,26 @@ void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
 s32 sys_prx_exitspawn_with_level(void);
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
 
+/* ---------------------------------------------------------------------------
+ * Random number generation
+ * -----------------------------------------------------------------------*/
+
+s32 sys_get_random_number(void* buf, u64 size);
+
+/* ---------------------------------------------------------------------------
+ * Console I/O (debug)
+ * -----------------------------------------------------------------------*/
+
+s32 console_putc(s32 ch);
+s32 console_getc(void);
+s32 console_write(const void* buf, u32 len);
+
+/* ---------------------------------------------------------------------------
+ * Process info
+ * -----------------------------------------------------------------------*/
+
+s32 sys_process_get_paramsfo(void* buf);
+
 #ifdef __cplusplus
 }
 #endif

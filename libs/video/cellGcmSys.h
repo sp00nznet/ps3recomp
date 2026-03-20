@@ -161,6 +161,9 @@ typedef void (*CellGcmFlipHandler)(u32 head);
 typedef void (*CellGcmVBlankHandler)(u32 head);
 typedef void (*CellGcmUserHandler)(u32 cause);
 typedef void (*CellGcmSecondVHandler)(u32 head);
+typedef s32  (*CellGcmContextCallback)(void* context, u32 count);
+typedef void (*CellGcmGraphicsHandler)(u32 val);
+typedef void (*CellGcmQueueHandler)(u32 head);
 
 /* ---------------------------------------------------------------------------
  * Functions
@@ -314,6 +317,70 @@ s32 cellGcmSetDefaultFifoSize(u32 size);
 /* Internal flip commands (called by game code directly) */
 s32 _cellGcmSetFlipCommand(u32 bufferId);
 s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue);
+
+/* --- Additional functions (RPCS3 parity) --- */
+
+/* FIFO command buffer callback */
+s32 cellGcmCallback(void* context, u32 count);
+
+/* Map RSX local memory */
+s32 cellGcmMapLocalMemory(u32* address, u32* size);
+
+/* Shutdown RSX */
+void cellGcmTerminate(void);
+
+/* IO map size queries */
+u32 cellGcmGetMaxIoMapSize(void);
+s32 cellGcmReserveIoMapSize(u32 size);
+s32 cellGcmUnreserveIoMapSize(u32 size);
+
+/* VBlank counter */
+u32 cellGcmGetVBlankCount(void);
+
+/* Tile / Zcull info getters */
+CellGcmTileInfo* cellGcmGetTileInfo(u8 index);
+CellGcmZcullInfo* cellGcmGetZcullInfo(u8 index);
+
+/* Display info by index */
+CellGcmDisplayInfo* cellGcmGetDisplayInfo(u32 index);
+
+/* Default FIFO mode / command buffer */
+void cellGcmInitDefaultFifoMode(s32 mode);
+void cellGcmSetDefaultCommandBuffer(void);
+
+/* Debug dump (no-op) */
+void cellGcmDumpGraphicsError(void);
+
+/* Default word sizes */
+u32 cellGcmGetDefaultCommandWordSize(void);
+u32 cellGcmGetDefaultSegmentWordSize(void);
+
+/* Immediate flip */
+s32 cellGcmSetFlipImmediate(u32 bufferId);
+
+/* Flip status setter */
+void cellGcmSetFlipStatus(u32 status);
+
+/* Graphics / queue handler setters */
+void cellGcmSetGraphicsHandler(CellGcmGraphicsHandler handler);
+void cellGcmSetQueueHandler(CellGcmQueueHandler handler);
+
+/* Frequency / VBlank configuration */
+void cellGcmSetSecondVFrequency(u32 freq);
+void cellGcmSetVBlankFrequency(u32 freq);
+
+/* User command */
+void cellGcmSetUserCommand(u32 cmd);
+
+/* Invalidate tile */
+s32 cellGcmSetInvalidateTile(u8 index);
+
+/* EA IO address remap (stub) */
+void cellGcmSortRemapEaIoAddress(void);
+
+/* Report data with location */
+CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location);
+u32 cellGcmGetReportDataLocation(u32 index, u32 location);
 
 #ifdef __cplusplus
 }

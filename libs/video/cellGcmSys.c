@@ -104,6 +104,26 @@ static CellGcmSecondVHandler s_second_v_handler = NULL;
 /* Flip timing */
 static u64 s_last_flip_time = 0;
 
+/* VBlank counter (incremented on each flip as approximation) */
+static u32 s_vblank_count = 0;
+
+/* IO map reservation tracking */
+static u32 s_io_map_reserved = 0;  /* bytes reserved for IO mapping */
+
+/* Default FIFO mode */
+static s32 s_default_fifo_mode = 0;
+
+/* Graphics / queue handlers */
+static CellGcmGraphicsHandler s_graphics_handler = NULL;
+static CellGcmQueueHandler    s_queue_handler    = NULL;
+
+/* Second V / VBlank frequency */
+static u32 s_second_v_frequency = 0;
+static u32 s_vblank_frequency   = 0;
+
+/* User command */
+static u32 s_user_command = 0;
+
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
 
@@ -240,6 +260,14 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+    s_vblank_count = 0;
+    s_io_map_reserved = 0;
+    s_default_fifo_mode = 0;
+    s_graphics_handler = NULL;
+    s_queue_handler = NULL;
+    s_second_v_frequency = 0;
+    s_vblank_frequency = 0;
+    s_user_command = 0;
 
     /* Set up the initial IO mapping for the command buffer region */
     if (ioAddress != 0 && ioSize > 0) {
@@ -823,4 +851,265 @@ s32 _cellGcmSetFlipCommand(u32 bufferId)
 s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue)
 {
     return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
+}
+
+/* ---------------------------------------------------------------------------
+ * Additional functions (RPCS3 parity)
+ * -----------------------------------------------------------------------*/
+
+/* FIFO command buffer callback — called when put pointer wraps.
+ * In recomp we don't have a real GPU consuming FIFO, so this is a no-op. */
+s32 cellGcmCallback(void* context, u32 count)
+{
+    (void)context;
+    (void)count;
+    return CELL_OK;
+}
+
+/* Map RSX local memory — returns the base address and size of local VRAM */
+s32 cellGcmMapLocalMemory(u32* address, u32* size)
+{
+    if (!address || !size)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+
+    *address = s_config.localAddress;
+    *size    = s_config.localSize;
+
+    printf("[cellGcmSys] MapLocalMemory(address=0x%08X, size=0x%X)\n",
+           *address, *size);
+    return CELL_OK;
+}
+
+/* Shutdown RSX — clear all state */
+void cellGcmTerminate(void)
+{
+    printf("[cellGcmSys] Terminate\n");
+
+    s_gcm_initialized = 0;
+    s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
+    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+    s_vblank_count = 0;
+    s_io_map_reserved = 0;
+    s_default_fifo_mode = 0;
+    s_user_command = 0;
+
+    memset(s_display_buffers, 0, sizeof(s_display_buffers));
+    memset(s_display_buffer_set, 0, sizeof(s_display_buffer_set));
+    memset(&s_config, 0, sizeof(s_config));
+    memset(&s_control, 0, sizeof(s_control));
+    memset(s_io_mappings, 0, sizeof(s_io_mappings));
+    memset(s_tiles, 0, sizeof(s_tiles));
+    memset(s_zcull, 0, sizeof(s_zcull));
+    memset(s_report_data, 0, sizeof(s_report_data));
+    memset(s_labels, 0, sizeof(s_labels));
+    memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
+    memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
+
+    s_flip_handler     = NULL;
+    s_vblank_handler   = NULL;
+    s_user_handler     = NULL;
+    s_second_v_handler = NULL;
+    s_graphics_handler = NULL;
+    s_queue_handler    = NULL;
+    s_local_mem_allocated = 0;
+    s_io_mapping_count = 0;
+    s_current_display_buffer_id = 0;
+    s_last_flip_time = 0;
+}
+
+/* Return remaining IO map space (256MB total IO space minus already mapped) */
+u32 cellGcmGetMaxIoMapSize(void)
+{
+    /* RSX has a 256MB IO address window */
+    u32 total_io = 256 * 1024 * 1024;
+    u32 used = 0;
+
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+        if (s_io_mappings[i].active)
+            used += s_io_mappings[i].size;
+    }
+
+    return (used < total_io) ? (total_io - used) : 0;
+}
+
+/* Reserve IO map space (pre-allocation for future mappings) */
+s32 cellGcmReserveIoMapSize(u32 size)
+{
+    u32 max_size = cellGcmGetMaxIoMapSize();
+    if (size > max_size - s_io_map_reserved)
+        return CELL_GCM_ERROR_FAILURE;
+
+    s_io_map_reserved += size;
+    return CELL_OK;
+}
+
+/* Unreserve IO map space */
+s32 cellGcmUnreserveIoMapSize(u32 size)
+{
+    if (size > s_io_map_reserved)
+        return CELL_GCM_ERROR_FAILURE;
+
+    s_io_map_reserved -= size;
+    return CELL_OK;
+}
+
+/* Return incrementing VBlank counter */
+u32 cellGcmGetVBlankCount(void)
+{
+    /* Approximate: increment each time queried (games use this for timing) */
+    return s_vblank_count++;
+}
+
+/* Return tile info for a given index */
+CellGcmTileInfo* cellGcmGetTileInfo(u8 index)
+{
+    if (index >= CELL_GCM_MAX_TILE_COUNT) {
+        printf("[cellGcmSys] WARNING: GetTileInfo index %u out of range\n", index);
+        return NULL;
+    }
+    return &s_tiles[index];
+}
+
+/* Return zcull info for a given index */
+CellGcmZcullInfo* cellGcmGetZcullInfo(u8 index)
+{
+    if (index >= CELL_GCM_MAX_ZCULL_COUNT) {
+        printf("[cellGcmSys] WARNING: GetZcullInfo index %u out of range\n", index);
+        return NULL;
+    }
+    return &s_zcull[index];
+}
+
+/* Return display buffer info by index */
+CellGcmDisplayInfo* cellGcmGetDisplayInfo(u32 index)
+{
+    if (index >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM) {
+        printf("[cellGcmSys] WARNING: GetDisplayInfo index %u out of range\n", index);
+        return NULL;
+    }
+    return &s_display_buffers[index];
+}
+
+/* Set default FIFO mode (before init) */
+void cellGcmInitDefaultFifoMode(s32 mode)
+{
+    printf("[cellGcmSys] InitDefaultFifoMode(mode=%d)\n", mode);
+    s_default_fifo_mode = mode;
+}
+
+/* Set command buffer to defaults (reset put/get pointers) */
+void cellGcmSetDefaultCommandBuffer(void)
+{
+    printf("[cellGcmSys] SetDefaultCommandBuffer\n");
+    s_control.put = 0;
+    s_control.get = 0;
+    s_control.ref = 0;
+}
+
+/* Debug dump — no-op in recomp */
+void cellGcmDumpGraphicsError(void)
+{
+    printf("[cellGcmSys] DumpGraphicsError (no-op)\n");
+}
+
+/* Default command word size: 0x400 (1024) words */
+u32 cellGcmGetDefaultCommandWordSize(void)
+{
+    return 0x400;
+}
+
+/* Default segment word size: 0x100 (256) words */
+u32 cellGcmGetDefaultSegmentWordSize(void)
+{
+    return 0x100;
+}
+
+/* Immediate flip — perform flip right now */
+s32 cellGcmSetFlipImmediate(u32 bufferId)
+{
+    printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId);
+    return cellGcmSetFlipCommand(bufferId);
+}
+
+/* Set flip status directly */
+void cellGcmSetFlipStatus(u32 status)
+{
+    s_flip_status = status;
+}
+
+/* Store graphics handler callback */
+void cellGcmSetGraphicsHandler(CellGcmGraphicsHandler handler)
+{
+    printf("[cellGcmSys] SetGraphicsHandler(%p)\n", (void*)(size_t)handler);
+    s_graphics_handler = handler;
+}
+
+/* Store queue handler callback */
+void cellGcmSetQueueHandler(CellGcmQueueHandler handler)
+{
+    printf("[cellGcmSys] SetQueueHandler(%p)\n", (void*)(size_t)handler);
+    s_queue_handler = handler;
+}
+
+/* Set second V frequency */
+void cellGcmSetSecondVFrequency(u32 freq)
+{
+    printf("[cellGcmSys] SetSecondVFrequency(%u)\n", freq);
+    s_second_v_frequency = freq;
+}
+
+/* Set VBlank frequency */
+void cellGcmSetVBlankFrequency(u32 freq)
+{
+    printf("[cellGcmSys] SetVBlankFrequency(%u)\n", freq);
+    s_vblank_frequency = freq;
+}
+
+/* Store user command value */
+void cellGcmSetUserCommand(u32 cmd)
+{
+    s_user_command = cmd;
+}
+
+/* Invalidate a tile region (unbind + clear) */
+s32 cellGcmSetInvalidateTile(u8 index)
+{
+    if (index >= CELL_GCM_MAX_TILE_COUNT)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+
+    printf("[cellGcmSys] SetInvalidateTile(index=%u)\n", index);
+
+    s_tiles[index].bound = 0;
+    memset(&s_tiles[index], 0, sizeof(CellGcmTileInfo));
+    return CELL_OK;
+}
+
+/* EA IO address remap — stub, sorting not needed in recomp */
+void cellGcmSortRemapEaIoAddress(void)
+{
+    /* No-op: IO address remapping not required for recomp */
+}
+
+/* Report data with location parameter */
+CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location)
+{
+    (void)location;  /* We only have one report area */
+
+    if (index >= CELL_GCM_MAX_REPORT_COUNT) {
+        printf("[cellGcmSys] WARNING: GetReportDataAddressLocation index %u out of range\n", index);
+        return NULL;
+    }
+    return &s_report_data[index];
+}
+
+/* Get report value at index with location */
+u32 cellGcmGetReportDataLocation(u32 index, u32 location)
+{
+    (void)location;
+
+    if (index >= CELL_GCM_MAX_REPORT_COUNT)
+        return 0;
+
+    return s_report_data[index].value;
 }

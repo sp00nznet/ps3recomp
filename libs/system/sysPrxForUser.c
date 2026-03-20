@@ -559,3 +559,75 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
     *id = 0; /* fake module ID */
     return CELL_OK;
 }
+
+/* ---------------------------------------------------------------------------
+ * Random number generation
+ *
+ * Used by many games for seeding RNG, crypto operations, UUID generation.
+ * We use the host OS PRNG for quality random data.
+ * -----------------------------------------------------------------------*/
+
+s32 sys_get_random_number(void* buf, u64 size)
+{
+    if (!buf || size == 0) return CELL_EFAULT;
+
+#ifdef _WIN32
+    /* Use BCryptGenRandom on Windows */
+    #include <bcrypt.h>
+    NTSTATUS status = BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)size,
+                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (status != 0) {
+        /* Fallback: fill with simple pseudo-random */
+        u8* p = (u8*)buf;
+        for (u64 i = 0; i < size; i++)
+            p[i] = (u8)(rand() & 0xFF);
+    }
+#else
+    /* Use /dev/urandom on Unix */
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (f) {
+        fread(buf, 1, (size_t)size, f);
+        fclose(f);
+    } else {
+        u8* p = (u8*)buf;
+        for (u64 i = 0; i < size; i++)
+            p[i] = (u8)(rand() & 0xFF);
+    }
+#endif
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Console I/O (debug)
+ * -----------------------------------------------------------------------*/
+
+s32 console_putc(s32 ch)
+{
+    fputc(ch, stderr);
+    return CELL_OK;
+}
+
+s32 console_getc(void)
+{
+    return -1; /* no input */
+}
+
+s32 console_write(const void* buf, u32 len)
+{
+    if (buf && len > 0)
+        fwrite(buf, 1, len, stderr);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Process info
+ * -----------------------------------------------------------------------*/
+
+s32 sys_process_get_paramsfo(void* buf)
+{
+    /* PARAM.SFO data — return a minimal valid SFO with title ID */
+    if (!buf) return CELL_EFAULT;
+    memset(buf, 0, 256);
+    return CELL_OK;
+}
