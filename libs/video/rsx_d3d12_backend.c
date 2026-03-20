@@ -791,6 +791,52 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     }
 }
 
+static void d3d12_set_vertex_attribs(void* ud, const rsx_state* state)
+{
+    (void)ud;
+    s_d3d.current_rsx_state = state;
+
+    /* Log enabled vertex attributes for debugging */
+    static int log_count = 0;
+    if (log_count < 5) {
+        printf("[D3D12] set_vertex_attribs:\n");
+        for (int i = 0; i < 16; i++) {
+            const rsx_vertex_attrib* a = &state->vertex_attribs[i];
+            if (a->enabled) {
+                const char* type_name = "?";
+                switch (a->type) {
+                case 1: type_name = "snorm16"; break;
+                case 2: type_name = "float32"; break;
+                case 3: type_name = "float16"; break;
+                case 4: type_name = "ubyte"; break;
+                case 5: type_name = "s16"; break;
+                case 7: type_name = "ubyte256"; break;
+                }
+                printf("  attrib[%d]: %s x%u, stride=%u, offset=0x%X\n",
+                       i, type_name, a->size, a->stride, a->offset);
+            }
+        }
+        log_count++;
+    }
+}
+
+static void d3d12_set_shader(void* ud, const rsx_state* state)
+{
+    (void)ud;
+    s_d3d.current_rsx_state = state;
+
+    static int log_count = 0;
+    if (log_count < 5) {
+        printf("[D3D12] set_shader: fp_addr=0x%08X, vp_load=%u, output_mask=0x%08X\n",
+               state->fragment_program_addr, state->transform_program_load,
+               state->vertex_attrib_output_mask);
+        log_count++;
+    }
+
+    /* TODO: Look up or compile a PSO matching this shader combination.
+     * For now we use the basic vertex-colored PSO for everything. */
+}
+
 static void d3d12_set_blend(void* ud, const rsx_state* state)
 {
     (void)ud;
@@ -862,6 +908,8 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     s_d3d12_backend.set_viewport      = d3d12_set_viewport;
     s_d3d12_backend.set_blend         = d3d12_set_blend;
     s_d3d12_backend.set_depth_stencil = d3d12_set_depth_stencil;
+    s_d3d12_backend.set_shader        = d3d12_set_shader;
+    s_d3d12_backend.set_vertex_attribs = d3d12_set_vertex_attribs;
     s_d3d12_backend.draw_arrays       = d3d12_draw_arrays;
     s_d3d12_backend.draw_indexed      = d3d12_draw_indexed;
     s_d3d12_backend.bind_texture      = d3d12_bind_texture;
