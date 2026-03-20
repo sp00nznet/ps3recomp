@@ -779,3 +779,46 @@ s32 cellSpursEventFlagGetDirection(CellSpursEventFlag* eventFlag,
     *direction = eventFlag->direction;
     return CELL_OK;
 }
+
+/* ---------------------------------------------------------------------------
+ * Additional functions needed by Tokyo Jungle (from RPCS3 audit)
+ * -----------------------------------------------------------------------*/
+
+/* _cellSpursEventFlagInitialize — internal init with more parameters */
+s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
+                                    CellSpursEventFlag* eventFlag,
+                                    u32 clearMode, u32 direction)
+{
+    (void)spurs; (void)taskset;
+    printf("[cellSpurs] _EventFlagInitialize(clearMode=%u, dir=%u)\n",
+           clearMode, direction);
+    if (!eventFlag) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    return cellSpursEventFlagInitialize((CellSpursTaskset*)taskset, eventFlag, clearMode, direction);
+}
+
+/* _cellSpursSendSignal — internal signal delivery */
+s32 _cellSpursSendSignal(void* taskset, u32 taskId)
+{
+    (void)taskset;
+    printf("[cellSpurs] _SendSignal(taskId=%u)\n", taskId);
+    /* In recomp without SPU execution, signals are no-ops */
+    return CELL_OK;
+}
+
+/* cellSpursRunJobChain — start a job chain execution */
+s32 cellSpursRunJobChain(void* spurs, void* jobChain)
+{
+    (void)spurs; (void)jobChain;
+    printf("[cellSpurs] RunJobChain() — stub (no SPU execution)\n");
+    /* Job chains run on SPUs. Without SPU execution, we stub this.
+     * Games that depend on job chain completion will need the jobs
+     * to be HLE'd or run on host threads. */
+    return CELL_OK;
+}
+
+/* cellSpursKickJobChain — kick a running job chain */
+s32 cellSpursKickJobChain(void* spurs, void* jobChain)
+{
+    (void)spurs; (void)jobChain;
+    return CELL_OK;
+}
