@@ -321,6 +321,22 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Changelog
 
+### v0.4.1 — *"First Light+" (March 2026)
+- **RPCS3 audit**: Cross-referenced all major modules against RPCS3's implementations. Added 28 cellGcmSys functions, 5 sysPrxForUser functions, 4 cellSpurs functions. cellGcmSys now at 61+ functions (was 33).
+- **D3D12 backend**: Real vertex upload from guest memory with BE byte-swap, DrawInstanced, vertex attrib + shader logging, blend/depth/stencil state callbacks, texture format decode (25 RSX→DXGI mappings). 990 lines.
+- **Image encoding**: Real PNG + JPEG encoding via stb_image_write v1.16. ARGB→RGBA/RGB swizzle, configurable quality, in-memory encoding.
+- **dcbz fix**: `dcbz` (data cache block zero) now zeroes 128 bytes instead of being a no-op. This was THE root cause of the flOw PhyreEngine init stall — dcbz loops ran trillions of no-op iterations.
+- **VMX disasm critical fix**: lvx/stvx decode was in unreachable code path. Moved to main opcode 31 block, eliminating 6,620 TODO instructions.
+- **VMX disasm duplicate key fix**: VX-form decode table had overlapping keys. Split compares into separate table with Rc bit handling. Added 60+ VMX VX-form instructions.
+- **Lifter**: 100+ instruction mnemonics across 18 categories. New: dcbz (real memset), bctrl→ps3_indirect_call, VMX int/float/logical/compare/convert/splat/merge/shift, mcrf, rlwnm, creqv, mffs/mtfsf, byte-reverse loads, load algebraic, all cache/sync ops. **~10K TODOs remaining** (down from 27K).
+- **sys_get_random_number**: Real crypto RNG via BCryptGenRandom / /dev/urandom.
+- **stb_image_write v1.16**: Vendored for PNG/JPEG encoding.
+- **cellSail**: Expanded to 28 functions with descriptor management for Tokyo Jungle.
+- **sceNpCommerce2 + cellSysutilNpEula**: New modules for Tokyo Jungle.
+- **RSX primitive/vertex/texture mapping**: Complete utility headers for D3D12 translation.
+- **Documentation**: 8 docs updated with comprehensive rewrites. RSX_GRAPHICS.md now 16KB with full D3D12 capability matrix, vertex format tables, shader translation strategy.
+- **97+ complete modules**, 250+ files, 70K+ lines of code.
+
 ### v0.4.0 — *"First Light"* (March 2026)
 - **RSX Command Buffer Processor**: New NV47xx GPU command parser (`rsx_commands.h/.c`) — FIFO command buffer parsing, state tracking for surfaces, viewport, scissor, clear, blend, depth/stencil, culling, color mask, alpha test, textures (16 units × 8 registers), vertex attributes (16 × format/offset), shader programs (fragment/vertex), draw arrays + draw indexed. Backend callback interface (`rsx_backend`) with 12 dispatch points for pluggable rendering.
 - **Null RSX Backend**: Win32 window backend (`rsx_null_backend.h/.c`) — creates a window, displays RSX clear color via GDI, FPS counter and debug overlay. Proves command pipeline works before D3D12/Vulkan.
