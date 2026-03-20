@@ -202,7 +202,7 @@ rsx_null_backend_pump_messages();              // call each frame
 
 ### D3D12 Backend
 
-**File:** `libs/video/rsx_d3d12_backend.c` (~700 lines)
+**File:** `libs/video/rsx_d3d12_backend.c` (~990 lines)
 
 Real GPU rendering via Direct3D 12. Current capabilities:
 
@@ -211,13 +211,19 @@ Real GPU rendering via Direct3D 12. Current capabilities:
 | Device creation | **Done** | Feature level 11.0, any D3D12-capable GPU |
 | Swap chain | **Done** | Double-buffered, flip-discard, VSync present |
 | Clear | **Done** | Clears to RSX clear color (ARGB → float4 RGBA) |
-| Root signature | **Done** | Empty (input assembler only, no CBV/SRV) |
-| Pipeline state | **Done** | Vertex-colored shader (float3 POSITION + float4 COLOR) |
-| Vertex buffer | **Done** | 4MB upload heap, persistently mapped |
+| Root signature | **Done** | Input assembler enabled |
+| Pipeline state | **Done** | Vertex-colored shader (position + color) compiled at init |
+| Vertex buffer | **Done** | 4MB upload heap, persistently mapped, DrawInstanced |
+| Vertex upload | **Done** | Reads position (float3) + color (ubyte4/float4) from guest memory with BE byte-swap |
 | Shader compilation | **Done** | Runtime D3DCompile (vs_5_0 / ps_5_0) |
 | Frame sync | **Done** | Fence-based, per-frame command allocators |
-| Draw calls | Logging | Logs draw_arrays/draw_indexed, not yet wired to VB |
-| Textures | Not started | Need texture upload + SRV creation |
+| Draw calls | **Done** | DrawInstanced with accumulated per-frame vertices |
+| Vertex attribs | **Done** | Logs all enabled attribs (type, size, stride, offset) |
+| Shader logging | **Done** | Logs fragment/vertex program addresses and output mask |
+| Blend state | Logging | Logs blend enable/factors (PSO recreation needed) |
+| Depth/stencil | Logging | Logs depth test/stencil state |
+| Texture binding | Logging | Logs format, dimensions, guest address. Format decode ready. |
+| Texture upload | Scaffold | 25 RSX→DXGI format mappings, upload process documented |
 | RSX shaders | Not started | Need NV40 ISA → HLSL translation |
 | Depth buffer | Not started | Need depth/stencil texture creation |
 
@@ -228,9 +234,9 @@ Real GPU rendering via Direct3D 12. Current capabilities:
 2. Transition render target: PRESENT → RENDER_TARGET
 3. Set render target, viewport, scissor
 4. ClearRenderTargetView with RSX clear color
-5. (future: bind PSO, set vertex buffer, draw)
-6. Transition render target: RENDER_TARGET → PRESENT
-7. Close + execute command list
+5. Bind root signature + PSO + vertex buffer + topology
+6. DrawInstanced with accumulated vertex data
+7. Transition render target: RENDER_TARGET → PRESENT
 8. Present with VSync
 9. Signal fence, advance to next frame
 ```
