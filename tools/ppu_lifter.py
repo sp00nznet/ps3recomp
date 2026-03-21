@@ -610,7 +610,10 @@ class PPULifter:
 
         if mn == "mtctr":
             rs_i = _reg_idx(ops[0])
-            return f"ctx->ctr = ctx->gpr[{rs_i}];"
+            # Mask CTR to 32 bits — PS3 games use 32-bit loop counts.
+            # Without masking, sign-extended 64-bit values from addi/rldicr
+            # produce CTR values like 0x9FFFFFFFE0000000 causing infinite loops.
+            return f"ctx->ctr = (uint32_t)ctx->gpr[{rs_i}];"
 
         if mn == "mfcr":
             rd_i = _reg_idx(ops[0])
