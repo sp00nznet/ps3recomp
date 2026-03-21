@@ -213,6 +213,16 @@ void cellRescResetFlipStatus(void)
 
 s32 cellRescGetFlipStatus(void)
 {
+    /* Auto-complete pending flips when polled, so games don't stall
+     * waiting for events in the null renderer. */
+    if (s_flip_status == 1) {
+        s_flip_status = 0;
+        s_last_flip_time++;
+        if (s_flip_handler)
+            s_flip_handler(1);
+        if (s_vblank_handler)
+            s_vblank_handler(1);
+    }
     return s_flip_status;
 }
 

@@ -341,6 +341,17 @@ void cellGcmResetFlipStatus(void)
 /* NID: 0xE315A0B2 */
 u32 cellGcmGetFlipStatus(void)
 {
+    /* If the game is polling flip status, also pump vblank/flip handlers
+     * so the game loop doesn't stall waiting for events. */
+    s_vblank_count++;
+    if (s_vblank_handler)
+        s_vblank_handler(s_vblank_count);
+    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) {
+        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        s_last_flip_time = get_timestamp_ns();
+        if (s_flip_handler)
+            s_flip_handler(1);
+    }
     return s_flip_status;
 }
 
