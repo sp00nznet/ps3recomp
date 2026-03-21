@@ -273,7 +273,7 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 
 | Game | Title ID | Status | Repo |
 |------|----------|--------|------|
-| **flOw** (thatgamecompany) | NPUA80001 | 92K functions, CRT complete, engine init running, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
+| **flOw** (thatgamecompany) | NPUA80001 | 92K functions, game reaches main() init, module loading + sysutil callbacks working, trampoline system for split-function chains, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
 | **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 33K functions lifted, CRT init + HLE framework wired, indirect call dispatch | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
 
 Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
@@ -320,6 +320,15 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.4.2 — *"Main Event"* (March 2026)
+- **flOw reaches game main() initialization**: CRT startup completes, abort intercepted via longjmp redirect, game enters `func_000CB9CC` with clean stack. Loads modules (GCM_SYS, SPURS, USBD, JPGDEC, NET), registers sysutil callback. First PS3 recomp project to reach game-level code execution.
+- **Trampoline system for split-function chains**: `convert_trampolines.py` and `post_lift.py` transform fallthrough edges between split functions into explicit trampoline calls. When the lifter splits a large function at branch targets, the resulting pieces are chained via trampolines so control flow is preserved without relying on physical code adjacency.
+- **DRAIN_TRAMPOLINE pattern**: Macro inserted after every `bl` call site in `ppu_recomp.cpp` (143K+ sites) to drain pending trampoline returns. Prevents unbounded host stack growth when recompiled split-function chains would otherwise nest deeply through call/return mismatches. Converts deep recursion into a flat loop.
+- **Manual dispatch stub registration**: `indirect_dispatch.cpp` supports registering stubs for mid-function entry points that the lifter does not emit as standalone functions. Allows `bctrl` indirect calls to reach branch targets inside split functions via hash table lookup.
+- **cellSysmodule complete module ID name mapping**: 30+ module IDs now map to correct human-readable names (0x00=NET, 0x0A=SPURS, 0x10=GCM_SYS, 0x17=Camera, 0x1C=USBD, etc.). Previously showed wrong names for several IDs.
+- **SEH-based crash recovery**: Three CRT constructors that access unmapped guest memory are caught via structured exception handling and recovered from, allowing startup to continue past constructor failures.
+- **malloc override**: Bump allocator at guest address range 0x00A00000-0x10000000 provides malloc/free for recompiled code without requiring full guest heap infrastructure.
 
 ### v0.4.1 — *"First Light+" (March 2026)
 - **RPCS3 audit**: Cross-referenced all major modules against RPCS3's implementations. Added 28 cellGcmSys functions, 5 sysPrxForUser functions, 4 cellSpurs functions. cellGcmSys now at 61+ functions (was 33).
