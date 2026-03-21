@@ -557,7 +557,10 @@ class PPULifter:
                 if func.start_addr <= tgt < func.end_addr:
                     return f"goto loc_{tgt:08X};"
                 else:
-                    return f"func_{tgt:08X}(ctx); return;"
+                    # Use trampoline for cross-fragment branches to avoid
+                    # stack-growing recursion when backward branches re-enter
+                    # a fragment's prologue (stack allocation).
+                    return f"{{ extern void (*g_trampoline_fn)(void*); g_trampoline_fn = (void(*)(void*))func_{tgt:08X}; return; }}"
             except ValueError:
                 return f"goto {target}; /* branch */"
 
@@ -582,7 +585,8 @@ class PPULifter:
                     return f"if ({cond}) goto loc_{tgt:08X};"
                 else:
                     cond = self._branch_condition(mn, ops)
-                    return f"if ({cond}) {{ func_{tgt:08X}(ctx); return; }}"
+                    # Use trampoline for cross-fragment conditional branches
+                    return f"if ({cond}) {{ extern void (*g_trampoline_fn)(void*); g_trampoline_fn = (void(*)(void*))func_{tgt:08X}; return; }}"
             except ValueError:
                 return f"/* {mn} {insn.operands} */;"
 
@@ -1486,13 +1490,14 @@ class PPULifter:
                     needs_fallthrough = False
 
             if needs_fallthrough:
-                # Find the next function by address
+                # Find the next function by address.
+                # Use trampoline pattern to avoid deep call chains.
                 try:
                     addr_idx = sorted_addrs.index(func.start_addr)
                     if addr_idx + 1 < len(sorted_addrs):
                         next_addr = sorted_addrs[addr_idx + 1]
                         next_func = func_by_addr[next_addr]
-                        lines.append(f"        {next_func.name}(ctx);")
+                        lines.append(f"        {{ extern void (*g_trampoline_fn)(void*); g_trampoline_fn = (void(*)(void*)){next_func.name}; return; }}")
                 except ValueError:
                     pass
 
