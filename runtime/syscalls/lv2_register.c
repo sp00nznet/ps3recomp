@@ -80,6 +80,14 @@ static int64_t sys_tty_read(ppu_context* ctx)
 #define SYS_TTY_READ   402
 #define SYS_TTY_WRITE  403
 
+/* Generic SPU stub — returns CELL_OK (0) for unimplemented SPU syscalls */
+static int64_t sys_spu_thread_stub(ppu_context* ctx)
+{
+    (void)ctx;
+    ctx->gpr[3] = 0;  /* CELL_OK */
+    return 0;
+}
+
 void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 {
     /* Initialize the table with unimplemented stubs first */
@@ -110,4 +118,18 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* TTY (debug console I/O — used by CRT startup) */
     lv2_syscall_register(tbl, SYS_TTY_READ,  sys_tty_read);
     lv2_syscall_register(tbl, SYS_TTY_WRITE, sys_tty_write);
+
+    /* SPU stubs — games that use SPURS call these during init.
+     * Since we don't emulate SPUs, return CELL_OK for most. */
+    lv2_syscall_register(tbl, 169, sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_INITIALIZE,              sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CREATE,     sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DESTROY,    sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_START,      sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_JOIN,       sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_INITIALIZE,       sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_ARGUMENT,     sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_CONNECT_EVENT,    sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT, sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_stub);
 }
