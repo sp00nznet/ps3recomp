@@ -73,6 +73,16 @@ extern "C" {
 #define NV4097_DRAW_ARRAYS                     0x00001814
 #define NV4097_DRAW_INDEX_ARRAY                0x00001820
 
+/* Index buffer (set before NV4097_DRAW_INDEX_ARRAY) */
+#define NV4097_SET_INDEX_ARRAY_ADDRESS          0x0000181C
+#define NV4097_SET_INDEX_ARRAY_DMA              0x00001818
+/* DMA word encodes index format in the low nibble:
+ *   0 = u32 (NV4097_SET_INDEX_ARRAY_DMA_FORMAT_U32)
+ *   1 = u16 (NV4097_SET_INDEX_ARRAY_DMA_FORMAT_U16)
+ * U16 is by far the more common choice in real PS3 titles. */
+#define RSX_INDEX_FORMAT_U32                    0
+#define RSX_INDEX_FORMAT_U16                    1
+
 /* Vertex attributes */
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
 #define NV4097_SET_VERTEX_DATA_ARRAY_OFFSET     0x00001680
@@ -235,6 +245,11 @@ typedef struct rsx_state {
     u32 primitive_type;
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
 
+    /* Index buffer (for NV4097_DRAW_INDEX_ARRAY) */
+    u32 index_array_offset;     /* main-memory offset into the index buffer */
+    u32 index_array_dma;        /* DMA word; low nibble encodes the format  */
+    u32 index_array_format;     /* RSX_INDEX_FORMAT_U16 or _U32 */
+
     /* Shader state */
     u32 shader_program;       /* fragment program address (offset | location in bits [0:1]) */
     u32 fragment_program_addr;
@@ -242,6 +257,14 @@ typedef struct rsx_state {
     u32 transform_program_load; /* vertex program load slot index */
     u32 transform_constant_load;
     int shader_dirty;
+
+    /* Vertex (transform) program microcode, accumulated from
+     * NV4097_SET_TRANSFORM_PROGRAM. Stored as native u32 words (4 per NV40
+     * VP instruction). The backend decompiles this to an HLSL vertex shader. */
+    u32 transform_program[2048];   /* up to 512 instructions x 4 words */
+    u32 transform_program_words;   /* count of valid words written */
+    u32 transform_program_cursor;  /* current write cursor (in words) */
+    int transform_program_dirty;
 
     /* Vertex transform constants — written by NV4097_SET_TRANSFORM_CONSTANT.
      * Each constant is a vec4 (4 floats). Games typically place the MVP

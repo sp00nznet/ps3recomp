@@ -18,6 +18,8 @@
 
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
+#include "rsx_fp_decompiler.h"
+#include "rsx_vp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -36,6 +38,12 @@
 /* We need these GUIDs — define them here to avoid uuid.lib dependency */
 #include <initguid.h>
 
+/* RSX→DXGI texture format mapping. Included AFTER the D3D12 headers on purpose:
+ * it defines DXGI_FORMAT_* helper macros whose values match the real enum, so
+ * here they harmlessly shadow the enumerators; including it first would clash
+ * with dxgiformat.h's enum definition. */
+#include "rsx_texture_formats.h"
+
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -48,11 +56,71 @@
 #define FRAME_COUNT         2   /* double buffering */
 #define MAX_VERTICES      4096  /* per-frame vertex buffer */
 #define MAX_DRAWS          256  /* per-frame draw records */
+#define MAX_PSO_CACHE       64  /* distinct blend/depth/topology PSOs */
+#define MAX_FP_CACHE        64  /* distinct fragment programs */
+#define MAX_FP_BYTES     16384  /* upper bound on one fragment program */
+#define FP_TEXTURE_SLOTS    16  /* SRV/sampler banks the decompiled PS expects */
+
+/* A decompiled + compiled fragment program, keyed by guest address + content
+ * hash. ps_blob == NULL records a known-bad program (decompile/compile failed)
+ * so we don't retry it every frame; such draws fall back to the placeholder
+ * pixel shader. */
+typedef struct {
+    u32       guest_addr;
+    u32       hash;
+    ID3DBlob* ps_blob;
+} FpCacheEntry;
+
+/* A decompiled + compiled vertex program, keyed by microcode content hash.
+ * vs_blob == NULL records a known-bad program (falls back to placeholder VS). */
+typedef struct {
+    u32       hash;
+    ID3DBlob* vs_blob;
+} VpCacheEntry;
+
+/* Host vertex fed to the placeholder VS. Carries the RSX vertex attributes
+ * that map to fragment-program interpolants (passthrough VP model: we don't
+ * translate the vertex program yet, so each attribute is forwarded straight
+ * to its conventional interpolant). All but position are float4 for a uniform
+ * layout. Field order must match s_input_layout and the VS input struct. */
+typedef struct {
+    float pos[3];     /* POSITION      (attrib 0)      */
+    float col0[4];    /* COLOR0        (attrib 3)      */
+    float col1[4];    /* COLOR1        (attrib 4)      */
+    float fog[4];     /* FOG  (.x)     (attrib 5)      */
+    float tc[8][4];   /* TEXCOORD0..7  (attribs 8..15) */
+} RsxVertex;
+
+/* Identifies a unique graphics PSO. D3D12 bakes blend + depth state into the
+ * pipeline object, so any change to these forces a new PSO. We snapshot the
+ * relevant RSX state at draw-record time into this key and look it up (or
+ * create) in render_frame. Raw NV4097 enum values are stored directly; the
+ * nv_to_d3d12_* mappers translate them at PSO-creation time. The struct is
+ * memset to 0 before filling and compared with memcmp, so it must contain no
+ * uninitialised padding -- keep the fields naturally aligned. */
+typedef struct {
+    u32 topology_type;      /* D3D12_PRIMITIVE_TOPOLOGY_TYPE_{POINT,LINE,TRIANGLE} */
+    u32 blend_enable;       /* 0/1 */
+    u32 blend_sfactor;      /* raw NV4097 */
+    u32 blend_dfactor;      /* raw NV4097 */
+    u32 blend_equation;     /* raw NV4097 */
+    u32 depth_enable;       /* 0/1 */
+    u32 depth_write;        /* 0/1 */
+    u32 depth_func;         /* raw NV4097 */
+    u32 fp_id;              /* fragment-program cache index, or 0xFFFFFFFF */
+    u32 vp_id;              /* vertex-program cache index, or 0xFFFFFFFF */
+} PsoKey;
+
+typedef struct {
+    PsoKey key;
+    ID3D12PipelineState* pso;
+} PsoCacheEntry;
 
 typedef struct {
     u32 vb_byte_offset; /* offset into vb_mapped where this draw's verts live */
     u32 vertex_count;
     u32 topology;       /* D3D_PRIMITIVE_TOPOLOGY_* */
+    PsoKey pso_key;     /* blend/depth/topology snapshot for PSO selection */
 } D3D12DrawRecord;
 
 /* ---------------------------------------------------------------------------
@@ -84,9 +152,47 @@ typedef struct {
 
     /* Pipeline */
     ID3D12RootSignature*  root_signature;
-    ID3D12PipelineState*  pipeline_state;         /* triangle class — default */
-    ID3D12PipelineState*  pipeline_state_lines;   /* line class */
-    ID3D12PipelineState*  pipeline_state_points;  /* point class */
+    ID3D12PipelineState*  pipeline_state;         /* triangle class — default/fallback */
+    ID3D12PipelineState*  pipeline_state_lines;   /* line class — fallback */
+    ID3D12PipelineState*  pipeline_state_points;  /* point class — fallback */
+
+    /* PSO cache keyed by blend/depth/topology state. Shader bytecode is kept
+     * alive (vs_blob/ps_blob) so new PSOs can be built lazily at draw time. */
+    ID3DBlob*             vs_blob;
+    ID3DBlob*             ps_blob;
+    PsoCacheEntry         pso_cache[MAX_PSO_CACHE];
+    u32                   pso_cache_count;
+
+    /* Fragment-program cache (RSX NV40 bytecode → compiled HLSL PS). */
+    FpCacheEntry          fp_cache[MAX_FP_CACHE];
+    u32                   fp_cache_count;
+    u32                   current_fp_id;  /* selected by set_shader; 0xFFFFFFFF = placeholder */
+
+    /* Vertex-program cache (RSX NV40 transform program → compiled HLSL VS),
+     * plus a VS-visible CBV (b0) holding the vertex constant bank, and a
+     * second root signature that binds that CBV instead of the placeholder
+     * MVP root constants. */
+    VpCacheEntry          vp_cache[MAX_FP_CACHE];
+    u32                   vp_cache_count;
+    u32                   current_vp_id;  /* 0xFFFFFFFF = placeholder MVP VS */
+    ID3D12RootSignature*  root_signature_vp;
+    ID3D12Resource*       vp_const_buffer;   /* upload heap, 1024 float4 */
+    void*                 vp_const_mapped;
+
+    /* Shader-visible SRV heap (FP_TEXTURE_SLOTS null/texture SRVs at t0..) so
+     * decompiled pixel shaders that sample textures link against the root
+     * signature. Slots are filled with real textures by bind_texture. */
+    ID3D12DescriptorHeap* srv_heap;
+    u32                   srv_descriptor_size;
+
+    /* Texture upload (synchronous one-shot, isolated from the frame list). */
+    ID3D12CommandAllocator*    upload_alloc;
+    ID3D12GraphicsCommandList* upload_list;
+    ID3D12Fence*               upload_fence;
+    HANDLE                     upload_event;
+    u64                        upload_fence_value;
+    ID3D12Resource*            unit_textures[FP_TEXTURE_SLOTS];
+    u32                        unit_tex_key[FP_TEXTURE_SLOTS];
 
     /* Depth/stencil */
     ID3D12DescriptorHeap* dsv_heap;
@@ -120,6 +226,134 @@ typedef struct {
 } D3D12State;
 
 static D3D12State s_d3d;
+
+/* Vertex input layout shared by every PSO. Mirrors RsxVertex / the VS input
+ * struct: position + the interpolants a fragment program can read. */
+#define IL_PV D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+#define IL_F4 DXGI_FORMAT_R32G32B32A32_FLOAT
+static const D3D12_INPUT_ELEMENT_DESC s_input_layout[] = {
+    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,   0, IL_PV, 0},
+    {"COLOR",    0, IL_F4,                       0,  12, IL_PV, 0},
+    {"COLOR",    1, IL_F4,                       0,  28, IL_PV, 0},
+    {"FOG",      0, IL_F4,                       0,  44, IL_PV, 0},
+    {"TEXCOORD", 0, IL_F4,                       0,  60, IL_PV, 0},
+    {"TEXCOORD", 1, IL_F4,                       0,  76, IL_PV, 0},
+    {"TEXCOORD", 2, IL_F4,                       0,  92, IL_PV, 0},
+    {"TEXCOORD", 3, IL_F4,                       0, 108, IL_PV, 0},
+    {"TEXCOORD", 4, IL_F4,                       0, 124, IL_PV, 0},
+    {"TEXCOORD", 5, IL_F4,                       0, 140, IL_PV, 0},
+    {"TEXCOORD", 6, IL_F4,                       0, 156, IL_PV, 0},
+    {"TEXCOORD", 7, IL_F4,                       0, 172, IL_PV, 0},
+};
+#define S_INPUT_LAYOUT_COUNT 12
+
+/* ---------------------------------------------------------------------------
+ * RSX (NV4097 / OpenGL-style enum) → D3D12 state mappers
+ *
+ * RSX blend factors and compare funcs use the OpenGL enum values that the
+ * NV4097 class inherits. We store the raw value in rsx_state and translate
+ * here, at PSO-creation time.
+ * -----------------------------------------------------------------------*/
+
+/* Blend factor for the RGB channels. */
+static D3D12_BLEND nv_to_d3d12_blend_color(u32 f)
+{
+    switch (f) {
+    case 0x0000: return D3D12_BLEND_ZERO;
+    case 0x0001: return D3D12_BLEND_ONE;
+    case 0x0300: return D3D12_BLEND_SRC_COLOR;
+    case 0x0301: return D3D12_BLEND_INV_SRC_COLOR;
+    case 0x0302: return D3D12_BLEND_SRC_ALPHA;
+    case 0x0303: return D3D12_BLEND_INV_SRC_ALPHA;
+    case 0x0304: return D3D12_BLEND_DEST_ALPHA;
+    case 0x0305: return D3D12_BLEND_INV_DEST_ALPHA;
+    case 0x0306: return D3D12_BLEND_DEST_COLOR;
+    case 0x0307: return D3D12_BLEND_INV_DEST_COLOR;
+    case 0x0308: return D3D12_BLEND_SRC_ALPHA_SAT;
+    case 0x8001: return D3D12_BLEND_BLEND_FACTOR;     /* CONSTANT_COLOR */
+    case 0x8002: return D3D12_BLEND_INV_BLEND_FACTOR; /* ONE_MINUS_CONSTANT_COLOR */
+    case 0x8003: return D3D12_BLEND_BLEND_FACTOR;     /* CONSTANT_ALPHA (approx) */
+    case 0x8004: return D3D12_BLEND_INV_BLEND_FACTOR; /* ONE_MINUS_CONSTANT_ALPHA */
+    default:     return D3D12_BLEND_ONE;
+    }
+}
+
+/* Blend factor for the alpha channel. D3D12 rejects *_COLOR factors in the
+ * alpha slots, so the four color-typed factors are folded to their alpha
+ * equivalents; everything else is already alpha-safe. */
+static D3D12_BLEND nv_to_d3d12_blend_alpha(u32 f)
+{
+    switch (f) {
+    case 0x0300: return D3D12_BLEND_SRC_ALPHA;      /* SRC_COLOR  -> SRC_ALPHA  */
+    case 0x0301: return D3D12_BLEND_INV_SRC_ALPHA;  /* 1-SRC_COLOR-> 1-SRC_ALPHA*/
+    case 0x0306: return D3D12_BLEND_DEST_ALPHA;     /* DST_COLOR  -> DST_ALPHA  */
+    case 0x0307: return D3D12_BLEND_INV_DEST_ALPHA; /* 1-DST_COLOR-> 1-DST_ALPHA*/
+    default:     return nv_to_d3d12_blend_color(f);
+    }
+}
+
+static D3D12_BLEND_OP nv_to_d3d12_blend_op(u32 e)
+{
+    switch (e) {
+    case 0x8006: return D3D12_BLEND_OP_ADD;
+    case 0x8007: return D3D12_BLEND_OP_MIN;
+    case 0x8008: return D3D12_BLEND_OP_MAX;
+    case 0x800A: return D3D12_BLEND_OP_SUBTRACT;
+    case 0x800B: return D3D12_BLEND_OP_REV_SUBTRACT;
+    default:     return D3D12_BLEND_OP_ADD;
+    }
+}
+
+static D3D12_COMPARISON_FUNC nv_to_d3d12_compare(u32 f)
+{
+    switch (f) {
+    case 0x0200: return D3D12_COMPARISON_FUNC_NEVER;
+    case 0x0201: return D3D12_COMPARISON_FUNC_LESS;
+    case 0x0202: return D3D12_COMPARISON_FUNC_EQUAL;
+    case 0x0203: return D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    case 0x0204: return D3D12_COMPARISON_FUNC_GREATER;
+    case 0x0205: return D3D12_COMPARISON_FUNC_NOT_EQUAL;
+    case 0x0206: return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    case 0x0207: return D3D12_COMPARISON_FUNC_ALWAYS;
+    default:     return D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    }
+}
+
+/* Topology class (point/line/triangle) that a D3D primitive topology belongs
+ * to. The PSO's PrimitiveTopologyType must match the topology set on the IA. */
+static D3D12_PRIMITIVE_TOPOLOGY_TYPE d3d12_topo_class(u32 topo)
+{
+    if (topo == D3D_TOPOLOGY_POINTLIST)
+        return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    if (topo == D3D_TOPOLOGY_LINELIST || topo == D3D_TOPOLOGY_LINESTRIP)
+        return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+    return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+}
+
+/* Build a PSO key from the current RSX state for a given draw topology.
+ * fp_id/vp_id identify the resolved fragment/vertex programs (or 0xFFFFFFFF). */
+static PsoKey pso_key_from_state(const rsx_state* st, u32 topo, u32 fp_id, u32 vp_id)
+{
+    PsoKey k;
+    memset(&k, 0, sizeof(k));
+    k.topology_type = (u32)d3d12_topo_class(topo);
+    k.fp_id = fp_id;
+    k.vp_id = vp_id;
+    if (st) {
+        k.blend_enable   = st->blend_enable ? 1u : 0u;
+        k.blend_sfactor  = st->blend_sfactor;
+        k.blend_dfactor  = st->blend_dfactor;
+        k.blend_equation = st->blend_equation;
+        k.depth_enable   = st->depth_test_enable ? 1u : 0u;
+        k.depth_write    = st->depth_mask ? 1u : 0u;
+        k.depth_func     = st->depth_func;
+    } else {
+        /* No state yet: opaque draw with default depth test. */
+        k.depth_enable = 1;
+        k.depth_write  = 1;
+    }
+    return k;
+}
 
 /* ---------------------------------------------------------------------------
  * Win32 window
@@ -336,6 +570,61 @@ static int init_d3d12(u32 width, u32 height)
         printf("[D3D12] Depth buffer created (%ux%u D24S8)\n", width, height);
     }
 
+    /* ---------------------------------------------------------------
+     * SRV heap for fragment-program textures (t0..t15).
+     * Filled with null SRVs now (sampling returns 0); bind_texture will
+     * replace slots with real texture views later. Shader-visible so the
+     * root descriptor table can reference it.
+     * ---------------------------------------------------------------*/
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc = {0};
+        srv_heap_desc.NumDescriptors = FP_TEXTURE_SLOTS;
+        srv_heap_desc.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        srv_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
+            s_d3d.device, &srv_heap_desc, &IID_ID3D12DescriptorHeap,
+            (void**)&s_d3d.srv_heap);
+        if (FAILED(hr)) {
+            printf("[D3D12] SRV heap creation failed (0x%08lX)\n", hr);
+            return -1;
+        }
+        s_d3d.srv_descriptor_size = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+            s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE h;
+        s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &h);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {0};
+        srv.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels     = 1;
+        for (u32 i = 0; i < FP_TEXTURE_SLOTS; i++) {
+            s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, NULL, &srv, h);
+            h.ptr += s_d3d.srv_descriptor_size;
+        }
+        printf("[D3D12] SRV heap created (%d null slots)\n", FP_TEXTURE_SLOTS);
+    }
+
+    /* Dedicated command list + fence for synchronous texture uploads. */
+    {
+        hr = s_d3d.device->lpVtbl->CreateCommandAllocator(
+            s_d3d.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void**)&s_d3d.upload_alloc);
+        if (SUCCEEDED(hr))
+            hr = s_d3d.device->lpVtbl->CreateCommandList(
+                s_d3d.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                s_d3d.upload_alloc, NULL,
+                &IID_ID3D12GraphicsCommandList, (void**)&s_d3d.upload_list);
+        if (SUCCEEDED(hr)) {
+            s_d3d.upload_list->lpVtbl->Close(s_d3d.upload_list);
+            hr = s_d3d.device->lpVtbl->CreateFence(
+                s_d3d.device, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void**)&s_d3d.upload_fence);
+        }
+        if (FAILED(hr)) { printf("[D3D12] Upload command objects failed\n"); return -1; }
+        s_d3d.upload_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    }
+
     /* Create command allocators and command list */
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         hr = s_d3d.device->lpVtbl->CreateCommandAllocator(
@@ -367,16 +656,46 @@ static int init_d3d12(u32 width, u32 height)
      * Visible only to the vertex shader — pixel shader doesn't need it.
      * ---------------------------------------------------------------*/
     {
-        D3D12_ROOT_PARAMETER root_params[1] = {0};
+        /* Param 0: MVP root constants (b0, VS). Param 1: SRV table t0..t15
+         * (PS) for decompiled fragment programs that sample textures. */
+        D3D12_DESCRIPTOR_RANGE srv_range = {0};
+        srv_range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv_range.NumDescriptors     = FP_TEXTURE_SLOTS;
+        srv_range.BaseShaderRegister = 0;   /* t0 */
+        srv_range.RegisterSpace      = 0;
+        srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER root_params[2] = {0};
         root_params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         root_params[0].Constants.ShaderRegister = 0;   /* b0 */
         root_params[0].Constants.RegisterSpace  = 0;
         root_params[0].Constants.Num32BitValues = 16;  /* mat4 */
         root_params[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_VERTEX;
+        root_params[1].ParameterType   = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        root_params[1].DescriptorTable.NumDescriptorRanges = 1;
+        root_params[1].DescriptorTable.pDescriptorRanges   = &srv_range;
+        root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        /* 16 static samplers s0..s15 (linear wrap) so the PS sampler array is
+         * satisfied without per-draw sampler descriptors. */
+        D3D12_STATIC_SAMPLER_DESC samplers[FP_TEXTURE_SLOTS] = {0};
+        for (u32 i = 0; i < FP_TEXTURE_SLOTS; i++) {
+            samplers[i].Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            samplers[i].AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            samplers[i].AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            samplers[i].AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            samplers[i].ComparisonFunc   = D3D12_COMPARISON_FUNC_ALWAYS;
+            samplers[i].MaxLOD           = D3D12_FLOAT32_MAX;
+            samplers[i].ShaderRegister   = i;   /* s0..s15 */
+            samplers[i].RegisterSpace    = 0;
+            samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        }
 
         D3D12_ROOT_SIGNATURE_DESC rs_desc = {0};
-        rs_desc.NumParameters = 1;
-        rs_desc.pParameters   = root_params;
+        rs_desc.NumParameters     = 2;
+        rs_desc.pParameters       = root_params;
+        rs_desc.NumStaticSamplers = FP_TEXTURE_SLOTS;
+        rs_desc.pStaticSamplers   = samplers;
         rs_desc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
                               | D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS
                               | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS
@@ -406,6 +725,81 @@ static int init_d3d12(u32 width, u32 height)
     }
 
     /* ---------------------------------------------------------------
+     * VP root signature: identical to the default one but root param 0 is a
+     * CBV at b0 (the vertex constant bank) instead of the MVP root constants.
+     * Used by PSOs that run a decompiled vertex program.
+     * ---------------------------------------------------------------*/
+    {
+        D3D12_DESCRIPTOR_RANGE srv_range = {0};
+        srv_range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv_range.NumDescriptors     = FP_TEXTURE_SLOTS;
+        srv_range.BaseShaderRegister = 0;
+        srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER rp[2] = {0};
+        rp[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rp[0].Descriptor.ShaderRegister = 0;   /* b0 = vp_c[] */
+        rp[0].Descriptor.RegisterSpace  = 0;
+        rp[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+        rp[1].ParameterType   = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[1].DescriptorTable.NumDescriptorRanges = 1;
+        rp[1].DescriptorTable.pDescriptorRanges   = &srv_range;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC samplers[FP_TEXTURE_SLOTS] = {0};
+        for (u32 i = 0; i < FP_TEXTURE_SLOTS; i++) {
+            samplers[i].Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW =
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            samplers[i].ComparisonFunc   = D3D12_COMPARISON_FUNC_ALWAYS;
+            samplers[i].MaxLOD           = D3D12_FLOAT32_MAX;
+            samplers[i].ShaderRegister   = i;
+            samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        }
+
+        D3D12_ROOT_SIGNATURE_DESC rd = {0};
+        rd.NumParameters     = 2;
+        rd.pParameters       = rp;
+        rd.NumStaticSamplers = FP_TEXTURE_SLOTS;
+        rd.pStaticSamplers   = samplers;
+        rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                 | D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS
+                 | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS
+                 | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+
+        ID3DBlob* sb = NULL; ID3DBlob* eb = NULL;
+        hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sb, &eb);
+        if (SUCCEEDED(hr))
+            hr = s_d3d.device->lpVtbl->CreateRootSignature(
+                s_d3d.device, 0, sb->lpVtbl->GetBufferPointer(sb),
+                sb->lpVtbl->GetBufferSize(sb),
+                &IID_ID3D12RootSignature, (void**)&s_d3d.root_signature_vp);
+        if (sb) sb->lpVtbl->Release(sb);
+        if (eb) eb->lpVtbl->Release(eb);
+        if (FAILED(hr)) { printf("[D3D12] VP root signature creation failed\n"); return -1; }
+
+        /* Vertex constant bank CBV (upload heap, 1024 float4 = 16 KB),
+         * persistently mapped; refreshed each frame from rsx_state. */
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC cbd = {0};
+        cbd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        cbd.Width            = 1024 * 16;
+        cbd.Height           = 1;
+        cbd.DepthOrArraySize = 1;
+        cbd.MipLevels        = 1;
+        cbd.SampleDesc.Count = 1;
+        cbd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &cbd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&s_d3d.vp_const_buffer);
+        if (FAILED(hr)) { printf("[D3D12] VP const buffer creation failed\n"); return -1; }
+        D3D12_RANGE nr = {0,0};
+        s_d3d.vp_const_buffer->lpVtbl->Map(s_d3d.vp_const_buffer, 0, &nr, &s_d3d.vp_const_mapped);
+        printf("[D3D12] VP root signature + 16KB constant CBV ready\n");
+    }
+
+    /* ---------------------------------------------------------------
      * Compile shaders and create PSO
      * ---------------------------------------------------------------*/
     {
@@ -414,25 +808,40 @@ static int init_d3d12(u32 width, u32 height)
          * (PS3/OpenGL column-major convention). We multiply explicitly so
          * we don't depend on HLSL's matrix packing — matches PS3 semantics
          * `gl_Position = MVP * vec4(pos, 1.0)`. */
+        /* Passthrough VS: applies the MVP to position and forwards every RSX
+         * interpolant (COL0/COL1/FOG/TEXCOORD0..7) so a decompiled fragment
+         * program can read whichever it needs. VSIO is the superset the
+         * decompiler's PSInput is always a subset of. */
         static const char vs_hlsl[] =
             "cbuffer cb0 : register(b0) {\n"
-            "    float4 mvp_col0;\n"
-            "    float4 mvp_col1;\n"
-            "    float4 mvp_col2;\n"
-            "    float4 mvp_col3;\n"
+            "    float4 mvp_col0; float4 mvp_col1; float4 mvp_col2; float4 mvp_col3;\n"
             "};\n"
-            "struct VSInput  { float3 pos : POSITION; float4 col : COLOR; };\n"
-            "struct VSOutput { float4 pos : SV_POSITION; float4 col : COLOR; };\n"
-            "VSOutput main(VSInput i) {\n"
-            "    VSOutput o;\n"
+            "struct VSInput {\n"
+            "    float3 pos:POSITION; float4 col0:COLOR0; float4 col1:COLOR1;\n"
+            "    float4 fog:FOG;\n"
+            "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2;\n"
+            "    float4 tc3:TEXCOORD3; float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5;\n"
+            "    float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+            "};\n"
+            "struct VSIO {\n"
+            "    float4 pos:SV_POSITION; float4 col0:COLOR0; float4 col1:COLOR1;\n"
+            "    float4 fog:FOG;\n"
+            "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2;\n"
+            "    float4 tc3:TEXCOORD3; float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5;\n"
+            "    float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+            "};\n"
+            "VSIO main(VSInput i) {\n"
+            "    VSIO o;\n"
             "    float4 p = float4(i.pos, 1.0);\n"
             "    o.pos = mvp_col0 * p.x + mvp_col1 * p.y + mvp_col2 * p.z + mvp_col3 * p.w;\n"
-            "    o.col = i.col;\n"
+            "    o.col0=i.col0; o.col1=i.col1; o.fog=i.fog;\n"
+            "    o.tc0=i.tc0; o.tc1=i.tc1; o.tc2=i.tc2; o.tc3=i.tc3;\n"
+            "    o.tc4=i.tc4; o.tc5=i.tc5; o.tc6=i.tc6; o.tc7=i.tc7;\n"
             "    return o;\n"
             "}\n";
         static const char ps_hlsl[] =
-            "struct PSInput { float4 pos : SV_POSITION; float4 col : COLOR; };\n"
-            "float4 main(PSInput i) : SV_TARGET { return i.col; }\n";
+            "struct PSInput { float4 pos : SV_POSITION; float4 col0 : COLOR0; };\n"
+            "float4 main(PSInput i) : SV_TARGET { return i.col0; }\n";
 
         ID3DBlob* vs_blob = NULL;
         ID3DBlob* ps_blob = NULL;
@@ -455,12 +864,10 @@ static int init_d3d12(u32 width, u32 height)
         }
 
         if (vs_blob && ps_blob) {
-            D3D12_INPUT_ELEMENT_DESC input_layout[] = {
-                {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
-                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
-                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-            };
+            /* Keep the compiled bytecode alive: the PSO cache builds new
+             * pipeline objects lazily from these blobs at draw time. */
+            s_d3d.vs_blob = vs_blob;
+            s_d3d.ps_blob = ps_blob;
 
             D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {0};
             pso_desc.pRootSignature = s_d3d.root_signature;
@@ -468,8 +875,8 @@ static int init_d3d12(u32 width, u32 height)
             pso_desc.VS.BytecodeLength = vs_blob->lpVtbl->GetBufferSize(vs_blob);
             pso_desc.PS.pShaderBytecode = ps_blob->lpVtbl->GetBufferPointer(ps_blob);
             pso_desc.PS.BytecodeLength = ps_blob->lpVtbl->GetBufferSize(ps_blob);
-            pso_desc.InputLayout.pInputElementDescs = input_layout;
-            pso_desc.InputLayout.NumElements = 2;
+            pso_desc.InputLayout.pInputElementDescs = s_input_layout;
+            pso_desc.InputLayout.NumElements = S_INPUT_LAYOUT_COUNT;
             pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
             pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
             pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
@@ -515,8 +922,9 @@ static int init_d3d12(u32 width, u32 height)
             if (SUCCEEDED(hr)) printf("[D3D12] Pipeline state created (point class)\n");
             else printf("[D3D12] PSO POINT creation failed (0x%08lX)\n", hr);
 
-            vs_blob->lpVtbl->Release(vs_blob);
-            ps_blob->lpVtbl->Release(ps_blob);
+            /* vs_blob/ps_blob are intentionally NOT released here -- they are
+             * retained in s_d3d for lazy PSO-cache creation and freed in
+             * rsx_d3d12_backend_shutdown(). */
         }
     }
 
@@ -529,7 +937,7 @@ static int init_d3d12(u32 width, u32 height)
 
         D3D12_RESOURCE_DESC buf_desc = {0};
         buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buf_desc.Width = MAX_VERTICES * 28; /* 28 bytes per vertex (pos3+col4) */
+        buf_desc.Width = MAX_VERTICES * sizeof(RsxVertex);
         buf_desc.Height = 1;
         buf_desc.DepthOrArraySize = 1;
         buf_desc.MipLevels = 1;
@@ -546,10 +954,10 @@ static int init_d3d12(u32 width, u32 height)
                 s_d3d.vertex_buffer, 0, &read_range, &s_d3d.vb_mapped);
             s_d3d.vb_view.BufferLocation =
                 s_d3d.vertex_buffer->lpVtbl->GetGPUVirtualAddress(s_d3d.vertex_buffer);
-            s_d3d.vb_view.StrideInBytes = 28;
-            s_d3d.vb_view.SizeInBytes = MAX_VERTICES * 28;
+            s_d3d.vb_view.StrideInBytes = sizeof(RsxVertex);
+            s_d3d.vb_view.SizeInBytes = MAX_VERTICES * sizeof(RsxVertex);
             printf("[D3D12] Vertex buffer created (%u KB)\n",
-                   (MAX_VERTICES * 28) / 1024);
+                   (u32)(MAX_VERTICES * sizeof(RsxVertex)) / 1024);
         }
     }
 
@@ -593,6 +1001,218 @@ static void move_to_next_frame(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Fragment-program cache (RSX NV40 bytecode → compiled HLSL pixel shader)
+ * -----------------------------------------------------------------------*/
+
+static u32 fnv1a(const u8* p, u32 n)
+{
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+/* Resolve the fragment program at guest address `addr` to an FP cache index.
+ * Decompiles + compiles on first sight; reuses by (addr, content-hash).
+ * Returns 0xFFFFFFFF when the program can't be used (out of range, no
+ * terminator, decompile/compile failure, or cache full) -- the caller then
+ * falls back to the placeholder pixel shader. */
+static u32 resolve_fragment_program(u32 addr)
+{
+    extern uint8_t* vm_base;
+    if (!vm_base || addr == 0 || addr >= 0x20000000) return 0xFFFFFFFFu;
+
+    const u8* uc = vm_base + addr;
+    u32 size = rsx_fp_program_size(uc, MAX_FP_BYTES);
+    if (size == 0) return 0xFFFFFFFFu;          /* no PROGRAM_END within bound */
+    u32 hash = fnv1a(uc, size);
+
+    for (u32 i = 0; i < s_d3d.fp_cache_count; i++) {
+        if (s_d3d.fp_cache[i].guest_addr == addr && s_d3d.fp_cache[i].hash == hash)
+            return s_d3d.fp_cache[i].ps_blob ? i : 0xFFFFFFFFu;
+    }
+    if (s_d3d.fp_cache_count >= MAX_FP_CACHE) {
+        static int warned = 0;
+        if (!warned) { printf("[D3D12] FP cache full (%d)\n", MAX_FP_CACHE); warned = 1; }
+        return 0xFFFFFFFFu;
+    }
+
+    /* Decompile to HLSL. */
+    static char hlsl[64 * 1024];
+    int n = rsx_fp_decompile(uc, size, hlsl, sizeof(hlsl));
+
+    ID3DBlob* ps_blob = NULL;
+    if (n > 0) {
+        ID3DBlob* err = NULL;
+        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "rsx_fp", NULL, NULL,
+                                "main", "ps_5_0", 0, 0, &ps_blob, &err);
+        if (FAILED(hr)) {
+            printf("[D3D12] FP @0x%08X (%u instr) compile FAILED: %s\n", addr, n,
+                   err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
+            if (err) err->lpVtbl->Release(err);
+            ps_blob = NULL;  /* cache as known-bad */
+        } else {
+            if (err) err->lpVtbl->Release(err);
+        }
+    }
+
+    u32 idx = s_d3d.fp_cache_count++;
+    s_d3d.fp_cache[idx].guest_addr = addr;
+    s_d3d.fp_cache[idx].hash       = hash;
+    s_d3d.fp_cache[idx].ps_blob    = ps_blob;
+    printf("[D3D12] FP @0x%08X %u bytes, %d instr -> %s (cache #%u)\n",
+           addr, size, n, ps_blob ? "compiled" : "FALLBACK", idx);
+    return ps_blob ? idx : 0xFFFFFFFFu;
+}
+
+/* ---------------------------------------------------------------------------
+ * Vertex-program cache (RSX NV40 transform program → compiled HLSL VS)
+ * -----------------------------------------------------------------------*/
+
+static int vp_is_valid(u32 vp_id)
+{
+    return vp_id < s_d3d.vp_cache_count && s_d3d.vp_cache[vp_id].vs_blob != NULL;
+}
+
+/* Resolve the current transform program to a VP cache index. Decompiles +
+ * compiles on first sight, reuses by content hash. 0xFFFFFFFF => fall back to
+ * the placeholder MVP vertex shader. */
+static u32 resolve_vertex_program(const rsx_state* st)
+{
+    if (!st || st->transform_program_words < 4) return 0xFFFFFFFFu;
+    const u8* uc = (const u8*)st->transform_program;
+    u32 bytes = st->transform_program_words * 4;
+    u32 instrs = rsx_vp_program_size_instrs(uc, bytes);
+    if (instrs == 0) return 0xFFFFFFFFu;
+    u32 size = instrs * 16;
+    u32 hash = fnv1a(uc, size);
+
+    for (u32 i = 0; i < s_d3d.vp_cache_count; i++)
+        if (s_d3d.vp_cache[i].hash == hash)
+            return s_d3d.vp_cache[i].vs_blob ? i : 0xFFFFFFFFu;
+    if (s_d3d.vp_cache_count >= MAX_FP_CACHE) return 0xFFFFFFFFu;
+
+    static char hlsl[160 * 1024];
+    int n = rsx_vp_decompile(uc, size, hlsl, sizeof(hlsl));
+    ID3DBlob* vs_blob = NULL;
+    if (n > 0) {
+        ID3DBlob* err = NULL;
+        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "rsx_vp", NULL, NULL,
+                                "main", "vs_5_0", 0, 0, &vs_blob, &err);
+        if (FAILED(hr)) {
+            printf("[D3D12] VP (%u instr) compile FAILED: %s\n", instrs,
+                   err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
+            vs_blob = NULL;
+        }
+        if (err) err->lpVtbl->Release(err);
+    }
+    u32 idx = s_d3d.vp_cache_count++;
+    s_d3d.vp_cache[idx].hash    = hash;
+    s_d3d.vp_cache[idx].vs_blob = vs_blob;
+    printf("[D3D12] VP %u instr (%u bytes) -> %s (cache #%u)\n",
+           instrs, size, vs_blob ? "compiled" : "FALLBACK", idx);
+    return vs_blob ? idx : 0xFFFFFFFFu;
+}
+
+/* ---------------------------------------------------------------------------
+ * PSO cache
+ * -----------------------------------------------------------------------*/
+
+/* Return a PSO matching `key`, creating and caching one on first use. Returns
+ * NULL only if shaders are unavailable or both creation and cache are
+ * exhausted (caller falls back to a topology-class PSO). */
+static ID3D12PipelineState* get_or_create_pso(const PsoKey* key)
+{
+    /* Linear search -- the cache stays tiny (a handful of blend/depth combos
+     * per title), so a hash map would be overkill. */
+    for (u32 i = 0; i < s_d3d.pso_cache_count; i++) {
+        if (memcmp(&s_d3d.pso_cache[i].key, key, sizeof(PsoKey)) == 0)
+            return s_d3d.pso_cache[i].pso;
+    }
+
+    if (!s_d3d.vs_blob || !s_d3d.ps_blob) return NULL;
+    if (s_d3d.pso_cache_count >= MAX_PSO_CACHE) {
+        static int warned = 0;
+        if (!warned) { printf("[D3D12] PSO cache full (%d) -- reusing fallback\n",
+                              MAX_PSO_CACHE); warned = 1; }
+        return NULL;
+    }
+
+    /* Pick the pixel shader: the decompiled fragment program if this key
+     * names a valid one, otherwise the placeholder vertex-color PS. */
+    ID3DBlob* ps = s_d3d.ps_blob;
+    if (key->fp_id < s_d3d.fp_cache_count && s_d3d.fp_cache[key->fp_id].ps_blob)
+        ps = s_d3d.fp_cache[key->fp_id].ps_blob;
+
+    /* Pick the vertex shader + root signature: the decompiled vertex program
+     * (with the vertex-constant CBV root sig) if valid, else the placeholder
+     * MVP vertex shader (root-constants root sig). */
+    ID3DBlob* vs = s_d3d.vs_blob;
+    ID3D12RootSignature* rs = s_d3d.root_signature;
+    if (vp_is_valid(key->vp_id)) {
+        vs = s_d3d.vp_cache[key->vp_id].vs_blob;
+        rs = s_d3d.root_signature_vp;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {0};
+    pso_desc.pRootSignature = rs;
+    pso_desc.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs);
+    pso_desc.VS.BytecodeLength  = vs->lpVtbl->GetBufferSize(vs);
+    pso_desc.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
+    pso_desc.PS.BytecodeLength  = ps->lpVtbl->GetBufferSize(ps);
+    pso_desc.InputLayout.pInputElementDescs = s_input_layout;
+    pso_desc.InputLayout.NumElements = S_INPUT_LAYOUT_COUNT;
+    pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso_desc.SampleMask = UINT_MAX;
+    pso_desc.SampleDesc.Count = 1;
+    pso_desc.PrimitiveTopologyType = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)key->topology_type;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pso_desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+
+    /* Blend state (single render target). */
+    D3D12_RENDER_TARGET_BLEND_DESC* rt = &pso_desc.BlendState.RenderTarget[0];
+    rt->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    if (key->blend_enable) {
+        rt->BlendEnable    = TRUE;
+        rt->SrcBlend       = nv_to_d3d12_blend_color(key->blend_sfactor);
+        rt->DestBlend      = nv_to_d3d12_blend_color(key->blend_dfactor);
+        rt->BlendOp        = nv_to_d3d12_blend_op(key->blend_equation);
+        rt->SrcBlendAlpha  = nv_to_d3d12_blend_alpha(key->blend_sfactor);
+        rt->DestBlendAlpha = nv_to_d3d12_blend_alpha(key->blend_dfactor);
+        rt->BlendOpAlpha   = nv_to_d3d12_blend_op(key->blend_equation);
+    }
+
+    /* Depth/stencil state. */
+    pso_desc.DepthStencilState.DepthEnable    = key->depth_enable ? TRUE : FALSE;
+    pso_desc.DepthStencilState.DepthWriteMask = key->depth_write
+        ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pso_desc.DepthStencilState.DepthFunc      = nv_to_d3d12_compare(key->depth_func);
+    pso_desc.DepthStencilState.StencilEnable  = FALSE;
+
+    ID3D12PipelineState* pso = NULL;
+    HRESULT hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+        s_d3d.device, &pso_desc, &IID_ID3D12PipelineState, (void**)&pso);
+    if (FAILED(hr)) {
+        printf("[D3D12] PSO cache: creation failed (0x%08lX) "
+               "blend=%u depth=%u topo=%u\n",
+               hr, key->blend_enable, key->depth_enable, key->topology_type);
+        return NULL;
+    }
+
+    s_d3d.pso_cache[s_d3d.pso_cache_count].key = *key;
+    s_d3d.pso_cache[s_d3d.pso_cache_count].pso = pso;
+    s_d3d.pso_cache_count++;
+    printf("[D3D12] PSO cached #%u (fp=%d | blend=%u s=0x%X d=0x%X eq=0x%X | "
+           "depth=%u write=%u func=0x%X | topo=%u)\n",
+           s_d3d.pso_cache_count - 1, (int)key->fp_id, key->blend_enable,
+           key->blend_sfactor, key->blend_dfactor, key->blend_equation,
+           key->depth_enable, key->depth_write, key->depth_func,
+           key->topology_type);
+    return pso;
+}
+
+/* ---------------------------------------------------------------------------
  * Render a frame (clear + present)
  * -----------------------------------------------------------------------*/
 
@@ -633,58 +1253,100 @@ static void render_frame(void)
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
         1.0f, 0, 0, NULL);
 
-    /* Set viewport and scissor */
+    /* Viewport / scissor: prefer the game's request (current_rsx_state),
+     * fall back to the swap-chain extents. RSX viewport_w/h are 0 until the
+     * game first writes NV4097_SET_VIEWPORT_HORIZONTAL/VERTICAL. */
     D3D12_VIEWPORT viewport = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
-    D3D12_RECT scissor = {0, 0, (LONG)s_d3d.width, (LONG)s_d3d.height};
+    D3D12_RECT     scissor  = {0, 0, (LONG)s_d3d.width, (LONG)s_d3d.height};
+    const rsx_state* rs = s_d3d.current_rsx_state;
+    if (rs && rs->viewport_w && rs->viewport_h) {
+        viewport.TopLeftX = (float)rs->viewport_x;
+        viewport.TopLeftY = (float)rs->viewport_y;
+        viewport.Width    = (float)rs->viewport_w;
+        viewport.Height   = (float)rs->viewport_h;
+        viewport.MinDepth = rs->clip_min;
+        viewport.MaxDepth = rs->clip_max;
+    }
+    if (rs && rs->scissor_w && rs->scissor_h) {
+        scissor.left   = (LONG)rs->scissor_x;
+        scissor.top    = (LONG)rs->scissor_y;
+        scissor.right  = (LONG)(rs->scissor_x + rs->scissor_w);
+        scissor.bottom = (LONG)(rs->scissor_y + rs->scissor_h);
+    }
     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &viewport);
     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &scissor);
 
     /* Bind pipeline state and push MVP if anything to draw */
     if (s_d3d.pipeline_ready && s_d3d.draw_count > 0) {
-        s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.root_signature);
+        /* SRV heap + vertex buffer are independent of the root signature. */
+        D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = {0};
+        if (s_d3d.srv_heap) {
+            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
+            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 1, heaps);
+            s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &srv_gpu);
+        }
         s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &s_d3d.vb_view);
 
-        /* Push the MVP matrix from RSX vertex constants slots 0..3.
-         * If the game hasn't written any constants (e.g. placeholder data
-         * already in clip space), fall back to identity. */
+        /* MVP (placeholder VS) from vertex constants slots 0..3, identity if
+         * the game wrote none. */
         float mvp[16];
         const rsx_state* st = s_d3d.current_rsx_state;
         int have_mvp = 0;
         if (st) {
-            for (u32 r = 0; r < 4; r++) {
+            for (u32 r = 0; r < 4; r++)
                 for (u32 c = 0; c < 4; c++) {
                     float v = st->vertex_constants[r][c];
-                    mvp[r * 4 + c] = v;
-                    if (v != 0.0f) have_mvp = 1;
+                    mvp[r*4+c] = v; if (v != 0.0f) have_mvp = 1;
                 }
-            }
         }
-        if (!have_mvp) {
-            memset(mvp, 0, sizeof(mvp));
-            mvp[0] = mvp[5] = mvp[10] = mvp[15] = 1.0f; /* identity */
-        }
-        s_d3d.cmd_list->lpVtbl->SetGraphicsRoot32BitConstants(
-            s_d3d.cmd_list, 0 /*root param 0*/, 16, mvp, 0);
+        if (!have_mvp) { memset(mvp,0,sizeof mvp); mvp[0]=mvp[5]=mvp[10]=mvp[15]=1.0f; }
 
-        /* Replay each recorded draw with its own primitive topology and
-         * the matching PSO class (triangle / line / point). The PSO class
-         * must match the topology or D3D12 rejects the draw. */
+        /* Refresh the vertex-constant CBV (decompiled VS path) from the RSX
+         * constant bank: 512 vec4 into the 1024-slot buffer. */
+        if (s_d3d.vp_const_mapped && st)
+            memcpy(s_d3d.vp_const_mapped, st->vertex_constants,
+                   sizeof(st->vertex_constants));
+        D3D12_GPU_VIRTUAL_ADDRESS cbv_addr = s_d3d.vp_const_buffer
+            ? s_d3d.vp_const_buffer->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_const_buffer) : 0;
+
+        /* Replay each recorded draw, switching root signature + its bindings
+         * when a draw flips between the placeholder-VS and decompiled-VP paths. */
         u32 last_topo = 0xFFFFFFFFu;
         ID3D12PipelineState* last_pso = NULL;
+        int last_uses_vp = -1;
         u32 draws = s_d3d.draw_count;
         if (draws > MAX_DRAWS) draws = MAX_DRAWS;
         for (u32 d = 0; d < draws; d++) {
             const D3D12DrawRecord* dr = &s_d3d.draws[d];
 
-            /* Select PSO based on topology class: */
-            ID3D12PipelineState* target_pso = s_d3d.pipeline_state; /* default triangle */
-            if (dr->topology == D3D_TOPOLOGY_POINTLIST) {
-                target_pso = s_d3d.pipeline_state_points
-                             ? s_d3d.pipeline_state_points : s_d3d.pipeline_state;
-            } else if (dr->topology == D3D_TOPOLOGY_LINELIST ||
-                       dr->topology == D3D_TOPOLOGY_LINESTRIP) {
-                target_pso = s_d3d.pipeline_state_lines
-                             ? s_d3d.pipeline_state_lines : s_d3d.pipeline_state;
+            int uses_vp = vp_is_valid(dr->pso_key.vp_id) ? 1 : 0;
+            if (uses_vp != last_uses_vp) {
+                s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(
+                    s_d3d.cmd_list, uses_vp ? s_d3d.root_signature_vp : s_d3d.root_signature);
+                if (s_d3d.srv_heap)
+                    s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, srv_gpu);
+                if (uses_vp)
+                    s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0, cbv_addr);
+                else
+                    s_d3d.cmd_list->lpVtbl->SetGraphicsRoot32BitConstants(s_d3d.cmd_list, 0, 16, mvp, 0);
+                last_uses_vp = uses_vp;
+                last_pso = NULL; /* force PSO rebind under the new root sig */
+            }
+
+            /* Select a PSO matching this draw's blend/depth/topology state.
+             * Fall back to the fixed topology-class PSO if the cache could
+             * not produce one (shaders missing, cache full, create failed). */
+            ID3D12PipelineState* target_pso = get_or_create_pso(&dr->pso_key);
+            if (!target_pso) {
+                target_pso = s_d3d.pipeline_state; /* default triangle */
+                if (dr->topology == D3D_TOPOLOGY_POINTLIST) {
+                    target_pso = s_d3d.pipeline_state_points
+                                 ? s_d3d.pipeline_state_points : s_d3d.pipeline_state;
+                } else if (dr->topology == D3D_TOPOLOGY_LINELIST ||
+                           dr->topology == D3D_TOPOLOGY_LINESTRIP) {
+                    target_pso = s_d3d.pipeline_state_lines
+                                 ? s_d3d.pipeline_state_lines : s_d3d.pipeline_state;
+                }
             }
             if (target_pso != last_pso) {
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, target_pso);
@@ -694,7 +1356,7 @@ static void render_frame(void)
                 s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, dr->topology);
                 last_topo = dr->topology;
             }
-            u32 start_vert = dr->vb_byte_offset / 28; /* 28 bytes per BasicVertex */
+            u32 start_vert = dr->vb_byte_offset / (u32)sizeof(RsxVertex);
             s_d3d.cmd_list->lpVtbl->DrawInstanced(
                 s_d3d.cmd_list, dr->vertex_count, 1, start_vert, 0);
         }
@@ -795,102 +1457,125 @@ static void d3d12_set_render_target(void* ud, const rsx_state* state)
 static void d3d12_set_viewport(void* ud, const rsx_state* state)
 {
     (void)ud;
-    /* TODO: update D3D12 viewport from RSX state */
+    /* The actual D3D12_VIEWPORT is set per-command-list in end_frame, where
+     * we read from s_d3d.current_rsx_state directly (so this callback only
+     * needs to ensure the state pointer is up to date -- which it is, since
+     * rsx_commands.c calls us with the new state and the begin_frame path
+     * captured the pointer). No work needed here. */
     (void)state;
 }
 
-/* Helper: read RSX vertex data from guest memory and convert to our BasicVertex format.
- * Reads position (float3) from attrib 0 and color (float4) from attrib 3.
- * If attribs aren't available, generates placeholder geometry.
- * Returns the actual number of vertices uploaded (may be less than `count`
- * if the per-frame buffer is full). */
-static u32 upload_vertices_from_rsx(u32 first, u32 count)
+static inline u32 be32(const void* p) {
+    u32 v; memcpy(&v, p, 4);
+    return ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+           ((v <<  8) & 0xFF0000) | ((v << 24) & 0xFF000000);
+}
+
+/* Decode RSX vertex attribute `a` at vertex `vidx` into out[4], filling
+ * missing/absent components from `def`. Handles float32 (type 2, big-endian)
+ * and normalized ubyte (type 4); other formats fall back to `def`. */
+static void read_attrib(const rsx_vertex_attrib* a, u32 vidx,
+                        const float def[4], float out[4])
 {
     extern uint8_t* vm_base;
-    typedef struct { float x, y, z; float r, g, b, a; } BasicVertex;
-    BasicVertex* verts = (BasicVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
-    u32 max_verts = (MAX_VERTICES * 28 - s_d3d.vb_offset) / sizeof(BasicVertex);
+    out[0] = def[0]; out[1] = def[1]; out[2] = def[2]; out[3] = def[3];
+    if (!a->enabled || !vm_base) return;
+    u32 addr = a->offset + vidx * a->stride;
+    if (addr >= 0x20000000) return;
+    const u8* src = vm_base + addr;
+    u32 n = a->size; if (n > 4) n = 4;
+    if (a->type == 2) {            /* float32 */
+        for (u32 i = 0; i < n; i++) { u32 v = be32(src + i * 4); memcpy(&out[i], &v, 4); }
+    } else if (a->type == 4) {     /* ubyte, normalized */
+        for (u32 i = 0; i < n; i++) out[i] = src[i] / 255.0f;
+    }
+}
+
+/* Read one logical RSX vertex at index `vidx` into `out`, following cellGcm's
+ * conventional attribute→semantic mapping (passthrough VP model): attrib 0 =
+ * position, 3 = COLOR0, 4 = COLOR1, 5 = FOG, 8..15 = TEXCOORD0..7.
+ * Returns 0 on success; 1 if there is no usable state. */
+static int read_one_vertex(u32 vidx, RsxVertex* out)
+{
+    static const float d_pos[4]  = {0, 0, 0, 1};
+    static const float d_col0[4] = {1, 1, 1, 1};
+    static const float d_zero[4] = {0, 0, 0, 0};
+
+    const rsx_state* st = s_d3d.current_rsx_state;
+    if (!st) {
+        out->pos[0] = out->pos[1] = out->pos[2] = 0.0f;
+        out->col0[0] = out->col0[1] = out->col0[2] = out->col0[3] = 1.0f;
+        memset(out->col1, 0, sizeof(out->col1));
+        memset(out->fog,  0, sizeof(out->fog));
+        memset(out->tc,   0, sizeof(out->tc));
+        return 1;
+    }
+
+    /* Position (attrib 0). */
+    const rsx_vertex_attrib* pos = &st->vertex_attribs[0];
+    if (pos->enabled && pos->type == 2 && pos->size >= 3) {
+        float p[4]; read_attrib(pos, vidx, d_pos, p);
+        out->pos[0] = p[0]; out->pos[1] = p[1]; out->pos[2] = p[2];
+    } else {
+        /* No real position -- fall back to a placeholder circle. */
+        float t = (float)vidx / 100.0f;
+        out->pos[0] = sinf(t * 6.28f) * 0.5f;
+        out->pos[1] = cosf(t * 6.28f) * 0.5f;
+        out->pos[2] = 0.0f;
+    }
+
+    read_attrib(&st->vertex_attribs[3], vidx, d_col0, out->col0); /* COLOR0 */
+    read_attrib(&st->vertex_attribs[4], vidx, d_zero, out->col1); /* COLOR1 */
+    read_attrib(&st->vertex_attribs[5], vidx, d_zero, out->fog);  /* FOG    */
+    for (u32 t = 0; t < 8; t++)
+        read_attrib(&st->vertex_attribs[8 + t], vidx, d_zero, out->tc[t]); /* TC0..7 */
+    return 0;
+}
+
+/* Upload a sequential range of vertices [first .. first+count). Returns the
+ * actual count written (may be capped by per-frame buffer space). */
+static u32 upload_vertices_from_rsx(u32 first, u32 count)
+{
+    RsxVertex* verts = (RsxVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
+    u32 max_verts = (MAX_VERTICES * sizeof(RsxVertex) - s_d3d.vb_offset) / sizeof(RsxVertex);
+    if (count > max_verts) count = max_verts;
+    for (u32 i = 0; i < count; i++) read_one_vertex(first + i, &verts[i]);
+    s_d3d.vb_offset += count * sizeof(RsxVertex);
+    return count;
+}
+
+/* Read `count` indices from guest memory (per current rsx_state.index_array_*),
+ * resolve each into an RsxVertex via read_one_vertex, and stage the resulting
+ * flat vertex array. Returns the actual vertex count written. We expand on
+ * the CPU (instead of using a real D3D12 index buffer) so the same draw
+ * record path used by draw_arrays handles the result -- a future pass can
+ * switch to a real GPU index buffer when the per-call vertex count justifies
+ * it. */
+static u32 upload_vertices_from_indices(u32 index_byte_offset, u32 count)
+{
+    extern uint8_t* vm_base;
+    const rsx_state* state = s_d3d.current_rsx_state;
+    if (!state || !vm_base) return 0;
+
+    u32 stride = (state->index_array_format == RSX_INDEX_FORMAT_U16) ? 2 : 4;
+    u32 base   = state->index_array_offset + index_byte_offset * stride;
+    if (base >= 0x20000000) return 0;        /* sanity */
+
+    RsxVertex* verts = (RsxVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
+    u32 max_verts = (MAX_VERTICES * sizeof(RsxVertex) - s_d3d.vb_offset) / sizeof(RsxVertex);
     if (count > max_verts) count = max_verts;
 
-    const rsx_state* state = s_d3d.current_rsx_state;
-    int has_position = 0;
-    int has_color = 0;
-
-    /* Check if position attrib (typically attrib 0) is enabled and is float */
-    if (state) {
-        const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
-        if (pos->enabled && pos->type == 2 /* float */ && pos->size >= 3) {
-            has_position = 1;
-        }
-        /* Color is typically attrib 3 (diffuse) */
-        const rsx_vertex_attrib* col = &state->vertex_attribs[3];
-        if (col->enabled && col->size >= 3) {
-            has_color = 1;
-        }
-    }
-
     for (u32 i = 0; i < count; i++) {
-        if (has_position && vm_base) {
-            /* Read position from guest memory.
-             * RSX stores vertices in big-endian. For float type, each component
-             * is a 32-bit BE float. We need to byte-swap. */
-            const rsx_vertex_attrib* pos = &state->vertex_attribs[0];
-            u32 addr = pos->offset + (first + i) * pos->stride;
-            if (addr < 0x20000000) { /* sanity check */
-                u8* src = vm_base + addr;
-                /* Byte-swap each float component (BE → LE) */
-                u32 fx, fy, fz;
-                memcpy(&fx, src,     4); fx = ((fx>>24)&0xFF)|((fx>>8)&0xFF00)|((fx<<8)&0xFF0000)|((fx<<24)&0xFF000000);
-                memcpy(&fy, src + 4, 4); fy = ((fy>>24)&0xFF)|((fy>>8)&0xFF00)|((fy<<8)&0xFF0000)|((fy<<24)&0xFF000000);
-                memcpy(&fz, src + 8, 4); fz = ((fz>>24)&0xFF)|((fz>>8)&0xFF00)|((fz<<8)&0xFF0000)|((fz<<24)&0xFF000000);
-                memcpy(&verts[i].x, &fx, 4);
-                memcpy(&verts[i].y, &fy, 4);
-                memcpy(&verts[i].z, &fz, 4);
-            } else {
-                verts[i].x = verts[i].y = verts[i].z = 0.0f;
-            }
+        u8* src = vm_base + base + i * stride;
+        u32 idx;
+        if (state->index_array_format == RSX_INDEX_FORMAT_U16) {
+            idx = ((u32)src[0] << 8) | src[1];      /* BE u16 */
         } else {
-            /* Placeholder: distribute vertices in a circle */
-            float t = (float)(first + i) / 100.0f;
-            verts[i].x = sinf(t * 6.28f) * 0.5f;
-            verts[i].y = cosf(t * 6.28f) * 0.5f;
-            verts[i].z = 0.0f;
+            idx = be32(src);                          /* BE u32 */
         }
-
-        if (has_color && vm_base) {
-            const rsx_vertex_attrib* col = &state->vertex_attribs[3];
-            u32 addr = col->offset + (first + i) * col->stride;
-            if (addr < 0x20000000 && col->type == 4 /* ubyte */) {
-                u8* src = vm_base + addr;
-                /* RGBA bytes, normalized to 0-1 */
-                verts[i].r = src[0] / 255.0f;
-                verts[i].g = src[1] / 255.0f;
-                verts[i].b = src[2] / 255.0f;
-                verts[i].a = (col->size >= 4) ? src[3] / 255.0f : 1.0f;
-            } else if (addr < 0x20000000 && col->type == 2 /* float */) {
-                u8* src = vm_base + addr;
-                u32 fr, fg, fb, fa;
-                memcpy(&fr, src,     4); fr = ((fr>>24)&0xFF)|((fr>>8)&0xFF00)|((fr<<8)&0xFF0000)|((fr<<24)&0xFF000000);
-                memcpy(&fg, src + 4, 4); fg = ((fg>>24)&0xFF)|((fg>>8)&0xFF00)|((fg<<8)&0xFF0000)|((fg<<24)&0xFF000000);
-                memcpy(&fb, src + 8, 4); fb = ((fb>>24)&0xFF)|((fb>>8)&0xFF00)|((fb<<8)&0xFF0000)|((fb<<24)&0xFF000000);
-                memcpy(&verts[i].r, &fr, 4);
-                memcpy(&verts[i].g, &fg, 4);
-                memcpy(&verts[i].b, &fb, 4);
-                if (col->size >= 4) {
-                    memcpy(&fa, src + 12, 4); fa = ((fa>>24)&0xFF)|((fa>>8)&0xFF00)|((fa<<8)&0xFF0000)|((fa<<24)&0xFF000000);
-                    memcpy(&verts[i].a, &fa, 4);
-                } else {
-                    verts[i].a = 1.0f;
-                }
-            } else {
-                verts[i].r = 1.0f; verts[i].g = 1.0f; verts[i].b = 1.0f; verts[i].a = 1.0f;
-            }
-        } else {
-            /* Default white */
-            verts[i].r = 1.0f; verts[i].g = 1.0f; verts[i].b = 1.0f; verts[i].a = 1.0f;
-        }
+        read_one_vertex(idx, &verts[i]);
     }
-    s_d3d.vb_offset += count * sizeof(BasicVertex);
+    s_d3d.vb_offset += count * sizeof(RsxVertex);
     return count;
 }
 
@@ -969,6 +1654,9 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
         s_d3d.draws[s_d3d.draw_count].vertex_count   = actual_count;
         s_d3d.draws[s_d3d.draw_count].topology       = topo;
+        s_d3d.draws[s_d3d.draw_count].pso_key        =
+            pso_key_from_state(s_d3d.current_rsx_state, topo,
+                               s_d3d.current_fp_id, s_d3d.current_vp_id);
         s_d3d.draw_count++;
     }
 }
@@ -976,13 +1664,156 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 static void d3d12_draw_indexed(void* ud, u32 primitive, u32 offset, u32 count)
 {
     (void)ud;
-    static int log_count = 0;
-    if (log_count < 20) {
-        printf("[D3D12] draw_indexed(prim=%u, offset=%u, count=%u)\n",
-               primitive, offset, count);
-        log_count++;
+    static u64 s_total = 0;
+    if (s_total < 20 || (s_total % 1000) == 0) {
+        printf("[D3D12] draw_indexed #%llu prim=%u offset=%u count=%u\n",
+               (unsigned long long)s_total, primitive, offset, count);
     }
-    /* TODO: create index buffer and call DrawIndexedInstanced */
+    s_total++;
+
+    if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
+    if (count == 0 || count > MAX_VERTICES) return;
+
+    u32 topo = rsx_to_d3d12_topology(primitive);
+    if (topo == D3D_TOPOLOGY_UNDEFINED) {
+        static int s_skipped = 0;
+        if (s_skipped < 3) {
+            printf("[D3D12] draw_indexed: skipping prim=%u (needs index conversion)\n",
+                   primitive);
+            s_skipped++;
+        }
+        return;
+    }
+
+    /* Resolve indices on the CPU into a flat vertex stream. The same draw
+     * record path that draw_arrays uses then dispatches a DrawInstanced
+     * with the expanded count -- no D3D12 index buffer needed for now. */
+    u32 record_offset = s_d3d.vb_offset;
+    u32 actual_count  = upload_vertices_from_indices(offset, count);
+    if (actual_count == 0) return;
+
+    if (s_d3d.draw_count < MAX_DRAWS) {
+        s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
+        s_d3d.draws[s_d3d.draw_count].vertex_count   = actual_count;
+        s_d3d.draws[s_d3d.draw_count].topology       = topo;
+        s_d3d.draws[s_d3d.draw_count].pso_key        =
+            pso_key_from_state(s_d3d.current_rsx_state, topo,
+                               s_d3d.current_fp_id, s_d3d.current_vp_id);
+        s_d3d.draw_count++;
+    }
+}
+
+/* Wait for the dedicated upload queue work to finish. */
+static void upload_flush(void)
+{
+    u64 v = ++s_d3d.upload_fence_value;
+    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.upload_fence, v);
+    if (s_d3d.upload_fence->lpVtbl->GetCompletedValue(s_d3d.upload_fence) < v) {
+        s_d3d.upload_fence->lpVtbl->SetEventOnCompletion(s_d3d.upload_fence, v, s_d3d.upload_event);
+        WaitForSingleObject(s_d3d.upload_event, INFINITE);
+    }
+}
+
+/* Upload a linear, uncompressed RSX texture into SRV slot `unit`. Returns 0 on
+ * success. Swizzled / block-compressed / unsupported formats are rejected by
+ * the caller (the slot keeps its null SRV). */
+static int upload_texture(u32 unit, u32 guest_off, u32 dxgi, u32 bpp,
+                          u32 width, u32 height)
+{
+    extern uint8_t* vm_base;
+    u32 src_pitch = (width * bpp) / 8;
+    if (src_pitch == 0) return -1;
+    if ((u64)guest_off + (u64)src_pitch * height > 0x20000000ull) return -1; /* bounds */
+
+    /* 1. Destination texture (DEFAULT heap, COPY_DEST). */
+    D3D12_HEAP_PROPERTIES dheap = {0}; dheap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width            = width;
+    td.Height           = height;
+    td.DepthOrArraySize = 1;
+    td.MipLevels        = 1;
+    td.Format           = (DXGI_FORMAT)dxgi;
+    td.SampleDesc.Count = 1;
+    td.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    ID3D12Resource* texres = NULL;
+    HRESULT hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+        s_d3d.device, &dheap, D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&texres);
+    if (FAILED(hr)) return -1;
+
+    /* 2. Copyable footprint + matching upload buffer. */
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; UINT rows; UINT64 row_bytes, total;
+    s_d3d.device->lpVtbl->GetCopyableFootprints(
+        s_d3d.device, &td, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+
+    D3D12_HEAP_PROPERTIES uheap = {0}; uheap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = total;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* upbuf = NULL;
+    hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+        s_d3d.device, &uheap, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&upbuf);
+    if (FAILED(hr)) { texres->lpVtbl->Release(texres); return -1; }
+
+    /* 3. Copy rows from guest memory into the upload buffer (row-pitch aligned).
+     * Linear layout assumed -- swizzled textures are rejected by the caller. */
+    u8* dst = NULL;
+    D3D12_RANGE no_read = {0, 0};
+    upbuf->lpVtbl->Map(upbuf, 0, &no_read, (void**)&dst);
+    const u8* src = vm_base + guest_off;
+    u32 copy = (u32)row_bytes; if (copy > src_pitch) copy = src_pitch;
+    for (UINT r = 0; r < rows; r++)
+        memcpy(dst + fp.Offset + (u64)r * fp.Footprint.RowPitch,
+               src + (u64)r * src_pitch, copy);
+    upbuf->lpVtbl->Unmap(upbuf, 0, NULL);
+
+    /* 4. Record copy + transition to shader-resource on the upload list. */
+    s_d3d.upload_alloc->lpVtbl->Reset(s_d3d.upload_alloc);
+    s_d3d.upload_list->lpVtbl->Reset(s_d3d.upload_list, s_d3d.upload_alloc, NULL);
+
+    D3D12_TEXTURE_COPY_LOCATION dl; memset(&dl, 0, sizeof(dl));
+    dl.pResource = texres; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION sl; memset(&sl, 0, sizeof(sl));
+    sl.pResource = upbuf;  sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; sl.PlacedFootprint = fp;
+    s_d3d.upload_list->lpVtbl->CopyTextureRegion(s_d3d.upload_list, &dl, 0, 0, 0, &sl, NULL);
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = texres;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    s_d3d.upload_list->lpVtbl->ResourceBarrier(s_d3d.upload_list, 1, &b);
+
+    s_d3d.upload_list->lpVtbl->Close(s_d3d.upload_list);
+    ID3D12CommandList* lists[] = { (ID3D12CommandList*)s_d3d.upload_list };
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+    upload_flush();
+    upbuf->lpVtbl->Release(upbuf);
+
+    /* 5. SRV into slot `unit`, replacing the null descriptor. */
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &h);
+    h.ptr += (size_t)unit * s_d3d.srv_descriptor_size;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {0};
+    srv.Format                  = (DXGI_FORMAT)dxgi;
+    srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels     = 1;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, texres, &srv, h);
+
+    if (s_d3d.unit_textures[unit]) s_d3d.unit_textures[unit]->lpVtbl->Release(s_d3d.unit_textures[unit]);
+    s_d3d.unit_textures[unit] = texres;
+    return 0;
 }
 
 static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
@@ -992,56 +1823,41 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
 
     u32 width  = (tex->image_rect >> 16) & 0xFFFF;
     u32 height = tex->image_rect & 0xFFFF;
-    u32 format = (tex->format >> 8) & 0xFF;
+    u32 fmtword = tex->format;
+    u32 format = rsx_texture_get_format(fmtword);
     u32 offset = tex->offset;
+
+    if (unit >= FP_TEXTURE_SLOTS || !vm_base) return;
+    if (width == 0 || height == 0 || offset >= 0x20000000) return;
+
+    /* Skip re-upload if this unit already holds an identical texture. */
+    u32 key = offset ^ (fmtword * 2654435761u) ^ (width << 16) ^ height;
+    if (s_d3d.unit_textures[unit] && s_d3d.unit_tex_key[unit] == key) return;
+
+    u32 dxgi = rsx_to_dxgi_texture_format(format);
+    int swizzled   = rsx_texture_is_swizzled(fmtword);
+    int compressed = (format == RSX_TEXTURE_COMPRESSED_DXT1 ||
+                      format == RSX_TEXTURE_COMPRESSED_DXT23 ||
+                      format == RSX_TEXTURE_COMPRESSED_DXT45);
 
     static int log_count = 0;
     if (log_count < 10) {
-        printf("[D3D12] bind_texture(unit=%u, offset=0x%X, fmt=0x%02X, %ux%u)\n",
-               unit, offset, format, width, height);
+        printf("[D3D12] bind_texture(unit=%u off=0x%X fmt=0x%02X %ux%u dxgi=%u%s%s)\n",
+               unit, offset, format, width, height, dxgi,
+               swizzled ? " SWZ" : "", compressed ? " DXT" : "");
         log_count++;
     }
 
-    /* Texture upload is complex and requires:
-     * 1. Matching DXGI format from RSX format
-     * 2. Creating a texture resource in DEFAULT heap
-     * 3. Creating an upload buffer in UPLOAD heap
-     * 4. Copying pixel data from guest memory (with potential deswizzle)
-     * 5. Recording CopyTextureRegion into the command list
-     * 6. Creating a SRV descriptor
-     * 7. Binding to the shader
-     *
-     * For now we log the texture parameters. The infrastructure is ready:
-     * - rsx_texture_formats.h provides format mapping
-     * - rsx_to_dxgi_texture_format() converts RSX → DXGI
-     * - Guest memory is accessible via vm_base + offset
-     *
-     * Full implementation requires:
-     * - A texture cache (avoid re-uploading unchanged textures)
-     * - A SRV descriptor heap (CBV_SRV_UAV type)
-     * - Root signature update to include SRV table
-     * - A textured PSO (with sampler state)
-     */
+    /* MVP scope: linear, uncompressed, single mip. Anything else keeps the
+     * unit's null SRV (samples 0) -- deswizzle / block formats are future. */
+    if (dxgi == 0 || swizzled || compressed) return;
 
-    /* Validate that we CAN read this texture */
-    if (!vm_base || width == 0 || height == 0) return;
-    if (offset >= 0x20000000) return; /* out of range */
-
-    /* Log format details for debugging */
-    static int detail_log = 0;
-    if (detail_log < 5) {
-        const char* fmt_name = "unknown";
-        switch (format) {
-        case 0x85: fmt_name = "A8R8G8B8"; break;
-        case 0x84: fmt_name = "R5G6B5"; break;
-        case 0x86: fmt_name = "DXT1"; break;
-        case 0x88: fmt_name = "DXT5"; break;
-        case 0x81: fmt_name = "B8"; break;
-        case 0x9E: fmt_name = "D8R8G8B8"; break;
-        }
-        printf("[D3D12]   texture: %s (%ux%u) at guest 0x%08X\n",
-               fmt_name, width, height, offset);
-        detail_log++;
+    u32 bpp = rsx_texture_bpp(format);
+    if (upload_texture(unit, offset, dxgi, bpp, width, height) == 0) {
+        s_d3d.unit_tex_key[unit] = key;
+        if (log_count <= 10)
+            printf("[D3D12]   uploaded unit %u (%ux%u) -> SRV slot %u\n",
+                   unit, width, height, unit);
     }
 }
 
@@ -1079,24 +1895,32 @@ static void d3d12_set_shader(void* ud, const rsx_state* state)
     (void)ud;
     s_d3d.current_rsx_state = state;
 
+    /* Resolve (decompile + compile + cache) the fragment program. The result
+     * index feeds the PSO key so the PSO cache builds a pipeline per
+     * (fragment program × blend × depth × topology). On any failure
+     * current_fp_id stays 0xFFFFFFFF and draws use the placeholder PS. */
+    s_d3d.current_fp_id = resolve_fragment_program(state->fragment_program_addr);
+    /* Likewise resolve the vertex (transform) program; 0xFFFFFFFF keeps the
+     * placeholder MVP vertex shader. */
+    s_d3d.current_vp_id = resolve_vertex_program(state);
+
     static int log_count = 0;
     if (log_count < 5) {
-        printf("[D3D12] set_shader: fp_addr=0x%08X, vp_load=%u, output_mask=0x%08X\n",
-               state->fragment_program_addr, state->transform_program_load,
+        printf("[D3D12] set_shader: fp_addr=0x%08X -> fp_id=%d, vp_id=%d (%u words), output_mask=0x%08X\n",
+               state->fragment_program_addr, (int)s_d3d.current_fp_id,
+               (int)s_d3d.current_vp_id, state->transform_program_words,
                state->vertex_attrib_output_mask);
         log_count++;
     }
-
-    /* TODO: Look up or compile a PSO matching this shader combination.
-     * For now we use the basic vertex-colored PSO for everything. */
 }
 
 static void d3d12_set_blend(void* ud, const rsx_state* state)
 {
     (void)ud;
-    /* TODO: modify PSO blend state or use dynamic state.
-     * D3D12 requires PSO recreation for blend state changes,
-     * so we'd need a PSO cache keyed by blend configuration. */
+    /* The blend configuration is baked into a PSO at draw time: each draw
+     * record snapshots the current rsx_state via pso_key_from_state(), and
+     * render_frame resolves it through the PSO cache (get_or_create_pso).
+     * Nothing to do here beyond diagnostics. */
     static int log_count = 0;
     if (log_count < 5) {
         printf("[D3D12] set_blend(enable=%d, sfactor=0x%X, dfactor=0x%X)\n",
@@ -1108,6 +1932,8 @@ static void d3d12_set_blend(void* ud, const rsx_state* state)
 static void d3d12_set_depth_stencil(void* ud, const rsx_state* state)
 {
     (void)ud;
+    /* Depth state is likewise baked into the per-draw PSO (see d3d12_set_blend).
+     * This callback is diagnostics-only. */
     static int log_count = 0;
     if (log_count < 5) {
         printf("[D3D12] set_depth_stencil(depth=%d, stencil=%d, func=0x%X)\n",
@@ -1132,6 +1958,8 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     memset(&s_d3d, 0, sizeof(s_d3d));
     s_d3d.width = width;
     s_d3d.height = height;
+    s_d3d.current_fp_id = 0xFFFFFFFFu; /* placeholder PS until a game sets one */
+    s_d3d.current_vp_id = 0xFFFFFFFFu; /* placeholder MVP VS until a game sets one */
     s_d3d.clear_color[0] = 0.0f;
     s_d3d.clear_color[1] = 0.0f;
     s_d3d.clear_color[2] = 0.1f;
@@ -1191,8 +2019,28 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.pipeline_state)        s_d3d.pipeline_state->lpVtbl->Release(s_d3d.pipeline_state);
     if (s_d3d.pipeline_state_lines)  s_d3d.pipeline_state_lines->lpVtbl->Release(s_d3d.pipeline_state_lines);
     if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);
+    for (u32 i = 0; i < s_d3d.pso_cache_count; i++)
+        if (s_d3d.pso_cache[i].pso) s_d3d.pso_cache[i].pso->lpVtbl->Release(s_d3d.pso_cache[i].pso);
+    for (u32 i = 0; i < s_d3d.fp_cache_count; i++)
+        if (s_d3d.fp_cache[i].ps_blob) s_d3d.fp_cache[i].ps_blob->lpVtbl->Release(s_d3d.fp_cache[i].ps_blob);
+    if (s_d3d.srv_heap) s_d3d.srv_heap->lpVtbl->Release(s_d3d.srv_heap);
+    for (u32 i = 0; i < FP_TEXTURE_SLOTS; i++)
+        if (s_d3d.unit_textures[i]) s_d3d.unit_textures[i]->lpVtbl->Release(s_d3d.unit_textures[i]);
+    if (s_d3d.upload_list)  s_d3d.upload_list->lpVtbl->Release(s_d3d.upload_list);
+    if (s_d3d.upload_alloc) s_d3d.upload_alloc->lpVtbl->Release(s_d3d.upload_alloc);
+    if (s_d3d.upload_fence) s_d3d.upload_fence->lpVtbl->Release(s_d3d.upload_fence);
+    if (s_d3d.upload_event) CloseHandle(s_d3d.upload_event);
+    if (s_d3d.vs_blob) s_d3d.vs_blob->lpVtbl->Release(s_d3d.vs_blob);
+    if (s_d3d.ps_blob) s_d3d.ps_blob->lpVtbl->Release(s_d3d.ps_blob);
     if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
     if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
+    for (u32 i = 0; i < s_d3d.vp_cache_count; i++)
+        if (s_d3d.vp_cache[i].vs_blob) s_d3d.vp_cache[i].vs_blob->lpVtbl->Release(s_d3d.vp_cache[i].vs_blob);
+    if (s_d3d.vp_const_buffer) {
+        s_d3d.vp_const_buffer->lpVtbl->Unmap(s_d3d.vp_const_buffer, 0, NULL);
+        s_d3d.vp_const_buffer->lpVtbl->Release(s_d3d.vp_const_buffer);
+    }
+    if (s_d3d.root_signature_vp) s_d3d.root_signature_vp->lpVtbl->Release(s_d3d.root_signature_vp);
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);

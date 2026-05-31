@@ -275,6 +275,7 @@ See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for the full walkthrough.
 |------|----------|--------|------|
 | **flOw** (thatgamecompany) | NPUA80001 | 92K functions, game reaches main() init, module loading + sysutil callbacks working, trampoline system for split-function chains, ~10K TODOs, D3D12 backend ready | [sp00nznet/flow](https://github.com/sp00nznet/flow) |
 | **Tokyo Jungle** (Crispy's/SCE Japan) | NPUA80523 | 33K functions lifted, CRT init + HLE framework wired, indirect call dispatch | [sp00nznet/tokyojungle](https://github.com/sp00nznet/tokyojungle) |
+| **Uncharted: Drake's Fortune** (Naughty Dog) | BCUS98103 | 14,282 functions lifted into one integrated boot; runs CRT → 350 global ctors → memory map → SPU audio-engine init; jump-table recovery, import-glink/TOC fixes, cellFs VFS. Next: internal-printf length bug + real lv2 memory layer | — |
 
 Want to port a game? Start with the [Getting Started](#getting-started) section, check [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) for system library coverage, and see the [flOw case study](docs/GAME_PORTING_GUIDE.md#case-study-flow) for a real-world walkthrough.
 
@@ -324,6 +325,17 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 ## Changelog
+
+### v0.6.0 — *"Uncharted Boots"* (May 2026)
+- **Full integrated PPU boot**: the complete **14,282-function lift** of a real retail EBOOT (Uncharted: Drake's Fortune, BCUS98103) builds into a single native executable and runs real boot code — CRT startup → `sys_initialize_tls` → **all 350 global C++ constructors** → TTY channel setup → memory-map report → **SPU audio-engine init** (~3,800 lines of authentic game TTY). No crashes, no OOB, no unresolved indirect calls.
+- **Jump-table (switch) recovery in the lifter**: detects the GCC ELFv1 computed-`bctr` switch pattern (`lwz rB,D(r2); lwzx rO,idx,rB; extsw; add; mtctr; bctr`), reads the offset table from the image, and emits `loc_` labels + a `switch((u32)ctr){ case→goto }` instead of an unresolved indirect call. Follows **single and double TOC-indirection** (`lwz r30,D1(r2); lwz rB,D2(r30)`) via a recursive TOC-load resolver. **91 tables recovered** — cleared the mid-function indirect-call walls that previously stalled the boot.
+- **Import glink → HLE fix**: the 172 firmware import glink stubs were reached by tail-entry resolution and lifted as real bodies that read the *unresolved* import GOT (dispatching to garbage `0x39800000` → early `abort()`). Import-stub addresses are now always emitted as `ps3_hle_call(NID)` trampolines.
+- **TOC-save in import trampolines**: trampolines replicate the glink's `std r2, 0x28(r1)` so a caller's post-call `ld r2, 0x28(r1)` restores the correct TOC. Previously r2/TOC was corrupted across every import call, breaking TOC-relative data reads (e.g. the global constructor-table pointer at `TOC-0x561C`).
+- **Branch-target declarations**: cross-fragment `b`/`bc` targets are now declared + stubbed (header and undefined-stub sets use `call_targets | branch_targets`).
+- **cellFs VFS** (`runtime/ppu/ppu_fs.cpp`): cellFsOpen/Close/Read/Write/Lseek/Stat/Fstat/Opendir/Readdir/Closedir/Mkdir/Rmdir/Unlink/Fsync over the host filesystem, with the VFS root derived from the EBOOT path and PS3 mount-point translation (`/dev_bdvd`, `/app_home`, `/dev_hdd0`, …).
+- **Boot HLE batch** (`ppu_sysprx.cpp` / `ppu_loader.cpp`): real `sys_lwmutex_*` (struct-modelled), `sys_ppu_thread_get_id`, `sys_mmapper_allocate/map/unmap/free`, `sys_memory_get_user_memory_size` (352), `sys_mmapper_allocate_address` (330), `sys_tty_write` (403). Flat VM sized to **1.36 GB** to cover the game's memory map (user heap at `0x20000000+`).
+- **Incremental build + spin diagnostics**: parallel per-TU object compile with fast relink; `-DVM_SAMPLE_READS` read-sampling + `__builtin_return_address` tracing (inside the actual lifted callee / inside `ps3_indirect_call` for vtable calls) to pinpoint divergences across the indirect-call boundary.
+- **Uncharted: Drake's Fortune progress**: boots through CRT, 350 constructors, and into the SPU audio-engine init. **Next blocker**: the internal printf/logging path passes a bad length (a data-segment pointer used as a `memchr` count) — traced through 4 call levels into `func_00764930`; plus wiring the existing lv2 `sys_memory` layer for real allocation accounting (needs `ppu_context` unified with the lifted header first).
 
 ### v0.5.0 — *"Pixels on Screen"* (April 2026)
 - **RSX command buffer processing wired up**: `gcm_flush_guest_cmdbuf()` now initializes RSX state via `rsx_state_init()`, passes NV40 commands to `rsx_process_command_buffer()`, and dispatches to the backend. Games can write GCM commands and see results on screen.

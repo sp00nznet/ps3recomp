@@ -72,6 +72,54 @@ static CellGcmConfig s_config;
 /* Command buffer control */
 static CellGcmControl s_control;
 
+/* ---------------------------------------------------------------------------
+ * RSX FIFO bridge: cellGcm command buffer -> rsx_process_command_buffer
+ *
+ * The game builds NV4097 method runs into the command buffer (IO memory) and
+ * advances s_control.put; the RSX consumes from s_control.get. With no real
+ * GPU thread, we drain [get, put) at the natural flush points (FIFO overflow
+ * callback and flip) and dispatch each method to the registered rsx_backend.
+ * -----------------------------------------------------------------------*/
+#include "rsx_commands.h"
+extern uint8_t* vm_base;            /* guest memory base (host-mapped) */
+
+static rsx_state s_rsx_state;       /* persistent RSX state machine */
+static u32       s_cmd_buffer_ea;   /* guest EA of command buffer base (io off 0) */
+static u32       s_cmd_buffer_size; /* command buffer size in bytes */
+static int       s_rsx_bridge_ready;
+
+/* Drain the FIFO from get up to put, dispatching methods to the backend.
+ * Handles a single wrap (put < get) using the buffer size. */
+static void gcm_consume_fifo(void)
+{
+    if (!s_rsx_bridge_ready || !vm_base || s_cmd_buffer_ea == 0) return;
+
+    u32 get = s_control.get;
+    u32 put = s_control.put;
+    if (put == get) return;
+
+    const u8* base = vm_base + s_cmd_buffer_ea;
+    if (put > get) {
+        rsx_process_command_buffer(&s_rsx_state, (const u32*)(base + get), put - get);
+    } else {
+        /* Wrapped: process the tail [get, size) then the head [0, put). */
+        if (s_cmd_buffer_size > get)
+            rsx_process_command_buffer(&s_rsx_state,
+                                       (const u32*)(base + get), s_cmd_buffer_size - get);
+        if (put > 0)
+            rsx_process_command_buffer(&s_rsx_state, (const u32*)base, put);
+    }
+    s_control.get = put;
+}
+
+/* Flush pending commands, then present the given display buffer. */
+static void gcm_flush_and_present(u32 buffer_id)
+{
+    gcm_consume_fifo();
+    rsx_backend* b = rsx_get_backend();
+    if (b && b->present) b->present(b->userdata, buffer_id);
+}
+
 /* Offset table storage */
 static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
@@ -288,9 +336,35 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mapping_count = 1;
     }
 
+    /* Bring up the RSX FIFO bridge. The default command buffer is the IO
+     * region (io offset 0 == EA ioAddress, per populate_offset_table above). */
+    rsx_state_init(&s_rsx_state);
+    s_cmd_buffer_ea   = ioAddress;
+    s_cmd_buffer_size = cmdSize;
+    s_rsx_bridge_ready = 1;
+
     s_gcm_initialized = 1;
     return CELL_OK;
 }
+
+/* The actual firmware import behind the SDK's inline cellGcmInit(); the first
+ * argument is the guest context-data pointer (the SDK populates it on return).
+ * We don't model the guest-side context yet, so reuse cellGcmInit. */
+s32 _cellGcmInitBody(u32 context, u32 cmdSize, u32 ioSize, u32 ioAddress)
+{
+    (void)context;
+    return cellGcmInit(cmdSize, ioSize, ioAddress);
+}
+
+/* cellGcmSetFlip(context, bufferId) -> queue a flip for the buffer. */
+s32 cellGcmSetFlip(u32 context, u32 bufferId)
+{
+    (void)context;
+    return cellGcmSetFlipCommand(bufferId);
+}
+
+/* Unidentified internal export; accepted as a no-op so the import resolves. */
+s32 _cellGcmFunc15(void) { return CELL_OK; }
 
 /* NID: 0x15BAE46B */
 s32 cellGcmGetConfiguration(CellGcmConfig* config)
@@ -414,6 +488,9 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_last_flip_time = get_timestamp_ns();
 
+    /* Drain the frame's commands to the backend and present. */
+    gcm_flush_and_present(bufferId);
+
     if (s_flip_handler)
         s_flip_handler(0);  /* head 0 = primary display */
 
@@ -448,6 +525,8 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     s_current_display_buffer_id = bufferId;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_last_flip_time = get_timestamp_ns();
+
+    gcm_flush_and_present(bufferId);
 
     if (s_flip_handler)
         s_flip_handler(0);
@@ -907,6 +986,10 @@ s32 cellGcmCallback(void* context, u32 count)
 {
     (void)context;
     (void)count;
+    /* FIFO overflow: drain everything submitted so far so the game can reuse
+     * the buffer. (Buffer wrap/reset of the guest context is the game's inline
+     * job; we only consume up to put.) */
+    gcm_consume_fifo();
     return CELL_OK;
 }
 
@@ -929,6 +1012,9 @@ void cellGcmTerminate(void)
 {
     printf("[cellGcmSys] Terminate\n");
 
+    s_rsx_bridge_ready = 0;
+    s_cmd_buffer_ea = 0;
+    s_cmd_buffer_size = 0;
     s_gcm_initialized = 0;
     s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;

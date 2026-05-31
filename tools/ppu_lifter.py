@@ -131,6 +131,10 @@ extern "C" uint8_t* vm_base;
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
 
+/* Firmware import dispatch (NID -> HLE handler) — implemented by the game
+ * project. Import glink stubs are emitted as direct calls to this. */
+extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
+
 /* Trampoline function pointer for cross-fragment branches (TLS).
  * Must match the __declspec(thread) definition in indirect_dispatch. */
 extern "C" __declspec(thread) void (*g_trampoline_fn)(void*);
@@ -201,15 +205,21 @@ class LiftedFunction:
     end_addr: int = 0
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
+    # bctr address -> sorted list of distinct in-function switch-case targets
+    # (recovered GCC jump tables; emitted as a switch instead of an indirect call)
+    jump_tables: dict = field(default_factory=dict)
 
 
 class PPULifter:
     """Translates PPU instructions into C source."""
 
     def __init__(self):
+        self.source_base = "ppu_recomp"
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
+        self.module_toc: int = 0            # r2 base; needed to resolve jump-table bases
+        self.word_at: dict[int, int] = {}   # guest addr -> raw BE word (for reading tables)
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -240,6 +250,16 @@ class PPULifter:
                         except ValueError:
                             pass
 
+        # Recover GCC switch jump tables (computed bctr) into explicit case
+        # targets, so a dispatch that lands mid-function becomes a local goto
+        # instead of an unresolved indirect call. Their targets are in-function
+        # addresses and must get loc_ labels.
+        finsns = sorted((i for i in instructions if start <= i.addr < end),
+                        key=lambda x: x.addr)
+        func.jump_tables = self._recover_jump_tables(finsns, start, end)
+        for tgts in func.jump_tables.values():
+            internal_targets.update(tgts)
+
         for insn in instructions:
             if insn.addr < start or insn.addr >= end:
                 continue
@@ -254,6 +274,95 @@ class PPULifter:
 
         self.functions.append(func)
         return func
+
+    # ------------------------------------------------------------------ #
+    # Jump-table (switch) recovery
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _reg(tok: str):
+        m = re.match(r"^r(\d+)$", tok.strip())
+        return int(m.group(1)) if m else None
+
+    def _reg_value(self, finsns, before_idx, reg, depth=3):
+        """Return the guest address/value held in `reg` just before
+        finsns[before_idx], by following TOC-relative load chains (r2 == the
+        module TOC). Handles both the direct form `lwz rB, D(r2)` and the
+        indirect form `lwz rB, D2(rX)` where rX itself comes from the TOC
+        (a TOC entry that points to a struct holding the jump table). Returns
+        None if `reg` isn't a simple load chain."""
+        if reg == 2:
+            return self.module_toc
+        if depth < 0:
+            return None
+        for k in range(before_idx - 1, max(before_idx - 1 - 24, -1), -1):
+            ins = finsns[k]
+            parts = [p.strip() for p in ins.operands.split(",", 1)]
+            if len(parts) != 2 or self._reg(parts[0]) != reg:
+                continue
+            if ins.mnemonic not in ("lwz", "ld"):
+                return None  # reg redefined by a non-load
+            m = re.match(r"(-?0x[0-9A-Fa-f]+|-?\d+)\((r\d+)\)$", parts[1])
+            if not m:
+                return None
+            disp = int(m.group(1), 0)
+            base = self._reg(m.group(2))
+            base_val = self._reg_value(finsns, k, base, depth - 1)
+            if base_val is None:
+                return None
+            return self.word_at.get((base_val + disp) & 0xFFFFFFFF)
+        return None
+
+    def _recover_jump_tables(self, finsns, fstart, fend):
+        """Detect the GCC switch dispatch
+            lwz rB,DISP(r2); ...; lwzx rO,rIdx,rB; extsw rO; add rT,rO,rB;
+            mtctr rT; bctr
+        and read the offset table (target = tableBase + sext(entry)). Returns
+        {bctr_addr: [distinct in-function targets]}."""
+        out = {}
+        if not self.module_toc or not self.word_at:
+            return out
+        for i, insn in enumerate(finsns):
+            if insn.mnemonic != "bctr":
+                continue
+            # mtctr rT just before
+            rT = None
+            for k in range(i - 1, max(i - 4, -1), -1):
+                if finsns[k].mnemonic == "mtctr":
+                    rT = self._reg(finsns[k].operands.split(",")[0]); break
+            if rT is None:
+                continue
+            # add rT, rOff, rBase feeding ctr; rBase holds the jump-table base
+            # address (resolved through the TOC load chain).
+            tbl = None
+            for k in range(i - 2, max(i - 9, -1), -1):
+                ins2 = finsns[k]
+                if ins2.mnemonic not in ("add", "add."):
+                    continue
+                parts = [p.strip() for p in ins2.operands.split(",")]
+                if len(parts) != 3 or self._reg(parts[0]) != rT:
+                    continue
+                for cand in (self._reg(parts[2]), self._reg(parts[1])):
+                    if cand is None:
+                        continue
+                    v = self._reg_value(finsns, k, cand)
+                    if v is not None:
+                        tbl = v; break
+                break
+            if tbl is None:
+                continue
+            targets, seen = [], set()
+            for n in range(0, 8192):
+                off = self.word_at.get((tbl + 4 * n) & 0xFFFFFFFF)
+                if off is None:
+                    break
+                soff = off - 0x100000000 if (off & 0x80000000) else off
+                tgt = (tbl + soff) & 0xFFFFFFFF
+                if not (fstart <= tgt < fend):
+                    break
+                targets.append(tgt); seen.add(tgt)
+            if len(targets) >= 2:
+                out[insn.addr] = sorted(seen)
+        return out
 
     # ------------------------------------------------------------------ #
     # Per-instruction translation
@@ -688,6 +797,12 @@ class PPULifter:
                 return f"/* {mn} {insn.operands} */;"
 
         if mn == "bctr":
+            targets = func.jump_tables.get(insn.addr)
+            if targets:
+                cases = " ".join(
+                    f"case 0x{t:08X}u: goto loc_{t:08X};" for t in targets)
+                return ("switch ((uint32_t)ctx->ctr) { " + cases +
+                        " default: ps3_indirect_call(ctx); return; }")
             return "ps3_indirect_call(ctx); return;"
 
         if mn == "bctrl":
@@ -1215,6 +1330,24 @@ class PPULifter:
                     f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
                     f"d[0] = a[0] | b[0]; d[1] = a[1] | b[1]; }}")
 
+        if mn == "vand":
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            return (f"{{ uint64_t* d = (uint64_t*)&ctx->vr[{vd}]; "
+                    f"uint64_t* a = (uint64_t*)&ctx->vr[{va}]; "
+                    f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
+                    f"d[0] = a[0] & b[0]; d[1] = a[1] & b[1]; }}")
+
+        if mn == "vandc":  # vand with complement: vD = vA & ~vB
+            vd = int(ops[0][1:])
+            va = int(ops[1][1:])
+            vb = int(ops[2][1:])
+            return (f"{{ uint64_t* d = (uint64_t*)&ctx->vr[{vd}]; "
+                    f"uint64_t* a = (uint64_t*)&ctx->vr[{va}]; "
+                    f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
+                    f"d[0] = a[0] & ~b[0]; d[1] = a[1] & ~b[1]; }}")
+
         # ------- VMX floating-point arithmetic -------
         if mn == "vmaddfp":
             # Vector Multiply-Add Floating-Point: vD = vA * vC + vB
@@ -1685,10 +1818,20 @@ class PPULifter:
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
-        # Also declare any call targets that aren't defined
+        # Also declare any call/branch targets that aren't defined. Cross-
+        # fragment branches (b/bc to an address outside the current function)
+        # emit `func_XXXX` via the trampoline just like calls do, so external
+        # branch targets need a prototype too -- not only call_targets.
         defined = {f.start_addr for f in self.functions}
-        for target in sorted(self.call_targets - defined):
+        external = (self.call_targets | self.branch_targets) - defined
+        for target in sorted(external):
             lines.append(f"void func_{target:08X}(ppu_context* ctx); /* external */")
+        lines.append("")
+        lines.append("/* Populate the runtime address->function map (defined in ppu_recomp.c). */")
+        lines.append("#ifdef __cplusplus")
+        lines.append('extern "C"')
+        lines.append("#endif")
+        lines.append("void ppu_recomp_register(void);")
         lines.append("")
         return "\n".join(lines)
 
@@ -1757,10 +1900,28 @@ class PPULifter:
         func_by_addr = {f.start_addr: f for f in self.functions}
         sorted_addrs = sorted(func_by_addr.keys())
 
+        import_map = getattr(self, "import_map", {})
+        lines.append("//@@BODIES_START@@")
         for i, func in enumerate(self.functions):
             label = self.name_map.get(func.start_addr)
             if label:
                 lines.append(f"/* {label} */")
+            # A firmware import glink stub may be reached by tail-entry/branch
+            # resolution and lifted with a real body (which reads the
+            # unresolved import GOT and dispatches to garbage). Always emit the
+            # HLE trampoline instead so both direct and indirect (function
+            # pointer) calls reach the NID handler.
+            if func.start_addr in import_map:
+                nid = import_map[func.start_addr]
+                # Replicate the glink's `std r2, 0x28(r1)`: it saves the
+                # caller's TOC to the ABI slot so the caller's post-call
+                # `ld r2, 0x28(r1)` restores the right TOC. Skipping it
+                # corrupts r2 across import calls.
+                lines.append(f"void {func.name}(ppu_context* ctx) "
+                             f"{{ vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); "
+                             f"ps3_hle_call(0x{nid:08X}u, ctx); }}  /* import glink */")
+                lines.append("")
+                continue
             lines.append(f"void {func.name}(ppu_context* ctx) {{")
             for bline in func.body_lines:
                 lines.append(f"    {bline}" if not bline.endswith(":") else bline)
@@ -1795,6 +1956,31 @@ class PPULifter:
             lines.append("}")
             lines.append("")
 
+        lines.append("//@@BODIES_END@@")
+
+        # Stubs for call targets not defined in this lift (subset/incremental
+        # builds reference functions outside the lifted set). A full-image lift
+        # has none. Stubs route through the runtime so an actual call to an
+        # unlifted function is diagnosable rather than a silent no-op.
+        undefined = sorted((self.call_targets | self.branch_targets)
+                           - {f.start_addr for f in self.functions})
+        import_map = getattr(self, "import_map", {})
+        if undefined:
+            lines.append("/* Call-target stubs: firmware imports route to the HLE NID")
+            lines.append("   dispatch; the rest are unlifted (subset/incremental builds). */")
+            lines.append('extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx);')
+            lines.append('extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);')
+            for target in undefined:
+                if target in import_map:
+                    nid = import_map[target]
+                    lines.append(f"void func_{target:08X}(ppu_context* ctx) "
+                                 f"{{ vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); "
+                                 f"ps3_hle_call(0x{nid:08X}u, ctx); }}  /* import */")
+                else:
+                    lines.append(f"void func_{target:08X}(ppu_context* ctx) "
+                                 f"{{ ppu_unlifted_stub(0x{target:08X}ULL, ctx); }}")
+            lines.append("")
+
         # Function table
         lines.append("/* Function table */")
         lines.append("typedef struct { uint64_t addr; void (*func)(ppu_context*); const char* name; } func_entry;")
@@ -1805,7 +1991,58 @@ class PPULifter:
         lines.append("};")
         lines.append("")
 
-        return "\n".join(lines)
+        # Registration hook: the runtime loader provides ppu_register_function;
+        # ppu_recomp_register() populates the address->function map used by
+        # ps3_indirect_call and the entry dispatch. Call once at startup.
+        lines.append('extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));')
+        lines.append('extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));')
+        lines.append('extern "C" void ppu_recomp_register(void) {')
+        lines.append("    for (const func_entry* e = function_table; e->func; e++)")
+        lines.append("        ppu_register_function(e->addr, e->func);")
+        lines.append("}")
+        lines.append("")
+
+        self._source_lines = lines  # cached for emit_source_files()
+        return "\n".join(l for l in lines if not l.startswith("//@@"))
+
+    def emit_source_files(self, num_files: int):
+        """Split the generated source across `num_files` C files so a large
+        lift compiles as independent translation units (a single 14k-function
+        file is ~88 MB -- impractical for one compiler invocation).
+
+        Returns [(filename, content)]. Every file repeats the shared preamble
+        (includes + static-inline helpers, harmless across TUs); the function
+        table / registration / unlifted stubs go only in file 0. Cross-file
+        calls resolve via the forward declarations in the header."""
+        if not getattr(self, "_source_lines", None):
+            self.emit_source()
+        lines = self._source_lines
+        si = lines.index("//@@BODIES_START@@")
+        ei = lines.index("//@@BODIES_END@@")
+        preamble = lines[:si]
+        body = lines[si + 1:ei]
+        tail = lines[ei + 1:]
+
+        # Function-start boundaries within the body region.
+        starts = [i for i, l in enumerate(body)
+                  if l.startswith("void func_") and l.rstrip().endswith("{")]
+        if not starts:
+            return [(self.source_base + ".c", "\n".join(preamble + body + tail))]
+        num_files = max(1, min(num_files, len(starts)))
+        # Partition function-start indices into num_files contiguous groups.
+        per = (len(starts) + num_files - 1) // num_files
+        files = []
+        for k in range(num_files):
+            grp = starts[k * per:(k + 1) * per]
+            if not grp:
+                break
+            lo = grp[0]
+            hi = starts[(k + 1) * per] if (k + 1) * per < len(starts) else len(body)
+            chunk = body[lo:hi]
+            content = preamble + chunk + (tail if k == 0 else [])
+            files.append((f"{self.source_base}_{k}.c",
+                          "\n".join(l for l in content if not l.startswith("//@@"))))
+        return files
 
 
 # ---------------------------------------------------------------------------
@@ -1827,6 +2064,15 @@ def main() -> None:
     parser.add_argument("--names", metavar="FILE", default=None,
                         help="JSON name map from ghidra_names.py "
                              "({\"0xADDR\": {\"label\": ...}}); emitted as comments")
+    parser.add_argument("--imports", metavar="FILE", default=None,
+                        help="JSON firmware imports from ppu_loader.py "
+                             "([{stub, nid}]); import stubs route to ps3_hle_call")
+    parser.add_argument("--split-files", type=int, default=1, metavar="N",
+                        help="split the source across N C files (for large "
+                             "lifts; a single-file 14k-function lift is ~88 MB)")
+    parser.add_argument("--toc", type=lambda x: int(x, 0), default=None,
+                        help="module TOC (r2 base) for jump-table recovery; "
+                             "auto-read from EBOOT.loader.json next to --functions")
     args = parser.parse_args()
 
     with open(args.input, "rb") as f:
@@ -1876,6 +2122,48 @@ def main() -> None:
 
     lifter = PPULifter()
 
+    # Jump-table recovery needs (a) the module TOC and (b) word access to ALL
+    # loadable segments (the table base pointer lives in the data segment, which
+    # isn't in the executable-only `all_insns`).
+    toc = args.toc
+    if toc is None and args.functions:
+        import os as _os
+        ld = _os.path.join(_os.path.dirname(args.functions) or ".",
+                           "EBOOT.loader.json")
+        if _os.path.exists(ld):
+            try:
+                with open(ld) as lf:
+                    toc = int(str(json.load(lf).get("module_toc", 0)), 0)
+            except Exception:
+                toc = None
+    if toc:
+        lifter.module_toc = toc
+        import struct as _struct
+        word_at = {}
+        try:
+            from elf_parser import ELFFile, PT_LOAD
+            _elf = ELFFile(args.input); _elf.load()
+            for ph in _elf.program_headers:
+                if ph.p_type == PT_LOAD and ph.p_filesz > 0:
+                    d = _elf.get_segment_data(_elf.program_headers.index(ph))
+                    va = ph.p_vaddr
+                    for off in range(0, len(d) - 3, 4):
+                        word_at[va + off] = _struct.unpack_from(">I", d, off)[0]
+        except Exception:
+            word_at = {i.addr: i.raw for i in all_insns}
+        lifter.word_at = word_at
+        print(f"  Jump-table recovery enabled (TOC=0x{toc:08X}, "
+              f"{len(word_at)} words)")
+
+    # Optional: firmware import map (stub address -> NID). Import stubs are
+    # emitted as HLE trampolines (ps3_hle_call) instead of unlifted stubs.
+    lifter.import_map = {}
+    if args.imports:
+        with open(args.imports) as imf:
+            for im in json.load(imf):
+                lifter.import_map[int(str(im["stub"]), 0)] = int(str(im["nid"]), 0)
+        print(f"  Loaded {len(lifter.import_map)} firmware import stubs")
+
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
     if args.names:
@@ -1915,16 +2203,24 @@ def main() -> None:
     os.makedirs(args.output, exist_ok=True)
 
     header_path = os.path.join(args.output, args.header_name)
-    source_path = os.path.join(args.output, args.source_name)
-
     with open(header_path, "w") as f:
         f.write(lifter.emit_header())
-
-    with open(source_path, "w") as f:
-        f.write(lifter.emit_source())
-
     print(f"Wrote {header_path}")
-    print(f"Wrote {source_path}")
+
+    lifter.source_base = os.path.splitext(args.source_name)[0]
+    if args.split_files > 1:
+        lifter.emit_source()  # populate the cache
+        for name, content in lifter.emit_source_files(args.split_files):
+            p = os.path.join(args.output, name)
+            with open(p, "w") as f:
+                f.write(content)
+            print(f"Wrote {p}")
+    else:
+        source_path = os.path.join(args.output, args.source_name)
+        with open(source_path, "w") as f:
+            f.write(lifter.emit_source())
+        print(f"Wrote {source_path}")
+
     print(f"  {len(lifter.functions)} functions lifted")
     print(f"  {len(lifter.call_targets)} unique call targets")
 

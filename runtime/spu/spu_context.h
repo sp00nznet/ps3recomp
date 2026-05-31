@@ -183,18 +183,41 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
     p[3] = (uint8_t)(val);
 }
 
+/* Local-store quadword access.
+ *
+ * LS bytes are big-endian (the SPU's native order); registers in our
+ * model are stored in native (little-endian on x86) order so that
+ * `_u32[i]` directly gives lane i's value and `spu_preferred_u32(r)`
+ * == `r._u32[0]`. The byte-swap below converts between the two on
+ * every quadword load/store, mirroring what `spu_ls_read32` already
+ * does explicitly. Doing the swap here (rather than in every channel
+ * extractor) keeps the per-word `_u32[i]` semantics that the lifter
+ * helpers in `spu_helpers.h` were written against. */
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    lsa &= SPU_LS_MASK & ~0xFu; /* align to 16 */
-    memcpy(&v, &ctx->ls[lsa], 16);
+    lsa &= SPU_LS_MASK & ~0xFu;
+    const uint8_t* p = &ctx->ls[lsa];
+    for (int i = 0; i < 4; i++) {
+        v._u32[i] = ((uint32_t)p[i*4]     << 24) |
+                    ((uint32_t)p[i*4 + 1] << 16) |
+                    ((uint32_t)p[i*4 + 2] <<  8) |
+                    (uint32_t)p[i*4 + 3];
+    }
     return v;
 }
 
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
-    memcpy(&ctx->ls[lsa], &val, 16);
+    uint8_t* p = &ctx->ls[lsa];
+    for (int i = 0; i < 4; i++) {
+        uint32_t w = val._u32[i];
+        p[i*4]     = (uint8_t)(w >> 24);
+        p[i*4 + 1] = (uint8_t)(w >> 16);
+        p[i*4 + 2] = (uint8_t)(w >>  8);
+        p[i*4 + 3] = (uint8_t)w;
+    }
 }
 
 /* ---------------------------------------------------------------------------

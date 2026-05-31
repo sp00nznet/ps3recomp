@@ -185,6 +185,14 @@ typedef void (*CellGcmQueueHandler)(u32 head);
 /* NID: 0xB2E761D4 */
 s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress);
 
+/* Underlying entry the SDK's inline cellGcmInit() actually imports (first arg
+ * is the guest context pointer, ignored here; reuses cellGcmInit). */
+s32 _cellGcmInitBody(u32 context, u32 cmdSize, u32 ioSize, u32 ioAddress);
+/* cellGcmSetFlip import: (context, bufferId) -> SetFlipCommand. */
+s32 cellGcmSetFlip(u32 context, u32 bufferId);
+/* Unidentified internal export #15 -- accepted as a no-op. */
+s32 _cellGcmFunc15(void);
+
 /* NID: 0x15BAE46B */
 s32 cellGcmGetConfiguration(CellGcmConfig* config);
 

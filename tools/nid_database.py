@@ -31,23 +31,21 @@ import sys
 # NID computation
 # ---------------------------------------------------------------------------
 
-# The suffix that Sony appends before hashing.
-# This is the well-known suffix used for PS3 NID generation.
+# The 16-byte secret Sony appends to the symbol name before hashing.
+# Verified against real EBOOT imports and RPCS3 (Emu/Cell/PPUModule.cpp
+# ppu_generate_id). The NID is the first 4 bytes of the SHA-1 read as a
+# LITTLE-endian u32 (le_t<u32>). The previous value/byte-order here was wrong.
 NID_SUFFIX = bytes([
-    0x67, 0x59, 0x65, 0x99, 0x04, 0x25, 0x04, 0x01,
-    0xC0, 0xA8, 0x43, 0x09,
+    0x67, 0x59, 0x65, 0x99, 0x04, 0x25, 0x04, 0x90,
+    0x56, 0x64, 0x27, 0x49, 0x94, 0x89, 0x74, 0x1A,
 ])
 
 
 def compute_nid(name: str, suffix: bytes = NID_SUFFIX) -> int:
-    """Compute the PS3 NID for *name*.
-
-    Returns the NID as a 32-bit unsigned integer.
-    """
-    h = hashlib.sha1(name.encode("utf-8") + suffix)
-    digest = h.digest()
-    # NID = first 4 bytes, big-endian
-    return struct.unpack(">I", digest[:4])[0]
+    """Compute the PS3 NID for *name* (32-bit unsigned)."""
+    digest = hashlib.sha1(name.encode("utf-8") + suffix).digest()
+    # NID = first 4 bytes of SHA-1, little-endian (matches RPCS3 le_t<u32>).
+    return struct.unpack("<I", digest[:4])[0]
 
 # ---------------------------------------------------------------------------
 # Built-in database

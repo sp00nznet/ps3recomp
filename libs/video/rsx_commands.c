@@ -60,6 +60,9 @@ void rsx_state_init(rsx_state* state)
     state->cull_face = 1; /* BACK */
     state->front_face = 0; /* CW */
 
+    /* Default index format -- 16-bit is the common case across PS3 titles. */
+    state->index_array_format = RSX_INDEX_FORMAT_U16;
+
     /* Default color mask: all channels writable (A|R|G|B) */
     state->color_mask = 0x01010101;
 
@@ -432,9 +435,28 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_SET_TRANSFORM_PROGRAM_LOAD) {
-        /* Vertex program load slot — index into vertex program instruction memory */
+        /* Vertex program load slot — index into VP instruction memory. Each
+         * instruction is 4 words; reposition the microcode write cursor. */
         state->transform_program_load = data;
+        state->transform_program_cursor = data * 4;
+        if (data == 0) state->transform_program_words = 0; /* new program */
         state->shader_dirty = 1;
+        return 0;
+    }
+    if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
+        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+        /* VP microcode word (0xB80..0xBFC is a 32-entry increasing-method
+         * array); append at the cursor regardless of which slot — words
+         * arrive in order. Stored native; the backend reads via rd_le. */
+        u32 c = state->transform_program_cursor;
+        if (c < 2048) {
+            state->transform_program[c] = data;
+            state->transform_program_cursor = c + 1;
+            if (c + 1 > state->transform_program_words)
+                state->transform_program_words = c + 1;
+            state->transform_program_dirty = 1;
+            state->shader_dirty = 1;
+        }
         return 0;
     }
     if (method == NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) {
@@ -548,6 +570,19 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    /* Index buffer setup -- written before DRAW_INDEX_ARRAY */
+    if (method == NV4097_SET_INDEX_ARRAY_ADDRESS) {
+        state->index_array_offset = data;
+        return 0;
+    }
+    if (method == NV4097_SET_INDEX_ARRAY_DMA) {
+        state->index_array_dma = data;
+        /* Low nibble: 0 = u32, 1 = u16 */
+        state->index_array_format = (data & 0xF) ? RSX_INDEX_FORMAT_U16
+                                                 : RSX_INDEX_FORMAT_U32;
+        return 0;
+    }
+
     /* Scissor */
     if (method == NV4097_SET_SCISSOR_HORIZONTAL) {
         state->scissor_x = data & 0xFFFF;
@@ -576,6 +611,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
  * Command buffer parsing
  * -----------------------------------------------------------------------*/
 
+/* The RSX FIFO lives in guest (big-endian) memory, so every command word is
+ * byte-swapped relative to our little-endian host. */
+static inline u32 rsx_fifo_swap(u32 v)
+{
+    return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24);
+}
+
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
 {
     int methods_processed = 0;
@@ -583,28 +625,34 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
     u32 count = size / 4; /* size in dwords */
 
     while (pos < count) {
-        u32 header = buf[pos++];
+        u32 header = rsx_fifo_swap(buf[pos++]);
+
+        /* RSX/NV FIFO command header encodings:
+         *   bits [31:30] = 0  -> method submission; [28:18]=count,
+         *                        [12:2]=method>>2, [30]=non-increment flag
+         *   0x20000000 (bit 29) -> jump (low bits = new get offset)
+         *   0x00000002 within   -> call, 0x00020000 -> return (rare)
+         * We decode the common increasing/non-increasing method runs and
+         * stop at jump/call/return (the caller re-points get). */
         u32 type = (header >> 29) & 0x7;
 
         if (type == 0 || type == 2) {
-            /* Increasing or non-increasing method */
-            u32 method = (header >> 2) & 0x7FF;
-            method <<= 2; /* method addresses are dword-aligned */
+            /* Increasing (0) or non-increasing (2) method run. */
+            u32 method   = ((header >> 2) & 0x7FF) << 2; /* dword-aligned addr */
             u32 num_data = (header >> 18) & 0x7FF;
             int increasing = (type == 0);
 
             for (u32 i = 0; i < num_data && pos < count; i++) {
-                u32 data = buf[pos++];
+                u32 data = rsx_fifo_swap(buf[pos++]);
                 u32 m = increasing ? (method + i * 4) : method;
                 rsx_process_method(state, m, data);
                 methods_processed++;
             }
         } else if (type == 1) {
-            /* Jump — change command buffer read position */
-            /* In recomp context, this is handled by the caller */
+            /* Jump — the caller owns get/put, so stop here. */
             break;
         } else {
-            /* Unknown type, skip */
+            /* Unknown / unsupported (call, return) — stop. */
             break;
         }
     }

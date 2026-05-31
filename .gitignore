@@ -59,6 +59,16 @@ env/
 # Recompiled output (generated, not tracked)
 recompiled/
 
+# Per-game lift + boot build artifacts (regenerable from the EBOOT + tools;
+# also contains game-derived translated code -- never commit)
+build_ppu/
+
+# Claude Code working dir (local settings, temp files) -- not for the repo
+.claude/
+
+# Session handoff scratchpad (transient working notes, not project docs)
+docs/SESSION_STATE.md
+
 # Game files (never commit these)
 *.elf
 *.ELF
@@ -85,3 +95,4 @@ ehthumbs.db
 
 # Logs
 *.log
+/tools/spu_disasm.py.bak
