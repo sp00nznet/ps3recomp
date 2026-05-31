@@ -301,8 +301,15 @@ void rsx_state_init(rsx_state* state);
 int rsx_process_method(rsx_state* state, u32 method, u32 data);
 
 /* Process a command buffer segment.
- * buf:  pointer to command buffer data (host memory)
- * size: size in bytes
+ *
+ * IMPORTANT — endianness contract: `buf` must point at the *raw guest RSX FIFO*,
+ * i.e. big-endian dwords exactly as they live in PS3 memory. Every word is
+ * byte-swapped internally on a little-endian host. Do NOT pass words that have
+ * already been converted to host order, or they will be double-swapped. (The
+ * pointer is typed `const u32*` for convenient indexing, but it is guest-BE
+ * data, not host-order values.)
+ *
+ * size: size in bytes.
  * Returns number of methods processed. */
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size);
 
