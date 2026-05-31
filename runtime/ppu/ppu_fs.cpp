@@ -21,6 +21,15 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>          /* open/close on MinGW */
+#else
+#include <unistd.h>
+#endif
+#ifndef O_BINARY
+#define O_BINARY 0       /* POSIX has no text/binary distinction */
+#endif
 
 extern "C" uint8_t* vm_base;
 extern "C" uint32_t ppu_vm_size;
@@ -106,14 +115,32 @@ static void cellFsOpen(ppu_context* ctx)
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
 
-    const char* mode = "rb";
-    if (flags & CELL_FS_O_RDWR)        mode = (flags & CELL_FS_O_CREAT) ? "wb+" : "rb+";
-    else if (flags & CELL_FS_O_WRONLY) mode = (flags & CELL_FS_O_APPEND) ? "ab" : "wb";
+    /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
+     * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build
+     * real open() flags from the access mode (low 2 bits) + the modifiers, then
+     * wrap the fd in a FILE* with fdopen() (which neither creates nor truncates
+     * -- that was already decided by open()). */
+    int acc = flags & 0x3;
+    int oflags = (acc == CELL_FS_O_RDWR)   ? O_RDWR
+               : (acc == CELL_FS_O_WRONLY) ? O_WRONLY : O_RDONLY;
+    if (flags & CELL_FS_O_CREAT)  oflags |= O_CREAT;
+    if (flags & CELL_FS_O_TRUNC)  oflags |= O_TRUNC;
+    if (flags & CELL_FS_O_APPEND) oflags |= O_APPEND;
 
-    FILE* f = fopen(hpath, mode);
-    if (!f) {
+    int hfd = open(hpath, oflags | O_BINARY, 0666);
+    if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+    }
+    const char* fmode = (acc == CELL_FS_O_RDWR)
+                        ? ((flags & CELL_FS_O_APPEND) ? "ab+" : "rb+")
+                        : (acc == CELL_FS_O_WRONLY)
+                          ? ((flags & CELL_FS_O_APPEND) ? "ab" : "wb")
+                          : "rb";
+    FILE* f = fdopen(hfd, fmode);
+    if (!f) {
+        close(hfd);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
