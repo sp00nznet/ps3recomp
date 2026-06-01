@@ -16,6 +16,20 @@
 #include <errno.h>
 #include <time.h>
 
+/* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros (st_atim.tv_sec
+ * etc.) that collide with the identically named members of CellSaveData*Stat; undef
+ * them so the struct fields resolve, and read host times via the explicit timespec
+ * fields in the POSIX branches below. */
+#ifdef st_atime
+#  undef st_atime
+#endif
+#ifdef st_mtime
+#  undef st_mtime
+#endif
+#ifdef st_ctime
+#  undef st_ctime
+#endif
+
 #ifdef _WIN32
 #  include <windows.h>
 #  include <io.h>
@@ -329,9 +343,15 @@ static u32 enumerate_save_files(const char* save_path,
                 strncpy(fileList[count].fileName, de->d_name,
                         CELL_SAVEDATA_FILENAME_SIZE - 1);
                 fileList[count].st_size = (u64)st.st_size;
+#ifdef _WIN32
                 fileList[count].st_atime = (s64)st.st_atime;
                 fileList[count].st_mtime = (s64)st.st_mtime;
                 fileList[count].st_ctime = (s64)st.st_ctime;
+#else
+                fileList[count].st_atime = (s64)st.st_atim.tv_sec;
+                fileList[count].st_mtime = (s64)st.st_mtim.tv_sec;
+                fileList[count].st_ctime = (s64)st.st_ctim.tv_sec;
+#endif
             }
             count++;
         }
@@ -523,9 +543,15 @@ static s32 savedata_execute(const char* dirName, int is_save,
     if (!is_new) {
         HOST_STAT_T hst;
         if (HOST_STAT(save_path, &hst) == 0) {
+#ifdef _WIN32
             statGet.dir.st_atime = (s64)hst.st_atime;
             statGet.dir.st_mtime = (s64)hst.st_mtime;
             statGet.dir.st_ctime = (s64)hst.st_ctime;
+#else
+            statGet.dir.st_atime = (s64)hst.st_atim.tv_sec;
+            statGet.dir.st_mtime = (s64)hst.st_mtim.tv_sec;
+            statGet.dir.st_ctime = (s64)hst.st_ctim.tv_sec;
+#endif
         }
         read_param_sfo(save_path, &statGet.getParam);
     }

@@ -12,6 +12,20 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+/* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
+ * to st_atim.tv_sec etc.  They collide with the identically named members of the
+ * PS3 CellFsStat struct, so undefine them here; host times are read via the
+ * explicit timespec fields in the POSIX branch of the conversion below. */
+#ifdef st_atime
+#  undef st_atime
+#endif
+#ifdef st_mtime
+#  undef st_mtime
+#endif
+#ifdef st_ctime
+#  undef st_ctime
+#endif
+
 #ifdef _WIN32
 #  include <windows.h>
 #  include <io.h>
@@ -180,9 +194,15 @@ static void fill_cellfs_stat(CellFsStat* sb, const HOST_STAT_T* hst)
 
     sb->st_uid   = 0;
     sb->st_gid   = 0;
+#ifdef _WIN32
     sb->st_atime = (s64)hst->st_atime;
     sb->st_mtime = (s64)hst->st_mtime;
     sb->st_ctime = (s64)hst->st_ctime;
+#else
+    sb->st_atime = (s64)hst->st_atim.tv_sec;
+    sb->st_mtime = (s64)hst->st_mtim.tv_sec;
+    sb->st_ctime = (s64)hst->st_ctim.tv_sec;
+#endif
     sb->st_size  = (u64)hst->st_size;
     sb->st_blksize = 4096;
 }
