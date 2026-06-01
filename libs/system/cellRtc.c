@@ -9,6 +9,7 @@
 #include "cellRtc.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* abs */
 #include <time.h>
 
 #ifdef _WIN32

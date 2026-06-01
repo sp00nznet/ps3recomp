@@ -1233,6 +1233,9 @@ void rsx_d3d12_backend_present(void)
 
 #else /* !_WIN32 */
 
+#include <ps3emu/ps3types.h>   /* u32 (header includes above are inside the _WIN32 guard) */
+#include <stdio.h>
+
 /* Stub for non-Windows — D3D12 is Windows-only */
 int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
 {

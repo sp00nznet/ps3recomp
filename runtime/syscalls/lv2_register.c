@@ -10,6 +10,7 @@
  * remain available as direct C calls for the runtime to use.
  */
 
+#include <stdlib.h>   /* calloc, free */
 #include "lv2_syscall_table.h"
 #include "sys_ppu_thread.h"
 #include "sys_mutex.h"
