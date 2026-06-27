@@ -109,6 +109,20 @@ static u32 s_flip_handler_opd     = 0;
 static u32 s_vblank_handler_opd   = 0;
 static u32 s_user_handler_opd     = 0;
 static u32 s_second_v_handler_opd = 0;
+
+/* Resolved {code,toc} captured when each handler is registered. The title's
+ * handler OPDs (0x530D70/78/80) get their code word clobbered in guest memory
+ * by a later lifted store, so re-resolving the OPD at tick time yields the TOC
+ * base instead of the real handler. Capture-at-registration + dispatch by
+ * code+toc runs the real lifted handler regardless. */
+extern unsigned vm_read32(unsigned long long);
+extern unsigned long long ppu_guest_call_ct(u32 code, u32 toc, u64 a0, u64 a1, u64 a2, u64 a3);
+static u32 s_flip_handler_code=0,   s_flip_handler_toc=0;
+static u32 s_vblank_handler_code=0, s_vblank_handler_toc=0;
+static void capture_handler_ct(u32 opd, u32* code, u32* toc) {
+    if (opd) { *code = vm_read32(opd); *toc = vm_read32(opd + 4); }
+    else     { *code = 0; *toc = 0; }
+}
 /* Legacy host-typed slots kept around for any caller still treating
  * these as host pointers. New code should use the _opd slots. */
 static CellGcmFlipHandler    s_flip_handler    = NULL;
@@ -414,16 +428,16 @@ u32 cellGcmGetFlipStatus(void)
 void cellGcmTickVBlank(void)
 {
     s_vblank_count++;
-    if (s_vblank_handler_opd && g_ps3_guest_caller) {
-        g_ps3_guest_caller(s_vblank_handler_opd,
-                           (uint64_t)s_vblank_count, 0, 0, 0);
+    if (s_vblank_handler_code) {
+        ppu_guest_call_ct(s_vblank_handler_code, s_vblank_handler_toc,
+                          (uint64_t)s_vblank_count, 0, 0, 0);
     }
 }
 
 void cellGcmTickFlip(void)
 {
-    if (s_flip_handler_opd && g_ps3_guest_caller) {
-        g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
+    if (s_flip_handler_code) {
+        ppu_guest_call_ct(s_flip_handler_code, s_flip_handler_toc, 1, 0, 0, 0);
     }
 }
 
@@ -562,17 +576,21 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
      * the legacy host-typed value too for any callers still using
      * the old API style. Real dispatch goes through
      * cellGcmDispatchVBlank()/DispatchFlip() via g_ps3_guest_caller. */
-    printf("[cellGcmSys] SetFlipHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_flip_handler_opd = (u32)(size_t)handler;
     s_flip_handler = handler;
+    capture_handler_ct(s_flip_handler_opd, &s_flip_handler_code, &s_flip_handler_toc);
+    printf("[cellGcmSys] SetFlipHandler(opd=0x%08X) code=0x%08X toc=0x%08X\n",
+           s_flip_handler_opd, s_flip_handler_code, s_flip_handler_toc);
 }
 
 /* NID: 0xA547ADDE */
 void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
 {
-    printf("[cellGcmSys] SetVBlankHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_vblank_handler_opd = (u32)(size_t)handler;
     s_vblank_handler = handler;
+    capture_handler_ct(s_vblank_handler_opd, &s_vblank_handler_code, &s_vblank_handler_toc);
+    printf("[cellGcmSys] SetVBlankHandler(opd=0x%08X) code=0x%08X toc=0x%08X\n",
+           s_vblank_handler_opd, s_vblank_handler_code, s_vblank_handler_toc);
 }
 
 /* NID: 0xF9BFCDA3 */
@@ -910,24 +928,20 @@ s32 cellGcmUnbindZcull(u8 index)
  * -----------------------------------------------------------------------*/
 
 /* NID: 0x107BF789 */
-s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch)
+/* Real ABI: uint32_t cellGcmGetTiledPitchSize(uint32_t size) -- ONE arg, the
+ * aligned tiled pitch is the RETURN VALUE (r3). The previous 2-arg form treated
+ * r4 as an out-pointer and wrote the pitch through it; at the title's call site
+ * r4 still held the caller's CellVideoOutResolution* (from the preceding
+ * cellVideoOutGetResolution), so it overwrote width/height with the pitch ->
+ * width became 0 -> every downstream tile/display-buffer setup went garbage. */
+u32 cellGcmGetTiledPitchSize(u32 size)
 {
-    /* `pitch` is a GUEST address (the generic HLE adapter passes r4 raw). Write
-     * through vm_write32 so it's byte-swapped to BE and bounds-checked -- a raw
-     * *pitch faults when the game hands us a null-object-derived low pointer. */
-    uint32_t pitch_ea = (uint32_t)(uintptr_t)pitch;
-    if (!pitch_ea)
-        return CELL_GCM_ERROR_INVALID_VALUE;
-
     /* Smallest valid tiled pitch >= size (RSX supports only specific pitches). */
     for (int i = 0; i < s_valid_pitch_count; i++) {
-        if (s_valid_pitches[i] >= size) {
-            vm_write32(pitch_ea, s_valid_pitches[i]);
-            return CELL_OK;
-        }
+        if (s_valid_pitches[i] >= size)
+            return s_valid_pitches[i];
     }
-    vm_write32(pitch_ea, s_valid_pitches[s_valid_pitch_count - 1]);
-    return CELL_OK;
+    return s_valid_pitches[s_valid_pitch_count - 1];
 }
 
 /* NID: 0xBC982946 */

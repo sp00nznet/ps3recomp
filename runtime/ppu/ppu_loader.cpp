@@ -148,11 +148,7 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
     return __builtin_bswap64(v); }
 void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return; vm_base[(uint32_t)a] = v; }
 void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return; v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
-void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
-    { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40)
-        fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
-    v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
+void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return; v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
 void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return; v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); }
 }
 
@@ -508,6 +504,33 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     ctx.gpr[13] = PPU_TLS_TP;
     ctx.cia     = code;
     g_active_ctx = &ctx;
+    g_active_ctx = &ctx;
+    fn(&ctx);
+    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    return ctx.gpr[3];
+}
+
+/* Call a guest function by an already-resolved {code, toc} pair. Used for
+ * callbacks whose OPD is captured at registration time and may later be
+ * clobbered in guest memory (e.g. the GCM flip/vblank handler OPDs). Same
+ * scratch-stack + trampoline-drain behaviour as ppu_guest_call. */
+extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+                                      uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+    if (!code) return 0;
+    ppu_fn fn = ppu_lookup(code);
+    if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
+
+    static __declspec(thread) uint32_t s_cb_sp = 0;
+    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+
+    ppu_context ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[2]  = toc;
+    ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+    ctx.gpr[13] = PPU_TLS_TP;
+    ctx.cia     = code;
     g_active_ctx = &ctx;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }

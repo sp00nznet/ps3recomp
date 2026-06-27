@@ -339,7 +339,7 @@ s32 cellGcmUnbindZcull(u8 index);
 /* Misc */
 
 /* NID: 0x107BF789 */
-s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch);
+u32 cellGcmGetTiledPitchSize(u32 size);
 
 /* NID: 0xBC982946 */
 void cellGcmSetDebugOutputLevel(u32 level);
