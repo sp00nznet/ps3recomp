@@ -72,13 +72,12 @@ s32 cellDaisyCreatePipe(void* spurs, CellDaisyPipe* pipe,
     p->tail = 0;
     p->count = 0;
 
-    /* Allocate ring buffer */
-    p->ring = (u8*)malloc(attr->entrySize * attr->depth);
+    /* Allocate ring buffer — calloc checks for overflow and zeroes memory */
+    p->ring = (u8*)calloc(attr->depth, attr->entrySize);
     if (!p->ring) {
         p->in_use = 0;
         return (s32)CELL_DAISY_ERROR_OUT_OF_MEMORY;
     }
-    memset(p->ring, 0, attr->entrySize * attr->depth);
 
     *pipe = (CellDaisyPipe)slot;
     return CELL_OK;
