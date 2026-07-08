@@ -952,20 +952,97 @@ uint8_t* spu_thread_get_local_store(uint32_t tid)
 
 uint32_t spu_thread_local_store_size(void) { return SPU_LS_SIZE; }
 
-/* sys_spu_image_import(*img, *source, type) — just log entry & return success.
- * We could parse the SPU ELF header and write entry into the image struct,
- * but no real use without SPU execution; zero-initialize so downstream
- * reads see a valid-looking image. */
+static uint16_t vm_read_be16(uint32_t a)
+{
+    extern uint8_t* vm_base;
+    if (!vm_base || !a) return 0;
+    const uint8_t* p = vm_base + a;
+    return (uint16_t)((p[0] << 8) | p[1]);
+}
+
+/* sys_spu_image_import(sys_spu_image_t* img, const void* src, uint32_t type)
+ * (Lv2 System Call & Library Reference, p.108). Parse the SPU ELF at `src`
+ * (guest memory) and fill the image-management struct so the entry point and
+ * segment table are real -- previously this zeroed the struct, so every SPU
+ * thread came up with entry=0, matched no fallback, and "instantly completed"
+ * (cellmark's SPU benchmarks read 0 as a result).
+ *
+ * sys_spu_image  { u32 type; u32 entry_point; sys_spu_segment* segs; int nsegs; }
+ * sys_spu_segment{ int type; u32 ls_start; int size; u64 src_pa; }  (0x18, src@0x10)
+ * PT_LOAD -> COPY segment (src_pa = src + p_offset); a memsz>filesz tail -> a
+ * FILL(0) segment, exactly as the SDK counts them. */
 static int64_t sys_spu_image_import_handler(ppu_context* ctx)
 {
     extern uint8_t* vm_base;
     uint32_t img_ea = (uint32_t)ctx->gpr[3];
     uint32_t src_ea = (uint32_t)ctx->gpr[4];
-    if (img_ea && vm_base) {
-        memset(vm_base + img_ea, 0, 16);
-        /* sys_spu_image.type = 0 (SYS_SPU_IMAGE_TYPE_KERNEL), entry=0, segs=0, nsegs=0 */
+    uint32_t itype  = (uint32_t)ctx->gpr[5];   /* PROTECT(0) / DIRECT(1) */
+    (void)itype;
+
+    if (!img_ea || !src_ea || !vm_base) {
+        if (img_ea && vm_base) memset(vm_base + img_ea, 0, 16);
+        ctx->gpr[3] = (uint64_t)(int64_t)-14;  /* EFAULT */
+        return -14;
     }
-    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X\n", img_ea, src_ea);
+
+    /* Validate SPU ELF32 (big-endian) magic. */
+    const uint8_t* e = vm_base + src_ea;
+    if (!(e[0] == 0x7F && e[1] == 'E' && e[2] == 'L' && e[3] == 'F')) {
+        memset(vm_base + img_ea, 0, 16);
+        fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -- not an ELF\n", img_ea, src_ea);
+        fflush(stderr);
+        ctx->gpr[3] = (uint64_t)(int64_t)-8;   /* ENOEXEC */
+        return -8;
+    }
+
+    uint32_t entry   = vm_read_be32(src_ea + 0x18);
+    uint32_t phoff   = vm_read_be32(src_ea + 0x1C);
+    uint16_t phentsz = vm_read_be16(src_ea + 0x2A);
+    uint16_t phnum   = vm_read_be16(src_ea + 0x2C);
+    if (phentsz == 0) phentsz = 0x20;
+
+    /* Build the segment array in a dedicated guest scratch region (below the
+     * TLS block at 0x0E000000). SPU images allow at most 32 segments. */
+    static uint32_t s_spu_seg_bump = 0x0D000000u;
+    uint32_t segs_ea = s_spu_seg_bump;
+    int nsegs = 0;
+
+    for (uint16_t i = 0; i < phnum && nsegs < 32; i++) {
+        uint32_t ph = phoff + (uint32_t)i * phentsz;
+        if (vm_read_be32(src_ea + ph + 0x00) != 1) continue;   /* PT_LOAD */
+        uint32_t p_off = vm_read_be32(src_ea + ph + 0x04);
+        uint32_t p_va  = vm_read_be32(src_ea + ph + 0x08);
+        uint32_t p_fsz = vm_read_be32(src_ea + ph + 0x10);
+        uint32_t p_msz = vm_read_be32(src_ea + ph + 0x14);
+
+        uint32_t seg = segs_ea + (uint32_t)nsegs * 0x18;        /* COPY */
+        vm_write_be32(seg + 0x00, 1);                           /* SYS_SPU_SEGMENT_TYPE_COPY */
+        vm_write_be32(seg + 0x04, p_va);                        /* ls_start   */
+        vm_write_be32(seg + 0x08, p_fsz);                       /* size       */
+        vm_write_be32(seg + 0x10, 0);                           /* src_pa hi  */
+        vm_write_be32(seg + 0x14, src_ea + p_off);              /* src_pa lo  */
+        nsegs++;
+
+        if (p_msz > p_fsz && nsegs < 32) {                      /* BSS tail -> FILL 0 */
+            seg = segs_ea + (uint32_t)nsegs * 0x18;
+            vm_write_be32(seg + 0x00, 2);                       /* SYS_SPU_SEGMENT_TYPE_FILL */
+            vm_write_be32(seg + 0x04, p_va + p_fsz);            /* ls_start */
+            vm_write_be32(seg + 0x08, p_msz - p_fsz);           /* size     */
+            vm_write_be32(seg + 0x10, 0);                       /* value    */
+            vm_write_be32(seg + 0x14, 0);
+            nsegs++;
+        }
+    }
+    s_spu_seg_bump += (uint32_t)nsegs * 0x18;
+    if (s_spu_seg_bump >= 0x0E000000u) s_spu_seg_bump = 0x0D000000u;  /* wrap */
+
+    vm_write_be32(img_ea + 0x00, 0);        /* type = SYS_SPU_IMAGE_TYPE_USER */
+    vm_write_be32(img_ea + 0x04, entry);    /* entry_point */
+    vm_write_be32(img_ea + 0x08, nsegs ? segs_ea : 0);  /* segs (guest EA) */
+    vm_write_be32(img_ea + 0x0C, (uint32_t)nsegs);
+
+    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -> entry=0x%05X nsegs=%d\n",
+            img_ea, src_ea, entry, nsegs);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -1097,6 +1174,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, 169,                            sys_spu_thread_stub); /* deprecated */
     lv2_syscall_register(tbl, SYS_SPU_INITIALIZE,             sys_spu_initialize_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_OPEN,             sys_spu_image_open_handler);
+    lv2_syscall_register(tbl, SYS_SPU_IMAGE_IMPORT,           sys_spu_image_import_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_CLOSE,            sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CREATE,    sys_spu_thread_group_create_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DESTROY,   sys_spu_thread_group_destroy_handler);
