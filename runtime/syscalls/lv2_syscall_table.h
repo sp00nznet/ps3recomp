@@ -175,7 +175,8 @@ extern "C" {
 #define SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS 185
 
 #define SYS_SPU_IMAGE_OPEN              156
-#define SYS_SPU_IMAGE_CLOSE             157
+#define SYS_SPU_IMAGE_IMPORT            157   /* _sys_spu_image_import (RPCS3 lv2.cpp) */
+#define SYS_SPU_IMAGE_CLOSE             158   /* was mis-numbered 157 -> import hit the close stub */
 
 /* PRX (module) management */
 #define SYS_PRX_LOAD_MODULE             480
