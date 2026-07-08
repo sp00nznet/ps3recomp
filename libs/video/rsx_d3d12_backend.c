@@ -861,9 +861,10 @@ static void dump_backbuffer_bmp(void)
         return;
 
     static int idx = 0;
-    char path[300];
-    snprintf(path, sizeof(path),
-             "C:/Users/sewshee/Documents/Dev/ps3/ps3recomp/cellmark/frame_%03d.bmp", idx++);
+    char path[512];
+    const char* dir = getenv("CELLMARK_DUMP_DIR");   /* default: current dir */
+    snprintf(path, sizeof(path), "%s%sframe_%03d.bmp",
+             dir ? dir : "", dir ? "/" : "", idx++);
     FILE* f = fopen(path, "wb");
     if (f) {
         u32 w = s_d3d.width, h = s_d3d.height;
