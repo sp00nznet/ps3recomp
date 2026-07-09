@@ -136,6 +136,17 @@ Real-controller correctness surfaced by a DualShock-as-XInput bring-up
   of `255 - x`, which turned a centered stick into 127 (`0x7F`, aliasing
   SELECT+START self-exit + TRIANGLE).
 
+SPU/SPURS execution bring-up:
+- **`sys_spu_image_import` implemented + SPU-image syscall numbers fixed** —
+  import was mis-numbered 157 (that's `_sys_spu_image_import`) and collided with
+  `SYS_SPU_IMAGE_CLOSE`, so a title's import call dispatched to the close stub and
+  the image struct was left zeroed (entry=0 → matched no fallback → SPU threads
+  "instantly completed"). Renumbered 156/157/158 and replaced the zero-init stub
+  with a real SPU-ELF32 PT_LOAD → `sys_spu_segment[]` parser (#57). This is the
+  parser reused by the `_sys_spu_image_import` (sysPrxForUser 0xEBE5F72F) library
+  wrapper that finally loads the SPURS kernel image for the You Don't Know Jack
+  bring-up.
+
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
 in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
