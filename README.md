@@ -339,6 +339,13 @@ for who did what — thank you, everyone.
 
 ## Changelog
 
+### v0.6.8 — *"Load-Bearing"* (July 2026)
+*SPURS titles can't run any SPU work until their SPU kernel image is actually loaded. This release lands the image-import path: [@sagemono](https://github.com/sagemono)'s syscall implementation plus the sysPrxForUser library wrapper `libsre` actually calls during `cellSpursInitialize`.*
+
+**Runtime & lv2**
+- **`sys_spu_image_import` implemented + SPU-image syscall numbers fixed** — import was mis-numbered 157 (that's `_sys_spu_image_import`) and collided with `SYS_SPU_IMAGE_CLOSE`, so a title's import call dispatched to the close stub and the image struct was left zeroed (entry=0 → matched no fallback → the SPU thread "instantly completed"). Renumbered 156/157/158 and replaced the zero-init stub with a real SPU-ELF32 PT_LOAD → `sys_spu_segment[]` parser — *[@sagemono](https://github.com/sagemono)* (#57)
+- **`_sys_spu_image_import` (sysPrxForUser NID `0xEBE5F72F`) implemented** — the user-space wrapper `libsre` invokes during `cellSpursInitialize`; previously unresolved (returned 0), so the SPURS SPU kernel image was never parsed and the cellSpurs SPU threads came up at entry 0. Now parses the SPU ELF into the image struct (entry/segments), reusing the #57 segment layout, so the threads come up at the real kernel entry. (An experimental, env-gated `YDKJ_SPURSKERNEL` path routes that entry to an HLE kernel runner for the *You Don't Know Jack* bring-up.)
+
 ### v0.6.7 — *"Fine Print"* (July 2026)
 *The second half of the two-port review pass: [@canersaka](https://github.com/canersaka)'s remaining decode/ABI/timing fixes plus a lifter/HLE audit toolkit, and the title-agnostic robustness fixes from [@JonathanDC64](https://github.com/JonathanDC64)'s port that could be ported and build-verified cleanly.*
 
