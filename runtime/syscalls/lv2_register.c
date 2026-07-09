@@ -402,10 +402,14 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
 
-    /* Empty image (entry=0) on a cellSpurs SPU thread -> route to the HLE SPURS
-     * kernel (YDKJ_SPURSKERNEL) so group_start runs a live SPU instead of an
-     * instant no-op. */
-    if (t->entry_point == 0 && getenv("YDKJ_SPURSKERNEL")) {
+    /* cellSpurs SPU kernel thread -> route to the HLE SPURS kernel runner so
+     * group_start runs a live SPU (the lifted sk_a) instead of an instant no-op.
+     * entry=0    : pre-image-import (empty image).
+     * entry=0x818: the REAL SPURS kernel-A entry, now that _sys_spu_image_import
+     *              (sysPrxForUser 0xEBE5F72F, ppu_sysprx.cpp) loads the kernel ELF. */
+    if ((t->entry_point == 0 || t->entry_point == 0x818) && getenv("YDKJ_SPURSKERNEL")) {
+        fprintf(stderr, "[SPU] SPURS kernel thread idx=%u entry=0x%X -> HLE kernel runner\n",
+                thread_num, t->entry_point);
         t->entry_point = YDKJ_SPURS_KERNEL_ENTRY;
         static int s_reg = 0;
         if (!s_reg) { s_reg = 1;

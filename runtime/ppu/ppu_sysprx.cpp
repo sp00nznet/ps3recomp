@@ -241,9 +241,74 @@ static void hle_gcm_callback(ppu_context* ctx)
     ctx->gpr[3] = 0;                                   /* CELL_OK */
 }
 
+/* _sys_spu_image_import (sysPrxForUser NID 0xEBE5F72F) -- the user-space wrapper
+ * libsre calls during cellSpursInitialize to load the SPURS SPU kernel into the
+ * sys_spu_image struct. Previously UNRESOLVED -> returned 0 -> libsre proceeded
+ * with an EMPTY image (entry=0) -> the 5 SPURS SPU threads ran nothing -> PPU
+ * busy-waits on an SPU completion that never comes -> 0 GCM draws
+ * (prx/spu_kernel/README.txt step 1). Parses the SPU ELF at r4 into the image
+ * struct at r3.
+ *
+ * The ELF-parse (segment/entry layout below) is lifted directly from sagemono's
+ * sys_spu_image_import SYSCALL handler in PR #57 (fix/spu-image-import); this is
+ * the sysPrxForUser LIBRARY counterpart libsre actually calls. Credit: sagemono
+ * (PR #57) for the import implementation + SPU-image syscall-number fix.
+ * Self-verifying: no-op unless r4 points to an ELF (so a wrong NID guess is safe).
+ * sys_spu_image { u32 type; u32 entry; sys_spu_segment* segs; int nsegs; }
+ * sys_spu_segment{ int type; u32 ls_start; int size; u64 src_pa }  (0x18, src@0x10) */
+static void hle_sys_spu_image_import(ppu_context* ctx)
+{
+    uint32_t img_ea = (uint32_t)ctx->gpr[3];
+    uint32_t src_ea = (uint32_t)ctx->gpr[4];
+    fprintf(stderr, "[HLE] _sys_spu_image_import(img=0x%08X src=0x%08X r5=0x%08X r6=0x%08X)\n",
+            img_ea, src_ea, (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
+    if (!img_ea || !src_ea || !vm_base) { ctx->gpr[3] = 0; return; }
+    const uint8_t* e = vm_base + src_ea;
+    if (!(e[0]==0x7F && e[1]=='E' && e[2]=='L' && e[3]=='F')) {
+        fprintf(stderr, "[HLE] _sys_spu_image_import: src not an ELF -> no-op\n");
+        fflush(stderr); ctx->gpr[3] = 0; return;
+    }
+    uint16_t machine = (uint16_t)((e[0x12] << 8) | e[0x13]);   /* 23 = SPU */
+    uint32_t entry   = vm_read32(src_ea + 0x18);
+    uint32_t phoff   = vm_read32(src_ea + 0x1C);
+    uint16_t phentsz = (uint16_t)((e[0x2A] << 8) | e[0x2B]); if (!phentsz) phentsz = 0x20;
+    uint16_t phnum   = (uint16_t)((e[0x2C] << 8) | e[0x2D]);
+    static uint32_t s_seg_bump = 0x0D000000u;
+    uint32_t segs_ea = s_seg_bump; int nsegs = 0;
+    for (uint16_t i = 0; i < phnum && nsegs < 32; i++) {
+        uint32_t ph = phoff + (uint32_t)i * phentsz;
+        if (vm_read32(src_ea + ph + 0x00) != 1) continue;      /* PT_LOAD */
+        uint32_t p_off = vm_read32(src_ea + ph + 0x04);
+        uint32_t p_va  = vm_read32(src_ea + ph + 0x08);
+        uint32_t p_fsz = vm_read32(src_ea + ph + 0x10);
+        uint32_t p_msz = vm_read32(src_ea + ph + 0x14);
+        uint32_t seg = segs_ea + (uint32_t)nsegs * 0x18;       /* COPY */
+        vm_write32(seg + 0x00, 1); vm_write32(seg + 0x04, p_va);
+        vm_write32(seg + 0x08, p_fsz); vm_write32(seg + 0x10, 0);
+        vm_write32(seg + 0x14, src_ea + p_off); nsegs++;
+        if (p_msz > p_fsz && nsegs < 32) {                     /* BSS tail -> FILL 0 */
+            seg = segs_ea + (uint32_t)nsegs * 0x18;
+            vm_write32(seg + 0x00, 2); vm_write32(seg + 0x04, p_va + p_fsz);
+            vm_write32(seg + 0x08, p_msz - p_fsz);
+            vm_write32(seg + 0x10, 0); vm_write32(seg + 0x14, 0); nsegs++;
+        }
+    }
+    s_seg_bump += (uint32_t)nsegs * 0x18;
+    if (s_seg_bump >= 0x0E000000u) s_seg_bump = 0x0D000000u;
+    vm_write32(img_ea + 0x00, 0);                              /* type = USER */
+    vm_write32(img_ea + 0x04, entry);
+    vm_write32(img_ea + 0x08, nsegs ? segs_ea : 0);
+    vm_write32(img_ea + 0x0C, (uint32_t)nsegs);
+    fprintf(stderr, "[HLE] _sys_spu_image_import -> entry=0x%05X nsegs=%d machine=%u (SPU=23)\n",
+            entry, nsegs, machine);
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+}
+
 extern "C" void ppu_sysprx_register(void)
 {
     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
+    ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
     ppu_register_function(GCM_FIFO_CALLBACK_SENTINEL_EA, hle_gcm_callback);
     ps3_hle_register_ctx(ps3_compute_nid("sys_initialize_tls"),       "sys_initialize_tls",       sys_initialize_tls);
     ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
