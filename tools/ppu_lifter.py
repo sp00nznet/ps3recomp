@@ -2012,6 +2012,26 @@ class PPULifter:
                     f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
                     f"d[0] = a[0] | b[0]; d[1] = a[1] | b[1]; }}")
 
+        # VMX merge (vmrgh{b,h,w} / vmrgl{b,h,w}) -- interleave the HIGH (elements
+        # 0..n/2-1) or LOW (n/2..n-1) half of vA and vB: vD = {a[k],b[k],a[k+1],
+        # b[k+1],...}. Byte 0 = element 0 (big-endian, same convention as vsldoi/
+        # vspltw). These build matrices from column vectors -- DeferredShading's
+        # Vectormath::Aos::Matrix4 assembles its projection rows with vmrghw, and
+        # without it the matrix vector kept stale VRAM data (the 0xC0FFC0FF garbage
+        # MVP -> every G-buffer mesh transformed offscreen -> instanced cubes gone).
+        # Temps handle vD aliasing vA/vB (`vmrghw v0,v0,v13`).
+        if mn in ("vmrghb","vmrghh","vmrghw","vmrglb","vmrglh","vmrglw"):
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
+            esz = mn[5]
+            ctype, n = ({"b":("uint8_t",16), "h":("uint16_t",8), "w":("uint32_t",4)})[esz]
+            half = n // 2
+            start = 0 if mn[4] == 'h' else half
+            asg = " ".join(f"t[{2*i}]=a[{start+i}]; t[{2*i+1}]=b[{start+i}];"
+                           for i in range(half))
+            return (f"{{ {ctype}* d=({ctype}*)&ctx->vr[{vd}]; "
+                    f"{ctype}* a=({ctype}*)&ctx->vr[{va}]; {ctype}* b=({ctype}*)&ctx->vr[{vb}]; "
+                    f"{ctype} t[{n}]; {asg} memcpy(d, t, 16); }}")
+
         # ------- VMX floating-point arithmetic -------
         if mn == "vmaddfp":
             # Vector Multiply-Add Floating-Point: vD = vA * vC + vB
