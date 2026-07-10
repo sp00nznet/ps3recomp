@@ -818,6 +818,9 @@ int cellGcmOffsetIsDisplay(u32 offset)
 /* NID: 0xEAA52F23 */
 s32 cellGcmSetFlipCommand(u32 bufferId)
 {
+    { static int _n=0; if (getenv("FLIP_DBG") && _n++ < 20)
+        fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
+                bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
 

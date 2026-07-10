@@ -2746,6 +2746,39 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     if (!have_display_draws)
         return;   /* keep accumulating the in-progress frame */
 
+    /* A title that DOUBLE-BUFFERS the display (DeferredShading clears both
+     * 0x0 and 0x440000 per frame, plus a HUD pass) issues several display
+     * clears per real frame -- treating each as a boundary presented the
+     * 1-2-draw intermediates, strobing black between the full 146-draw
+     * frames. Anchor the boundary to the FLIP instead: only present once a
+     * cellGcmSetFlip has landed since the last present. Titles that flip once
+     * per frame (wave/cellmark/gcmcube) are unaffected -- their single
+     * display clear still follows their single flip. Fall back to the old
+     * clear-only heuristic for titles that never flip (fc stays 0). */
+    static u32 s_frame_draws_max = 0;   /* running max frame size (typical full frame) */
+    if (s_d3d.draw_count > s_frame_draws_max) s_frame_draws_max = s_d3d.draw_count;
+    {
+        extern unsigned cellGcm_flip_request_count(void);
+        static unsigned s_last_present_flip = 0;
+        unsigned fc = cellGcm_flip_request_count();
+        if (fc != 0) {
+            if (fc == s_last_present_flip)
+                return;   /* no flip since last present -> not a real boundary */
+            /* A double-buffered title issues several display clears per flip
+             * (DeferredShading: clear back-buffer, HUD pass, ...). They can
+             * arrive in either order, so a small batch here may be an
+             * intermediate that precedes the full frame's clear. Don't present
+             * (or consume the flip) until the batch is a substantial fraction
+             * of a full frame -- keep accumulating so the complete frame lands
+             * in one present. Gauged against the running MAX frame size (not
+             * the last, which a leaked tiny batch would poison), so it
+             * self-scales per title with no fixed threshold. */
+            if (s_frame_draws_max > 16 && s_d3d.draw_count < s_frame_draws_max / 4)
+                return;   /* intermediate: keep accumulating, flip stays pending */
+            s_last_present_flip = fc;
+        }
+    }
+
     if (s_d3d.initialized) {
         if (blink_dbg())
             printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",
@@ -2938,7 +2971,7 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
          * instanced cubes drew with garbage transforms (only the baseplate,
          * which isn't instanced, survived). */
         u32 ei = vi;
-        if (a->frequency > 1) {
+        if (a->frequency > 1 && !getenv("VP_NOFREQ")) {   /* VP_NOFREQ: instancing kill-switch */
             ei = (state->frequency_divider_op & (1u << i))
                      ? (vi % a->frequency)      /* MODULO: repeat mesh */
                      : (vi / a->frequency);     /* DIVIDE: per-instance */
