@@ -2033,12 +2033,20 @@ class PPULifter:
                     f"{ctype} t[{n}]; {asg} memcpy(d, t, 16); }}")
 
         # ------- VMX floating-point arithmetic -------
+        # CRITICAL operand order: capstone disassembles the VA-form FMA as
+        # [vD, vA, vC, vB] -- i.e. ops[2] is the MULTIPLICAND (vC) and ops[3]
+        # is the ADDEND (vB), matching the PPC assembler mnemonic order
+        # `vmaddfp vD,vA,vC,vB` => vD = vA*vC + vB. The old code read ops[2]
+        # as the addend and ops[3] as the multiplicand -- swapped -- so every
+        # VMX matrix multiply (Vectormath::Aos, e.g. DeferredShading's
+        # transformHierarchy world*view) computed vA*vB+vC and produced garbage
+        # (huge 1e37 model-eye matrices -> meshes offscreen). Verified against
+        # capstone: enc(vD,vA,vB,vC) -> "vmaddfp vD, vA, vC, vB".
         if mn == "vmaddfp":
-            # Vector Multiply-Add Floating-Point: vD = vA * vC + vB
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
-            vb = int(ops[2][1:])  # Note: vmaddfp operand order is vD, vA, vC, vB
-            vc = int(ops[3][1:])
+            vc = int(ops[2][1:])   # vC = multiplicand
+            vb = int(ops[3][1:])   # vB = addend
             return (f"{{ float* d = (float*)&ctx->vr[{vd}]; "
                     f"float* a = (float*)&ctx->vr[{va}]; "
                     f"float* b = (float*)&ctx->vr[{vb}]; "
@@ -2047,11 +2055,11 @@ class PPULifter:
                     f"d[2]=a[2]*c[2]+b[2]; d[3]=a[3]*c[3]+b[3]; }}")
 
         if mn == "vnmsubfp":
-            # Vector Negative Multiply-Subtract: vD = -(vA * vC - vB) = vB - vA*vC
+            # vD = -(vA*vC - vB) = vB - vA*vC. Same [vD,vA,vC,vB] operand order.
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
-            vb = int(ops[2][1:])
-            vc = int(ops[3][1:])
+            vc = int(ops[2][1:])   # vC = multiplicand
+            vb = int(ops[3][1:])   # vB = addend
             return (f"{{ float* d = (float*)&ctx->vr[{vd}]; "
                     f"float* a = (float*)&ctx->vr[{va}]; "
                     f"float* b = (float*)&ctx->vr[{vb}]; "
