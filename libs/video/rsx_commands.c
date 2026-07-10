@@ -544,7 +544,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             float f;
             memcpy(&f, &data, 4);
             { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
-              static int _n=0; if(_en && _n++<64) fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); }
+              static int _n=0;
+              int _hit = _en && (getenv("TCONST_ALL") ? (_n<64) : (slot>=254 && slot<=260 && _n<400));
+              if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
             state->vertex_constants[slot][lane] = f;
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;

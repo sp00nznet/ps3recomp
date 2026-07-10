@@ -1277,11 +1277,16 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                     if (a > 1e-9f) last_nz = i;
                     if (a > maxabs) maxabs = a;
                 }
-                fprintf(mf, "op%03u vs=%d c0[%.4f %.4f %.4f %.4f] c1[%.4f %.4f %.4f %.4f] "
-                            "c2[%.4f %.4f %.4f %.4f] c3[%.4f %.4f %.4f %.4f] lastNZslot=%d maxabs=%.3f\n",
-                        d, r->vs_idx, c[0],c[1],c[2],c[3], c[4],c[5],c[6],c[7],
-                        c[8],c[9],c[10],c[11], c[12],c[13],c[14],c[15],
-                        last_nz / 4, maxabs);
+                fprintf(mf, "op%03u vs=%d lastNZslot=%d maxabs=%.3f\n",
+                        d, r->vs_idx, last_nz / 4, maxabs);
+                if (shown == 0) {   /* full non-zero slot dump for the 1st draw */
+                    for (int s = 0; s <= last_nz / 4; s++) {
+                        const float* v = c + s * 4;
+                        if ((v[0]||v[1]||v[2]||v[3]))
+                            fprintf(mf, "   c[%3d] = %9.4f %9.4f %9.4f %9.4f\n",
+                                    s, v[0], v[1], v[2], v[3]);
+                    }
+                }
                 shown++;
             }
         }
