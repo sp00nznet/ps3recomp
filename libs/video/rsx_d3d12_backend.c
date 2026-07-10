@@ -2922,12 +2922,23 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 {
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
+    extern u32 cellGcmResolveLocated(int, u32);
     for (int i = 0; i < 16; i++) {
         VPSlot* o = &out16[i];
         o->v[0] = o->v[1] = o->v[2] = 0.0f; o->v[3] = 1.0f;
         const rsx_vertex_attrib* a = &state->vertex_attribs[i];
         if (!a->enabled || a->stride == 0) continue;
-        const u8* p = vm_base + cellGcmResolveOffset(a->offset + vi * a->stride);
+        /* The vertex-array OFFSET register (NV4097_SET_VERTEX_DATA_ARRAY_OFFSET)
+         * carries the context-DMA location in bit 31: 0 = LOCAL (VRAM), 1 = MAIN
+         * (IO-mapped system memory). DeferredShading is the first sample to put
+         * its meshes in the main heap -- passing the raw 0x80xxxxxx offset to
+         * cellGcmResolveOffset made page = 0x80x and resolved to garbage VRAM
+         * (vertices read as -7.992 => degenerate => empty G-buffer). Strip the
+         * bit and resolve MAIN explicitly; local offsets keep the old path. */
+        u32 off = (a->offset & 0x7FFFFFFFu) + vi * a->stride;
+        const u8* p = vm_base + ((a->offset & 0x80000000u)
+            ? cellGcmResolveLocated(0, off)   /* MAIN: IO offset table */
+            : cellGcmResolveOffset(off));     /* LOCAL/legacy path */
         u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
         switch (a->type) {
         case 2: /* CELL_GCM_VERTEX_F: float32 BE */
