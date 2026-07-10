@@ -45,6 +45,8 @@ void     ps3_load_prx_modules(void) {}
 
 #ifdef _WIN32
 #include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 /* Last-chance crash reporter: vm_base accesses are bounds-guarded, so a real
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
  * runtime-struct walk). Print the faulting address and the RIP as a module
@@ -164,41 +166,70 @@ extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" unsigned cellGcm_flip_request_count(void);
 extern "C" int cellGcm_take_flip_pending(void);
+extern "C" int cellGcm_take_flip_pending_synced(void);
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
-    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "cellmark (ps3recomp)") == 0);
+        /* 1ms scheduler resolution: without this Sleep(1..4) rounds to the
+     * 15.6ms timer tick, so the "fast" fence-drain cadence was fiction
+     * and every guest fence wait cost a full tick (wave: ~15 fps). */
+    timeBeginPeriod(1);
+    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "wave (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     unsigned last_flip = 0;
-    ULONGLONG next_tick = GetTickCount64();
+    /* Vblank beats at the true PS3 rate (59.94Hz NTSC), accumulated on QPC.
+     * GetTickCount64 + `next_tick += 16` quantized the beat to whole ms:
+     * 16ms = exactly 62.5Hz, which leaked into every flip-synced title as
+     * 62-63 fps. Accumulating qpf*1001/60000 QPC ticks holds 60000/1001 Hz
+     * to within the period truncation (<=1 tick per beat, ~6ppm). */
+    LARGE_INTEGER qpf_li, qpc_li;
+    QueryPerformanceFrequency(&qpf_li);
+    QueryPerformanceCounter(&qpc_li);
+    const ULONGLONG vblank_period = (ULONGLONG)(qpf_li.QuadPart * 1001ULL / 60000ULL);
+    ULONGLONG next_tick = (ULONGLONG)qpc_li.QuadPart;
+    /* High-resolution waitable timer: Sleep()/timeBeginPeriod round to the
+     * 15.6ms scheduler tick (and Win10+ ignores timeBeginPeriod for
+     * unfocused processes), which capped the fence-drain cadence at ~64Hz
+     * and the guest at ~15 fps. The HIGH_RESOLUTION flag is precise and
+     * focus-independent (Win10 1803+). */
+    HANDLE hrtimer = CreateWaitableTimerExW(NULL, NULL,
+        0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
     for (;;) {
         /* Fast cadence: titles fence EVERY render pass on an RSX label the
          * drain writes; at a 16ms drain each fence cost a frame's worth of
-         * time (wave: six passes -> ~7 fps). Drain at ~2ms; vblank/flip
+         * time (wave: six passes -> ~7 fps). Drain at ~1ms; vblank/flip
          * ticks stay on 16ms beats. */
-        Sleep(2);
-        /* Flip completion at the fast cadence too: the 16ms beat is only
-         * vsync emulation and throttled the whole frame loop; the guest's
-         * flip-status wait resolves as soon as the frame actually finished. */
-        cellGcmTickFlip();
-        ULONGLONG now = GetTickCount64();
+        if (hrtimer) {
+            LARGE_INTEGER due; due.QuadPart = -10000;   /* 1ms, 100ns units */
+            SetWaitableTimer(hrtimer, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(hrtimer, 2);
+        } else {
+            Sleep(2);
+        }
+        QueryPerformanceCounter(&qpc_li);
+        ULONGLONG now = (ULONGLONG)qpc_li.QuadPart;
         while ((long long)(now - next_tick) >= 0) {
             cellGcmTickVBlank();
-            next_tick += 16;
-            if ((long long)(now - next_tick) > 1000) { next_tick = now; break; }
+            /* Flip completion on the vblank beat = 59.94Hz vsync pacing (with
+             * the fast fence drain below the guest otherwise runs ~94fps). */
+            cellGcmTickFlip();
+            next_tick += vblank_period;
+            /* Fell >1s behind (debugger pause, laptop sleep): resync instead
+             * of machine-gunning catch-up vblanks. */
+            if ((long long)(now - next_tick) > (long long)(qpf_li.QuadPart)) { next_tick = now; break; }
         }
         if (rsx_ok) {
             if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
-            /* Present a pending flip BEFORE draining further: the flip fires
-             * at a get==put boundary, so the held batch is exactly the
-             * completed frame. */
+            cellGcm_rsx_process_fifo();      /* execute the game's GCM commands */
+            /* Present once the drain has consumed the flipped frame: the
+             * guest blocks in WaitFlip after flipping, so at get==put the
+             * batch is exactly the completed frame. */
             {
-                if (cellGcm_take_flip_pending()) {
+                if (cellGcm_take_flip_pending_synced()) {
                     rsx_d3d12_backend_present();
                     last_flip = cellGcm_flip_request_count();
                 }
             }
-            cellGcm_rsx_process_fifo();      /* execute the game's GCM commands */
             /* Boot fallback: before the first flip, present freely so the
              * window isn't stuck white. */
             unsigned fc = cellGcm_flip_request_count();
