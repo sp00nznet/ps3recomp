@@ -1100,6 +1100,208 @@ static void dump_backbuffer_bmp(void)
     s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
 }
 
+/* ---------------------------------------------------------------------------
+ * RSX frame capture ("rsxcap") -- a purpose-built GPU debugger. RSX_CAP=start
+ * [:count[:stride]] snapshots whole frames to <RSX_CAP_DIR>/frame_NN/: a text
+ * manifest of every op (in submission order, with full surface/shader/texture
+ * state) plus a BMP of the backbuffer and every offscreen colour RT used that
+ * frame. One frame, captured atomically -- no cross-frame guessing.
+ * -----------------------------------------------------------------------*/
+
+/* Shared 24-bit BMP writer for readbacks. R8G8B8A8_UNORM straight; the half/
+ * float RT formats are |v|-tonemapped so signed/HDR data is visible. */
+static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
+                          u32 pitch, u32 dxgi)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    u32 rowb = (w * 3 + 3) & ~3u, datasz = rowb * h;
+    u8 hdr[54] = {0};
+    hdr[0] = 'B'; hdr[1] = 'M';
+    *(u32*)(hdr+2) = 54 + datasz; *(u32*)(hdr+10) = 54; *(u32*)(hdr+14) = 40;
+    *(int*)(hdr+18) = (int)w; *(int*)(hdr+22) = (int)h;
+    *(u16*)(hdr+26) = 1; *(u16*)(hdr+28) = 24; *(u32*)(hdr+34) = datasz;
+    fwrite(hdr, 1, 54, f);
+    u8* line = (u8*)malloc(rowb);
+    if (line) for (int y = (int)h - 1; y >= 0; y--) {   /* BMP is bottom-up */
+        const u8* srow = (const u8*)mapped + (u64)y * pitch;
+        memset(line, 0, rowb);
+        for (u32 x = 0; x < w; x++) {
+            float rv, gv, bv;
+            if (dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                const u16* hp = (const u16*)(srow + (u64)x * 8);
+                float v[3];
+                for (int c = 0; c < 3; c++) {
+                    u16 hv = hp[c]; u32 s = (hv>>15)&1, e = (hv>>10)&0x1F, m = hv&0x3FF; float fv;
+                    if (e == 0) fv = (float)m / 16777216.0f;
+                    else { u32 fb = (s<<31)|((e-15+127)<<23)|(m<<13); memcpy(&fv,&fb,4); }
+                    v[c] = fv;
+                }
+                rv = v[0]; gv = v[1]; bv = v[2];
+            } else if (dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+                const float* fp = (const float*)(srow + (u64)x * 16);
+                rv = fp[0]; gv = fp[1]; bv = fp[2];
+            } else {
+                const u8* p = srow + (u64)x * 4;
+                rv = p[0]/255.0f; gv = p[1]/255.0f; bv = p[2]/255.0f;
+            }
+            float ar = rv<0?-rv:rv, ag = gv<0?-gv:gv, ab = bv<0?-bv:bv;
+            if (ar>1) ar=1; if (ag>1) ag=1; if (ab>1) ab=1;
+            line[x*3+0] = (u8)(ab*255.0f);
+            line[x*3+1] = (u8)(ag*255.0f);
+            line[x*3+2] = (u8)(ar*255.0f);
+        }
+        fwrite(line, 1, rowb, f);
+    }
+    free(line);
+    fclose(f);
+}
+
+/* Copy one GPU resource into a fresh readback buffer and write it as a BMP.
+ * Self-contained: waits, resets the frame command list, copies, executes,
+ * waits, maps. `prior` is the resource's current tracked state (restored after
+ * the copy so the caller's state tracking stays valid). */
+static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
+                               D3D12_RESOURCE_STATES prior, u32 fi, const char* path)
+{
+    if (!res || !w || !h) return;
+    u32 bpp = (dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 :
+              (dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
+    u32 pitch = (w * bpp + 255) & ~255u;
+
+    ID3D12Resource* rb = NULL;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = (u64)pitch * h; rd.Height = 1; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void**)&rb)) || !rb)
+        return;
+
+    wait_for_gpu();
+    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
+    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = res;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        b.Transition.StateBefore = prior;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Footprint.Format = (DXGI_FORMAT)dxgi;
+    dst.PlacedFootprint.Footprint.Width = w; dst.PlacedFootprint.Footprint.Height = h;
+    dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = pitch;
+    src.pResource = res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+
+    if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter  = prior;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+
+    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+    ID3D12CommandList* cl[] = { (ID3D12CommandList*)s_d3d.cmd_list };
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cl);
+    wait_for_gpu();
+
+    void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * h};
+    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &mp)) && mp) {
+        cap_write_bmp(path, mp, w, h, pitch, dxgi);
+        D3D12_RANGE wr = {0, 0};
+        rb->lpVtbl->Unmap(rb, 0, &wr);
+    }
+    rb->lpVtbl->Release(rb);
+}
+
+static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
+{
+    char dir[300]; const char* base = getenv("RSX_CAP_DIR");
+    if (!base || !*base) base = "rsxcap";
+    CreateDirectoryA(base, NULL);
+    snprintf(dir, sizeof dir, "%s/frame_%02u", base, capidx);
+    CreateDirectoryA(dir, NULL);
+    char path[512];
+
+    /* Manifest: every op in submission order with full state. */
+    snprintf(path, sizeof path, "%s/manifest.txt", dir);
+    FILE* mf = fopen(path, "w");
+    if (mf) {
+        fprintf(mf, "frame_count=%llu draws=%u backbuffer=%ux%u\n",
+                (unsigned long long)s_d3d.frame_count, ndraws, s_d3d.width, s_d3d.height);
+        for (int i = 0; i < MAX_OFF_RTS; i++)
+            if (s_d3d.off_rt[i].res && s_d3d.off_rt[i].used)
+                fprintf(mf, "offrt[%d] off=0x%08X %ux%u dxgi=%u\n", i, s_d3d.off_rt[i].off,
+                        s_d3d.off_rt[i].w, s_d3d.off_rt[i].h, s_d3d.off_rt[i].dxgi);
+        fprintf(mf, "--- ops ---\n");
+        for (u32 d = 0; d < ndraws && d < MAX_DRAWS; d++) {
+            const D3D12DrawRecord* r = &s_d3d.draws[d];
+            if (r->is_clear)
+                fprintf(mf, "op%03u CLEAR rt=0x%08X rt2=0x%08X cc=(%.3f,%.3f,%.3f,%.3f)\n",
+                        d, r->rt_off, r->rt_off2, r->cc[0], r->cc[1], r->cc[2], r->cc[3]);
+            else
+                fprintf(mf, "op%03u DRAW  rt=0x%08X rt2=0x%08X vp=%u,%u,%ux%u fp=0x%08X vs=%d "
+                            "n=%u cmask=%X blend=%d t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X\n",
+                        d, r->rt_off, r->rt_off2, r->vp_x, r->vp_y, r->vp_w, r->vp_h,
+                        r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend,
+                        r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw);
+        }
+        /* Per-draw VP constant banks for the first few offscreen-RT geometry
+         * draws: c[0..3] is the projection row-major for most CG VPs; also scan
+         * for the largest non-zero slot so a mis-placed MVP is obvious. Records
+         * live at slot==draw-index; parity is post-^1 here (capture is after the
+         * frame's vp_parity flip), so read the other half. */
+        if (s_d3d.vp_cb_mapped) {
+            u32 par = (u32)(s_d3d.vp_parity ^ 1);
+            fprintf(mf, "--- vp constants (first offscreen geometry draws) ---\n");
+            int shown = 0;
+            for (u32 d = 0; d < ndraws && d < MAX_DRAWS && shown < 4; d++) {
+                const D3D12DrawRecord* r = &s_d3d.draws[d];
+                if (r->is_clear || !r->rt_off) continue;
+                const float* c = (const float*)((const char*)s_d3d.vp_cb_mapped
+                    + ((u64)par * MAX_DRAWS + d) * VP_CB_STRIDE);
+                int last_nz = -1; float maxabs = 0.0f;
+                for (int i = 0; i < RSX_MAX_VERTEX_CONSTANTS * 4; i++) {
+                    float a = c[i] < 0 ? -c[i] : c[i];
+                    if (a > 1e-9f) last_nz = i;
+                    if (a > maxabs) maxabs = a;
+                }
+                fprintf(mf, "op%03u vs=%d c0[%.4f %.4f %.4f %.4f] c1[%.4f %.4f %.4f %.4f] "
+                            "c2[%.4f %.4f %.4f %.4f] c3[%.4f %.4f %.4f %.4f] lastNZslot=%d maxabs=%.3f\n",
+                        d, r->vs_idx, c[0],c[1],c[2],c[3], c[4],c[5],c[6],c[7],
+                        c[8],c[9],c[10],c[11], c[12],c[13],c[14],c[15],
+                        last_nz / 4, maxabs);
+                shown++;
+            }
+        }
+        fclose(mf);
+    }
+
+    /* Backbuffer (in PRESENT state at capture time) + every used offscreen RT. */
+    snprintf(path, sizeof path, "%s/backbuffer.bmp", dir);
+    cap_readback_write(s_d3d.render_targets[fi], s_d3d.width, s_d3d.height,
+                       DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
+    for (int i = 0; i < MAX_OFF_RTS; i++) {
+        OffRT* r = &s_d3d.off_rt[i];
+        if (!r->res || !r->used) continue;
+        snprintf(path, sizeof path, "%s/rt_%08X.bmp", dir, r->off);
+        cap_readback_write(r->res, r->w, r->h, r->dxgi, r->st, fi, path);
+    }
+    printf("[RSXCAP] frame %llu -> %s (%u ops)\n",
+           (unsigned long long)s_d3d.frame_count, dir, ndraws);
+}
+
 /* Decompile the captured RSX vertex program to HLSL and build the VP PSO
  * (decompiled VS + atlas alpha-test PS). One-shot per program. */
 static void compile_vp(void)
@@ -1416,9 +1618,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, int blend, in
          * every MRT-B write would be masked off. Mirror RT0's blend state. */
         pd.BlendState.RenderTarget[_r] = pd.BlendState.RenderTarget[0];
     }
-    /* Guest colour write mask (RGBA nibble, already D3D-ordered). */
+    /* Guest colour write mask (RGBA nibble, already D3D-ordered). cmask is 0xF
+     * by default (unset colour_mask register decodes to all-on); a literal 0
+     * therefore means the guest EXPLICITLY masked every channel -- a depth-only
+     * pass (e.g. DeferredShading's shadow-map generation). Honour it: forcing 0
+     * back to 0xF splatters the depth pass's fragment colour onto the target. */
     for (int _r = 0; _r < nrt; _r++)
-        pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask ? cmask : 0xF);
+        pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     pd.DepthStencilState.DepthEnable = TRUE;
     pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
@@ -1726,6 +1932,11 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32* out_off2)
             }
         }
     }
+    if (getenv("RT_OFFDBG")) { static int _n=0; if (_n++ < 240)
+        fprintf(stderr, "[RTOFF] tgt=0x%X off[0]=0x%X off[1]=0x%X zeta=0x%X clip=%ux%u disp=%d -> 0x%X\n",
+                st->color_target, st->surface_color_offset[0], st->surface_color_offset[1],
+                st->surface_zeta_offset, st->surface_clip_w, st->surface_clip_h,
+                cellGcmOffsetIsDisplay(raw), cellGcmOffsetIsDisplay(raw) ? 0 : raw); }
     if (cellGcmOffsetIsDisplay(raw)) return 0;
     /* Surface clip dims when sane; else the window size. Any size works --
      * passes draw normalized full-surface quads -- this only picks resolution. */
@@ -2595,6 +2806,31 @@ static void render_frame(void)
         }
         s_rtsave_state = 0;
     }
+
+    /* rsxcap: snapshot whole frames (backbuffer + every offscreen RT + a draw
+     * manifest) at RSX_CAP=start[:count[:stride]] frame_counts. Runs before the
+     * present transition would matter -- the backbuffer is in PRESENT here and
+     * is restored to PRESENT after each readback. */
+    { const char* cap = getenv("RSX_CAP");
+      if (cap) {
+        static int s_cap_parsed = 0;
+        static u32 s_cap_start = 0, s_cap_count = 1, s_cap_stride = 1, s_cap_done = 0;
+        if (!s_cap_parsed) {
+            s_cap_parsed = 1;
+            u32 a = 0, b = 1, c = 1;
+            int n = sscanf(cap, "%u:%u:%u", &a, &b, &c);
+            s_cap_start  = (n >= 1 && a) ? a : 200;
+            s_cap_count  = (n >= 2 && b) ? b : 1;
+            s_cap_stride = (n >= 3 && c) ? c : 1;
+        }
+        if (s_cap_done < s_cap_count) {
+            u32 target = s_cap_start + s_cap_done * s_cap_stride;
+            if (s_d3d.frame_count >= target && s_dbg_last_draws > 0) {
+                rsx_capture_frame(fi, s_dbg_last_draws, s_cap_done);
+                s_cap_done++;
+            }
+        }
+      } }
 
     /* Present */
     s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */
