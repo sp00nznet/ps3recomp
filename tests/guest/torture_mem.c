@@ -9,6 +9,8 @@ typedef unsigned int u32;
 typedef unsigned short u16;
 typedef unsigned char u8;
 
+static u64 t_d2b(double d) { union { u64 u; double d; } v; v.d = d; return v.u; }
+
 /* One shared 16-byte-aligned playground. */
 static union {
     u8  b[128];
@@ -69,6 +71,109 @@ static void NOINLINE mem_update_forms(void)
         __asm__ __volatile__("stdu %1,8(%0)" : "+b"(base) : "r"(v) : "memory");
         t_kat("stdu_ea", 0, (u64)(base - &g_buf.b[0]), 40);
         t_kat("stdu_mem", 0, g_buf.d[5], 0x1122334455667788ULL);
+    }
+}
+
+/* ---- FP update-form loads/stores --------------------------------------
+ * The lifter emitted these WITHOUT the rA writeback (integer u-forms had
+ * it): gcc walks float arrays with `lfsu f,4(rN)`, so every later access
+ * through rN re-read element 0. wave's _XyToPolar computed sqrt(x*x+x*x)
+ * and the hue-palette disc came out as a vertical band. */
+
+static void NOINLINE mem_fp_update_forms(void)
+{
+    t_section("mem_fp_update");
+    /* two known floats/doubles at fixed offsets */
+    g_buf.b[0] = 0x3F; g_buf.b[1] = 0x80; g_buf.b[2] = 0; g_buf.b[3] = 0;   /* 1.0f  */
+    g_buf.b[4] = 0x40; g_buf.b[5] = 0x40; g_buf.b[6] = 0; g_buf.b[7] = 0;   /* 3.0f  */
+    g_buf.d[1] = 0x4000000000000000ULL;                                     /* 2.0   */
+    g_buf.d[2] = 0xC010000000000000ULL;                                     /* -4.0  */
+    {
+        double got; u8* base = &g_buf.b[0];
+        __asm__ __volatile__("lfsu %0,4(%1)" : "=&f"(got), "+b"(base));
+        t_kat("lfsu_val", 0, t_d2b(got), t_d2b(3.0));
+        t_kat("lfsu_ea", 0, (u64)(base - &g_buf.b[0]), 4);
+    }
+    {
+        double got; u8* base = &g_buf.b[0];
+        __asm__ __volatile__("lfdu %0,8(%1)" : "=&f"(got), "+b"(base));
+        t_kat("lfdu_val", 0, t_d2b(got), t_d2b(2.0));
+        t_kat("lfdu_ea", 0, (u64)(base - &g_buf.b[0]), 8);
+    }
+    {
+        double got; u8* base = &g_buf.b[0]; u64 idx = 4;
+        __asm__ __volatile__("lfsux %0,%1,%2" : "=&f"(got), "+b"(base) : "r"(idx));
+        t_kat("lfsux_val", 0, t_d2b(got), t_d2b(3.0));
+        t_kat("lfsux_ea", 0, (u64)(base - &g_buf.b[0]), 4);
+    }
+    {
+        double got; u8* base = &g_buf.b[0]; u64 idx = 16;
+        __asm__ __volatile__("lfdux %0,%1,%2" : "=&f"(got), "+b"(base) : "r"(idx));
+        t_kat("lfdux_val", 0, t_d2b(got), t_d2b(-4.0));
+        t_kat("lfdux_ea", 0, (u64)(base - &g_buf.b[0]), 16);
+    }
+    {
+        u8* base = &g_buf.b[32]; double v = 5.0;
+        __asm__ __volatile__("stfsu %1,4(%0)" : "+b"(base) : "f"(v) : "memory");
+        t_kat("stfsu_ea", 0, (u64)(base - &g_buf.b[0]), 36);
+        t_kat("stfsu_mem", 0,
+              ((u64)g_buf.b[36] << 24) | ((u64)g_buf.b[37] << 16) |
+              ((u64)g_buf.b[38] << 8) | g_buf.b[39], 0x40A00000ULL);
+    }
+    {
+        u8* base = &g_buf.b[40]; double v = -6.5;
+        __asm__ __volatile__("stfdu %1,8(%0)" : "+b"(base) : "f"(v) : "memory");
+        t_kat("stfdu_ea", 0, (u64)(base - &g_buf.b[0]), 48);
+        t_kat("stfdu_mem", 0, g_buf.d[6], 0xC01A000000000000ULL);
+    }
+    {
+        u8* base = &g_buf.b[56]; u64 idx = 8; double v = 0.5;
+        __asm__ __volatile__("stfsux %1,%0,%2" : "+b"(base) : "f"(v), "r"(idx) : "memory");
+        t_kat("stfsux_ea", 0, (u64)(base - &g_buf.b[0]), 64);
+        t_kat("stfsux_mem", 0,
+              ((u64)g_buf.b[64] << 24) | ((u64)g_buf.b[65] << 16) |
+              ((u64)g_buf.b[66] << 8) | g_buf.b[67], 0x3F000000ULL);
+    }
+    {
+        u8* base = &g_buf.b[64]; u64 idx = 8; double v = 1.5;
+        __asm__ __volatile__("stfdux %1,%0,%2" : "+b"(base) : "f"(v), "r"(idx) : "memory");
+        t_kat("stfdux_ea", 0, (u64)(base - &g_buf.b[0]), 72);
+        t_kat("stfdux_mem", 0, g_buf.d[9], 0x3FF8000000000000ULL);
+    }
+    /* indexed integer update stores (stbux/sthux/stwux/stdux lacked the
+     * writeback too; ldux was missing entirely) */
+    fill_pattern();
+    {
+        u64 got; u8* base = &g_buf.b[0]; u64 idx = 8;
+        __asm__ __volatile__("ldux %0,%1,%2" : "=&r"(got), "+b"(base) : "r"(idx));
+        t_kat("ldux_val", 0, got, 0xA8A9AAABACADAEAFULL);
+        t_kat("ldux_ea", 0, (u64)(base - &g_buf.b[0]), 8);
+    }
+    {
+        u8* base = &g_buf.b[16]; u64 idx = 4; u64 v = 0xCAFEF00D;
+        __asm__ __volatile__("stwux %1,%0,%2" : "+b"(base) : "r"(v), "r"(idx) : "memory");
+        t_kat("stwux_ea", 0, (u64)(base - &g_buf.b[0]), 20);
+        t_kat("stwux_mem", 0,
+              ((u64)g_buf.b[20] << 24) | ((u64)g_buf.b[21] << 16) |
+              ((u64)g_buf.b[22] << 8) | g_buf.b[23], 0xCAFEF00DULL);
+    }
+    {
+        u8* base = &g_buf.b[24]; u64 idx = 8; u64 v = 0x0123456789ABCDEFULL;
+        __asm__ __volatile__("stdux %1,%0,%2" : "+b"(base) : "r"(v), "r"(idx) : "memory");
+        t_kat("stdux_ea", 0, (u64)(base - &g_buf.b[0]), 32);
+        t_kat("stdux_mem", 0, g_buf.d[4], 0x0123456789ABCDEFULL);
+    }
+    {
+        u8* base = &g_buf.b[48]; u64 idx = 2; u64 v = 0xBEEF;
+        __asm__ __volatile__("sthux %1,%0,%2" : "+b"(base) : "r"(v), "r"(idx) : "memory");
+        t_kat("sthux_ea", 0, (u64)(base - &g_buf.b[0]), 50);
+        t_kat("sthux_mem", 0, ((u64)g_buf.b[50] << 8) | g_buf.b[51], 0xBEEFULL);
+    }
+    {
+        u8* base = &g_buf.b[56]; u64 idx = 3; u64 v = 0x5A;
+        __asm__ __volatile__("stbux %1,%0,%2" : "+b"(base) : "r"(v), "r"(idx) : "memory");
+        t_kat("stbux_ea", 0, (u64)(base - &g_buf.b[0]), 59);
+        t_kat("stbux_mem", 0, g_buf.b[59], 0x5AULL);
     }
 }
 
@@ -238,6 +343,7 @@ static void NOINLINE mem_multiword(void)
 void torture_mem_run(void)
 {
     mem_update_forms();
+    mem_fp_update_forms();
     mem_byterev();
     mem_sign_loads();
     mem_unaligned();

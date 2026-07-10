@@ -1024,6 +1024,7 @@ class PPULifter:
             "lbzx": "vm_read8", "lhzx": "vm_read16", "lwzx": "vm_read32", "ldx": "vm_read64",
             "lhax": "vm_read16", "lwax": "vm_read32",
             "lbzux": "vm_read8", "lhzux": "vm_read16", "lwzux": "vm_read32",
+            "ldux": "vm_read64",
         }
         if mn in idx_load_map:
             helper = idx_load_map[mn]
@@ -1052,27 +1053,49 @@ class PPULifter:
         idx_store_map = {
             "stbx": "vm_write8", "sthx": "vm_write16", "stwx": "vm_write32", "stdx": "vm_write64",
             "stbux": "vm_write8", "sthux": "vm_write16", "stwux": "vm_write32",
+            "stdux": "vm_write64",
         }
         if mn in idx_store_map:
             helper = idx_store_map[mn]
             rs_i, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            # Indexed update forms: EA = ra+rb, store, then ra = EA (was missing
+            # -- same writeback bug as lfsu; see FP loads below).
+            if mn.endswith("ux") and ra_i != "0":
+                return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
+                        f"{helper}(ea, ctx->gpr[{rs_i}]); ctx->gpr[{ra_i}] = ea; }}")
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             return f"{helper}({ea}, ctx->gpr[{rs_i}]);"
 
         # ------- Indexed FP Loads/Stores -------
-        if mn in ("lfsx", "lfdx"):
+        # ux forms write EA back to rA (rA=0 is an invalid form for updates,
+        # so the plain-EA fallback below is fine for it).
+        if mn in ("lfsx", "lfdx", "lfsux", "lfdux"):
             frd, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            single = mn in ("lfsx", "lfsux")
+            if mn.endswith("ux") and ra_i != "0":
+                body = (f"uint32_t tmp = vm_read32(ea); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp;"
+                        if single else
+                        f"uint64_t tmp = vm_read64(ea); memcpy(&ctx->fpr[{frd}], &tmp, 8);")
+                return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
+                        f"{body} ctx->gpr[{ra_i}] = ea; }}")
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
-            if "s" in mn:
+            if single:
                 return f"{{ uint32_t tmp = vm_read32({ea}); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}"
             else:
                 return f"{{ uint64_t tmp = vm_read64({ea}); memcpy(&ctx->fpr[{frd}], &tmp, 8); }}"
 
-        if mn in ("stfsx", "stfdx"):
+        if mn in ("stfsx", "stfdx", "stfsux", "stfdux"):
             frs, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             # stfdx also contains 's' -- match single explicitly [fork eb5451b3]
-            if mn == "stfsx":
+            single = mn in ("stfsx", "stfsux")
+            if mn.endswith("ux") and ra_i != "0":
+                body = (f"float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32(ea, tmp);"
+                        if single else
+                        f"uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64(ea, tmp);")
+                return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
+                        f"{body} ctx->gpr[{ra_i}] = ea; }}")
+            ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
+            if single:
                 return f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32({ea}, tmp); }}"
             else:
                 return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64({ea}, tmp); }}"
@@ -1356,16 +1379,24 @@ class PPULifter:
             return "lv2_syscall(ctx);"
 
         # ------- Floating-point loads/stores -------
+        # Update forms (lfsu/lfdu/stfsu/stfdu) write EA back to rA like their
+        # integer counterparts. This was missing: gcc emits `lfsu f1,4(rN)` to
+        # walk float arrays, and without the writeback every later load through
+        # rN re-reads element 0 (wave's _XyToPolar computed sqrt(x*x+x*x), so
+        # the hue-palette disc degenerated into a vertical band).
         if mn in ("lfs", "lfsu", "lfd", "lfdu"):
             frd = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                if "s" in mn:
-                    return (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
+                if mn in ("lfs", "lfsu"):
+                    line = (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
                             f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
-                    return (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
+                    line = (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
+                if mn.endswith("u"):
+                    line += f" ctx->gpr[{base}] += {disp};"
+                return line
 
         if mn in ("stfs", "stfsu", "stfd", "stfdu"):
             frs = _reg_idx(ops[0])
@@ -1377,11 +1408,14 @@ class PPULifter:
                 # store, corrupting the double (breaks fctidz+stfd+ld float->GPR
                 # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
                 if mn in ("stfs", "stfsu"):
-                    return (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
+                    line = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
                             f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
                 else:
-                    return (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
+                    line = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
                             f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
+                if mn.endswith("u"):
+                    line += f" ctx->gpr[{base}] += {disp};"
+                return line
 
         # ------- FP arithmetic -------
         # PPC NaN semantics + default +QNaN via preamble helpers (a plain C
