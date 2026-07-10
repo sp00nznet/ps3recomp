@@ -84,15 +84,16 @@ typedef struct CellPngDecThreadOutParam {
     u32 pngCodecVersion;
 } CellPngDecThreadOutParam;
 
-/* Source descriptor */
+/* Source descriptor -- HOST-side working copy (NOT the guest layout; the guest
+ * CellPngDecSrc is marshalled field-by-field in cellPngDecOpen). fileName points
+ * at the sub-handle's host path buffer; streamPtr holds the guest address. */
 typedef struct CellPngDecSrc {
-    u32  srcSelect;                 /* CELL_PNGDEC_FILE or CELL_PNGDEC_BUFFER */
-    char fileName[CELL_PNGDEC_MAX_PATH]; /* File path (if FILE) */
-    u64  fileOffset;                /* Offset within file */
-    u32  fileSize;                  /* Size of data */
-    u64  streamPtr;                 /* Buffer pointer (if BUFFER, guest addr) */
-    u32  streamSize;                /* Buffer size */
-    u32  spuThreadEnable;
+    u32         srcSelect;          /* CELL_PNGDEC_FILE or CELL_PNGDEC_BUFFER */
+    const char* fileName;           /* host path (if FILE) */
+    u64         fileOffset;         /* Offset within file */
+    u32         fileSize;           /* Size of data */
+    u32         streamPtr;          /* Buffer guest address (if BUFFER) */
+    u32         streamSize;         /* Buffer size */
 } CellPngDecSrc;
 
 /* Image info from header */
@@ -146,30 +147,29 @@ typedef struct CellPngDecDataInfo {
  * Functions
  * -----------------------------------------------------------------------*/
 
-s32 cellPngDecCreate(CellPngDecMainHandle* mainHandle,
-                     const CellPngDecThreadInParam* threadInParam,
-                     CellPngDecThreadOutParam* threadOutParam);
+/* Pointer parameters are GUEST addresses (u32): the HLE bridge forwards raw
+ * gpr values, so these arrive as big-endian guest addresses, not host pointers.
+ * Marshalling to/from guest memory happens inside the .c. */
+s32 cellPngDecCreate(u32 mainHandle_addr, u32 threadInParam_addr, u32 threadOutParam_addr);
 
 s32 cellPngDecDestroy(CellPngDecMainHandle mainHandle);
 
 s32 cellPngDecOpen(CellPngDecMainHandle mainHandle,
-                   CellPngDecSubHandle* subHandle,
-                   const CellPngDecSrc* src,
-                   CellPngDecOpnInfo* openInfo);
+                   u32 subHandle_addr, u32 src_addr, u32 openInfo_addr);
 
 s32 cellPngDecReadHeader(CellPngDecMainHandle mainHandle,
                          CellPngDecSubHandle subHandle,
-                         CellPngDecInfo* info);
+                         u32 info_addr);
 
 s32 cellPngDecSetParameter(CellPngDecMainHandle mainHandle,
                            CellPngDecSubHandle subHandle,
-                           const CellPngDecInParam* inParam,
-                           CellPngDecOutParam* outParam);
+                           u32 inParam_addr, u32 outParam_addr);
 
+/* Real SDK arity: 5 args -- dataCtrlParam (carrying outputBytesPerLine, the
+ * destination pitch) sits BEFORE dataOutInfo. */
 s32 cellPngDecDecodeData(CellPngDecMainHandle mainHandle,
                          CellPngDecSubHandle subHandle,
-                         u8* data,
-                         CellPngDecDataInfo* dataInfo);
+                         u32 data_addr, u32 dataCtrlParam_addr, u32 dataOutInfo_addr);
 
 s32 cellPngDecClose(CellPngDecMainHandle mainHandle,
                     CellPngDecSubHandle subHandle);
