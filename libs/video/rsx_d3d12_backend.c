@@ -2928,6 +2928,21 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
         o->v[0] = o->v[1] = o->v[2] = 0.0f; o->v[3] = 1.0f;
         const rsx_vertex_attrib* a = &state->vertex_attribs[i];
         if (!a->enabled || a->stride == 0) continue;
+        /* Vertex frequency divisor (instancing). freq 0/1 = per-vertex. For
+         * freq > 1 the element index is either vertex/freq (DIVIDE: per-instance
+         * data advances once per freq verts) or vertex%freq (MODULO: a mesh
+         * repeats every freq verts). NV4097_SET_FREQUENCY_DIVIDER_OPERATION's
+         * per-attribute bit selects MODULO. DeferredShading's cube rings need
+         * this: the shared cube mesh is MODULO, the per-instance transform in
+         * attrib9 is DIVIDE -- without it attrib9 advanced every vertex and the
+         * instanced cubes drew with garbage transforms (only the baseplate,
+         * which isn't instanced, survived). */
+        u32 ei = vi;
+        if (a->frequency > 1) {
+            ei = (state->frequency_divider_op & (1u << i))
+                     ? (vi % a->frequency)      /* MODULO: repeat mesh */
+                     : (vi / a->frequency);     /* DIVIDE: per-instance */
+        }
         /* The vertex-array OFFSET register (NV4097_SET_VERTEX_DATA_ARRAY_OFFSET)
          * carries the context-DMA location in bit 31: 0 = LOCAL (VRAM), 1 = MAIN
          * (IO-mapped system memory). DeferredShading is the first sample to put
@@ -2935,7 +2950,7 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
          * cellGcmResolveOffset made page = 0x80x and resolved to garbage VRAM
          * (vertices read as -7.992 => degenerate => empty G-buffer). Strip the
          * bit and resolve MAIN explicitly; local offsets keep the old path. */
-        u32 off = (a->offset & 0x7FFFFFFFu) + vi * a->stride;
+        u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
         const u8* p = vm_base + ((a->offset & 0x80000000u)
             ? cellGcmResolveLocated(0, off)   /* MAIN: IO offset table */
             : cellGcmResolveOffset(off));     /* LOCAL/legacy path */
@@ -2973,11 +2988,12 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 static void vp_attrs_dbg(const rsx_state* state)
 {
     if (!getenv("VP_ATTRS")) return;
-    static int _a = 0; if (_a++ >= 4) return;
+    static int _a = 0; if (_a++ >= 6) return;
+    fprintf(stderr, "[VPATTR] divider_op=0x%08X\n", state->frequency_divider_op);
     for (int i = 0; i < 16; i++) {
         const rsx_vertex_attrib* a = &state->vertex_attribs[i];
-        if (a->enabled) fprintf(stderr, "[VPATTR] a%d off=0x%X stride=%u size=%u type=%u\n",
-                                i, a->offset, a->stride, a->size, a->type);
+        if (a->enabled) fprintf(stderr, "[VPATTR] a%d off=0x%X stride=%u size=%u type=%u freq=%u fmt=0x%08X\n",
+                                i, a->offset, a->stride, a->size, a->type, a->frequency, a->format);
     }
 }
 

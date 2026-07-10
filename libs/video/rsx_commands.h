@@ -187,6 +187,7 @@ typedef struct rsx_vertex_attrib {
     u32 stride;
     u32 size;
     u32 type;
+    u32 frequency;   /* format bits [31:16]: vertex frequency divisor (instancing) */
     int enabled;
 } rsx_vertex_attrib;
 
@@ -248,6 +249,11 @@ typedef struct rsx_state {
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];
+    /* NV4097_SET_FREQUENCY_DIVIDER_OPERATION (0x1FC0): per-attribute bitmask
+     * selecting how the frequency divisor is applied -- bit set = MODULO
+     * (index = vertex % freq, repeats a mesh), clear = DIVIDE (index =
+     * vertex / freq, advances once per instance). Instancing needs both. */
+    u32 frequency_divider_op;
 
     /* Current draw state */
     u32 primitive_type;

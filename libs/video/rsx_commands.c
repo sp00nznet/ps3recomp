@@ -244,11 +244,12 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
          *   [15:8]  stride (bytes between consecutive elements)
          *   [16]    enable
          */
-        attr->type    = data & 0xF;
-        attr->size    = (data >> 4) & 0xF;
-        attr->stride  = (data >> 8) & 0xFF;
-        attr->enabled = (attr->type != 0); /* type 0 = disabled */
-        attr->format  = data;
+        attr->type      = data & 0xF;
+        attr->size      = (data >> 4) & 0xF;
+        attr->stride    = (data >> 8) & 0xFF;
+        attr->frequency = (data >> 16) & 0xFFFF;   /* instancing divisor */
+        attr->enabled   = (attr->type != 0); /* type 0 = disabled */
+        attr->format    = data;
         state->vertex_dirty = 1;
         return 0;
     }
@@ -280,6 +281,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * into the GCM label window @0x03000000); NV4097_BACK_END_WRITE_SEMAPHORE_
      * RELEASE(0x1D70)=value. Also NV406E semaphore release (0x0010 offset/0x0014
      * value) for the sub-channel path. */
+    /* NV4097_SET_FREQUENCY_DIVIDER_OPERATION: per-attribute modulo/divide mask
+     * for the frequency divisor (instancing). Captured for read_vp_vertex. */
+    if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
+
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if (method == 0x1D70) {
