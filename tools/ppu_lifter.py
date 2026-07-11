@@ -86,6 +86,13 @@ void     vm_write8 (uint64_t addr, uint8_t  val);
 void     vm_write16(uint64_t addr, uint16_t val);
 void     vm_write32(uint64_t addr, uint32_t val);
 void     vm_write64(uint64_t addr, uint64_t val);
+/* stwcx./stdcx. store-conditional: atomically store `val` at `addr` iff the raw
+ * big-endian guest word still equals `expected` (the value the paired lwarx/ldarx
+ * loaded). Returns 1 if the reservation held (store applied), 0 otherwise. This
+ * makes lock-free sequences (free-list CAS, refcounts) correct across host
+ * threads -- a plain conditional write races and corrupts under real concurrency. */
+int      ppu_stwcx32(uint64_t addr, uint32_t expected, uint32_t val);
+int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
 #ifdef __cplusplus
 }
 #endif
@@ -1772,13 +1779,15 @@ class PPULifter:
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
+            # Atomic store-conditional: succeed only if the reservation address
+            # matches AND the guest word is unchanged since lwarx (ppu_stwcx32 does
+            # the atomic CAS). A plain conditional write loses concurrent updates
+            # (lock-free free-list/refcount corruption under real host threads).
             return (f"{{ uint64_t ea = {ea}; "
-                    f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
-                    f"vm_write32(ea, (uint32_t)ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "  # CR0 = EQ
-                    f"}} else {{ "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)); "  # CR0 = 0
-                    f"}} ctx->reserve_addr = 0; }}")
+                    f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
+                    f"ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "  # CR0 EQ = success
+                    f"ctx->reserve_addr = 0; }}")
 
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -1791,12 +1800,10 @@ class PPULifter:
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"if (ctx->reserve_addr == (uint32_t)ea) {{ "
-                    f"vm_write64(ea, ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (2u << 28); "
-                    f"}} else {{ "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)); "
-                    f"}} ctx->reserve_addr = 0; }}")
+                    f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
+                    f"ppu_stdcx64(ea, ctx->reserve_value, ctx->gpr[{rs}]); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "
+                    f"ctx->reserve_addr = 0; }}")
 
         # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
         if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
@@ -2650,6 +2657,16 @@ class PPULifter:
             # in output. Update defined set so we don't re-generate.
             defined.add(target)
             count += 1
+            # A span-capped tail ends mid-stream on a non-terminator; its
+            # fall-through continuation is a real code address that NO function
+            # covers. Register it so the next pass lifts func_<cont> — otherwise
+            # the emit fallback chains to the next function in ADDRESS order,
+            # which is an unrelated interior entry, silently teleporting
+            # execution. (LBP: gap function 0x32CC18 spans 0x69BC > _MAX_MID_TAIL;
+            # every capped tail ended at 0x332C18 and the fallback warped back
+            # into a string-reset join, skipping its cap>15 free-guard →
+            # heap-pointer truncation → "Pool possibly corrupt" abort storm.)
+            self._register_continuation(tail_func)
 
         # Lift gap-resident targets. Each is bounded by the next known boundary
         # (existing function start OR the next gap target, whichever is closer)
@@ -2666,11 +2683,26 @@ class PPULifter:
                 bound = min(bound, target + _MAX_MID_TAIL)   # cap span (see above)
                 if bound <= target:
                     continue
-                self.lift_function(_insn_slice(target, bound), target, bound)
+                gap_func = self.lift_function(_insn_slice(target, bound), target, bound)
                 defined.add(target)
                 count += 1
+                # Same dangling-continuation registration as the mid-entry path.
+                self._register_continuation(gap_func)
 
         return count
+
+    def _register_continuation(self, func) -> None:
+        """If a lifted tail fell off its (possibly capped) end, promote the
+        continuation address to a branch target so a later mid-function pass
+        emits a real func_<cont> for the fallthrough trampoline to land on.
+        Window-guarded to keep the rodata-misread blast radius bounded (see
+        the code_hi note in lift_function's fallthrough comment)."""
+        cont = func.fallthrough_to
+        if not cont:
+            return
+        if self.code_hi is not None and not (self.code_lo <= cont < self.code_hi):
+            return
+        self.branch_targets.add(cont)
 
     # ------------------------------------------------------------------ #
     # Output generation
@@ -2808,9 +2840,21 @@ class PPULifter:
             else:
                 addr_idx = addr_index.get(func.start_addr)
                 if addr_idx is not None and addr_idx + 1 < len(sorted_addrs):
-                    target = func_by_addr[sorted_addrs[addr_idx + 1]].name
+                    nxt = func_by_addr[sorted_addrs[addr_idx + 1]]
+                    # Chain to the next function in address order ONLY when it
+                    # starts exactly at the continuation (a contiguous split).
+                    # Anything else teleports execution to an unrelated address
+                    # (observed on LBP: span-capped tails chained back into an
+                    # interior string-reset join, skipping its cap>15 free-guard
+                    # → heap corruption). Halting the thread is strictly safer.
+                    if nxt.start_addr == func.fallthrough_to:
+                        target = nxt.name
             if target:
                 lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
+            else:
+                print(f"  WARNING: {func.name} has no continuation at "
+                      f"0x{func.fallthrough_to:08X}; emitting halt", flush=True)
+                lines.append(f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;")
 
         lines.append("}")
         lines.append("")

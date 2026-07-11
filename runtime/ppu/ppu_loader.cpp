@@ -28,6 +28,27 @@
 #endif
 
 extern "C" uint8_t* vm_base;   /* defined by the host */
+extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below) */
+
+/* stwcx./stdcx. store-conditional (see ppu_recomp.h). Atomically store `val` at
+ * the guest EA iff the raw big-endian word still equals `expected` (what the
+ * paired lwarx/ldarx loaded). Models the reservation as a value-CAS so lock-free
+ * sequences are correct across host threads; the old always-succeed conditional
+ * write raced and corrupted lock-free free-lists under real concurrency. */
+extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+{
+    uint32_t exp_raw = __builtin_bswap32(expected);
+    uint32_t new_raw = __builtin_bswap32(val);
+    return __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
+                                       0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+}
+extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
+{
+    uint64_t exp_raw = __builtin_bswap64(expected);
+    uint64_t new_raw = __builtin_bswap64(val);
+    return __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw,
+                                       0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+}
 
 /* ---- page-guard watchpoint (find raw memcpy/vector stores that vm_write* can't
  * see, e.g. the lifter bug clobbering the GCM handler OPDs to the TOC base). When
@@ -156,6 +177,32 @@ extern "C" __declspec(thread) ppu_context* g_active_ctx;  /* fwd decl (defined b
  * report the SOURCE a copied value came from (poison propagation vs true origin). */
 static __declspec(thread) uint32_t g_last_rd_addr = 0;
 static __declspec(thread) uint32_t g_last_rd_val  = 0;
+/* PT=<hex>: persistent high-byte truncation detector. A write8 that turns the word
+ * at some addr into <hex> (e.g. a heap ptr 0x471057A0 zeroed to 0x001057A0) is BENIGN
+ * if the word is later restored to a full pointer; it is the BUG if the truncated
+ * value is later READ BACK (and freed). We record each truncation with its writer
+ * backtrace, clear it on restore (a write32 of a high-byte-set value to that addr),
+ * and when a vm_read32 returns <hex> from a still-live truncated addr we print the
+ * ORIGINAL truncating writer -- that is the miscompiled instruction. */
+#ifdef _WIN32
+static int64_t   g_pt_val = -2;               /* the truncated value to hunt (e.g. 0x001057A0) */
+static uint32_t  g_pt_addr[256];
+static int       g_pt_live[256];
+static char      g_pt_bt[256][300];
+static int       g_pt_n = 0;
+static void pt_bt(char* out, int cap) {
+    int p = 0; out[0] = 0;
+    void* bt[20]; unsigned short fr = RtlCaptureStackBackTrace(0, 20, bt, 0);
+    for (int i = 0; i < fr && i < 12; i++) { uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
+        for (uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
+        if (bg && (tgt-bh)<0x10000) p += snprintf(out+p, cap-p, " func_%08X+0x%llX", bg, (unsigned long long)(tgt-bh)); }
+}
+static void pt_record(uint32_t addr) {
+    for (int i=0;i<g_pt_n;i++) if (g_pt_addr[i]==addr){ g_pt_live[i]=1; pt_bt(g_pt_bt[i],300); return; }
+    if (g_pt_n<256){ g_pt_addr[g_pt_n]=addr; g_pt_live[g_pt_n]=1; pt_bt(g_pt_bt[g_pt_n],300); g_pt_n++; }
+}
+static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr[i]==addr) g_pt_live[i]=0; }
+#endif
 /* Stack of currently-executing indirect-call (vtable) targets on this thread, so a
  * write hook can name the virtual method that is running when it writes a value. */
 static __declspec(thread) uint32_t g_vcall_stk[128];
@@ -181,6 +228,17 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap(
     return __builtin_bswap16(v); }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
+#ifdef _WIN32
+    /* PT report: the hunted truncated value is being READ BACK from a slot we saw
+     * get truncated and never restored -> this read (about to free it) is the bug's
+     * consumption; print the ORIGINAL truncating writer we recorded. */
+    if (g_pt_val>=0 && g_last_rd_val==(uint32_t)g_pt_val) {
+        for (int i=0;i<g_pt_n;i++) if (g_pt_live[i] && g_pt_addr[i]==(uint32_t)a) {
+            static int _rn=0; if (_rn++<6) { char rb[300]; pt_bt(rb,300);
+                fprintf(stderr,"[PT-HIT] persistent trunc [0x%08X]=0x%08X\n  TRUNCATED-BY:%s\n  READ-BACK-BY:%s\n",
+                        (uint32_t)a,(uint32_t)g_pt_val, g_pt_bt[i], rb); }
+            g_pt_live[i]=0; break; } }
+#endif
     { static int64_t rw=-2; if (rw==-2) { const char* e=getenv("YDKJ_RWATCH"); rw=e?(int64_t)strtoul(e,0,0):-1; }
       if (rw>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)rw && ea<(uint32_t)rw+0x80) {
         static int _n=0; if (_n++<40) {
@@ -257,8 +315,52 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
             fprintf(stderr,"%s\n",line); } } }
 #endif
       } } else { last=(uint32_t)a; n=0; } }
+#ifdef _WIN32
+    { static int64_t r6=-2; if(r6==-2){const char*e=getenv("FLOW_RVAL64"); r6=e?(int64_t)strtoul(e,0,16):-1;}
+      if(r6>=0){ uint64_t vb=__builtin_bswap64(v);
+        if((uint32_t)(vb>>32)==(uint32_t)r6 || (uint32_t)vb==(uint32_t)r6){ static int _n=0; if(_n++<12){
+          void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+          char ln[820]; int p=snprintf(ln,sizeof ln,"[RVAL64] read64 0x%08X = 0x%016llX guest:",(uint32_t)a,(unsigned long long)vb);
+          for(int i=0;i<fr && i<10;i++){ uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
+            for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
+            if(bg&&(tgt-bh)<0x1400) p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh)); }
+          fprintf(stderr,"%s\n",ln); } } } }
+#endif
     return __builtin_bswap64(v); }
 void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return;
+#ifdef _WIN32
+    /* FLOW_TRUNC=<hex>: catch the byte-write that clobbers the word currently
+     * holding <hex> (e.g. a null-terminator overflow zeroing a pointer's high byte). */
+    { static int64_t tv=-2; if(tv==-2){const char*e=getenv("FLOW_TRUNC"); tv=e?(int64_t)strtoul(e,0,16):-1;}
+      if(tv>=0){ uint32_t wa=((uint32_t)a)&~3u; uint32_t cur; memcpy(&cur,vm_base+wa,4); cur=__builtin_bswap32(cur);
+        if(cur==(uint32_t)tv){
+          /* This word is a std::string data-ptr field (ptr@obj+4). Read the object's
+           * size@obj+0x14 (= wa+0x10) and capacity@obj+0x18 (= wa+0x14). A '\0' write
+           * here while capacity>15 (heap-mode) is the DAMAGING truncation: it zeroes the
+           * live heap pointer's high byte, so a later free() gets the truncated garbage.
+           * A write while capacity<=15 is a benign SSO-conversion/construction. */
+          uint32_t sz=0,cap=0;
+          if(!vm_oob(wa+0x10,4)){ memcpy(&sz ,vm_base+wa+0x10,4); sz =__builtin_bswap32(sz ); }
+          if(!vm_oob(wa+0x14,4)){ memcpy(&cap,vm_base+wa+0x14,4); cap=__builtin_bswap32(cap); }
+          int heap=(cap>0xF);
+          static int _ns=0,_nh=0; int show = heap ? (_nh++<40) : (_ns++<4);
+          if(show){
+          char ln[900]; int p=snprintf(ln,sizeof ln,"[TRUNC%s] write8 0x%08X=0x%02X clobbers [0x%08X]=0x%08X sz=0x%X cap=0x%X",heap?"-HEAP":"",(uint32_t)a,v,wa,cur,sz,cap);
+          if(g_active_ctx) p+=snprintf(ln+p,sizeof(ln)-p," cia=0x%08X",(uint32_t)g_active_ctx->cia);
+          p+=snprintf(ln+p,sizeof(ln)-p," guest:");
+          void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+          for(int i=0;i<fr&&i<14;i++){ uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
+            for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
+            /* cutoff 0x10000: lifted funcs can be large (the trampolined writer skipped
+             * the old 0x1400 filter). Runtime helpers are MBs away so won't misattribute. */
+            if(bg&&(tgt-bh)<0x10000) p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh)); }
+          fprintf(stderr,"%s\n",ln);
+          /* Host backtrace is muddied by DRAIN_TRAMPOLINE (the leaf writer runs inside
+           * the caller's inlined trampoline loop). Scan the GUEST r1 chain for saved LRs
+           * to get true guest attribution of the persistent (heap) truncation. */
+          if(heap && g_active_ctx){ extern void ppu_dump_guest_stack(ppu_context*, const char*); ppu_dump_guest_stack(g_active_ctx,"trunc-heap"); }
+          } } } }
+#endif
     /* AWATCH8: watch byte writes to a specific addr (e.g. the 0x543580 Lv-2
      * completion flag the worker spins on) — vm_write32-based AWATCH misses these. */
     { static int64_t aw=-2; if(aw==-2){const char*e=getenv("YDKJ_AWATCH8"); aw=e?(int64_t)strtoul(e,0,16):-1;}
@@ -266,6 +368,14 @@ void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return;
         extern void ppu_dump_guest_stack(ppu_context*, const char*);
         fprintf(stderr,"[AWATCH8] write8 0x%08X = 0x%02X  tid=%llu\n",(uint32_t)a,v,g_active_ctx?(unsigned long long)g_active_ctx->thread_id:999ull);
         if(g_active_ctx) ppu_dump_guest_stack(g_active_ctx,"aw8-writer"); } } }
+#ifdef _WIN32
+    /* PT detector: does this byte-write turn its word into the hunted truncated value? */
+    { if(g_pt_val==-2){const char*e=getenv("PT"); g_pt_val=e?(int64_t)strtoul(e,0,16):-1;}
+      if(g_pt_val>=0){ uint32_t wa=((uint32_t)a)&~3u; uint32_t cur; memcpy(&cur,vm_base+wa,4); cur=__builtin_bswap32(cur);
+        uint32_t shift=(3-((uint32_t)a & 3))*8; uint32_t nw=(cur & ~(0xFFu<<shift))|((uint32_t)v<<shift);
+        if(nw==(uint32_t)g_pt_val && cur!=(uint32_t)g_pt_val) pt_record(wa);
+        else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
+#endif
     vm_base[(uint32_t)a] = v; }
 void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
@@ -273,6 +383,11 @@ void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return;
         fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
     v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
 void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
+#ifdef _WIN32
+    /* PT restore: a full-word store of a valid pointer (high byte set) to a
+     * previously-truncated slot clears the record (that truncation was transient). */
+    if (g_pt_val>=0 && (v>>24)!=0) pt_restore((uint32_t)a);
+#endif
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
 #ifdef _WIN32
@@ -286,7 +401,7 @@ void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
     /* FLOW_WVAL=<hex>: catch the instruction that STORES this value to a non-rodata
      * dest (e.g. a metaclass list node corrupted with a format-string pointer). */
     { static int64_t wv=-2; if (wv==-2){ const char* e=getenv("FLOW_WVAL"); wv=e?(int64_t)strtoul(e,0,16):-1; }
-      if (wv>=0 && v==(uint32_t)wv && (uint32_t)a < 0x50000000u) { static int _n=0; if(_n++<6){
+      if (wv>=0 && v==(uint32_t)wv) { static int _n=0; if(_n++<40){
         fprintf(stderr,"[WVAL] write32 0x%08X = 0x%08X  (lastread: [0x%08X]=0x%08X %s)\n",
                 (uint32_t)a,v, g_last_rd_addr, g_last_rd_val,
                 (g_last_rd_val==(uint32_t)wv)?"<-COPIED-FROM-HERE":"(value NOT from last read = COMPUTED/origin)");
@@ -363,8 +478,8 @@ void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return;
     /* FLOW_WVAL (64-bit): catch a 64-bit store whose HIGH or LOW 32-bit half equals
      * the watched value — the blind spot for the vm_write32-only FLOW_WVAL hook. */
     { static int64_t wv=-2; if(wv==-2){const char*e=getenv("FLOW_WVAL"); wv=e?(int64_t)strtoul(e,0,16):-1;}
-      if(wv>=0 && (uint32_t)a<0x50000000u){ uint32_t hi=(uint32_t)(v>>32), lo=(uint32_t)v;
-        if(hi==(uint32_t)wv||lo==(uint32_t)wv){ static int _n=0; if(_n++<8){
+      if(wv>=0){ uint32_t hi=(uint32_t)(v>>32), lo=(uint32_t)v;
+        if(hi==(uint32_t)wv||lo==(uint32_t)wv){ static int _n=0; if(_n++<24){
           uint32_t dst=(hi==(uint32_t)wv)?(uint32_t)a:(uint32_t)a+4;
           uint32_t vtgt = g_vcall_sp>0 ? g_vcall_stk[g_vcall_sp-1] : 0;
           fprintf(stderr,"[WVAL64] write64 0x%08X (poison half @0x%08X) v=0x%016llX  active-vcall=func_%08X (depth %d)\n",(uint32_t)a,dst,(unsigned long long)v,vtgt,g_vcall_sp);
@@ -994,6 +1109,20 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             wlen = 0x4000u;
         }
         FILE* out = stdout;   /* keep all TTY on stdout, clean of [ppu] logs */
+        /* POOL CORRUPTION TRACE: dump the host->guest call chain the first few
+         * times the game's debug allocator reports a bad block / wrong pool /
+         * zeroed sentinel, to locate who passed/corrupted the block. */
+        if (vm_base && wlen < 256) {
+            char pt[260]; uint32_t pn = wlen < 255 ? wlen : 255;
+            for (uint32_t i = 0; i < pn; i++) pt[i] = (char)vm_read8(buf + i);
+            pt[pn] = 0;
+            if (strstr(pt, "belong to pool") || strstr(pt, "Bad signature") ||
+                strstr(pt, "sentinel") || strstr(pt, "double-deallocate") ||
+                strstr(pt, "out of memory on request")) {
+                static int pc = 0;
+                if (pc++ < 3) { fprintf(stderr, "\n[POOLTRACE] \"%.90s\"\n", pt); ppu_log_host_chain("pool-corrupt"); }
+            }
+        }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title's tty output carries a
          * PhyreEngine init-failure fragment, dump the HOST backtrace (RVAs vs
          * the exe base) so we can map the error-reporter's call chain through
