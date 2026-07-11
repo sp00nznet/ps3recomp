@@ -33,6 +33,12 @@ typedef int http_socket_t;
 #define http_closesocket close
 #endif
 
+/* Guest-EA marshalling: the generic HLE adapter passes PPC r3.. verbatim, so
+ * pointer arguments are guest effective addresses, not host pointers. Translate
+ * through vm_base before dereferencing. */
+extern uint8_t* vm_base;
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
+
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
@@ -331,6 +337,10 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
     if (!clientId)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
+    /* clientId is a raw GUEST effective address (the generic HLE adapter passes
+     * r3 verbatim); translate it before writing or we fault on a host pointer. */
+    CellHttpClientId* clientId_h = GUEST_PTR(clientId, CellHttpClientId*);
+
     for (u32 i = 0; i < CELL_HTTP_MAX_CLIENTS; i++) {
         if (!s_clients[i].in_use) {
             s_clients[i].in_use = 1;
@@ -338,7 +348,7 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
             s_clients[i].connect_timeout = 30000000;
             s_clients[i].send_timeout    = 120000000;
             s_clients[i].recv_timeout    = 120000000;
-            *clientId = i;
+            *clientId_h = i;
             printf("[cellHttp] CreateClient(id=%u)\n", i);
             return CELL_OK;
         }
