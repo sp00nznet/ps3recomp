@@ -15,6 +15,7 @@
  * addresses, not host pointers. */
 extern void vm_write8(uint64_t addr, uint8_t v);
 extern void vm_write32(uint64_t addr, uint32_t v);
+extern uint8_t* vm_base;
 
 /* ---------------------------------------------------------------------------
  * Guest callback dispatch hook (set by the game's host code at startup).
@@ -248,10 +249,11 @@ s32 cellSysutilDisableBgmPlayback(void)
 
 s32 cellSysutilGetBgmPlaybackStatus(s32* status)
 {
-    if (!status)
+    uint32_t ea = (uint32_t)(uintptr_t)status;   /* guest addr */
+    if (!ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 
-    *status = s_bgm_status;
+    vm_write32(ea, (uint32_t)s_bgm_status);
     return CELL_OK;
 }
 
@@ -282,21 +284,31 @@ s32 cellSysutilDisableBgmPlaybackEx(void)
  * System cache
  * -----------------------------------------------------------------------*/
 
-s32 cellSysCacheMount(char* cachePath)
+s32 cellSysCacheMount(char* param)
 {
-    printf("[cellSysutil] SysCacheMount()\n");
-
-    if (!cachePath)
+    /* The argument is a GUEST EA of CellSysCacheParam:
+     *   +0x00 char cacheId[32]       (IN)
+     *   +0x20 char getCachePath[136] (OUT)
+     *   +0xA8 void* reserved
+     * The old code strncpy'd through the raw EA as a host char* -> host AV
+     * (LBP: write fault at 0xD00109F0, a guest thread-stack address). */
+    uint32_t ea = (uint32_t)(uintptr_t)param;
+    if (!ea)
         return CELL_EINVAL;
 
-    /* Provide a temp directory path */
-    strncpy(s_cache_path, "/dev_hdd1/caches", CELL_SYSCACHE_PATH_MAX - 1);
-    s_cache_path[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
-    strncpy(cachePath, s_cache_path, CELL_SYSCACHE_PATH_MAX - 1);
-    cachePath[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
+    char cache_id[33];
+    memcpy(cache_id, vm_base + ea, 32);
+    cache_id[32] = '\0';
+    printf("[cellSysutil] SysCacheMount(id='%s')\n", cache_id);
+
+    snprintf(s_cache_path, CELL_SYSCACHE_PATH_MAX, "/dev_hdd1/cache/%s", cache_id);
+    size_t n = strlen(s_cache_path);
+    if (n > 135) n = 135;
+    memcpy(vm_base + ea + 0x20, s_cache_path, n);
+    vm_base[ea + 0x20 + n] = '\0';
     s_cache_mounted = 1;
 
-    return CELL_OK;
+    return CELL_OK;   /* CELL_SYSCACHE_RET_OK_CLEARED */
 }
 
 s32 cellSysCacheClear(void)
@@ -315,15 +327,22 @@ s32 cellDiscGameGetBootDiscInfo(u32* type, char* titleId, u32 titleIdSize)
 {
     printf("[cellSysutil] DiscGameGetBootDiscInfo()\n");
 
-    if (type)
-        *type = CELL_DISCGAME_TYPE_HDD; /* pretend HDD game */
+    /* Both out-params are GUEST addresses (generic adapter passes raw EAs). */
+    uint32_t type_ea  = (uint32_t)(uintptr_t)type;
+    uint32_t title_ea = (uint32_t)(uintptr_t)titleId;
 
-    if (titleId && titleIdSize > 0) {
+    if (type_ea)
+        vm_write32(type_ea, CELL_DISCGAME_TYPE_HDD); /* pretend HDD game */
+
+    if (title_ea && titleIdSize > 0) {
         /* Use the real title id (from PARAM.SFO at boot) instead of a placeholder. */
         extern const char* cellGame_get_title_id(void);
         const char* tid = cellGame_get_title_id();
-        strncpy(titleId, tid && tid[0] ? tid : "GAME00000", titleIdSize - 1);
-        titleId[titleIdSize - 1] = '\0';
+        if (!tid || !tid[0]) tid = "GAME00000";
+        size_t n = strlen(tid);
+        if (n > titleIdSize - 1) n = titleIdSize - 1;
+        memcpy(vm_base + title_ea, tid, n);
+        vm_base[title_ea + n] = '\0';
     }
 
     return CELL_OK;

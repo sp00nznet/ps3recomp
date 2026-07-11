@@ -9,8 +9,18 @@
  * Internal state
  * -----------------------------------------------------------------------*/
 
-/* Track which modules have been "loaded" */
-static int s_module_loaded[CELL_SYSMODULE_MAX_ID];
+/* Track which modules have been "loaded". IDs come in two ranges: 0x00xx
+ * (core) and 0xF0xx (extended: NP_TROPHY=0xF035, GIFDEC=0xF010, ...). The old
+ * `id >= MAX_ID -> ERROR_UNKNOWN` check rejected every 0xF0xx load — LBP's
+ * trophy-module load failed at boot. Map both ranges into one table. */
+static int s_module_loaded[2 * CELL_SYSMODULE_MAX_ID];
+static int sysmodule_slot(u16 id)
+{
+    if (id < CELL_SYSMODULE_MAX_ID) return (int)id;
+    if ((id & 0xFF00) == 0xF000 && (id & 0xFF) < CELL_SYSMODULE_MAX_ID)
+        return CELL_SYSMODULE_MAX_ID + (id & 0xFF);
+    return -1;
+}
 
 static const char* sysmodule_id_to_name(u16 id)
 {
@@ -51,6 +61,16 @@ static const char* sysmodule_id_to_name(u16 id)
     case CELL_SYSMODULE_SYSUTIL_GAME:  return "CELL_SYSMODULE_SYSUTIL_GAME";
     case CELL_SYSMODULE_FIBER:         return "CELL_SYSMODULE_FIBER";
     case CELL_SYSMODULE_GEM:           return "CELL_SYSMODULE_GEM";
+    case CELL_SYSMODULE_CAMERA:        return "CELL_SYSMODULE_CAMERA";
+    case CELL_SYSMODULE_LV2DBG:        return "CELL_SYSMODULE_LV2DBG";
+    case CELL_SYSMODULE_SYSUTIL_USERINFO: return "CELL_SYSMODULE_SYSUTIL_USERINFO";
+    case CELL_SYSMODULE_SYSUTIL_NP2:   return "CELL_SYSMODULE_SYSUTIL_NP2";
+    case CELL_SYSMODULE_SYSUTIL_GAME_EXEC: return "CELL_SYSMODULE_SYSUTIL_GAME_EXEC";
+    case CELL_SYSMODULE_SYSUTIL_NP_TROPHY: return "CELL_SYSMODULE_SYSUTIL_NP_TROPHY";
+    case CELL_SYSMODULE_MIC:           return "CELL_SYSMODULE_MIC";
+    case CELL_SYSMODULE_FONTFT:        return "CELL_SYSMODULE_FONTFT";
+    case CELL_SYSMODULE_AVCONF_EXT:    return "CELL_SYSMODULE_AVCONF_EXT";
+    case CELL_SYSMODULE_USBPSPCM:      return "CELL_SYSMODULE_USBPSPCM";
     default:                           return "UNKNOWN";
     }
 }
@@ -69,13 +89,14 @@ s32 cellSysmoduleLoadModule(u16 id)
     printf("[cellSysmodule] LoadModule(id=0x%04X '%s')\n",
            id, sysmodule_id_to_name(id));
 
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    int slot = sysmodule_slot(id);
+    if (slot < 0)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    if (s_module_loaded[id])
+    if (s_module_loaded[slot])
         return CELL_OK;  /* Already loaded — return success (some games treat DUPLICATED as fatal) */
 
-    s_module_loaded[id] = 1;
+    s_module_loaded[slot] = 1;
     return CELL_OK;
 }
 
@@ -85,13 +106,14 @@ s32 cellSysmoduleUnloadModule(u16 id)
     printf("[cellSysmodule] UnloadModule(id=0x%04X '%s')\n",
            id, sysmodule_id_to_name(id));
 
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    int slot = sysmodule_slot(id);
+    if (slot < 0)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    if (!s_module_loaded[id])
+    if (!s_module_loaded[slot])
         return CELL_SYSMODULE_ERROR_UNLOADED;
 
-    s_module_loaded[id] = 0;
+    s_module_loaded[slot] = 0;
     return CELL_OK;
 }
 
@@ -101,8 +123,9 @@ s32 cellSysmoduleIsLoaded(u16 id)
     printf("[cellSysmodule] IsLoaded(id=0x%04X '%s')\n",
            id, sysmodule_id_to_name(id));
 
-    if (id >= CELL_SYSMODULE_MAX_ID)
+    int slot = sysmodule_slot(id);
+    if (slot < 0)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    return s_module_loaded[id] ? CELL_OK : CELL_SYSMODULE_ERROR_UNLOADED;
+    return s_module_loaded[slot] ? CELL_OK : CELL_SYSMODULE_ERROR_UNLOADED;
 }

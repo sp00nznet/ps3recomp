@@ -50,6 +50,10 @@ extern "C" {
 /* Size info mode */
 #define CELL_GAME_SIZEKB_NOTCALC    (-1)
 
+/* Positive return statuses (not errors) */
+#define CELL_GAME_RET_OK            0
+#define CELL_GAME_RET_NONE          2   /* no game data yet -> title may CreateGameData */
+
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/

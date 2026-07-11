@@ -7,6 +7,7 @@
  */
 
 #include "cellRtc.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read/write (guest mem) */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>   /* abs */
@@ -101,6 +102,60 @@ static const char* s_month_names[] = {
 };
 
 /* ---------------------------------------------------------------------------
+ * Guest/host dual-mode accessors.
+ *
+ * Public entry points receive GUEST addresses (the generic HLE adapter passes
+ * PPC registers raw), but internal helpers (TickAdd*) call the same functions
+ * with HOST stack locals. Values in guest memory are BIG-ENDIAN, so a plain
+ * pointer translation is not enough — each field store must byte-swap.
+ * Discriminate by value: guest EAs are < 4GB, host pointers are not.
+ * -----------------------------------------------------------------------*/
+static int rtc_is_guest(const void* p)
+{
+    uintptr_t v = (uintptr_t)p;
+    return v && v < 0x100000000ull;
+}
+static u64 rtc_tick_read(const CellRtcTick* p)
+{
+    return rtc_is_guest(p) ? vm_read64((uint32_t)(uintptr_t)p) : p->tick;
+}
+static void rtc_tick_write(CellRtcTick* p, u64 t)
+{
+    if (rtc_is_guest(p)) vm_write64((uint32_t)(uintptr_t)p, t);
+    else                 p->tick = t;
+}
+static void rtc_dt_write(CellRtcDateTime* p, const CellRtcDateTime* v)
+{
+    if (rtc_is_guest(p)) {
+        uint32_t ea = (uint32_t)(uintptr_t)p;
+        vm_write16(ea + 0,  v->year);
+        vm_write16(ea + 2,  v->month);
+        vm_write16(ea + 4,  v->day);
+        vm_write16(ea + 6,  v->hour);
+        vm_write16(ea + 8,  v->minute);
+        vm_write16(ea + 10, v->second);
+        vm_write32(ea + 12, v->microsecond);
+    } else {
+        *p = *v;
+    }
+}
+static void rtc_dt_read(const CellRtcDateTime* p, CellRtcDateTime* v)
+{
+    if (rtc_is_guest(p)) {
+        uint32_t ea = (uint32_t)(uintptr_t)p;
+        v->year        = vm_read16(ea + 0);
+        v->month       = vm_read16(ea + 2);
+        v->day         = vm_read16(ea + 4);
+        v->hour        = vm_read16(ea + 6);
+        v->minute      = vm_read16(ea + 8);
+        v->second      = vm_read16(ea + 10);
+        v->microsecond = vm_read32(ea + 12);
+    } else {
+        *v = *p;
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
 
@@ -110,8 +165,32 @@ s32 cellRtcGetCurrentTick(CellRtcTick* pTick)
         return CELL_EINVAL;
 
     u64 unix_usec = get_host_time_usec();
-    pTick->tick = unix_usec + PS3_UNIX_EPOCH_DIFF * USEC_PER_SEC;
+    rtc_tick_write(pTick, unix_usec + PS3_UNIX_EPOCH_DIFF * USEC_PER_SEC);
 
+    return CELL_OK;
+}
+
+/* cellRtcGetCurrentClock(CellRtcDateTime* pClock, s32 iTimeZone) — UTC shifted
+ * by iTimeZone minutes. LBP's boot path imports this (was missing entirely). */
+s32 cellRtcGetCurrentClock(CellRtcDateTime* pClock, s32 iTimeZone)
+{
+    if (!pClock)
+        return CELL_EINVAL;
+
+    u64 host_usec = get_host_time_usec();
+    host_usec += (u64)((s64)iTimeZone * 60 * (s64)USEC_PER_SEC);
+    time_t t = (time_t)(host_usec / USEC_PER_SEC);
+    u32 usec = (u32)(host_usec % USEC_PER_SEC);
+
+    struct tm tm_val;
+#ifdef _WIN32
+    gmtime_s(&tm_val, &t);
+#else
+    gmtime_r(&t, &tm_val);
+#endif
+    CellRtcDateTime dt;
+    tm_to_datetime(&tm_val, usec, &dt);
+    rtc_dt_write(pClock, &dt);
     return CELL_OK;
 }
 
@@ -131,7 +210,9 @@ s32 cellRtcGetCurrentClockLocalTime(CellRtcDateTime* pClock)
     localtime_r(&t, &local_tm);
 #endif
 
-    tm_to_datetime(&local_tm, usec, pClock);
+    CellRtcDateTime dt_l;
+    tm_to_datetime(&local_tm, usec, &dt_l);
+    rtc_dt_write(pClock, &dt_l);
     return CELL_OK;
 }
 
@@ -151,7 +232,9 @@ s32 cellRtcGetCurrentClockUtc(CellRtcDateTime* pClock)
     gmtime_r(&t, &utc_tm);
 #endif
 
-    tm_to_datetime(&utc_tm, usec, pClock);
+    CellRtcDateTime dt_u;
+    tm_to_datetime(&utc_tm, usec, &dt_u);
+    rtc_dt_write(pClock, &dt_u);
     return CELL_OK;
 }
 
@@ -160,7 +243,11 @@ s32 cellRtcGetTime_t(const CellRtcTick* pTick, s64* pTime)
     if (!pTick || !pTime)
         return CELL_EINVAL;
 
-    *pTime = tick_to_time_t(pTick->tick);
+    {
+        s64 t = tick_to_time_t(rtc_tick_read(pTick));
+        if (rtc_is_guest(pTime)) vm_write64((uint32_t)(uintptr_t)pTime, (u64)t);
+        else                     *pTime = t;
+    }
     return CELL_OK;
 }
 
@@ -169,7 +256,7 @@ s32 cellRtcSetTime_t(CellRtcTick* pTick, s64 iTime)
     if (!pTick)
         return CELL_EINVAL;
 
-    pTick->tick = time_t_to_tick(iTime);
+    rtc_tick_write(pTick, time_t_to_tick(iTime));
     return CELL_OK;
 }
 
@@ -406,7 +493,7 @@ s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
     if (!pDateTime || !pTick)
         return CELL_EINVAL;
 
-    u64 tick = pTick->tick;
+    u64 tick = rtc_tick_read(pTick);
     u32 usec = (u32)(tick % USEC_PER_SEC);
     s64 unix_time = tick_to_time_t(tick);
 
@@ -418,7 +505,11 @@ s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
     gmtime_r(&t, &tm_val);
 #endif
 
-    tm_to_datetime(&tm_val, usec, pDateTime);
+    {
+        CellRtcDateTime dt_s;
+        tm_to_datetime(&tm_val, usec, &dt_s);
+        rtc_dt_write(pDateTime, &dt_s);
+    }
     return CELL_OK;
 }
 
@@ -427,13 +518,15 @@ s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)
     if (!pDateTime || !pTick)
         return CELL_EINVAL;
 
-    struct tm t = datetime_to_tm(pDateTime);
+    CellRtcDateTime dt_g;
+    rtc_dt_read(pDateTime, &dt_g);
+    struct tm t = datetime_to_tm(&dt_g);
 #ifdef _WIN32
     time_t tt = _mkgmtime(&t);
 #else
     time_t tt = timegm(&t);
 #endif
 
-    pTick->tick = time_t_to_tick((s64)tt) + pDateTime->microsecond;
+    rtc_tick_write(pTick, time_t_to_tick((s64)tt) + dt_g.microsecond);
     return CELL_OK;
 }
