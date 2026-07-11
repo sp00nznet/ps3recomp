@@ -53,6 +53,20 @@ static int64_t sys_tty_write(ppu_context* ctx)
         /* Write guest string data to host stderr */
         fwrite(vm_base + buf_ea, 1, len, stderr);
         fflush(stderr);
+        /* POOL CORRUPTION TRACE: when the game's debug allocator reports a bad
+         * block / wrong pool / zeroed sentinel, dump the host call chain (resolved
+         * to guest funcs) to find who passed/corrupted the block. */
+        if (len < 4096) {
+            char ptmp[256]; uint32_t pn = len < 255 ? len : 255;
+            memcpy(ptmp, vm_base + buf_ea, pn); ptmp[pn] = 0;
+            if (strstr(ptmp, "Pool possibly") || strstr(ptmp, "Bad signature") ||
+                strstr(ptmp, "double-deallocate") ||
+                strstr(ptmp, "out of memory on request")) {
+                extern void ppu_log_host_chain(const char*);
+                static int _pn = 0;
+                if (_pn++ < 3) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
+            }
+        }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
          * init failure, dump the guest back-chain so we can locate the failing
          * function (the message itself goes through here, not _sys_printf). */

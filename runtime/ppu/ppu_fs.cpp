@@ -189,8 +189,15 @@ static void cellFsLseek(ppu_context* ctx)
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    fseek(g_files[fd], (long)off, worigin);
-    long p = ftell(g_files[fd]);
+    /* 64-bit seek/tell: a plain fseek(long) truncates offsets in files > 2GB
+     * (and long is 32-bit on Windows regardless of arch). */
+#ifdef _WIN32
+    _fseeki64(g_files[fd], off, worigin);
+    int64_t p = _ftelli64(g_files[fd]);
+#else
+    fseeko(g_files[fd], (off_t)off, worigin);
+    int64_t p = (int64_t)ftello(g_files[fd]);
+#endif
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
