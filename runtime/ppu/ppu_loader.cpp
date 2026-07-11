@@ -578,6 +578,14 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         fprintf(stderr,"[RECVTRACE #%d] indirect-call -> func_00075380 (q=1 receive) r3=0x%08X r4=0x%08X\n",_n,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4]);
         ppu_dump_guest_stack(ctx,"recv-caller"); } } }
     uint32_t addr = (uint32_t)ctx->ctr;
+    /* PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) --
+     * generic visibility into vtable/callback dispatch (e.g. which job body a
+     * JobManager worker runs). */
+    { static int64_t ctr_n=-2; if(ctr_n==-2){const char*e=getenv("PS3_CALLTRACE"); ctr_n=e?atoi(e):0;}
+      if(ctr_n>0){ ctr_n--;
+        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X tid=%llu\n",
+                addr,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
+                (unsigned long long)ctx->thread_id); } }
     /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
      * unwound to the initial frame (or a not-yet-populated function pointer).
      * Don't treat it as an unresolved call -- just return to the caller. */
@@ -1335,4 +1343,28 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
     return 0;
+}
+
+/* Resolve the current HOST call stack to guest functions via the lifted
+ * dispatch table and print it. Callable from C runtime modules (sys_timer's
+ * poll-site probe etc). Guest LR slots are stale under the direct-call model,
+ * so this is the only reliable caller-chain view. */
+extern "C" void ppu_log_host_chain(const char* tag)
+{
+#ifdef _WIN32
+    void* bt[48]; unsigned short fr = RtlCaptureStackBackTrace(0, 48, bt, 0);
+    char b[1800]; int p = snprintf(b, sizeof b, "[CHAIN:%s]", tag ? tag : "?");
+    for (int i = 0; i < fr; i++) {
+        uintptr_t tgt = (uintptr_t)bt[i]; uintptr_t bh = 0; uint32_t bg = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > bh) { bh = h; bg = (uint32_t)function_table[k].addr; }
+        }
+        if (bg && tgt - bh < 0x200000)
+            p += snprintf(b + p, sizeof(b) - p, " %08X", bg);
+    }
+    fprintf(stderr, "%s\n", b);
+#else
+    (void)tag;
+#endif
 }

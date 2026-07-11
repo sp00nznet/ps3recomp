@@ -88,6 +88,9 @@ static void sys_lwmutex_create(ppu_context* ctx)
 {
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
     uint32_t attr = (uint32_t)ctx->gpr[4];
+    { static long long _n=0; _n++;
+      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
+        fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
     uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
     vm_write32(lwm + 0x00, 0);          /* owner */
     vm_write32(lwm + 0x04, 0);          /* waiter */
@@ -193,6 +196,14 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
 
 /* A handful of CRT helpers the early boot tends to hit; accept and continue. */
 static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
+static void sys_lwmutex_destroy_counted(ppu_context* ctx)
+{
+    { static long long _n=0; _n++;
+      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
+        fprintf(stderr, "[LWM] destroy #%lld lwm=0x%08X r4=0x%08X r5=0x%08X\n", _n,
+                (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); }
+    ctx->gpr[3] = 0;
+}
 
 /* Real preemptive thread create/exit live in the lv2 syscall layer
  * (syscalls/sys_ppu_thread.c) and spawn a host thread that runs the guest
@@ -271,7 +282,7 @@ extern "C" void ppu_sysprx_register(void)
 
     /* Lightweight mutex family (guards global/singleton init in the CRT). */
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_create"),  "sys_lwmutex_create",  sys_lwmutex_create);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_destroy"), "sys_lwmutex_destroy", crt_ok);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_destroy"), "sys_lwmutex_destroy", sys_lwmutex_destroy_counted);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_lock"),    "sys_lwmutex_lock",    sys_lwmutex_lock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_unlock"),  "sys_lwmutex_unlock",  sys_lwmutex_unlock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_trylock"), "sys_lwmutex_trylock", sys_lwmutex_trylock);

@@ -285,6 +285,9 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 
+    { static int _n=0; if (_n++ < 40)
+        fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count); }
+
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
