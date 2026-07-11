@@ -222,7 +222,11 @@ static void cellFsStat(ppu_context* ctx)
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
     struct stat st;
-    if (stat(hpath, &st) != 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
+    if (stat(hpath, &st) != 0) {
+        if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+    }
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
     if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
@@ -249,6 +253,7 @@ static void cellFsOpendir(ppu_context* ctx)
     uint32_t fd_ptr = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
     DIR* d = opendir(hpath);
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
     int fd = fd_alloc_dir(d);
     if (fd < 0) { closedir(d); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
@@ -286,7 +291,41 @@ static void cellFsClosedir(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
-static void cellFsMkdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+#ifdef _WIN32
+#include <direct.h>
+#define HOST_MKDIR(p) _mkdir(p)
+#else
+#define HOST_MKDIR(p) mkdir((p), 0777)
+#endif
+
+/* Create `path` and any missing parent dirs on the host. Returns 0 on
+ * success or if the directory already exists. */
+static int host_mkdir_p(const char* path)
+{
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    size_t len = strlen(tmp);
+    while (len > 1 && (tmp[len-1] == '/' || tmp[len-1] == '\\')) tmp[--len] = 0;
+    for (char* p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') { char c = *p; *p = 0; HOST_MKDIR(tmp); *p = c; }
+    }
+    int r = HOST_MKDIR(tmp);
+    if (r != 0) { struct stat st; if (stat(tmp, &st) == 0 && (st.st_mode & S_IFDIR)) r = 0; }
+    return r;
+}
+
+/* cellFsMkdir(path, mode): create the guest directory on the host. A no-op stub
+ * here silently breaks games that create then poll a dir (e.g. LBP's boot waits
+ * for /dev_hdd0/game/<title>/USRDIR to appear). Create parents too. */
+static void cellFsMkdir(ppu_context* ctx)
+{
+    char gpath[1024], hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    host_path(hpath, sizeof hpath, gpath);
+    int r = host_mkdir_p(hpath);
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+    ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
+}
 static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
 static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 static void cellFsFsync(ppu_context* ctx)

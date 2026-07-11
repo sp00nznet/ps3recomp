@@ -240,9 +240,20 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
 {
     printf("[cellGame] ContentPermit()\n");
 
-    /* Ensure directories exist */
+    /* Ensure directories exist. IMPORTANT: also create them at the SAME host
+     * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
+     * i.e. $ppu_vfs_root/game/<title>/. cellGame historically only created
+     * ./gamedata/dev_hdd0/game/... which cellFs never looks at, so a game that
+     * polls cellFsStat for its game-data USRDIR (LBP's boot bringup stage) stalls
+     * forever and exits. Create it where cellFs will actually find it. */
     ensure_dirs(s_content_info_path);
     ensure_dirs(s_usrdir_path);
+    {
+        extern const char* ppu_vfs_root;
+        char vpath[CELL_GAME_PATH_MAX];
+        snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_title_id);
+        ensure_dirs(vpath);
+    }
 
     /* Both paths are GUEST addresses; format into a host temp, copy into the
      * guest buffer through vm_base (a raw snprintf to the guest addr faults). */
