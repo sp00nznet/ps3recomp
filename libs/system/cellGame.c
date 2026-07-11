@@ -274,11 +274,13 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
 {
-    printf("[cellGame] DataCheck(type=%u, dir='%s')\n",
-           type, dirName ? dirName : "<null>");
-
+    /* dirName is a GUEST address -- translate BEFORE any use. The old code
+     * printf'd the raw EA as a host char* and crashed (LBP: read fault at
+     * 0x94AEA0 = the guest EA of its dir string). */
     uint32_t dir_ea = (uint32_t)(uintptr_t)dirName;   /* guest addr */
     const char* check_dir = dir_ea ? (const char*)(vm_base + dir_ea) : s_title_id;
+    printf("[cellGame] DataCheck(type=%u, dir='%s')\n", type, check_dir);
+
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", s_content_path, check_dir);
 
@@ -289,11 +291,23 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
         vm_write32(size_ea + 8, 0);
     }
 
+    /* Disc-content check (type 1 = CELL_GAME_GAMETYPE_DISC): the disc is
+     * inherently present (mounted via the VFS root); a NOTFOUND here makes
+     * disc titles bail out of boot. */
+    if (type == 1)
+        return CELL_OK;
+
     if (dir_exists(path)) {
         return CELL_OK;
     }
 
-    return CELL_GAME_ERROR_NOTFOUND;
+    /* Missing game-data dir is NOT an error: firmware (and RPCS3) return
+     * CELL_GAME_RET_NONE (2) so the title knows to cellGameCreateGameData.
+     * Returning ERROR_NOTFOUND here made LBP treat first boot as fatal and
+     * exit(0) politely. sizeKB must read 0 (not NOTCALC) for the no-data case. */
+    if (size_ea)
+        vm_write32(size_ea + 4, 0);   /* sizeKB = 0 (no data yet) */
+    return CELL_GAME_RET_NONE;
 }
 
 /* cellGameDataCheckCreate2 (NID 0xC9645C41) -- check/prepare game data, invoking the
