@@ -194,6 +194,33 @@ static inline double ppu_frsp(double b)
     return (double)(float)b;
 }
 
+/* AltiVec register byte order: ctx->vr holds RAW big-endian guest bytes (lvx is
+ * a plain 16-byte memcpy). Byte/word MOVE ops (vperm, vmrgh*, vsldoi, vspltw)
+ * operate on those bytes directly and are endian-correct. But ops that
+ * INTERPRET element VALUES as float/int must byte-swap each 32-bit lane, or
+ * they read every operand byte-reversed (a BE 1.0 = 0x3F800000 becomes the
+ * denormal 0x0000803F). These helpers load/store one 4-lane vector with the
+ * per-lane swap. */
+static inline uint32_t ppu_vbswap32(uint32_t x) {
+    return (x >> 24) | ((x >> 8) & 0xFF00u) | ((x << 8) & 0xFF0000u) | (x << 24);
+}
+static inline void ppu_vldf4(const void* v, float o[4]) {
+    const uint8_t* p = (const uint8_t*)v;
+    for (int i = 0; i < 4; i++) { uint32_t b; memcpy(&b, p + i*4, 4); b = ppu_vbswap32(b); memcpy(&o[i], &b, 4); }
+}
+static inline void ppu_vstf4(void* v, const float in[4]) {
+    uint8_t* p = (uint8_t*)v;
+    for (int i = 0; i < 4; i++) { uint32_t b; memcpy(&b, &in[i], 4); b = ppu_vbswap32(b); memcpy(p + i*4, &b, 4); }
+}
+static inline void ppu_vldu4(const void* v, uint32_t o[4]) {
+    const uint8_t* p = (const uint8_t*)v;
+    for (int i = 0; i < 4; i++) { uint32_t b; memcpy(&b, p + i*4, 4); o[i] = ppu_vbswap32(b); }
+}
+static inline void ppu_vstu4(void* v, const uint32_t in[4]) {
+    uint8_t* p = (uint8_t*)v;
+    for (int i = 0; i < 4; i++) { uint32_t b = ppu_vbswap32(in[i]); memcpy(p + i*4, &b, 4); }
+}
+
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
 #ifdef __cplusplus
@@ -2033,58 +2060,53 @@ class PPULifter:
                     f"{ctype} t[{n}]; {asg} memcpy(d, t, 16); }}")
 
         # ------- VMX floating-point arithmetic -------
-        # CRITICAL operand order: capstone disassembles the VA-form FMA as
-        # [vD, vA, vC, vB] -- i.e. ops[2] is the MULTIPLICAND (vC) and ops[3]
-        # is the ADDEND (vB), matching the PPC assembler mnemonic order
-        # `vmaddfp vD,vA,vC,vB` => vD = vA*vC + vB. The old code read ops[2]
-        # as the addend and ops[3] as the multiplicand -- swapped -- so every
-        # VMX matrix multiply (Vectormath::Aos, e.g. DeferredShading's
-        # transformHierarchy world*view) computed vA*vB+vC and produced garbage
-        # (huge 1e37 model-eye matrices -> meshes offscreen). Verified against
-        # capstone: enc(vD,vA,vB,vC) -> "vmaddfp vD, vA, vC, vB".
+        # CRITICAL operand order: our disassembler (ppu_disasm.py VA-form, line
+        # ~909) prints the FMA in ENCODING-FIELD order `vD, vA, vB, vC` -- i.e.
+        # ops[2] is the ADDEND (vB, bits 16-20) and ops[3] is the MULTIPLICAND
+        # (vC, bits 21-25). This is NOT capstone's mnemonic order (vD,vA,vC,vB).
+        # The operation is vD = vA*vC + vB. Reading ops[2] as the multiplicand
+        # (the capstone convention) is WRONG here and computes vA*vB + vC: for
+        # `vmaddfp vD,vA,v0zero,vA` (the Vectormath dot-product square, vB=zero,
+        # vC=vA) it degenerates vA*vA+0 into vA*0+vA = vA (a copy), so every
+        # length^2 collapses to a stray lane (len2=0/-1 -> rsqrt -> NaN view
+        # matrix, DeferredShading black screen). Verified at byte level:
+        # 0x1e1a8 = 0x11AC4B2E enc(vD=13,vA=12,vB=9,vC=12) -> disasm prints
+        # "v13, v12, v9, v12" -> ops[2]=v9 (addend), ops[3]=v12 (multiplicand).
         if mn == "vmaddfp":
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
-            vc = int(ops[2][1:])   # vC = multiplicand
-            vb = int(ops[3][1:])   # vB = addend
-            return (f"{{ float* d = (float*)&ctx->vr[{vd}]; "
-                    f"float* a = (float*)&ctx->vr[{va}]; "
-                    f"float* b = (float*)&ctx->vr[{vb}]; "
-                    f"float* c = (float*)&ctx->vr[{vc}]; "
-                    f"d[0]=a[0]*c[0]+b[0]; d[1]=a[1]*c[1]+b[1]; "
-                    f"d[2]=a[2]*c[2]+b[2]; d[3]=a[3]*c[3]+b[3]; }}")
+            vb = int(ops[2][1:])   # ops[2] = vB = addend (encoding order)
+            vc = int(ops[3][1:])   # ops[3] = vC = multiplicand
+            return (f"{{ float a[4],b[4],c[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); "
+                    f"ppu_vldf4(&ctx->vr[{vb}],b); ppu_vldf4(&ctx->vr[{vc}],c); "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]*c[i]+b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         if mn == "vnmsubfp":
-            # vD = -(vA*vC - vB) = vB - vA*vC. Same [vD,vA,vC,vB] operand order.
+            # vD = -(vA*vC - vB) = vB - vA*vC. Encoding order [vD,vA,vB,vC]:
+            # ops[2]=vB (minuend), ops[3]=vC (multiplicand).
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
-            vc = int(ops[2][1:])   # vC = multiplicand
-            vb = int(ops[3][1:])   # vB = addend
-            return (f"{{ float* d = (float*)&ctx->vr[{vd}]; "
-                    f"float* a = (float*)&ctx->vr[{va}]; "
-                    f"float* b = (float*)&ctx->vr[{vb}]; "
-                    f"float* c = (float*)&ctx->vr[{vc}]; "
-                    f"d[0]=b[0]-a[0]*c[0]; d[1]=b[1]-a[1]*c[1]; "
-                    f"d[2]=b[2]-a[2]*c[2]; d[3]=b[3]-a[3]*c[3]; }}")
+            vb = int(ops[2][1:])   # ops[2] = vB = minuend (encoding order)
+            vc = int(ops[3][1:])   # ops[3] = vC = multiplicand
+            return (f"{{ float a[4],b[4],c[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); "
+                    f"ppu_vldf4(&ctx->vr[{vb}],b); ppu_vldf4(&ctx->vr[{vc}],c); "
+                    f"for(int i=0;i<4;i++) d[i]=b[i]-a[i]*c[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         if mn == "vaddfp":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"d[0]=a[0]+b[0]; d[1]=a[1]+b[1]; d[2]=a[2]+b[2]; d[3]=a[3]+b[3]; }}")
+            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]+b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         if mn == "vsubfp":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"d[0]=a[0]-b[0]; d[1]=a[1]-b[1]; d[2]=a[2]-b[2]; d[3]=a[3]-b[3]; }}")
+            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]-b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         if mn == "vmulfp":
             # Not a real PPC instruction but some disassemblers emit it
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"d[0]=a[0]*b[0]; d[1]=a[1]*b[1]; d[2]=a[2]*b[2]; d[3]=a[3]*b[3]; }}")
+            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]*b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         # VMX select (vsel) — bitwise select: vD = (vA & ~vC) | (vB & vC)
         if mn == "vsel":
@@ -2101,24 +2123,21 @@ class PPULifter:
         # VMX compare (vcmpequw, vcmpeqfp, vcmpgefp, vcmpgtfp)
         if mn.startswith("vcmpeqfp"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
+            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"d[0]=a[0]==b[0]?~0u:0; d[1]=a[1]==b[1]?~0u:0; "
-                    f"d[2]=a[2]==b[2]?~0u:0; d[3]=a[3]==b[3]?~0u:0; }}")
+                    f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
 
         if mn.startswith("vcmpgefp"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
+            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"d[0]=a[0]>=b[0]?~0u:0; d[1]=a[1]>=b[1]?~0u:0; "
-                    f"d[2]=a[2]>=b[2]?~0u:0; d[3]=a[3]>=b[3]?~0u:0; }}")
+                    f"for(int i=0;i<4;i++) d[i]=a[i]>=b[i]?~0u:0; }}")
 
         if mn.startswith("vcmpgtfp"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
+            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
                     f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"d[0]=a[0]>b[0]?~0u:0; d[1]=a[1]>b[1]?~0u:0; "
-                    f"d[2]=a[2]>b[2]?~0u:0; d[3]=a[3]>b[3]?~0u:0; }}")
+                    f"for(int i=0;i<4;i++) d[i]=a[i]>b[i]?~0u:0; }}")
 
         # VMX shift (vsldoi) — shift left double by octet immediate
         if mn == "vsldoi":
@@ -2248,11 +2267,12 @@ class PPULifter:
             if mn == "vspltisb":
                 return (f"{{ memset(&ctx->vr[{vd}], (uint8_t){simm}, 16); }}")
             elif mn == "vspltish":
-                return (f"{{ int16_t* d=(int16_t*)&ctx->vr[{vd}]; "
-                        f"for(int i=0;i<8;i++) d[i]={simm}; }}")
+                # store BE: swap bytes within each halfword lane
+                return (f"{{ uint8_t* p=(uint8_t*)&ctx->vr[{vd}]; uint16_t hv=(uint16_t)((int16_t){simm}); "
+                        f"for(int i=0;i<8;i++){{ p[i*2]=(uint8_t)(hv>>8); p[i*2+1]=(uint8_t)hv; }} }}")
             else:
-                return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; "
-                        f"for(int i=0;i<4;i++) d[i]={simm}; }}")
+                return (f"{{ uint32_t v[4]; for(int i=0;i<4;i++) v[i]=(uint32_t)(int32_t){simm}; "
+                        f"ppu_vstu4(&ctx->vr[{vd}],v); }}")
 
         # Merge (vmrghb/h/w, vmrglb/h/w) — interleave elements
         if mn.startswith("vmrg"):
@@ -2273,18 +2293,18 @@ class PPULifter:
         # Float reciprocal estimate / reciprocal sqrt estimate
         if mn == "vrefp":
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])  # vB = last operand (vmx_vx emits vD, vA, vB)
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=1.0f/b[i]; }}")
+            return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=1.0f/b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         if mn == "vrsqrtefp":
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])  # vB = last operand (vmx_vx emits vD, vA, vB)
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); }}")
+            return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         if mn == "vrfim":  # round to FP integer toward -inf (floor); vrfim is vD,vB
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); }}")
+            return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int)
         if mn == "vcfsx" or mn == "vcfux":
@@ -2292,8 +2312,8 @@ class PPULifter:
             uimm = int(ops[2]) if len(ops) > 2 and not ops[2].startswith("v") else 0
             src_ty = "int32_t" if mn == "vcfsx" else "uint32_t"
             scale = f" / {1 << uimm}.0f" if uimm > 0 else ""
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; {src_ty}* b=({src_ty}*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=(float)b[i]{scale}; }}")
+            return (f"{{ uint32_t bi[4]; ppu_vldu4(&ctx->vr[{vb}],bi); float d[4]; "
+                    f"for(int i=0;i<4;i++) d[i]=(float)({src_ty})bi[i]{scale}; ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         # PEM vctsxs/vctuxs: SATURATE out-of-range (a plain cast is UB and
         # sign-flips positive overflow on x86); NaN => 0.
@@ -2308,8 +2328,9 @@ class PPULifter:
             else:
                 sat = ("(v!=v) ? 0u : (v>=4294967295.0f) ? 4294967295u : "
                        "(v<=0.0f) ? 0u : (uint32_t)v")
-            return (f"{{ {dst_ty}* d=({dst_ty}*)&ctx->vr[{vd}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{ float v=b[i]{scale}; d[i]=({sat}); }} }}")
+            return (f"{{ float b[4]; ppu_vldf4(&ctx->vr[{vb}],b); uint32_t d[4]; "
+                    f"for(int i=0;i<4;i++){{ float v=b[i]{scale}; d[i]=(uint32_t)({dst_ty})({sat}); }} "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
 
         # Compare with Rc (vcmpeqfp., vcmpgefp., etc.)
         if mn.startswith("vcmpbfp"):
@@ -2419,14 +2440,12 @@ class PPULifter:
                     f"for(int i=0;i<16;i++) d[i]=(uint8_t)(a[i]<<(b[i]&7u)); }}")
         if mn == "vslw":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]<<(b[i]&31u); }}")
+            return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]<<(b[i]&31u); ppu_vstu4(&ctx->vr[{vd}],d); }}")
         if mn == "vsrw":  # vector shift right word (logical), per-element count = b[i] & 31
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]>>(b[i]&31u); }}")
+            return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]>>(b[i]&31u); ppu_vstu4(&ctx->vr[{vd}],d); }}")
         if mn == "vrlb":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
@@ -3472,6 +3491,45 @@ def main() -> None:
                   f"{len(enclosed_cases)} kept internal, +{added} case funcs")
         except Exception as exc:
             print(f"  jump-table discovery skipped: {exc}", file=sys.stderr)
+
+    # ----- fall-through gap repair -----------------------------------------
+    # IDA exports sometimes TRUNCATE a function: its declared end lands mid-body
+    # on a non-terminator (LBP: malloc wrapper 0x5E7808 exported as ending at
+    # 0x5E7810, cutting off its `bl mspace_malloc` + epilogue). The lifted
+    # fragment falls through, and because no function starts at end_addr the
+    # emit fallback trampolines to the NEXT function in address order --
+    # silently SKIPPING the truncated tail (LBP: operator new never reached
+    # malloc, got NULL, threw bad_alloc -> terminate -> abort at boot ctors).
+    # Repair: for every bound whose final instruction still falls through and
+    # whose end address has no function, synthesize a tail function
+    # [end, next_start) so fallthrough_to resolves to the REAL continuation.
+    # Iterate: a synthesized tail may itself end on a non-terminator.
+    _XFER = ("b", "ba", "blr", "bctr", "rfi", "rfid")  # unconditional transfers
+    _fbmap = dict(func_bounds)
+    _starts = sorted(_fbmap)
+    import bisect as _bis
+    _tails = 0
+    _work = list(func_bounds)
+    while _work:
+        _s, _e = _work.pop()
+        if _e in _fbmap:
+            continue                      # contiguous: falls into a known func
+        _last = _by_addr.get(_e - 4)
+        if _last is None or _last.mnemonic in _XFER:
+            continue                      # ends in a real transfer (or data)
+        if _by_addr.get(_e) is None:
+            continue                      # gap holds no decodable code
+        _k = _bis.bisect_right(_starts, _e)
+        _nxt = _starts[_k] if _k < len(_starts) else None
+        if _nxt is None or _nxt <= _e:
+            continue
+        _fbmap[_e] = _nxt
+        _starts.insert(_k, _e)
+        _work.append((_e, _nxt))
+        _tails += 1
+    if _tails:
+        func_bounds = sorted(_fbmap.items())
+        print(f"  fall-through repair: +{_tails} tail function(s) for truncated bounds")
 
     if args.code_end is not None:
         before = len(func_bounds)
