@@ -337,6 +337,12 @@ _CS_ANY_STORE_RE = re.compile(
 # A primary stack-frame allocation (lifted `stdu r1,-N(r1)`); its presence means
 # the body is a real function/merge, not a pure mid-function tail-entry.
 _FRAME_ALLOC = "ctx->gpr[1] += -0x"
+# Address-of a frame slot (lifted `addi rN, r1, off`): the slot's address escapes
+# into a register, so a CALLEE can write it through that pointer. A memory
+# snapshot of such a slot taken at entry is unsafe -- the slot's live value is
+# produced by a call DURING the body (an out-param), not held from entry.
+_CS_ADDR_OF_RE = re.compile(
+    r'ctx->gpr\[\d+\] = ctx->gpr\[1\] \+ \(int64_t\)\((-?0x[0-9A-Fa-f]+|-?\d+)\);')
 
 
 def _xea(ra, rb):
@@ -650,6 +656,28 @@ class PPULifter:
             if (_m and _write_counts[_m.group(1)] == 1
                     and _i <= _first_def.get(int(_m.group(2)), 1 << 30)):
                 _saved_slots.add((_m.group(1), _m.group(2)))
+        # Frame offsets whose address is computed into a register (addi rN,r1,off):
+        # a callee may write these via the escaped pointer, so a `ld rN,off(r1)`
+        # after such a call is a LIVE reload (an out-param result), never a
+        # callee-save restore. Memory-snapshotting them at entry would resurrect
+        # the stale pre-call value. (LBP sub_4A51F0/loc_4A52B0: `addi r5,r1,var_80`
+        # passes &var_80 to a cellFsFstat-style call that writes the file size
+        # there; `ld r28,var_80` reloads it. Snapshotting var_80 at entry gave r28
+        # stale stack garbage -> a bogus vector grow size -> "AllocatorPlatform out
+        # of memory on request size -805238272" and a stalled loader.)
+        _addr_taken = set()
+        for _l in func.body_lines:
+            _am = _CS_ADDR_OF_RE.search(_l)
+            if _am:
+                try:
+                    _addr_taken.add(int(_am.group(1), 0))
+                except ValueError:
+                    pass
+        def _off_escapes(_off):
+            try:
+                return int(_off, 0) in _addr_taken
+            except ValueError:
+                return False
         _reg_snap = set()        # regs to snapshot from the register at entry
         _mem_snap = {}           # reg -> offset, snapshot from memory at entry
         for _i, _l in enumerate(func.body_lines):
@@ -659,9 +687,10 @@ class PPULifter:
                 if (_off, _m.group(1)) in _saved_slots:
                     _reg_snap.add(_reg)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
-                elif not _has_stdu and _write_counts[_off] == 0:
+                elif not _has_stdu and _write_counts[_off] == 0 and not _off_escapes(_off):
                     # pure tail-entry: the save lives in the original function, so
                     # this body never writes the slot; snapshot from memory at entry.
+                    # (Skip slots whose address escaped to a callee -- see above.)
                     _mem_snap.setdefault(_reg, _off)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
         if _reg_snap or _mem_snap:
@@ -1330,11 +1359,28 @@ class PPULifter:
             # resolved case address (base + table[idx]); match it to a case.
             cases = self.jump_tables.get(insn.addr)
             if cases:
-                arms = "".join(
-                    f"case 0x{c:08X}u: goto loc_{c:08X};"
-                    for c in cases if func.start_addr <= c < func.end_addr)
+                arms = []
+                for c in cases:
+                    if func.start_addr <= c < func.end_addr:
+                        arms.append(f"case 0x{c:08X}u: goto loc_{c:08X};")
+                    else:
+                        # Case OUTSIDE this function's range. Almost always the
+                        # function was truncated by the IDA export (its real body
+                        # includes the jump-table case blocks past the declared
+                        # end) -- or the dispatcher runs in a mid-function
+                        # fragment whose end is the container's. Dropping these
+                        # arms leaves the runtime `bctr` landing on an unlifted
+                        # address (LBP sub_422A40: end=0x422BEC but its 0x2A switch
+                        # cases run to ~0x422Dxx, so a "GMTb" resource dispatch hit
+                        # `unresolved indirect call 0x422CA0` and stalled the
+                        # loader). Tail-call the case as its own function and
+                        # register it so the mid-function pass lifts it.
+                        self.branch_targets.add(c)
+                        arms.append(
+                            f"case 0x{c:08X}u: {{ g_trampoline_fn = "
+                            f"(void(*)(void*)){self.prefix}func_{c:08X}; return; }}")
                 if arms:
-                    return ("switch ((uint32_t)ctx->ctr) { " + arms +
+                    return ("switch ((uint32_t)ctx->ctr) { " + "".join(arms) +
                             " default: ps3_indirect_call(ctx); return; } return;")
             return "ps3_indirect_call(ctx); return;"
 
@@ -3022,15 +3068,43 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             [x.strip() for x in w.operands.split(',')][0] == rC and
             r_base in [x.strip() for x in w.operands.split(',')][1:]
             for w in win)
-        # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
+        # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`. Match the
+        # compare on the RAW INDEX register: the lwzx index (rIdx*4) is usually a
+        # shift of the raw index (`rldic/clrlsldi rShift, rIdx, ...`), and the raw
+        # index is what the switch bounds-checks. Blindly taking the nearest
+        # cmpwi grabbed an unrelated `cmpwi r9,0` in a sibling basic block (the
+        # 30-insn address window spans both arms of a branch), where r9 is only
+        # reused as the shifted index LATER -> count=0 -> a single case decoded ->
+        # LBP sub_422A40's 0x2A-case "GMTb" dispatcher fell through to an
+        # unresolved indirect call (0x422CA0) and stalled the loader.
+        _idx_reg = p[1] if r_base == p[2] else p[2]
+        _raw_idx = _idx_reg
+        for w in reversed(win):
+            a = [x.strip() for x in w.operands.split(',')]
+            if a and a[0] == _idx_reg:
+                if (w.mnemonic in ('rldic', 'rldicl', 'rldicr', 'rlwinm',
+                                   'clrlsldi', 'sldi', 'slwi', 'clrldi')
+                        and len(a) >= 2):
+                    _raw_idx = a[1]
+                break                           # first (nearest) def of idx wins
+        # Take the LARGEST immediate compared against the raw index: the switch
+        # bounds-check (`cmplwi rIdx, COUNT`) uses the max index, while any
+        # per-case `cmpwi rIdx, k` in the window tests a specific smaller case
+        # value. Picking the nearest compare grabbed `cmpwi r7,1` (a case test)
+        # -> count=1 -> only the default case decoded. Over-counting is safe: the
+        # per-entry text-range validation below stops at the first bogus offset.
         count = None
         for w in reversed(win):
             if w.mnemonic in ('cmplwi', 'cmpwi'):
-                try:
-                    count = int(w.operands.split(',')[-1].strip(), 0)
-                except ValueError:
-                    count = None
-                break
+                a = [x.strip() for x in w.operands.split(',')]
+                _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
+                if _cmp_reg == _raw_idx:
+                    try:
+                        _c = int(a[-1], 0)
+                    except ValueError:
+                        continue
+                    if count is None or _c > count:
+                        count = _c
         if count is None or count < 0 or count > 4096:
             count = 256
 
