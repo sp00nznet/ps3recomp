@@ -82,6 +82,19 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
     }
 
+    /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
+     * for a disc title patched to e.g. v1.30) -- mirror ppu_fs.cpp host_path.
+     * PS3_HDD0_ROOT = host dir that /dev_hdd0 maps into (contains game/<title>/). */
+    {
+        static const char* hdd0_root = NULL; static int hdd0_init = 0;
+        if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
+        if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
+            fs_normalize_sep(host_path);
+            return;
+        }
+    }
+
     /* Strip a known mount prefix so this sys_fs layer resolves to the SAME host
      * tree as the cellFs layer (ppu_fs.cpp host_path). Previously /dev_bdvd/X
      * mapped to <root>/dev_bdvd/X -- a directory that doesn't exist -- so a title

@@ -76,6 +76,18 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 static void host_path(char* out, size_t cap, const char* guest)
 {
     const char* rel = guest;
+    /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
+     * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
+     * /dev_hdd0/game/<title>/), mirroring the PS3/RPCS3 layout: base data on
+     * /dev_bdvd (disc), update data on /dev_hdd0. Set PS3_HDD0_ROOT to the host
+     * dir that /dev_hdd0 maps into (the one containing game/<title>/). */
+    static const char* hdd0_root = nullptr; static int hdd0_init = 0;
+    if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
+    if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
+        snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+        return;
+    }
     static const char* mounts[] = {
         "/dev_bdvd/", "/app_home/", "/dev_hdd0/", "/dev_hdd1/",
         "/dev_flash/", "/host_root/", "/dev_usb000/", "/dev_usb/"
@@ -341,6 +353,9 @@ static void cellFsFsync(ppu_context* ctx)
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) fflush(g_files[fd]);
     ctx->gpr[3] = CELL_OK;
 }
+/* File-area preallocation (LBP cache warm-up spams this): host filesystems
+ * grow files on write, so accepting is correct -- no preallocation needed. */
+static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 
 extern "C" void ppu_fs_register(void)
 {
@@ -358,4 +373,6 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
+                         "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
 }
