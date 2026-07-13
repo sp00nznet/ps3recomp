@@ -6,6 +6,7 @@
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -49,6 +50,135 @@ static void write_be32(uint32_t addr, uint32_t val)
           ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
 #endif
     *p = val;
+}
+
+static uint32_t read_be32(uint32_t addr)
+{
+    uint32_t v; uint32_t* p = (uint32_t*)vm_to_host(addr);
+    v = *p;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+    v = ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+        ((v <<  8) & 0xFF0000) | ((v << 24) & 0xFF000000u);
+#endif
+    return v;
+}
+
+/* ---------------------------------------------------------------------------
+ * lbp_hang_census (diagnostic; called from the hang watchdog)
+ *
+ * Reads the LBP resource-manager's three work-queue depths straight out of
+ * guest memory and cross-references each queue's semaphore runtime value. The
+ * manager pointer lives at guest [TOC(0x93BCC0)-25864] = 0x009357B8; each queue
+ * struct has +0=base, +4=count, +8=capacity, +0x30=sem_id, +0x34=done flag.
+ *
+ * Reading:  count>0 with sem.value==0  => item enqueued but no post reached the
+ *           consumer (lost wakeup / producer bug), OR the consumer left (done!=0)
+ *           without draining. count>0 with sem.value>0 => a post is pending and
+ *           unconsumed (the consumer has exited). all counts 0 => queues drained,
+ *           the stall is in completion signalling, not the pump.
+ * -----------------------------------------------------------------------*/
+void lbp_hang_census(void)
+{
+    uint32_t mgr = read_be32(0x009357B8);
+    fprintf(stderr, "\n[HANGCENSUS] resource-manager mgr=0x%08X\n", mgr);
+    const uint32_t qoff[3] = { 0x3C, 0x40, 0x44 };
+    int poke = getenv("POKESEM") ? 1 : 0;
+    for (int i = 0; i < 3; i++) {
+        uint32_t q    = read_be32(mgr + qoff[i]);
+        uint32_t base = read_be32(q + 0x00);
+        uint32_t cnt  = read_be32(q + 0x04);
+        uint32_t cap  = read_be32(q + 0x08);
+        uint32_t sem  = read_be32(q + 0x30);
+        /* the guest done flag is the BYTE at address q+0x34 = big-endian high byte */
+        uint32_t done = (read_be32(q + 0x34) >> 24) & 0xFF;
+        fprintf(stderr, "[HANGCENSUS] q[%d]@mgr+0x%02X ptr=0x%08X count=%u cap=%u sem=%u done=%u base=0x%08X\n",
+                i, qoff[i], q, cnt, cap, sem, done, base);
+        fprintf(stderr, "[HANGCENSUS]   raw:");
+        for (uint32_t o = 0; o <= 0x34; o += 4) fprintf(stderr, " +%02X=%08X", o, read_be32(q + o));
+        fprintf(stderr, "\n");
+        if (sem >= 1 && sem <= SYS_SEMAPHORE_MAX) {
+            sys_semaphore_info* qs = &g_sys_semaphores[sem - 1];
+            fprintf(stderr, "[HANGCENSUS]   sem=%u runtime: active=%d value=%d max=%d\n",
+                    sem, qs->active, qs->value, qs->max_value);
+#ifdef _WIN32
+            /* POKESEM experiment: if the guest queue holds more items than the
+             * semaphore has been posted for, the wakeup was lost -- post the
+             * deficit and see whether the consumer drains it and the load proceeds. */
+            if (poke && qs->active && (int)cnt > qs->value) {
+                int deficit = (int)cnt - qs->value;
+                EnterCriticalSection(&qs->value_lock);
+                qs->value += deficit;
+                LeaveCriticalSection(&qs->value_lock);
+                ReleaseSemaphore(qs->sem_handle, deficit, NULL);
+                fprintf(stderr, "[HANGCENSUS]   *** POKED sem=%u by %d (count=%u > value) ***\n",
+                        sem, deficit, cnt);
+            }
+#endif
+        }
+    }
+#ifdef _WIN32
+    /* POKE7=<id>: one-shot force-post of an arbitrary semaphore, to test whether a
+     * starved gate (e.g. the completion sem tid0 polls) is merely a lost wakeup --
+     * if the load then proceeds, the state was ready and only the signal was lost. */
+    { const char* pk = getenv("POKE7");
+      if (pk && *pk) {
+        static int done_pk = 0;
+        if (!done_pk) { done_pk = 1;
+          int id = atoi(pk);
+          if (id >= 1 && id <= SYS_SEMAPHORE_MAX && g_sys_semaphores[id-1].active) {
+            sys_semaphore_info* ps = &g_sys_semaphores[id-1];
+            EnterCriticalSection(&ps->value_lock); ps->value += 1; LeaveCriticalSection(&ps->value_lock);
+            ReleaseSemaphore(ps->sem_handle, 1, NULL);
+            fprintf(stderr, "[HANGCENSUS] *** FORCE-POSTED sem=%d by 1 (POKE7 test) ***\n", id);
+          }
+        }
+      }
+    }
+#endif
+    fflush(stderr);
+}
+
+/* ---------------------------------------------------------------------------
+ * lbp_unstick_once (diagnostic; called on a timer when UNSTICK is set)
+ *
+ * Tests the lost-wakeup hypothesis: the loader is a producer/consumer pipeline
+ * whose "an item is ready / work is done" nudge posts are intermittently lost
+ * (the hang is nondeterministic). Each tick:
+ *   - for each of the 3 resource-manager queues, if the guest item count exceeds
+ *     the semaphore value, post the deficit (a lost enqueue-post) so the consumer
+ *     drains it and advances the resource one load-step;
+ *   - nudge the top-level completion sem (id 7) so tid0 re-checks its predicate.
+ * If the title then reaches the loading screen, the deadlock IS lost wakeups and
+ * the real fix is to make the guest producer/consumer handshake race-free.
+ * -----------------------------------------------------------------------*/
+void lbp_unstick_once(void)
+{
+#ifdef _WIN32
+    uint32_t mgr = read_be32(0x009357B8);
+    if (!mgr) return;
+    const uint32_t qoff[3] = { 0x3C, 0x40, 0x44 };
+    for (int i = 0; i < 3; i++) {
+        uint32_t q   = read_be32(mgr + qoff[i]);
+        uint32_t cnt = read_be32(q + 0x04);
+        uint32_t sem = read_be32(q + 0x30);
+        if (sem >= 1 && sem <= SYS_SEMAPHORE_MAX && g_sys_semaphores[sem-1].active) {
+            sys_semaphore_info* ps = &g_sys_semaphores[sem-1];
+            if ((int)cnt > ps->value) {
+                int d = (int)cnt - ps->value;
+                EnterCriticalSection(&ps->value_lock); ps->value += d; LeaveCriticalSection(&ps->value_lock);
+                ReleaseSemaphore(ps->sem_handle, d, NULL);
+            }
+        }
+    }
+    /* nudge the completion sem (id 7) so tid0 re-evaluates the load predicate */
+    if (g_sys_semaphores[7-1].active) {
+        sys_semaphore_info* ps = &g_sys_semaphores[7-1];
+        if (ps->value < 2) {
+            EnterCriticalSection(&ps->value_lock); ps->value += 1; LeaveCriticalSection(&ps->value_lock);
+            ReleaseSemaphore(ps->sem_handle, 1, NULL);
+        }
+    }
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -164,8 +294,23 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 {
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
-    fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us);
-
+    { static int _n = 0; if (getenv("SEMTID") && _n++ < 60000)
+        fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu)\n",
+                (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us);
+      else if (!getenv("SEMTID"))
+        fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
+    /* LBP_BREADCRUMB: every 500th wait, dump the per-tid indirect-call breadcrumb
+     * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
+     * so two consecutive [BC] lines reveal which worker's count is FROZEN = the
+     * job it's stuck in, and its last indirect-call target = that callback. */
+    { static int bc=-2; if(bc==-2) bc=getenv("LBP_BREADCRUMB")?1:0;
+      if(bc){ static long w=0; if((++w % 500)==0){ extern void lbp_breadcrumb_dump(const char*); lbp_breadcrumb_dump("semwait"); } } }
+    /* SEMCHAIN: dump the guest call-chain at the main thread's sem=7 poll (the
+     * "loading done" wait) to locate its loop -- is it meant to re-post sem=3? */
+    if (getenv("SEMCHAIN") && sem_id == 7 && ctx->thread_id == 0) {
+        static int _c = 0;
+        if (_c++ < 2) { extern void ppu_log_host_chain(const char*); ppu_log_host_chain("sem7-wait-tid0"); }
+    }
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -285,8 +430,20 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 
-    { static int _n=0; if (_n++ < 40)
-        fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count); }
+    { static int _n=0; if (getenv("SEMTID") && _n < 60000)
+        fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d)\n",
+                (unsigned long long)ctx->thread_id, sem_id, count);
+      else if (!getenv("SEMTID") && _n < 40)
+        fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count);
+      _n++; }
+    /* SEMCHAIN: dump the guest call-chain at every sem=3 post (the sema the main
+     * loading thread starves on) -- reveals which thread/loop produces it. */
+    if (getenv("SEMCHAIN") && sem_id == 3) {
+        static int _c = 0;
+        if (_c++ < 3) { extern void ppu_log_host_chain(const char*);
+            fprintf(stderr, "[SEMCHAIN] sem=3 post by tid=%llu\n", (unsigned long long)ctx->thread_id);
+            ppu_log_host_chain("sem3-post"); }
+    }
 
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;

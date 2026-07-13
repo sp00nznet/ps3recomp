@@ -297,10 +297,17 @@ static void dump_threads(const char* label, HMODULE self)
                 {
                     uint64_t* sp = (uint64_t*)ctx.Rsp;
                     /* Bound the scan to the committed stack region so we never read
-                     * past the guard page (VirtualQuery gives this region's end). */
+                     * past the guard page. If the query fails or the region is not
+                     * committed+readable (thread mid-create, guard page, garbage
+                     * Rsp), skip the scan entirely -- a diagnostic AV here gets
+                     * caught by the crash filter and kills the whole run. */
                     MEMORY_BASIC_INFORMATION mbi;
-                    uint64_t region_end = (uint64_t)sp + 0x8000;
-                    if (VirtualQuery((LPCVOID)sp, &mbi, sizeof mbi))
+                    uint64_t region_end = (uint64_t)sp;
+                    if (VirtualQuery((LPCVOID)sp, &mbi, sizeof mbi) &&
+                        mbi.State == MEM_COMMIT &&
+                        !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                        (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
                         region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
                     int maxk = (int)((region_end - (uint64_t)sp) / 8);
                     if (maxk > 0x20000 / 8) maxk = 0x20000 / 8;

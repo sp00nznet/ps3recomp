@@ -134,8 +134,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { static int tr=-1; if(tr<0){const char*e=getenv("FLOW_HLETRACE"); tr=e?1:0;}
       if(tr) fprintf(stderr,"[hletrace] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
           nid,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); }
-    /* sys_process_exit (abort path): dump the guest back-chain so we see WHO aborted. */
-    if (nid == 0xE6F2C1E7u && getenv("FLOW_EXITCHAIN")) {
+    /* sys_process_exit (abort path): dump the guest back-chain so we see WHO aborted.
+     * Always-on for a NONZERO exit code (error/abort) -- the rare loader-thread
+     * abort in LBP is a race we can't reliably reproduce, so capture it whenever
+     * it fires. Clean code=0 exits (normal shutdown) stay quiet. */
+    if (nid == 0xE6F2C1E7u && ((uint32_t)ctx->gpr[3] != 0 || getenv("FLOW_EXITCHAIN"))) {
         uint32_t sp = (uint32_t)ctx->gpr[1];
         fprintf(stderr, "[exit-chain] code=0x%X lr=0x%08X sp=0x%08X\n", (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, sp);
         /* Scan the guest stack for words in the lifted code range — saved return
