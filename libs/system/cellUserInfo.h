@@ -40,11 +40,16 @@ extern "C" {
  * Structures
  * -----------------------------------------------------------------------*/
 
-/* User stat */
+/* User stat -- REAL SDK layout: id + name ONLY (68 bytes). homeDir is NOT a
+ * member (it is returned by cellUserInfoGetHomeDir into a caller buffer).
+ * The old homeDir[128] member made sizeof()=196 while guests allocate ~80B
+ * on their STACK for this: GetStat's memset/strncpy then overflowed the
+ * caller's frame, wiping the PPC CR save slot (nonvolatile cr2-4) -- in LBP
+ * this silently broke the bringup init-walker's control flow so the
+ * Video/RenderTargets/GfxMemPools init nodes never ran. */
 typedef struct CellUserInfoUserStat {
     u32  id;
     char name[CELL_USERINFO_USERNAME_SIZE];
-    char homeDir[CELL_USERINFO_HOME_PATH_SIZE];
 } CellUserInfoUserStat;
 
 /* User list */

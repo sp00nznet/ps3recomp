@@ -5,9 +5,15 @@
  */
 
 #include "cellGameExec.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 -- guest addrs */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+
+/* The generic HLE adapter passes GUEST addresses for pointer args; translate
+ * to host pointers for struct/string access and write scalars big-endian. */
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -20,8 +26,9 @@ static int s_exit_param_set = 0;
  * API implementations
  * -----------------------------------------------------------------------*/
 
-s32 cellGameSetExitParam(const CellGameExecBootParam* param)
+s32 cellGameSetExitParam(const CellGameExecBootParam* param_guest)
 {
+    const CellGameExecBootParam* param = GUEST_PTR(param_guest, const CellGameExecBootParam*);
     printf("[cellGameExec] SetExitParam(type=%u, titleId=%.16s)\n",
            param ? param->type : 0,
            param ? param->titleId : "(null)");
@@ -34,8 +41,9 @@ s32 cellGameSetExitParam(const CellGameExecBootParam* param)
     return CELL_OK;
 }
 
-s32 cellGameGetExitParam(CellGameExecBootParam* param)
+s32 cellGameGetExitParam(CellGameExecBootParam* param_guest)
 {
+    CellGameExecBootParam* param = GUEST_PTR(param_guest, CellGameExecBootParam*);
     printf("[cellGameExec] GetExitParam()\n");
 
     if (!param)
@@ -62,17 +70,19 @@ void cellGameExitToShelf(void)
 
 s32 cellGameGetBootGameInfo(u32* type, char* dirName, u32* execData)
 {
-    printf("[cellGameExec] GetBootGameInfo()\n");
+    printf("[cellGameExec] GetBootGameInfo() -> DISC\n");
 
-    /* Report as HDD game by default */
+    /* Disc-boot title (matches cellGame's disc-content reporting). Args are
+     * guest addresses: scalars written big-endian, dirName only meaningful
+     * for HDD boot so it is zeroed. */
     if (type)
-        *type = CELL_GAME_GAMETYPE_HDD;
+        vm_write32((uint32_t)(uintptr_t)type, CELL_GAME_GAMETYPE_DISC);
 
     if (dirName)
-        strncpy(dirName, "GAME00000", 32);
+        memset(GUEST_PTR(dirName, char*), 0, 32);
 
     if (execData)
-        *execData = 0;
+        vm_write32((uint32_t)(uintptr_t)execData, 0);
 
     return CELL_OK;
 }
