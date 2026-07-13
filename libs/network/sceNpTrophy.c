@@ -15,6 +15,7 @@
 #include <time.h>
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "ps3emu/endian.h"                   /* ps3_bswap64 -- guest is big-endian */
 /* HLE args arrive as guest effective addresses; translate before deref. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
@@ -370,8 +371,14 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
     reqSpace = GUEST_PTR(reqSpace, u64*);
 
-    /* Typical trophy pack size */
-    *reqSpace = 1024 * 1024; /* 1 MB */
+    /* Typical trophy pack size. The guest is big-endian and reads this u64
+     * back in BE order, so the value MUST be byte-swapped on write -- otherwise
+     * a host-LE 0x100000 is read as 0x0010000000000000 (2^44). LBP feeds this
+     * "required disk space" straight into its save-data free-space accounting
+     * (sub_379EC0: errB = budget - usedKB - reqSpaceKB); a garbage 2^44 makes
+     * errB underflow negative -> cellGame GameData check returns ERROR-B ->
+     * boot bails. (Same LE-write class as the cellUserInfo fix.) */
+    *reqSpace = ps3_bswap64((u64)(1024 * 1024)); /* 1 MB, big-endian */
     printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> 1MB\n", context);
     return CELL_OK;
 }
