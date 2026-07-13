@@ -73,6 +73,11 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
 
+    /* Register this thread's context for lwarx/stwcx cross-thread reservation
+     * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
+     * reservation and prevents ABA corruption of the guest's lock-free lists. */
+    { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX\n",
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr);
@@ -207,8 +212,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
-            t->name, (unsigned long long)entry, (unsigned long long)arg,
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+            (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
             stack_size, priority);
 
     /* Diagnostic (YDKJ_NOHDLR): suppress libsre's SPURS handler threads (entry in
