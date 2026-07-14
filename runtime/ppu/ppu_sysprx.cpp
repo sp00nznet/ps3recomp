@@ -88,6 +88,9 @@ static void sys_process_is_stack(ppu_context* ctx)
 #define LWM_RECUR  0x0C
 #define LWM_TID    1u   /* single-thread boot: one fixed owner id */
 
+#ifdef _WIN32
+static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
+#endif
 static void sys_lwmutex_create(ppu_context* ctx)
 {
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
@@ -102,36 +105,48 @@ static void sys_lwmutex_create(ppu_context* ctx)
     vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
     vm_write32(lwm + 0x14, 0);
+#ifdef _WIN32
+    /* A recreate at a reused address must not inherit a locked slot (e.g. the
+     * previous holder exited while holding). Force the semaphore signaled;
+     * over-release of an already-free sem fails harmlessly at max count 1. */
+    { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
+#endif
     ctx->gpr[3] = 0;
 }
 /* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
  * every lwmutex-protected structure once LBP spun up its worker/loader threads --
  * notably the dlmalloc mspace behind the game's big-allocator, whose tree then
- * fell apart and reported OOM on a tiny request with 100+ MB free. Each guest
- * lwmutex gets a host CRITICAL_SECTION (recursive, blocking), keyed by its guest
- * address in an open-addressed table. Guest owner/recur fields are still stamped
- * for any guest code that reads them, but exclusion is the CS. */
+ * fell apart and reported OOM on a tiny request with 100+ MB free.
+ *
+ * Backed by a binary SEMAPHORE, not a CRITICAL_SECTION: a CS may only be
+ * released by its owning thread, but guest code passes lwmutex ownership
+ * between threads (LBP's job system) and threads exit while holding -- one
+ * cross-thread unlock silently failed and the still-owned CS parked the next
+ * locker forever (the Network-node hang). A semaphore releases from any
+ * thread. Recursion is handled explicitly via the guest owner/recur fields
+ * we stamp (only the holder ever writes owner=self, so the re-lock check is
+ * race-free). Keyed by guest address in an open-addressed table. */
 #ifdef _WIN32
 #define LWM_HASH 65536u
-static struct LwmSlot { volatile long addr; CRITICAL_SECTION cs; } g_lwm[LWM_HASH];
+static struct LwmSlot { volatile long addr; HANDLE sem; } g_lwm[LWM_HASH];
 static volatile long g_lwm_tab_lock = 0;
-static CRITICAL_SECTION* lwm_cs(uint32_t addr)
+static HANDLE lwm_sem(uint32_t addr)
 {
     if (!addr) return nullptr;
     uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
     for (uint32_t i = 0; i < LWM_HASH; i++) {
         uint32_t idx = (h + i) & (LWM_HASH - 1);
         long cur = g_lwm[idx].addr;
-        if ((uint32_t)cur == addr) return &g_lwm[idx].cs;
+        if ((uint32_t)cur == addr) return g_lwm[idx].sem;
         if (cur == 0) {
             while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
-            CRITICAL_SECTION* r = nullptr;
+            HANDLE r = nullptr;
             if (g_lwm[idx].addr == 0) {
-                InitializeCriticalSection(&g_lwm[idx].cs);
+                g_lwm[idx].sem = CreateSemaphoreA(NULL, 1, 1, NULL); /* free */
                 g_lwm[idx].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
-                r = &g_lwm[idx].cs;
+                r = g_lwm[idx].sem;
             } else if ((uint32_t)g_lwm[idx].addr == addr) {
-                r = &g_lwm[idx].cs;
+                r = g_lwm[idx].sem;
             }
             _InterlockedExchange(&g_lwm_tab_lock, 0);
             if (r) return r;
@@ -141,7 +156,7 @@ static CRITICAL_SECTION* lwm_cs(uint32_t addr)
     return nullptr;   /* table full (raise LWM_HASH) */
 }
 #else
-static void* lwm_cs(uint32_t) { return nullptr; }
+static void* lwm_sem(uint32_t) { return nullptr; }
 #endif
 /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
@@ -150,45 +165,69 @@ volatile int g_nd_inpump = 0;
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
+    uint32_t self = (uint32_t)ctx->thread_id ? (uint32_t)ctx->thread_id : LWM_TID;
 #ifdef _WIN32
-    CRITICAL_SECTION* cs = lwm_cs(lwm);
-    if (cs && !TryEnterCriticalSection(cs)) {
-        /* Contended: log who we're stuck behind (owner stamped at acquire),
-         * then block for real. Bounded diagnostics for park hunts; uncapped
-         * while the probe window is open (g_nd_inpump). */
-        static long _bl = 0; long _b = ++_bl;
-        if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u\n",
-            (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), vm_read32(lwm + LWM_RECUR));
-        EnterCriticalSection(cs);
-        if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
+    HANDLE s = lwm_sem(lwm);
+    if (s) {
+        /* Recursive re-lock by the current holder: bump the count, no wait.
+         * Only the holder ever stamps owner=self, so this check is race-free. */
+        if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
+            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            ctx->gpr[3] = 0;
+            return;
+        }
+        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) {
+            /* Contended: log who we're stuck behind (owner stamped at acquire),
+             * then block for real. Bounded diagnostics for park hunts; uncapped
+             * while the probe window is open (g_nd_inpump). */
+            static long _bl = 0; long _b = ++_bl;
+            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u\n",
+                (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), vm_read32(lwm + LWM_RECUR));
+            WaitForSingleObject(s, INFINITE);
+            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
+        }
     }
 #endif
-    uint32_t self = (uint32_t)ctx->thread_id ? (uint32_t)ctx->thread_id : LWM_TID;
     vm_write32(lwm + LWM_OWNER, self);
-    vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+    vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;   // CELL_OK
 }
 static void sys_lwmutex_trylock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
-#ifdef _WIN32
-    CRITICAL_SECTION* cs = lwm_cs(lwm);
-    if (cs && !TryEnterCriticalSection(cs)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
-#endif
     uint32_t self = (uint32_t)ctx->thread_id ? (uint32_t)ctx->thread_id : LWM_TID;
+#ifdef _WIN32
+    HANDLE s = lwm_sem(lwm);
+    if (s) {
+        if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
+            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            ctx->gpr[3] = 0;
+            return;
+        }
+        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+    }
+#endif
     vm_write32(lwm + LWM_OWNER, self);
-    vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+    vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;
 }
 static void sys_lwmutex_unlock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t rc = vm_read32(lwm + LWM_RECUR);
-    if (rc) vm_write32(lwm + LWM_RECUR, rc - 1);
-    if (rc <= 1) vm_write32(lwm + LWM_OWNER, 0);
+    if (rc > 1) {                       /* recursive hold: count down, keep the lock */
+        vm_write32(lwm + LWM_RECUR, rc - 1);
+        ctx->gpr[3] = 0;
+        return;
+    }
+    vm_write32(lwm + LWM_RECUR, 0);
+    vm_write32(lwm + LWM_OWNER, 0);
 #ifdef _WIN32
-    CRITICAL_SECTION* cs = lwm_cs(lwm);
-    if (cs) LeaveCriticalSection(cs);
+    HANDLE s = lwm_sem(lwm);
+    /* Semaphore release works from ANY thread (unlike a CS) -- guest code
+     * hands lwmutex ownership across threads. Over-release (unlock of a free
+     * mutex) fails harmlessly at the max count of 1. */
+    if (s) ReleaseSemaphore(s, 1, NULL);
 #endif
     ctx->gpr[3] = 0;
 }
@@ -223,8 +262,18 @@ static void sys_lwcond_wait(ppu_context* ctx)
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
 #ifdef _WIN32
-    CRITICAL_SECTION* cs = lwm_cs(lwmutex);
-    if (cs) { LeaveCriticalSection(cs); Sleep(1); EnterCriticalSection(cs); }
+    HANDLE s = lwm_sem(lwmutex);
+    if (s) {
+        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+        vm_write32(lwmutex + LWM_RECUR, 0);
+        vm_write32(lwmutex + LWM_OWNER, 0);
+        ReleaseSemaphore(s, 1, NULL);
+        Sleep(1);
+        WaitForSingleObject(s, INFINITE);
+        vm_write32(lwmutex + LWM_OWNER, own);
+        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+    }
 #endif
     ctx->gpr[3] = 0;
 }
@@ -389,18 +438,34 @@ static void hle_net_wouldblock(ppu_context* ctx)
     ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)-1;
 }
 static void hle_net_zero(ppu_context* ctx) { ctx->gpr[3] = 0; }  /* select/poll: 0 ready */
+/* Distinct small fds: the unresolved default handed EVERY socket() call fd 0,
+ * making all sockets alias one id in the game's tables. */
+static void hle_net_socket(ppu_context* ctx) { static uint32_t s_fd = 3; ctx->gpr[3] = s_fd++; }
+/* sendto: report the full length as sent (packets vanish into the void, matching
+ * the RPCS3-offline oracle where broadcasts go out and nothing answers). */
+static void hle_net_sendto(ppu_context* ctx) { ctx->gpr[3] = (uint32_t)ctx->gpr[5]; }
 
 extern "C" void ppu_sysprx_register(void)
 {
     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
 
-    /* sys_net offline model (NIDs from PSL1GHT libnet exports). */
+    /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
+     * sys_net NID LBP imports so none fall to the unresolved-NID default. */
     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);
     ps3_hle_register_ctx(0x1F953B9Fu, "sys_net_bnet_recvfrom",  hle_net_wouldblock);
     ps3_hle_register_ctx(0xFBA04F37u, "sys_net_bnet_recv",      hle_net_wouldblock);
     ps3_hle_register_ctx(0xC9D09C34u, "sys_net_bnet_recvmsg",   hle_net_wouldblock);
     ps3_hle_register_ctx(0x051EE3EEu, "sys_net_bnet_poll",      hle_net_zero);
     ps3_hle_register_ctx(0x3F09E20Au, "sys_net_bnet_select",    hle_net_zero);
+    ps3_hle_register_ctx(0x139A9E9Bu, "netInitializeNetworkEx", hle_net_zero);   /* lib init ok */
+    ps3_hle_register_ctx(0x9C056962u, "netSocket",              hle_net_socket);
+    ps3_hle_register_ctx(0xB0A59804u, "netBind",                hle_net_zero);
+    ps3_hle_register_ctx(0x88F03575u, "netSetSockOpt",          hle_net_zero);
+    ps3_hle_register_ctx(0x9647570Bu, "netSendTo",              hle_net_sendto);
+    ps3_hle_register_ctx(0x6DB6E8CDu, "netClose",               hle_net_zero);
+    ps3_hle_register_ctx(0x71F4C717u, "netGetHostByName",       hle_net_zero);   /* NULL: DNS down */
+    ps3_hle_register_ctx(0xB68D5625u, "netFinalizeNetwork",     hle_net_zero);
+    ps3_hle_register_ctx(0xFDB8F926u, "netFreethreadContext",   hle_net_zero);
     /* Route the GCM command-buffer-full callback (invoked indirectly via the
      * context OPD) into cellGcm_fifo_recycle so the FIFO ring recycles on wrap. */
     ppu_register_function(GCM_FIFO_CALLBACK_SENTINEL_EA, hle_gcm_callback);
