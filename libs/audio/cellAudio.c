@@ -404,10 +404,15 @@ static void audio_mix_one_block(void)
         }
 
         /* Advance read index and publish it to the guest-visible counter so the
-         * game (FMOD) can tell how far playback has consumed. */
+         * game can tell how far playback has consumed. The counter is a 64-bit
+         * big-endian value: LBP's audio watchdog reads it with `ld` and compares
+         * the LOW word (`ld r0,0(r11)` / `cmpw r9,r0` at 0x484144), so the live
+         * bits are bytes [4..7]. A 32-bit store here only ever wrote bytes
+         * [0..3] -- the half the game never looks at -- so it saw a frozen index
+         * and tripped "LIBAUDIO DROPOUT - POSITION NO LONGER INCREMENTING". */
         port->read_index++;
         if (port->read_idx_addr)
-            vm_write32((u32)port->read_idx_addr, (u32)port->read_index);
+            vm_write64((u32)port->read_idx_addr, port->read_index);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -638,7 +643,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
     memset(port->buffer, 0, port->buf_size);
-    vm_write32(guest_ridx, 0);                        /* read index counter */
+    vm_write64(guest_ridx, 0);                        /* read index counter (u64, see below) */
 
     port->port_addr     = guest_buf;
     port->read_idx_addr = guest_ridx;
@@ -783,21 +788,23 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     mutex_lock(&s_audio_mutex);
     AudioPortSlot* port = &s_ports[portNum];
 
-    /* CellAudioPortConfig layout (PS3 is 32-bit user; sys_addr_t/bptr are u32):
-     *   +0x00 u32 readIndexAddr   +0x04 u32 status
-     *   +0x08 u64 nChannel        +0x10 u64 nBlock
-     *   +0x18 u32 portSize        +0x1C u32 portAddr      (32 bytes total)
-     * The old code wrote readIndexAddr as a u64 and put status at +8 / nChannel at
-     * +16, shifting EVERY field. FMOD's PS3 output init reads nChannel at +0x08 and
-     * requires it to be 8 -- it was reading (status|garbage) instead, returning
-     * FMOD_ERR_INVALID_PARAM(37) => "No sound will be playing" => no FMOD at all. */
-    vm_write32(cfg + 0x00, port->read_idx_addr);                            /* readIndexAddr */
-    vm_write32(cfg + 0x04, port->running ? CELL_AUDIO_STATUS_RUN
-                                         : CELL_AUDIO_STATUS_READY);        /* status */
-    vm_write64(cfg + 0x08, port->param.nChannel);                           /* nChannel */
-    vm_write64(cfg + 0x10, port->param.nBlock);                             /* nBlock */
-    vm_write32(cfg + 0x18, port->buf_size);                                 /* portSize */
-    vm_write32(cfg + 0x1C, port->port_addr);                                /* portAddr */
+    /* CellAudioPortConfig (cell/audio.h). sys_addr_t is uintptr_t, which on the
+     * 32-bit PPU ABI is FOUR bytes -- not eight. Writing the two sys_addr_t
+     * fields as u64 shifted every field past it and left the game reading the
+     * high (zero) half of readIndexAddr as its pointer:
+     *   sys_addr_t readIndexAddr;  u32 @  0
+     *   uint32_t   status;         u32 @  4
+     *   uint64_t   nChannel;       u64 @  8
+     *   uint64_t   nBlock;         u64 @ 16
+     *   uint32_t   portSize;       u32 @ 24
+     *   sys_addr_t portAddr;       u32 @ 28      -> 32 bytes */
+    vm_write32(cfg +  0, (u32)port->read_idx_addr);                          /* readIndexAddr */
+    vm_write32(cfg +  4, port->running ? CELL_AUDIO_STATUS_RUN
+                                       : CELL_AUDIO_STATUS_READY);           /* status */
+    vm_write64(cfg +  8, port->param.nChannel);                             /* nChannel */
+    vm_write64(cfg + 16, port->param.nBlock);                               /* nBlock */
+    vm_write32(cfg + 24, port->buf_size);                                   /* portSize */
+    vm_write32(cfg + 28, (u32)port->port_addr);                             /* portAddr */
 
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;
