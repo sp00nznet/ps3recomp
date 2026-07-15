@@ -958,10 +958,48 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     static volatile long s_pm_off = -1;
     if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;
 
+    fprintf(stderr, "[spurs-kern] \"%s\" poll thread live: ea=0x%08X pm=%s\n",
+            si->prefix, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
+    fflush(stderr);
+
+    /* Instance change detector (SPURS_KERN_WATCH=1).
+     *
+     * We assumed the title kicks a workload by poking wklReadyCount/wklSignal
+     * with inlined atomics -- but this thread watches exactly those bytes every
+     * 1 ms and has never once seen them nonzero, across whole runs. Rather than
+     * guess again, shadow the head of the instance and report EVERY byte the
+     * title changes. Whatever the real kick is, it has to land in here. */
+    static const u32 WATCH_LEN = 0xC0;
+    unsigned char shadow[0xC0];
+    int shadow_primed = 0;
+    int watch = getenv("SPURS_KERN_WATCH") ? 1 : 0;
+    int changes_logged = 0;
+
     for (;;) {
         Sleep(1);
         u32 ea = si->ea;
         if (!ea || s_pm_off) continue;
+
+        if (watch) {
+            const unsigned char* live = (const unsigned char*)vm_base + ea;
+            if (!shadow_primed) { memcpy(shadow, live, WATCH_LEN); shadow_primed = 1; }
+            else if (memcmp(shadow, live, WATCH_LEN) != 0) {
+                for (u32 o = 0; o < WATCH_LEN; o++) {
+                    if (shadow[o] == live[o]) continue;
+                    if (changes_logged < 200) {
+                        changes_logged++;
+                        fprintf(stderr, "[spurs-kern] \"%s\" INSTANCE +0x%02X: %02X -> %02X%s\n",
+                                si->prefix, o, shadow[o], live[o],
+                                o < 16                    ? "  (wklReadyCount1)" :
+                                o >= 0x70 && o < 0x76     ? "  (wklSignal1)"     :
+                                o >= 0x80 && o < 0x90     ? "  (wklState1)"      :
+                                o >= 0xB0 && o < 0xB4     ? "  (wklEnabled)"     : "");
+                    }
+                }
+                memcpy(shadow, live, WATCH_LEN);
+                fflush(stderr);
+            }
+        }
 
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
 
@@ -1162,12 +1200,20 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
 
     ef_lock(sync);
 
-    /* Block until the requested bit pattern is satisfied */
-    /* SPU-completion shim: the bits this wait expects are normally set by an SPU
-     * workload via cellSpursEventFlagSet. We don't execute SPU code, so after a
-     * short grace period with no signal we force-satisfy the pattern (as if the
-     * SPU finished) so the title's boot proceeds. Correct fix is SPU execution. */
-    unsigned timeouts = 0;
+    /* Block until the requested bit pattern is satisfied.
+     *
+     * These bits are set by an SPU workload via cellSpursEventFlagSet. This used
+     * to force-satisfy the pattern after a short grace period "as if the SPU
+     * finished", which fabricated a completion that never happened: the title
+     * then ran on work that was never done, and the resulting misbehaviour
+     * looked like a dozen unrelated bugs downstream. A wait that the SPU cannot
+     * satisfy is a REAL deadlock and must present as one -- that is the signal
+     * telling us which workload is not executing.
+     *
+     * SPURS_EF_FORCE=1 restores the old fake for A/B comparison only. */
+    static int s_force = -1;
+    if (s_force < 0) s_force = getenv("SPURS_EF_FORCE") ? 1 : 0;
+    unsigned waits = 0;
     for (;;) {
         u16 current = eventFlag->bits;
 
@@ -1180,10 +1226,25 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                 break;
         }
 
-        if (!ef_wait_timed(sync, 50) && ++timeouts >= 4) {
-            fprintf(stderr, "[cellSpurs] EventFlagWait: no SPU signal for pattern "
-                            "0x%04X -- force-satisfying (SPU not executed)\n", pattern);
-            eventFlag->bits |= pattern;
+        if (!ef_wait_timed(sync, 50)) {
+            /* Report the stall once per second, naming what would have to run. */
+            if (++waits % 20 == 0) {
+                static int _n = 0;
+                if (_n < 24) { _n++;
+                    fprintf(stderr, "[cellSpurs] EventFlagWait BLOCKED %us on pattern 0x%04X "
+                                    "(mode=%s, bits=0x%04X) -- waiting for an SPU workload to "
+                                    "cellSpursEventFlagSet it\n",
+                            waits / 20, pattern,
+                            mode == CELL_SPURS_EVENT_FLAG_AND ? "AND" : "OR",
+                            eventFlag->bits);
+                    fflush(stderr);
+                }
+            }
+            if (s_force && waits >= 4) {
+                fprintf(stderr, "[cellSpurs] EventFlagWait: SPURS_EF_FORCE -- faking pattern "
+                                "0x%04X (NOT real; A/B only)\n", pattern);
+                eventFlag->bits |= pattern;
+            }
         }
     }
 
