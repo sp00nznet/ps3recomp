@@ -1028,19 +1028,38 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             if (*(vm_base + ea + SPURS_WKL_STATE1 + wid) != 2) continue;
             if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
 
+            /* A SPURS policy module is a PERSISTENT SPU program. The real kernel
+             * schedules an ENABLED, runnable workload onto an SPU and the module
+             * then polls its OWN job queue in main memory; being enabled is the
+             * trigger, not a per-job kick. That is why this title never writes
+             * wklReadyCount, never sets a signal bit, and never calls
+             * cellSpursReadyCountStore -- on hardware it does not have to. Gating
+             * dispatch on a kick meant the module never ran at all, so nothing
+             * ever called cellSpursEventFlagSet and the title's loading thread
+             * blocked forever.
+             *
+             * Run one scheduling quantum per enabled workload per pass: the
+             * module does its work, exits to the kernel (LS 0x9C0) when it has
+             * none, and we re-enter it on the next pass -- which is exactly what
+             * the real kernel's dispatch loop does.
+             *
+             * readyCount/wklSignal are still honoured when a title DOES use them:
+             * consume one unit so a kick-driven title paces the same as before. */
             volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
-            u32 sig  = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;   /* be u16 @0x70 */
-            int kick = 0;
-            if (*rdy) { (*rdy)--; kick = 1; }
-            else if (sig & (0x8000u >> wid)) {
+            u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
+            if (*rdy) (*rdy)--;
+            if (sig & (0x8000u >> wid))
                 vm_write32(ea + SPURS_WKL_SIGNAL1,
                            (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
-                kick = 1;
-            }
-            if (!kick) continue;
 
             WklPm* r = spurs_resolve_pm(wid);
             if (!r) continue;
+
+            {   static int _n = 0;
+                if (_n < 8) { _n++;
+                    fprintf(stderr, "[spurs-kern] \"%s\" dispatch wid=%u (enabled, state=2) "
+                                    "image=%d ready=%u\n", si->prefix, wid, r->image_id, *rdy);
+                    fflush(stderr); } }
 
             /* Live workload arg from the real wklInfo (the game may update it). */
             u64 arg = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
