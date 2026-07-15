@@ -223,6 +223,21 @@ def _dest_reg(insn) -> int:
     return insn.raw & 0x7F
 
 
+def _is_identity_move(insn) -> bool:
+    """`ai $rX,$rX,0` / `ori $rX,$rX,0` -- writes rX but preserves its value.
+
+    Sony's interrupt-window idiom needs a real instruction slot between the
+    `bie` that enables interrupts and the `bid` that disables them again (that
+    is the window a pending interrupt fires in), and uses `ai $r0,$r0,0` for it.
+    A nearest-writer scan must look straight through it: it "writes" r0 without
+    changing it, so the classification depends on whatever wrote r0 before.
+    """
+    if insn.mnemonic not in ("ai", "ori"):
+        return False
+    ops = _ops(insn.operands)
+    return len(ops) == 3 and ops[0] == ops[1] and ops[2].strip() in ("0", "0x0")
+
+
 def compute_bi_r0_jumps(insns, bounds) -> set:
     """`bi $r0` (and conditional `biz/binz $r0`) is normally a function RETURN
     (r0 = link register). But Sony's SPU code also uses it as a COMPUTED TAIL
@@ -232,22 +247,63 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     the launch fall through and the taskset dispatcher loop forever (same bug
     class as the brsl mislifts). Detect it: within each function, a `bi $r0`
     is a computed jump iff the NEAREST preceding write to r0 is an ABSOLUTE
-    load (lqa/lqr). A genuine return restores the link via a register/stack
-    load (lqd/lqx) or never rewrites r0 -- those stay returns. Returns the
-    set of such bi addrs."""
+    load (lqa/lqr) or an IMMEDIATE load (il/ila). A genuine return restores the
+    link via a register/stack load (lqd/lqx) or never rewrites r0 -- those stay
+    returns. Returns the set of such bi addrs.
+
+    The il/ila case is the interrupt-window idiom: `bid $r0` (branch indirect
+    and disable interrupts -- we decode it as plain `bi $r0`, since the D/E bits
+    only gate interrupts and the branch is identical) after `ila $r0, <resume>`
+    JUMPS to the resume address; it does not return. Mislifting it as `return;`
+    unwinds to the caller and silently skips everything after the window. Found
+    in LBP's wwsjob SPURS policy module at 0x2D3C, where the sequence
+    `ila $r0,0x2D40 / ila $r2,0x2D38 / bie $r2 / ai $r0,$r0,0 / bid $r0` opens a
+    one-instruction window for a pending interrupt and resumes at 0x2D40."""
     jumps = set()
+    ordered = sorted(insns, key=lambda x: x.addr)
+    idx_of = {ins.addr: i for i, ins in enumerate(ordered)}
+
+    def _writes_r0(w):
+        return w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == 0
+
     for (s, e) in bounds:
-        fn = sorted((i for i in insns if s <= i.addr < e), key=lambda x: x.addr)
+        fn = [i for i in ordered if s <= i.addr < e]
         for idx, insn in enumerate(fn):
             if _bi_target_reg(insn) != "0":
                 continue
             # backward scan for the nearest instruction that writes r0
+            decided = False
+            only_identity = False
             for j in range(idx - 1, -1, -1):
                 w = fn[j]
-                if w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == 0:
-                    if w.mnemonic in ("lqa", "lqr"):
-                        jumps.add(insn.addr)
-                    break  # nearest r0 writer found; classification decided
+                if not _writes_r0(w):
+                    continue
+                if _is_identity_move(w):
+                    only_identity = True   # preserves r0; keep looking
+                    continue
+                if w.mnemonic in ("lqa", "lqr", "il", "ila"):
+                    jumps.add(insn.addr)
+                decided = True
+                break  # nearest real r0 writer found; classification decided
+            if decided or not only_identity:
+                continue
+            # The ONLY r0 write in this function was an identity move, so r0 was
+            # set by the predecessor block. That is the interrupt-window idiom:
+            # `bie $rN` branches here, making this a function of its own, and the
+            # matching `ila $r0,<resume>` sits a few instructions back in LINEAR
+            # order (outside these bounds). Follow it, bounded, so `bid $r0`
+            # jumps to the resume address instead of unwinding to the caller.
+            # Gated on only_identity so a normal `brsl`-called function -- whose
+            # `bi $r0` genuinely returns and never touches r0 -- can never reach
+            # this scan and be misread as a jump.
+            g = idx_of[insn.addr]
+            for j in range(g - 1, max(-1, g - 1 - 12), -1):
+                w = ordered[j]
+                if not _writes_r0(w) or _is_identity_move(w):
+                    continue
+                if w.mnemonic in ("il", "ila"):
+                    jumps.add(insn.addr)
+                break
     return jumps
 
 
@@ -835,7 +891,7 @@ def main() -> None:
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
-              f"(r0 reloaded via lqa/lqr): "
+              f"(r0 set by lqa/lqr/il/ila, not a link): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:

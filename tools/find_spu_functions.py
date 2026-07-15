@@ -5,11 +5,13 @@ Find SPU function boundaries inside an embedded SPU ELF.
 Emits a JSON list of {"start": addr, "end": addr} ready for
 `spu_lifter.py --functions`.
 
-Seeds the function set from three sources:
+Seeds the function set from four sources:
   1. ELF entry point (e_entry).
   2. Symbol table -- STT_FUNC entries (with their st_value/st_size if size
      is non-zero, which gives us *exact* boundaries when present).
   3. All brsl/brasl targets the disassembler can resolve in the code.
+  4. Addresses loaded into $r0 by `il`/`ila` -- the link-register resume
+     idiom (see collect_link_register_targets).
 
 For each function start without a symbol-provided size, the end is
 determined by scanning forward until we hit one of:
@@ -165,6 +167,111 @@ def collect_branch_targets(insns):
     return targets
 
 
+def collect_link_register_targets(insns):
+    """Addresses loaded into $r0 (the SPU ABI link register) by an immediate.
+
+    Not every call site is a `brsl`. Both hand-written SPU code and the SDK's
+    shared stubs set up a resume address by hand and then reach the stub with a
+    PLAIN branch, because the stub is entered from several places and spills the
+    link register to LS rather than keeping it in $r0:
+
+        2ce0:  ila  $r0, 0x2cf0      <- resume address, set by hand
+        2ce4:  lqa  $r2, 0x12c0
+        2ce8:  cgti $r2, $r2, -1
+        2cec:  brnz $r2, 0x3038      <- plain branch, NOT brsl
+        2cf0:  lqa  $r0, 0x12a0      <- the stub returns HERE via `bi $r0`
+        ...
+        3038:  lqa  $r3, 0x13f0
+        3040:  stqa $r0, 0x1570      <- stub spills the hand-set link register
+
+    Nothing ever *branches* to 0x2cf0, so the branch-target scan cannot see it,
+    and the address is only ever materialised as an immediate. Without seeding
+    it the address is a mid-function label: the `bi $r0` return resolves through
+    spu_indirect_branch -> spu_lookup(), finds no registered function, and halts
+    the SPU (SPU_STATUS_STOPPED_BY_HALT). Observed in LBP's wwsjob SPURS policy
+    module, which halted at LS 0x2cf0 on every dispatch.
+
+    Restricted to $r0: setting the *link register* to a code address means
+    "resume here", which is a strong signal. Loading a code-looking constant
+    into any other register is usually just data (the same PM does
+    `ila $r81, 0x1440` for a table base). Over-seeding is cheap anyway -- the
+    lifter chains fall-through between adjacent functions -- but a tight filter
+    keeps the output honest.
+    """
+    targets = set()
+    for ins in insns:
+        if ins.mnemonic not in ("il", "ila"):
+            continue
+        ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        if len(ops) != 2 or ops[0] != "$r0":
+            continue
+        tok = ops[1]
+        try:
+            # `ila` renders hex ("0x2CF0"), `il` renders signed decimal.
+            targets.add(int(tok, 16) if tok.lower().startswith(("0x", "-0x"))
+                        else int(tok, 10))
+        except ValueError:
+            pass
+    return targets
+
+
+_INDIRECT_BR = {"bi", "bisl", "bisled", "biz", "binz", "bihz", "bihnz"}
+
+
+def collect_computed_branch_targets(insns, window=8):
+    """Targets of `bi $rN` where $rN was just loaded with an immediate address.
+
+    The link-register form (collect_link_register_targets) is not the only way
+    the SPU materialises a branch target as a constant. The interrupt-window
+    idiom uses a *scratch* register, because `bie`/`bid` (branch indirect and
+    enable/disable interrupts) are the only way to toggle the interrupt bit
+    atomically with a jump:
+
+        2d2c:  ila $r0, 0x2d40     <- where to resume once interrupts are off
+        2d30:  ila $r2, 0x2d38     <- where to land with interrupts on
+        2d34:  bie $r2             <- jump to 0x2d38, interrupts ENABLED
+        2d38:  ai  $r0, $r0, 0     <- the window: any pending interrupt fires here
+        2d3c:  bid $r0             <- jump to 0x2d40, interrupts DISABLED
+        2d40:  ...
+
+    We decode `bie`/`bid` as plain `bi` (the D/E bits only gate interrupts,
+    which we do not model -- the branch itself is identical), so both land in
+    spu_indirect_branch and both targets must be registered. 0x2d40 comes from
+    the $r0 scan; 0x2d38 only from here. Observed in LBP's wwsjob SPURS policy
+    module, which halted at 0x2d38 once the $r0 case was fixed.
+
+    Scans backward a short window for the nearest `il`/`ila` writing the branch
+    register -- the same "nearest preceding writer" technique compute_bi_r0_jumps
+    uses. Keeping the window local is what makes this precise: an `ila` feeding a
+    branch two instructions later is a jump target; a code-shaped constant loaded
+    somewhere else entirely is usually just data.
+    """
+    targets = set()
+    for idx, ins in enumerate(insns):
+        if ins.mnemonic not in _INDIRECT_BR:
+            continue
+        ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        # bi/bisl emit only the target reg; biz/binz/bihz/bihnz emit (cond, target).
+        if not ops or not ops[-1].startswith("$r"):
+            continue
+        reg = ops[-1]
+        for j in range(idx - 1, max(-1, idx - 1 - window), -1):
+            w = insns[j]
+            if w.mnemonic not in ("il", "ila"):
+                continue
+            wops = [t.strip() for t in w.operands.split(",") if t.strip()]
+            if len(wops) != 2 or wops[0] != reg:
+                continue
+            tok = wops[1]
+            try:
+                targets.add(int(tok, 16) if tok.lower().startswith(("0x", "-0x"))
+                            else int(tok, 10))
+            except ValueError:
+                pass
+            break   # nearest writer decides
+    return targets
+
+
 # Kept for backwards compatibility / call-only counting.
 def collect_brsl_targets(insns):
     return {t for ins in insns if ins.mnemonic in ("brsl", "brasl")
@@ -238,6 +345,14 @@ def detect_functions(buf, base_override=None, verbose=True):
                 sized_funcs.append((s["addr"], s["addr"] + s["size"]))
     for t in collect_branch_targets(insns):
         if code_start <= t < code_end:
+            seed_starts.add(t)
+    # Link-register resume addresses (`il`/`ila $r0, <code>` + a plain branch to
+    # a stub that returns via `bi $r0`). Require the target to be 4-byte aligned
+    # AND to decode as an instruction, so a scratch use of $r0 that happens to
+    # hold a small constant cannot seed a bogus function.
+    for t in (collect_link_register_targets(insns)
+              | collect_computed_branch_targets(insns)):
+        if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
 
     # Always cover the entry of the text segment itself (some images have no
