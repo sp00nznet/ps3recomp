@@ -89,6 +89,17 @@ spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
     return NULL;
 }
 
+spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_out)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            if (image_id_out) *image_id_out = s_registry[i].image_id;
+            return s_registry[i].fn;
+        }
+    if (image_id_out) *image_id_out = 0;
+    return NULL;
+}
+
 unsigned spu_workload_count(void) { return s_registry_count; }
 
 /* ---- SPU ELF loader (32-bit big-endian) -------------------------------- */
@@ -387,6 +398,30 @@ static DWORD WINAPI spu_async_thread(LPVOID p) { spu_async_run((spu_async_job*)p
 #else
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
+
+int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+                              uint32_t job_ea, uint32_t job_desc_size)
+{
+    if (!image || image_size == 0) return 0;
+
+    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    spu_lifted_entry_fn fn = NULL;
+    int image_id = 0;
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+    if (!fn) {
+        fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X\n",
+                (unsigned long long)fp, image_size, job_ea);
+        return 0;
+    }
+    fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
+            (unsigned long long)fp, image_id, job_ea);
+    fflush(stderr);
+    int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
+    fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
+    fflush(stderr);
+    return 1;
+}
 
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea)

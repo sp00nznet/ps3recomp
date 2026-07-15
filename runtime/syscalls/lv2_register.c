@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>   /* calloc, free */
+#include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
 #include "sys_ppu_thread.h"
 #include "sys_mutex.h"
@@ -1249,9 +1250,36 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
  * -----------------------------------------------------------------------*/
 lv2_syscall_table g_lv2_syscalls;
 
+/* Firmware imports that are ALSO lv2 syscalls.
+ *
+ * A title can reach these two ways: issue the raw `sc` (-> the syscall table
+ * above) or call the sysPrxForUser userland wrapper by NID (-> ps3_hle_call).
+ * LBP does the latter, and an unregistered NID falls to the unresolved-NID
+ * stub, which returns CELL_OK WITHOUT touching the caller's out-params -- so
+ * the caller reads its own uninitialised stack as the result. For
+ * sys_spu_image_import that means a garbage sys_spu_image {segs, nsegs}, and
+ * the caller (LBP func_00483498) then walks the bogus segment array until it
+ * runs off the end of memory: on hardware that segfaults immediately, but our
+ * demand-committed flat VM answers every stray read with a zero page, so it
+ * silently swept ~3 GB of address space and hung the boot.
+ *
+ * Bridge them onto the NID path so both entries hit the same implementation.
+ * The handlers already take the ppu_context and set gpr[3] themselves. */
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+
+#define LV2_HLE_BRIDGE(fn_name, handler)                                       static void fn_name(ppu_context* ctx) { (void)handler(ctx); }
+
+LV2_HLE_BRIDGE(hle_sys_spu_image_import, sys_spu_image_import_handler)
+LV2_HLE_BRIDGE(hle_sys_spu_image_open,   sys_spu_image_open_handler)
+
 void lv2_init_syscalls(void)
 {
     lv2_register_all_syscalls(&g_lv2_syscalls);
+
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spu_image_import"),
+                         "sys_spu_image_import", hle_sys_spu_image_import);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spu_image_open"),
+                         "sys_spu_image_open",   hle_sys_spu_image_open);
 }
 
 /* Returns 1 (and sets gpr[3] from the handler) if `num` is a registered

@@ -384,6 +384,19 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
+    /* Policy-module observation trace: every SPURS PM run's first transfers,
+     * always on (policy runs are rare and their DMA pattern is the primary
+     * bring-up signal: joblist fetch, job-module loads, output stores). */
+    if (spu->policy_mode) {
+        static int _pn = 0;
+        if (_pn < 96)
+            fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
+                    cmd, lsa, (unsigned long long)ea, size, tag);
+        else if (_pn == 96)
+            fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
+        _pn++;
+    }
+
     /* Execute the transfer */
     if (mfc_is_list(cmd)) {
         rc = mfc_do_list_transfer(spu, lsa, ea, size, cmd);

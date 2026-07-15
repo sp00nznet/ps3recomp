@@ -55,6 +55,41 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 
+/* As spu_workload_find, but also returns the image's indirect-branch table id. */
+spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_out);
+
+/* Run a SPURS policy module (raw PM binary loaded at LS 0xA00) under the HLE'd
+ * kernel handoff: kernel context at LS 0x100, entry ABI of
+ * cellSpursModuleEntry(context, ea) with the workload's u64 data in r4.
+ * Returns 0 if the module exited back to the kernel, negative otherwise.
+ * (spurs_policy.c) */
+int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+                          const uint8_t* pm_host, uint32_t pm_size,
+                          uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea);
+
+/* Stage and enter one SPURS jobchain job (spurs_job.c). Unlike a policy module
+ * or a task, a job binary is a raw image built by the SDK's job_elf-to-bin and
+ * linked against Sony's job_start_w_crt.o, whose entry contract is
+ *   cellSpursJobMain2(CellSpursJobContext2 *ctx, CellSpursJob256 *job)
+ * with r3 = ctx, r4 = job and BOTH pointers into local store. This lays out
+ * LS the way jm2 does (per
+ * _cellSpursCheckJob in the SDK's job_descriptor.h: binary+bss, ioBuffer,
+ * oBuffer, unified scratch+stack, cacheBuffer[0..3], all 1024-aligned), fills
+ * ioBuffer from the descriptor's input DMA list, builds the context, and runs
+ * the lifted entry. `job_desc_size` is the jobchain's sizeJobDescriptor (0 =>
+ * assume 256). Returns 0 if the job ran, negative if it could not be staged. */
+int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                      uint32_t job_ea, uint32_t job_desc_size);
+
+/* Fingerprint `image`, look up its lifted entry, and run it as a SPURS jobchain
+ * job via spu_run_spurs_job. Runs SYNCHRONOUSLY on the caller's thread: a job
+ * is not persistent (it runs to completion and returns to the manager), and a
+ * chain's jobs are ordered by its own NEXT/CALL/RET commands, so the jobchain
+ * thread is the right place to run them. Returns 1 if a lifted image matched
+ * and ran, 0 if none is registered for this binary. */
+int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+                              uint32_t job_ea, uint32_t job_desc_size);
+
 /* Load a 32-bit big-endian SPU ELF image into a 256 KB local store: each PT_LOAD
  * segment is copied to its p_vaddr (BSS zero-filled). Returns 1 on success and
  * writes the entry vaddr (e_entry, which may legitimately be 0) to *entry_out;

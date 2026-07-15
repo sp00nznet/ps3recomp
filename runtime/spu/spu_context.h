@@ -179,7 +179,20 @@ typedef struct spu_context {
     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
 
+    /* SPURS policy-module run mode (spurs_policy.c): nonzero while a lifted
+     * policy module runs under the HLE'd kernel handoff. spu_indirect_branch
+     * intercepts branches to the two reserved kernel-service addresses below
+     * only when this is set. */
+    int policy_mode;
+
 } spu_context;
+
+/* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
+ * base) that the HLE kernel plants as exitToKernelAddr / selectWorkloadAddr in
+ * the SpursKernelContext. A policy module branching to them is performing a
+ * kernel service; spu_indirect_branch intercepts (policy_mode only). */
+#define SPURS_PM_EXIT_TO_KERNEL_LS   0x9C0u
+#define SPURS_PM_SELECT_WORKLOAD_LS  0x9D0u
 
 /* ---------------------------------------------------------------------------
  * Initialization

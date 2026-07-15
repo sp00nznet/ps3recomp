@@ -461,6 +461,31 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    /* SPURS kernel services (policy-module runs only): the HLE kernel plants
+     * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
+     * the SpursKernelContext (spurs_policy.c). */
+    if (ctx->policy_mode) {
+        extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+        if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
+            /* Module exit: the workload returned to the kernel (drained/yield). */
+            g_spurs_pm_exited = 1;
+            fprintf(stderr, "[spurs-pm] exit-to-kernel (r3=0x%08X polls=%u)\n",
+                    ctx->gpr[3]._u32[0], g_spurs_pm_polls);
+            ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+            spu_halt(ctx);
+            return;
+        }
+        if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
+            /* cellSpursModulePoll: report "no contention — keep running".
+             * (One virtual SPU per workload here, so nothing ever preempts.) */
+            unsigned n = ++g_spurs_pm_polls;
+            if (n <= 4 || (n % 4096) == 0)
+                fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                        n, ctx->gpr[3]._u32[0]);
+            ctx->gpr[3] = spu_make_preferred_u32(0);
+            return;
+        }
+    }
     /* Taskset PM task-syscall entry (LS 0xA70): HLE it instead of branching into
      * (absent) PM code. The cri task (image 22) reaches here via syscallAddr. */
     if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR && ctx->image_id == 22) {
