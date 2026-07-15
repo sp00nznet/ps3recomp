@@ -113,10 +113,10 @@ static int dir_exists(const char* path)
  *   3. Dispatch the OPD via g_ps3_guest_caller with the guest pointers
  *   4. Read the structures back (game may have updated CBResult.result)
  *
- * Layout (sizes in PS3 ABI, all big-endian):
- *   CellSaveDataCBResult:    4 + 4 + 4 + 256        = 268 bytes
- *   CellSaveDataStatGet:     4 + 4 + 56 + 1408 + 24 + 4 ≈ 1500 bytes
- *   CellSaveDataStatSet:     4 + 4 + 4              = 12 bytes (pointers + reCreateMode)
+ * Layout (sizes in PS3 ABI, all big-endian, 32-bit pointers):
+ *   CellSaveDataCBResult:    4 + 4 + 4 + 4 + 4                = 20 bytes
+ *   CellSaveDataStatGet:     4 + 4 + 56 + 1552 + 4*5 + 4      = 1640 bytes
+ *   CellSaveDataStatSet:     4 + 4 + 4                        = 12 bytes (pointers + reCreateMode)
  *
  * We use a fixed scratch region at 0x024E0000 (128 KB, just before the
  * cmdbuf region at 0x02500000). Only one savedata operation is in flight
@@ -143,13 +143,30 @@ static uint32_t scratch_alloc(uint32_t size)
     return addr;
 }
 
-/* Big-endian struct field writers. Offsets are in PS3 ABI layout. */
-static void marshal_cbresult_init(uint32_t addr, s32 result)
+/* Big-endian struct field writers. Offsets are in PS3 ABI layout.
+ *
+ * CellSaveDataCBResult (sysutil_savedata.h) is 20 bytes, and invalidMsg is a
+ * POINTER, not an inline buffer:
+ *   int   result;                +0
+ *   unsigned int progressBarInc; +4
+ *   int   errNeedSizeKB;         +8
+ *   char *invalidMsg;            +12   (32-bit guest pointer, NULL when unused)
+ *   void *userdata;              +16   (32-bit guest pointer)
+ *
+ * userdata is the pointer the title handed to cellSaveData*(..., userdata) and
+ * it MUST be echoed back here: a callback typically recovers its own object
+ * from it. LBP's funcStat is literally
+ *     v = cbResult->userdata; r = (*(v+104))(cbResult, get, set); ...
+ * so leaving it zero made it dispatch through guest address 104, read the VM's
+ * zero-fill, and report CELL_SAVEDATA_CBRESULT_ERR_NODATA (-4) -- it never
+ * reached its own handler at all. */
+static void marshal_cbresult_init(uint32_t addr, s32 result, uint32_t userdata_ea)
 {
     vm_write32(addr + 0,  (uint32_t)result);     /* result */
     vm_write32(addr + 4,  0);                    /* progressBarInc */
     vm_write32(addr + 8,  0);                    /* errNeedSizeKB */
-    /* invalidMsg[256] left zero */
+    vm_write32(addr + 12, 0);                    /* invalidMsg = NULL */
+    vm_write32(addr + 16, userdata_ea);          /* userdata (echoed back) */
 }
 
 static s32 marshal_cbresult_read_result(uint32_t addr)
@@ -172,7 +189,7 @@ static s32 marshal_cbresult_read_result(uint32_t addr)
  */
 #define SAVEDATA_STATGET_SIZE   1640u
 #define SAVEDATA_STATSET_SIZE   16u    /* setParam ptr + reCreateMode + indicator ptr */
-#define SAVEDATA_CBRESULT_SIZE  272u   /* s32 + u32 + s32 + char[256] */
+#define SAVEDATA_CBRESULT_SIZE  20u    /* s32 + u32 + s32 + char* + void* */
 
 static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
                                   s32 sizeKB, u32 fileNum)
@@ -199,7 +216,8 @@ static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
 /* Dispatch funcStat callback via the guest-caller hook.
  * Returns the cbResult.result value the callback wrote, or
  * CELL_SAVEDATA_CBRESULT_ERR_FAILURE if no dispatcher is installed. */
-static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName)
+static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName,
+                              uint32_t userdata_ea)
 {
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
 
@@ -212,12 +230,12 @@ static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName
         return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
     }
 
-    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT);
+    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea);
     marshal_statget_init(get_ea, is_new, dirName, 0, 0);
     /* StatSet zero-init by scratch_alloc */
 
-    printf("[cellSaveData] dispatching funcStat OPD=0x%08X (cb=0x%X get=0x%X set=0x%X, isNew=%d)\n",
-           func_opd, cb_ea, get_ea, set_ea, is_new);
+    printf("[cellSaveData] dispatching funcStat OPD=0x%08X (cb=0x%X get=0x%X set=0x%X, isNew=%d, userdata=0x%08X)\n",
+           func_opd, cb_ea, get_ea, set_ea, is_new, userdata_ea);
     g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0);
 
     s32 result = marshal_cbresult_read_result(cb_ea);
@@ -905,7 +923,7 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
 {
     dirName = savedata_host_str(dirName);
     (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
-    (void)container; (void)userdata;
+    (void)container;
     printf("[cellSaveData] AutoLoad2(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
 
@@ -921,7 +939,10 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     int is_new = !dir_exists(save_path);
 
     uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
-    s32 cb = dispatch_func_stat(func_opd, is_new, dirName);
+    /* userdata arrives as a GUEST address in a pointer type (same convention as
+     * funcStat/dirName). The callback recovers its own object from it. */
+    uint32_t userdata_ea = (uint32_t)(uintptr_t)userdata;
+    s32 cb = dispatch_func_stat(func_opd, is_new, dirName, userdata_ea);
 
     if (cb < 0) {
         if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
@@ -975,7 +996,7 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
 {
     dirName = savedata_host_str(dirName);
     (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
-    (void)container; (void)userdata;
+    (void)container;
     printf("[cellSaveData] AutoLoad(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
     if (!dirName || !setBuf || !funcStat)
@@ -986,7 +1007,10 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
     int is_new = !dir_exists(save_path);
 
     uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
-    s32 cb = dispatch_func_stat(func_opd, is_new, dirName);
+    /* userdata arrives as a GUEST address in a pointer type (same convention as
+     * funcStat/dirName). The callback recovers its own object from it. */
+    uint32_t userdata_ea = (uint32_t)(uintptr_t)userdata;
+    s32 cb = dispatch_func_stat(func_opd, is_new, dirName, userdata_ea);
 
     if (cb < 0) {
         if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
@@ -1024,13 +1048,92 @@ s32 cellSaveDataUserAutoSave(u32 version, u32 userId, const char* dirName,
                                 funcStat, funcFile, container, NULL);
 }
 
+/* NOTE: the User* entry points take NINE arguments -- cellSaveDataUserAutoLoad
+ * inserts `userId` ahead of dirName, which pushes `userdata` into the ninth
+ * slot. The generic HLE adapter only forwards r3..r10 (eight), so the ninth
+ * argument is unreachable here and MUST come from the caller's parameter save
+ * area. That is what hle_cellSaveDataUserAutoLoad (below) is for; this plain-C
+ * entry only sees eight and cannot know userdata. It stays for direct/internal
+ * callers, and the ctx handler overrides it on the NID path. */
+/* ---------------------------------------------------------------------------
+ * Nine-argument entry points
+ *
+ * cellSaveDataUserAutoLoad/UserAutoSave take nine arguments; the generic HLE
+ * adapter forwards only r3..r10, so the ninth (userdata) never arrives and used
+ * to be hardcoded to NULL. That is fatal: a funcStat callback typically recovers
+ * its own object from cbResult->userdata. LBP's is
+ *     v = cbResult->userdata;  r = sub(v + 104, cbResult, get, set);
+ * so a NULL made it work off guest address 104, read the VM's zero-fill, and
+ * return CELL_SAVEDATA_CBRESULT_ERR_NODATA (-4) -- it never reached its handler.
+ *
+ * Take the full context and read the ninth argument from the caller's parameter
+ * save area. SAVEDATA_ARG9_SP_OFF can be overridden at runtime
+ * (PS3_SAVEDATA_ARG9_OFF) and the surrounding window is dumped once, so the
+ * offset is confirmed from a real call rather than assumed.
+ * -----------------------------------------------------------------------*/
+#include "../../runtime/ppu/ppu_context.h"
+
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+
+/* PPC64 ELFv1: back chain, CR, LR, 2 reserved, TOC = 48 bytes, then the
+ * parameter save area shadowing r3.. one doubleword each -> arg9 at SP+112. */
+#define SAVEDATA_ARG9_SP_OFF 112u
+
+static uint32_t savedata_arg9(ppu_context* ctx)
+{
+    uint32_t sp = (uint32_t)ctx->gpr[1];
+    static int off = -1;
+    if (off < 0) {
+        const char* e = getenv("PS3_SAVEDATA_ARG9_OFF");
+        off = e ? (int)strtol(e, NULL, 0) : (int)SAVEDATA_ARG9_SP_OFF;
+    }
+    { static int dumped = 0;
+      if (!dumped) { dumped = 1;
+        printf("[cellSaveData] caller SP=0x%08X param-save-area window:\n", sp);
+        for (uint32_t o = 48; o <= 136; o += 8)
+            printf("    SP+%3u = 0x%016llX%s\n", o,
+                   (unsigned long long)vm_read64(sp + o),
+                   o == (uint32_t)off ? "   <- taking as arg9 (userdata)" : "");
+      } }
+    return (uint32_t)vm_read64(sp + (uint32_t)off);
+}
+
+static void hle_cellSaveDataUserAutoLoad(ppu_context* ctx)
+{
+    u32   version   = (u32)ctx->gpr[3];
+    u32   userId    = (u32)ctx->gpr[4];
+    const char* dir = (const char*)(uintptr_t)(u32)ctx->gpr[5];
+    u32   errDialog = (u32)ctx->gpr[6];
+    void* setBuf    = (void*)(uintptr_t)(u32)ctx->gpr[7];
+    void* funcStat  = (void*)(uintptr_t)(u32)ctx->gpr[8];
+    void* funcFile  = (void*)(uintptr_t)(u32)ctx->gpr[9];
+    u32   container = (u32)ctx->gpr[10];
+    uint32_t userdata = savedata_arg9(ctx);
+
+    printf("[cellSaveData] UserAutoLoad(user=%u, userdata=0x%08X)\n", userId, userdata);
+    ctx->gpr[3] = (uint64_t)(int64_t)(s32)
+        cellSaveDataAutoLoad2(version, dir, errDialog,
+                              (CellSaveDataSetBuf*)setBuf,
+                              (CellSaveDataStatCallback)funcStat,
+                              (CellSaveDataFileCallback)funcFile,
+                              container, (void*)(uintptr_t)userdata);
+}
+
+void cellSaveData_register_ctx_handlers(void)
+{
+    /* Overrides the generated 8-arg registration: ctx handlers are dispatched
+     * before the generic table. */
+    ps3_hle_register_ctx(0xCDC6AEFDu, "cellSaveDataUserAutoLoad",
+                         hle_cellSaveDataUserAutoLoad);
+}
+
 s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
                              u32 errDialog, CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile, u32 container)
 {
     (void)userId;
-    printf("[cellSaveData] UserAutoLoad(user=%u)\n", userId);
+    printf("[cellSaveData] UserAutoLoad(user=%u) [8-arg path: userdata unavailable]\n", userId);
     return cellSaveDataAutoLoad(version, dirName, errDialog, setBuf,
                                 funcStat, funcFile, container, NULL);
 }
