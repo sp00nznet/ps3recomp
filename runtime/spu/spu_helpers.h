@@ -33,6 +33,21 @@ static inline int spu_clz32(uint32_t x) {
 static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
 #endif
 
+/* Architectural SPU barrier -- the lifted `sync`/`dsync`/`syncc` emission.
+ * SPU ISA v1.2 §13 (+ the per-instruction pages): order all earlier LS and
+ * channel accesses before later ones; LS must be consistent "if it were
+ * observed by another entity" (Table 13-6 is exactly this runtime's
+ * host-thread producer -> SPU consumer handoff). A no-op is neither a
+ * compiler nor a CPU barrier -- MSVC at /O2 may reorder plain LS accesses
+ * across an empty statement (the PPU twin of this bug is LESSONS #11d). A
+ * full fence: the locked exchange forces total order and is opaque to the
+ * optimizer. */
+#ifdef _MSC_VER
+static inline void spu_arch_fence(void) { long spu_fence_tmp = 0; _InterlockedExchange(&spu_fence_tmp, 1); }
+#else
+static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+#endif
+
 /* SPU byte position -> our _u8 index.
  * Our u128 is HOST-NATIVE little-endian (_u32[i]=SPU word i as a value via
  * spu_ls_read128's big-endian load), so within each 4-byte word the _u8[]
