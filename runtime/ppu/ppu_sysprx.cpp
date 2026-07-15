@@ -166,6 +166,12 @@ static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t self = (uint32_t)ctx->thread_id ? (uint32_t)ctx->thread_id : LWM_TID;
+    /* lv2 ABI: r4 = timeout in microseconds, 0 = infinite. The real kernel
+     * returns ETIMEDOUT (0x8001000B) when the wait expires; games rely on that
+     * (e.g. LBP's resource loader locks with a 2s timeout in a retry loop so a
+     * contended lock yields to other threads instead of hard-blocking). We had
+     * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
+    uint64_t timeout_us = ctx->gpr[4];
 #ifdef _WIN32
     HANDLE s = lwm_sem(lwm);
     if (s) {
@@ -178,12 +184,19 @@ static void sys_lwmutex_lock(ppu_context* ctx)
         }
         if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) {
             /* Contended: log who we're stuck behind (owner stamped at acquire),
-             * then block for real. Bounded diagnostics for park hunts; uncapped
-             * while the probe window is open (g_nd_inpump). */
+             * then block. Bounded diagnostics for park hunts; uncapped while the
+             * probe window is open (g_nd_inpump). */
             static long _bl = 0; long _b = ++_bl;
-            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u\n",
-                (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), vm_read32(lwm + LWM_RECUR));
-            WaitForSingleObject(s, INFINITE);
+            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u tmo=%lluus\n",
+                (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), vm_read32(lwm + LWM_RECUR),
+                (unsigned long long)timeout_us);
+            DWORD ms = INFINITE;
+            if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
+            DWORD wr = WaitForSingleObject(s, ms);
+            if (wr == WAIT_TIMEOUT) {           /* honor the timeout: ETIMEDOUT, no acquire */
+                ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
+                return;
+            }
             if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
         }
     }

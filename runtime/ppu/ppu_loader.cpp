@@ -1053,11 +1053,20 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     static uint32_t stuckmax = 0; if (!stuckmax) { const char* e=getenv("YDKJ_STUCKMAX"); stuckmax = e?(uint32_t)strtoul(e,0,0):2000u; }
     uint32_t cur = (uint32_t)ctx->ctr;
     if (cur == last) {
-        if (++streak == stuckmax) { fprintf(stderr, "[ppu] FATAL: stuck calling 0x%08X (%u times) -- aborting run\n", cur, streak); fflush(stderr); exit(3); }
+        if (++streak == stuckmax) {
+            fprintf(stderr, "[ppu] FATAL: stuck calling 0x%08X (%u times) -- aborting run\n", cur, streak);
+            fprintf(stderr, "[ppu]   tid=%llu lr=0x%08X r2=0x%08X r3=0x%08X r31=0x%08X\n",
+                    (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[2],
+                    (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[31]);
+            ppu_log_host_chain("stuck-caller");
+            ppu_dump_guest_stack(ctx, "stuck-caller");
+            fflush(stderr); exit(3);
+        }
         return;   /* don't spam the log on a tight retry loop */
     }
     last = cur; streak = 0;
-    fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X\n", (uint32_t)ctx->ctr);
+    fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X (tid=%llu lr=0x%08X)\n",
+            (uint32_t)ctx->ctr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
     static int dumped = 0;
     if (dumped < 3) {
         dumped++;

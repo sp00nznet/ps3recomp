@@ -137,6 +137,25 @@ typedef struct CellPadInfo2 {
     u32 device_type[CELL_PAD_MAX_PORT_NUM];
 } CellPadInfo2;
 
+/* Peripheral-class view of the ports (cellPadPeriphGetInfo). Extends the
+ * CellPadInfo2 field set with the peripheral class (guitar/drums/DJ/...);
+ * a normal DUALSHOCK reports pclass_type STANDARD with no profile bits.
+ * Layout must match SDK cell/pad/pad_codes.h -- all u32. */
+typedef struct CellPadPeriphInfo {
+    u32 max_connect;
+    u32 now_connect;
+    u32 system_info;
+    u32 port_status[CELL_PAD_MAX_PORT_NUM];
+    u32 port_setting[CELL_PAD_MAX_PORT_NUM];
+    u32 device_capability[CELL_PAD_MAX_PORT_NUM];
+    u32 device_type[CELL_PAD_MAX_PORT_NUM];
+    u32 pclass_type[CELL_PAD_MAX_PORT_NUM];
+    u32 pclass_profile[CELL_PAD_MAX_PORT_NUM];
+} CellPadPeriphInfo;
+
+/* Peripheral class types (SDK pad_codes.h) */
+#define CELL_PAD_PCLASS_TYPE_STANDARD   0
+
 /* Capability info for a specific port */
 typedef struct CellPadCapabilityInfo {
     u32 info[CELL_PAD_MAX_CODES];
@@ -162,6 +181,7 @@ s32 cellPadGetData(u32 port_no, CellPadData* data);
 
 /* NID: 0x8B8013DA */
 s32 cellPadGetInfo2(CellPadInfo2* info);
+s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info);
 
 /* NID: 0xA703A51D */
 s32 cellPadSetPortSetting(u32 port_no, u32 port_setting);
