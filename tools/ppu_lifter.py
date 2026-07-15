@@ -3107,6 +3107,19 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                         count = _c
         if count is None or count < 0 or count > 4096:
             count = 256
+        # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
+        # counting: the backward window spans sibling basic blocks, so it can
+        # latch a per-case test (`cmpwi rIdx, k`) instead of the real bounds
+        # check and silently truncate the table. A truncated table drops real
+        # cases, and the runtime `bctr` then lands on an unlifted mid-function
+        # address -> "unresolved indirect call" -> the caller runs on garbage.
+        # (LBP func_0038F380: a 31-entry offset table decoded as 19 because a
+        # stray `cmpwi 18` won; case 22 = 0x0038F754 fell through to the global
+        # dispatcher -- which only knows function ENTRIES, not mid-function
+        # labels -- and the boot died in a storm of vcalls through a job
+        # descriptor's name string.) The per-entry validation below already
+        # finds the true end, so scan generously and let it terminate.
+        scan = min(max(count + 1, 256), 4096)
 
         # Multi-TOC executables (e.g. LBP: two TOCs, ~3.6k/2.2k functions each)
         # load the table base relative to WHICHEVER r2 their function runs
@@ -3128,8 +3141,20 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             if table_base is None:
                 continue
             targets = []
-            for k in range(count + 1):
-                v = read_u32((table_base + k * 4) & 0xFFFFFFFF)
+            for k in range(scan):
+                ea = (table_base + k * 4) & 0xFFFFFFFF
+                # Structural end-of-table: a jump table never overlaps the code
+                # it dispatches to, so once the cursor reaches the lowest case
+                # target that lies AHEAD of the table, the table has ended. (The
+                # gcc/SN pattern puts the table immediately before its cases:
+                # LBP func_0038F380's table is 0x38F4F0..0x38F56C and case[0] IS
+                # 0x38F56C.) Forward targets only -- a table whose cases branch
+                # backwards would otherwise bound at k=0.
+                fwd = [t for t in targets if t > table_base]
+                if fwd and ea >= min(fwd):
+                    _dbg(all_insns[i].addr, f"  stop at k={k}: cursor 0x{ea:X} reached first case 0x{min(fwd):X}")
+                    break
+                v = read_u32(ea)
                 if v is None:
                     break
                 if is_offset:
