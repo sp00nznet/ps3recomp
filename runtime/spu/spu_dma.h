@@ -210,6 +210,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     { extern int g_cri_video_dma;
       if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
+    /* DIAGNOSTIC (LBP_SKIP_NULL_DMA): a GET from a null/near-null EA reads guest
+     * memory at ~0 (the ELF header / low mem) = garbage. The FMOD SPU mixer's DSP
+     * buffer pointers are 0 in our run; if the real task would SKIP a null DSP
+     * input (output silence), zeroing the LS target instead of reading garbage
+     * lets us test whether the task then PROGRESSES (reaches a PUT / signals the
+     * event flag) vs still loops. If it progresses, the null buffers are tolerable
+     * and our lift is DMAing where HW skips; if not, the buffers must be real. */
+    if (mfc_is_get(cmd) && (uint32_t)ea < 0x10000u) {
+        static int s_skip = -1; if (s_skip < 0) s_skip = getenv("LBP_SKIP_NULL_DMA") ? 1 : 0;
+        if (s_skip) {
+            static int _n = 0; if (_n++ < 20)
+                fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
+                        spu->image_id, (uint32_t)ea, size);
+            memset(ls_ptr, 0, size);
+            return 0;
+        }
+    }
     if (mfc_is_get(cmd)) {
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);

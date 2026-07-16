@@ -615,6 +615,28 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         fprintf(stderr, "  +%03X: %08X %08X %08X %08X\n", o,
                                 vm_read32(ho+o), vm_read32(ho+o+4), vm_read32(ho+o+8), vm_read32(ho+o+12));
                 }
+                /* The descriptor block the SPU task actually DMAs + reads its buffer
+                 * pointers from: v10[336..] at v10+1344 = arg[3]-64 (arg[3]=v10+1408).
+                 * v10[344]=a1[141], v10[345]=a1[140] (the FMOD DSP buffers). If those
+                 * words are 0 here, they are the null source (task GETs from EA 0). */
+                uint32_t d = task_arg[3];
+                if (d >= 0x10040 && d < 0x50000000u) {
+                    uint32_t db = d - 64;   /* 0x0094F6C0 = v10+1344 */
+                    fprintf(stderr, "[descblk] v10+1344=0x%08X (a1[141]@+0x20, a1[140]@+0x24):\n", db);
+                    for (int o = 0; o < 0x40; o += 16)
+                        fprintf(stderr, "  +%02X: %08X %08X %08X %08X\n", o,
+                                vm_read32(db+o), vm_read32(db+o+4), vm_read32(db+o+8), vm_read32(db+o+12));
+                }
+                /* a1 (the FMOD object) = taskId_ea - 628 (sub_48420C passes the taskId
+                 * out-param as (_DWORD)a1+628 for task 0). a1[140]/a1[141] (= a1+0x230/
+                 * +0x234) are the null DSP-buffer fields. Log the EAs so the next run
+                 * can YDKJ_WWATCH=<a1+0x230> to catch who should write it (or prove no
+                 * one does). Only for task 0 (offset 628); task 1 uses +688. */
+                uint32_t a1 = (uint32_t)(uintptr_t)taskId - 628u;
+                if (a1 < 0x50000000u)
+                    fprintf(stderr, "[a1obj] a1=0x%08X  a1+0x230(dsp0)=0x%08X val=0x%08X  "
+                            "a1+0x234(dsp1)=0x%08X val=0x%08X\n", a1,
+                            a1+0x230, vm_read32(a1+0x230), a1+0x234, vm_read32(a1+0x234));
                 fflush(stderr);
             }
 

@@ -504,8 +504,15 @@ void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
 #ifdef _WIN32
-        void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(NULL);
-        fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra_rva=0x%llX\n", ea, v, (unsigned long long)((char*)ra-mb));
+        /* Full host backtrace, not just ra: lifted `bl` is a plain C call, so the
+         * host stack walks through every lifted caller INCLUDING vtable dispatch
+         * (ps3_indirect_call) -- the only way to see past no-xref indirect calls.
+         * Resolve RVAs against the linker map (e.g. lbp/build/lbp_ps3.map). */
+        static int _wn=0; if (_wn++ < 400) {
+        char* mb=(char*)GetModuleHandleA(NULL); void* bt[28]; unsigned short fr=RtlCaptureStackBackTrace(0,28,bt,0);
+        char ln[1000]; int p=snprintf(ln,sizeof ln,"[WWATCH] write32 0x%08X = 0x%08X bt:",ea,v);
+        for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
+        fprintf(stderr,"%s\n",ln); }
 #else
         fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p\n", ea, v, __builtin_return_address(0));
 #endif
