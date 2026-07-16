@@ -143,8 +143,13 @@ typedef struct spu_context {
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
 
-    /* Decrementer (a free-running down counter) */
+    /* Decrementer: a free-running down counter, ticking at the PS3 timebase.
+     * SPU_WrDec latches the reload value here and stamps dec_base_ns; SPU_RdDec
+     * derives the live value from the host clock. Storing only the written
+     * value (and returning it unchanged) makes every timed wait immortal --
+     * see SPU_RdDec in spu_channels.c. */
     uint32_t decrementer;
+    uint64_t dec_base_ns;
 
     /* SRR0 - Save/Restore Register (exception return address) */
     uint32_t srr0;

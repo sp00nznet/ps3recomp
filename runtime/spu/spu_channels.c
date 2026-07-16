@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -24,6 +25,30 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* The SPU decrementer ticks at the PS3 timebase, 79.8 MHz -- the same clock
+ * sys_time_get_timebase_frequency reports to the PPU. Titles calibrate real
+ * delays against it, so the rate has to be right, not merely non-zero. */
+#define SPU_DECREMENTER_HZ  79800000ull
+
+static uint64_t spu_host_ns(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER s_freq;
+    LARGE_INTEGER c;
+    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
+    QueryPerformanceCounter(&c);
+    /* Split the divide to keep the multiply from overflowing: QPC counters are
+     * large enough that (count * 1e9) wraps a u64 within hours of uptime. */
+    return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
+         + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
+           / (uint64_t)s_freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
 
 /* ---------------------------------------------------------------------------
  * Clean SPU job abort (longjmp). The `br .` halt idiom and other terminal
@@ -298,7 +323,8 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                            ctx->spu_group_id, ctx->spu_id, v); }
         if (g_spu_out_mbox_hook) g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id, 1, v);
         break;
-    case SPU_WrDec:          ctx->decrementer = v;                          break;
+    case SPU_WrDec:          ctx->decrementer = v;
+                             ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:     ctx->event_status &= ~v;                       break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
@@ -336,7 +362,32 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     case SPU_RdInMbox:      v = spu_channel_read(&ctx->ch_in_mbox);     break;
     case SPU_RdSigNotify1:  v = spu_channel_read(&ctx->ch_sig_notify[0]); break;
     case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
-    case SPU_RdDec:         v = ctx->decrementer;                       break;
+    /* The decrementer must actually DECREMENT. Returning the latched WrDec
+     * value verbatim makes every `rdch $ch8` deadline poll spin forever: the
+     * elapsed-time term is always zero, so the deadline never passes. LBP's
+     * wwsjob SPURS policy module hangs on exactly that at LS 0x2D68:
+     *
+     *     2d6c:  lqa   $2, 0x1530     ; deadline
+     *     2d74:  rdch  $5, $ch8       ; now  <- always read 0
+     *     2d78:  sf    $6, $2, $5     ; now - deadline
+     *     2d80:  cgti  $5, $6, 0
+     *     2d88:  binz  $2, $0         ; leave once it goes positive
+     *
+     * It never leaves, never reaches its first DMA, and blocks the workload.
+     * Wraparound on subtract is deliberate -- it is what hardware does, and the
+     * `cgti > 0` test above is written to tolerate it. */
+    case SPU_RdDec: {
+        /* Never armed by a WrDec: stamp the base on first read rather than
+         * measuring from epoch 0, which would subtract the host's entire
+         * uptime and hand back a wild value to code that has every right to
+         * read the decrementer before writing it. */
+        if (!ctx->dec_base_ns) ctx->dec_base_ns = spu_host_ns();
+        uint64_t elapsed = spu_host_ns() - ctx->dec_base_ns;
+        uint32_t ticks   = (uint32_t)((elapsed * SPU_DECREMENTER_HZ)
+                                      / 1000000000ull);
+        v = ctx->decrementer - ticks;
+        break;
+    }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
     case SPU_RdEventStat:   v = ctx->event_status;                      break;
     case SPU_RdMachStat:    v = (ctx->status == SPU_STATUS_RUNNING) ? 1 : 0; break;
@@ -610,10 +661,31 @@ void spu_trace_init(const char* path)
     if (!s_trace_fp) s_trace_fp = stderr;
 }
 
+/* Bounded by design: a --trace lift emits one call PER INSTRUCTION, so an image
+ * that spins (a persistent SPURS policy module polling its job queue never
+ * returns) would otherwise write stderr until the disk fills. The cap keeps the
+ * useful part -- the entry path plus enough revolutions to show what the loop
+ * tests -- and the tail IS the loop. SPU_TRACE_MAX=0 restores unbounded.
+ * SPU_TRACE_FILE redirects off stderr so the trace does not interleave with the
+ * boot log. */
 void spu_trace_pc(spu_context* ctx, uint32_t pc)
 {
     (void)ctx;
+    static long long s_left = -1;
+    if (s_left < 0) {
+        const char* p = getenv("SPU_TRACE_FILE");
+        if (p && *p && !s_trace_fp) spu_trace_init(p);
+        const char* m = getenv("SPU_TRACE_MAX");
+        s_left = (m && *m) ? atoll(m) : 200000;
+        if (s_left == 0) s_left = -2;          /* -2 = unbounded */
+    }
     if (!s_trace_fp) s_trace_fp = stderr;
+    if (s_left == 0) return;
+    if (s_left > 0 && --s_left == 0) {
+        fprintf(s_trace_fp, "-- SPU_TRACE_MAX reached; trace stopped --\n");
+        fflush(s_trace_fp);
+        return;
+    }
     fprintf(s_trace_fp, "%05X\n", pc & SPU_LS_MASK);
 }
 
