@@ -108,12 +108,10 @@ unsigned spu_workload_count(void) { return s_registry_count; }
 static uint16_t rd_be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static uint32_t rd_be32(const uint8_t* p)
 {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
 }
 
-int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls,
-                       uint32_t* entry_out)
+int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls, uint32_t* entry_out)
 {
     if (!image || !ls || image_size < 0x34) return 0;
 
@@ -220,8 +218,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 
     uint32_t entry = 0;
     if (!spu_elf_load_to_ls(image, image_size, ls, &entry)) {
-        fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: not a valid SPU ELF\n",
-                (unsigned long long)fp);
+        fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: not a valid SPU ELF\n", (unsigned long long)fp);
         free(ls);
         return 0;
     }
@@ -251,6 +248,8 @@ typedef struct {
     int                 image_id;
     uint32_t            r3[4];        /* captured race-free at dispatch time */
     int                 have_r3;
+    uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
+    uint32_t            taskid;
 } spu_async_job;
 
 static void spu_async_run(spu_async_job* j)
@@ -364,14 +363,29 @@ static void spu_async_run(spu_async_job* j)
              * Build the context here from the real taskset CreateTask recorded;
              * spu_run_lifted_job_abi then sets r3/r4 off the 0xA70 sentinel.
              * Env-gated while bringing this up — default leaves every path as-is. */
+            /* Timing probe: a real SPURS task is dispatched when work is signaled.
+             * We dispatch immediately at CreateTask. If LBP fills the task's work
+             * buffer slightly LATER, delaying the run lets it see real data (=>
+             * timing bug, fix = defer/re-dispatch on signal); if it still loops on
+             * a null base, the buffer is never filled (=> an audio HLE gap). */
+            if (j->image_id != 22) {
+                const char* d = getenv("LBP_TASK_DELAY");
+                if (d && *d) {
+#ifdef _WIN32
+                    Sleep((unsigned)(atoi(d) * 1000));
+#endif
+                }
+            }
             if (j->image_id != 22 && getenv("LBP_TASKSET")) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
-                extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-                if (g_ydkj_real_taskset_ea) {
-                    spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                /* Use the taskset+taskid captured for THIS job at dispatch (not the
+                 * globals, which the next CreateTask clobbers -- the race that made
+                 * both audio tasks run task 1's descriptor). */
+                if (j->taskset_ea) {
+                    spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
                     fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
                             "taskset=0x%08X task=%u\n", j->image_id,
-                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid); fflush(stderr);
+                            j->taskset_ea, j->taskid); fflush(stderr);
                 }
             }
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
@@ -445,6 +459,12 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
+    /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
+     * set the globals for THIS task). Reading them later in the async thread races
+     * the next CreateTask overwriting the single-slot globals -- with two audio
+     * tasks that made both run task 1's descriptor. */
+    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is

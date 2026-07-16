@@ -549,6 +549,18 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         fprintf(stderr, " %08X", vm_read32(p + o));
                     fprintf(stderr, "\n");
                 }
+                /* Full heap object (arg[2], the audio engine object): the count the
+                 * PPU validated is at +0xC8 (16-aligned, <=0x160 = stream count); the
+                 * task's per-stream buffer pointers live at +0x124 (=arg[1]). Dump
+                 * +0x00..+0x160 so we can see: 0 streams (task should yield) vs N
+                 * streams with null data buffers (fill gap). */
+                uint32_t ho = task_arg[2];
+                if (ho >= 0x10000 && ho < 0x50000000u) {
+                    fprintf(stderr, "[heapobj] 0x%08X count@+0xC8=0x%08X\n", ho, vm_read32(ho + 0xC8));
+                    for (int o = 0; o < 0x160; o += 16)
+                        fprintf(stderr, "  +%03X: %08X %08X %08X %08X\n", o,
+                                vm_read32(ho+o), vm_read32(ho+o+4), vm_read32(ho+o+8), vm_read32(ho+o+12));
+                }
                 fflush(stderr);
             }
 
