@@ -272,6 +272,75 @@ def collect_computed_branch_targets(insns, window=8):
     return targets
 
 
+def collect_jump_table_targets(insns, code, code_start, code_end,
+                               window=10, max_entries=32):
+    """Targets reached through an in-code JUMP TABLE:
+
+        ila  $r14, 0x1724C          <- TABLE base (an LS address in .text)
+        shli $r13, $r15, 2          <- selector * 4
+        lqx  $r11, $r13, $r14       <- load the 16-byte line holding the entry
+        rotqby $r3, $r11, $r12      <- extract the 32-bit entry
+        bi   $r3                    <- dispatch
+
+    The `ila` materialises the table ADDRESS, not a branch target, so the
+    il/ila-into-branch-register scans never see the entries — none of the
+    handlers get lifted, every dispatch lands in spu_indirect_branch as a
+    lookup MISS, and the C call chain silently unwinds to the lifted caller:
+    the handler is skipped AND the guest stack frame is never restored.
+    (Observed in LBP's FMOD SPU mixer: the 7-entry DSP-node table at LS
+    0x1724C leaked 0x60 of guest stack per mix cycle until the task's LS was
+    destroyed — and the skipped handlers were the entire DSP graph.)
+
+    Recognizer: an indirect branch through $rN, preceded in a short window by
+    (a) an `il`/`ila` into a DIFFERENT register whose immediate lands inside
+    the code segment, and (b) a quadword load (the table read) between the
+    two. The table words are then read from the image: consecutive BE u32
+    values are taken as entries while they are 4-aligned addresses inside the
+    code segment (the first out-of-range word — typically adjacent float/data
+    constants — terminates the table).
+    """
+    _LOADS = {"lqx", "lqd", "lqa", "lqr"}
+    targets = set()
+    for idx, ins in enumerate(insns):
+        if ins.mnemonic not in _INDIRECT_BR:
+            continue
+        ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        if not ops or not ops[-1].startswith("$r"):
+            continue
+        branch_reg = ops[-1]
+        saw_load = False
+        for j in range(idx - 1, max(-1, idx - 1 - window), -1):
+            w = insns[j]
+            if w.mnemonic in _LOADS:
+                saw_load = True
+                continue
+            if w.mnemonic not in ("il", "ila"):
+                continue
+            wops = [t.strip() for t in w.operands.split(",") if t.strip()]
+            if len(wops) != 2 or wops[0] == branch_reg:
+                continue        # same-reg case is the direct-target idiom
+            try:
+                tok = wops[1]
+                tbl = int(tok, 16) if tok.lower().startswith(("0x", "-0x")) else int(tok, 10)
+            except ValueError:
+                continue
+            if not saw_load:
+                continue        # no table read between ila and bi
+            if not (code_start <= tbl < code_end) or (tbl & 3):
+                continue
+            off = tbl - code_start
+            for k in range(max_entries):
+                o = off + 4 * k
+                if o + 4 > len(code):
+                    break
+                wrd = int.from_bytes(code[o:o + 4], "big")
+                if (wrd & 3) or not (code_start <= wrd < code_end):
+                    break
+                targets.add(wrd)
+            break               # nearest qualifying ila decides
+    return targets
+
+
 # Kept for backwards compatibility / call-only counting.
 def collect_brsl_targets(insns):
     return {t for ins in insns if ins.mnemonic in ("brsl", "brasl")
@@ -351,7 +420,8 @@ def detect_functions(buf, base_override=None, verbose=True):
     # AND to decode as an instruction, so a scratch use of $r0 that happens to
     # hold a small constant cannot seed a bogus function.
     for t in (collect_link_register_targets(insns)
-              | collect_computed_branch_targets(insns)):
+              | collect_computed_branch_targets(insns)
+              | collect_jump_table_targets(insns, code, code_start, code_end)):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
 

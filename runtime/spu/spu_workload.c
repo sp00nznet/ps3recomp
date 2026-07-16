@@ -462,6 +462,83 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     return 1;
 }
 
+/* ---- SPURS task signal channel (real WAIT_SIGNAL semantics) --------------
+ *
+ * Mirrors the kernel/RPCS3 contract (spursTasksetProcessSyscall):
+ *   - _cellSpursSendSignal / cellSpursEventFlagSet mark the task's bit in the
+ *     taskset's `signalled` bitset (BE, in the GUEST CellSpursTaskset) and
+ *     wake it if sleeping.
+ *   - The WAIT_SIGNAL taskset syscall consumes a pending signal, or sleeps
+ *     the task until one arrives (POLL_SIGNAL-then-wait, no lost wakeups:
+ *     the guest bit is set under the same lock the waiter checks it).
+ * The bitset is guest state (SPU-visible); the host lock/condvar exist only
+ * to block and wake the task's host thread. */
+#include "../../libs/spurs/spurs_taskset.h"
+
+#ifdef _WIN32
+static SRWLOCK            s_sig_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_sig_cv;   /* zero-init == CONDITION_VARIABLE_INIT */
+#else
+static pthread_mutex_t s_sig_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
+#endif
+
+/* Deliver a signal to a task (callable from any PPU/host thread). */
+void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+{
+    if (!taskset_ea || taskId >= 128) return;
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_sig_lock);
+    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    WakeAllConditionVariable(&s_sig_cv);
+    ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+    pthread_mutex_lock(&s_sig_lock);
+    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    pthread_cond_broadcast(&s_sig_cv);
+    pthread_mutex_unlock(&s_sig_lock);
+#endif
+    { static int _n = 0; if (_n++ < 24)
+        fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
+                taskId, taskset_ea); fflush(stderr); }
+}
+
+/* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
+ * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
+ * until one is delivered. Returns 0 (the syscall's success rc). */
+int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+{
+    if (!taskset_ea || taskId >= 128) return 0;
+    unsigned secs = 0;
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_sig_lock);
+    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
+        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+            static int _n = 0;
+            if (++secs && _n < 16) { _n++;
+                fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+                        "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+        }
+    }
+    spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+    pthread_mutex_lock(&s_sig_lock);
+    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+        if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+            static int _n = 0;
+            if (++secs && _n < 16) { _n++;
+                fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+                        "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+        }
+    }
+    spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    pthread_mutex_unlock(&s_sig_lock);
+#endif
+    return 0;
+}
+
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea)
 {

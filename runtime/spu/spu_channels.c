@@ -499,7 +499,28 @@ static void spu_spurs_taskset_syscall(spu_context* ctx)
         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
         return;
     }
-    /* EXIT(0, cri bootstrap)/YIELD(1)/WAIT_SIGNAL(2)/POLL(3)/RECV_WKL_FLAG(4):
+    /* WAIT_SIGNAL(2): REAL semantics (RPCS3 spursTasksetProcessSyscall) --
+     * consume the task's bit in the guest taskset's `signalled` bitset, or
+     * SLEEP this task's host thread until _cellSpursSendSignal /
+     * cellSpursEventFlagSet delivers one (the FMOD mixer's flag-A wait path:
+     * the task registers its wait slot in the flag struct with atomics, then
+     * syscalls WAIT_SIGNAL; the PPU-side Set satisfies the slot and signals).
+     * Returning "success" here without waiting made the task spin on empty
+     * work state forever -- the LBP boot deadlock. taskset/taskId come from
+     * the SpursTasksetContext this runtime planted at LS 0x2700. */
+    if (num == 2) {
+        uint32_t ts  = ((uint32_t)ctx->ls[0x27BC] << 24) | ((uint32_t)ctx->ls[0x27BD] << 16) |
+                       ((uint32_t)ctx->ls[0x27BE] << 8)  |  (uint32_t)ctx->ls[0x27BF];
+        uint32_t tid = ((uint32_t)ctx->ls[0x27D4] << 24) | ((uint32_t)ctx->ls[0x27D5] << 16) |
+                       ((uint32_t)ctx->ls[0x27D6] << 8)  |  (uint32_t)ctx->ls[0x27D7];
+        if (ts) {
+            extern int spu_taskset_wait_signal(uint32_t, uint32_t);
+            spu_taskset_wait_signal(ts, tid);
+        }
+        ctx->gpr[3]._u32[0] = 0;
+        return;
+    }
+    /* EXIT(0, cri bootstrap)/YIELD(1)/POLL(3)/RECV_WKL_FLAG(4):
      * report success and resume (return -> lifted caller continues at its link). */
     ctx->gpr[3]._u32[0] = 0;
 }
