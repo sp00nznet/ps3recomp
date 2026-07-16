@@ -538,9 +538,18 @@ void spu_indirect_branch(spu_context* ctx)
         }
     }
     /* Taskset PM task-syscall entry (LS 0xA70): HLE it instead of branching into
-     * (absent) PM code. The cri task (image 22) reaches here via syscallAddr. */
-    if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR && ctx->image_id == 22) {
-        spu_spurs_taskset_syscall(ctx); return;
+     * (absent) PM code. Fires for the cri task (image 22) AND any generic taskset
+     * task whose SpursTasksetContext we planted -- detected by the syscallAddr
+     * sentinel at LS 0x27C4 (== 0xA70), which only spurs_pm_build_context writes.
+     * Without generalizing this, an LBP FMOD task that reaches its EXIT/YIELD
+     * syscall would branch into empty LS 0xA70 and halt as "branch-to-0" instead
+     * of cleanly exiting. */
+    if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
+        uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
+                    | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
+        if (ctx->image_id == 22 || sc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
+            spu_spurs_taskset_syscall(ctx); return;
+        }
     }
     /* YDKJ_CRI_R4: the taskset policy entry (LS 0xA00, image 23) writes r4 into
      * SpursTasksetContext.taskset @LS 0x27B8 (per RPCS3 cellSpursSpu.cpp). Our
