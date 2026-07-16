@@ -526,11 +526,27 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * Task
  * =====================================================================*/
 
+/* Real SDK ABI (verified against RPCS3 cellSpurs.cpp:370):
+ *   cellSpursCreateTask(taskset, taskId, elf, context, sizeContext,
+ *                       CellSpursTaskLsPattern* lsPattern,
+ *                       CellSpursTaskArgument*  argument)
+ * -- SEVEN args (r3..r9), not six. The old 6-arg form treated r8 as an opaque
+ * `attr` and never read r9 (the argument), so the task's 16-byte work-descriptor
+ * argument was dropped and TaskInfo.args stayed 0. LBP's audio task DMAs its work
+ * from an EA computed out of r3 = that argument (spu_0003 task main @0x17e70:
+ * `wrch $ch18, f(r3.word3)`), so a zero argument makes it GET from EA 0 and
+ * stall. lsPattern/argument arrive as guest EAs (generic adapter forwards r3..r10). */
 s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
-                        CellSpursTaskAttribute* attr)
+                        u32 lsPattern_ea, u32 argument_ea)
 {
-    (void)context; (void)sizeContext; (void)attr;
+    (void)context; (void)sizeContext;
+
+    /* Read the 16-byte CellSpursTaskArgument + optional LS pattern from guest mem. */
+    uint32_t task_arg[4] = {0,0,0,0};
+    uint32_t task_lsp[4] = {0,0,0,0};
+    if (argument_ea)  for (int _i=0;_i<4;_i++) task_arg[_i] = vm_read32(argument_ea + _i*4);
+    if (lsPattern_ea) for (int _i=0;_i<4;_i++) task_lsp[_i] = vm_read32(lsPattern_ea + _i*4);
 
     /* Capture guest EAs BEFORE host translation (the real BE taskset builder + the
      * SPU DMA use guest EAs). */
@@ -566,13 +582,13 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
             spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
-                                   (uint64_t)context_ea, /*arg*/NULL, /*ls_pattern*/NULL);
+                                   (uint64_t)context_ea, task_arg, task_lsp);
             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p) - task logged\n",
-                   s_tasks[i].id, elf);
+            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X)\n",
+                   s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3]);
 
             /* Run the task's SPU program if a lifted build is registered for it.
              * The registry maps the task ELF (by content fingerprint) to its
@@ -637,10 +653,13 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
     /* taskset/taskId forwarded raw (callee translates); elf/context are guest EAs. */
+    /* lsPattern/argument live inside the 256-byte attribute; our struct doesn't
+     * model them yet. LBP uses the plain 7-arg cellSpursCreateTask (which carries
+     * the argument explicitly), so pass 0 here until a title exercises this path. */
     return cellSpursCreateTask(taskset, taskId,
                                (void*)(uintptr_t)(u32)attr_h->eaElf,
                                (void*)(uintptr_t)(u32)attr_h->eaContext,
-                               attr_h->sizeContext, attr);
+                               attr_h->sizeContext, /*lsPattern*/0, /*argument*/0);
 }
 
 /* The SDK's versioned taskset-attribute initializer. We forward taskset creation
