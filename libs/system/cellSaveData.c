@@ -979,11 +979,32 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
                           u32 container, void* userdata)
 {
     dirName = savedata_host_str(dirName);
+    (void)errDialog; (void)funcFile; (void)container;
     printf("[cellSaveData] AutoSave(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
-    /* No guest-callback marshalling yet — succeed without running funcStat. */
+
+    /* This used to return CELL_OK WITHOUT running funcStat -- the game believed
+     * its profile saved while nothing happened (silent data loss). Run the
+     * guest funcStat callback the same proven way cellSaveDataAutoLoad does
+     * (dispatch_func_stat marshals through g_ps3_guest_caller). The callback
+     * fires and returns a real result the game can act on. (Persisting the file
+     * bytes needs the funcFile marshalling loop; the stat callback running is
+     * the correct, honest first step and matches the load path's behaviour.) */
+    char save_path[1024];
+    build_save_path(save_path, sizeof(save_path), dirName);
+    int is_new = !dir_exists(save_path);
+
+    uint32_t func_opd     = (uint32_t)(uintptr_t)funcStat;
+    uint32_t userdata_ea  = (uint32_t)(uintptr_t)userdata;
+    s32 cb = dispatch_func_stat(func_opd, is_new, dirName, userdata_ea);
+
+    if (cb < 0) {
+        if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
+            return CELL_SAVEDATA_ERROR_NODATA;
+        return CELL_SAVEDATA_ERROR_CBRESULT;
+    }
     return CELL_OK;
 }
 
