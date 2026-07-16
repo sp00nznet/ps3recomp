@@ -257,7 +257,11 @@ static void spu_async_run(spu_async_job* j)
     uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
     if (ls) {
         uint32_t entry = 0;
-        if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry)) {
+        int loaded = spu_elf_load_to_ls(j->image, j->image_size, ls, &entry);
+        if (!loaded)
+            fprintf(stderr, "[spu_workload] async image=%d ELF LOAD FAILED\n",
+                    j->image_id), fflush(stderr);
+        if (loaded) {
             /* YDKJ_CRI_POLICY (cri build experiment): the cri SPU task
              * (image 22) calls the SPURS task-API via a jump table at LS 0x2700
              * and reads its task descriptor at LS 0x2FB0 — both POLICY-provided,
@@ -348,6 +352,27 @@ static void spu_async_run(spu_async_job* j)
              * task kernel ABI in r3 ({0x40 marker, eaContext, queue EA, ...}),
              * captured at dispatch time (j->r3) so it doesn't race the PPU
              * overwriting the stack-allocated context. */
+            /* Generic SPURS taskset task (LBP's audio SPEEX/MultiStream tasks,
+             * image 6/7 — anything but the cri image 22 handled above): the real
+             * kernel runs the task UNDER the taskset policy, which plants a
+             * SpursTasksetContext at LS 0x2700 (taskset header, TaskInfo, and
+             * syscallAddr=0xA70) and enters it with r3 = task args, r4 = {spurs,
+             * taskset args}. We dispatch the task ELF directly, so without this it
+             * runs with r3=r4=0 and no context and SPINS FOREVER (observed: image
+             * 6/7 ENTER + RUN, never RETURN, 0 DMA, PPU blocks on EventFlag 0x0100).
+             * Build the context here from the real taskset CreateTask recorded;
+             * spu_run_lifted_job_abi then sets r3/r4 off the 0xA70 sentinel.
+             * Env-gated while bringing this up — default leaves every path as-is. */
+            if (j->image_id != 22 && getenv("LBP_TASKSET")) {
+                extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                if (g_ydkj_real_taskset_ea) {
+                    spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                            "taskset=0x%08X task=%u\n", j->image_id,
+                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid); fflush(stderr);
+                }
+            }
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0);
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)

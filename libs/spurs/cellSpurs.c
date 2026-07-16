@@ -590,6 +590,22 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X)\n",
                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3]);
 
+            /* One-shot: dump the memory the task argument points at, to find the
+             * pointer that reads back 0 (the task GETs from EA 0 -> some field of
+             * its work descriptor is null in our run). Each of the 4 arg words that
+             * looks like a valid guest EA gets 64 bytes dumped as BE u32s. */
+            if (getenv("LBP_TASKSET_TRACE")) {
+                for (int a = 0; a < 4; a++) {
+                    uint32_t p = task_arg[a];
+                    if (p < 0x10000 || p >= 0x50000000u) continue;   /* not a plausible EA */
+                    fprintf(stderr, "[argdump] arg[%d]=0x%08X ->", a, p);
+                    for (int o = 0; o < 64; o += 4)
+                        fprintf(stderr, " %08X", vm_read32(p + o));
+                    fprintf(stderr, "\n");
+                }
+                fflush(stderr);
+            }
+
             /* Run the task's SPU program if a lifted build is registered for it.
              * The registry maps the task ELF (by content fingerprint) to its
              * pre-lifted native entry; dispatch loads the ELF into a local store
@@ -1154,6 +1170,7 @@ s32 cellSpursEventFlagInitialize(CellSpursTaskset* taskset,
                                  CellSpursEventFlag* eventFlag,
                                  u32 clearMode, u32 direction)
 {
+    uint32_t eventFlag_ea = (uint32_t)(uintptr_t)eventFlag;   /* raw guest EA for tracing */
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     eventFlag = GUEST_PTR(eventFlag, CellSpursEventFlag*);
     (void)taskset;
@@ -1177,8 +1194,8 @@ s32 cellSpursEventFlagInitialize(CellSpursTaskset* taskset,
         return CELL_SPURS_TASK_ERROR_NOMEM;
     }
 
-    printf("[cellSpurs] EventFlagInitialize(clearMode=%u, direction=%u)\n",
-           clearMode, direction);
+    printf("[cellSpurs] EventFlagInitialize(clearMode=%u, direction=%u) flagEA=0x%08X\n",
+           clearMode, direction, eventFlag_ea);
     return CELL_OK;
 }
 
@@ -1222,6 +1239,7 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                            u32 mode)
 {
+    uint32_t eventFlag_ea = (uint32_t)(uintptr_t)eventFlag;   /* raw guest EA for tracing */
     eventFlag = GUEST_PTR(eventFlag, CellSpursEventFlag*);
     bits = GUEST_PTR(bits, u16*);
     if (!eventFlag || !bits)
@@ -1270,11 +1288,11 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                 static int _n = 0;
                 if (_n < 24) { _n++;
                     fprintf(stderr, "[cellSpurs] EventFlagWait BLOCKED %us on pattern 0x%04X "
-                                    "(mode=%s, bits=0x%04X) -- waiting for an SPU workload to "
-                                    "cellSpursEventFlagSet it\n",
+                                    "(mode=%s, bits=0x%04X) flagEA=0x%08X -- waiting for an SPU "
+                                    "workload to cellSpursEventFlagSet it\n",
                             waits / 20, pattern,
                             mode == CELL_SPURS_EVENT_FLAG_AND ? "AND" : "OR",
-                            eventFlag->bits);
+                            eventFlag->bits, (uint32_t)(uintptr_t)eventFlag_ea);
                     fflush(stderr);
                 }
             }

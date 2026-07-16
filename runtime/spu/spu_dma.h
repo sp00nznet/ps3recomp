@@ -190,10 +190,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         fprintf(stderr, "[spu-dma] %s lsa=0x%05X ea=0x%08X size=%u\n",
                 mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size); }
 #endif
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_DMATRACE") ? 1 : 0;
-      if (s_t) { static int _n = 0; if (_n++ < 300)
-        fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d\n",
-                mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id); } }
+    { static int s_t = -1; static int s_img = -2;
+      if (s_t < 0) s_t = getenv("YDKJ_DMATRACE") ? 1 : 0;
+      if (s_img == -2) { const char* e = getenv("YDKJ_DMA_IMG"); s_img = e ? atoi(e) : -1; }
+      /* YDKJ_DMA_IMG=N: trace ONLY image N, uncapped (the 300-cap otherwise fills
+       * with the always-running PM's DMA and hides a late image entirely). */
+      if (s_t) {
+        if (s_img >= 0) {
+            if (spu->image_id == s_img)
+                fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d\n",
+                        mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id);
+        } else { static int _n = 0; if (_n++ < 300)
+            fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d\n",
+                    mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id); }
+      } }
     /* Detect the cri task actually DECODING: a GET of the real video payload
      * (large, from a non-context EA) as opposed to the 64-byte context handshake
      * DMAs. Set a flag the dispatcher polls to know the task got real work. */
