@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (BE store into guest) */
 
 /* vm_base: base pointer for the PS3 guest address space */
 extern uint8_t* vm_base;
@@ -364,6 +365,17 @@ s32 cellJpgDecDecodeData(CellJpgDecMainHandle mainHandle,
     if (!sub->header_read || !sub->param_set)
         return CELL_JPGDEC_ERROR_SEQ;
 
+    /* `data` and `dataInfo` arrive as raw guest effective addresses (the generic
+     * HLE dispatcher passes GPRs straight through), so they must be translated
+     * to host memory before use -- exactly as sub->src_data is above and as
+     * cellPngDecDecodeData does. Writing decoded pixels straight into `data`
+     * dereferenced it as a host pointer, corrupting/crashing instead of landing
+     * in the guest's output buffer. status is one BE u32 in guest memory. */
+    u32 data_addr     = (u32)(uintptr_t)data;
+    u32 datainfo_addr = (u32)(uintptr_t)dataInfo;
+    if (!vm_base) return CELL_JPGDEC_ERROR_ARG;
+    u8* data_host = vm_base + data_addr;
+
 #if JPGDEC_HAS_STB
     {
         int w, h, comp;
@@ -381,7 +393,7 @@ s32 cellJpgDecDecodeData(CellJpgDecMainHandle mainHandle,
                                             &w, &h, &comp, desired_comp);
         if (!pixels) {
             printf("[cellJpgDec] stbi_load failed: %s\n", stbi_failure_reason());
-            dataInfo->status = CELL_JPGDEC_DEC_STATUS_STOP;
+            if (datainfo_addr) vm_write32(datainfo_addr, CELL_JPGDEC_DEC_STATUS_STOP);
             return CELL_JPGDEC_ERROR_STREAM_FORMAT;
         }
 
@@ -395,17 +407,18 @@ s32 cellJpgDecDecodeData(CellJpgDecMainHandle mainHandle,
             }
         }
 
-        memcpy(data, pixels, total);
+        memcpy(data_host, pixels, total);
         stbi_image_free(pixels);
 
-        printf("[cellJpgDec]   decoded %ux%u (%u bytes)\n", (u32)w, (u32)h, total);
+        printf("[cellJpgDec]   decoded %ux%u (%u bytes) -> guest 0x%08X\n",
+               (u32)w, (u32)h, total, data_addr);
 
-        dataInfo->status = CELL_JPGDEC_DEC_STATUS_FINISH;
+        if (datainfo_addr) vm_write32(datainfo_addr, CELL_JPGDEC_DEC_STATUS_FINISH);
         return CELL_OK;
     }
 #else
     printf("[cellJpgDec] DecodeData: stb_image not available — place stb_image.h in libs/codec/\n");
-    dataInfo->status = CELL_JPGDEC_DEC_STATUS_STOP;
+    if (datainfo_addr) vm_write32(datainfo_addr, CELL_JPGDEC_DEC_STATUS_STOP);
     return (s32)CELL_ENOSYS;
 #endif
 }
