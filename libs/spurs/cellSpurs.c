@@ -1750,6 +1750,37 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
 {
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] GetWorkloadInfo(wid=%u info=0x%08X)\n", wid, (u32)info_ea);
+
+    if (!spurs_ea || !info_ea)
+        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use)
+        return CELL_SPURS_CORE_ERROR_INVAL;
+
+    /* CellSpursWorkloadInfo is a GUEST out-buffer (cell/spurs/workload_types.h),
+     * big-endian, 32-bit pointers. This used to return CELL_OK writing NOTHING,
+     * so the guest read whatever stale bytes sat at info_ea as the descriptor.
+     * Fill the header from our workload mirror + the live BE instance counters;
+     * zero the pointer/name/hook fields we do not track. Byte fields are single
+     * bytes (endian-neutral); multi-byte fields go through vm_write* (BE). */
+    const SpursWorkload* w = &s_workloads[wid];
+    u32 base = (u32)info_ea;
+    for (u32 o = 0; o < 0x30; o += 4) vm_write32(base + o, 0);   /* header clean */
+
+    vm_write64(base + 0x00, w->data);                            /* data        */
+    for (int b = 0; b < 8 && b < CELL_SPURS_MAX_SPU; b++)
+        *(vm_base + base + 0x08 + b) = w->priority[b];           /* priority[8] */
+    vm_write32(base + 0x10, (u32)(uintptr_t)w->pm);              /* policyModule (32-bit EA) */
+    vm_write32(base + 0x14, w->sizePm);                          /* sizePolicyModule */
+    /* nameClass/nameInstance (0x18/0x1C): not tracked -> left 0 by the zero above. */
+
+    u32 se = (u32)spurs_ea;
+    *(vm_base + base + 0x20) = *(vm_base + se + SPURS_WKL_CURCONT + wid);  /* contention   */
+    *(vm_base + base + 0x21) = (u8)w->minContention;                       /* minContention */
+    *(vm_base + base + 0x22) = (u8)w->maxContention;                       /* maxContention */
+    *(vm_base + base + 0x23) = *(vm_base + se + SPURS_WKL_READY1 + wid);   /* readyCount   */
+    *(vm_base + base + 0x24) = *(vm_base + se + SPURS_WKL_IDLE2  + wid);   /* idleSpuRequest */
+    u32 sig = vm_read32(se + SPURS_WKL_SIGNAL1) >> 16;
+    *(vm_base + base + 0x25) = (sig & (0x8000u >> wid)) ? 1 : 0;           /* hasSignal    */
     return CELL_OK;
 }
 
