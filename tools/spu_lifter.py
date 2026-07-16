@@ -387,13 +387,29 @@ class SPULifter:
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
+        """The literal target of a direct branch, or None if it has none.
+
+        The target is always the LAST operand. `br`/`bra` carry only a target
+        ("0x2D40"), but `brsl`/`brasl` carry the link register first
+        ("$r0, 0x35A0") -- so reading operand 0 got the link register for every
+        call, never matched "0x", and returned None. That made _translate emit
+        `/* TODO spu: brsl unresolved target */` for EVERY brsl in EVERY image:
+        the link register was set and the call silently dropped. 1,484 of them
+        across LBP's 25 SPU images -- no SPU function call had ever run.
+
+        It hid well because nothing downstream depends on this: the callee is
+        still lifted (find_spu_functions scans all operands for targets, so the
+        function exists and links), and a dropped call just falls through to the
+        next instruction, which usually looks like plausible progress. LBP's
+        wwsjob policy module spun forever at LS 0x2D68 because the one call in
+        its loop -- `brsl $0,0x35a0`, which is what polls the workload and
+        issues the DMA -- was one of these.
+        """
         mn = insn.mnemonic
         ops = _ops(insn.operands)
-        tok = None
-        if mn in ("br", "brsl", "bra", "brasl") and ops:
-            tok = ops[0]
-        elif mn in _COND_BR and ops:
-            tok = ops[-1]
+        if mn not in ("br", "brsl", "bra", "brasl") and mn not in _COND_BR:
+            return None
+        tok = ops[-1] if ops else None
         if tok and tok.startswith("0x"):
             try:
                 return int(tok, 16)
@@ -682,14 +698,20 @@ class SPULifter:
             return ("ctx->pc = ctx->srr0; "
                     "spu_indirect_branch(ctx); return;")
         if mn in ("bisl",):
-            link_rt = insn.raw & 0x7F            # link reg dropped from operands
-            tgt_reg = _reg(ops[0])
+            # `bisl rt, ra`: rt = link, ra = TARGET. The disassembler emits BOTH
+            # ("$r0, $r2"), so operand 0 is the link register -- taking it as the
+            # target made every indirect call branch to its own return address
+            # instead of the callee. LBP's wwsjob policy module halted at exactly
+            # that: `bisl $0,$2` at LS 0x3598 calls selectWorkload through the
+            # kernel context, and we jumped to 0x359C (its own link) instead.
+            link_rt = insn.raw & 0x7F            # rt = bits 25-31 of the encoding
+            tgt_reg = _reg(ops[-1])
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
-            link_rt = insn.raw & 0x7F
-            tgt_reg = _reg(ops[0])
+            link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
+            tgt_reg = _reg(ops[-1])
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
