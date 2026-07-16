@@ -90,7 +90,7 @@ s32 cellMouseInit(u32 max_connect);
 s32 cellMouseEnd(void);
 s32 cellMouseGetData(u32 port_no, CellMouseData* data);
 s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data);
-s32 cellMouseGetInfo(CellMouseInfo* info);
+s32 cellMouseGetInfo(u32 info_ea);   /* guest EA -- BE fields, SDK layout */
 s32 cellMouseSetTabletMode(u32 port_no, u32 mode);
 s32 cellMouseClearBuf(u32 port_no);
 
