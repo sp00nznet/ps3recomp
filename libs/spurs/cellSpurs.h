@@ -221,9 +221,11 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * Task functions
  * -----------------------------------------------------------------------*/
 
+/* 7-arg SDK ABI: ... , CellSpursTaskLsPattern* lsPattern, CellSpursTaskArgument* argument.
+ * Both are guest EAs (passed as u32 by the generic HLE adapter). */
 s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
-                        CellSpursTaskAttribute* attr);
+                        u32 lsPattern_ea, u32 argument_ea);
 s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
                       s32* exitCode);
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
