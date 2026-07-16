@@ -9,12 +9,14 @@
  *        own initial stack)                doubleword) — e.g. a joblist EA
  *                                     r5 = poll status
  *
- * The SpursKernelContext fields this fills are the ones the lifted wwsjob PM
- * verifiably reads (LS 0x100/0x1C0/0x1D0/0x1E0), laid out per the known SPURS
- * kernel contract:
- *   0x1C0 be u64 spurs EA      0x1D4 wklCurrentUniqueId  0x1DC exitToKernelAddr
- *   0x1C8 be u32 spuNum        0x1D8 wklCurrentId        0x1E0 selectWorkloadAddr
- *   0x1CC be u32 dmaTagId      0x1D0 wklCurrentAddr (PM base 0xA00)
+ * The SpursKernelContext fields this fills, per the layout RPCS3 documents
+ * (Emu/Cell/Modules/cellSpurs.h, struct SpursKernelContext) and the lifted
+ * wwsjob PM verifiably reads. NOTE both pointers are 64-BIT:
+ *   0x1C0 be u64 spurs EA           0x1D8 be u32 wklCurrentUniqueId
+ *   0x1C8 be u32 spuNum             0x1DC be u32 wklCurrentId
+ *   0x1CC be u32 dmaTagId           0x1E0 be u32 exitToKernelAddr
+ *   0x1D0 be u64 wklCurrentAddr     0x1E4 be u32 selectWorkloadAddr
+ *        (PM base 0xA00, in the LOW word at 0x1D4)
  *
  * exitToKernel/selectWorkload point at two reserved LS addresses below the PM
  * base; spu_indirect_branch intercepts them (ctx->policy_mode) and HLEs the
@@ -54,15 +56,26 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 #define KBE32(off, v) do { uint32_t _v = (v); ls[(off)] = (uint8_t)(_v >> 24); \
         ls[(off)+1] = (uint8_t)(_v >> 16); ls[(off)+2] = (uint8_t)(_v >> 8);   \
         ls[(off)+3] = (uint8_t)_v; } while (0)
-    KBE32(0x1C0, 0);                    /* spurs EA hi32 */
-    KBE32(0x1C4, spurs_ea);             /* spurs EA lo32 */
-    KBE32(0x1C8, 0);                    /* spuNum */
-    KBE32(0x1CC, 8);                    /* dmaTagId (kernel's tag) */
-    KBE32(0x1D0, 0xA00);                /* wklCurrentAddr = PM load base */
-    KBE32(0x1D4, wid);                  /* wklCurrentUniqueId */
-    KBE32(0x1D8, wid);                  /* wklCurrentId */
-    KBE32(0x1DC, SPURS_PM_EXIT_TO_KERNEL_LS);
-    KBE32(0x1E0, SPURS_PM_SELECT_WORKLOAD_LS);
+    /* wklCurrentAddr is a 64-BIT pointer (vm::bcptr<void,u64>), so it occupies
+     * 0x1D0..0x1D7 and everything after it sits 4 bytes higher than a u32 would
+     * put it. Writing it as a u32 shifted the whole tail of the struct:
+     * exitToKernelAddr landed on selectWorkloadAddr's slot and selectWorkloadAddr
+     * fell off into moduleId, leaving 0x1E4 zero. The wwsjob PM reads both --
+     * `lqa $2,0x1e0; bisl $0,$2` at LS 0x3588 calls exitToKernel, and
+     * `lqa $7,0x1e0; rotqbyi $6,$7,4; bisl $0,$6` at LS 0x35A0 calls
+     * selectWorkload -- so it called our exit intercept for every poll and
+     * branched to 0 for every select. It also tests wklCurrentId (0x1DC) against
+     * 1, which only reads sensibly at the correct offset. */
+    KBE32(0x1C0, 0);                    /* spurs EA hi32 (u64 ptr)  */
+    KBE32(0x1C4, spurs_ea);             /* spurs EA lo32            */
+    KBE32(0x1C8, 0);                    /* spuNum                   */
+    KBE32(0x1CC, 8);                    /* dmaTagId (kernel's tag)  */
+    KBE32(0x1D0, 0);                    /* wklCurrentAddr hi32 (u64 ptr) */
+    KBE32(0x1D4, 0xA00);                /* wklCurrentAddr lo32 = PM load base */
+    KBE32(0x1D8, wid);                  /* wklCurrentUniqueId       */
+    KBE32(0x1DC, wid);                  /* wklCurrentId             */
+    KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
+    KBE32(0x1E4, SPURS_PM_SELECT_WORKLOAD_LS);
 #undef KBE32
 
     /* Entry registers per cellSpursModuleEntry. */
