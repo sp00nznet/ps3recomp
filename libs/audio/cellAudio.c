@@ -363,6 +363,23 @@ static void audio_mix_one_block(void)
 
     for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
         AudioPortSlot* port = &s_ports[p];
+        /* Diagnostic: a port that HOLDS PCM but was never started is inaudible
+         * by design -- flag it once so "no PortStart" vs "no data" is decidable
+         * from the log (LBP's Bink movie audio port sat exactly there). */
+        if (port->in_use && !port->running && port->buffer) {
+            static u8 warned[CELL_AUDIO_PORT_MAX];
+            if (!warned[p]) {
+                u32 probe = (u32)(port->param.nBlock * CELL_AUDIO_BLOCK_SAMPLES *
+                                  port->param.nChannel);
+                int nz = 0;
+                for (u32 s = 0; s < probe; s += 64) if (port->buffer[s] != 0.0f) { nz = 1; break; }
+                if (nz) {
+                    warned[p] = 1;
+                    fprintf(stderr, "[cellAudio] port %d HAS DATA but never started"
+                            " -- game withheld PortStart\n", p);
+                }
+            }
+        }
         if (!port->in_use || !port->running || !port->buffer)
             continue;
 
@@ -805,6 +822,11 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     vm_write64(cfg + 16, port->param.nBlock);                               /* nBlock */
     vm_write32(cfg + 24, port->buf_size);                                   /* portSize */
     vm_write32(cfg + 28, (u32)port->port_addr);                             /* portAddr */
+
+    { static int _n = 0; if (_n++ < 24)
+        fprintf(stderr, "[cellAudio] GetPortConfig(port=%u) status=%s bufEA=0x%08X ridxEA=0x%08X\n",
+                portNum, port->running ? "RUN" : "READY",
+                (u32)port->port_addr, (u32)port->read_idx_addr); }
 
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;

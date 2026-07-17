@@ -1840,6 +1840,44 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
     } else {
         for (u32 y = 0; y < h; y++)
             memcpy((u8*)mapped + (u64)y * pitch, vm_base + off + (u64)y * w, w);
+        /* TEX_SAVE=1: also dump wide B8 uploads (Bink video planes are B8 --
+         * the Y plane IS the movie frame in grayscale) + a content stat, so
+         * "is the decoder producing pixels" is answerable by looking at a BMP. */
+        if (getenv("TEX_SAVE") && w >= 256) {
+            static int _bs = 0;
+            const u8* sp = vm_base + off;
+            u32 nz = 0; u8 mn = 255, mx = 0;
+            for (u32 i = 0; i < w * h; i += 17) {
+                u8 v = sp[i]; if (v) nz++; if (v < mn) mn = v; if (v > mx) mx = v;
+            }
+            fprintf(stderr, "[TEXB8] off=0x%X %ux%u nz=%u/%u min=%u max=%u\n",
+                    off, w, h, nz, (w * h) / 17, mn, mx);
+            if (_bs < 8 && mx > mn) { _bs++;
+                char pn[128];
+                snprintf(pn, sizeof(pn), "texb8_%08X_%ux%u_%d.bmp", off, w, h, _bs);
+                FILE* f = fopen(pn, "wb");
+                if (f) {
+                    u32 rowb = w * 3, rowp = (rowb + 3) & ~3u;
+                    u32 fsz = 54 + rowp * h;
+                    u8 hd[54] = {'B','M'};
+                    hd[2]=(u8)fsz; hd[3]=(u8)(fsz>>8); hd[4]=(u8)(fsz>>16); hd[5]=(u8)(fsz>>24);
+                    hd[10]=54; hd[14]=40;
+                    hd[18]=(u8)w; hd[19]=(u8)(w>>8); hd[22]=(u8)h; hd[23]=(u8)(h>>8);
+                    hd[26]=1; hd[28]=24;
+                    fwrite(hd, 1, 54, f);
+                    for (int y = (int)h - 1; y >= 0; y--) {
+                        const u8* srow = sp + (u64)y * w;
+                        for (u32 x = 0; x < w; x++) {
+                            u8 px[3]; px[0]=px[1]=px[2]=srow[x];
+                            fwrite(px, 1, 3, f);
+                        }
+                        { u8 z[3] = {0,0,0}; fwrite(z, 1, rowp - rowb, f); }
+                    }
+                    fclose(f);
+                    fprintf(stderr, "[TEX_SAVE] %s\n", pn);
+                }
+            }
+        }
     }
     /* TEX_SAVE=1: dump the first few converted ARGB uploads as BMPs (rgb +
      * alpha channel separately) -- ground-truth for "is the guest texture
