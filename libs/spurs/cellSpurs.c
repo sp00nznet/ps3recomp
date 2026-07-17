@@ -800,7 +800,7 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
                                       u32 sizeContext, const void* lsPattern,
                                       const void* argument)
 {
-    (void)sdkVersion; (void)lsPattern; (void)argument;
+    (void)sdkVersion;
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, CellSpursTaskAttribute*);
     memset(attr, 0, sizeof(CellSpursTaskAttribute));
@@ -808,8 +808,15 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
     attr->sizeContext = sizeContext;
     attr->eaContext   = eaContext;
     attr->eaElf       = eaElf;
-    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u)\n",
-           (u32)eaElf, (u32)eaContext, sizeContext);
+    /* lsPattern/argument are guest EAs of 16-byte blocks; carry them so
+     * CreateTaskWithAttribute writes them into the TaskInfo. The SPU task
+     * library refuses blocking waits for a task whose argument is zero or
+     * whose lsPattern doesn't cover its stack (0x8041090F). */
+    attr->lsPattern_ea = (u32)(uintptr_t)lsPattern;
+    attr->argument_ea  = (u32)(uintptr_t)argument;
+    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
+           (u32)eaElf, (u32)eaContext, sizeContext,
+           attr->lsPattern_ea, attr->argument_ea);
     return CELL_OK;
 }
 
@@ -822,14 +829,25 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
 {
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
-    /* taskset/taskId forwarded raw (callee translates); elf/context are guest EAs. */
-    /* lsPattern/argument live inside the 256-byte attribute; our struct doesn't
-     * model them yet. LBP uses the plain 7-arg cellSpursCreateTask (which carries
-     * the argument explicitly), so pass 0 here until a title exercises this path. */
+    /* Dump the raw attribute: our struct doesn't model lsPattern/argument, and
+     * a wait-capable task NEEDS its context size + ls pattern carried through
+     * (a no-context task may not block -- SPU task-lib waits then fail with
+     * ERROR_STAT). Learn the real field offsets from the bytes. */
+    { uint32_t aea = (uint32_t)(uintptr_t)attr;
+      static int _n = 0; if (_n++ < 6) {
+        fprintf(stderr, "[cellSpurs] CreateTaskWithAttr attr=0x%08X raw:", aea);
+        for (int o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(aea + o));
+        fprintf(stderr, "\n"); } }
+    /* taskset/taskId forwarded raw (callee translates); elf/context are guest
+     * EAs, as are lsPattern/argument (stored by _cellSpursTaskAttributeInitialize;
+     * dropping them left the TaskInfo with a zero argument + zero lsPattern and
+     * the SPU task library then refuses every blocking wait with 0x8041090F --
+     * LBP's binkspu movie-IO task spun forever on that). */
     return cellSpursCreateTask(taskset, taskId,
                                (void*)(uintptr_t)(u32)attr_h->eaElf,
                                (void*)(uintptr_t)(u32)attr_h->eaContext,
-                               attr_h->sizeContext, /*lsPattern*/0, /*argument*/0);
+                               attr_h->sizeContext,
+                               attr_h->lsPattern_ea, attr_h->argument_ea);
 }
 
 /* The SDK's versioned taskset-attribute initializer. We forward taskset creation

@@ -146,7 +146,15 @@ struct CellSpursTaskAttribute {
     u32  sizeContext;
     u64  eaContext;
     u64  eaElf;        /* SPU task ELF guest EA (set by _cellSpursTaskAttributeInitialize) */
-    u8   _padding[56];
+    /* Guest EAs of the 16-byte CellSpursTaskLsPattern / CellSpursTaskArgument
+     * blocks passed to _cellSpursTaskAttributeInitialize. A wait-capable task
+     * NEEDS both carried into its TaskInfo: the SPU task library validates
+     * argument != 0 and lsPattern-covers-stack before any blocking wait
+     * (else 0x8041090F) -- dropping them kept LBP's binkspu movie-IO task
+     * spinning forever. */
+    u32  lsPattern_ea;
+    u32  argument_ea;
+    u8   _padding[48];
 };
 
 /* Event flag -- SPURS-level event synchronization */

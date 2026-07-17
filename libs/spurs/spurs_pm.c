@@ -76,6 +76,29 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
     LS_BE32(STC_KERNEL_MGMT_ADDR, 0x100);
     LS_BE32(STC_SYSCALL_ADDR,     CELL_SPURS_TASKSET_PM_SYSCALL_ADDR);
 
+    /* SPURS KERNEL context (LS 0x100..0x1FF): the SPU task library's fast-path
+     * validation reads fields the real kernel + taskset PM populate there.
+     * moduleId @0x1E4 must be "TK" (stamped by the taskset PM, RPCS3
+     * spursTasksetInit) -- without it every task-API wait (event flag / queue)
+     * fails its context check with ERROR_STAT 0x80410909: LBP's binkspu movie
+     * IO task spun forever on exactly that, so BinkWait never completed and
+     * the intro never produced a frame. Also plant the spurs instance ptr
+     * (@0x1C0, read from the taskset header) + spuNum/dmaTagId, which the
+     * library reads next to the moduleId. */
+    {
+        uint32_t spurs_lo = vm_read32(taskset_ea + 0x64);   /* be64 spurs @0x60 */
+        LS_BE64(0x1C0, (uint64_t)spurs_lo);
+        LS_BE32(0x1C8, spuNum);
+        LS_BE32(0x1CC, dmaTagId);
+        /* The task library's fast-path check FSMs on the halfword at 0x1E8
+         * (ceqh of rotqbyi(LS[0x1E0],6), select-mask bit -> word0); stamp the
+         * neighboring slots too -- they are all inside the moduleId/pad area
+         * the real PM owns and nothing else reads them. */
+        ls[0x1E4] = 'T'; ls[0x1E5] = 'K';
+        ls[0x1E6] = 'T'; ls[0x1E7] = 'K';
+        ls[0x1E8] = 'T'; ls[0x1E9] = 'K';
+    }
+
     /* DMA the selected task's TaskInfo (48 bytes) into LS 0x2780 (the kernel temp area).
      * Read each word BE and re-store BE -> the raw bytes are preserved verbatim. */
     uint32_t ti = spurs_taskset_taskinfo_ea(taskset_ea, taskId);
