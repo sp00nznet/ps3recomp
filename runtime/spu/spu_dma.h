@@ -432,12 +432,21 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             static uint64_t n_get=0, n_put=0, b_get=0, b_put=0;
             static uint32_t max_put=0, max_put_ea=0, max_get=0;
             static uint64_t ticks=0;
+            /* Track the unique DMA-issuing PCs (which code sites fire) + the
+             * distinct GET-source / PUT-dest page set, so we see whether the
+             * frame-output DMA site is ever reached and where data would land. */
+            static uint32_t pcs[32]; static int npc=0;
+            { uint32_t p=(uint32_t)spu->pc & 0x3FFFF; int f=0;
+              for(int i=0;i<npc;i++) if(pcs[i]==p){f=1;break;}
+              if(!f && npc<32){ pcs[npc++]=p;
+                fprintf(stderr,"[bink-dmapc] NEW dma site pc=0x%05X %s ea=0x%08X size=0x%X\n",
+                    p, is_put?"PUT":"GET", ea32, size); } }
             if (is_put) { n_put++; b_put+=size; if (size>max_put){max_put=size;max_put_ea=ea32;} }
             else        { n_get++; b_get+=size; if (size>max_get) max_get=size; }
             if ((++ticks % 20000)==0)
-                fprintf(stderr, "[bink-dmahist] GET n=%llu bytes=%llu maxsz=0x%X | PUT n=%llu bytes=%llu maxsz=0x%X @0x%08X\n",
+                fprintf(stderr, "[bink-dmahist] GET n=%llu bytes=%llu maxsz=0x%X | PUT n=%llu bytes=%llu maxsz=0x%X @0x%08X | sites=%d\n",
                         (unsigned long long)n_get,(unsigned long long)b_get,max_get,
-                        (unsigned long long)n_put,(unsigned long long)b_put,max_put,max_put_ea);
+                        (unsigned long long)n_put,(unsigned long long)b_put,max_put,max_put_ea,npc);
         }
     }
 
