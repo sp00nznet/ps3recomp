@@ -633,6 +633,44 @@ int cellGcm_take_flip_pending_synced(void)
     return 1;
 }
 
+/* ---- fence (SET_REFERENCE) observability ---------------------------------
+ * cellGcmFinish waits for ctrl->ref with EQUALITY. On hardware every fence
+ * value persists in the register for the RSX-time until the next fence
+ * (~a frame), so an equality poll cannot miss it. Our drain consumes a whole
+ * backlog in microseconds; publishing only the final value made intermediate
+ * fences invisible -- LBP's boot deadlocked with a thread spinning on a fence
+ * the counter had already passed (waiting 0x13 while ref climbed 0x51->0x1F4).
+ * Queue every fence as it is drained and publish ONE per tick: the GPU work
+ * is never throttled (draw/recycle proceed at full speed), only the ref
+ * register advances at most one fence per tick, so every value is observable
+ * for >= 16 ms, like hardware. (Throttling the DRAIN at fence boundaries
+ * instead starved wrap recycles and wedged the backend -- don't.) */
+#define GCM_REF_QLEN 4096
+static u32 s_ref_q[GCM_REF_QLEN];
+static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
+
+static void gcm_ref_push(u32 v)
+{
+    { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
+      if (_d) fprintf(stderr, "[refq] drained fence 0x%X\n", v); }
+    u32 t = s_ref_qtail;
+    if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
+        s_ref_qhead++;
+        static int _o = 0;
+        if (_o++ < 4) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+    }
+    s_ref_q[t % GCM_REF_QLEN] = v;
+    s_ref_qtail = t + 1;
+}
+
+static void gcm_ref_publish_one(void)
+{
+    u32 h = s_ref_qhead;
+    if (h == s_ref_qtail) return;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+    s_ref_qhead = h + 1;
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -712,9 +750,13 @@ void cellGcm_rsx_process_fifo(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
-                if (subch == 0)
+                if (subch == 0) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
-                else
+                    /* NV406E_SET_REFERENCE: queue the fence value for PACED
+                     * publication (gcm_ref_publish below) instead of letting a
+                     * later fence in the same batch overwrite it. */
+                    if (m == 0x50) gcm_ref_push(g_rsx_last_reference);
+                } else
                     gcm_2d_method(subch, m, vm_read32(dea));
             }
             s_fifo_getoff += 4 + count * 4;
@@ -725,12 +767,13 @@ void cellGcm_rsx_process_fifo(void)
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
-    /* Publish progress: get chases put; ref reflects the last SET_REFERENCE
-     * (cellGcmFinish / wait-label spins read these big-endian). The wrap
-     * recycle path also polls the drained EA. */
+    /* Publish progress: get chases put; ref advances at most ONE queued fence
+     * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
+     * value stays observable to equality-waiters. The wrap recycle path polls
+     * the drained EA. */
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, g_rsx_last_reference);       /* ref */
+    gcm_ref_publish_one();                                              /* ref */
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls

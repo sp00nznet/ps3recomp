@@ -410,7 +410,21 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X)\n", (uint32_t)a, __builtin_bswap32(v)); n=0; } }
+      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X)\n", (uint32_t)a, __builtin_bswap32(v)); n=0;
+#ifdef _WIN32
+        /* YDKJ_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
+         * is on the watched address -- names the guest function containing the
+         * spin loop + its callers (resolve RVAs against the linker map). Same
+         * mechanism as the read64 variant below; LBP's GPU-ref wait
+         * (0x03002008) is a read32 spin. */
+        { static int64_t wa=-2; if(wa==-2){const char*e=getenv("YDKJ_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
+          if(wa>=0 && (uint32_t)a==(uint32_t)wa){ static int once=0; if(!once){ once=1;
+            void* bt[28]; unsigned short fr=RtlCaptureStackBackTrace(0,28,bt,0);
+            char* mb=(char*)GetModuleHandleA(0); char line[800]; int p=snprintf(line,sizeof line,"[SPINBT32 0x%08X] rva:",(uint32_t)a);
+            for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
+            fprintf(stderr,"%s\n",line); fflush(stderr); } } }
+#endif
+      } }
       else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap32(v); }
 uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
