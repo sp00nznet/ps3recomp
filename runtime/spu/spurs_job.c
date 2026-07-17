@@ -214,6 +214,31 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
               out_ls, size_out, s_ls, size_scr, stack_top, size_stk, n_cache,
               ctx_ls, desc_ls, dsz); }
 
+    /* LBP job protocol probe (LBP_JOB_DUMP): the game's one shared job binary
+     * ("JOBCRT Ver13" crt + main @0x1570) reads a be u64 EA out of the
+     * descriptor's USER DATA at +0x30, GETs a 128-byte command block from it,
+     * then jump-tables on the command TYPE (word1 of the block, cases 0..5).
+     * The header's input-DMA-list/io fields are legitimately zero for it. Dump
+     * the user data + that command block so the bail path is attributable. */
+    if (getenv("LBP_JOB_DUMP")) {
+        uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
+        uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
+        fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
+                job_ea, (unsigned long long)ud,
+                (unsigned long long)g64(job_ea + JH_SIZE + 8),
+                (unsigned long long)g64(job_ea + JH_SIZE + 16),
+                (unsigned long long)g64(job_ea + JH_SIZE + 24));
+        if (cmd && cmd < 0x30000000u) {
+            fprintf(stderr, "[spurs-job]   cmdblock @0x%08X:", cmd);
+            for (int o = 0; o < 64; o += 4) {
+                if ((o & 15) == 0) fprintf(stderr, "\n      +%02X:", o);
+                fprintf(stderr, " %08X", g32(cmd + o));
+            }
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
+
     /* ---- enter the job -------------------------------------------------- */
     spu_context ctx;
     spu_context_init(&ctx, 0);
@@ -224,6 +249,12 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
     spu_run_with_halt(entry, &ctx);
+
+    if (getenv("LBP_JOB_DUMP")) {
+        fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
+                job_ea, ctx.status, ctx.stop_code, ctx.pc);
+        fflush(stderr);
+    }
 
     free(ls);
     return 0;

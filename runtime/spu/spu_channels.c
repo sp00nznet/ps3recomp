@@ -625,7 +625,15 @@ void spu_indirect_branch(spu_context* ctx)
         fn(ctx);
         return;
     }
-    { static int _bt0=0; if (_bt0++ < 12)
+    /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
+     * image (the FMOD mixer's overlay calls) exhaust it and silently hide
+     * every other image's misses -- LBP's loading jobs skipped their command
+     * handlers for a whole session without a single log line. */
+    { enum { BT0_MAX_IMG = 64, BT0_PER_IMG = 12 };
+      static int _bt0[BT0_MAX_IMG];
+      unsigned img = (ctx->image_id >= 0 && ctx->image_id < BT0_MAX_IMG)
+                     ? (unsigned)ctx->image_id : 0;
+      if (_bt0[img]++ < BT0_PER_IMG)
         fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
                 ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
     { static int _n=0; if (_n++ < 2) {

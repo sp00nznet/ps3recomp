@@ -273,7 +273,7 @@ def collect_computed_branch_targets(insns, window=8):
 
 
 def collect_jump_table_targets(insns, code, code_start, code_end,
-                               window=10, max_entries=32):
+                               window=48, max_entries=32):
     """Targets reached through an in-code JUMP TABLE:
 
         ila  $r14, 0x1724C          <- TABLE base (an LS address in .text)
@@ -291,53 +291,125 @@ def collect_jump_table_targets(insns, code, code_start, code_end,
     0x1724C leaked 0x60 of guest stack per mix cycle until the task's LS was
     destroyed — and the skipped handlers were the entire DSP graph.)
 
-    Recognizer: an indirect branch through $rN, preceded in a short window by
-    (a) an `il`/`ila` into a DIFFERENT register whose immediate lands inside
-    the code segment, and (b) a quadword load (the table read) between the
-    two. The table words are then read from the image: consecutive BE u32
-    values are taken as entries while they are 4-aligned addresses inside the
-    code segment (the first out-of-range word — typically adjacent float/data
-    constants — terminates the table).
+    Recognizer: anchored on the `il`/`ila` itself, NOT on the branch. Pairing
+    the table load with its `bi` by scanning a linear window fails in real
+    code: compilers hoist the handler computation far above the dispatch and
+    REACH the `bi` by a jump (LBP's shared loading job computes the handler
+    ~140 instructions before the function epilogue's `bi $r2` and jumps
+    there), so no window connects them. Instead, EVERY `il`/`ila` whose
+    immediate is a 4-aligned in-code address is tried as a table base; it
+    qualifies if the words there form a plausible table (below). A false
+    positive only adds an entry point at a valid instruction boundary — cheap;
+    a false negative silently skips an entire handler class — fatal.
+
+    A table entry can be ABSOLUTE (the word is the handler address —
+    pm_wwsjob's DSP table) or TABLE-RELATIVE (the code adds the table base
+    before branching — LBP's loading job: table @0x198C = {0x8C,0x2F4,...},
+    handlers at 0x198C+off). Which one it is can't be decided locally, so BOTH
+    in-code-segment interpretations are seeded: a wrong-side seed is just an
+    extra entry point at a valid instruction boundary, while a missing
+    right-side seed loses the whole handler. Consecutive BE u32 words are read
+    while at least one interpretation is a 4-aligned VALID INSTRUCTION START
+    (the first word where neither is — adjacent float/data constants —
+    terminates the table); bases yielding fewer than 2 entries are ignored.
     """
-    _LOADS = {"lqx", "lqd", "lqa", "lqr"}
+    del window                       # kept in the signature for compatibility
+    valid_starts = {ins.addr for ins in insns}
+    targets = set()
+    seen_bases = set()
+    for ins in insns:
+        if ins.mnemonic not in ("il", "ila"):
+            continue
+        wops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        if len(wops) != 2:
+            continue
+        try:
+            tok = wops[1]
+            tbl = int(tok, 16) if tok.lower().startswith(("0x", "-0x")) else int(tok, 10)
+        except ValueError:
+            continue
+        if tbl == 0 or (tbl & 3) or not (code_start <= tbl < code_end):
+            continue
+        if tbl in seen_bases:
+            continue
+        seen_bases.add(tbl)
+        off = tbl - code_start
+        entries = set()
+        for k in range(max_entries):
+            o = off + 4 * k
+            if o + 4 > len(code):
+                break
+            wrd = int.from_bytes(code[o:o + 4], "big")
+            if wrd & 3:
+                break
+            abs_ok = wrd in valid_starts
+            rel = tbl + wrd
+            rel_ok = (rel & 3) == 0 and rel in valid_starts
+            if not abs_ok and not rel_ok:
+                break           # neither reading decodes as code -- table end
+            if abs_ok:
+                entries.add(wrd)
+            if rel_ok:
+                entries.add(rel)
+        if len(entries) >= 2:
+            targets.update(entries)
+    return targets
+
+
+def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
+    """Mid-ladder entries of a Duff's device (computed jump into an unrolled
+    loop). Sony's SPU job CRT clears BSS with one:
+
+        brsl $r8, .+4               <- PC-getter: r8 = link address
+        andi $r6, $r6, 112          <- residual = (count & 112)
+        rotmi $r4, $r6, -2          <- ... >> 2  (0,4,...,28)
+        ai   $r8, $r8, 36           <- base = link + 36
+        a    $r8, $r8, $r4          <- + residual
+        bi   $r8                    <- jump INTO the stqd ladder
+
+    The targets are mid-function addresses no table scan can see; the miss
+    unwinds the C call chain out of the CRT, skipping everything after the
+    clear loop (observed in LBP's loading job as branch-to-0 pc=0x207E4).
+    Recognizer: a `bi $rX` whose register was built from a PC-getter
+    (`brsl $rX, .+4`) plus an immediate `ai $rX, $rX, K` within `window`
+    instructions. Seed link+K plus the following `span` bytes at 4-byte
+    stride — the ladder entries are all real instruction starts, and the
+    final in-code/valid-instruction filter drops any overshoot."""
     targets = set()
     for idx, ins in enumerate(insns):
-        if ins.mnemonic not in _INDIRECT_BR:
+        if ins.mnemonic != "bi":
             continue
         ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
-        if not ops or not ops[-1].startswith("$r"):
+        if len(ops) != 1 or not ops[0].startswith("$r") or ops[0] == "$r0":
             continue
-        branch_reg = ops[-1]
-        saw_load = False
+        reg = ops[0]
+        link = None
+        imm = 0
         for j in range(idx - 1, max(-1, idx - 1 - window), -1):
             w = insns[j]
-            if w.mnemonic in _LOADS:
-                saw_load = True
-                continue
-            if w.mnemonic not in ("il", "ila"):
-                continue
             wops = [t.strip() for t in w.operands.split(",") if t.strip()]
-            if len(wops) != 2 or wops[0] == branch_reg:
-                continue        # same-reg case is the direct-target idiom
-            try:
-                tok = wops[1]
-                tbl = int(tok, 16) if tok.lower().startswith(("0x", "-0x")) else int(tok, 10)
-            except ValueError:
-                continue
-            if not saw_load:
-                continue        # no table read between ila and bi
-            if not (code_start <= tbl < code_end) or (tbl & 3):
-                continue
-            off = tbl - code_start
-            for k in range(max_entries):
-                o = off + 4 * k
-                if o + 4 > len(code):
+            if w.mnemonic == "ai" and len(wops) == 3 \
+                    and wops[0] == reg and wops[1] == reg:
+                try:
+                    imm += int(wops[2], 0)
+                except ValueError:
                     break
-                wrd = int.from_bytes(code[o:o + 4], "big")
-                if (wrd & 3) or not (code_start <= wrd < code_end):
+                continue
+            if w.mnemonic in ("brsl", "brasl") and wops and wops[0] == reg:
+                try:
+                    tgt = int(wops[-1], 0)
+                except ValueError:
                     break
-                targets.add(wrd)
-            break               # nearest qualifying ila decides
+                if tgt == w.addr + 4:       # PC-getter, not a real call
+                    link = w.addr + 4
+                break
+        if link is None or imm <= 0:
+            continue
+        base = link + imm
+        for o in range(0, span + 4, 4):
+            t = base + o
+            if code_start <= t < code_end:
+                targets.add(t)
     return targets
 
 
@@ -478,6 +550,7 @@ def detect_functions(buf, base_override=None, verbose=True):
     for t in (collect_link_register_targets(insns)
               | collect_computed_branch_targets(insns)
               | collect_jump_table_targets(insns, code, code_start, code_end)
+              | collect_duff_targets(insns, code_start, code_end)
               | fptr_targets):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
