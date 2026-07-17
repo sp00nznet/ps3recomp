@@ -291,6 +291,14 @@ int64_t sys_fs_read(ppu_context* ctx)
     void* buf = vm_to_host(buf_addr);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
+    /* PS3_FS_READLOG=1: trace reads (tid/fd/size) -- used to check whether an
+     * async-IO consumer (LBP's Bink IO thread) ever actually reads its file. */
+    { static int _rl = -1; if (_rl < 0) _rl = getenv("PS3_FS_READLOG") ? 1 : 0;
+      if (_rl) { static int _n = 0; if (_n++ < 200)
+        fprintf(stderr, "[fsread] tid=%llu fd=%d size=%llu got=%llu\n",
+                (unsigned long long)ctx->thread_id, fd,
+                (unsigned long long)size, (unsigned long long)nread); } }
+
     if (nread_addr != 0) {
         write_be64(nread_addr, (uint64_t)nread);
     }

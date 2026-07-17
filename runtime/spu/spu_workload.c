@@ -519,6 +519,9 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return 0;
+    { static int _n = 0; if (_n++ < 60 || (_n % 500) == 0)
+        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X\n",
+                _n, taskId, taskset_ea); }
     unsigned secs = 0;
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);

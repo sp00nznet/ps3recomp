@@ -551,11 +551,17 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
      * register values); translate to host before dereferencing. */
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
 
-    if (!spurs || !taskset)
+    if (!spurs || !taskset) {
+        fprintf(stderr, "[cellSpurs] CreateTaskset REJECT null (spurs=0x%08X taskset=0x%08X)\n",
+                spurs_ea, taskset_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    }
 
-    if (!spurs_inst_find(spurs_ea))
+    if (!spurs_inst_find(spurs_ea)) {
+        fprintf(stderr, "[cellSpurs] CreateTaskset REJECT unregistered spurs=0x%08X (taskset=0x%08X)\n",
+                spurs_ea, taskset_ea);
         return CELL_SPURS_CORE_ERROR_STAT;
+    }
 
     memset(taskset, 0, sizeof(CellSpursTaskset));
     taskset->initialized = 1;
@@ -668,11 +674,16 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     CellSpursTaskId* taskId_h = GUEST_PTR(taskId, CellSpursTaskId*);
 
-    if (!taskset)
+    if (!taskset) {
+        fprintf(stderr, "[cellSpurs] CreateTask REJECT null taskset (elf=0x%08X)\n", elf_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    }
 
-    if (!g_ydkj_real_taskset_ea)   /* real-BE init flag (native ->initialized clobbered by BE layout) */
+    if (!g_ydkj_real_taskset_ea) { /* real-BE init flag (native ->initialized clobbered by BE layout) */
+        fprintf(stderr, "[cellSpurs] CreateTask REJECT no-init (taskset=0x%08X elf=0x%08X)\n",
+                taskset_ea, elf_ea);
         return CELL_SPURS_TASK_ERROR_STAT;
+    }
 
     /* Find a free task slot */
     for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
@@ -1373,6 +1384,13 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
     if (!sync)
         return CELL_SPURS_TASK_ERROR_STAT;
 
+    { static int _n=0; if (_n++ < 40 || (_n%1000)==0)
+        fprintf(stderr, "[cellSpurs] EventFlagSet#%d flagEA=0x%08X bits=0x%04X "
+                "events=0x%04X used=0x%04X pend=0x%04X mode=0x%04X\n",
+                _n, ea, (unsigned)bits,
+                vm_read16(ea + EF_EVENTS), vm_read16(ea + EF_SPU_USED_SLOTS),
+                vm_read16(ea + EF_SPU_PENDING_RECV), vm_read16(ea + EF_SPU_WAIT_MODE)); }
+
     ef_lock(sync);
     spurs_ef_set_locked(ea, bits);
     ef_broadcast(sync);
@@ -1788,6 +1806,13 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
+    /* TIMING PROBE (LBP_JC_DELAY=ms): the real jm2 chain walker is async and
+     * picks up jobs as the PPU appends them + fills their descriptors. Our walk
+     * is one-shot; if it reads descriptors before the PPU populates the I/O
+     * (n_dma=0, empty ioBuffer), deferring the walk should let real I/O appear.
+     * Confirms timing-vs-never before committing to the async rewrite. */
+    { const char* d = getenv("LBP_JC_DELAY");
+      if (d && *d) Sleep((unsigned)atoi(d)); }
     jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
                s_jobchains[slot].size_desc);
     s_jobchains[slot].running = 0;
