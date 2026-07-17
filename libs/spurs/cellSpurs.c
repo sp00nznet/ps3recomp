@@ -935,11 +935,10 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     ef_lock(sync);
 
     /* Block until the requested bit pattern is satisfied */
-    /* SPU-completion shim: the bits this wait expects are normally set by an SPU
-     * workload via cellSpursEventFlagSet. We don't execute SPU code, so after a
-     * short grace period with no signal we force-satisfy the pattern (as if the
-     * SPU finished) so the title's boot proceeds. Correct fix is SPU execution. */
-    unsigned timeouts = 0;
+    /* SPURS_EF_FORCE=1 restores the old unconditional fake for A/B comparison. */
+    static int s_force = -1;
+    if (s_force < 0) s_force = getenv("SPURS_EF_FORCE") ? 1 : 0;
+    unsigned waits = 0;
     for (;;) {
         u16 current = eventFlag->bits;
 
