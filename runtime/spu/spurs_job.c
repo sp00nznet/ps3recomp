@@ -220,6 +220,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * then jump-tables on the command TYPE (word1 of the block, cases 0..5).
      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
      * the user data + that command block so the bail path is attributable. */
+    uint32_t dump_cmd = 0;
     if (getenv("LBP_JOB_DUMP")) {
         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
@@ -228,13 +229,28 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                 (unsigned long long)g64(job_ea + JH_SIZE + 8),
                 (unsigned long long)g64(job_ea + JH_SIZE + 16),
                 (unsigned long long)g64(job_ea + JH_SIZE + 24));
-        if (cmd && cmd < 0x30000000u) {
+        if (cmd && cmd < 0x50000000u) {
+            dump_cmd = cmd;
             fprintf(stderr, "[spurs-job]   cmdblock @0x%08X:", cmd);
             for (int o = 0; o < 64; o += 4) {
                 if ((o & 15) == 0) fprintf(stderr, "\n      +%02X:", o);
                 fprintf(stderr, " %08X", g32(cmd + o));
             }
             fprintf(stderr, "\n");
+            /* cmdblock+0x1C points at a 2048-byte WORK-ITEM table the type-0/1
+             * handler GETs (pc=0x1A78) before entering its per-item worker with
+             * count = cmdblock+0x24. Dump its head: all-zero means the game
+             * never filled the items (upstream/ordering); real entries mean the
+             * SPU worker mishandles them. */
+            uint32_t tbl = g32(cmd + 0x1C);
+            if (tbl && tbl < 0x50000000u) {
+                fprintf(stderr, "[spurs-job]   worktable @0x%08X (n=%u):", tbl, g32(cmd + 0x24));
+                for (int o = 0; o < 96; o += 4) {
+                    if ((o & 15) == 0) fprintf(stderr, "\n      +%02X:", o);
+                    fprintf(stderr, " %08X", g32(tbl + o));
+                }
+                fprintf(stderr, "\n");
+            }
         }
         fflush(stderr);
     }
@@ -253,6 +269,17 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     if (getenv("LBP_JOB_DUMP")) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
                 job_ea, ctx.status, ctx.stop_code, ctx.pc);
+        /* Post-run view of the same command block: the game polls result/status
+         * fields the job writes back -- a before/after diff shows whether the
+         * handler delivered its completion or the PPU waits on stale state. */
+        if (dump_cmd) {
+            fprintf(stderr, "[spurs-job]   cmdblock @0x%08X AFTER:", dump_cmd);
+            for (int o = 0; o < 64; o += 4) {
+                if ((o & 15) == 0) fprintf(stderr, "\n      +%02X:", o);
+                fprintf(stderr, " %08X", g32(dump_cmd + o));
+            }
+            fprintf(stderr, "\n");
+        }
         fflush(stderr);
     }
 
