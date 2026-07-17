@@ -415,6 +415,31 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
+    /* Bink SPU (image 3) DMA trace: is the video decode dispatching real work?
+     * Log only the INTERESTING transfers -- frame-sized (>256B) or targeting the
+     * movie-plane main-heap region (0x40C00000..0x41000000) -- so if the log
+     * stays empty the task only ever does <=128B control DMAs (stuck in the
+     * SPURS job-queue kernel, never dispatching decode); if plane-sized PUTs
+     * appear we learn where the decoded frame actually lands. Env LBP_DMATRACE. */
+    {
+        static int64_t bt=-2; if (bt==-2){ const char* e=getenv("LBP_DMATRACE"); bt=e?1:0; }
+        if (bt && spu->image_id==3) {
+            uint32_t ea32 = (uint32_t)ea;
+            int is_put   = ((cmd & 0x20) && !(cmd & 0x40));   /* PUT-family */
+            uint32_t hi  = ea32 & 0xFFFF0000u;
+            /* Suppress the two known-noise sources so a real frame-output PUT is
+             * not buried: the fixed 0x00927E80 SPURS control-PUT and the 0x4945/
+             * 0x4847 reference-GET reads. Log EVERYTHING else (any PUT to a new
+             * address, any transfer >=512B). */
+            int noise = (ea32 == 0x00927E80u) ||
+                        (!is_put && (hi == 0x49450000u || hi == 0x48470000u || hi == 0x49460000u));
+            static int _bx=0;
+            if (!noise && (is_put || size >= 512) && _bx++ < 300)
+                fprintf(stderr, "[bink-io] %s cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X tag=%u\n",
+                        is_put?"PUT":"GET", cmd, lsa, ea32, size, tag);
+        }
+    }
+
     /* Policy-module observation trace: every SPURS PM run's first transfers,
      * always on (policy runs are rare and their DMA pattern is the primary
      * bring-up signal: joblist fetch, job-module loads, output stores). */

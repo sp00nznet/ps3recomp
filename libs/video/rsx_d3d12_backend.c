@@ -1858,11 +1858,12 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
                  * ring-desync (frame present at a DIFFERENT slot) is separable
                  * from decode-never-ran (region entirely zero). */
                 struct { u32 lo, hi; const char* tag; } rng[] = {
-                    {0x40000000u, 0x41000000u, "VRAM"}, {0x00100000u, 0x10000000u, "MAIN"} };
+                    {0x40000000u, 0x41000000u, "VRAM"}, {0x00100000u, 0x10000000u, "MAIN"},
+                    {0x48000000u, 0x4A000000u, "BINK"} };  /* Bink working set (handle ~0x4849E760, SPU I/O 0x4847/0x4945) */
                 u32 plane_lo = (off > 0x400000u) ? off - 0x400000u : 0;
                 u32 plane_hi = off + 0x400000u;
                 int found = 0, nearc = 0;
-                for (int r = 0; r < 2; r++) {
+                for (int r = 0; r < (int)(sizeof(rng)/sizeof(rng[0])); r++) {
                     u32 best_a = 0, best_nz = 0; u32 best_span = 0;
                     for (u32 a = rng[r].lo; a + w*h < rng[r].hi; a += 0x8000) {
                         const u8* p = vm_base + a;
