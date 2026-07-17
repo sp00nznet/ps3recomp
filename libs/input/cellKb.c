@@ -11,6 +11,15 @@
 #include "cellKb.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+/* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. Write
+ * through the vm accessors (cellPad.c idiom) -- dereferencing the "pointer"
+ * as host memory faults (LBP: cellKbGetInfo memset at guest-stack EA
+ * 0x0FEFF814 crashed the boot right after the loading phase). */
+extern void vm_write8 (unsigned long long a, unsigned char  v);
+extern void vm_write16(unsigned long long a, unsigned short v);
+extern void vm_write32(unsigned long long a, unsigned int   v);
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -144,8 +153,12 @@ s32 cellKbEnd(void)
     return CELL_OK;
 }
 
+/* Guest CellKbData layout (big-endian): +0x00 led u32, +0x04 mkey u32,
+ * +0x08 len s32, +0x0C keycode[62] u16. */
 s32 cellKbGetData(u32 port_no, CellKbData* data)
 {
+    unsigned long long ea = (unsigned int)(uintptr_t)data;
+
     if (!s_kb_initialized)
         return CELL_KB_ERROR_UNINITIALIZED;
 
@@ -155,21 +168,23 @@ s32 cellKbGetData(u32 port_no, CellKbData* data)
     KbPortState* kb = &s_kb_ports[port_no];
 
     if (!kb->connected) {
-        memset(data, 0, sizeof(CellKbData));
+        vm_write32(ea + 0x00, 0);
+        vm_write32(ea + 0x04, 0);
+        vm_write32(ea + 0x08, 0);
         return CELL_KB_ERROR_NO_DEVICE;
     }
 
-    data->led  = kb->led;
-    data->mkey = kb->mkey;
+    vm_write32(ea + 0x00, kb->led);
+    vm_write32(ea + 0x04, kb->mkey);
 
     if (kb->rmode == CELL_KB_RMODE_PACKET) {
         /* Return buffered key events */
-        data->len = kb->event_count;
+        vm_write32(ea + 0x08, (u32)kb->event_count);
         for (s32 i = 0; i < kb->event_count && i < CELL_KB_MAX_KEYCODES; i++) {
             u16 code = kb->event_buf[i];
             if (kb->codetype == CELL_KB_CODETYPE_ASCII)
                 code = kb_raw_to_ascii(code, kb->mkey);
-            data->keycode[i] = code;
+            vm_write16(ea + 0x0C + (u32)i * 2, code);
         }
         /* Clear event buffer after reading */
         kb->event_count = 0;
@@ -181,34 +196,39 @@ s32 cellKbGetData(u32 port_no, CellKbData* data)
                 u16 code = (u16)i;
                 if (kb->codetype == CELL_KB_CODETYPE_ASCII)
                     code = kb_raw_to_ascii(code, kb->mkey);
-                data->keycode[count++] = code;
+                vm_write16(ea + 0x0C + (u32)count * 2, code);
+                count++;
             }
         }
-        data->len = count;
+        vm_write32(ea + 0x08, (u32)count);
     }
 
     return CELL_OK;
 }
 
+/* Guest CellKbInfo layout (big-endian): +0x00 max_connect u32, +0x04
+ * now_connect u32, +0x08 info u32, +0x0C status[] u8 PER KEYBOARD (bytes,
+ * not u32s -- SDK/RPCS3 layout). */
 s32 cellKbGetInfo(CellKbInfo* info)
 {
+    unsigned long long ea = (unsigned int)(uintptr_t)info;
+
     if (!s_kb_initialized)
         return CELL_KB_ERROR_UNINITIALIZED;
 
     if (!info)
         return CELL_KB_ERROR_INVALID_PARAMETER;
 
-    memset(info, 0, sizeof(CellKbInfo));
-    info->max_connect = s_kb_max_connect;
+    vm_write32(ea + 0x00, s_kb_max_connect);
+    vm_write32(ea + 0x08, 0);                      /* system info flags */
 
     u32 connected = 0;
     for (u32 i = 0; i < s_kb_max_connect; i++) {
-        if (s_kb_ports[i].connected) {
-            info->status[i] = CELL_KB_STATUS_CONNECTED;
-            connected++;
-        }
+        int on = s_kb_ports[i].connected;
+        vm_write8(ea + 0x0C + i, on ? CELL_KB_STATUS_CONNECTED : 0);
+        if (on) connected++;
     }
-    info->now_connect = connected;
+    vm_write32(ea + 0x04, connected);              /* now_connect */
 
     return CELL_OK;
 }

@@ -11,6 +11,13 @@
 #include "cellMouse.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+/* HLE struct args are GUEST EAs -- write through the vm accessors (also
+ * declared above cellMouseGetInfo; harmless duplicates). */
+extern void vm_write8 (unsigned long long a, unsigned char  v);
+extern void vm_write16(unsigned long long a, unsigned short v);
+extern void vm_write32(unsigned long long a, unsigned int   v);
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -142,8 +149,27 @@ s32 cellMouseEnd(void)
     return CELL_OK;
 }
 
+/* Guest CellMouseData layout (big-endian, 8 bytes): +0 update u8, +1 buttons
+ * u8, +2 x_axis s8, +3 y_axis s8, +4 wheel s8, +5 tilt s8, +6..7 pad. The
+ * arg is a GUEST EA -- write via vm accessors (see cellMouseGetInfo below);
+ * dereferencing it as a host pointer is an instant AV. */
+static void mouse_write_data(unsigned long long ea, u8 update, u8 buttons,
+                             s8 x, s8 y, s8 wheel)
+{
+    vm_write8(ea + 0, update);
+    vm_write8(ea + 1, buttons);
+    vm_write8(ea + 2, (u8)x);
+    vm_write8(ea + 3, (u8)y);
+    vm_write8(ea + 4, (u8)wheel);
+    vm_write8(ea + 5, 0);           /* tilt */
+    vm_write8(ea + 6, 0);
+    vm_write8(ea + 7, 0);
+}
+
 s32 cellMouseGetData(u32 port_no, CellMouseData* data)
 {
+    unsigned long long ea = (unsigned int)(uintptr_t)data;
+
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
@@ -153,12 +179,9 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     MousePortState* ms = &s_mouse_ports[port_no];
 
     if (!ms->connected) {
-        memset(data, 0, sizeof(CellMouseData));
+        mouse_write_data(ea, 0, 0, 0, 0, 0);
         return CELL_MOUSE_ERROR_NO_DEVICE;
     }
-
-    data->update  = ms->updated ? 1 : 0;
-    data->buttons = ms->buttons;
 
     /* Clamp accumulated deltas to s8 range */
     s32 dx = ms->acc_dx;
@@ -168,10 +191,8 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     if (dy > 127) dy = 127; if (dy < -128) dy = -128;
     if (wh > 127) wh = 127; if (wh < -128) wh = -128;
 
-    data->x_axis = (s8)dx;
-    data->y_axis = (s8)dy;
-    data->wheel  = (s8)wh;
-    data->tilt   = 0;
+    mouse_write_data(ea, ms->updated ? 1 : 0, ms->buttons,
+                     (s8)dx, (s8)dy, (s8)wh);
 
     /* Reset accumulated state */
     ms->acc_dx = 0;
@@ -182,8 +203,11 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     return CELL_OK;
 }
 
+/* Guest CellMouseDataList layout: +0x00 list_num u32, +0x04 CellMouseData[8]. */
 s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
 {
+    unsigned long long ea = (unsigned int)(uintptr_t)data;
+
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
@@ -193,7 +217,7 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
     MousePortState* ms = &s_mouse_ports[port_no];
 
     if (!ms->connected) {
-        memset(data, 0, sizeof(CellMouseDataList));
+        vm_write32(ea + 0x00, 0);
         return CELL_MOUSE_ERROR_NO_DEVICE;
     }
 
@@ -206,14 +230,16 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
         ms->updated = 0;
     }
 
-    data->list_num = ms->ring_count;
+    vm_write32(ea + 0x00, ms->ring_count);
     u32 start = 0;
     if (ms->ring_write > CELL_MOUSE_MAX_DATA_LIST_NUM)
         start = ms->ring_write - CELL_MOUSE_MAX_DATA_LIST_NUM;
 
     for (u32 i = 0; i < ms->ring_count; i++) {
         u32 idx = (start + i) % CELL_MOUSE_MAX_DATA_LIST_NUM;
-        data->list[i] = ms->ring[idx];
+        CellMouseData* d = &ms->ring[idx];
+        mouse_write_data(ea + 0x04 + i * 8, d->update, d->buttons,
+                         d->x_axis, d->y_axis, d->wheel);
     }
 
     /* Clear ring */
