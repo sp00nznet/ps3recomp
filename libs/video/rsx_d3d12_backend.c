@@ -1850,25 +1850,45 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
             u32 hz = 0; for (u32 i=0;i<w*h;i+=137) if (here[i]) { hz=1; break; }
             static int _mf = 0;
             if (!hz && _mf++ < 3) {
-                fprintf(stderr, "[movie-find] bound plane off=0x%X is ZERO; scanning...\n", off);
-                /* scan 0x40000000..0x41000000 (VRAM) + 0x00100000..0x10000000
-                 * (main heap) in 0x8000 steps for a 640x360 content block. */
+                fprintf(stderr, "[movie-find] bound plane ea=0x%X is ZERO; full scan...\n", off);
+                /* Scan FULL VRAM + main heap in 0x8000 steps for a 640x360
+                 * content block -- NO early cap (the previous found<6 stopped in
+                 * the low-VRAM display buffers before ever reaching the movie
+                 * region ~0x40E80000). Report the near-plane hits explicitly so
+                 * ring-desync (frame present at a DIFFERENT slot) is separable
+                 * from decode-never-ran (region entirely zero). */
                 struct { u32 lo, hi; const char* tag; } rng[] = {
                     {0x40000000u, 0x41000000u, "VRAM"}, {0x00100000u, 0x10000000u, "MAIN"} };
-                int found = 0;
-                for (int r = 0; r < 2 && found < 6; r++) {
-                    for (u32 a = rng[r].lo; a + w*h < rng[r].hi && found < 6; a += 0x8000) {
+                u32 plane_lo = (off > 0x400000u) ? off - 0x400000u : 0;
+                u32 plane_hi = off + 0x400000u;
+                int found = 0, nearc = 0;
+                for (int r = 0; r < 2; r++) {
+                    u32 best_a = 0, best_nz = 0; u32 best_span = 0;
+                    for (u32 a = rng[r].lo; a + w*h < rng[r].hi; a += 0x8000) {
                         const u8* p = vm_base + a;
-                        u32 nz = 0, span = 0; u8 mn2 = 255, mx2 = 0;
+                        u32 nz = 0; u8 mn2 = 255, mx2 = 0;
                         for (u32 i = 0; i < w*h; i += 257) { u8 v = p[i]; if (v) nz++; if (v<mn2) mn2=v; if (v>mx2) mx2=v; }
-                        span = mx2 - mn2;
+                        u32 span = mx2 - mn2;
+                        if (nz > best_nz) { best_nz = nz; best_a = a; best_span = span; }
                         if (nz > 400 && span > 60) {  /* looks like image content */
-                            fprintf(stderr, "[movie-find]   CONTENT @0x%08X (%s) nz=%u span=%u\n", a, rng[r].tag, nz, span);
+                            int isnear = (a >= plane_lo && a <= plane_hi);
+                            if (isnear) nearc++;
+                            if (found < 40)
+                                fprintf(stderr, "[movie-find]   CONTENT @0x%08X (%s) nz=%u span=%u%s\n",
+                                        a, rng[r].tag, nz, span, isnear ? " <== NEAR bound plane" : "");
                             found++;
                         }
                     }
+                    /* Always report the densest block in this range even below the
+                     * content threshold -- the MM intro fades in from black, so the
+                     * real first frames are low-span and would otherwise be invisible. */
+                    fprintf(stderr, "[movie-find]   %s best @0x%08X nz=%u span=%u%s\n",
+                            rng[r].tag, best_a, best_nz, best_span,
+                            (best_a >= plane_lo && best_a <= plane_hi) ? " <== NEAR bound plane" : "");
                 }
-                if (!found) fprintf(stderr, "[movie-find]   no 640x360 content block found anywhere\n");
+                fprintf(stderr, "[movie-find]   total=%d near-plane=%d (window 0x%X..0x%X)\n",
+                        found, nearc, plane_lo, plane_hi);
+                if (!found) fprintf(stderr, "[movie-find]   no 640x360 content block (>thresh) found anywhere\n");
             }
         }
         /* TEX_SAVE=1: also dump wide B8 uploads (Bink video planes are B8 --
@@ -3918,11 +3938,23 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         ((width == 640 && height == 360) || (width == 320 && height == 180))) {
         extern u32 cellGcmResolveLocated(int local, u32 offset);
         static int _mv = 0; if (_mv++ < 24) {
-            u32 rez = cellGcmResolveLocated((tex->format & 3) == 1, offset);
-            u32 fnz = 0; extern uint8_t* vm_base;
-            if (vm_base) for (u32 i=0;i<0x8000;i+=137){ if (vm_base[rez+i]) { fnz = vm_base[rez+i]; break; } }
-            fprintf(stderr, "[mv-bind] unit=%u fmt=0x%02X %ux%u off=0x%X -> ea=0x%08X firstnz=%u\n",
-                    unit, format, width, height, offset, rez, fnz);
+            /* Resolve the SAME raw offset both ways -- as LOCAL (VRAM) and as MAIN
+             * (IO-mapped) -- and count nonzero bytes over the whole plane for each.
+             * If the plane the game declares (loc bits fmt&3) is zero but the OTHER
+             * pool has content, the decoder wrote to a different memory space than
+             * our texture resolve picked (the local-vs-main mismatch). */
+            u32 loc = tex->format & 3;               /* 1=LOCAL, 2=MAIN */
+            u32 ea_loc  = cellGcmResolveLocated(1, offset);
+            u32 ea_main = cellGcmResolveLocated(0, offset);
+            u32 plane = width * height;
+            u32 nz_loc = 0, nz_main = 0;
+            if (vm_base) for (u32 i = 0; i < plane; i += 137) {
+                if (vm_base[ea_loc  + i]) nz_loc++;
+                if (vm_base[ea_main + i]) nz_main++;
+            }
+            fprintf(stderr, "[mv-bind] unit=%u fmt=0x%02X loc=%u %ux%u off=0x%X | LOCAL ea=0x%08X nz=%u | MAIN ea=0x%08X nz=%u\n",
+                    unit, format, loc, width, height, offset,
+                    ea_loc, nz_loc, ea_main, nz_main);
         }
     }
 
