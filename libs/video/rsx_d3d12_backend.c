@@ -3468,6 +3468,36 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     return count;
 }
 
+/* Non-indexed TRIANGLE_STRIP (fan=0) / TRIANGLE_FAN (fan=1) through the VP
+ * path, expanded to a triangle list. LBP's Bink movie draws its YUV quad as a
+ * non-indexed 4-vertex strip (prim 6); without this it fell to the fixed-
+ * function fallback with is_vp=0 (no vertex-program transform -> the quad
+ * collapsed to a line) and textured=0 (the Y/U/V planes never sampled). */
+static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan)
+{
+    extern uint8_t* vm_base;
+    if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+    if (!state->vertex_attribs[0].enabled) return 0;
+    if (count < 3) return 0;
+    u32 tris = count - 2;
+    u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    if (tris * 3 > maxv) tris = maxv / 3;
+    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
+    u32 o = 0;
+    for (u32 t = 0; t < tris; t++) {
+        u32 i0 = fan ? 0 : t;
+        /* strip winding alternates per triangle to keep facing consistent */
+        u32 i1 = t + 1, i2 = t + 2;
+        if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
+        read_vp_vertex(state, first + i0, &out[o*16]); o++;
+        read_vp_vertex(state, first + i1, &out[o*16]); o++;
+        read_vp_vertex(state, first + i2, &out[o*16]); o++;
+    }
+    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
+    return o;
+}
+
 /* Fetch index k from the guest index array (SET_INDEX_ARRAY_ADDRESS/_DMA:
  * dma [3:0] = location (0 local, 1 main), [7:4] = type (0 u32, 1 u16)).
  * Indices are big-endian in guest memory. */
@@ -3667,10 +3697,13 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * vertex program does the MVP transform (gcm/cube draws its cube this way);
      * the fixed-function fallback below applies no transform, so 3D geometry
      * ends up in object space (invisible/garbage). */
-    if (primitive == 5 /* CELL_GCM_PRIMITIVE_TRIANGLES */ &&
+    if ((primitive == 5 /* TRIANGLES */ || primitive == 6 /* TRIANGLE_STRIP */
+         || primitive == 7 /* TRIANGLE_FAN */) &&
         s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
         u32 rec = s_d3d.vp_vb_offset;
-        u32 emitted = upload_tris_vp(s_d3d.current_rsx_state, first, count);
+        u32 emitted = (primitive == 5)
+            ? upload_tris_vp(s_d3d.current_rsx_state, first, count)
+            : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == 7);
         if (emitted && s_d3d.draw_count < MAX_DRAWS) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
             dr->vb_byte_offset = rec;
@@ -3845,6 +3878,21 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         printf("[D3D12] bind_texture(unit=%u, offset=0x%X, fmt=0x%02X, %ux%u)\n",
                unit, offset, format, width, height);
         log_count++;
+    }
+    /* MOVIE_BIND=1: trace movie-plane binds (640x360 Y / 320x180 U/V) with the
+     * resolved EA + a content probe -- used to diagnose the Bink frame-buffer
+     * ring mismatch (the draw binds a cleared buffer 0x4D80 before the one the
+     * decoder actually fills). */
+    if (getenv("MOVIE_BIND") &&
+        ((width == 640 && height == 360) || (width == 320 && height == 180))) {
+        extern u32 cellGcmResolveLocated(int local, u32 offset);
+        static int _mv = 0; if (_mv++ < 24) {
+            u32 rez = cellGcmResolveLocated((tex->format & 3) == 1, offset);
+            u32 fnz = 0; extern uint8_t* vm_base;
+            if (vm_base) for (u32 i=0;i<0x8000;i+=137){ if (vm_base[rez+i]) { fnz = vm_base[rez+i]; break; } }
+            fprintf(stderr, "[mv-bind] unit=%u fmt=0x%02X %ux%u off=0x%X -> ea=0x%08X firstnz=%u\n",
+                    unit, format, width, height, offset, rez, fnz);
+        }
     }
 
     if (!vm_base || width == 0 || height == 0) return;
