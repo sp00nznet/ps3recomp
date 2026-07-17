@@ -2870,7 +2870,14 @@ class PPULifter:
         """
         defined = {f.start_addr for f in self.functions}
         # All addresses that are referenced as func_X but not yet defined
-        all_refs = (self.call_targets | self.branch_targets) - defined
+        # Include code addresses discovered in DATA (fn-ptr tables, vtables, struct
+        # fields). These are reached only by INDIRECT calls, so they appear in no
+        # static call/branch set -- without them the runtime hits
+        # `[ppu] unresolved indirect call -> 0x...` and hangs. (The pre-2026-07
+        # lifter emitted ~7k such mid-function wrappers wholesale; dropping them
+        # silently broke YDKJ: 0x202140, 0x2B69BC, 0x2DE850 ...)
+        all_refs = (self.call_targets | self.branch_targets
+                    | getattr(self, 'data_code_targets', set())) - defined
 
         if not all_refs:
             return 0
@@ -3292,6 +3299,15 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             return None
         r_val = p[0]
         r_base = None; table_base = None
+        # `toc` may be a SCALAR or a LIST of candidate TOCs (multi-TOC executables).
+        # Normalise FIRST: this probe used to do `toc + d_base` directly, which threw
+        # "can only concatenate list (not int) to list" the moment the caller started
+        # passing toc_candidates -- and the caller's `except` silently disabled
+        # jump-table discovery for the WHOLE binary (every switch lifted as a failing
+        # bctr). Probe each candidate here; the loop below re-validates properly.
+        toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
+        _toc_probe = [t for t in toc_candidates if t]
+        cand_bases = []          # [(toc_used, table_base)] -- one per viable TOC
         for cand in (p[1], p[2]):
             ld = _lwz_of(cand)
             if ld is None:
@@ -3299,19 +3315,29 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             d_base, rA = ld
             if d_base is None:
                 continue
-            if rA == 'r2' and toc:                       # one-level: lwz base, d(r2)
-                table_base = read_u32((toc + d_base) & 0xFFFFFFFF)
+            found = []
+            if rA == 'r2':                               # one-level: lwz base, d(r2)
+                for _t in _toc_probe:
+                    tb = read_u32((_t + d_base) & 0xFFFFFFFF)
+                    if tb is not None:
+                        found.append((_t, tb))
             else:                                        # two-level: base <- global <- TOC
                 mid = _lwz_of(rA)
-                if mid is not None and mid[0] is not None and mid[1] == 'r2' and toc:
-                    midval = read_u32((toc + mid[0]) & 0xFFFFFFFF)
-                    if midval is not None:
-                        table_base = read_u32((midval + d_base) & 0xFFFFFFFF)
-            if table_base is not None:
-                r_base = cand; break
-        if table_base is None or not toc:
+                if mid is not None and mid[0] is not None and mid[1] == 'r2':
+                    for _t in _toc_probe:
+                        midval = read_u32((_t + mid[0]) & 0xFFFFFFFF)
+                        if midval is None:
+                            continue
+                        tb = read_u32((midval + d_base) & 0xFFFFFFFF)
+                        if tb is not None:
+                            found.append((_t, tb))
+            if found:
+                r_base = cand
+                cand_bases = found
+                table_base = found[0][1]
+                break
+        if not cand_bases:
             continue
-        toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
         # offset table iff an `add rC, *, r_base` combines the loaded value + base
         is_offset = any(
             w.mnemonic == 'add' and
@@ -3336,16 +3362,9 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # and keep the one whose table decodes to the most in-text case
         # targets (a wrong TOC reads unrelated data and validates 0 targets).
         best = []
-        for cand in toc_candidates:
+        for cand, table_base in cand_bases:
             if not cand:
                 continue
-            if base_is_ld:
-                hi = read_u32((cand + disp) & 0xFFFFFFFF)
-                table_base = read_u32((cand + disp + 4) & 0xFFFFFFFF)
-                if hi:              # table addresses live in the 32-bit VA space
-                    table_base = None
-            else:
-                table_base = read_u32((cand + disp) & 0xFFFFFFFF)
             _dbg(all_insns[i].addr, f"cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
             if table_base is None:
                 continue
@@ -3740,6 +3759,7 @@ def main() -> None:
     # mechanism lifts target..func_end, so a far end explodes the output.)
     jt_targets = set()
     jt_dispatchers: dict[int, list[int]] = {}   # {bctr_addr: [case targets]}
+    data_code_targets: set[int] = set()         # code ptrs found in data (indirect-call targets)
     if not args.raw:
         try:
             seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
@@ -3797,6 +3817,24 @@ def main() -> None:
                 print(f"  TOC candidates: {', '.join(hex(t) for t in toc_candidates)}")
             tables = discover_jump_tables(all_insns, _read_u32, toc_candidates, text_lo, text_hi)
             jt_dispatchers = tables
+
+            # ---- code pointers living in DATA -------------------------------
+            # Vtables / fn-ptr tables / struct fields hold code addresses that are
+            # reached ONLY by indirect call, so they are in no static call/branch
+            # set. The mid-function tail-entry pass needs them or the runtime hits
+            # `[ppu] unresolved indirect call -> 0x...` and hangs (YDKJ: 0x202140,
+            # 0x2B69BC, 0x2DE850). Scan every NON-text segment for aligned words
+            # that point into .text. The tail-entry pass caps each span
+            # (_MAX_MID_TAIL) and skips anything already defined, so false
+            # positives cost at most a small truncated stub.
+            for v0, v1, d in seg_map:
+                if v0 <= text_lo < v1:      # skip the text segment itself
+                    continue
+                for o in range(0, len(d) - 3, 4):
+                    w = int.from_bytes(d[o:o+4], 'big')
+                    if text_lo <= w < text_hi and (w & 3) == 0:
+                        data_code_targets.add(w)
+            print(f"  data code-pointers: {len(data_code_targets)} candidate targets")
             for ts in tables.values():
                 jt_targets.update(ts)
             import bisect
@@ -3893,6 +3931,7 @@ def main() -> None:
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
+    lifter.data_code_targets = data_code_targets
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.

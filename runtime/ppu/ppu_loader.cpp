@@ -325,6 +325,28 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
 #endif
       } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap64(v); }
+
+/* Host-backtrace -> guest-func resolver, callable from C runtime code (e.g. the
+ * LLE-libsre taskset setter) to identify the GAME-side caller. */
+extern "C" void ydkj_host_bt(const char* tag)
+{
+#ifdef _WIN32
+    void* bt[48]; unsigned short fr = RtlCaptureStackBackTrace(0, 48, bt, 0);
+    char line[1600]; int p = snprintf(line, sizeof line, "[HOSTBT %s]", tag ? tag : "");
+    for (int i = 0; i < fr && p < 1520; i++) {
+        uintptr_t tgt = (uintptr_t)bt[i]; uint32_t bg = 0; uintptr_t bh = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > bh) { bh = h; bg = function_table[k].addr; }
+        }
+        if (bg && (tgt - bh) < 0x1400) p += snprintf(line + p, sizeof(line) - p, " %08X+%llX", bg, (unsigned long long)(tgt - bh));
+    }
+    fprintf(stderr, "%s\n", line); fflush(stderr);
+#else
+    (void)tag;
+#endif
+}
+
 void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return;
     /* AWATCH8: watch byte writes to a specific addr (e.g. the 0x543580 Lv-2
      * completion flag the worker spins on) — vm_write32-based AWATCH misses these. */
@@ -339,7 +361,79 @@ void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return;
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40)
         fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
     v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
+extern "C" uint32_t g_ydkj_vidlist_ea = 0;
 void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
+#ifdef _WIN32
+    /* VIDLIST watch: the GFx video advance-list count/array. The recomp probe in
+     * func_003133D0 publishes the delegate EA here (it drifts per run). The videos are
+     * registered (count=2) then REMOVED (2->1->0) before any read -- log who does it. */
+    /* FMODREG watch: FMOD's global object registry. Static addrs (no drift):
+     *   TOC slot 0x0053F83C -> list obj 0x00544258 -> head 0x00596330.
+     * func_002B03AC walks it to validate an FMOD handle; our System (heap 0x400039xx)
+     * is never found => returns 0x25 (37) => FMOD init fails. Log every write to the
+     * list/head to find the register/insert path (or prove none exists). */
+    if (getenv("YDKJ_FMODREG")) {
+        uint32_t ea=(uint32_t)a;
+        if (ea==0x00596330u || ea==0x00544258u || ea==0x0053F83Cu) {
+            static long _n=0;
+            if (_n++<24) {
+                char ln[640]; int p2=snprintf(ln,sizeof ln,"[FMODREG] *0x%08X = 0x%08X  writer:",ea,v);
+                void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+                for(unsigned short k=0;k<fr&&p2<600;k++){ uintptr_t tgt=(uintptr_t)bt[k]; uint32_t bg=0; uintptr_t bh=0;
+                    for(uint64_t j=0;j<function_table_count;j++){ uintptr_t h=(uintptr_t)function_table[j].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[j].addr;} }
+                    if(bg&&(tgt-bh)<0x1400) p2+=snprintf(ln+p2,sizeof(ln)-p2," %08X+%llX",bg,(unsigned long long)(tgt-bh)); }
+                fprintf(stderr,"%s\n",ln); fflush(stderr);
+            }
+        }
+    }
+    if (g_ydkj_vidlist_ea) {
+        uint32_t ea=(uint32_t)a;
+        if (ea==g_ydkj_vidlist_ea+0x10 || ea==g_ydkj_vidlist_ea+0x0C) {
+            static long _n=0;
+            if (_n++<24) {
+                char ln[640]; int p2=snprintf(ln,sizeof ln,"[VIDLIST] *0x%08X (%s) = 0x%08X  writer:",
+                    ea, ea==g_ydkj_vidlist_ea+0x10?"COUNT":"ARRAY", v);
+                void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+                for(unsigned short k=0;k<fr&&p2<600;k++){ uintptr_t tgt=(uintptr_t)bt[k]; uint32_t bg=0; uintptr_t bh=0;
+                    for(uint64_t j=0;j<function_table_count;j++){ uintptr_t h=(uintptr_t)function_table[j].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[j].addr;} }
+                    if(bg&&(tgt-bh)<0x1400) p2+=snprintf(ln+p2,sizeof(ln)-p2," %08X+%llX",bg,(unsigned long long)(tgt-bh)); }
+                fprintf(stderr,"%s\n",ln); fflush(stderr);
+            }
+        }
+    }
+    /* REGWATCH: screen-system forensics. Watches (a) the screen registry std::list at
+     * 0x587510 {+0 next, +4 prev, +8 size} — observed corrupt (prev=node but next=0,
+     * size=0) => a mis-lifted list insert; and (b) the transition arm flag 0x545820
+     * (func_00023C54 writes 1). Logs the guest writer chain for each. */
+    { static int rw_on=-1; if(rw_on==-1) rw_on = getenv("YDKJ_REGWATCH")?1:0;
+      if(rw_on){ uint32_t ea=(uint32_t)a;
+        if((ea>=0x587510u && ea<=0x58751Cu) || ea==0x545820u){
+          static long _n=0;
+          if(_n++<40){
+            char ln[640]; int p=snprintf(ln,sizeof ln,"[REGW] *0x%08X = 0x%08X  writer:",ea,v);
+            void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+            for(unsigned short k=0;k<fr&&p<600;k++){ uintptr_t tgt=(uintptr_t)bt[k]; uint32_t bg=0; uintptr_t bh=0;
+              for(uint64_t j=0;j<function_table_count;j++){ uintptr_t h=(uintptr_t)function_table[j].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[j].addr;} }
+              if(bg&&(tgt-bh)<0x1400) p+=snprintf(ln+p,sizeof(ln)-p," %08X+%llX",bg,(unsigned long long)(tgt-bh)); }
+            fprintf(stderr,"%s\n",ln); fflush(stderr);
+          } } } }
+    /* STREAMWATCH: drift-proof watch of the criMv stream's +0x10 decode handle.
+     * Capture the stream at construction (vtable 0x52E7A8 written to its base),
+     * then log every write to base+0x10 with the guest writer func. */
+    { static int sw_on=-1; if(sw_on==-1) sw_on = getenv("YDKJ_STREAMWATCH")?1:0;
+      if(sw_on){ static uint32_t strm[4]={0,0,0,0}; static int nstrm=0; uint32_t ea=(uint32_t)a;
+        if(v==0x0052E7A8u && (ea&3)==0 && ea>=0x40000000u && nstrm<4){ int dup=0; for(int i=0;i<nstrm;i++) if(strm[i]==ea) dup=1;
+          if(!dup){ strm[nstrm++]=ea; fprintf(stderr,"[STREAMW] ctor: vtable 0x52E7A8 -> stream 0x%08X (#%d)\n",ea,nstrm-1); fflush(stderr);} }
+        for(int i=0;i<nstrm;i++) if(ea==strm[i]+0x10){
+          char ln[600]; int p=snprintf(ln,sizeof ln,"[STREAMW] stream[0x%08X]+0x10 = 0x%08X  writer:",strm[i],v);
+          void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+          for(unsigned short k=0;k<fr&&p<560;k++){ uintptr_t tgt=(uintptr_t)bt[k]; uint32_t bg=0; uintptr_t bh=0;
+            for(uint64_t j=0;j<function_table_count;j++){ uintptr_t h=(uintptr_t)function_table[j].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[j].addr;} }
+            if(bg&&(tgt-bh)<0x1400) p+=snprintf(ln+p,sizeof(ln)-p," %08X+%llX",bg,(unsigned long long)(tgt-bh)); }
+          fprintf(stderr,"%s\n",ln); fflush(stderr);
+        }
+      } }
+#endif
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
 #ifdef _WIN32
@@ -1153,6 +1247,17 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                         if (v >= 0x10000u && v < 0x818000u && v != last) { p += snprintf(line+p, sizeof(line)-p, " %06X", v); last = v; }
                     }
                     fprintf(stderr, "%s\n", line); fflush(stderr);
+                    /* Deterministic host-backtrace -> guest-func resolution (the
+                     * guest-stack scan above is noisy with static-data pointers).
+                     * Each recompiled guest fn is a host fn in function_table. */
+#ifdef _WIN32
+                    { void* bt[40]; unsigned short fr=RtlCaptureStackBackTrace(0,40,bt,0);
+                      char hl[1400]; int hp=snprintf(hl,sizeof hl,"[CRIBT-HOST] \"%.40s\"", t);
+                      for(int i=0;i<fr && hp<1340;i++){ uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
+                        for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
+                        if(bg&&(tgt-bh)<0x1400) hp+=snprintf(hl+hp,sizeof(hl)-hp," %08X+%llX",bg,(unsigned long long)(tgt-bh)); }
+                      fprintf(stderr,"%s\n",hl); fflush(stderr); }
+#endif
                 }
             }
         }

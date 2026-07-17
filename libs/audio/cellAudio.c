@@ -783,13 +783,21 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     mutex_lock(&s_audio_mutex);
     AudioPortSlot* port = &s_ports[portNum];
 
-    vm_write64(cfg +  0, port->read_idx_addr);                               /* readIndexAddr */
-    vm_write32(cfg +  8, port->running ? CELL_AUDIO_STATUS_RUN
-                                       : CELL_AUDIO_STATUS_READY);           /* status */
-    vm_write64(cfg + 16, port->param.nChannel);                             /* nChannel */
-    vm_write64(cfg + 24, port->param.nBlock);                               /* nBlock */
-    vm_write32(cfg + 32, port->buf_size);                                   /* portSize */
-    vm_write64(cfg + 40, port->port_addr);                                  /* portAddr */
+    /* CellAudioPortConfig layout (PS3 is 32-bit user; sys_addr_t/bptr are u32):
+     *   +0x00 u32 readIndexAddr   +0x04 u32 status
+     *   +0x08 u64 nChannel        +0x10 u64 nBlock
+     *   +0x18 u32 portSize        +0x1C u32 portAddr      (32 bytes total)
+     * The old code wrote readIndexAddr as a u64 and put status at +8 / nChannel at
+     * +16, shifting EVERY field. FMOD's PS3 output init reads nChannel at +0x08 and
+     * requires it to be 8 -- it was reading (status|garbage) instead, returning
+     * FMOD_ERR_INVALID_PARAM(37) => "No sound will be playing" => no FMOD at all. */
+    vm_write32(cfg + 0x00, port->read_idx_addr);                            /* readIndexAddr */
+    vm_write32(cfg + 0x04, port->running ? CELL_AUDIO_STATUS_RUN
+                                         : CELL_AUDIO_STATUS_READY);        /* status */
+    vm_write64(cfg + 0x08, port->param.nChannel);                           /* nChannel */
+    vm_write64(cfg + 0x10, port->param.nBlock);                             /* nBlock */
+    vm_write32(cfg + 0x18, port->buf_size);                                 /* portSize */
+    vm_write32(cfg + 0x1C, port->port_addr);                                /* portAddr */
 
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;

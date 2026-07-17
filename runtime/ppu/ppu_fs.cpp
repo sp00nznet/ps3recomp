@@ -21,6 +21,10 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <dirent.h>
+
+/* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
+ * `extern "C"` inside a function body is ill-formed in C++. */
+extern "C" void ydkj_host_bt(const char* tag);
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>          /* open/close on MinGW */
@@ -78,6 +82,20 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 static void host_path(char* out, size_t cap, const char* guest)
 {
     const char* rel = guest;
+
+    /* /dev_flash is FIRMWARE, not game data — mapping it into the game root (the
+     * old behaviour) makes every firmware lookup miss. YDKJ's FMOD asks for
+     * /dev_flash/sys/external/flashMP3.pic and, on a miss, prints "mp3 failed to
+     * load MP3 codec (are you using the correct flash?)" and then crashes.
+     * Serve it from a real dev_flash tree instead ($PS3_DEV_FLASH, else RPCS3's). */
+    if (strncmp(guest, "/dev_flash/", 11) == 0) {
+        const char* fw = getenv("PS3_DEV_FLASH");
+        if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
+        snprintf(out, cap, "%s/%s", fw, guest + 11);
+        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+        return;
+    }
+
     static const char* mounts[] = {
         "/dev_bdvd/", "/app_home/", "/dev_hdd0/", "/dev_hdd1/",
         "/dev_flash/", "/host_root/", "/dev_usb000/", "/dev_usb/"
@@ -148,6 +166,13 @@ static void cellFsOpen(ppu_context* ctx)
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
+    if (getenv("YDKJ_USMBT") && strstr(gpath, ".usm")) {
+        /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
+         * which criMv/criFs function opened the movie, so the reader-attach path
+         * (stream+0x10, never wired => movie opened but never read) can be found. */
+        fprintf(stderr,"[USMBT] open '%s' -> fd %d\n", gpath, fd); fflush(stderr);
+        ydkj_host_bt("usm-open");
+    }
     ctx->gpr[3] = CELL_OK;
 }
 

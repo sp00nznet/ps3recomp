@@ -248,10 +248,23 @@ s32 cellSysutilDisableBgmPlayback(void)
 
 s32 cellSysutilGetBgmPlaybackStatus(s32* status)
 {
-    if (!status)
+    /* `status` is a GUEST address (YDKJ's "FMOD BGM status query thread" passes its
+     * own stack, e.g. 0xD011FF00) -- the old `*status = ...` dereferenced it as a
+     * HOST pointer and segfaulted (same bug the GetSystemParamInt comment above
+     * describes). It is also NOT an s32 out-param: the real API fills a
+     * CellSysutilBgmPlaybackStatus (guest, big-endian):
+     *   +0x00 u8  playerState        +0x01 u8 reserved[7]
+     *   +0x08 char contentId[16]     +0x18 u8 reserved2[8]
+     *   +0x20 s32 currentFadeRatio   +0x24 u8 reserved3[4]     (0x28 bytes)
+     */
+    uint32_t out_ea = (uint32_t)(uintptr_t)status;
+    if (!out_ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 
-    *status = s_bgm_status;
+    for (uint32_t o = 0; o < 0x28; o += 4)
+        vm_write32(out_ea + o, 0);
+    vm_write8(out_ea + 0x00, (uint8_t)s_bgm_status);   /* playerState */
+    vm_write32(out_ea + 0x20, 0);                      /* currentFadeRatio */
     return CELL_OK;
 }
 

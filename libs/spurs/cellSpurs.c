@@ -25,6 +25,19 @@ uint32_t g_ydkj_real_taskset_ea = 0;
 uint32_t g_ydkj_real_taskid     = 0;
 uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the taskset-policy handoff) */
 
+/* C-linkage setter so the LLE libsre lift (compiled as C) can wire the real
+ * SPURS+taskset EAs it sees in cellSpursCreateTaskset -> the cri-task
+ * SpursTasksetContext builder. (LLE bypasses the HLE cellSpurs CreateTaskset.) */
+void ydkj_set_real_taskset_ea(uint32_t spurs_ea, uint32_t taskset_ea)
+{
+    g_ydkj_real_spurs_ea   = spurs_ea;
+    g_ydkj_real_taskset_ea = taskset_ea;
+    { static int n = 0; if (n++ < 3) {
+        fprintf(stderr, "[cri] wired REAL taskset: spurs=0x%08X taskset=0x%08X (from LLE libsre)\n",
+                spurs_ea, taskset_ea);
+        { extern void ydkj_host_bt(const char*); ydkj_host_bt("CreateTaskset caller"); } } }
+}
+
 /* Generic HLE adapter passes GUEST addresses; translate pointer args. CellSpurs
  * is treated opaquely by the game (passed back as a handle), so translating the
  * pointer is enough here. */

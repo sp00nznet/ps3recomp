@@ -94,12 +94,17 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     g_last_hle_nid = nid;
     /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
     { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;
-        int gfx=0,dds=0,png=0; for(uint32_t a=0x10000; a<0x0FF00000u; a++){
+        int gfx=0,cfx=0,swf=0,dds=0,png=0; for(uint32_t a=0x10000; a<0x0FF00000u; a++){
           uint8_t m0=vm_base[a],m1=vm_base[a+1],m2=vm_base[a+2],vv=vm_base[a+3];
-          if(m0==0x47&&m1==0x46&&(m2==0x58||m2==0x43)&&(vv>=8&&vv<=12)){ if(gfx<3)fprintf(stderr,"[GFX-SCAN] GFX movie @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); gfx++; }
+          /* uncompressed GFx: 'GFX'/'GFC' ver 4..20 */
+          if(m0==0x47&&m1==0x46&&(m2==0x58||m2==0x43)&&(vv>=4&&vv<=20)){ if(gfx<3)fprintf(stderr,"[GFX-SCAN] GFX @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); gfx++; }
+          /* compressed GFx: 'CFX' (zlib) */
+          else if(m0==0x43&&m1==0x46&&m2==0x58&&(vv>=4&&vv<=20)){ if(cfx<3)fprintf(stderr,"[GFX-SCAN] CFX(zlib) @0x%08X ver=%d\n",a,vv); cfx++; }
+          /* SWF: 'FWS'(raw) / 'CWS'(zlib) / 'ZWS'(lzma) */
+          else if((m0==0x46||m0==0x43||m0==0x5A)&&m1==0x57&&m2==0x53&&(vv>=4&&vv<=20)){ if(swf<3)fprintf(stderr,"[GFX-SCAN] SWF @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); swf++; }
           else if(m0==0x44&&m1==0x44&&m2==0x53&&vv==0x20){ dds++; }
           else if(m0==0x89&&m1==0x50&&m2==0x4E&&vv==0x47){ png++; } }
-        fprintf(stderr,"[GFX-SCAN #%ld] GFX-movies=%d DDS=%d PNG=%d\n",_c/200000,gfx,dds,png); fflush(stderr); } }
+        fprintf(stderr,"[GFX-SCAN #%ld] GFX=%d CFX=%d SWF=%d DDS=%d PNG=%d\n",_c/200000,gfx,cfx,swf,dds,png); fflush(stderr); } }
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */

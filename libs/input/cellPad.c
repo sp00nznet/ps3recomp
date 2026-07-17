@@ -10,6 +10,7 @@
  * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
  */
 
+#include <time.h>
 #include "cellPad.h"
 #include <stdio.h>
 #include <string.h>
@@ -399,10 +400,36 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
      * GetData) -- if it's parked on a "press button" prompt after loading, no
      * host input means it waits forever. Inject a real button PULSE (CROSS+START+
      * CIRCLE) so it advances. Legit input simulation, not forged pixels. */
-    if (getenv("YDKJ_INJECT_PAD") && port_no < PAD_MAX_HOST_PORTS) {
+    /* NOTE: cache getenv() -- this runs on every poll from multiple threads, and the
+     * uncached version crashed deterministically (varying fault address = race). Every
+     * other probe in this tree uses the cached `static int x=-1` pattern; match it. */
+    static int  s_inj   = -1;
+    static u16  s_btn   = 0x0008u;   /* default START */
+    static long s_delay = 3000;
+    if (s_inj < 0) {
+        s_inj = getenv("YDKJ_INJECT_PAD") ? 1 : 0;
+        const char* be = getenv("YDKJ_PAD_BTN");   if (be) s_btn   = (u16)strtoul(be,0,0);
+        const char* de = getenv("YDKJ_PAD_DELAY"); if (de) s_delay = strtol(de,0,0);
+    }
+    /* Gate on WALL-CLOCK, not poll count: the game polls the pad hundreds of thousands
+     * of times inside an early wait loop, so any count-based delay fires during init
+     * (crash: guest ctr=0x0005F8A0 r3=0 -- button handler on an unconstructed object).
+     * YDKJ_PAD_DELAY is now SECONDS to wait before the first injected press. */
+    if (s_inj && port_no < PAD_MAX_HOST_PORTS) {
         static long _pc = 0; _pc++;
-        const char* be = getenv("YDKJ_PAD_BTN"); u16 btn = be ? (u16)strtoul(be,0,0) : 0x0008u; /* default START */
-        long delay = 3000; const char* de = getenv("YDKJ_PAD_DELAY"); if(de) delay = strtol(de,0,0);
+        /* Cheap counter gate FIRST: clock() is a slow call and this poll loop is hammered
+         * by the guest from multiple threads; sampling it every poll perturbs timing. Only
+         * consult the clock once every 256 polls, and never after arming. */
+        static int     s_armed = 0;
+        static clock_t s_t0    = 0;
+        if (!s_armed) {
+            if ((_pc & 0xFF) == 0) {
+                if (!s_t0) s_t0 = clock();
+                else if ((double)(clock() - s_t0) / (double)CLOCKS_PER_SEC >= (double)s_delay) s_armed = 1;
+            }
+            goto skip_inject;
+        }
+        u16 btn = s_btn; long delay = 0;
         /* Delay past init, then a single clean pulse every ~180 calls (press 15, release 165). */
         if (_pc > delay) {
             long ph = (_pc - delay) % 180;
@@ -411,6 +438,7 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
             s_host_state[port_no].connected = 1;
         }
     }
+skip_inject: ;
 
     if (port_no >= PAD_MAX_HOST_PORTS || (!s_host_state[port_no].connected && port_no != 0)) {
         goto emit;   /* data stays zeroed -> len=0 */
