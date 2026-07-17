@@ -706,20 +706,29 @@ void spu_trace_init(const char* path)
  * tests -- and the tail IS the loop. SPU_TRACE_MAX=0 restores unbounded.
  * SPU_TRACE_FILE redirects off stderr so the trace does not interleave with the
  * boot log. */
+/* Trace output is OPT-IN at runtime: a --trace lift bakes the calls into the
+ * generated C forever, so a trace-lifted image shipped in a title build (LBP's
+ * job kernel, kept from the WWS verification) would otherwise spew the
+ * per-instruction log into every boot. Enable with SPU_TRACE=1 (stderr) or
+ * SPU_TRACE_FILE=<path>. */
+static long long s_trace_left = -1;     /* -1 uninit, -2 unbounded, 0 off */
+
 void spu_trace_pc(spu_context* ctx, uint32_t pc)
 {
     (void)ctx;
-    static long long s_left = -1;
-    if (s_left < 0) {
-        const char* p = getenv("SPU_TRACE_FILE");
-        if (p && *p && !s_trace_fp) spu_trace_init(p);
-        const char* m = getenv("SPU_TRACE_MAX");
-        s_left = (m && *m) ? atoll(m) : 200000;
-        if (s_left == 0) s_left = -2;          /* -2 = unbounded */
+    if (s_trace_left < 0) {
+        if (s_trace_left == -1) {
+            const char* p = getenv("SPU_TRACE_FILE");
+            if ((!p || !*p) && !getenv("SPU_TRACE")) { s_trace_left = 0; return; }
+            if (p && *p && !s_trace_fp) spu_trace_init(p);
+            const char* m = getenv("SPU_TRACE_MAX");
+            s_trace_left = (m && *m) ? atoll(m) : 200000;
+            if (s_trace_left == 0) s_trace_left = -2;   /* -2 = unbounded */
+        }
     }
     if (!s_trace_fp) s_trace_fp = stderr;
-    if (s_left == 0) return;
-    if (s_left > 0 && --s_left == 0) {
+    if (s_trace_left == 0) return;
+    if (s_trace_left > 0 && --s_trace_left == 0) {
         fprintf(s_trace_fp, "-- SPU_TRACE_MAX reached; trace stopped --\n");
         fflush(s_trace_fp);
         return;
@@ -729,6 +738,7 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
 
 void spu_trace_rt(spu_context* ctx, uint32_t rt)
 {
+    if (s_trace_left == 0) return;         /* tracing off/stopped (see _pc) */
     if (!s_trace_fp) s_trace_fp = stderr;
     u128 v = ctx->gpr[rt & 0x7F];
     fprintf(s_trace_fp, "  r%-3u %016llX %016llX\n",
