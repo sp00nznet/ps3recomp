@@ -1840,6 +1840,37 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
     } else {
         for (u32 y = 0; y < h; y++)
             memcpy((u8*)mapped + (u64)y * pitch, vm_base + off + (u64)y * w, w);
+        /* MOVIE_FIND=1: when a 640x360 movie plane uploads ZERO, scan a wide
+         * guest window for the REAL frame (a 640-wide region with content) so
+         * we learn where the video decode actually wrote vs where the texture
+         * points -- ends the frame-buffer-address guessing. */
+        if (getenv("MOVIE_FIND") && w == 640 && h == 360) {
+            extern uint8_t* vm_base;
+            const u8* here = vm_base + off;
+            u32 hz = 0; for (u32 i=0;i<w*h;i+=137) if (here[i]) { hz=1; break; }
+            static int _mf = 0;
+            if (!hz && _mf++ < 3) {
+                fprintf(stderr, "[movie-find] bound plane off=0x%X is ZERO; scanning...\n", off);
+                /* scan 0x40000000..0x41000000 (VRAM) + 0x00100000..0x10000000
+                 * (main heap) in 0x8000 steps for a 640x360 content block. */
+                struct { u32 lo, hi; const char* tag; } rng[] = {
+                    {0x40000000u, 0x41000000u, "VRAM"}, {0x00100000u, 0x10000000u, "MAIN"} };
+                int found = 0;
+                for (int r = 0; r < 2 && found < 6; r++) {
+                    for (u32 a = rng[r].lo; a + w*h < rng[r].hi && found < 6; a += 0x8000) {
+                        const u8* p = vm_base + a;
+                        u32 nz = 0, span = 0; u8 mn2 = 255, mx2 = 0;
+                        for (u32 i = 0; i < w*h; i += 257) { u8 v = p[i]; if (v) nz++; if (v<mn2) mn2=v; if (v>mx2) mx2=v; }
+                        span = mx2 - mn2;
+                        if (nz > 400 && span > 60) {  /* looks like image content */
+                            fprintf(stderr, "[movie-find]   CONTENT @0x%08X (%s) nz=%u span=%u\n", a, rng[r].tag, nz, span);
+                            found++;
+                        }
+                    }
+                }
+                if (!found) fprintf(stderr, "[movie-find]   no 640x360 content block found anywhere\n");
+            }
+        }
         /* TEX_SAVE=1: also dump wide B8 uploads (Bink video planes are B8 --
          * the Y plane IS the movie frame in grayscale) + a content stat, so
          * "is the decoder producing pixels" is answerable by looking at a BMP. */
