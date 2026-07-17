@@ -307,6 +307,63 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     return jumps
 
 
+def compute_link_returns(insns, bounds) -> set:
+    """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
+    as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
+    caller-saved register as the LINK register for leaf/helper calls: the caller
+    does `brsl $rN, helper` (or `bisl $rN, ...`) and the helper returns via
+    `bi $rN`. Modelled as a generic indirect branch, that return targets the
+    caller's mid-function return address -- which is NOT a registered function
+    entry -> branch-to-0 (observed: LBP's wwsjob policy module uses r4/r5/r6/r8/
+    r78/r79 as link registers; e.g. `bi $r78` returned to 0x2C58/0x2D28/0x3048
+    and stalled the whole WWS job engine).
+
+    Detect it: rN is used as a link register somewhere in the image (the rt of
+    some brsl/brasl/bisl/bisled), AND within the enclosing function block rN is a
+    pure live-in -- never written before the branch. A COMPUTED branch (tail
+    call, jump table, vtable dispatch) always materialises its target register
+    in-block (lqx/rotqby/ai/il/ila...), so the write check excludes it; only a
+    genuine link-register return leaves rN untouched. Then the branch is a
+    RETURN -> emit a host `return;` so it composes with the brsl->C-call nesting,
+    exactly like `bi $r0`. Returns the set of such branch addresses."""
+    link_regs = set()
+    for insn in insns:
+        if insn.mnemonic in ("brsl", "brasl", "bisl", "bisled"):
+            link_regs.add(insn.raw & 0x7F)
+    link_regs.discard(0)   # r0 is handled by compute_bi_r0_jumps()
+    if not link_regs:
+        return set()
+
+    returns = set()
+    ordered = sorted(insns, key=lambda x: x.addr)
+    for (s, e) in bounds:
+        fn = [i for i in ordered if s <= i.addr < e]
+        for idx, insn in enumerate(fn):
+            tr = _bi_target_reg(insn)
+            if tr is None or tr == "0":
+                continue
+            try:
+                rn = int(tr)
+            except ValueError:
+                continue
+            if rn not in link_regs:
+                continue
+            # rN must be a pure live-in (the link address the caller planted):
+            # if any earlier insn in this block writes rN (other than an identity
+            # move), the target was computed here -> a real indirect branch, not
+            # a return.
+            written = False
+            for j in range(idx - 1, -1, -1):
+                w = fn[j]
+                if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
+                        and not _is_identity_move(w)):
+                    written = True
+                    break
+            if not written:
+                returns.add(insn.addr)
+    return returns
+
+
 class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
@@ -322,6 +379,11 @@ class SPULifter:
         # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
         # set => every `bi $r0` is a return (the prior behaviour).
         self.bi_r0_jump: set = set()
+        # Addresses of `bi/biz/... $rN` (N != 0) that are LINK-REGISTER RETURNS
+        # (rN is a non-r0 link register the caller set via brsl/bisl) -- see
+        # compute_link_returns(). Emitted as `return;` so they compose with the
+        # brsl->C-call nesting instead of branching to an unregistered PC.
+        self.link_return: set = set()
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -689,7 +751,8 @@ class SPULifter:
             # when r0 was reloaded from memory (lqa/lqr) it is a COMPUTED TAIL
             # JUMP (e.g. the SPURS task launch `lqa $r0,savedContextLr; bi $r0`),
             # flagged by compute_bi_r0_jumps() — emit the indirect dispatch.
-            if tgt_reg == "0" and addr not in self.bi_r0_jump:
+            if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
+                    or addr in self.link_return:
                 return "return;"
             return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"spu_indirect_branch(ctx); return;")
@@ -725,7 +788,8 @@ class SPULifter:
             # with the brsl->C-call nesting (mirrors the `bi $r0` case above).
             # Dispatching to the return address would miss the C frame and
             # land on an unregistered mid-function PC.
-            if tgt_reg == "0" and addr not in self.bi_r0_jump:
+            if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
+                    or addr in self.link_return:
                 return f"if ({cond}) return;"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"spu_indirect_branch(ctx); return; }}")
@@ -915,6 +979,11 @@ def main() -> None:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
               f"(r0 set by lqa/lqr/il/ila, not a link): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
+    lifter.link_return = compute_link_returns(insns, bounds)
+    if lifter.link_return:
+        print(f"  {len(lifter.link_return)} non-r0 link-register return site(s) "
+              f"(`bi $rN` where rN is a brsl/bisl link reg): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)
