@@ -1886,6 +1886,34 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
                     fprintf(stderr, "[movie-find]   %s best @0x%08X nz=%u span=%u%s\n",
                             rng[r].tag, best_a, best_nz, best_span,
                             (best_a >= plane_lo && best_a <= plane_hi) ? " <== NEAR bound plane" : "");
+                    /* Dump the densest block as a 640x360 grayscale BMP so the
+                     * "is this the decoded movie frame" question is answered by
+                     * eye. One dump per range per process. */
+                    if (best_nz > 400 && best_span > 40) {
+                        static int _bd[4] = {0,0,0,0};
+                        if (r < 4 && !_bd[r]) { _bd[r] = 1;
+                            const u8* sp = vm_base + best_a;
+                            char pn[128];
+                            snprintf(pn, sizeof(pn), "binkscan_%s_%08X.bmp", rng[r].tag, best_a);
+                            FILE* f = fopen(pn, "wb");
+                            if (f) {
+                                u32 rowb = w*3, rowp = (rowb+3)&~3u, fsz = 54 + rowp*h;
+                                u8 hd[54] = {'B','M'};
+                                hd[2]=(u8)fsz; hd[3]=(u8)(fsz>>8); hd[4]=(u8)(fsz>>16); hd[5]=(u8)(fsz>>24);
+                                hd[10]=54; hd[14]=40;
+                                hd[18]=(u8)w; hd[19]=(u8)(w>>8); hd[22]=(u8)h; hd[23]=(u8)(h>>8);
+                                hd[26]=1; hd[28]=24;
+                                fwrite(hd,1,54,f);
+                                for (int y=(int)h-1; y>=0; y--) {
+                                    const u8* srow = sp + (u64)y*w;
+                                    for (u32 x=0;x<w;x++){ u8 px[3]; px[0]=px[1]=px[2]=srow[x]; fwrite(px,1,3,f); }
+                                    { u8 z[3]={0,0,0}; fwrite(z,1,rowp-rowb,f); }
+                                }
+                                fclose(f);
+                                fprintf(stderr, "[movie-find]   dumped %s\n", pn);
+                            }
+                        }
+                    }
                 }
                 fprintf(stderr, "[movie-find]   total=%d near-plane=%d (window 0x%X..0x%X)\n",
                         found, nearc, plane_lo, plane_hi);

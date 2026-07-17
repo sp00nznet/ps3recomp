@@ -598,6 +598,23 @@ void spu_indirect_branch(spu_context* ctx)
       if (s_ib && ctx->image_id == 23) { static int _i = 0; if (_i++ < 60)
         fprintf(stderr, "[ib23] target=0x%05X lr=0x%05X\n",
                 ctx->pc, ctx->gpr[0]._u32[0] & 0x3FFFF); } }
+    /* LBP_IBCOV: image-3 (Bink SPU) PC-page coverage. Track which 0x1000-byte LS
+     * pages the task's indirect branches land in; dump the set periodically. If
+     * coverage stays in the kernel/wait region (~0x13xxx) the decode routine never
+     * runs; if it spans a wide high range, decode executes but doesn't output. */
+    { static int s_cov = -1; if (s_cov < 0) s_cov = getenv("LBP_IBCOV") ? 1 : 0;
+      if (s_cov && ctx->image_id == 3) {
+        static uint8_t pages[64] = {0};   /* 64 pages * 0x1000 = 256KB LS */
+        static uint64_t hits = 0;
+        uint32_t pg = (ctx->pc & 0x3FFFF) >> 12;
+        int newp = 0;
+        if (pg < 64 && !pages[pg]) { pages[pg] = 1; newp = 1; }
+        ++hits;
+        if (newp || (hits % 200000) == 0) {
+            char line[400]; int p = snprintf(line, sizeof line, "[ibcov3] hits=%llu tgt=0x%05X pages:", (unsigned long long)hits, ctx->pc & 0x3FFFF);
+            for (int i = 0; i < 64; i++) if (pages[i]) p += snprintf(line+p, sizeof(line)-p, " 0x%X", i<<12);
+            fprintf(stderr, "%s\n", line); }
+      } }
     { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_last = 0; static uint64_t s_run = 0;
         if (ctx->pc == s_last) s_run++; else { s_last = ctx->pc; s_run = 1; }
