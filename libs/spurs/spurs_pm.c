@@ -105,6 +105,21 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
     for (int o = 0; o < TI_SIZE; o += 4)
         LS_BE32(STC_TEMP_TASKINFO + o, vm_read32(ti + o));
 
+    /* Force a FULL-COVERAGE ls pattern (TaskInfo +0x20, 128 bits). The real
+     * taskset PM computes a precise bitmask of the 2KB LS blocks the task's
+     * context occupies, and the SPU task library refuses any blocking wait
+     * whose pattern doesn't cover the task's stack (error 0x8041090F). We run
+     * each task in its OWN full 256KB local store (never sharing LS between
+     * tasks), so every block IS the task's -- an all-ones pattern is the
+     * accurate description of our execution model, not a fake. Without it a
+     * wait-capable task (LBP's binkspu movie IO) spun forever and the intro
+     * movie never decoded a frame. The game's own pattern reaches us mangled
+     * anyway (its lsPattern EA arrives unaligned through the attribute ABI). */
+    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x0, 0xFFFFFFFFu);
+    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x4, 0xFFFFFFFFu);
+    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x8, 0xFFFFFFFFu);
+    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0xC, 0xFFFFFFFFu);
+
     return vm_read64(ti + TI_ELF);       /* caller masks elf & ~7 to load */
     #undef LS_BE32
     #undef LS_BE64
