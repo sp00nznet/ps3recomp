@@ -1262,7 +1262,7 @@ u32 cellGcmResolveLocated(int local, u32 offset)
  * Label / report / timestamp
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x21397818 */
+/* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index)
 {
     if (index >= CELL_GCM_MAX_LABEL_COUNT) {
@@ -1472,12 +1472,19 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
  * bufferId as arg1 made the range check eat the context pointer, so the
  * flip counter never advanced (wave: presents free-ran 4x per frame,
  * layout flashing/zooming). */
+/* NID 0x21397818 is gcmSetFlipCommand (PSL1GHT libgcm_sys exports.h) -- it
+ * was misassigned to cellGcmGetLabelAddress (real NID 0xF80196C1), so every
+ * import-based flip (LBP: cellGcmSetFlip -> stub 0x7482FC(ctx, id)) landed
+ * in the label getter and no flip was EVER issued: the intro-movie pump ran,
+ * drew, "flipped" into the wrong function, and the screen stayed black. */
+/* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
     (void)ctx;
     return cellGcmSetFlipCommand(bufferId);
 }
 
+/* NID: 0xD8F88E1A */
 s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
                                         u32 labelIndex, u32 labelValue)
 {

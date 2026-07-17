@@ -303,7 +303,7 @@ s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea);
 
 /* Label / report / timestamp */
 
-/* NID: 0x21397818 */
+/* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index);
 
 /* NID: 0x8572ADE4 */
