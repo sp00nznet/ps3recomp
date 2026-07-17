@@ -1582,6 +1582,16 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
      * frame is reused -- corrupting the crash handler / any diagnostic that reads the
      * current-thread ctx. Restore the caller's. */
     ppu_context* saved_active = g_active_ctx;
+    /* Thread identity: a zeroed scratch ctx used to run callbacks as thread_id 0
+     * -- aliasing the main thread in every owner-tracking primitive. Inherit the
+     * calling guest thread's id; host-only threads (ticker) get a per-host-thread
+     * sentinel far above the thread table's range. */
+#ifdef _WIN32
+    ctx.thread_id = saved_active ? saved_active->thread_id
+                                 : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
+#else
+    ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
+#endif
     g_active_ctx = &ctx;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
@@ -1613,6 +1623,13 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     /* Save/restore g_active_ctx (see ppu_guest_call): the scratch ctx is stack-local,
      * so a dangling g_active_ctx after return corrupts the crash handler / diagnostics. */
     ppu_context* saved_active = g_active_ctx;
+    /* Inherit the caller's thread identity (see ppu_guest_call above). */
+#ifdef _WIN32
+    ctx.thread_id = saved_active ? saved_active->thread_id
+                                 : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
+#else
+    ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
+#endif
     g_active_ctx = &ctx;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
@@ -1632,6 +1649,14 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     memset(&ctx, 0, sizeof(ctx));
     ctx.gpr[1] = stack_top;   /* stack pointer */
     ctx.gpr[2] = toc;         /* TOC base (r2) */
+
+    /* Unique nonzero identity for the main thread (thread-table slot 0, id 1).
+     * With thread_id 0, main aliased the first created thread in sys_lwmutex's
+     * owner stamps (0 -> LWM_TID collided with tid 1) and read as "free" in
+     * sys_mutex -- LBP's main + bringup threads both held the GCM lock at once
+     * and concurrently-emitted fences vanished (the boot-loading stall). */
+    { extern uint64_t ppu_thread_register_main(void);
+      ctx.thread_id = ppu_thread_register_main(); }
 
     /* PS3 process-entry ABI: the loader hands _start register state the CRT
      * (_initialize) consumes directly:

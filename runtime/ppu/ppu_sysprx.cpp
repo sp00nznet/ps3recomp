@@ -86,7 +86,13 @@ static void sys_process_is_stack(ppu_context* ctx)
 #define LWM_OWNER  0x00
 #define LWM_ATTR   0x08
 #define LWM_RECUR  0x0C
-#define LWM_TID    1u   /* single-thread boot: one fixed owner id */
+/* Owner id = ctx->thread_id, which is nonzero for every thread since main
+ * registers as id 1 (ppu_thread_register_main). The old 0->1 fallback made
+ * main alias the FIRST CREATED thread: each passed the other's recursive
+ * re-lock check, both "owned" the lock, and (LBP) main + bringup emitted GCM
+ * concurrently -- fences vanished mid-ring. A zero id now means an
+ * unregistered context (bug); stamp a sentinel that matches no real thread. */
+#define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
 
 #ifdef _WIN32
 static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
@@ -165,7 +171,7 @@ volatile int g_nd_inpump = 0;
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
-    uint32_t self = (uint32_t)ctx->thread_id ? (uint32_t)ctx->thread_id : LWM_TID;
+    uint32_t self = LWM_SELF(ctx);
     /* lv2 ABI: r4 = timeout in microseconds, 0 = infinite. The real kernel
      * returns ETIMEDOUT (0x8001000B) when the wait expires; games rely on that
      * (e.g. LBP's resource loader locks with a 2s timeout in a retry loop so a
@@ -208,7 +214,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
 static void sys_lwmutex_trylock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
-    uint32_t self = (uint32_t)ctx->thread_id ? (uint32_t)ctx->thread_id : LWM_TID;
+    uint32_t self = LWM_SELF(ctx);
 #ifdef _WIN32
     HANDLE s = lwm_sem(lwm);
     if (s) {
@@ -298,7 +304,10 @@ static void sys_lwcond_wait(ppu_context* ctx)
 static void sys_ppu_thread_get_id(ppu_context* ctx)
 {
     uint32_t p = (uint32_t)ctx->gpr[3];
-    if (p) vm_write64(p, ctx->thread_id ? (uint64_t)ctx->thread_id : 1);
+    /* Every registered thread has a nonzero id (main = 1 via
+     * ppu_thread_register_main); 0 = unregistered scratch ctx, report the same
+     * never-a-real-thread sentinel the lwmutex owner stamps use. */
+    if (p) vm_write64(p, ctx->thread_id ? (uint64_t)ctx->thread_id : 0x7FFFFFFEull);
     ctx->gpr[3] = 0;
 }
 

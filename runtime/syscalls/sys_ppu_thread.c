@@ -5,6 +5,7 @@
 #include "sys_ppu_thread.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>     /* getenv (YDKJ_NOHDLR diagnostic) */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -116,6 +117,38 @@ static void* ppu_host_thread_proc(void* param)
     pthread_mutex_unlock(&info->finish_mutex);
     return NULL;
 #endif
+}
+
+/* ---------------------------------------------------------------------------
+ * Main-thread registration. The main guest thread used to run with
+ * thread_id 0 -- an id every owner-tracking primitive treated specially:
+ * sys_lwmutex mapped 0 to owner id 1 (COLLIDING with the first created
+ * thread, so main and that thread mutually satisfied each other's recursive
+ * re-lock check and both "owned" the lock -- LBP: main + "bringup" emitted
+ * GCM concurrently and fences vanished), and sys_mutex uses owner_tid==0 as
+ * its FREE marker (a mutex held by main read as free). Claim slot 0 (id 1)
+ * for main before any sys_ppu_thread_create so every thread has a unique
+ * nonzero id and the special cases die.
+ * -----------------------------------------------------------------------*/
+uint64_t ppu_thread_register_main(void)
+{
+    table_lock();
+    ppu_thread_info* t = &g_ppu_threads[0];
+    if (t->state == PPU_THREAD_STATE_FREE) {
+        memset(t, 0, sizeof(*t));
+        t->ctx.thread_id = 1;
+        t->state    = PPU_THREAD_STATE_RUNNING;
+        t->joinable = 0;                    /* nobody joins the main thread */
+        strncpy(t->name, "main", sizeof(t->name) - 1);
+#ifdef _WIN32
+        t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+#else
+        pthread_mutex_init(&t->finish_mutex, NULL);
+        pthread_cond_init(&t->finish_cond, NULL);
+#endif
+    }
+    table_unlock();
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------
