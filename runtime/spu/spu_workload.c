@@ -375,7 +375,17 @@ static void spu_async_run(spu_async_job* j)
 #endif
                 }
             }
-            if (j->image_id != 22 && getenv("LBP_TASKSET")) {
+            /* A generic SPURS taskset task (image != cri 22) MUST get its
+             * SpursTasksetContext planted at LS 0x2700 -- the real kernel builds
+             * it from the taskset before entry, and the task reads its args and
+             * every DMA base pointer out of it. Without it the task runs with a
+             * null base and DMAs EVERYTHING from EA 0 (observed on LBP's FMOD
+             * mixer: 105k GETs from ea=0x0, degenerate handler targets ->
+             * branch-to-0, and the PPU pump blocks forever on EventFlag 0x0100).
+             * Planting it makes the mixer read the real FMOD control block
+             * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
+             * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
+            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
                  * globals, which the next CreateTask clobbers -- the race that made
