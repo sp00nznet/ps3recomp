@@ -1021,7 +1021,28 @@ static void wait_for_gpu(void)
     if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[fi]) {
         s_d3d.fence->lpVtbl->SetEventOnCompletion(
             s_d3d.fence, s_d3d.fence_values[fi], s_d3d.fence_event);
-        WaitForSingleObject(s_d3d.fence_event, INFINITE);
+        /* NEVER wait unbounded here: this runs on the vblank ticker, which also
+         * drives the guest's vblank handlers, the FIFO drain, and the fence
+         * publication. A device removal (TDR) leaves the D3D12 fence unsignaled
+         * forever and an INFINITE wait silently froze the ENTIRE emulation --
+         * observed on LBP as a boot that died the moment the 2048x2048
+         * offscreen RT was created (last log line), every guest thread parked.
+         * Degrade loudly instead: bounded waits + the removal reason, then
+         * carry on (subsequent D3D calls fail visibly but the game keeps
+         * running headless). */
+        for (int tries = 0; tries < 3; tries++) {
+            if (WaitForSingleObject(s_d3d.fence_event, 2000) != WAIT_TIMEOUT)
+                return;
+            HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+            printf("[D3D12] wait_for_gpu STUCK %ds: want %llu got %llu removed=0x%08lX\n",
+                   2 * (tries + 1),
+                   (unsigned long long)s_d3d.fence_values[fi],
+                   (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
+                   (long)rr);
+            fflush(stdout);
+            if (rr != 0 /* S_OK: device still alive, keep waiting a bit */)
+                break;
+        }
     }
 }
 
