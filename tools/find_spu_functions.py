@@ -341,6 +341,60 @@ def collect_jump_table_targets(insns, code, code_start, code_end,
     return targets
 
 
+def collect_function_pointer_tables(buf, phs, code_start, code_end,
+                                    insns_by_addr, min_run=3, max_run=1024):
+    """Function-pointer tables that live in DATA, not .text.
+
+    A program can dispatch through an array of code addresses: it loads an entry
+    from a table in the data segment and calls/branches through it. LBP's FMOD
+    SPU mixer does exactly this -- it walks a DSP-node handler table and calls
+    each node's process function via `bisl $r0,$r3`, r3 loaded from the table.
+    Because the pointers live in the R/W data segment and are materialised by a
+    memory load (no `ila <target>` in the code), NONE of the code-scan seeders
+    (branch / link-register / computed / jump-table) can find them: every
+    dispatch through an entry lands in spu_indirect_branch as a lookup MISS ->
+    branch-to-0, and the handler (an entire DSP effect) is skipped, so the mixer
+    never finishes and never sets its completion event flag (the FMOD boot
+    deadlock's audio-path form).
+
+    Observed: a 5-entry table at LS 0x1AB04 in the flags=6 (R/W) segment =
+    {0x0B980,0x0C5F0,0x15CF8,0x16D70,0x17100}; the trailing 0x0 sentinel is why
+    a dispatch also reached pc=0x00000.
+
+    Recogniser: scan every PT_LOAD segment for runs of >= min_run consecutive
+    4-aligned BE32 words that are ALL valid instruction starts inside .text
+    (present in insns_by_addr). A run that long of in-range, aligned code
+    addresses is a pointer table, not incidental data: the text base is well
+    above 0 so small counters/sizes/enums fall below code_start, real SPU
+    opcodes encode high bits far above code_end, and float/vector constants
+    almost never form a 3+ aligned-in-range sequence. A distinct-value guard
+    stops a filled/repeated constant region from seeding.
+    """
+    targets = set()
+    for ph in phs:
+        if ph.get("type") != 1:            # PT_LOAD only
+            continue
+        off, fsz, vaddr = ph["off"], ph["filesz"], ph["vaddr"]
+        seg = buf[off:off + fsz]
+        skew = (-vaddr) & 3                 # keep words on the LS 4-byte grid
+        run = []
+        def _flush(r):
+            if len(r) >= min_run and len(set(r)) >= 2:
+                targets.update(r)
+        i = skew
+        while i + 4 <= len(seg):
+            w = int.from_bytes(seg[i:i + 4], "big")
+            if (w & 3) == 0 and code_start <= w < code_end and w in insns_by_addr:
+                run.append(w)
+                if len(run) >= max_run:
+                    _flush(run); run = []
+            else:
+                _flush(run); run = []
+            i += 4
+        _flush(run)
+    return targets
+
+
 # Kept for backwards compatibility / call-only counting.
 def collect_brsl_targets(insns):
     return {t for ins in insns if ins.mnemonic in ("brsl", "brasl")
@@ -419,11 +473,17 @@ def detect_functions(buf, base_override=None, verbose=True):
     # a stub that returns via `bi $r0`). Require the target to be 4-byte aligned
     # AND to decode as an instruction, so a scratch use of $r0 that happens to
     # hold a small constant cannot seed a bogus function.
+    fptr_targets = collect_function_pointer_tables(
+        buf, elf["phs"], code_start, code_end, insns_by_addr)
     for t in (collect_link_register_targets(insns)
               | collect_computed_branch_targets(insns)
-              | collect_jump_table_targets(insns, code, code_start, code_end)):
+              | collect_jump_table_targets(insns, code, code_start, code_end)
+              | fptr_targets):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
+    if fptr_targets and verbose:
+        print(f"  {len(fptr_targets)} data function-pointer-table target(s): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(fptr_targets))}")
 
     # Always cover the entry of the text segment itself (some images have no
     # entry point but a function at va 0).
