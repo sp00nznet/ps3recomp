@@ -426,17 +426,18 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         if (bt && spu->image_id==3) {
             uint32_t ea32 = (uint32_t)ea;
             int is_put   = ((cmd & 0x20) && !(cmd & 0x40));   /* PUT-family */
-            uint32_t hi  = ea32 & 0xFFFF0000u;
-            /* Suppress the two known-noise sources so a real frame-output PUT is
-             * not buried: the fixed 0x00927E80 SPURS control-PUT and the 0x4945/
-             * 0x4847 reference-GET reads. Log EVERYTHING else (any PUT to a new
-             * address, any transfer >=512B). */
-            int noise = (ea32 == 0x00927E80u) ||
-                        (!is_put && (hi == 0x49450000u || hi == 0x48470000u || hi == 0x49460000u));
-            static int _bx=0;
-            if (!noise && (is_put || size >= 512) && _bx++ < 300)
-                fprintf(stderr, "[bink-io] %s cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X tag=%u\n",
-                        is_put?"PUT":"GET", cmd, lsa, ea32, size, tag);
+            /* Uncapped histogram: total GET/PUT counts + bytes + the single
+             * largest PUT (and its target) -- settles definitively whether the
+             * task EVER outputs a frame-sized block, without per-entry caps. */
+            static uint64_t n_get=0, n_put=0, b_get=0, b_put=0;
+            static uint32_t max_put=0, max_put_ea=0, max_get=0;
+            static uint64_t ticks=0;
+            if (is_put) { n_put++; b_put+=size; if (size>max_put){max_put=size;max_put_ea=ea32;} }
+            else        { n_get++; b_get+=size; if (size>max_get) max_get=size; }
+            if ((++ticks % 20000)==0)
+                fprintf(stderr, "[bink-dmahist] GET n=%llu bytes=%llu maxsz=0x%X | PUT n=%llu bytes=%llu maxsz=0x%X @0x%08X\n",
+                        (unsigned long long)n_get,(unsigned long long)b_get,max_get,
+                        (unsigned long long)n_put,(unsigned long long)b_put,max_put,max_put_ea);
         }
     }
 
