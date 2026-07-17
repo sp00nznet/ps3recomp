@@ -649,10 +649,10 @@ int cellGcm_take_flip_pending_synced(void)
 static u32 s_ref_q[GCM_REF_QLEN];
 static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
 
-static void gcm_ref_push(u32 v)
+static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
-      if (_d) fprintf(stderr, "[refq] drained fence 0x%X\n", v); }
+      if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
@@ -729,6 +729,9 @@ void cellGcm_rsx_process_fifo(void)
         }
 
         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+            { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+              if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
+                               s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             s_fifo_getoff = w & 0x1FFFFFFCu;
             continue;
         }
@@ -755,7 +758,7 @@ void cellGcm_rsx_process_fifo(void)
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
-                    if (m == 0x50) gcm_ref_push(g_rsx_last_reference);
+                    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
             }
@@ -804,6 +807,15 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     if (getenv("CELLMARK_BLINKDBG"))
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
 
+    static int s_recdbg = -1;
+    if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+    if (s_recdbg)
+        fprintf(stderr, "[REC>] tid=%lu begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
+                GetCurrentThreadId(), begin, current,
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
+                g_gcm_fifo_drained_ea);
+
     /* Do what the SDK's default command-buffer-full callback does: append a
      * JUMP-to-begin at the write head and move `put` to begin. The FIFO walker
      * consumes the tail, follows the jump, and idles at begin; then it's safe
@@ -826,6 +838,13 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
+
+    if (s_recdbg)
+        fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
+                GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
+                g_gcm_fifo_drained_ea, spins);
 }
 
 /* NID: 0xDC09357E */
