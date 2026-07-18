@@ -356,6 +356,59 @@ def collect_jump_table_targets(insns, code, code_start, code_end,
     return targets
 
 
+def collect_ila_continuation_targets(insns, code_start, code_end):
+    """Continuation addresses materialised as plain immediates:
+
+        6114:  ila $r29, 0x52D8      <- where the SUBROUTINE should return to
+        ...    (30+ scheduled setup instructions)
+        61A0:  br  0x8500            <- enter the subroutine
+        ...
+        8500:  ...  bi $r29          <- 'return' to the caller's continuation
+
+    The manual-link idiom, but with the `ila` in the CALLER and the `bi` in the
+    CALLEE — no local window ever connects them, so neither the link-register
+    scan nor collect_computed_branch_targets sees 0x52D8, and the whole basic
+    block at the continuation is never lifted. LBP's Bink SPU decoder chains
+    dozens of these; missing them dropped the ENTIRE back half of the decoder
+    (IDCT/motion-comp, ~59 functions) from the lift, surfacing at runtime as
+    unresolved-indirect-branch misses (the C call chain then silently unwinds).
+
+    Also pairs `ilhu $rN, hi` + `iohl $rN, lo` (the 32-bit two-step form —
+    Bink builds 0xDE94 that way).
+
+    Seeds EVERY il/ila/ilhu+iohl immediate that is a 4-aligned in-code address
+    decoding at an instruction boundary. Same cost argument as the jump-table
+    scan above: a false positive only adds an entry point at a valid
+    instruction boundary; a false negative loses an entire code region.
+    """
+    valid_starts = {ins.addr for ins in insns}
+    targets = set()
+    ilhu_val = {}                     # reg -> pending high halfword
+    for ins in insns:
+        wops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        if len(wops) != 2:
+            continue
+        try:
+            tok = wops[1]
+            imm = int(tok, 16) if tok.lower().startswith(("0x", "-0x")) else int(tok, 10)
+        except ValueError:
+            continue
+        cand = None
+        if ins.mnemonic in ("il", "ila"):
+            cand = imm
+        elif ins.mnemonic == "ilhu":
+            ilhu_val[wops[0]] = (imm & 0xFFFF) << 16
+            continue
+        elif ins.mnemonic == "iohl" and wops[0] in ilhu_val:
+            cand = ilhu_val.pop(wops[0]) | (imm & 0xFFFF)
+        if cand is None:
+            continue
+        if cand and (cand & 3) == 0 and code_start <= cand < code_end \
+           and cand in valid_starts:
+            targets.add(cand)
+    return targets
+
+
 def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
     """Mid-ladder entries of a Duff's device (computed jump into an unrolled
     loop). Sony's SPU job CRT clears BSS with one:
@@ -550,6 +603,7 @@ def detect_functions(buf, base_override=None, verbose=True):
     for t in (collect_link_register_targets(insns)
               | collect_computed_branch_targets(insns)
               | collect_jump_table_targets(insns, code, code_start, code_end)
+              | collect_ila_continuation_targets(insns, code_start, code_end)
               | collect_duff_targets(insns, code_start, code_end)
               | fptr_targets):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
