@@ -6,10 +6,46 @@
 extern "C" {
 #endif
 
+/* Cross-function branch/loop = a guest tail-jump to another lifted function's
+ * entry. It MUST reuse the current host frame, not nest one: SPURS task loops
+ * iterate via these, so nesting overflows the host stack and silently kills the
+ * process. clang's musttail guarantees the tail call (a jump); without it (or on
+ * a non-clang compiler) we fall back to call+return, which only stays bounded if
+ * the compiler happens to do sibling-call optimization. All lifted SPU functions
+ * share the signature `void f(spu_context*)`, so the tail call is always valid. */
+#if defined(__clang__)
+#  define SPU_TAILCALL(call) __attribute__((musttail)) return call
+#else
+#  define SPU_TAILCALL(call) do { call; return; } while (0)
+#endif
+
 /* Indirect branch dispatch (bi/bisl/bid...): PC has been set to the target
  * local-store address; the runtime resolves it to the matching lifted
- * function and continues execution. Implemented by the SPU program glue. */
+ * function and continues execution. Implemented by the SPU program glue.
+ *
+ * The full resolver lives in the (MSVC-built) runtime lib, where musttail is
+ * unavailable -- its dispatch is a plain call, so guest loops that iterate
+ * through a computed jump leak a resolver frame per iteration. Title builds
+ * that compile their lifted sources with clang should provide the thin
+ * musttail fast path spu_indirect_branch_mt (see lbp/spu_dispatch_mt.c) and
+ * define SPU_USE_DISPATCH_MT for the lifted TUs; dispatch sites below go
+ * through SPU_IB_DISPATCH so the choice is a compile-time switch. */
 void spu_indirect_branch(spu_context* ctx);
+void spu_indirect_branch_mt(spu_context* ctx);
+#ifdef SPU_USE_DISPATCH_MT
+#  define SPU_IB_DISPATCH spu_indirect_branch_mt
+#else
+#  define SPU_IB_DISPATCH spu_indirect_branch
+#endif
+
+/* stop/stopd hook (YDKJ): the runtime inspects the stop code, may deliver a
+ * stop-and-signal event to the PPU (SPURS bring-up handshake), and longjmps the
+ * host SPU thread back to spu_run_with_halt so the job does not spin past the
+ * stop. Complements ctx->status; harmless where the runtime handles status. */
+void spu_stop(spu_context* ctx);
+/* Lower-level longjmp helper: abort the host SPU thread back to spu_run_with_halt
+ * (used for the infinite no-op self-loop / idle halt idiom). */
+void spu_halt(spu_context* ctx);
 
 /* Channel access -- implemented by the runtime (MFC DMA engine, mailboxes,
  * signal notification, decrementer). See runtime/spu/spu_dma.h. */

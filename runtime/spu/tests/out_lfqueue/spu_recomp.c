@@ -26,7 +26,7 @@ void spu_func_00000000(spu_context* ctx) {
         spu_wrch(ctx, MFC_Cmd, ctx->gpr[8]);
         ctx->gpr[11] = spu_il(3342);
         spu_wrch(ctx, SPU_WrOutIntrMbox, ctx->gpr[11]);
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 }
 
 /* Function table */
