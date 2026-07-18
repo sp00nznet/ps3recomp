@@ -397,6 +397,88 @@ static void spu_async_run(spu_async_job* j)
                             j->taskset_ea, j->taskid); fflush(stderr);
                 }
             }
+            /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
+             * (1) dump binkspu's Bink work-descriptor at its arg EA so we can see
+             *     the output-plane EAs and the plane+0x50 "needs-decode" gate that
+             *     gates the frame-output PUT (all prior PUTs went to the 0x927E80
+             *     control block, never a plane). This tells us whether the missing
+             *     output EA is a Bink/PPU-layer field (this descriptor) or a SPURS
+             *     taskset-context field (LS 0x2700, below).
+             * (2) LBP_REAL_POLICY: run the REAL lifted taskset policy to build its
+             *     SpursTasksetContext and diff it against the C reimpl build_context
+             *     planted in `ls` -- shows exactly which fields differ. */
+            if (j->image_id == 3) {
+                extern uint8_t* vm_base;
+                uint32_t arg = j->args_ea;
+                /* SPU DMA maps EAs as vm_base + (uint32_t)ea with NO masking
+                 * (spu_dma.h:186); vm_base spans the full 4GB so VRAM 0xC0000000+
+                 * is directly addressable. (The earlier &0x0FFFFFFF mask read main
+                 * code at 0x10B88 instead of the real VRAM descriptor.) */
+                #define RDBE32(base, off) (((uint32_t)(base)[(off)]<<24)|((uint32_t)(base)[(off)+1]<<16)| \
+                                           ((uint32_t)(base)[(off)+2]<<8)|(base)[(off)+3])
+                if (vm_base && arg >= 0x10000) {
+                    const uint8_t* d = vm_base + arg;         /* FULL EA, no mask */
+                    fprintf(stderr, "[bink-desc] arg=0x%08X 256B work-descriptor:", arg);
+                    uint32_t words[64];
+                    for (int i = 0; i < 256; i += 16) {
+                        fprintf(stderr, "\n   +%03X:", i);
+                        for (int k = 0; k < 16; k += 4) {
+                            uint32_t w = RDBE32(d, i+k); words[(i+k)/4] = w;
+                            fprintf(stderr, " %08X", w);
+                        }
+                    }
+                    fprintf(stderr, "\n");
+                    /* Follow each plausible pointer one level: dump +0x00..+0x60 so
+                     * the output-plane EA + the plane+0x50 "needs-decode" gate show. */
+                    for (int wi = 0; wi < 64; wi++) {
+                        uint32_t p = words[wi];
+                        if (p < 0x10000 || (p >= 0x50000000u && p < 0xC0000000u)) continue;
+                        const uint8_t* q = vm_base + p;
+                        fprintf(stderr, "  [desc+%02X]=0x%08X -> +00:%08X +40:%08X +50:%08X(gate) +54:%08X\n",
+                                wi*4, p, RDBE32(q,0), RDBE32(q,0x40), RDBE32(q,0x50), RDBE32(q,0x54));
+                    }
+                    fflush(stderr);
+                }
+                if (getenv("LBP_REAL_POLICY") && j->taskset_ea) {
+                    extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
+                                                              uint64_t,uint32_t,uint8_t*,uint32_t);
+                    /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
+                    uint32_t ts = j->taskset_ea;
+                    uint32_t spurs_ea = 0;
+                    if (vm_base) { const uint8_t* t = vm_base + ts;
+                        spurs_ea = RDBE32(t, 0x64);
+                        /* Why did the policy exit without dispatching? Dump the task
+                         * bitsets it reads (task N = bit 127-N; task 2 = bit 125). */
+                        fprintf(stderr, "[taskset-bits] RUNNING=%08X%08X READY=%08X%08X ENABLED=%08X%08X SIGNALLED=%08X%08X WAITING=%08X%08X\n",
+                                RDBE32(t,0x00),RDBE32(t,0x04), RDBE32(t,0x10),RDBE32(t,0x14),
+                                RDBE32(t,0x30),RDBE32(t,0x34), RDBE32(t,0x40),RDBE32(t,0x44),
+                                RDBE32(t,0x50),RDBE32(t,0x54)); }
+                    uint8_t real2700[0x180];
+                    int st = spurs_run_taskset_policy_probe(ts, j->taskid, spurs_ea,
+                                                            (uint64_t)ts, 3, real2700, sizeof real2700);
+                    fprintf(stderr, "[real-pm] status=0x%X -- LS 0x2700 diff (build_context vs real policy):\n", st);
+                    for (uint32_t o = 0; o < sizeof real2700; o += 4) {
+                        uint32_t bc = ((uint32_t)ls[0x2700+o]<<24)|((uint32_t)ls[0x2700+o+1]<<16)|
+                                      ((uint32_t)ls[0x2700+o+2]<<8)|ls[0x2700+o+3];
+                        uint32_t rp = ((uint32_t)real2700[o]<<24)|((uint32_t)real2700[o+1]<<16)|
+                                      ((uint32_t)real2700[o+2]<<8)|real2700[o+3];
+                        if (bc != rp)
+                            fprintf(stderr, "   0x%04X: build=%08X real=%08X\n", 0x2700+o, bc, rp);
+                    }
+                    /* EMPIRICAL TEST (LBP_POLICY_CTX): overlay the REAL policy's
+                     * SpursTasksetContext onto binkspu's LS 0x2700, replacing the C
+                     * reimpl, then let binkspu run with it. If the movie plane fills
+                     * (not green) the policy's fuller ctx is the fix (H1); if still
+                     * green, the frame-output gate is Bink-layer (H2). Keeps the
+                     * build_context 0x100 kernel ctx (moduleId "TK") intact. */
+                    if (getenv("LBP_POLICY_CTX")) {
+                        memcpy(ls + 0x2700, real2700, sizeof real2700);
+                        fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
+                    }
+                    fflush(stderr);
+                }
+                #undef RDBE32
+            }
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0);
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
@@ -443,7 +525,13 @@ static void spu_async_run(spu_async_job* j)
 }
 
 #ifdef _WIN32
-static DWORD WINAPI spu_async_thread(LPVOID p) { spu_async_run((spu_async_job*)p); return 0; }
+static DWORD WINAPI spu_async_thread(LPVOID p) {
+    /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
+     * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
+     * instead of killing the process silently with 0x80000001. */
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    spu_async_run((spu_async_job*)p); return 0;
+}
 #else
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
@@ -622,7 +710,12 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
             } } }
 
 #ifdef _WIN32
-    HANDLE th = CreateThread(NULL, 1u << 20, spu_async_thread, j, 0, NULL);
+    /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
+     * chains are deep host call chains with fat lifted frames -- a 1MB stack
+     * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent
+     * process death) the moment the real decode path first executed. */
+    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
+                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!th) { free(j); return 0; }
     CloseHandle(th);   /* detached */
 #else
