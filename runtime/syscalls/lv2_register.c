@@ -1056,8 +1056,13 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
         vm_write_be32(seg + 0x00, 1);                           /* SYS_SPU_SEGMENT_TYPE_COPY */
         vm_write_be32(seg + 0x04, p_va);                        /* ls_start   */
         vm_write_be32(seg + 0x08, p_fsz);                       /* size       */
-        vm_write_be32(seg + 0x10, 0);                           /* src_pa hi  */
-        vm_write_be32(seg + 0x14, src_ea + p_off);              /* src_pa lo  */
+        /* sys_spu_segment.src is a u32 EA at +0x10 (not a BE u64 hi/lo pair):
+         * LBP's FMOD overlay loader reads read32(seg+0x10) as the DMA source,
+         * so the address must sit at +0x10. Putting it at +0x14 (as a u64 lo)
+         * left +0x10 zero -> overlays DMA'd from NULL -> empty LS -> unresolved
+         * branch. +0x14 kept = addr too, harmless for any u64-lo reader. */
+        vm_write_be32(seg + 0x10, src_ea + p_off);              /* src EA (@+0x10) */
+        vm_write_be32(seg + 0x14, src_ea + p_off);
         nsegs++;
 
         if (p_msz > p_fsz && nsegs < 32) {                      /* BSS tail -> FILL 0 */
