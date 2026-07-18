@@ -372,15 +372,21 @@ def _reg_idx(token: str) -> str:
 # Callee-saved register save/restore (r14-r31) to/from the frame, for the
 # robust ABI-preservation pass in lift_function. Group order: SAVE -> (off, reg);
 # RESTORE -> (reg, off), so a save and its restore pair on matching (off, reg).
+# The r1 (stack) base can be emitted plainly (`ctx->gpr[1]`) OR, since the ra=0
+# form is lowered as a runtime ternary, as `((1) ? ctx->gpr[1] : 0)`. The
+# callee-save detection below must match BOTH, or it silently finds nothing and
+# the whole _cs entry-capture pass no-ops (600 -> 0 captures on libsre), leaving
+# reused-slot reloads reading stale/corrupt values.
+_R1 = r'(?:ctx->gpr\[1\]|\(\(1\) \? ctx->gpr\[1\] : 0\))'
 _CS_SAVE_RE = re.compile(
-    r'vm_write64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
+    r'vm_write64\(' + _R1 + r' \+ (-?0x[0-9A-Fa-f]+|-?\d+), ctx->gpr\[(1[4-9]|2[0-9]|3[01])\]\);')
 _CS_REST_RE = re.compile(
-    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
+    r'ctx->gpr\[(1[4-9]|2[0-9]|3[01])\] = vm_read64\(' + _R1 + r' \+ (-?0x[0-9A-Fa-f]+|-?\d+)\);')
 # Any frame-relative store (any width), capturing the offset. Used to tell a
 # spill/reload apart from a callee-save restore: a slot this body writes itself
 # is scratch, so a later load from it is NOT a callee-save restore.
 _CS_ANY_STORE_RE = re.compile(
-    r'vm_write(?:8|16|32|64)\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
+    r'vm_write(?:8|16|32|64)\(' + _R1 + r' \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
 # A write (assignment) to a callee-saved GPR. A `std rN,off(r1)` only preserves
 # the caller's value if rN has NOT been reassigned first; when the compiler
 # reuses a callee-save slot for a local (store a computed rN, later reload rN),
