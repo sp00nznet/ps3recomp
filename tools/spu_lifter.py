@@ -90,8 +90,22 @@ extern "C" {
 
 /* Indirect branch dispatch (bi/bisl/bid...): PC has been set to the target
  * local-store address; the runtime resolves it to the matching lifted
- * function and continues execution. Implemented by the SPU program glue. */
+ * function and continues execution. Implemented by the SPU program glue.
+ *
+ * The full resolver lives in the (MSVC-built) runtime lib, where musttail is
+ * unavailable -- its dispatch is a plain call, so guest loops that iterate
+ * through a computed jump leak a resolver frame per iteration. Title builds
+ * that compile their lifted sources with clang should provide the thin
+ * musttail fast path spu_indirect_branch_mt (see lbp/spu_dispatch_mt.c) and
+ * define SPU_USE_DISPATCH_MT for the lifted TUs; dispatch sites below go
+ * through SPU_IB_DISPATCH so the choice is a compile-time switch. */
 void spu_indirect_branch(spu_context* ctx);
+void spu_indirect_branch_mt(spu_context* ctx);
+#ifdef SPU_USE_DISPATCH_MT
+#  define SPU_IB_DISPATCH spu_indirect_branch_mt
+#else
+#  define SPU_IB_DISPATCH spu_indirect_branch
+#endif
 
 /* stop/stopd hook (YDKJ): the runtime inspects the stop code, may deliver a
  * stop-and-signal event to the PPU (SPURS bring-up handshake), and longjmps the
@@ -755,11 +769,11 @@ class SPULifter:
                     or addr in self.link_return:
                 return "return;"
             return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"SPU_TAILCALL(spu_indirect_branch(ctx));")
+                    f"SPU_TAILCALL(SPU_IB_DISPATCH(ctx));")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
             return ("ctx->pc = ctx->srr0; "
-                    "SPU_TAILCALL(spu_indirect_branch(ctx));")
+                    "SPU_TAILCALL(SPU_IB_DISPATCH(ctx));")
         if mn in ("bisl",):
             # `bisl rt, ra`: rt = link, ra = TARGET. The disassembler emits BOTH
             # ("$r0, $r2"), so operand 0 is the link register -- taking it as the
@@ -770,7 +784,7 @@ class SPULifter:
             link_rt = insn.raw & 0x7F            # rt = bits 25-31 of the encoding
             tgt_reg = _reg(ops[-1])
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; SPU_IB_DISPATCH(ctx);")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
@@ -778,7 +792,7 @@ class SPULifter:
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"SPU_TAILCALL(spu_indirect_branch(ctx)); }}")
+                    f"SPU_TAILCALL(SPU_IB_DISPATCH(ctx)); }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -792,7 +806,7 @@ class SPULifter:
                     or addr in self.link_return:
                 return f"if ({cond}) return;"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"SPU_TAILCALL(spu_indirect_branch(ctx)); }}")
+                    f"SPU_TAILCALL(SPU_IB_DISPATCH(ctx)); }}")
 
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
@@ -867,7 +881,7 @@ class SPULifter:
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
                 lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
-                lines.append(f"    ctx->pc = 0x{t:X}u; spu_indirect_branch(ctx);")
+                lines.append(f"    ctx->pc = 0x{t:X}u; SPU_IB_DISPATCH(ctx);")
                 lines.append("}")
             lines.append("")
 
