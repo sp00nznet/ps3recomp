@@ -234,6 +234,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if (mfc_is_get(cmd)) {
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        /* LBP_SPU_WATCH: a DMA GET landing on a watched LS line is how the PPU
+         * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
+        { int _n; unsigned* _w = spu_ls_watch_list(&_n);
+          for (int _i = 0; _i < _n; _i++) {
+              if (_w[_i] >= lsa && _w[_i] < lsa + size) {
+                  const uint8_t* q = &spu->ls[_w[_i] & (SPU_LS_MASK & ~0xFu)];
+                  fprintf(stderr, "[spu-watch DMA-GET 0x%05X <- ea=0x%08X sz=%u img=%d] "
+                          "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                          _w[_i], (uint32_t)ea, size, spu->image_id,
+                          q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                          q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
+                  fflush(stderr);
+              }
+          } }
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory */
         memcpy(ea_ptr, ls_ptr, size);
@@ -454,12 +468,43 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               if(!f && npc<32){ pcs[npc++]=p;
                 fprintf(stderr,"[bink-dmapc] NEW dma site pc=0x%05X %s ea=0x%08X size=0x%X\n",
                     p, is_put?"PUT":"GET", ea32, size); } }
+            /* Control-block command protocol dump: binkspu GETs the request at
+             * 0x927E00 (what the PPU BinkDoFrame commands) and PUTs the response
+             * at 0x927E80. Dump the first ~24 of each so we see the actual command
+             * words + how binkspu answers -- pinpoints where the decode handshake
+             * stalls (e.g. a "needs-decode"/frame-ready word the PPU never sets). */
+            if (ea32 >= 0x00927E00u && ea32 < 0x00927F00u) {
+                extern uint8_t* vm_base;
+                static int nreq=0, nrsp=0;
+                const uint8_t* c = is_put ? (spu->ls + (lsa & SPU_LS_MASK)) : (vm_base + ea32);
+                int* cnt = is_put ? &nrsp : &nreq;
+                /* Dump the first ~40 of each + then every 400th, so we see both the
+                 * steady-state command binkspu keeps re-reading AND its response --
+                 * to find the field the busy-loop polls that never changes. */
+                if (*cnt < 40 || ((*cnt) % 400)==0) {
+                    fprintf(stderr, "[bink-ctl] #%d %s ea=0x%08X pc=0x%05X:", *cnt, is_put?"RSP(put)":"REQ(get)",
+                            ea32, (uint32_t)spu->pc & 0x3FFFF);
+                    for (int i=0;i<0x20;i+=4)
+                        fprintf(stderr, " %02X%02X%02X%02X", c[i],c[i+1],c[i+2],c[i+3]);
+                    fprintf(stderr, "\n");
+                }
+                (*cnt)++;
+            }
             if (is_put) { n_put++; b_put+=size; if (size>max_put){max_put=size;max_put_ea=ea32;} }
             else        { n_get++; b_get+=size; if (size>max_get) max_get=size; }
-            if ((++ticks % 20000)==0)
-                fprintf(stderr, "[bink-dmahist] GET n=%llu bytes=%llu maxsz=0x%X | PUT n=%llu bytes=%llu maxsz=0x%X @0x%08X | sites=%d\n",
+            /* Decode-progress tracker: the compressed-frame ring lives at 0x49Bxxxxx.
+             * Record the lowest+highest frame-data EA read so we can see, over time,
+             * whether binkspu advances forward through the stream (slow-but-decoding)
+             * or freezes on the same window (truly stuck). */
+            static uint32_t fd_lo=0xFFFFFFFFu, fd_hi=0;
+            if (!is_put && (ea32 & 0xFFF00000u)==0x49B00000u) {
+                if (ea32<fd_lo) fd_lo=ea32; if (ea32>fd_hi) fd_hi=ea32;
+            }
+            if ((++ticks % 2000)==0)
+                fprintf(stderr, "[bink-dmahist] GET n=%llu bytes=%llu maxsz=0x%X | PUT n=%llu bytes=%llu maxsz=0x%X @0x%08X | sites=%d | framedata 0x%08X..0x%08X (span=0x%X)\n",
                         (unsigned long long)n_get,(unsigned long long)b_get,max_get,
-                        (unsigned long long)n_put,(unsigned long long)b_put,max_put,max_put_ea,npc);
+                        (unsigned long long)n_put,(unsigned long long)b_put,max_put,max_put_ea,npc,
+                        fd_lo,fd_hi, (fd_hi>=fd_lo)?(fd_hi-fd_lo):0);
         }
     }
 

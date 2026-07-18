@@ -13,6 +13,8 @@
 #include "../../include/ps3emu/ps3types.h"
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +30,43 @@ extern "C" {
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)
+
+/* ---------------------------------------------------------------------------
+ * Reusable env-driven LS watchpoint (mini-debugger, no rebuild to retarget).
+ *   LBP_SPU_WATCH=0x1BE80        watch one 16-byte LS line (reads + writes)
+ *   LBP_SPU_WATCH=0x1BE80,0x927D80  up to 4 comma-separated addresses
+ * Fires from every SPU image's spu_ls_read128/write128. Cheap: one cached
+ * compare on the hot path when disabled.
+ * -----------------------------------------------------------------------*/
+#define SPU_WATCH_MAX 4
+static inline unsigned* spu_ls_watch_list(int* out_n) {
+    static int init = 0; static unsigned addr[SPU_WATCH_MAX]; static int n = 0;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("LBP_SPU_WATCH");
+        while (e && *e && n < SPU_WATCH_MAX) {
+            addr[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
+            while (*e == ',' || *e == ' ') e++;
+        }
+    }
+    *out_n = n;
+    return addr;
+}
+static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p) {
+    int n; unsigned* w = spu_ls_watch_list(&n);
+    if (!n) return;
+    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
+    for (int i = 0; i < n; i++) {
+        if (w[i] == a) {
+            fprintf(stderr, "[spu-watch %s 0x%05X] %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                is_write ? "WR" : "rd", a,
+                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+            fflush(stderr);
+            break;
+        }
+    }
+}
 
 /* Maximum number of MFC tag groups */
 #define SPU_MFC_MAX_TAGS    32
@@ -251,6 +290,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     u128 v;
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
+    spu_ls_watch_hit(lsa, 0, p);
     for (int i = 0; i < 4; i++) {
         v._u32[i] = ((uint32_t)p[i*4]     << 24) |
                     ((uint32_t)p[i*4 + 1] << 16) |
@@ -271,6 +311,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 2] = (uint8_t)(w >>  8);
         p[i*4 + 3] = (uint8_t)w;
     }
+    spu_ls_watch_hit(lsa, 1, p);
 }
 
 /* ---------------------------------------------------------------------------
