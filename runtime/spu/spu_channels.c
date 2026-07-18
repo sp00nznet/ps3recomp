@@ -243,6 +243,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
     }
 
+    /* Bink sync-line atomic trace (armed by the PPU-side producer probe). */
+    { extern uint32_t g_barrier_sync_watch;
+      uint32_t b = g_barrier_sync_watch;
+      if (b && ea >= (b & ~127u) && ea < ((b + 0xC0 + 127) & ~127u)) {
+          static int _n = 0;
+          if (_n++ < 64)
+              fprintf(stderr, "[sync-atomic] %s img=%d pc=0x%05X ea=0x%08X\n",
+                      cmd == MFC_GETLLAR_CMD ? "GETLLAR" :
+                      cmd == MFC_PUTLLC_CMD ? "PUTLLC" : "PUTLLUC",
+                      ctx->image_id, (uint32_t)ctx->pc, ea);
+      } }
     switch (cmd) {
     case MFC_GETLLAR_CMD:
         resv_lock();
@@ -261,6 +272,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
         }
+        { extern uint32_t g_barrier_sync_watch;
+          uint32_t b = g_barrier_sync_watch;
+          if (b && ea >= (b & ~127u) && ea < ((b + 0xC0 + 127) & ~127u)) {
+              static int _n = 0;
+              if (_n++ < 64)
+                  fprintf(stderr, "[sync-atomic] PUTLLC-%s img=%d valid=%d\n",
+                          ctx->atomic_stat == 0 ? "OK" : "FAIL",
+                          ctx->image_id, ctx->resv_valid);
+          } }
         ctx->resv_valid = 0;                           /* reservation consumed */
         resv_unlock();
         return 1;

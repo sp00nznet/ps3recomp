@@ -131,8 +131,12 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
     ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
 }
 
+extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
+    ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     g_last_hle_nid = nid;
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for

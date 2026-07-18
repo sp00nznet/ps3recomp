@@ -19,6 +19,7 @@
  */
 
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
+extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -332,7 +333,11 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
 #endif
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD8] spinning on 0x%08X\n", (uint32_t)a); n=0; } }
+      if ((uint32_t)a==last) { if (++n==200000) {
+          fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
+                  (uint32_t)a, vm_base[(uint32_t)a], GetCurrentThreadId(),
+                  ppu_prof_resolve_host(__builtin_return_address(0)));
+          n=0; } }
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
 uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
@@ -454,7 +459,23 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
           fprintf(stderr,"%s\n",ln); } } } }
 #endif
     return __builtin_bswap64(v); }
-void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return;
+/* Self-arming write-watch on the Bink SPURS sync area (skip-freeze debug).
+ * The barrier probe in the lifted code sets g_barrier_sync_watch = sync base;
+ * any PPU store into [base+0x40, base+0xC0) is then logged with its guest
+ * function, catching whoever bumps the per-SPU lane counters. */
+extern "C" uint32_t g_barrier_sync_watch = 0;
+static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
+{
+    uint32_t b = g_barrier_sync_watch;
+    if (!b) return;
+    if (a >= b + 0x40 && a < b + 0xC0) {
+        static int _n = 0;
+        if (_n++ < 48)
+            fprintf(stderr, "[sync-write] +0x%02X <- 0x%X (w%d) guest-fn=0x%08X\n",
+                    a - b, v, width, ppu_prof_resolve_host(ra));
+    }
+}
+void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return; if (vm_oob((uint32_t)a,1)) return;
 #ifdef _WIN32
     /* FLOW_TRUNC=<hex>: catch the byte-write that clobbers the word currently
      * holding <hex> (e.g. a null-terminator overflow zeroing a pointer's high byte). */
@@ -504,12 +525,12 @@ void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return;
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
     vm_base[(uint32_t)a] = v; }
-void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return;
+void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40)
         fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
     v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
-void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
+void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4)) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */
@@ -707,6 +728,34 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
     if (warned++ < 4)
         fprintf(stderr, "[ppu] function table full (%u/%u) -- raise PPU_HASH_BITS; "
                 "0x%08X dropped\n", g_fn_count, (unsigned)PPU_HASH_SIZE, a);
+}
+
+/* Host-RA -> guest-function resolver for the sampling profiler. The lifted
+ * ABI does not maintain guest lr, so the only reliable callsite breadcrumb at
+ * syscall time is the HOST return address; map it to the lifted function's
+ * guest address via the (host fn ptr -> guest addr) inverse of the registry.
+ * Built lazily on first use (registration is boot-time-only). */
+static struct { void* host; uint32_t guest; } g_inv[PPU_HASH_SIZE];
+static uint32_t g_inv_n = 0;
+extern "C" uint32_t ppu_prof_resolve_host(void* ra)
+{
+    if (!g_inv_n) {
+        for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
+            if (g_fn[i]) { g_inv[g_inv_n].host = (void*)g_fn[i]; g_inv[g_inv_n].guest = g_addr[i]; g_inv_n++; }
+        /* insertion-sort-free: qsort by host ptr */
+        qsort(g_inv, g_inv_n, sizeof(g_inv[0]),
+              [](const void* a, const void* b) -> int {
+                  const void* ha = ((decltype(&g_inv[0]))a)->host;
+                  const void* hb = ((decltype(&g_inv[0]))b)->host;
+                  return ha < hb ? -1 : (ha > hb ? 1 : 0);
+              });
+        if (!g_inv_n) return 0;
+    }
+    /* greatest host fn <= ra */
+    uint32_t lo = 0, hi = g_inv_n;
+    while (lo < hi) { uint32_t mid = (lo + hi) / 2;
+        if (g_inv[mid].host <= ra) lo = mid + 1; else hi = mid; }
+    return lo ? g_inv[lo - 1].guest : 0;
 }
 
 static ppu_fn ppu_lookup(uint32_t a)
@@ -1244,9 +1293,14 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
+extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     uint64_t num = ctx->gpr[11];
+    /* Guest-PC breadcrumb for the sampling profiler: record the syscall
+     * callsite (lr) in the runtime-side thread info. cia itself is the thread
+     * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
+    ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     if (getenv("YDKJ_SCTRACE"))
         fprintf(stderr, "[sc] %llu r3=%08X r4=%08X r5=%08X r6=%08X\n",
                 (unsigned long long)num, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],

@@ -1161,6 +1161,7 @@ static WklPm* spurs_resolve_pm(u32 wid)
 #ifdef _WIN32
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
     struct SpursInst* si = (struct SpursInst*)p;
     static volatile long s_pm_off = -1;
     if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;

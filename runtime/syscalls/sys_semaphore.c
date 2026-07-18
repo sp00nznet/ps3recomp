@@ -247,6 +247,14 @@ int64_t sys_semaphore_create(ppu_context* ctx)
         write_be32(id_out_addr, sem_id);
     }
 
+    /* Identify every semaphore at birth: name + creator's guest LR. The
+     * LBP movie stall was a 2369-waits/0-posts semaphore whose OWNER took
+     * grep archaeology to guess -- the name would have said it instantly. */
+    { static int _n = 0;
+      if (_n++ < 48)
+          fprintf(stderr, "[sem] create id=%u name='%.8s' init=%d max=%d lr=0x%08X\n",
+                  sem_id, s->name, initial, max_val, (uint32_t)ctx->lr); }
+
     sem_table_unlock();
     return CELL_OK;
 }

@@ -251,6 +251,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory */
         memcpy(ea_ptr, ls_ptr, size);
+        /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
+         * that touch the per-SPU lane counters. */
+        { extern uint32_t g_barrier_sync_watch;
+          uint32_t b = g_barrier_sync_watch;
+          if (b && (uint32_t)ea < b + 0xC0 && (uint32_t)ea + size > b + 0x40) {
+              static int _n = 0;
+              if (_n++ < 32)
+                  fprintf(stderr, "[sync-PUT] img=%d pc=0x%05X ea=0x%08X size=%u (sync+0x%X)\n",
+                          spu->image_id, (uint32_t)spu->pc, (uint32_t)ea, size,
+                          (uint32_t)ea - b);
+          } }
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the

@@ -165,6 +165,56 @@ extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" unsigned cellGcm_flip_request_count(void);
 
+/* ---- Guest-PC sampling profiler (PS3_GUEST_PROF=1) -----------------------
+ * Samples every guest thread's ctx.cia every ~5ms and dumps the top sites
+ * every 5s. cia is refreshed at every syscall, and guest spin loops issue a
+ * syscall per iteration (yield/usleep), so a thread stuck in a wait loop
+ * shows its loop's PC dominating the histogram. This is the tool that
+ * answers "where does thread X spend its wall time" without a debugger. */
+#include "../../syscalls/sys_ppu_thread.h"
+static DWORD WINAPI guest_prof_thread(LPVOID)
+{
+    struct Site { uint32_t tid, cia; uint32_t hits; };
+    static Site sites[256];
+    int nsites = 0;
+    ULONGLONG t0 = GetTickCount64();
+    unsigned total = 0;
+    for (;;) {
+        Sleep(5);
+        for (int i = 0; i < PPU_THREAD_MAX; i++) {
+            ppu_thread_info* t = &g_ppu_threads[i];
+            if (t->state != 1 /*RUNNING-ish; harmless if enum differs*/ && t->state != 2) continue;
+            uint32_t cia = (uint32_t)t->ctx.cia;
+            if (!cia) continue;
+            uint32_t tid = (uint32_t)(i + 1);
+            total++;
+            int f = -1;
+            for (int k = 0; k < nsites; k++)
+                if (sites[k].tid == tid && sites[k].cia == cia) { f = k; break; }
+            if (f < 0 && nsites < 256) { f = nsites++; sites[f].tid = tid; sites[f].cia = cia; sites[f].hits = 0; }
+            if (f >= 0) sites[f].hits++;
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now - t0 >= 5000) {
+            /* top 10 by hits */
+            fprintf(stderr, "[gprof] %u samples/5s; top sites:\n", total);
+            for (int rank = 0; rank < 10; rank++) {
+                int best = -1; uint32_t bh = 0;
+                for (int k = 0; k < nsites; k++)
+                    if (sites[k].hits > bh) { bh = sites[k].hits; best = k; }
+                if (best < 0 || bh == 0) break;
+                fprintf(stderr, "[gprof]   tid=%-3u cia=0x%08X  %5.1f%%  (%s)\n",
+                        sites[best].tid, sites[best].cia,
+                        100.0 * sites[best].hits / (total ? total : 1),
+                        g_ppu_threads[sites[best].tid - 1].name);
+                sites[best].hits = 0;   /* consume */
+            }
+            fflush(stderr);
+            nsites = 0; total = 0; t0 = now;
+        }
+    }
+}
+
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "You Don't Know Jack (ps3recomp)") == 0);
@@ -475,6 +525,8 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
     CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
+    if (getenv("PS3_GUEST_PROF"))
+        CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);

@@ -2,6 +2,7 @@
  * ps3recomp - PPU thread management syscalls (implementation)
  */
 
+#include <stddef.h>
 #include "sys_ppu_thread.h"
 #include <string.h>
 #include <stdio.h>
@@ -162,6 +163,44 @@ uint64_t ppu_thread_register_main(void)
  * r8 = flags
  * r9 = thread name pointer
  * -----------------------------------------------------------------------*/
+
+/* Profiler accessor: snapshot slot idx (0-based). Returns 1 if the slot holds
+ * a live thread, filling tid/cia/name. Lets a host-side sampling profiler
+ * iterate guest threads without depending on ppu_thread_info's layout. */
+static unsigned s_prof_main_pc = 0;   /* main guest thread: ctx lives outside the table */
+
+int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
+{
+    if (idx < 0 || idx >= PPU_THREAD_MAX) return 0;
+    ppu_thread_info* t = &g_ppu_threads[idx];
+    if (idx == 0 && t->state == PPU_THREAD_STATE_FREE) {
+        /* slot 0 stays FREE (the main thread never registers) -- serve its
+         * dispatcher breadcrumb here so the profiler sees tid 1. */
+        *tid = 1; *cia = s_prof_main_pc; *name = "main";
+        return s_prof_main_pc != 0;
+    }
+    if (t->state == PPU_THREAD_STATE_FREE) return 0;
+    *tid  = (unsigned)(idx + 1);
+    *cia  = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    *name = t->name;
+    return 1;
+}
+
+/* Called from the lv2/HLE dispatchers with the guest ctx (== &info->ctx). */
+void ppu_prof_stamp(void* vctx, unsigned lr)
+{
+    /* container-of: every dispatched ctx is embedded in its ppu_thread_info */
+    char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
+    ppu_thread_info* t = (ppu_thread_info*)p;
+    int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
+    if (!in_range) { s_prof_main_pc = lr; return; }
+    { static int _n = 0; if (_n++ < 0)
+        fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
+                vctx, (void*)g_ppu_threads, in_range, lr); }
+    if (in_range)
+        t->prof_pc = lr;
+}
+
 int64_t sys_ppu_thread_create(ppu_context* ctx)
 {
     uint32_t tid_out_addr = LV2_ARG_PTR(ctx, 0);
