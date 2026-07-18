@@ -376,7 +376,13 @@ static void spu_async_run(spu_async_job* j)
 #endif
                 }
             }
-            if (j->image_id != 22 && getenv("LBP_TASKSET")) {
+            /* A generic SPURS taskset task (image != cri 22) MUST get its
+             * SpursTasksetContext planted at LS 0x2700 -- the real kernel builds it
+             * from the taskset before entry, and the task reads its args and every
+             * DMA base pointer out of it. Without it the task DMAs from EA 0 and the
+             * PPU pump blocks forever on the EventFlag. Default ON (sagemono 35c2767);
+             * LBP_NO_TASKSET restores the old opt-in dispatch for comparison. */
+            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
                  * globals, which the next CreateTask clobbers -- the race that made
