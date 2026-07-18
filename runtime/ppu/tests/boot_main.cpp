@@ -367,6 +367,30 @@ static DWORD WINAPI hang_watchdog(LPVOID)
  * crashing the process (essential now that the recompiled engine runs deep and
  * worker threads touch incomplete state). Out-of-arena faults fall through to
  * the crash reporter. */
+/* Guard-page-violation reporter: STATUS_GUARD_PAGE_VIOLATION (0x80000001)
+ * bypasses every ACCESS_VIOLATION-only handler and kills the process SILENTLY
+ * (observed the moment the Bink SPU decoder first really ran). Log full context
+ * before letting the chain continue. */
+static LONG WINAPI guard_report_veh(EXCEPTION_POINTERS* ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == 0x80000001u /*STATUS_GUARD_PAGE_VIOLATION*/) {
+        static LONG s_n = 0;
+        if (InterlockedIncrement(&s_n) <= 8) {
+            char* mbase = (char*)GetModuleHandleA(NULL);
+            fprintf(stderr, "\n[GUARDVIOLATION] tid=%lu %s fault=0x%llX rip-rva=0x%llX\n",
+                    GetCurrentThreadId(),
+                    ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+                    (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1],
+                    (unsigned long long)((char*)ep->ExceptionRecord->ExceptionAddress - mbase));
+            void* fr[24]; USHORT n = RtlCaptureStackBackTrace(0, 24, fr, NULL);
+            fprintf(stderr, "[GUARDVIOLATION] bt-rva:");
+            for (USHORT i = 0; i < n; i++)
+                fprintf(stderr, " %llX", (unsigned long long)((char*)fr[i] - mbase));
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -416,6 +440,7 @@ int main(int argc, char** argv)
      * buffer's offset incorrectly. */
 #ifdef _WIN32
     /* Reserve the full 4 GB guest space; pages commit on first touch via the VEH. */
+    AddVectoredExceptionHandler(1, guard_report_veh);  /* diagnose 0x80000001 silent deaths */
     AddVectoredExceptionHandler(1, vm_commit_veh);
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
