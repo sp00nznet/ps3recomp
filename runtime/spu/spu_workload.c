@@ -610,6 +610,35 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     { static int _n = 0; if (_n++ < 60 || (_n % 500) == 0)
         fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X\n",
                 _n, taskId, taskset_ea); }
+    /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
+     * POLICY MODULE advances the per-SPU progress lanes (sync+0x40+16*row:
+     * ticket u16 @+0, consumer lanes @+2..) as tasks are processed; our HLE
+     * runs the task on a dedicated thread and re-runs the PM ~never, so the
+     * lanes froze and the skip path's min-of-lanes barrier (sub_4D3730) hung
+     * forever. A task ENTERING WAIT_SIGNAL has by definition drained all work
+     * dispatched to it, so advancing the active lanes to the published ticket
+     * here is semantically the PM's bookkeeping, batched. Validation gate. */
+    if (getenv("LBP_SYNC_ACK")) {
+        extern uint32_t g_barrier_sync_watch;
+        uint32_t b = g_barrier_sync_watch;
+        if (b) {
+            for (int row = 0; row < 4; row++) {
+                uint32_t p = b + 0x40 + 16u * (uint32_t)row;
+                extern uint8_t* vm_base;
+                uint16_t ticket = (uint16_t)((vm_base[p] << 8) | vm_base[p+1]);
+                for (int lane = 0; lane < 7; lane++) {
+                    uint32_t la = p + 2 + 2u * (uint32_t)lane;
+                    uint16_t cur = (uint16_t)((vm_base[la] << 8) | vm_base[la+1]);
+                    if (cur != 0xFFFF && cur < ticket) {
+                        vm_base[la]   = (uint8_t)(ticket >> 8);
+                        vm_base[la+1] = (uint8_t)ticket;
+                    }
+                }
+            }
+            { static int _a = 0; if (_a++ < 8)
+                fprintf(stderr, "[sync-ack] lanes advanced to tickets (sync=0x%08X)\n", b); }
+        }
+    }
     unsigned secs = 0;
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);

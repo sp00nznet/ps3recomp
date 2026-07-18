@@ -24,7 +24,21 @@ void spu_indirect_branch(spu_context* ctx);               /* full resolver in th
 void spu_indirect_branch_mt(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK;
-    if (!ctx->policy_mode && pc != TASKSET_PM_SYSCALL_ADDR && ctx->image_id != 23) {
+    /* Policy modules MUST use this fast path for ordinary branches too: the
+     * lib resolver's plain `fn(ctx)` cannot tail under MSVC, so routing every
+     * policy-mode branch there stacked one resolver frame per PM loop
+     * iteration -- the moment the jobmanager PM got REAL work (intro skip ->
+     * loading jobs) it recursed ~28k deep and stack-overflowed the SPURS
+     * kernel thread (C00000FD, bt = spu_indirect_branch repeating). Only the
+     * kernel-service addresses (exit-to-kernel / select-workload, which the
+     * lib intercepts and RETURNS from without dispatching) and the special
+     * HLE addresses still take the slow path. */
+    int special = (ctx->policy_mode &&
+                   (pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
+                    pc == SPURS_PM_SELECT_WORKLOAD_LS))
+                  || pc == TASKSET_PM_SYSCALL_ADDR
+                  || ctx->image_id == 23;
+    if (!special) {
         spu_dispatch_fn fn = spu_lookup(pc, ctx->image_id);
         if (fn) {
             ctx->pc = pc;
