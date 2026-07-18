@@ -755,11 +755,11 @@ class SPULifter:
                     or addr in self.link_return:
                 return "return;"
             return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return;")
+                    f"SPU_TAILCALL(spu_indirect_branch(ctx));")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
             return ("ctx->pc = ctx->srr0; "
-                    "spu_indirect_branch(ctx); return;")
+                    "SPU_TAILCALL(spu_indirect_branch(ctx));")
         if mn in ("bisl",):
             # `bisl rt, ra`: rt = link, ra = TARGET. The disassembler emits BOTH
             # ("$r0, $r2"), so operand 0 is the link register -- taking it as the
@@ -778,7 +778,7 @@ class SPULifter:
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return; }}")
+                    f"SPU_TAILCALL(spu_indirect_branch(ctx)); }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -792,7 +792,7 @@ class SPULifter:
                     or addr in self.link_return:
                 return f"if ({cond}) return;"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return; }}")
+                    f"SPU_TAILCALL(spu_indirect_branch(ctx)); }}")
 
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
@@ -809,7 +809,7 @@ class SPULifter:
     def _cond(self, mn: str, reg: str) -> str:
         """Condition expression on preferred slot for conditional branches."""
         word = f"ctx->gpr[{reg}]._u32[0]"
-        half = f"ctx->gpr[{reg}]._u16[1]"   # preferred halfword (lane 1 of word 0)
+        half = f"ctx->gpr[{reg}]._u16[0]"   # preferred halfword = BE bytes 2-3 = LOW half of native _u32[0]
         table = {
             "brz": f"{word} == 0",      "brnz": f"{word} != 0",
             "brhz": f"{half} == 0",     "brhnz": f"{half} != 0",
