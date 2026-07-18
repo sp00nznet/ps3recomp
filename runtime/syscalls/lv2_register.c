@@ -494,6 +494,9 @@ static DWORD WINAPI spu_fallback_thread_proc(LPVOID arg)
 static void* spu_fallback_thread_proc(void* arg)
 #endif
 {
+#ifdef _WIN32
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+#endif
     spu_thread_t* t = (spu_thread_t*)arg;
     int32_t rc = 0;
     if (t->fb_handler) {
@@ -1077,6 +1080,33 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
 
     fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -> entry=0x%05X nsegs=%d\n",
             img_ea, src_ea, entry, nsegs);
+    /* LBP_DUMP_IMPORT=<dir>: save each unique imported ELF (FMOD's runtime-
+     * materialized SPU overlay plugins) so they can be lifted + registered.
+     * Extent = max(p_off+p_fsz) over PT_LOADs, re-walked here cheaply. */
+    { const char* dd = getenv("LBP_DUMP_IMPORT");
+      if (dd && *dd) {
+          static uint32_t s_seen[16]; static int s_nseen = 0;
+          int dup = 0;
+          for (int k = 0; k < s_nseen; k++) if (s_seen[k] == src_ea) dup = 1;
+          if (!dup && s_nseen < 16) {
+              s_seen[s_nseen++] = src_ea;
+              uint32_t ext = 0x40;
+              for (uint16_t i2 = 0; i2 < phnum; i2++) {
+                  uint32_t ph2 = phoff + (uint32_t)i2 * phentsz;
+                  if (vm_read_be32(src_ea + ph2 + 0x00) != 1) continue;
+                  uint32_t end2 = vm_read_be32(src_ea + ph2 + 0x04) + vm_read_be32(src_ea + ph2 + 0x10);
+                  if (end2 > ext) ext = end2;
+              }
+              uint32_t shend = vm_read_be32(src_ea + 0x20) +
+                               (uint32_t)vm_read_be16(src_ea + 0x2E) * vm_read_be16(src_ea + 0x30);
+              if (shend > ext && shend < 0x400000) ext = shend;
+              char path[512];
+              snprintf(path, sizeof path, "%s/import_%08X.elf", dd, src_ea);
+              FILE* fo = fopen(path, "wb");
+              if (fo) { fwrite(vm_base + src_ea, 1, ext, fo); fclose(fo);
+                        fprintf(stderr, "[SPU] import dumped: %s (%u bytes)\n", path, ext); }
+          }
+      } }
 #ifdef _WIN32
     /* LBP retries this import in a tight loop (134x observed) with no other
      * syscall in between -- something it derives from the filled struct keeps
