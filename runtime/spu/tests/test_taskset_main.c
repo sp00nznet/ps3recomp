@@ -73,6 +73,12 @@ static void taskset_run(spurs_taskset* ts) {
     }
 }
 
+/* diagnostics externs referenced from spu_dma.h in the full runtime */
+int g_cri_video_dma = 0;
+/* stop/halt hooks required by current lifter output */
+void spu_stop(spu_context* ctx) { (void)ctx; }
+void spu_halt(spu_context* ctx) { (void)ctx; }
+
 int main(void) {
     memset(g_mem, 0, sizeof(g_mem));
     memset(&g_taskset_evq, 0, sizeof(g_taskset_evq)); g_taskset_evq.active = 1;

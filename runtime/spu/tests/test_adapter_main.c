@@ -36,6 +36,12 @@ extern void spu_func_00000000(spu_context*);   /* the lifted task entry */
 static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 static void wbe32(uint8_t* p, uint32_t v) { p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; }
 
+/* diagnostics externs referenced from spu_dma.h in the full runtime */
+int g_cri_video_dma = 0;
+/* stop/halt hooks required by current lifter output */
+void spu_stop(spu_context* ctx) { (void)ctx; }
+void spu_halt(spu_context* ctx) { (void)ctx; }
+
 int main(void) {
     memset(g_mem, 0, sizeof(g_mem));
     mfc_engine_init(&g_mfc);
