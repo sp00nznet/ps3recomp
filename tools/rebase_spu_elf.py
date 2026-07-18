@@ -46,21 +46,22 @@ def main():
         n = be32(b, sh)
         end = strs.find(b'\0', n)
         return strs[n:end].decode('ascii','replace')
-    PTR_SECTIONS = {'.ctors', '.dtors', '.data.rel.ro', '.data'}
+    # Shift ONLY section addresses (sh_addr) so the lifter's --auto-functions
+    # sees load-base VAs and registers each function at loadbase+va. We do NOT
+    # patch data-section bytes: verified (LS-vs-ELF byte diff = 0%) that the SCE
+    # .fixup pass touches only data pointers, never code, and the runtime
+    # applies those data fixups in LS -- our lifted code reads them live from
+    # LS at run time, so the ELF's stale link-base data is never used. (The
+    # night-session heuristic that rewrote data words corrupted execution;
+    # dropped.)
+    del lo, hi
     for i in range(shnum):
         sh = e_shoff + i*shentsz
         addr = be32(b, sh+12)
         if addr:
             wbe32(b, sh+12, addr + base)         # sh_addr
-        nm = shname(i)
-        if nm in PTR_SECTIONS:
-            off, size = be32(b, sh+16), be32(b, sh+20)
-            for o in range(off, off+size-3, 4):
-                v = be32(b, o)
-                if lo <= v < hi and (v & 3) == 0 and v != 0:
-                    wbe32(b, o, v + base)
     open(dst, 'wb').write(b)
-    print(f"rebased {src} -> {dst} (+{base:#x}, image {lo:#x}..{hi:#x})")
+    print(f"rebased {src} -> {dst} (+{base:#x})")
 
 if __name__ == '__main__':
     main()
