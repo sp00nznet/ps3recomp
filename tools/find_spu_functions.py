@@ -343,7 +343,12 @@ def collect_jump_table_targets(insns, code, code_start, code_end,
             if wrd & 3:
                 break
             abs_ok = wrd in valid_starts
-            rel = tbl + wrd
+            # SIGNED table-relative entries: Bink's dispatch table at LS 0xCC7C
+            # mixes positive and negative offsets (0xFFFFBF64 = -0x409C ->
+            # 0x8BE0). The unsigned add produced 0x100008BE0, failed
+            # validation, and ended the table walk one entry in -- masking to
+            # the 18-bit LS space is what the hardware add does anyway.
+            rel = (tbl + wrd) & 0x3FFFF
             rel_ok = (rel & 3) == 0 and rel in valid_starts
             if not abs_ok and not rel_ok:
                 break           # neither reading decodes as code -- table end

@@ -442,6 +442,25 @@ typedef struct {
 static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
 static uint32_t s_registry_count = 0;
 
+/* Hash index over the registry. spu_lookup runs on EVERY guest indirect
+ * branch -- with the Bink decoder live that is millions of dispatches per
+ * second, and the old linear scan (~950 binkspu entries walked per branch)
+ * dominated movie playback. Buckets chain in REGISTRATION ORDER (tail
+ * append) so the first-registered-match-wins semantics of the linear scan
+ * are preserved exactly; the image-id wildcard rules stay in the bucket
+ * walk, which is 1-3 entries (same LS addr across overlapping images).
+ * Registration is startup-single-threaded; lookups treat the index as
+ * read-only. Chain links store index+1 so zero-init means "empty". */
+#define SPU_FN_HASH_SIZE 32768   /* power of two, ~2x max load factor 2 */
+static uint32_t s_hash_head[SPU_FN_HASH_SIZE];
+static uint32_t s_hash_tail[SPU_FN_HASH_SIZE];
+static uint32_t s_hash_next[SPU_FN_REGISTRY_MAX];
+
+static inline uint32_t spu_fn_hash(uint32_t addr)
+{
+    return ((addr >> 2) * 2654435761u) & (SPU_FN_HASH_SIZE - 1);
+}
+
 /* Image currently being registered. SPURS images (kernel/policy/job) overlap in
  * LS, so each registers under a distinct id via spu_begin_image() before calling
  * its (prefixed) spu_recomp_register(). Single-image callers leave it 0. */
@@ -451,23 +470,31 @@ void spu_begin_image(int image_id) { s_reg_image = image_id; }
 void spu_register_function(uint32_t addr, spu_fn fn)
 {
     if (s_registry_count < SPU_FN_REGISTRY_MAX) {
-        s_registry[s_registry_count].addr = addr;
-        s_registry[s_registry_count].fn = fn;
-        s_registry[s_registry_count].image_id = s_reg_image;
-        s_registry_count++;
+        uint32_t i = s_registry_count;
+        s_registry[i].addr = addr;
+        s_registry[i].fn = fn;
+        s_registry[i].image_id = s_reg_image;
+        s_registry_count = i + 1;
+        uint32_t h = spu_fn_hash(addr);
+        s_hash_next[i] = 0;
+        if (s_hash_head[h] == 0)
+            s_hash_head[h] = i + 1;
+        else
+            s_hash_next[s_hash_tail[h] - 1] = i + 1;
+        s_hash_tail[h] = i + 1;
     }
 }
 
 spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
-    /* Linear scan is fine for the small per-image tables. Match the context's
-     * active image; image_id 0 (context or entry) matches any, for back-compat
-     * with single-image contexts. */
-    for (uint32_t i = 0; i < s_registry_count; i++)
-        if (s_registry[i].addr == addr &&
-            (image_id == 0 || s_registry[i].image_id == 0 ||
-             s_registry[i].image_id == image_id))
-            return s_registry[i].fn;
+    /* Match the context's active image; image_id 0 (context or entry) matches
+     * any, for back-compat with single-image contexts. */
+    for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
+        const spu_reg_entry* e = &s_registry[n - 1];
+        if (e->addr == addr &&
+            (image_id == 0 || e->image_id == 0 || e->image_id == image_id))
+            return e->fn;
+    }
     return NULL;
 }
 
@@ -539,10 +566,14 @@ void spu_indirect_branch(spu_context* ctx)
     if (ctx->policy_mode) {
         extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
-            /* Module exit: the workload returned to the kernel (drained/yield). */
+            /* Module exit: the workload returned to the kernel (drained/yield).
+             * Print gated: fires once per policy run = thousands/sec. */
             g_spurs_pm_exited = 1;
-            fprintf(stderr, "[spurs-pm] exit-to-kernel (r3=0x%08X polls=%u)\n",
-                    ctx->gpr[3]._u32[0], g_spurs_pm_polls);
+            { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (s_t) { static unsigned long _n = 0; unsigned long n = ++_n;
+                if (n <= 64 || (n & 0xFFF) == 0)
+                    fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X polls=%u)\n",
+                            n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
             ctx->status = SPU_STATUS_STOPPED_BY_STOP;
             spu_halt(ctx);
             return;
@@ -662,7 +693,13 @@ void spu_indirect_branch(spu_context* ctx)
       if (_bt0[img]++ < BT0_PER_IMG)
         fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
                 ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
-    { static int _n=0; if (_n++ < 2) {
+    /* SPU_MISS_DUMP_IMG=<n>: reserve the deep-dump budget for image n's misses
+     * (the global 2-shot budget was always consumed by an earlier image's
+     * misses, hiding the one under investigation). Unset = old behavior. */
+    { static int s_img = -2;
+      if (s_img == -2) { const char* e = getenv("SPU_MISS_DUMP_IMG"); s_img = e ? atoi(e) : -1; }
+      static int _n=0;
+      if ((s_img < 0 || ctx->image_id == s_img) && _n++ < 2) {
         fprintf(stderr, "[SPU] branch-to-0 lr=0x%05X r1=0x%05X\n",
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK);
 #ifdef _WIN32

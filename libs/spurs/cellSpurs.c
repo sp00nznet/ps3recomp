@@ -1254,6 +1254,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * consume one unit so a kick-driven title paces the same as before. */
             volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
             u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
+            int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
             if (*rdy) (*rdy)--;
             if (sig & (0x8000u >> wid))
                 vm_write32(ea + SPURS_WKL_SIGNAL1,
@@ -1261,6 +1262,24 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 
             WklPm* r = spurs_resolve_pm(wid);
             if (!r) continue;
+
+            /* Idle backoff: running EVERY enabled workload's module EVERY 1ms
+             * pass (x N instance threads) burned ~5 host cores on modules that
+             * immediately exit-to-kernel with no work, starving the actual
+             * decode/render threads (LBP movie at ~1fps while 500% CPU).
+             * A module that keeps finding nothing gets re-run every 2nd, 4th,
+             * ... up to 16th pass; an explicit kick (readyCount/signal) resets
+             * it to every pass, so kick-driven latency is unchanged. */
+            {
+                static u8 s_idle[CELL_SPURS_MAX_WORKLOAD];      /* idle streak (log2 cadence) */
+                static u32 s_pass_no;                            /* shared pass counter is fine */
+                if (wid == 0) s_pass_no++;
+                if (kicked) s_idle[wid] = 0;
+                u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
+                if (!kicked && (s_pass_no & (cad - 1)) != 0) continue;
+                extern volatile unsigned g_spurs_pm_polls;
+                u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
+                (void)polls_before;
 
             {   static int _n = 0;
                 if (_n < 8) { _n++;
@@ -1275,6 +1294,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                                   (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm,
                                   s_workloads[wid].sizePm, arg, wid, ea);
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+            /* "Found work" heuristic: a module that did something polls the
+             * kernel for MORE work before exiting (selectWorkload calls >0);
+             * an idle module exits immediately with polls==0. Grow the idle
+             * streak on the latter, reset on the former. */
+            if (g_spurs_pm_polls == 0) { if (s_idle[wid] < 8) s_idle[wid]++; }
+            else s_idle[wid] = 0;
+            }
         }
     }
 }
