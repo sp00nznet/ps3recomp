@@ -458,7 +458,7 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     }
 }
 
-static spu_fn spu_lookup(uint32_t addr, int image_id)
+spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
     /* Linear scan is fine for the small per-image tables. Match the context's
      * active image; image_id 0 (context or entry) matches any, for back-compat
@@ -639,8 +639,17 @@ void spu_indirect_branch(spu_context* ctx)
     }
     spu_fn fn = spu_lookup(ctx->pc, ctx->image_id);
     if (fn) {
+        /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
+         * Bink decoder's per-command dispatch does) must not grow the host
+         * stack -- a plain call here leaked a resolver+callee frame per
+         * iteration and blew the thread stack ~4k iterations into the first
+         * really-decoding movie frame (silent 0x80000001 death). */
+#if defined(__clang__)
+        __attribute__((musttail)) return fn(ctx);
+#else
         fn(ctx);
         return;
+#endif
     }
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
