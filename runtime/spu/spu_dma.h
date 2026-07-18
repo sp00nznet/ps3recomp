@@ -436,6 +436,19 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
              * distinct GET-source / PUT-dest page set, so we see whether the
              * frame-output DMA site is ever reached and where data would land. */
             static uint32_t pcs[32]; static int npc=0;
+            /* Dump the task-context/descriptor the kernel reads (GET from the
+             * 0x49xxxxxx SPURS task region) -- reveals whether task 2 is marked
+             * ready-with-work, scoping the dispatch fix. First 8 distinct EAs. */
+            if (!is_put && (ea32 & 0xFF000000u) == 0x49000000u) {
+                extern uint8_t* vm_base;
+                static uint32_t seen[8]; static int ns=0; int f=0;
+                for(int i=0;i<ns;i++) if(seen[i]==ea32){f=1;break;}
+                if(!f && ns<8 && vm_base){ seen[ns++]=ea32;
+                    const uint8_t* c = vm_base + ea32;
+                    fprintf(stderr,"[bink-taskctx] GET ea=0x%08X size=0x%X:",ea32,size);
+                    for(int i=0;i<0x40;i++){ if((i&15)==0) fprintf(stderr,"\n  +%02X:",i); fprintf(stderr," %02X",c[i]); }
+                    fprintf(stderr,"\n"); }
+            }
             { uint32_t p=(uint32_t)spu->pc & 0x3FFFF; int f=0;
               for(int i=0;i<npc;i++) if(pcs[i]==p){f=1;break;}
               if(!f && npc<32){ pcs[npc++]=p;
