@@ -372,6 +372,16 @@ def _reg_idx(token: str) -> str:
 # Callee-saved register save/restore (r14-r31) to/from the frame, for the
 # robust ABI-preservation pass in lift_function. Group order: SAVE -> (off, reg);
 # RESTORE -> (reg, off), so a save and its restore pair on matching (off, reg).
+def _mem_base(base):
+    """EA base register expr. The PPC d-form ra=0 means a literal 0 base, not r0;
+    since `base` is a lift-time constant, resolve it here to plain `ctx->gpr[N]`
+    (N!=0) or `0` (ra=0) instead of a runtime `((N)?ctx->gpr[N]:0)` ternary. The
+    ternary was correct but (a) redundant and (b) broke every pattern-match that
+    expects a bare `ctx->gpr[1]` stack base -- most importantly the callee-save
+    (_cs) detection, which silently no-op'd, corrupting reused-slot reloads."""
+    return "0" if str(base) == "0" else f"ctx->gpr[{base}]"
+
+
 # The r1 (stack) base can be emitted plainly (`ctx->gpr[1]`) OR, since the ra=0
 # form is lowered as a runtime ternary, as `((1) ? ctx->gpr[1] : 0)`. The
 # callee-save detection below must match BOTH, or it silently finds nothing and
@@ -1101,7 +1111,7 @@ class PPULifter:
             if mn == "ld" and str(rd_i) == "2" and str(base) == "1" and self.toc_base:
                 return f"ctx->gpr[2] = 0x{self.toc_base:08X}ULL; /*TOCFIX ld r2,N(r1)*/"
             if disp is not None:
-                expr = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp})"
+                expr = f"{helper}({_mem_base(base)} + {disp})"
                 if signed and "16" in helper:
                     expr = f"(int64_t)(int16_t){expr}"
                 line = f"ctx->gpr[{rd_i}] = {expr};"
@@ -1151,7 +1161,7 @@ class PPULifter:
             rs_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                line = f"{helper}((({base}) ? ctx->gpr[{base}] : 0) + {disp}, ctx->gpr[{rs_i}]);"
+                line = f"{helper}({_mem_base(base)} + {disp}, ctx->gpr[{rs_i}]);"
                 # Handle update forms
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
@@ -1173,7 +1183,7 @@ class PPULifter:
             rd_i = int(_reg_idx(ops[0]))
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                stmts = [f"{{ uint64_t _ea = (({base}) ? ctx->gpr[{base}] : 0) + {disp};"]
+                stmts = [f"{{ uint64_t _ea = {_mem_base(base)} + {disp};"]
                 for i, r in enumerate(range(rd_i, 32)):
                     off = f" + {i * 4}" if i else ""
                     stmts.append(f" ctx->gpr[{r}] = vm_read32(_ea{off});")
@@ -1185,7 +1195,7 @@ class PPULifter:
             rs_i = int(_reg_idx(ops[0]))
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                stmts = [f"{{ uint64_t _ea = (({base}) ? ctx->gpr[{base}] : 0) + {disp};"]
+                stmts = [f"{{ uint64_t _ea = {_mem_base(base)} + {disp};"]
                 for i, r in enumerate(range(rs_i, 32)):
                     off = f" + {i * 4}" if i else ""
                     stmts.append(f" vm_write32(_ea{off}, (uint32_t)ctx->gpr[{r}]);")
@@ -1221,7 +1231,7 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp});"
+                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32({_mem_base(base)} + {disp});"
 
         # ------- Indexed Stores -------
         idx_store_map = {
@@ -1571,10 +1581,10 @@ class PPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if "s" in mn:
-                    body = (f"{{ uint32_t tmp = vm_read32((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
+                    body = (f"{{ uint32_t tmp = vm_read32({_mem_base(base)} + {disp}); "
                             f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
-                    body = (f"{{ uint64_t tmp = vm_read64((({base}) ? ctx->gpr[{base}] : 0) + {disp}); "
+                    body = (f"{{ uint64_t tmp = vm_read64({_mem_base(base)} + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
                 # Update-form (lfsu/lfdu): EA = (rA)+disp, then rA = EA.
                 # Dropping this base write-back leaves rA stale and corrupts every
@@ -1612,10 +1622,10 @@ class PPULifter:
                 if mn in ("stfs", "stfsu"):
                     body = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
                             f"memcpy(&tmp, &ftmp, 4); "
-                            f"vm_write32((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
+                            f"vm_write32({_mem_base(base)} + {disp}, tmp); }}")
                 else:
                     body = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
-                            f"vm_write64((({base}) ? ctx->gpr[{base}] : 0) + {disp}, tmp); }}")
+                            f"vm_write64({_mem_base(base)} + {disp}, tmp); }}")
                 # Update-form (stfsu/stfdu): EA = (rA)+disp, then rA = EA
                 # (PowerISA p.132/133). Dropping this base write-back is what let
                 # stfsu-initialized color fields clobber the object vtable at
