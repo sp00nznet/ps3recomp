@@ -1303,14 +1303,14 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             u8 maxcont = *(vm_base + ea + SPURS_WKL_MAXCONT + wid);
             if (maxcont < 1) maxcont = 1;
             if (maxcont > 6) maxcont = 6;
-            /* Dispatch at least 4 virtual SPUs: the WWS work-queue consume
-             * protocol needs every potential consumer lane to either play or
-             * PARK (write its 0x1FFFFFFF marker) -- with only maxContention
-             * lanes dispatched, the un-parked lanes blocked the ticket
-             * barrier and LBP's level-loading queue never drained (measured:
-             * 2 lanes = frozen at ticket 10/20; 4 lanes = drained, lane0
-             * catches up to the published ticket). */
-            if (maxcont < 4) maxcont = 4;
+            /* Do NOT exceed the workload's own contention: per-SPU rows in
+             * the WWS sync struct live at +0x40+16*spuNum, and dispatching
+             * spuNum >= nSpus made virtual SPU 3 write its bookkeeping row
+             * OVER the game's ticket row (row 3) -- observed as ticket values
+             * jumping to garbage (141028, 9960...) during the savedata load.
+             * The earlier "4 lanes drains the queue" result was partly that
+             * scribble. Correct progress comes from PERSISTENT PM contexts
+             * (spurs_policy.c), not extra lanes. */
             /* SPURS_FORCE_SPUS=<n>: dispatch every workload for n virtual SPUs
              * regardless of maxContention (A/B: LBP publishes its loading
              * tickets on sync row 3, and the PM's row index = spuNum). */

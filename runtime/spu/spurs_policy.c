@@ -47,23 +47,33 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * per second with the SPURS workload churn live), and a fresh 260KB
      * calloc/free each time was allocator + page-zeroing churn. The explicit
      * memset preserves the exact fresh-zero semantics calloc provided. */
-#if defined(_MSC_VER)
-    static __declspec(thread) spu_context* t_ctx;
-#else
-    static _Thread_local spu_context* t_ctx;
-#endif
-    if (!t_ctx) {
-        t_ctx = (spu_context*)malloc(sizeof(spu_context));
-        if (!t_ctx) return -1;
+    /* PERSISTENT context per (workload, virtual SPU): a real policy module
+     * stays RESIDENT on its SPU -- its LS carries continuation state between
+     * scheduling quanta (the wwsjob PM caches the last-seen queue line at LS
+     * 0x14B0 and its staging rings at 0x12xx; a freshly zeroed context every
+     * dispatch made it treat every re-entry as first contact and it could
+     * never progress its claim/stage pipeline). Image + context init happen
+     * once; re-entries keep LS and only refresh the entry registers and the
+     * (possibly game-updated) kernel-context fields. */
+    enum { SPURS_PM_MAX_WKL = 16 };
+    static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
+    if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
+    spu_context* ctx = s_pm_ctx[wid][spu_num];
+    int first = 0;
+    if (!ctx) {
+        ctx = (spu_context*)malloc(sizeof(spu_context));
+        if (!ctx) return -1;
+        s_pm_ctx[wid][spu_num] = ctx;
+        first = 1;
+        memset(ctx, 0, sizeof(*ctx));
+        spu_context_init(ctx, 0);
     }
-    spu_context* ctx = t_ctx;
-    memset(ctx, 0, sizeof(*ctx));
-    spu_context_init(ctx, 0);
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
 
-    /* PM image at its load base. */
-    memcpy(ctx->ls + 0xA00, pm_host, pm_size);
+    /* PM image at its load base (first entry only -- LS persists). */
+    if (first)
+        memcpy(ctx->ls + 0xA00, pm_host, pm_size);
 
     /* SpursKernelContext at LS 0x100 (fields big-endian, like all guest data). */
     uint8_t* ls = ctx->ls;
@@ -104,8 +114,14 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * early-returned on every run: tickets got claimed via the shifted copy
      * but the job-list header never DMA'd in, and the PM wedged forever in
      * its staged-job wait (LBP's post-intro loading freeze). */
-    ctx->gpr[4]._u32[0] = (uint32_t)wkl_data;          /* lo32: the queue EA  */
-    ctx->gpr[4]._u32[1] = (uint32_t)(wkl_data >> 32);  /* hi32: aux           */
+    /* ...and the CLAIM path reads the EA from the shlqbyi(r4,4) copy (LS
+     * 0x13F0, via func_3038 -> 2418), i.e. r4's SECOND word. Both word 0
+     * (attach) and word 1 (claim) must carry the 32-bit EA; the hi half
+     * rides in words 2-3. */
+    ctx->gpr[4]._u32[0] = (uint32_t)wkl_data;          /* attach reads word0  */
+    ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;          /* claim reads word1   */
+    ctx->gpr[4]._u32[2] = (uint32_t)(wkl_data >> 32);
+    ctx->gpr[4]._u32[3] = (uint32_t)(wkl_data >> 32);
     ctx->gpr[5]._u32[0] = 0;                           /* poll status */
 
     g_spurs_pm_polls  = 0;
