@@ -40,24 +40,19 @@ extern uint8_t* vm_base;
  * committed and accessible. Returns 1 if the range is safe to memcpy. */
 static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
 {
+    /* The flat VM reserves the FULL 32-bit guest space and demand-commits
+     * pages on first touch (ppu_loader's vectored handler), so every 32-bit
+     * EA is safe host memory by construction -- a garbage EA reads zeros /
+     * commits an empty page, exactly like vm_read32. The old implementation
+     * additionally VirtualQuery'd the range on EVERY MFC transfer: VTune
+     * measured that at 94 CPU-seconds in a 50 s movie run -- 60x the entire
+     * lifted-SPU execution cost, and the real reason the Bink intro decoded
+     * at 1-2 FPS. Bounds-check only. */
     uint32_t e = (uint32_t)ea;
     if (size == 0) return 0;
     if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
 #ifdef _WIN32
     if (!vm_base) return 0;
-    uint8_t* p = vm_base + e;
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
-    if (mbi.State != MEM_COMMIT) return 0;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    /* If the range spans into the next region, verify the last byte's page too. */
-    uintptr_t region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    if ((uintptr_t)p + size > region_end) {
-        MEMORY_BASIC_INFORMATION mbi2;
-        if (VirtualQuery(p + size - 1, &mbi2, sizeof(mbi2)) == 0) return 0;
-        if (mbi2.State != MEM_COMMIT) return 0;
-        if (mbi2.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    }
 #endif
     return 1;
 }
