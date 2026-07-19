@@ -111,6 +111,16 @@ void lbp_spu_register_all(void)
         spu_begin_image(64); fmod_ovl_7EC280_spu_recomp_register();
         spu_overlay_register_sig(sig_7EC280, 64);
         spu_overlay_register_source(0x007EC380u, 64); }
+      /* Eighth plugin (import 0x826400, the audio-banks-phase DSP; observed
+       * load base 0x250B0). Re-lifted from a FRESH capture with the fixed
+       * metadata-only rebase (the old corrupting lift predates 1c0a965). */
+      { extern void fmod_ovl_826400_spu_recomp_register(void);
+        extern void spu_overlay_register_sig(const uint8_t sig[16], int image_id);
+        static const uint8_t sig_826400[16] = {0x42,0x1A,0x08,0x02,0x42,0xD3,0x44,0x82,
+                                               0x43,0x51,0x05,0x02,0x43,0xC9,0x81,0x82};
+        spu_begin_image(65); fmod_ovl_826400_spu_recomp_register();
+        spu_overlay_register_sig(sig_826400, 65);
+        spu_overlay_register_source(0x00826500u, 65); }
       spu_begin_image(6);  fmod_ovl_842180_spu_recomp_register(); }
     spu_begin_image(6); spu_0003_at_007DDD00_spu_recomp_register();
     spu_workload_register_img(0x24722689EAEC1D8CULL, spu_0003_at_007DDD00_spu_func_00003070, 6, "spu_0003_at_007DDD00");
@@ -152,15 +162,8 @@ void lbp_spu_register_all(void)
     spu_workload_register_img(0xA00CF1A3CD05D69CULL, spu_0021_at_00832180_spu_func_00000178, 24, "spu_0021_at_00832180");
     spu_begin_image(25); spu_0022_at_00836280_spu_recomp_register();
     spu_workload_register_img(0xBF82618757E4A947ULL, spu_0022_at_00836280_spu_func_00000178, 25, "spu_0022_at_00836280");
-    /* FMOD SPU overlay plugin (runtime-imported from guest 0x826400, loaded
-     * at LS base 0x250B0 by FMOD's own loader; lifted from a rebased dump --
-     * see tools/rebase_spu_elf.py). Registered under image 6 (the mixer). */
-    /* DISABLED pending faithful .fixup rebase: executing this lift corrupted
-     * guest heap (Bink IO thread died calling 0x3F800000). Re-enable after
-     * tools/rebase_spu_elf.py decodes the real .fixup format instead of the
-     * address-looking-word heuristic.
-    { extern void fmod_ovl_826400_spu_recomp_register(void);
-      spu_begin_image(6); fmod_ovl_826400_spu_recomp_register(); } */
+    /* (fmod_ovl_826400 now registers EARLY as overlay image 65 -- the old
+     * corrupting lift predates the metadata-only rebase fix, 1c0a965.) */
     /* (fmod_ovl_846280/842180 register EARLY, before the base mixer image --
      * see the comment at the image-6 registration above.) */
     spu_begin_image(0);
