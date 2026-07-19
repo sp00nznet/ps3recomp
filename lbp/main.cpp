@@ -413,13 +413,45 @@ static DWORD WINAPI hang_watchdog(LPVOID)
                        (LPCSTR)&hang_watchdog, &self);
     Sleep(8000);
     dump_threads("8s sample", self);
+    /* LBP_DUMP_EA=<hex>: one-shot guest dump at the 8s mark -- reads the BE
+     * u32 at EA as a pointer and dumps 16 words of the pointee (for chasing
+     * runtime object tables, e.g. the Bink audio thread's quit-object ids). */
+    { const char* e = getenv("LBP_DUMP_EA");
+      if (e && vm_base) {
+          uint32_t ea = (uint32_t)strtoul(e, 0, 16);
+          const uint8_t* p = vm_base + ea;
+          uint32_t ptr = (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3];
+          fprintf(stderr, "[dump-ea] [0x%08X] = 0x%08X; pointee words:", ea, ptr);
+          if (ptr && ptr < 0xF0000000u) {
+              const uint8_t* q = vm_base + ptr;
+              for (int i = 0; i < 16; i++)
+                  fprintf(stderr, " %02X%02X%02X%02X", q[i*4],q[i*4+1],q[i*4+2],q[i*4+3]);
+          }
+          fprintf(stderr, "\n"); fflush(stderr);
+      } }
     Sleep(7000);
     dump_threads("15s sample", self);
     /* LBP_WATCHDOG_PERIOD=<sec>: keep sampling -- late wedges (the FMOD
      * mixer's silent post-DSP loop at ~20s+) happen after both boot samples. */
-    { const char* p = getenv("LBP_WATCHDOG_PERIOD");
-      if (p) { int s = atoi(p); if (s < 1) s = 5;
-        for (;;) { Sleep((DWORD)s * 1000); dump_threads("periodic", self); } } }
+    { const char* p = getenv("LBP_DUMP_EA");
+      const char* wp = getenv("LBP_WATCHDOG_PERIOD");
+      if (p || wp) { int s = wp ? atoi(wp) : 10; if (s < 1) s = 5;
+        for (;;) {
+            Sleep((DWORD)s * 1000);
+            if (wp) dump_threads("periodic", self);
+            if (p && vm_base) {
+                uint32_t ea = (uint32_t)strtoul(p, 0, 16);
+                const uint8_t* b = vm_base + ea;
+                uint32_t ptr = (b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3];
+                fprintf(stderr, "[dump-ea] [0x%08X] = 0x%08X; pointee:", ea, ptr);
+                if (ptr && ptr < 0xF0000000u) {
+                    const uint8_t* q = vm_base + ptr;
+                    for (int i = 0; i < 16; i++)
+                        fprintf(stderr, " %02X%02X%02X%02X", q[i*4],q[i*4+1],q[i*4+2],q[i*4+3]);
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
+        } } }
     return 0;
 }
 
