@@ -354,6 +354,20 @@ static u32 audio_backend_queued_samples(void)
  * Mixing
  * -----------------------------------------------------------------------*/
 
+/* Guest PCM is BIG-ENDIAN float32; the port buffer is a raw vm_base view, so
+ * every sample must be byte-swapped before use. Reading it as a host float
+ * turned the whole mix into denormal noise -- silence after clipping (LBP
+ * had a verified end-to-end pipeline with no audible output). */
+static inline float ld_be_f32(const float* p)
+{
+    u32 v;
+    memcpy(&v, p, 4);
+    v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+    float f;
+    memcpy(&f, &v, 4);
+    return f;
+}
+
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
@@ -394,24 +408,43 @@ static void audio_mix_one_block(void)
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
 
+        /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
+         * vs which block the read cursor is on -- distinguishes "writer never
+         * writes" from "writer and reader cycle out of phase". */
+        { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("AUDIO_PEAK") ? 1 : 0;
+          if (s_pk) { static _Thread_local unsigned _c;
+            if ((++_c % 400) == 0) {
+                char map[36]; u32 b;
+                for (b = 0; b < nblock && b < 32; b++) {
+                    const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+                    int nz = 0;
+                    for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16)
+                        if (bp[s2] != 0.0f) { nz = 1; break; }
+                    map[b] = nz ? '#' : '.';
+                }
+                map[b] = 0;
+                fprintf(stderr, "[audio-ring] port %d ridx=%llu blk=%u ring=[%s]\n",
+                        p, (unsigned long long)port->read_index, block_idx, map);
+            } } }
+
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             float left, right;
             if (nch >= 2) {
-                left  = src[s * nch + 0] * level;
-                right = src[s * nch + 1] * level;
+                left  = ld_be_f32(&src[s * nch + 0]) * level;
+                right = ld_be_f32(&src[s * nch + 1]) * level;
             } else {
                 /* Mono: duplicate to both channels */
-                left = right = src[s] * level;
+                left = right = ld_be_f32(&src[s]) * level;
             }
 
             /* If 7.1, mix center and other channels into stereo */
             if (nch == 8) {
-                float center = src[s * 8 + 2] * level * 0.707f;
-                float lfe    = src[s * 8 + 3] * level * 0.5f;
-                float rl     = src[s * 8 + 4] * level * 0.5f;
-                float rr     = src[s * 8 + 5] * level * 0.5f;
-                float sl     = src[s * 8 + 6] * level * 0.3f;
-                float sr     = src[s * 8 + 7] * level * 0.3f;
+                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
+                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
+                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
+                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
+                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
+                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
                 left  += center + lfe + rl + sl;
                 right += center + lfe + rr + sr;
             }

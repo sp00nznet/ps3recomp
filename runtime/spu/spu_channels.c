@@ -752,6 +752,19 @@ void spu_indirect_branch(spu_context* ctx)
       if (_bt0[img]++ < BT0_PER_IMG)
         fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
                 ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+    /* One-shot: the FMOD null-handler DSP node carries a PPU descriptor EA at
+     * node+0x14 (observed 0x93C3C0). Dump it to identify which plugin/unit
+     * type never got its SPU code streamed (env LBP_DSPDESC=<hex ea>). */
+    { static int _d = -1; static uint32_t _ea = 0;
+      if (_d < 0) { const char* e = getenv("LBP_DSPDESC");
+        _ea = e ? (uint32_t)strtoul(e, 0, 16) : 0; _d = _ea ? 1 : 0; }
+      if (_d == 1) { _d = 2;
+        extern uint8_t* vm_base;
+        fprintf(stderr, "[dspdesc] RAM[0x%08X]:", _ea);
+        for (int k = 0; k < 0x60; k += 4)
+            fprintf(stderr, " %02X%02X%02X%02X", vm_base[_ea+k], vm_base[_ea+k+1],
+                    vm_base[_ea+k+2], vm_base[_ea+k+3]);
+        fprintf(stderr, "\n"); fflush(stderr); } }
     /* SPU_MISS_DUMP_IMG=<n>: reserve the deep-dump budget for image n's misses
      * (the global 2-shot budget was always consumed by an earlier image's
      * misses, hiding the one under investigation). Unset = old behavior. */
