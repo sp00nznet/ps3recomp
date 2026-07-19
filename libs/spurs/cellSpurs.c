@@ -1292,10 +1292,22 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 
             /* Live workload arg from the real wklInfo (the game may update it). */
             u64 arg = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
-            *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 1;
-            spu_run_policy_module(r->fn, r->image_id,
-                                  (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm,
-                                  s_workloads[wid].sizePm, arg, wid, ea);
+            /* Dispatch once per VIRTUAL SPU up to the workload's maxContention:
+             * the WWS job manager keys its per-SPU ticket lane off the kernel
+             * context's spuNum, and its command lists carry cross-lane BARRIER
+             * commands -- with only spu 0 ever dispatched, lane 1 (pre-armed by
+             * the PPU for a 2-SPU workload) never advanced and every barrier
+             * deadlocked: LBP's post-intro loading froze with 8 ready jobs and
+             * the lanes stuck at {1,0,...} against ticket 10+. Sequential
+             * per-lane rounds converge where parallel SPUs would. */
+            u8 maxcont = *(vm_base + ea + SPURS_WKL_MAXCONT + wid);
+            if (maxcont < 1) maxcont = 1;
+            if (maxcont > 6) maxcont = 6;
+            *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
+            for (u32 sn = 0; sn < maxcont; sn++)
+                spu_run_policy_module(r->fn, r->image_id,
+                                      (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm,
+                                      s_workloads[wid].sizePm, arg, wid, ea, sn);
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
             /* "Found work" heuristic: a module that did something polls the
              * kernel for MORE work before exiting (selectWorkload calls >0);

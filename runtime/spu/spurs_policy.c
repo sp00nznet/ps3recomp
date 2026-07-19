@@ -37,7 +37,8 @@ volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
-                          uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea)
+                          uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
+                          uint32_t spu_num)
 {
     if (!entry || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
         return -1;
@@ -81,7 +82,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * 1, which only reads sensibly at the correct offset. */
     KBE32(0x1C0, 0);                    /* spurs EA hi32 (u64 ptr)  */
     KBE32(0x1C4, spurs_ea);             /* spurs EA lo32            */
-    KBE32(0x1C8, 0);                    /* spuNum                   */
+    KBE32(0x1C8, spu_num);              /* spuNum (virtual SPU / lane row) */
     KBE32(0x1CC, 8);                    /* dmaTagId (kernel's tag)  */
     KBE32(0x1D0, 0);                    /* wklCurrentAddr hi32 (u64 ptr) */
     KBE32(0x1D4, 0xA00);                /* wklCurrentAddr lo32 = PM load base */
@@ -95,8 +96,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;  /* return-to-kernel link */
     ctx->gpr[1]._u32[0] = 0x3FFB0;                     /* stack (PM reloads its own) */
     ctx->gpr[3]._u32[0] = 0x100;                       /* context */
-    ctx->gpr[4]._u32[0] = (uint32_t)(wkl_data >> 32);  /* ea (u64, preferred dword) */
-    ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;
+    /* r4 layout is LO-WORD-IN-PREFERRED, not a big-endian u64: verified
+     * against the authentic wwsjob PM bytes (entry 0x2BF0 `stqa r4,0x14E0`,
+     * attach 0x2720 `brz r4`/`wrch MFC_EAL, r4` -- it treats r4's PREFERRED
+     * WORD as the 32-bit queue EA, and `shlqbyi r4,4`'s next word as the aux
+     * half). Passing {hi,lo} put 0 in the preferred slot, so the queue attach
+     * early-returned on every run: tickets got claimed via the shifted copy
+     * but the job-list header never DMA'd in, and the PM wedged forever in
+     * its staged-job wait (LBP's post-intro loading freeze). */
+    ctx->gpr[4]._u32[0] = (uint32_t)wkl_data;          /* lo32: the queue EA  */
+    ctx->gpr[4]._u32[1] = (uint32_t)(wkl_data >> 32);  /* hi32: aux           */
     ctx->gpr[5]._u32[0] = 0;                           /* poll status */
 
     g_spurs_pm_polls  = 0;
