@@ -890,18 +890,18 @@ s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
 
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId)
 {
-    (void)taskset;
+    /* Capture the guest taskset EA before host translation -- the WAIT_SIGNAL
+     * waiter (spu_taskset_wait_signal) keys on the guest EA + taskId. */
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
 
-    printf("[cellSpurs] SendSignal(id=%u)\n", taskId);
+    printf("[cellSpurs] SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
 
-    for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
-        if (s_tasks[i].in_use && s_tasks[i].id == taskId) {
-            /* In a real implementation, signal the task's wait condition */
-            return CELL_OK;
-        }
-    }
-
-    return CELL_SPURS_TASK_ERROR_SRCH;
+    /* Deliver the signal for real: set the task's bit in the guest taskset's
+     * SIGNALLED bitset and wake its blocked host thread. (Was a documented
+     * no-op from the pre-SPU-execution era -- a dropped signal deadlocked any
+     * task parked in WAIT_SIGNAL waiting for it.) */
+    if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
+    return CELL_OK;
 }
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr)
@@ -1609,9 +1609,10 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
 /* _cellSpursSendSignal — internal signal delivery */
 s32 _cellSpursSendSignal(void* taskset, u32 taskId)
 {
-    (void)taskset;
-    printf("[cellSpurs] _SendSignal(taskId=%u)\n", taskId);
-    /* In recomp without SPU execution, signals are no-ops */
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+    printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    /* Real delivery now that SPU tasks execute (comment was stale). */
+    if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
     return CELL_OK;
 }
 
