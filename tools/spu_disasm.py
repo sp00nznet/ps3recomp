@@ -158,6 +158,9 @@ RI10_TABLE: dict[int, str] = {
     0b01011110: "clgtbi", # compare logical greater than byte immediate
     0b01110100: "mpyi",   # multiply immediate
     0b01110101: "mpyui",  # multiply unsigned immediate
+    0b01111111: "heqi",   # halt if equal word immediate      (assert-style trap)
+    0b01001111: "hgti",   # halt if greater than word immediate
+    0b01011111: "hlgti",  # halt if logically greater than word immediate
     # NOTE: the rotate/shift IMMEDIATE forms (roti/rotmi/rotmai/shli/rothi/
     # rothmi/rotmahi/shlhi) are RI7 (op11 0x78-0x7f), NOT RI10 — they are
     # handled in the ri7_table inside spu_decode(). The old spurious RI10

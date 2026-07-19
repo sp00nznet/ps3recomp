@@ -537,10 +537,29 @@ class SPULifter:
         if mn == "bgx":
             return f"{g(rt())} = spu_bgx({g(ra())}, {g(rb())}, {g(rt())});"
 
-        # Halt-on-condition + stopd: pure stop semantics in recompiled code;
-        # we just continue execution (no host halt path for these yet).
+        # Halt-on-condition: compiler/middleware assert traps (e.g. FMOD's
+        # heqi rX,0 null-pointer guards). On real HW a taken halt stops the
+        # SPU at the faulty data; emitting a no-op here let bad data sail
+        # into silent million-iteration wedges. Honor the halt with a log.
         if mn in ("hgti", "hlgti", "heqi", "hgt", "hlgt", "heq"):
-            return f"/* {mn}: halt-on-condition (no-op in recomp) */;"
+            pw = lambda i: f"{g(i)}._u32[0]"
+            if mn == "heqi":
+                cond = f"(int32_t){pw(ra())} == (int32_t)({_imm(ops[2])})"
+            elif mn == "hgti":
+                cond = f"(int32_t){pw(ra())} > (int32_t)({_imm(ops[2])})"
+            elif mn == "hlgti":
+                cond = f"{pw(ra())} > (uint32_t)({_imm(ops[2])})"
+            elif mn == "heq":
+                cond = f"{pw(ra())} == {pw(rb())}"
+            elif mn == "hgt":
+                cond = f"(int32_t){pw(ra())} > (int32_t){pw(rb())}"
+            else:  # hlgt
+                cond = f"{pw(ra())} > {pw(rb())}"
+            return (f"if ({cond}) {{ extern void spu_halt(spu_context*); "
+                    f"fprintf(stderr, \"[spu] HALT-ASSERT {mn} pc=0x{addr:05X} "
+                    f"img=%d\\n\", ctx->image_id); "
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
+                    f"spu_halt(ctx); return; }}")
         if mn == "stopd":
             return ("ctx->stop_code = 0u; "
                     "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
