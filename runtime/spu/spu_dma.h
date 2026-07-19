@@ -204,6 +204,18 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           if ((cmd & 0x40) && (uint32_t)ea != 0 && lsa == 0x25200 && size == 336)
               last_node_ea = (uint32_t)ea;
         } } }
+    /* cellAudio port-ring window: log every guest write into it (rare, load-
+     * bearing -- the audio OUTPUT path). Same env gate as the sampler. */
+    { static int s_pr = -1; if (s_pr < 0) s_pr = getenv("LBP_MFC_TRACE") ? 1 : 0;
+      if (s_pr && (cmd & 0x20) && !(cmd & 0x40) &&
+          (((uint32_t)ea >= 0x01000000u && (uint32_t)ea < 0x01800000u) ||
+           ((uint32_t)ea >= 0x00927D00u && (uint32_t)ea < 0x00928000u))) {
+          static int _n = 0;
+          if (_n++ < 48)
+              fprintf(stderr, "[ring-PUT] img=%d pc=0x%05X ea=0x%08X size=%u lsa=0x%05X\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                      (uint32_t)ea, size, lsa);
+      } }
     /* Validate size */
     if (size == 0 || size > MFC_MAX_DMA_SIZE)
         return -1;

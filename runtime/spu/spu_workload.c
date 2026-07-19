@@ -741,9 +741,16 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return 0;
-    { static int _n = 0; if (_n++ < 60 || (_n % 500) == 0)
-        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X\n",
-                _n, taskId, taskset_ea); }
+    /* ran= is the wall time this task spent OUT of the wait (decode/mix work
+     * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
+     * task runs on its own host thread. */
+    static _Thread_local unsigned long long s_wait_exit_ms;
+    { extern unsigned long long ps3_ms_now(void);
+      unsigned long long _now = ps3_ms_now();
+      static int _n = 0; if (_n++ < 200 || (_n % 500) == 0)
+        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
+                _n, taskId, taskset_ea,
+                s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
     /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
      * POLICY MODULE advances the per-SPU progress lanes (sync+0x40+16*row:
      * ticket u16 @+0, consumer lanes @+2..) as tasks are processed; our HLE
@@ -819,6 +826,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     spu_serial_acquire();       /* resume: re-take the serial lock */
+    { extern unsigned long long ps3_ms_now(void);
+      s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
     return 0;
 }
 

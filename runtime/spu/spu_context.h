@@ -298,6 +298,20 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  * does explicitly. Doing the swap here (rather than in every channel
  * extractor) keeps the per-word `_u32[i]` semantics that the lifter
  * helpers in `spu_helpers.h` were written against. */
+/* The 128-bit LS accessors are THE hot primitive of lifted SPU execution
+ * (every load/store in a Bink movie frame's ~millions of lifted instructions
+ * runs through here). On x86 the whole BE<->LE quadword swizzle is one
+ * SSSE3 byte-shuffle instead of 16 scalar byte ops -- measured against the
+ * scalar path with the same per-lane _u32 semantics. */
+#if defined(_MSC_VER)
+#include <stdlib.h>
+#define SPU_BSWAP32(x) _byteswap_ulong(x)
+#define SPU_LS_FAST 1
+#elif defined(__GNUC__) || defined(__clang__)
+#define SPU_BSWAP32(x) __builtin_bswap32(x)
+#define SPU_LS_FAST 1
+#endif
+
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
@@ -305,12 +319,20 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     const uint8_t* p = &ctx->ls[lsa];
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+#if SPU_LS_FAST
+    uint32_t w0, w1, w2, w3;
+    memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
+    memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
+    v._u32[0] = SPU_BSWAP32(w0); v._u32[1] = SPU_BSWAP32(w1);
+    v._u32[2] = SPU_BSWAP32(w2); v._u32[3] = SPU_BSWAP32(w3);
+#else
     for (int i = 0; i < 4; i++) {
         v._u32[i] = ((uint32_t)p[i*4]     << 24) |
                     ((uint32_t)p[i*4 + 1] << 16) |
                     ((uint32_t)p[i*4 + 2] <<  8) |
                     (uint32_t)p[i*4 + 3];
     }
+#endif
     return v;
 }
 
@@ -318,6 +340,12 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
+#if SPU_LS_FAST
+    uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+    memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
+    memcpy(p + 8,  &w2, 4); memcpy(p + 12, &w3, 4);
+#else
     for (int i = 0; i < 4; i++) {
         uint32_t w = val._u32[i];
         p[i*4]     = (uint8_t)(w >> 24);
@@ -325,6 +353,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 2] = (uint8_t)(w >>  8);
         p[i*4 + 3] = (uint8_t)w;
     }
+#endif
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
 }

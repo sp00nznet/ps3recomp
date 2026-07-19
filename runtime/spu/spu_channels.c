@@ -247,12 +247,24 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
      * line (e.g. a SPURS event flag) -- who tries to set it, from where. */
     { static int s_ae = -1; static uint32_t s_aea;
       if (s_ae < 0) { const char* e = getenv("SPU_ATOM_EA");
-        s_aea = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_ae = s_aea ? 1 : 0; }
+        s_aea = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_ae = s_aea ? 1 : 0;
+        if (s_ae == 1) { extern uint32_t g_barrier_sync_watch;
+            g_barrier_sync_watch = s_aea; } /* arm PUTLLC OK/FAIL verdict log */ }
       if (s_ae == 1 && ((uint32_t)ea & ~127u) == s_aea) {
           static int _n = 0;
-          if (_n++ < 48)
-              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X ea=0x%08X\n",
-                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK, (uint32_t)ea);
+          if (_n++ < 48) {
+              extern uint8_t* vm_base;
+              const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
+              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X ea=0x%08X "
+                      "RAM=%02X%02X%02X%02X %02X%02X%02X%02X",
+                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK, (uint32_t)ea,
+                      r[0],r[1],r[2],r[3], r[4],r[5],r[6],r[7]);
+              if (cmd == MFC_PUTLLC_CMD) {
+                  fprintf(stderr, " STORE=%02X%02X%02X%02X %02X%02X%02X%02X",
+                          ls[0],ls[1],ls[2],ls[3], ls[4],ls[5],ls[6],ls[7]);
+              }
+              fprintf(stderr, "\n"); fflush(stderr);
+          }
       } }
     /* Bink sync-line atomic trace (armed by the PPU-side producer probe). */
     { extern uint32_t g_barrier_sync_watch;
@@ -577,9 +589,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 ctx->resident_ovl = o->image_id;
                 { static int _n = 0; if (_n++ < 32)
                     fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
-                            "size=%u -> resident ovl image %d%s\n",
-                            ctx->image_id, ea, size, ctx->resident_ovl,
-                            o->has_sig ? " (sig match)" : ""); }
+                            "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
+                            ctx->image_id, ea, (uint32_t)(ls - ctx->ls), size,
+                            ctx->resident_ovl, o->has_sig ? " (sig match)" : ""); }
             }
             return;
         }

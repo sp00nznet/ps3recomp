@@ -1490,10 +1490,10 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
             if (++waits % 500 == 0) {
                 static int _n = 0;
                 if (_n < 24) { _n++;
-                    fprintf(stderr, "[cellSpurs] EventFlagWait BLOCKED %us on pattern 0x%04X "
+                    fprintf(stderr, "[cellSpurs] EventFlagWait BLOCKED tid=%lu %us on pattern 0x%04X "
                                     "(mode=%s, bits=0x%04X) flagEA=0x%08X -- waiting for an SPU "
                                     "workload to cellSpursEventFlagSet it\n",
-                            waits / 500, pattern,
+                            (unsigned long)GetCurrentThreadId(), waits / 500, pattern,
                             mode == CELL_SPURS_EVENT_FLAG_AND ? "AND" : "OR",
                             current, ea);
                     fflush(stderr);
@@ -1511,6 +1511,10 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     vm_write16(bits_ea, current);
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
+    { static int _n = 0; if (_n++ < 40)
+        fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
+                "pattern=0x%04X got=0x%04X (waits=%u)\n",
+                (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
         vm_write16(ea + EF_EVENTS, (u16)(current & ~received));
 
