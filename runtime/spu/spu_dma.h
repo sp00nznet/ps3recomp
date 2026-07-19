@@ -310,9 +310,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
         /* Swappable-overlay tracking: a GET from a registered overlay source
-         * marks that overlay's lifted functions resident for this context. */
-        { extern void spu_overlay_note_get(spu_context*, uint32_t);
-          spu_overlay_note_get(spu, (uint32_t)ea); }
+         * (by EA or by content signature) marks that overlay's lifted
+         * functions resident for this context. */
+        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+          spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
         /* LBP_SPU_WATCH: a DMA GET landing on a watched LS line is how the PPU
          * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
         { int _n; unsigned* _w = spu_ls_watch_list(&_n);

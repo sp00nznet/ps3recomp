@@ -523,7 +523,7 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
  * the image id its lifted functions were registered under. The MFC GET path
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
-typedef struct { uint32_t src_ea; int image_id; } spu_ovl_src;
+typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; } spu_ovl_src;
 #define SPU_OVL_SRC_MAX 16
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
@@ -533,24 +533,46 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
+        s_ovl_src[s_ovl_src_count].has_sig = 0;
         s_ovl_src_count++;
     }
 }
 
-/* Called from the MFC GET path with every transfer's source EA. */
-void spu_overlay_note_get(spu_context* ctx, uint32_t ea)
+/* Content-signature variant: FMOD COPIES codec overlays to the heap before
+ * streaming them into the swap slot, so the source EA is unknowable ahead of
+ * time -- match the first 16 bytes of the streamed content instead. */
+void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
 {
-    for (int i = 0; i < s_ovl_src_count; i++)
-        if (s_ovl_src[i].src_ea == ea) {
-            if (ctx->resident_ovl != s_ovl_src[i].image_id) {
-                ctx->resident_ovl = s_ovl_src[i].image_id;
+    if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
+        s_ovl_src[s_ovl_src_count].src_ea = 0;
+        s_ovl_src[s_ovl_src_count].image_id = image_id;
+        memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
+        s_ovl_src[s_ovl_src_count].has_sig = 1;
+        s_ovl_src_count++;
+    }
+}
+
+/* Called from the MFC GET path after the copy: ls points at the JUST-COPIED
+ * bytes. EA match first (exact, cheap), then content signature for sizeable
+ * chunks (overlay bodies are >= 0x500 bytes). */
+void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
+{
+    for (int i = 0; i < s_ovl_src_count; i++) {
+        const spu_ovl_src* o = &s_ovl_src[i];
+        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+                             : (o->src_ea == ea);
+        if (hit) {
+            if (ctx->resident_ovl != o->image_id) {
+                ctx->resident_ovl = o->image_id;
                 { static int _n = 0; if (_n++ < 32)
                     fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
-                            "-> resident ovl image %d\n",
-                            ctx->image_id, ea, ctx->resident_ovl); }
+                            "size=%u -> resident ovl image %d%s\n",
+                            ctx->image_id, ea, size, ctx->resident_ovl,
+                            o->has_sig ? " (sig match)" : ""); }
             }
             return;
         }
+    }
 }
 
 /* HLE of the taskset Policy Module's task-syscall entry (LS 0xA70). A SPURS task
