@@ -53,6 +53,26 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
     if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
 #ifdef _WIN32
     if (!vm_base) return 0;
+    /* Committed-page bitmap as a self-healing CACHE of VirtualQuery. The
+     * demand-commit fault handler seeds it, but regions the host commits
+     * directly (the D3D12 backend's VRAM window never faults) start unseeded
+     * -- treating the bitmap as authoritative rejected every Bink decode DMA
+     * (green movie). On a miss, fall back to ONE VirtualQuery and remember
+     * the answer: first touch per 64K page pays the syscall, steady state is
+     * two bit tests. (The all-syscall version was 94 CPU-s per 50 s run.) */
+    { extern uint8_t g_vm_page_bitmap[65536 / 8];
+      uint32_t last = e + size - 1;
+      uint32_t pg[2] = { e >> 16, last >> 16 };
+      for (int i = 0; i < (pg[0] == pg[1] ? 1 : 2); i++) {
+          if ((g_vm_page_bitmap[pg[i] >> 3] >> (pg[i] & 7)) & 1) continue;
+          MEMORY_BASIC_INFORMATION mbi;
+          uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
+          if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
+          if (mbi.State != MEM_COMMIT) return 0;
+          if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+          g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
+      }
+    }
 #endif
     return 1;
 }

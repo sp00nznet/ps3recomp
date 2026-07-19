@@ -458,6 +458,13 @@ static DWORD WINAPI unstick_thread(LPVOID)
  * space rather than using it. */
 static volatile long g_vm_commits = 0;
 
+/* Committed-page bitmap: one bit per 64 KB page across the 4 GB guest space
+ * (8 KB total), set on every demand-commit below. The MFC DMA guard
+ * (mfc_ea_range_committed) tests these bits instead of calling VirtualQuery
+ * per transfer -- the syscall version measured 94 CPU-s in a 50 s run. */
+extern "C" uint8_t g_vm_page_bitmap[65536 / 8];
+uint8_t g_vm_page_bitmap[65536 / 8];
+
 static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -466,6 +473,8 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
         if (vm_base && fault >= base && fault < base + VM_SIZE) {
             void* page = (void*)(fault & ~(uintptr_t)0xFFFF);
             if (VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE)) {
+                { uint32_t g = (uint32_t)(fault - base);
+                  g_vm_page_bitmap[g >> 19] |= (uint8_t)(1u << ((g >> 16) & 7)); }
                 static int s_tr = -1;
                 if (s_tr < 0) s_tr = getenv("VM_TRACE") ? 1 : 0;
                 if (s_tr) {
