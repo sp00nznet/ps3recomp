@@ -1303,6 +1303,21 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             u8 maxcont = *(vm_base + ea + SPURS_WKL_MAXCONT + wid);
             if (maxcont < 1) maxcont = 1;
             if (maxcont > 6) maxcont = 6;
+            /* Dispatch at least 4 virtual SPUs: the WWS work-queue consume
+             * protocol needs every potential consumer lane to either play or
+             * PARK (write its 0x1FFFFFFF marker) -- with only maxContention
+             * lanes dispatched, the un-parked lanes blocked the ticket
+             * barrier and LBP's level-loading queue never drained (measured:
+             * 2 lanes = frozen at ticket 10/20; 4 lanes = drained, lane0
+             * catches up to the published ticket). */
+            if (maxcont < 4) maxcont = 4;
+            /* SPURS_FORCE_SPUS=<n>: dispatch every workload for n virtual SPUs
+             * regardless of maxContention (A/B: LBP publishes its loading
+             * tickets on sync row 3, and the PM's row index = spuNum). */
+            { static int s_fs = -2;
+              if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS");
+                s_fs = e ? atoi(e) : -1; }
+              if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
             for (u32 sn = 0; sn < maxcont; sn++)
                 spu_run_policy_module(r->fn, r->image_id,
