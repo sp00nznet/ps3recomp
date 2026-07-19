@@ -57,7 +57,11 @@ void spu_indirect_branch_mt(spu_context* ctx)
                   || pc == TASKSET_PM_SYSCALL_ADDR
                   || ctx->image_id == 23;
     if (!special) {
-        spu_dispatch_fn fn = spu_lookup(pc, ctx->image_id);
+        /* Resident overlay first (mirrors the full resolver): streamed plugin
+         * code owns its LS range; base-image entries at the same address are
+         * stale bytes and must lose. */
+        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
+        if (!fn) fn = spu_lookup(pc, ctx->image_id);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);

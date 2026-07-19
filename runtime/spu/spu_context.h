@@ -229,6 +229,14 @@ typedef struct spu_context {
      * only when this is set. */
     int policy_mode;
 
+    /* Resident code-overlay image id (0 = none). FMOD's mixer swaps per-DSP
+     * plugin code in and out of ONE LS scratch region (e.g. the Compressor
+     * streams over the Fader plugin's slot), so one static per-image function
+     * registry cannot hold both: their lifted addresses overlap. The MFC GET
+     * path recognizes a registered overlay's source EA and records which
+     * overlay is now resident; dispatch retries a missed lookup against it. */
+    int resident_ovl;
+
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

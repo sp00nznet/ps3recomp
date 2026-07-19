@@ -157,6 +157,53 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* LBP_MFC_TRACE: attribute silent DMA-poll loops (a wedged task whose
+     * host thread samples "in ntdll" because VirtualQuery dominates). Prints
+     * every 64k-th transfer per thread: enough to see the loop's pc/ea. */
+    { static int s_t = -1; if (s_t < 0) { const char* e = getenv("LBP_MFC_TRACE");
+        s_t = e ? atoi(e) : 0; if (e && !s_t) s_t = 1; }
+      if (s_t) { static _Thread_local unsigned long long _n; ++_n;
+        /* level 2+: also print each thread's first 192 transfers (setup DMAs
+         * -- shows WHERE round configs/headers are fetched from). */
+        if ((s_t >= 2 && _n <= 192) || (_n & 0xFFFFu) == 0)
+            fprintf(stderr, "[mfc-trace] img=%d pc=0x%05X cmd=0x%X lsa=0x%05X "
+                    "ea=0x%08X size=%u (#%llu this thread)\n",
+                    spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa,
+                    (uint32_t)ea, size, _n);
+        /* Forensic one-shot: on the FIRST GET from EA 0 (the FMOD node-walk
+         * wedge), dump the previously staged node still in LS at this lsa
+         * (its link field produced the null) and the same node's bytes in
+         * guest RAM, so "stale LS staging" vs "PPU wrote a null link" is
+         * decidable from one run. last-good EA tracked per (thread, GET). */
+        { static _Thread_local uint32_t last_node_ea; static _Thread_local int dumped;
+          if ((cmd & 0x40) && (uint32_t)ea == 0 && size >= 160 && !dumped) {
+              dumped = 1;
+              extern uint8_t* vm_base;
+              fprintf(stderr, "[mfc-null] img=%d pc=0x%05X first null-EA GET "
+                      "(lsa=0x%05X size=%u); last node GET ea=0x%08X -- dumping "
+                      "staged node LS[0x25200] vs guest RAM copy\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, lsa, size,
+                      last_node_ea);
+              for (int r = 0; r < 336; r += 16) {
+                  fprintf(stderr, "[mfc-null]  LS[0x25200+%03X]:", r);
+                  for (int k = 0; k < 16; k += 4)
+                      fprintf(stderr, " %02X%02X%02X%02X", spu->ls[(0x25200+r+k)&SPU_LS_MASK],
+                              spu->ls[(0x25200+r+k+1)&SPU_LS_MASK], spu->ls[(0x25200+r+k+2)&SPU_LS_MASK],
+                              spu->ls[(0x25200+r+k+3)&SPU_LS_MASK]);
+                  if (vm_base && last_node_ea) {
+                      fprintf(stderr, "  | RAM[0x%08X+%03X]:", last_node_ea, r);
+                      for (int k = 0; k < 16; k += 4)
+                          fprintf(stderr, " %02X%02X%02X%02X", vm_base[last_node_ea+r+k],
+                                  vm_base[last_node_ea+r+k+1], vm_base[last_node_ea+r+k+2],
+                                  vm_base[last_node_ea+r+k+3]);
+                  }
+                  fprintf(stderr, "\n");
+              }
+              fflush(stderr);
+          }
+          if ((cmd & 0x40) && (uint32_t)ea != 0 && lsa == 0x25200 && size == 336)
+              last_node_ea = (uint32_t)ea;
+        } } }
     /* Validate size */
     if (size == 0 || size > MFC_MAX_DMA_SIZE)
         return -1;
@@ -232,8 +279,40 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         }
     }
     if (mfc_is_get(cmd)) {
+        /* LBP overlay-load diagnosis: a GET of the FMOD overlay descriptor
+         * (32B from ~0x94Fxxx) then a large GET from a NULL source = the
+         * overlay never loads. Dump the descriptor content to see where the
+         * real source EA was dropped. */
+        { static int s_ovl = -1; if (s_ovl < 0) s_ovl = getenv("LBP_OVL_DIAG") ? 1 : 0;
+          if (s_ovl) {
+              /* overlay-load map: image-6 GET of a code-sized chunk into the
+               * high LS overlay region, with its (now-correct) plugin source.
+               * plugin EA = source - 0x100 (ELF header offset). */
+              if (spu->image_id == 6 && size > 256 &&
+                  lsa >= 0x20000 && lsa < 0x3A000 && (uint32_t)ea >= 0x800000) {
+                  static int _n=0; if(_n++<40)
+                      fprintf(stderr, "[ovl-load] plugin~0x%08X -> LS 0x%05X size=%u pc=0x%05X%s",
+                              (uint32_t)ea - 0x100, lsa, size, (uint32_t)spu->pc, "\n");
+              }
+              if (size == 32 && (uint32_t)ea >= 0x94F000 && (uint32_t)ea < 0x950000) {
+                  static int _n=0; if(_n++<12) {
+                      const uint8_t* d = ea_ptr;
+                      fprintf(stderr, "[ovl-desc] ea=0x%08X:", (uint32_t)ea);
+                      for (int i=0;i<32;i+=4) fprintf(stderr," %02X%02X%02X%02X",d[i],d[i+1],d[i+2],d[i+3]);
+                      fprintf(stderr, "%s", "\n"); }
+              }
+              if ((uint32_t)ea < 0x1000 && size > 256) {
+                  static int _n=0; if(_n++<12)
+                      fprintf(stderr, "[ovl-NULL] GET lsa=0x%05X ea=0x%08X size=%u pc=0x%05X img=%d%s",
+                              lsa, (uint32_t)ea, size, (uint32_t)spu->pc, spu->image_id, "\n");
+              }
+          } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        /* Swappable-overlay tracking: a GET from a registered overlay source
+         * marks that overlay's lifted functions resident for this context. */
+        { extern void spu_overlay_note_get(spu_context*, uint32_t);
+          spu_overlay_note_get(spu, (uint32_t)ea); }
         /* LBP_SPU_WATCH: a DMA GET landing on a watched LS line is how the PPU
          * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
         { int _n; unsigned* _w = spu_ls_watch_list(&_n);

@@ -518,6 +518,41 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
     return NULL;
 }
 
+/* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
+ * A title registers each runtime-streamed overlay's SOURCE content EA with
+ * the image id its lifted functions were registered under. The MFC GET path
+ * marks that overlay resident in the streaming context; dispatch retries a
+ * primary-image miss against the resident overlay's registry. */
+typedef struct { uint32_t src_ea; int image_id; } spu_ovl_src;
+#define SPU_OVL_SRC_MAX 16
+static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
+static int s_ovl_src_count = 0;
+
+void spu_overlay_register_source(uint32_t content_ea, int image_id)
+{
+    if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
+        s_ovl_src[s_ovl_src_count].src_ea = content_ea;
+        s_ovl_src[s_ovl_src_count].image_id = image_id;
+        s_ovl_src_count++;
+    }
+}
+
+/* Called from the MFC GET path with every transfer's source EA. */
+void spu_overlay_note_get(spu_context* ctx, uint32_t ea)
+{
+    for (int i = 0; i < s_ovl_src_count; i++)
+        if (s_ovl_src[i].src_ea == ea) {
+            if (ctx->resident_ovl != s_ovl_src[i].image_id) {
+                ctx->resident_ovl = s_ovl_src[i].image_id;
+                { static int _n = 0; if (_n++ < 32)
+                    fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
+                            "-> resident ovl image %d\n",
+                            ctx->image_id, ea, ctx->resident_ovl); }
+            }
+            return;
+        }
+}
+
 /* HLE of the taskset Policy Module's task-syscall entry (LS 0xA70). A SPURS task
  * (e.g. the cri_mpv task, image 22) reads syscallAddr from its SpursTasksetContext
  * (LS 0x27C4) and branches to it to perform a task syscall (EXIT/YIELD/WAIT/POLL).
@@ -688,7 +723,11 @@ void spu_indirect_branch(spu_context* ctx)
             fflush(stderr);
         } }
     }
-    spu_fn fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* Resident overlay FIRST: streamed code overwrote that LS range, so its
+     * lift is the truth there -- the base image's stale bytes at the same
+     * addresses may also be registered (historical junk lifts) and must lose. */
+    spu_fn fn = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
+    if (!fn) fn = spu_lookup(ctx->pc, ctx->image_id);
     if (fn) {
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host
@@ -716,10 +755,12 @@ void spu_indirect_branch(spu_context* ctx)
     /* SPU_MISS_DUMP_IMG=<n>: reserve the deep-dump budget for image n's misses
      * (the global 2-shot budget was always consumed by an earlier image's
      * misses, hiding the one under investigation). Unset = old behavior. */
-    { static int s_img = -2;
-      if (s_img == -2) { const char* e = getenv("SPU_MISS_DUMP_IMG"); s_img = e ? atoi(e) : -1; }
+    { static int s_img = -2; static uint32_t s_pcmin = 0;
+      if (s_img == -2) { const char* e = getenv("SPU_MISS_DUMP_IMG"); s_img = e ? atoi(e) : -1;
+        const char* p = getenv("SPU_MISS_DUMP_PCMIN"); s_pcmin = p ? (uint32_t)strtoul(p,0,0) : 0; }
       static int _n=0;
-      if ((s_img < 0 || ctx->image_id == s_img) && _n++ < 2) {
+      uint32_t misspc = ctx->pc & SPU_LS_MASK;
+      if ((s_img < 0 || ctx->image_id == s_img) && misspc >= s_pcmin && _n++ < 2) {
         fprintf(stderr, "[SPU] branch-to-0 lr=0x%05X r1=0x%05X\n",
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK);
 #ifdef _WIN32
