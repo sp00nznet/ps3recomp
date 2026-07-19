@@ -682,17 +682,44 @@ static void gcm_ref_publish_one(void)
  * >= 1 ms to any equality-waiter (no skip-past). Decoupled from present, so a
  * wait makes progress even when the ticker is starved. Idempotent + additive:
  * it only ever publishes fences the ticker would eventually publish anyway. */
+/* Serializes the FIFO walker between the 60 Hz present thread and the
+ * poll-path below. TryAcquire on the poll path avoids re-entrancy (the walker
+ * itself performs guest reads) and never blocks a spinning game thread. */
+static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
+static void gcm_rsx_process_fifo_unlocked(void);
+
+/* Kick event: a game thread whose fence wait finds the queue DRY signals the
+ * present thread to run the FIFO walker NOW instead of on its next 16 ms
+ * tick. A movie frame issues ~46 one-ahead cellGcmFinish waits; paying a
+ * 16 ms tick per fence was ~0.75 s/frame (the 2 FPS intro). The walker (and
+ * the D3D12 backend it feeds) stays on the present thread -- running it from
+ * the polling game thread killed the process silently. */
+static HANDLE s_gcm_kick_ev = NULL;
+void* cellGcm_fifo_kick_event(void)
+{
+    if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    return (void*)s_gcm_kick_ev;
+}
+
 void cellGcm_ref_on_poll(void)
 {
-    extern unsigned long long ps3_ms_now(void);
-    static volatile unsigned long long s_last_ms = 0;
-    unsigned long long now = ps3_ms_now();
-    if (now == s_last_ms) return;      /* <= 1 publish/ms keeps each value observable */
-    s_last_ms = now;
+    /* Advance one queued fence per guest POLL-READ (no wall-clock cap). The
+     * old <=1-per-ms pacing throttled a movie frame with hundreds of fences
+     * to hundreds of ms. LBP's waits compare with >, not ==, so fast
+     * advancement is not a hang risk. */
     gcm_ref_publish_one();
+    if (s_ref_qhead == s_ref_qtail && s_gcm_kick_ev)
+        SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
 }
 
 void cellGcm_rsx_process_fifo(void)
+{
+    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    gcm_rsx_process_fifo_unlocked();
+    ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+}
+
+static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);

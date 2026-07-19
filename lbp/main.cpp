@@ -181,6 +181,7 @@ extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+extern "C" void* cellGcm_fifo_kick_event(void);   /* cellGcmSys.c: dry-queue kick */
 extern "C" unsigned long long ps3_ms_now(void);   /* runtime: monotonic ms clock  */
 
 #pragma comment(lib, "winmm")
@@ -256,11 +257,22 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * deadline loop then holds a true 60 Hz without drift. */
     timeBeginPeriod(1);
     ULONGLONG next_ms = GetTickCount64();
+    /* Fence-kick event: a game thread whose cellGcmFinish wait finds the
+     * fence queue dry signals this thread to drain the FIFO immediately
+     * instead of on the next 16 ms tick. Presents stay on the 60 Hz cadence;
+     * only the drain runs early. Without this a movie frame's ~46 one-ahead
+     * finish waits paid a full tick each (~0.75 s per movie frame). */
+    HANDLE kick_ev = (HANDLE)cellGcm_fifo_kick_event();
     for (;;) {
         next_ms += 16;        /* 60 Hz cadence against an absolute deadline */
-        {   ULONGLONG now = GetTickCount64();
-            if (next_ms > now) Sleep((DWORD)(next_ms - now));
-            else               next_ms = now;   /* overran: reset the deadline */
+        for (;;) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= next_ms) { next_ms = now > next_ms + 16 ? now : next_ms; break; }
+            DWORD w = WaitForSingleObject(kick_ev, (DWORD)(next_ms - now));
+            if (w == WAIT_OBJECT_0 && rsx_ok)
+                cellGcm_rsx_process_fifo();   /* early drain: retire fences now */
+            else if (w != WAIT_OBJECT_0)
+                break;                        /* deadline reached */
         }
         cellGcmTickVBlank();
         cellGcmTickFlip();
