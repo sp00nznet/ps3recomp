@@ -267,10 +267,17 @@ typedef struct {
  * default keeps per-dispatch fresh LS. */
 typedef struct {
     uint32_t taskset_ea;   /* 0 = free slot */
+    uint32_t taskid;       /* slot key is (taskset, task): on real SPURS each
+                            * task has a PRIVATE LS context (the kernel saves/
+                            * restores per task); one shared slot per TASKSET
+                            * serialized siblings behind one lock, and FMOD's
+                            * persistent mixer (task 0, never returns) starved
+                            * its producer (task 1) forever -- the mixer then
+                            * DMA-polled a NULL control EA for the whole run. */
     uint8_t* ls;           /* persistent LS (NULL until first task loads it) */
     int      loaded;       /* image loaded into ls */
 #ifdef _WIN32
-    SRWLOCK  lock;         /* serializes this taskset's task dispatches */
+    SRWLOCK  lock;         /* serializes re-dispatches of this ONE task */
 #else
     pthread_mutex_t lock;
 #endif
@@ -287,8 +294,31 @@ static pthread_mutex_t s_ts_ls_dir = PTHREAD_MUTEX_INITIALIZER;
 static int spu_persist_ls_enabled(void)
 { static int _p = -1; if (_p < 0) _p = getenv("LBP_PERSIST_LS") ? 1 : 0; return _p; }
 
-/* Find-or-create the slot for a taskset (directory lock held briefly). */
-static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea)
+/* ---- Global SPU execution serialization (LBP_SPU_SERIAL) ------------------
+ * Default runs each SPU task on its own detached host thread, so N tasks race:
+ * timing jitter sends each boot down a different path to a different dead end
+ * (one run hangs on the FMOD DSP null, the next on an unrelated PPU init spin),
+ * which makes any single failure impossible to reproduce and debug. Serialize:
+ * only ONE SPU task executes at a time (global lock), so the SPU stage becomes
+ * a fixed, repeatable sequence. A task that parks in WAIT_SIGNAL RELEASES the
+ * lock so another task can run (and possibly signal it) -- cooperative, mirrors
+ * a single SPU's task scheduling; with LBP_WS_DRAIN a genuinely unsignalled
+ * task drains and releases. Opt-in; default keeps concurrent per-thread SPU. */
+static int spu_serial_enabled(void)
+{ static int _s = -1; if (_s < 0) _s = getenv("LBP_SPU_SERIAL") ? 1 : 0; return _s; }
+#ifdef _WIN32
+static SRWLOCK s_spu_serial = SRWLOCK_INIT;
+void spu_serial_acquire(void){ if (spu_serial_enabled()) AcquireSRWLockExclusive(&s_spu_serial); }
+void spu_serial_release(void){ if (spu_serial_enabled()) ReleaseSRWLockExclusive(&s_spu_serial); }
+#else
+static pthread_mutex_t s_spu_serial = PTHREAD_MUTEX_INITIALIZER;
+void spu_serial_acquire(void){ if (spu_serial_enabled()) pthread_mutex_lock(&s_spu_serial); }
+void spu_serial_release(void){ if (spu_serial_enabled()) pthread_mutex_unlock(&s_spu_serial); }
+#endif
+
+/* Find-or-create the slot for a (taskset, task) pair (directory lock held
+ * briefly). Per-task keying is load-bearing: see spu_ts_ls_slot.taskid. */
+static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
 {
     spu_ts_ls_slot* slot = NULL;
 #ifdef _WIN32
@@ -297,10 +327,12 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea)
     pthread_mutex_lock(&s_ts_ls_dir);
 #endif
     for (int i = 0; i < SPU_TS_LS_MAX && !slot; i++)
-        if (s_ts_ls[i].taskset_ea == taskset_ea) slot = &s_ts_ls[i];
+        if (s_ts_ls[i].taskset_ea == taskset_ea && s_ts_ls[i].taskid == taskid)
+            slot = &s_ts_ls[i];
     for (int i = 0; i < SPU_TS_LS_MAX && !slot; i++)
         if (s_ts_ls[i].taskset_ea == 0) {
             s_ts_ls[i].taskset_ea = taskset_ea;
+            s_ts_ls[i].taskid = taskid;
 #ifdef _WIN32
             InitializeSRWLock(&s_ts_ls[i].lock);
 #else
@@ -323,7 +355,7 @@ static void spu_async_run(spu_async_job* j)
     spu_ts_ls_slot* ts_slot = NULL;
     int did_load = 0;           /* whether THIS dispatch (re)loaded the image */
     if (spu_persist_ls_enabled() && j->taskset_ea && j->image_id != 22)
-        ts_slot = ts_ls_get(j->taskset_ea);
+        ts_slot = ts_ls_get(j->taskset_ea, j->taskid);
     uint8_t* ls;
     if (ts_slot) {
 #ifdef _WIN32
@@ -570,6 +602,7 @@ static void spu_async_run(spu_async_job* j)
                 }
                 #undef RDBE32
             }
+            spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0);
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
@@ -609,6 +642,7 @@ static void spu_async_run(spu_async_job* j)
             }
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
+            spu_serial_release();
         }
         /* Persistent LS is retained in its taskset slot for the next task; a
          * per-dispatch LS is freed. */
@@ -750,6 +784,9 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * keeps the block-forever behaviour. Reversible, opt-in. */
     unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
     int drained = 0;
+    /* Release the global SPU-serial lock while parked so another SPU task can
+     * run (and possibly signal us); re-acquired before returning to resume. */
+    spu_serial_release();
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
@@ -781,6 +818,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     if (drained) { static int _d = 0; if (_d++ < 24)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
+    spu_serial_acquire();       /* resume: re-take the serial lock */
     return 0;
 }
 
