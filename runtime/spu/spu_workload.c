@@ -640,6 +640,16 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         }
     }
     unsigned secs = 0;
+    /* LBP_WS_DRAIN=<secs>: EXPERIMENT (general work-drained approximation).
+     * A task ENTERING WAIT_SIGNAL has drained the work dispatched to it. In our
+     * one-shot SPU model the producer task ran to completion already, so the
+     * signal never arrives and the consumer blocks forever (movie/audio/loading
+     * deadlock). If set, after <secs> of no real signal we RETURN rc=0 as if the
+     * kernel resumed the task with "no pending work" -- lets it run its post-wait
+     * path (complete its loop / set completion flags) instead of hanging. 0/unset
+     * keeps the block-forever behaviour. Reversible, opt-in. */
+    unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
+    int drained = 0;
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
@@ -648,9 +658,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
                         "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+            if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
@@ -661,11 +672,15 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
                         "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+            if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
+    if (drained) { static int _d = 0; if (_d++ < 24)
+        fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
+                "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     return 0;
 }
 
