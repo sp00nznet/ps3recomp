@@ -471,7 +471,36 @@ static void hle_net_wouldblock(ppu_context* ctx)
     if (g_net_errno_ea) vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
     ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)-1;
 }
-static void hle_net_zero(ppu_context* ctx) { ctx->gpr[3] = 0; }  /* select/poll: 0 ready */
+static void hle_net_zero(ppu_context* ctx) { ctx->gpr[3] = 0; }
+/* select/poll: nothing is ever ready offline -- but a real select BLOCKS for
+ * the caller's timeout before saying so. Returning instantly turned LBP's
+ * 30Hz net pump (sub_3A5548: select(1, r/w/e sets, {0s, 33333us})) into a
+ * 100%-CPU busy-spin that also dominated the guest-PC profiler, masquerading
+ * as a boot hang. Honor the timeout and clear the fd sets (1024-bit each). */
+static void hle_net_select(ppu_context* ctx)
+{
+    uint32_t rd = (uint32_t)ctx->gpr[4], wr = (uint32_t)ctx->gpr[5];
+    uint32_t ex = (uint32_t)ctx->gpr[6], tv = (uint32_t)ctx->gpr[7];
+    uint64_t us = 10000;              /* NULL timeout = block forever: tick at 10ms instead */
+    if (tv) us = vm_read64(tv) * 1000000ull + vm_read64(tv + 8);   /* {s64 sec, s64 usec} BE */
+    if (us > 100000) us = 100000;     /* cap so shutdown stays responsive */
+    if (us) Sleep((DWORD)((us + 999) / 1000));
+    const uint32_t sets[3] = { rd, wr, ex };
+    for (int s = 0; s < 3; s++)
+        if (sets[s]) for (uint32_t i = 0; i < 128; i += 4) vm_write32(sets[s] + i, 0);
+    ctx->gpr[3] = 0;                  /* 0 fds ready */
+}
+static void hle_net_poll(ppu_context* ctx)
+{
+    uint32_t fds  = (uint32_t)ctx->gpr[3];
+    uint32_t nfds = (uint32_t)ctx->gpr[4];
+    int32_t  ms   = (int32_t)(uint32_t)ctx->gpr[5];
+    if (ms < 0 || ms > 100) ms = (ms < 0) ? 10 : 100;   /* -1 = infinite: tick at 10ms */
+    if (ms) Sleep((DWORD)ms);
+    for (uint32_t i = 0; i < nfds && i < 64; i++)       /* pollfd = {s32 fd, s16 ev, s16 rev} */
+        if (fds) vm_write32(fds + i * 8 + 4, vm_read32(fds + i * 8 + 4) & 0xFFFF0000u);
+    ctx->gpr[3] = 0;                  /* 0 fds ready */
+}
 /* Distinct small fds: the unresolved default handed EVERY socket() call fd 0,
  * making all sockets alias one id in the game's tables. */
 static void hle_net_socket(ppu_context* ctx) { static uint32_t s_fd = 3; ctx->gpr[3] = s_fd++; }
@@ -489,8 +518,8 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(0x1F953B9Fu, "sys_net_bnet_recvfrom",  hle_net_wouldblock);
     ps3_hle_register_ctx(0xFBA04F37u, "sys_net_bnet_recv",      hle_net_wouldblock);
     ps3_hle_register_ctx(0xC9D09C34u, "sys_net_bnet_recvmsg",   hle_net_wouldblock);
-    ps3_hle_register_ctx(0x051EE3EEu, "sys_net_bnet_poll",      hle_net_zero);
-    ps3_hle_register_ctx(0x3F09E20Au, "sys_net_bnet_select",    hle_net_zero);
+    ps3_hle_register_ctx(0x051EE3EEu, "sys_net_bnet_poll",      hle_net_poll);
+    ps3_hle_register_ctx(0x3F09E20Au, "sys_net_bnet_select",    hle_net_select);
     ps3_hle_register_ctx(0x139A9E9Bu, "netInitializeNetworkEx", hle_net_zero);   /* lib init ok */
     ps3_hle_register_ctx(0x9C056962u, "netSocket",              hle_net_socket);
     ps3_hle_register_ctx(0xB0A59804u, "netBind",                hle_net_zero);
