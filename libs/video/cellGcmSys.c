@@ -671,6 +671,27 @@ static void gcm_ref_publish_one(void)
     s_ref_qhead = h + 1;
 }
 
+/* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
+ * ref register (GCM_CONTROL+8). The 60 Hz present-thread ticker publishes only
+ * one queued fence per frame, so when present overruns during heavy boot load
+ * the tick rate -- and thus fence publication -- collapses and an equality-
+ * waiter stalls seconds per fence (the [finspin] boot crawl; the game is not
+ * deadlocked, just starved). Let the spinning reader drive publication too:
+ * this is called from vm_read32 on each ref read, advancing one queued fence,
+ * globally paced to at most one per millisecond so every value stays visible
+ * >= 1 ms to any equality-waiter (no skip-past). Decoupled from present, so a
+ * wait makes progress even when the ticker is starved. Idempotent + additive:
+ * it only ever publishes fences the ticker would eventually publish anyway. */
+void cellGcm_ref_on_poll(void)
+{
+    extern unsigned long long ps3_ms_now(void);
+    static volatile unsigned long long s_last_ms = 0;
+    unsigned long long now = ps3_ms_now();
+    if (now == s_last_ms) return;      /* <= 1 publish/ms keeps each value observable */
+    s_last_ms = now;
+    gcm_ref_publish_one();
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;

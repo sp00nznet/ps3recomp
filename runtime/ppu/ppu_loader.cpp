@@ -344,7 +344,15 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap(
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
-uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
+uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
+    /* GCM_REFPOLL: read-driven RSX fence publication. A spin-read of the ref
+     * register (GCM_CONTROL+8 = 0x03002008) advances one queued fence (paced
+     * <=1/ms), so cellGcmFinish makes progress even when the 60 Hz present
+     * ticker is starved during heavy boot load (fixes the [finspin] crawl).
+     * Publish BEFORE the read so this poll observes the freshly-advanced ref. */
+    if ((uint32_t)a == 0x03002008u) { static int _rp=-1; if(_rp<0)_rp=getenv("GCM_REFPOLL")?1:0;
+        if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+    uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
 #ifdef _WIN32
     /* PT report: the hunted truncated value is being READ BACK from a slot we saw
