@@ -10,6 +10,7 @@
  */
 
 #include "cellSpurs.h"
+#include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
@@ -263,8 +264,9 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
         if (pendingRecv & (0x8000u >> s)) {
             uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
             u32 taskId = vm_read8(ea + EF_WAITING_TASK_ID + s);
-            fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X satisfies SPU task "
-                    "slot %d (taskset=0x%08X task=%u)\n", ea, s, taskset_ea, taskId);
+            if (ps3_log_verbose())
+                fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X satisfies SPU task "
+                        "slot %d (taskset=0x%08X task=%u)\n", ea, s, taskset_ea, taskId);
             spu_taskset_signal_task(taskset_ea, taskId);
         }
     }

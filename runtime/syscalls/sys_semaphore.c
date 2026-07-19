@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
@@ -305,7 +306,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     { static int _n = 0; if (getenv("SEMTID") && _n++ < 60000)
         fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu)\n",
                 (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us);
-      else if (!getenv("SEMTID"))
+      else if (!getenv("SEMTID") && ps3_log_verbose())
         fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
     /* LBP_BREADCRUMB: every 500th wait, dump the per-tid indirect-call breadcrumb
      * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
