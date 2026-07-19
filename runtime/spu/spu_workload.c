@@ -251,12 +251,103 @@ typedef struct {
     uint32_t            taskid;
 } spu_async_job;
 
+/* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
+ * Real SPURS time-multiplexes a taskset's tasks onto SPUs, saving/restoring a
+ * shared taskset context in LS. Our default model runs each task ONCE on a
+ * fresh calloc'd LS, so state one task establishes (e.g. FMOD's SPU DSP handler
+ * table at LS 0x39Dxx, built by the init task) is invisible to the next task of
+ * the same taskset, which reads the uninitialised image sentinel and
+ * branch-to-0's. Give each taskset a PERSISTENT LS reused across its task
+ * dispatches (image loaded once, state retained) and SERIALIZE its tasks (one
+ * at a time) so they observe each other's setup without racing the shared
+ * store -- a cooperative approximation of the kernel's context save/restore.
+ * With LBP_WS_DRAIN (a task parked in WAIT_SIGNAL resumes + releases the
+ * taskset, letting the next task run), the FMOD init + DSP tasks share one LS
+ * and the handler table is populated when the DSP dispatch reads it. Opt-in;
+ * default keeps per-dispatch fresh LS. */
+typedef struct {
+    uint32_t taskset_ea;   /* 0 = free slot */
+    uint8_t* ls;           /* persistent LS (NULL until first task loads it) */
+    int      loaded;       /* image loaded into ls */
+#ifdef _WIN32
+    SRWLOCK  lock;         /* serializes this taskset's task dispatches */
+#else
+    pthread_mutex_t lock;
+#endif
+} spu_ts_ls_slot;
+
+#define SPU_TS_LS_MAX 24
+static spu_ts_ls_slot s_ts_ls[SPU_TS_LS_MAX];
+#ifdef _WIN32
+static SRWLOCK s_ts_ls_dir = SRWLOCK_INIT;
+#else
+static pthread_mutex_t s_ts_ls_dir = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static int spu_persist_ls_enabled(void)
+{ static int _p = -1; if (_p < 0) _p = getenv("LBP_PERSIST_LS") ? 1 : 0; return _p; }
+
+/* Find-or-create the slot for a taskset (directory lock held briefly). */
+static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea)
+{
+    spu_ts_ls_slot* slot = NULL;
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_ts_ls_dir);
+#else
+    pthread_mutex_lock(&s_ts_ls_dir);
+#endif
+    for (int i = 0; i < SPU_TS_LS_MAX && !slot; i++)
+        if (s_ts_ls[i].taskset_ea == taskset_ea) slot = &s_ts_ls[i];
+    for (int i = 0; i < SPU_TS_LS_MAX && !slot; i++)
+        if (s_ts_ls[i].taskset_ea == 0) {
+            s_ts_ls[i].taskset_ea = taskset_ea;
+#ifdef _WIN32
+            InitializeSRWLock(&s_ts_ls[i].lock);
+#else
+            pthread_mutex_init(&s_ts_ls[i].lock, NULL);
+#endif
+            slot = &s_ts_ls[i];
+        }
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&s_ts_ls_dir);
+#else
+    pthread_mutex_unlock(&s_ts_ls_dir);
+#endif
+    return slot;
+}
+
 static void spu_async_run(spu_async_job* j)
 {
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+    /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+     * back to a fresh per-dispatch LS when disabled / no taskset. */
+    spu_ts_ls_slot* ts_slot = NULL;
+    int did_load = 0;           /* whether THIS dispatch (re)loaded the image */
+    if (spu_persist_ls_enabled() && j->taskset_ea && j->image_id != 22)
+        ts_slot = ts_ls_get(j->taskset_ea);
+    uint8_t* ls;
+    if (ts_slot) {
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&ts_slot->lock);   /* serialize this taskset */
+#else
+        pthread_mutex_lock(&ts_slot->lock);
+#endif
+        if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+        ls = ts_slot->ls;
+        { static int _n = 0; if (_n++ < 24)
+            fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
+                    j->taskset_ea, j->taskid, j->image_id,
+                    ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
+    } else {
+        ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+    }
     if (ls) {
         uint32_t entry = 0;
-        int loaded = spu_elf_load_to_ls(j->image, j->image_size, ls, &entry);
+        /* Load the image only on a taskset's FIRST task (or every dispatch when
+         * not persisting) -- reusing preserves the prior task's LS state. */
+        int loaded = (ts_slot && ts_slot->loaded)
+                   ? 1
+                   : (did_load = 1, spu_elf_load_to_ls(j->image, j->image_size, ls, &entry));
+        if (ts_slot && did_load && loaded) ts_slot->loaded = 1;
         if (!loaded)
             fprintf(stderr, "[spu_workload] async image=%d ELF LOAD FAILED\n",
                     j->image_id), fflush(stderr);
@@ -519,7 +610,16 @@ static void spu_async_run(spu_async_job* j)
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
         }
-        free(ls);
+        /* Persistent LS is retained in its taskset slot for the next task; a
+         * per-dispatch LS is freed. */
+        if (!ts_slot) free(ls);
+    }
+    if (ts_slot) {
+#ifdef _WIN32
+        ReleaseSRWLockExclusive(&ts_slot->lock);
+#else
+        pthread_mutex_unlock(&ts_slot->lock);
+#endif
     }
     free(j);
 }
