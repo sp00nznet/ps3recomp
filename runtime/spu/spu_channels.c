@@ -243,6 +243,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
     }
 
+    /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA's 128B
+     * line (e.g. a SPURS event flag) -- who tries to set it, from where. */
+    { static int s_ae = -1; static uint32_t s_aea;
+      if (s_ae < 0) { const char* e = getenv("SPU_ATOM_EA");
+        s_aea = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_ae = s_aea ? 1 : 0; }
+      if (s_ae == 1 && ((uint32_t)ea & ~127u) == s_aea) {
+          static int _n = 0;
+          if (_n++ < 48)
+              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X ea=0x%08X\n",
+                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK, (uint32_t)ea);
+      } }
     /* Bink sync-line atomic trace (armed by the PPU-side producer probe). */
     { extern uint32_t g_barrier_sync_watch;
       uint32_t b = g_barrier_sync_watch;

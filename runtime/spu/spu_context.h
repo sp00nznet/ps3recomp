@@ -52,20 +52,25 @@ static inline unsigned* spu_ls_watch_list(int* out_n) {
     *out_n = n;
     return addr;
 }
-static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p) {
+static inline void spu_ls_watch_hit2(uint32_t lsa, int is_write, const uint8_t* p,
+                                     uint32_t pc, uint32_t lr) {
     int n; unsigned* w = spu_ls_watch_list(&n);
     if (!n) return;
     uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
     for (int i = 0; i < n; i++) {
         if (w[i] == a) {
-            fprintf(stderr, "[spu-watch %s 0x%05X] %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                is_write ? "WR" : "rd", a,
+            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
+                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                is_write ? "WR" : "rd", a, pc, lr,
                 p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
                 p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
             fflush(stderr);
             break;
         }
     }
+}
+static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p) {
+    spu_ls_watch_hit2(lsa, is_write, p, 0, 0);
 }
 
 /* Maximum number of MFC tag groups */
@@ -298,7 +303,8 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     u128 v;
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-    spu_ls_watch_hit(lsa, 0, p);
+    spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     for (int i = 0; i < 4; i++) {
         v._u32[i] = ((uint32_t)p[i*4]     << 24) |
                     ((uint32_t)p[i*4 + 1] << 16) |
@@ -319,7 +325,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 2] = (uint8_t)(w >>  8);
         p[i*4 + 3] = (uint8_t)w;
     }
-    spu_ls_watch_hit(lsa, 1, p);
+    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
 }
 
 /* ---------------------------------------------------------------------------
