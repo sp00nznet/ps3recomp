@@ -378,10 +378,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           uint32_t b = g_barrier_sync_watch;
           if (b && (uint32_t)ea < b + 0xC0 && (uint32_t)ea + size > b + 0x40) {
               static int _n = 0;
-              if (_n++ < 32)
-                  fprintf(stderr, "[sync-PUT] img=%d pc=0x%05X ea=0x%08X size=%u (sync+0x%X)\n",
-                          spu->image_id, (uint32_t)spu->pc, (uint32_t)ea, size,
-                          (uint32_t)ea - b);
+              if (_n++ < 64) {
+                  /* spuNum lives in the kernel context at LS 0x1C8 (BE u32). */
+                  uint32_t sn = ((uint32_t)spu->ls[0x1C8]<<24)|((uint32_t)spu->ls[0x1C9]<<16)|
+                                ((uint32_t)spu->ls[0x1CA]<<8)|spu->ls[0x1CB];
+                  const uint8_t* lp = (const uint8_t*)ls_ptr;   /* the 16B being PUT */
+                  fprintf(stderr, "[sync-PUT] spuNum=%u pc=0x%05X ea=0x%08X (sync+0x%X) row={%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X}\n",
+                          sn, (uint32_t)spu->pc, (uint32_t)ea, (uint32_t)ea - b,
+                          lp[0],lp[1],lp[2],lp[3],lp[4],lp[5],lp[6],lp[7],
+                          lp[8],lp[9],lp[10],lp[11],lp[12],lp[13],lp[14],lp[15]);
+              }
           } }
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side

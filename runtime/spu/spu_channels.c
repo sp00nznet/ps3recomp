@@ -299,10 +299,16 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           uint32_t b = g_barrier_sync_watch;
           if (b && ea >= (b & ~127u) && ea < ((b + 0xC0 + 127) & ~127u)) {
               static int _n = 0;
-              if (_n++ < 64)
-                  fprintf(stderr, "[sync-atomic] PUTLLC-%s img=%d valid=%d\n",
-                          ctx->atomic_stat == 0 ? "OK" : "FAIL",
-                          ctx->image_id, ctx->resv_valid);
+              if (_n++ < 96 && ctx->atomic_stat == 0) {
+                  uint32_t sn = ((uint32_t)ctx->ls[0x1C8]<<24)|((uint32_t)ctx->ls[0x1C9]<<16)|
+                                ((uint32_t)ctx->ls[0x1CA]<<8)|ctx->ls[0x1CB];
+                  extern uint8_t* vm_base;
+                  const uint8_t* r = vm_base + b + 0x70;   /* row 3 (sync+0x40+16*3) */
+                  fprintf(stderr, "[sync-atomic] PUTLLC-OK spuNum=%u ea=+0x%X lanes@row3={%u %u %u %u %u %u %u}\n",
+                          sn, ea - b,
+                          (r[2]<<8)|r[3],(r[4]<<8)|r[5],(r[6]<<8)|r[7],(r[8]<<8)|r[9],
+                          (r[10]<<8)|r[11],(r[12]<<8)|r[13],(r[14]<<8)|r[15]);
+              }
           } }
         ctx->resv_valid = 0;                           /* reservation consumed */
         resv_unlock();
