@@ -356,6 +356,23 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 #endif
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
+     * target LS line falls inside that image's CODE segment (the segment
+     * bounds come from SPU_SMC_LO/HI, default the pm_wwsjob range 0xA00..
+     * 0x3700). A hit proves the guest rewrites its own instructions -- which
+     * a static recompiler cannot follow. */
+    { static int s = -2; static uint32_t lo, hi, img;
+      if (s == -2) { const char* e = getenv("SPU_SMC_WATCH");
+        s = e ? atoi(e) : -1; img = (uint32_t)s;
+        const char* l = getenv("SPU_SMC_LO"); lo = l ? (uint32_t)strtoul(l,0,0) : 0xA00;
+        const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
+      if (s >= 0 && (uint32_t)ctx->image_id == img && lsa >= lo && lsa < hi) {
+          static int _n = 0;
+          if (_n++ < 48)
+              fprintf(stderr, "[spu-SMC] img=%d WROTE CODE @0x%05X (pc=0x%05X) = %02X%02X%02X%02X\n",
+                      ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      p[0], p[1], p[2], p[3]);
+      } }
 }
 
 /* ---------------------------------------------------------------------------

@@ -336,6 +336,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        /* SPU_SMC_WATCH: a DMA GET that lands inside the image's own code
+         * segment is a code overlay = self-modification. */
+        { static int s = -2; static uint32_t lo, hi, img;
+          if (s == -2) { const char* e = getenv("SPU_SMC_WATCH");
+            s = e ? atoi(e) : -1; img = (uint32_t)s;
+            const char* l = getenv("SPU_SMC_LO"); lo = l ? (uint32_t)strtoul(l,0,0) : 0xA00;
+            const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
+          if (s >= 0 && (uint32_t)spu->image_id == img &&
+              lsa < hi && lsa + size > lo) {
+              static int _n = 0;
+              if (_n++ < 32)
+                  fprintf(stderr, "[spu-SMC] img=%d DMA-GET into CODE @0x%05X size=%u ea=0x%08X pc=0x%05X\n",
+                          spu->image_id, lsa, size, (uint32_t)ea, (uint32_t)spu->pc & SPU_LS_MASK);
+          } }
         /* Swappable-overlay tracking: a GET from a registered overlay source
          * (by EA or by content signature) marks that overlay's lifted
          * functions resident for this context. */
