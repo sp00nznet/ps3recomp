@@ -1161,6 +1161,27 @@ static WklPm* spurs_resolve_pm(u32 wid)
 }
 
 #ifdef _WIN32
+/* One virtual SPU running a workload's policy module. The WWS job manager
+ * runs concurrently across N SPUs (RPCS3: jobmanagerCellSpursKernel0..N): each
+ * claims jobs from the shared queue and advances its own lane of the sync
+ * barrier. Running the SPUs SEQUENTIALLY deadlocks -- SPU 0 completes its job,
+ * then busy-waits at the cross-SPU barrier for lane 1, which the sequential
+ * loop can never advance (SPU 1 hasn't run). Concurrency is required, not an
+ * optimization: SPU 0's barrier poll observes SPU 1's atomic lane update live. */
+struct spurs_pm_worker_arg {
+    spu_lifted_entry_fn fn; int image_id;
+    const uint8_t* pm; uint32_t pm_size;
+    uint64_t arg; uint32_t wid, ea, spu_num;
+};
+static DWORD WINAPI spurs_pm_worker(LPVOID p)
+{
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    struct spurs_pm_worker_arg* a = (struct spurs_pm_worker_arg*)p;
+    spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
+                          a->arg, a->wid, a->ea, a->spu_num);
+    return 0;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
@@ -1319,10 +1340,32 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 s_fs = e ? atoi(e) : -1; }
               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
-            for (u32 sn = 0; sn < maxcont; sn++)
-                spu_run_policy_module(r->fn, r->image_id,
-                                      (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm,
-                                      s_workloads[wid].sizePm, arg, wid, ea, sn);
+            {
+                const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
+                uint32_t sz = s_workloads[wid].sizePm;
+                if (maxcont <= 1) {
+                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                } else {
+                    /* Run the workload's virtual SPUs CONCURRENTLY (see
+                     * spurs_pm_worker): each lane advances in parallel so the
+                     * cross-SPU barrier resolves. Spawn maxcont-1 workers for
+                     * lanes 1..N-1 and run lane 0 on this thread, then join. */
+                    HANDLE th[8]; struct spurs_pm_worker_arg wa[8];
+                    unsigned nth = 0;
+                    for (u32 sn = 1; sn < maxcont && nth < 7; sn++, nth++) {
+                        wa[nth].fn = r->fn; wa[nth].image_id = r->image_id;
+                        wa[nth].pm = pm; wa[nth].pm_size = sz;
+                        wa[nth].arg = arg; wa[nth].wid = wid; wa[nth].ea = ea;
+                        wa[nth].spu_num = sn;
+                        th[nth] = CreateThread(NULL, 1u << 20, spurs_pm_worker, &wa[nth], 0, NULL);
+                    }
+                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                    if (nth) {
+                        WaitForMultipleObjects(nth, th, TRUE, INFINITE);
+                        for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
+                    }
+                }
+            }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
             /* "Found work" heuristic: a module that did something polls the
              * kernel for MORE work before exiting (selectWorkload calls >0);
