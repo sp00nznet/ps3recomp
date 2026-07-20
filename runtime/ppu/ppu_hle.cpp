@@ -91,6 +91,19 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
     struct _TocGuard { ppu_context* c; uint64_t toc, sp;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc); } } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+
+    /* YDKJ_TUNERFIX (moved to the top so it wins over any registered handler): the
+     * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
+     * _cellSpursIsLaunchedFromTuner (0x3000D318), must return 0x8001112E ("profiler not
+     * loaded") on a normal run. Anything else trips the usertrace.c:123 assert AND makes
+     * the fn report "launched from tuner", so the caller runs tuner/trace setup that fails
+     * with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
+    if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
+        static int _tn = 0; if (_tn++ < 3)
+            fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
+        return;
+    }
     g_last_hle_nid = nid;
     /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
     { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;
@@ -201,9 +214,37 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { static int _ns=-1; if(_ns<0)_ns=getenv("FLOW_NOSPILL")?1:0;
       if(!_ns) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); }
 
-    /* Real libsre (loaded PRX) takes priority over the HLE stub. */
+    /* Real libsre (loaded PRX) takes priority over the HLE stub -- EXCEPT for NIDs
+     * listed in YDKJ_FORCE_HLE (comma-separated hex). Some LLE entry points fail
+     * against our partially-modelled SPURS state and the CALLER ASSERTS on it:
+     * YDKJ's CRI calls _cellSpursEventFlagInitialize (0x5EF96465), libsre returns
+     * 0x80410910 (CELL_SPURS_TASK_ERROR_STAT), and CRI's own
+     * "CellSpursTaskset.cc:423: ret == CELL_OK -- assertion failed" kills its
+     * taskset init => the movie decode task is never created. Forcing the HLE
+     * (which succeeds) lets the caller proceed. */
     {
         uint32_t opd = prx_resolve_export(nid);
+        if (opd) {
+            static const char* s_force = (const char*)1;
+            if (s_force == (const char*)1) s_force = getenv("YDKJ_FORCE_HLE");
+            if (s_force && *s_force) {
+                char want[16]; snprintf(want, sizeof want, "%08X", nid);
+                /* case-insensitive substring match on the 8-hex-digit NID */
+                for (const char* p2 = s_force; *p2; p2++) {
+                    int k = 0;
+                    while (k < 8 && p2[k] &&
+                           (p2[k] == want[k] ||
+                            (p2[k] >= 'a' && p2[k] - 32 == want[k]))) k++;
+                    if (k == 8) {
+                        static int _n = 0;
+                        if (_n++ < 8)
+                            fprintf(stderr, "[FORCE-HLE] nid=0x%08X: bypassing libsre, using HLE\n", nid);
+                        opd = 0;   /* fall through to the HLE handler below */
+                        break;
+                    }
+                }
+            }
+        }
         if (opd) {
             uint32_t code = vm_read32(opd);
             uint32_t toc  = vm_read32(opd + 4);
@@ -257,6 +298,18 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
     ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
     if (!e || !e->handler) {
+        /* YDKJ_TUNERFIX: sysPrxForUser 0xE0998DBF is the profiler-presence query called
+         * by libsre _cellSpursIsLaunchedFromTuner (0x3000D318). On a normal (non-tuner)
+         * run it must return 0x8001112E ("profiler not loaded"); an unresolved-NID error
+         * instead trips the usertrace.c:123 assert AND makes the fn return "launched=1",
+         * so the caller does tuner/trace setup that fails with CELL_SPURS_CORE_ERROR_STAT
+         * -> the SPURS task workload never attaches -> no movie decode. Return not-loaded. */
+        if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
+            static int _tn = 0; if (_tn++ < 3)
+                fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
+            return;
+        }
         static int logged = 0;
         if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD

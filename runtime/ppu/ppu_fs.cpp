@@ -112,6 +112,7 @@ static void host_path(char* out, size_t cap, const char* guest)
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
 static FILE* g_files[FS_MAX];
+static uint8_t g_fd_usm[FS_MAX];   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
@@ -165,6 +166,7 @@ static void cellFsOpen(ppu_context* ctx)
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+    g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
     if (getenv("YDKJ_USMBT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
@@ -179,7 +181,10 @@ static void cellFsOpen(ppu_context* ctx)
 static void cellFsClose(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) { fclose(g_files[fd]); g_files[fd] = nullptr; }
+    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+        if (g_fd_usm[fd] && getenv("YDKJ_USMRD")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
+        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
+    }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -194,6 +199,7 @@ static void cellFsRead(ppu_context* ctx)
     long fpos_before = ftell(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    if (g_fd_usm[fd] && getenv("YDKJ_USMRD")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
     if (getenv("YDKJ_FSDBG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
 #ifdef _WIN32
     if (getenv("YDKJ_FSDBG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)&__ImageBase; fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }

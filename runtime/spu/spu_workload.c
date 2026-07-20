@@ -316,6 +316,13 @@ static void spu_async_run(spu_async_job* j)
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+                /* YDKJ_CRI_TS: the cri DECODE taskset is created by LLE (not the HLE CreateTask),
+                 * so g_ydkj_real_taskset_ea stays 0 and we fall to the minimal/garbage plant. Let
+                 * the caller supply the cri taskset EA (observed 0x40131000) so build_context reads
+                 * the REAL TaskInfo (eaElf/eaContext/args) the LLE create wrote. */
+                if (!g_ydkj_real_taskset_ea) { const char* _cts=getenv("YDKJ_CRI_TS");
+                    if (_cts && *_cts) { g_ydkj_real_taskset_ea=(uint32_t)strtoul(_cts,0,16); g_ydkj_real_taskid=0;
+                        fprintf(stderr,"[cri] YDKJ_CRI_TS: forcing cri taskset=0x%08X\n", g_ydkj_real_taskset_ea); } }
                 if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
@@ -327,6 +334,29 @@ static void spu_async_run(spu_async_job* j)
                     LSBE32(0x2FB8, 0x2700);      LSBE32(0x2FBC, 0x3000);
                     fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
                             g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
+                    if (getenv("YDKJ_CRI_DUMP")) { extern uint8_t* vm_base;
+                        #define RD32(ea) (((uint32_t)vm_base[(ea)]<<24)|((uint32_t)vm_base[(ea)+1]<<16)|((uint32_t)vm_base[(ea)+2]<<8)|vm_base[(ea)+3])
+                        /* Dump the actual structures (committed, safe) instead of a RAM scan --
+                         * the earlier scan was vacuous (ppu_vm_size==0 at runtime). Show the taskset
+                         * header+TaskInfo (find eaElf/eaContext) and the SPURS instance workload
+                         * words (w0/w4 -- observed EMPTY, so the kernel has nothing to dispatch). */
+                        uint32_t ts = g_ydkj_real_taskset_ea;
+                        fprintf(stderr,"[cri-dump] taskset 0x%08X first 0x80 bytes:\n", ts);
+                        for(uint32_t o=0;o<0x80;o+=16){ fprintf(stderr,"  +0x%02X:",o);
+                            for(uint32_t k=0;k<16;k+=4) fprintf(stderr," %08X", RD32(ts+o+k)); fprintf(stderr,"\n"); }
+                        /* scan the taskset's own 0x1000 bytes for the cri ELF ptr 0x4F5F80 (this
+                         * region IS committed -- we just read it above) */
+                        uint32_t hits=0;
+                        for(uint32_t a=ts; a<ts+0x2000; a+=4){ uint32_t w=RD32(a);
+                            if((w&~0xFu)==0x004F5F80u){ fprintf(stderr,"  eaElf 0x4F5F80 REF @0x%08X = 0x%08X\n",a,w); hits++; } }
+                        fprintf(stderr,"[cri-dump] eaElf refs in taskset: %u\n", hits);
+                        /* SPURS instance workload state */
+                        for(uint32_t inst=0x40009D00u; inst<=0x40009F00u; inst+=0x200){
+                            fprintf(stderr,"[cri-dump] SPURS instance @0x%08X: w0=%08X w4=%08X w8=%08X wC=%08X w10=%08X w14=%08X\n",
+                                inst, RD32(inst), RD32(inst+4), RD32(inst+8), RD32(inst+0xC), RD32(inst+0x10), RD32(inst+0x14)); }
+                        fflush(stderr);
+                        #undef RD32
+                    }
                 } else {
                     LSBE32(0x27C0, 0x100);     /* kernelMgmtAddr -> SPURS kernel ctx @LS 0x100 */
                     LSBE32(0x27C4, 0xA70);     /* syscallAddr -> HLE PM syscall trampoline (0xA70) */

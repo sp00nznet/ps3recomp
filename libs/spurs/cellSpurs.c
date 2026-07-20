@@ -24,6 +24,42 @@
 uint32_t g_ydkj_real_taskset_ea = 0;
 uint32_t g_ydkj_real_taskid     = 0;
 uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the taskset-policy handoff) */
+uint32_t g_ydkj_cri_elf_ea = 0, g_ydkj_cri_ctx_ea = 0;   /* captured from the cri task's attr (LLE create) */
+
+/* Called from the lifted libsre cellSpursCreateTaskset entry (0x30014DC4): the cri
+ * decode taskset is created via the game-static/LLE path (never the HLE CreateTaskset),
+ * so capture the real spurs+taskset EAs here for the image-23 taskset-policy handoff
+ * (spu_workload.c YDKJ_CRI_TASKSET). Latest-wins, matching sagemono's HLE capture. */
+void ydkj_cri_capture_taskset(uint32_t spurs_ea, uint32_t taskset_ea)
+{
+    g_ydkj_real_spurs_ea   = spurs_ea;
+    g_ydkj_real_taskset_ea = taskset_ea;
+    g_ydkj_real_taskid     = 0;
+    if (getenv("YDKJ_CRI_CAP")) {
+        static int _n = 0; if (_n++ < 12)
+            fprintf(stderr, "[cri-cap] libsre CreateTaskset #%d spurs=0x%08X taskset=0x%08X\n",
+                    _n, spurs_ea, taskset_ea);
+    }
+}
+
+/* Capture the cri decode task's real params at the LLE cellSpursCreateTaskWithAttribute
+ * (libsre 0x300121EC): r3=taskset, r5=attr. The attr holds eaElf(=0x4F5F80)/eaContext(the
+ * decode job)/argument -- the LLE never copies them into a taskset TaskInfo our HLE reader
+ * can find (RAM scan for 0x4F5F80 = 0 hits), so grab them straight from the attr here. */
+void ydkj_cri_cap(uint32_t taskset, uint32_t attr)
+{
+    g_ydkj_real_taskset_ea = taskset;
+    if (getenv("YDKJ_CRI_CAP")) {
+        static int _n = 0; if (_n++ < 3) {
+            fprintf(stderr, "[cri-cap] taskset=0x%08X attr=0x%08X  attr dump (find eaElf 0x4F5F80 / eaContext):\n", taskset, attr);
+            for (int o = 0; o < 0x40; o += 4) {
+                uint32_t w = attr ? vm_read32(attr + o) : 0;
+                fprintf(stderr, "   attr+0x%02X = 0x%08X%s\n", o, w, ((w & ~7u) == 0x004F5F80u) ? "  <-- eaElf!" : "");
+                if ((w & ~7u) == 0x004F5F80u) { g_ydkj_cri_elf_ea = w; if (o >= 8) g_ydkj_cri_ctx_ea = vm_read32(attr + o + 4); }
+            }
+        }
+    }
+}
 
 /* C-linkage setter so the LLE libsre lift (compiled as C) can wire the real
  * SPURS+taskset EAs it sees in cellSpursCreateTaskset -> the cri-task
@@ -491,6 +527,8 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 
     /* Args arrive as guest effective addresses (ps3_hle_call passes raw guest
      * register values); translate to host before dereferencing. */
+    if (getenv("YDKJ_TSCHK")) fprintf(stderr, "[TSCHK] HLE CreateTaskset: spurs_ea=0x%08X taskset_ea=0x%08X args=0x%llX\n", spurs_ea, taskset_ea, (unsigned long long)args);
+
     spurs   = GUEST_PTR(spurs, CellSpurs*);
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
 

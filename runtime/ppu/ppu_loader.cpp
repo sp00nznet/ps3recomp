@@ -664,6 +664,21 @@ extern "C" void ydkj_memmove_0036FA74(ppu_context* ctx)
             fprintf(stderr,"[memfix] copy dst=0x%08X src=0x%08X n=0x%X -> 0x400240A8 gets src[0x%08X]=0x%08X\n",
                     dst, src, n, soff, sval);
     }
+    /* YDKJ_TSFIND: the cri task attr (with eaElf 0x4F5F80) is built on the stack and
+     * copied into the persistent taskset TaskInfo via this memmove (never via a
+     * traceable vm_write*). Catch the copy whose SOURCE holds the eaElf -> the DEST
+     * is the live cri taskset EA (sagemono's 0x45F1B000 is run-specific; derive ours). */
+    if (vm_base && n >= 8 && n <= 0x8000 && getenv("YDKJ_TSFIND")) {
+        for (uint32_t o = 0; o + 4 <= n; o += 4) {
+            uint32_t w = __builtin_bswap32(*(volatile uint32_t*)(vm_base + src + o));
+            if ((w & ~0xFu) == 0x004F5F80u) {
+                static int _n = 0; if (_n++ < 16)
+                    fprintf(stderr, "[TSFIND] memmove eaElf 0x%08X: src=0x%08X -> DST(taskset)=0x%08X n=0x%X eaElf@dst+0x%X\n",
+                            w, src, dst, n, o);
+                break;
+            }
+        }
+    }
     if (n && vm_base) memmove(vm_base + dst, vm_base + src, n);
     /* r3 (dst) is preserved as the return value. */
 }
@@ -757,8 +772,17 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     g_active_ctx = ctx;
     /* ELFv1 glink-stub TOC save (kept from gcmtri bring-up). NOTE: investigated as a
      * suspect for the YDKJ func_002B03AC r2=0 spin -- removing it did NOT clear that
-     * spin, so YDKJ's r2 corruption comes from a different mechanism (see memory). */
-    vm_write64(ctx->gpr[1] + 40, ctx->gpr[2]);
+     * spin, so YDKJ's r2 corruption comes from a different mechanism (see memory).
+     * 2026-07-19 (s8): guard against clobbering the caller's TOC slot with GARBAGE.
+     * libsre's UNRESOLVED sysPrxForUser import glink-stub (0x3001D8D8, NID 0x68B9B011)
+     * sets r2 = *(GOT+4) = its own bytes 0x658C3003 (the GOT points back to the stub,
+     * never bound), then bctr's here -> this save wrote 0x658C3003 over the caller's
+     * real TOC (0x30039AB0) it had already spilled to 0x28(r1) -> func_30014B08 reloads
+     * r2=garbage -> *(TOC-0x7c4c)=0 -> cellSpursCreateTaskset returns NULL_POINTER. Only
+     * spill r2 when it is a plausible guest TOC (< 0x40000000); garbage is skipped so the
+     * stub's own correct spill survives. */
+    if ((uint32_t)ctx->gpr[2] < 0x40000000u)
+        vm_write64(ctx->gpr[1] + 40, ctx->gpr[2]);
 #ifdef _WIN32
     { static int64_t tw=-2; if(tw==-2){const char*e=getenv("FLOW_TOCWATCH"); tw=e?(int64_t)strtoul(e,0,16):-1;}
       if(tw>=0 && (uint32_t)ctx->gpr[2]==(uint32_t)tw){ static int _n=0; if(_n++<4){
@@ -775,6 +799,17 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         extern void ppu_dump_guest_stack(ppu_context*, const char*);
         fprintf(stderr,"[RECVTRACE #%d] indirect-call -> func_00075380 (q=1 receive) r3=0x%08X r4=0x%08X\n",_n,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4]);
         ppu_dump_guest_stack(ctx,"recv-caller"); } } }
+    /* YDKJ_CRI_CAP: the cri DECODE task is created via LLE cellSpursCreateTaskWithAttribute
+     * (libsre 0x300121EC, r3=taskset, r5=attr) -- NOT the HLE CreateTask, so g_ydkj_real_taskset_ea
+     * stays 0 and the image-22 SPU dispatch falls back to a minimal/garbage context. Capture the
+     * cri taskset here so spurs_pm_build_context builds the REAL SpursTasksetContext (TaskInfo:
+     * eaElf/eaContext/args) for the decode task. */
+    if ((uint32_t)ctx->ctr == 0x300121ECu && getenv("YDKJ_CRI_CAP")) {
+        extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+        uint32_t ts = (uint32_t)ctx->gpr[3];
+        g_ydkj_real_taskset_ea = ts; g_ydkj_real_taskid = 0;
+        static int _n=0; if(_n++<4) fprintf(stderr,"[cri-cap] CreateTaskWithAttribute taskset=0x%08X attr=0x%08X -> g_ydkj_real_taskset_ea captured\n", ts, (uint32_t)ctx->gpr[5]);
+    }
     uint32_t addr = (uint32_t)ctx->ctr;
     /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
      * unwound to the initial frame (or a not-yet-populated function pointer).
