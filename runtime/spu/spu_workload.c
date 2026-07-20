@@ -424,6 +424,37 @@ static void spu_async_run(spu_async_job* j)
                             j->taskset_ea, j->taskid); fflush(stderr);
                 }
             }
+            /* YDKJ_CRI_INTERP: run the cri task (image 22) through the SPU
+             * INTERPRETER on the prepared LS (SpursTasksetContext already planted
+             * at 0x2700 by the taskset path above). The LIFTED image branch-to-0's
+             * on the SPURS task-API jump table @0x2700 / computed `bi $reg` that the
+             * static lift can't resolve; the interpreter executes those from live
+             * LS. Same SPURS task ABI r3 as the lifted dispatch (word0=handle,
+             * word1=eaContext, word2/3=queue/lock). Merged from the SPU-interp
+             * branch (aa3a85a). Best paired with YDKJ_CRI_TS=0x4000C900. */
+            if (j->image_id == 22 && getenv("YDKJ_CRI_INTERP")) {
+                spu_context ictx;
+                spu_context_init(&ictx, 0);
+                ictx.image_id = 22;
+                ictx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* stack top */
+                memcpy(ictx.ls, ls, SPU_LS_SIZE);
+                if (j->have_r3) {
+                    ictx.gpr[3]._u32[0] = j->r3[0];     /* 0x40-marker handle   */
+                    ictx.gpr[3]._u32[1] = j->args_ea;   /* eaContext (DMA'd 1st)*/
+                    ictx.gpr[3]._u32[2] = j->r3[2];     /* queue/lock EA        */
+                    ictx.gpr[3]._u32[3] = j->r3[3];
+                }
+                fprintf(stderr, "[cri] YDKJ_CRI_INTERP: interpret image 22 entry=0x%X "
+                        "r3=[%08X %08X %08X %08X]\n", entry, ictx.gpr[3]._u32[0],
+                        ictx.gpr[3]._u32[1], ictx.gpr[3]._u32[2], ictx.gpr[3]._u32[3]);
+                fflush(stderr);
+                uint32_t stop_lsa = spu_interp_run(&ictx, entry);
+                memcpy(ls, ictx.ls, SPU_LS_SIZE);
+                fprintf(stderr, "[cri] YDKJ_CRI_INTERP: image 22 interp halted at LSA=0x%X "
+                        "stop_code=0x%X (video_dma=%d)\n", stop_lsa, ictx.stop_code, g_cri_video_dma);
+                fflush(stderr);
+                free(ls); free(j); return;
+            }
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0);
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
