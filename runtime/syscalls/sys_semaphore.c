@@ -231,7 +231,8 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     }
 
 #ifdef _WIN32
-    s->sem_handle = CreateSemaphoreA(NULL, initial, max_val, NULL);
+    /* The kernel semaphore is a wake channel, not a second count. */
+    s->sem_handle = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
     InitializeCriticalSection(&s->value_lock);
     if (s->sem_handle == NULL) {
         s->active = 0;
@@ -332,40 +333,41 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
-    DWORD result;
-    if (timeout_us > 0 && timeout_us < 1000) {
-        /* Sub-ms timed wait: WaitForSingleObject floors to 1 ms and the OS
-         * rounds up to the timer tick; poll the handle (0-timeout try-acquire)
-         * to a QPC deadline instead. Safe to poll: the semaphore count lives
-         * in the Win32 kernel object, so a post between polls stays counted
-         * and is simply picked up by the next try-acquire. */
-        int64_t deadline = lv2_usec_deadline(timeout_us);
-        for (;;) {
-            result = WaitForSingleObject(s->sem_handle, 0);
-            if (result != WAIT_TIMEOUT) break;
-            if (lv2_deadline_passed(deadline)) break;
-            SwitchToThread();
+    /* value is the only count. The kernel semaphore is only a wake channel;
+     * every wake re-checks value under the lock. */
+    int64_t deadline = (timeout_us > 0) ? lv2_usec_deadline(timeout_us) : 0;
+    for (;;) {
+        /* Take a token if available (the ONLY count, under the lock). */
+        EnterCriticalSection(&s->value_lock);
+        if (s->value > 0) {
+            s->value--;
+            LeaveCriticalSection(&s->value_lock);
+            return CELL_OK;
         }
-    } else {
-        DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
-        result = WaitForSingleObject(s->sem_handle, ms);
-    }
-    if (result == WAIT_TIMEOUT) {
-        return (int64_t)(int32_t)CELL_ETIMEDOUT;
-    }
-    if (result != WAIT_OBJECT_0) {
-        return (int64_t)(int32_t)CELL_EINVAL;
-    }
+        if (timeout_us > 0 && lv2_deadline_passed(deadline)) {
+            LeaveCriticalSection(&s->value_lock);
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+        }
+        s->waiters++;
+        LeaveCriticalSection(&s->value_lock);
 
-    EnterCriticalSection(&s->value_lock);
-    s->value--;
-    LeaveCriticalSection(&s->value_lock);
+        /* Bounded slices keep timed waits on the QPC deadline. */
+        DWORD ms = (timeout_us == 0) ? INFINITE : 1;
+        WaitForSingleObject(s->sem_handle, ms);
+
+        EnterCriticalSection(&s->value_lock);
+        if (s->waiters > 0) s->waiters--;
+        LeaveCriticalSection(&s->value_lock);
+        /* loop: re-check value */
+    }
 #else
     pthread_mutex_lock(&s->mtx);
 
     if (timeout_us == 0) {
         while (s->value <= 0) {
+            s->waiters++;
             pthread_cond_wait(&s->cv, &s->mtx);
+            s->waiters--;
         }
     } else {
         struct timespec ts;
@@ -377,7 +379,9 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
             ts.tv_nsec -= 1000000000L;
         }
         while (s->value <= 0) {
+            s->waiters++;
             int rc = pthread_cond_timedwait(&s->cv, &s->mtx, &ts);
+            s->waiters--;
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&s->mtx);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
@@ -410,14 +414,11 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
-    DWORD result = WaitForSingleObject(s->sem_handle, 0);
-    if (result == WAIT_TIMEOUT) {
+    EnterCriticalSection(&s->value_lock);
+    if (s->value <= 0) {
+        LeaveCriticalSection(&s->value_lock);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
-    if (result != WAIT_OBJECT_0) {
-        return (int64_t)(int32_t)CELL_EINVAL;
-    }
-    EnterCriticalSection(&s->value_lock);
     s->value--;
     LeaveCriticalSection(&s->value_lock);
 #else
@@ -476,23 +477,29 @@ int64_t sys_semaphore_post(ppu_context* ctx)
             fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
                     sem_id, s->value, count, s->max_value); }
         LeaveCriticalSection(&s->value_lock);
-        return (int64_t)(int32_t)CELL_EINVAL;
+        return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
+    /* Wake channel: release exactly enough tokens to cover the parked waiters
+     * this post can satisfy (min(count, waiters)). Woken waiters re-check
+     * value under the lock; an orphaned token (waiter already left) is benign.
+     * This is the lost-wake fix — a post can NEVER skip the release now. */
+    int wake = (count < s->waiters) ? count : s->waiters;
     LeaveCriticalSection(&s->value_lock);
 
-    ReleaseSemaphore(s->sem_handle, count, NULL);
+    if (wake > 0)
+        ReleaseSemaphore(s->sem_handle, wake, NULL);
 #else
     pthread_mutex_lock(&s->mtx);
     if (s->value + count > s->max_value) {
         pthread_mutex_unlock(&s->mtx);
-        return (int64_t)(int32_t)CELL_EINVAL;
+        return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
-    /* Wake waiters */
-    for (int i = 0; i < count; i++) {
-        pthread_cond_signal(&s->cv);
-    }
+    /* Wake the waiters this post can satisfy (broadcast is also correct — they
+     * re-check value — but min(count,waiters) signals is precise). */
+    { int wake = (count < s->waiters) ? count : s->waiters;
+      for (int i = 0; i < wake; i++) pthread_cond_signal(&s->cv); }
     pthread_mutex_unlock(&s->mtx);
 #endif
 

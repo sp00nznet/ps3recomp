@@ -31,8 +31,9 @@ typedef struct sys_semaphore_info {
     int      active;
     char     name[8];
     uint32_t protocol;
-    int32_t  value;      /* current count */
+    int32_t  value;      /* current count; the single source of truth */
     int32_t  max_value;
+    int32_t  waiters;    /* threads currently parked in wait() */
 
 #ifdef _WIN32
     HANDLE   sem_handle;
