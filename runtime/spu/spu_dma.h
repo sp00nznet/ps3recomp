@@ -43,22 +43,12 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
     uint32_t e = (uint32_t)ea;
     if (size == 0) return 0;
     if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
-#ifdef _WIN32
     if (!vm_base) return 0;
-    uint8_t* p = vm_base + e;
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
-    if (mbi.State != MEM_COMMIT) return 0;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    /* If the range spans into the next region, verify the last byte's page too. */
-    uintptr_t region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    if ((uintptr_t)p + size > region_end) {
-        MEMORY_BASIC_INFORMATION mbi2;
-        if (VirtualQuery(p + size - 1, &mbi2, sizeof(mbi2)) == 0) return 0;
-        if (mbi2.State != MEM_COMMIT) return 0;
-        if (mbi2.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    }
-#endif
+    /* The 4 GB bound above is the only check needed. The guest VM is either fully
+     * committed or demand-committed via a page-fault handler (boot_main), so an
+     * in-bounds DMA to an uncommitted page is committed on access, not a crash.
+     * The old per-DMA VirtualQuery (up to 2 OS calls) was pure overhead -- ~60x
+     * slowdown on DMA-heavy SPU workloads (reported by contributors). Dropped. */
     return 1;
 }
 
@@ -213,6 +203,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if (mfc_is_get(cmd)) {
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        /* Overlay watch: a GET into the code segment (LBP-style DMA'd code)
+         * invalidates the stale lifted functions so dispatch re-interprets. */
+        if ((lsa & SPU_LS_MASK) < g_spu_code_hi)
+            spu_code_write_watch(lsa & SPU_LS_MASK, size);
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory */
         memcpy(ea_ptr, ls_ptr, size);

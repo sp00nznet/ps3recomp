@@ -143,6 +143,13 @@ typedef struct spu_context {
      * here. 0 = match any image (back-compat for single-image contexts). */
     int image_id;
 
+    /* When set, a rchcnt(SPU_RdInMbox) that finds the inbound mailbox EMPTY halts
+     * the SPU (spu_halt longjmp) instead of returning 0. Lets a persistent-worker
+     * SPU (e.g. the ducky's AsyncCopy raw SPU) run SYNCHRONOUSLY: it does its full
+     * init + ready-mailbox handshake, then parks the first time it idle-waits for
+     * a PPU command -- deterministic, no async host thread racing the PPU. */
+    int park_on_empty_inmbox;
+
     /* Decrementer (a free-running down counter) */
     uint32_t decrementer;
 
@@ -242,6 +249,21 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
+/* Self-modifying-code watch. A store whose target lands in the lifted code
+ * region invalidates the now-stale compiled function(s) (spu_fn_registry.c) so
+ * the next dispatch interprets the new bytes. g_spu_code_hi == 0 (no code
+ * region active) makes the guard free. ponytail: one predicted-not-taken range
+ * check per quadword store — correctness of self-modifying/overlay SPUs (LBP,
+ * the spu_0004 `sync; bi $3` trampoline) outweighs it. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern uint32_t g_spu_code_lo, g_spu_code_hi;
+void spu_code_write_watch(uint32_t lsa, uint32_t size);
+#ifdef __cplusplus
+}
+#endif
+
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
@@ -253,6 +275,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 2] = (uint8_t)(w >>  8);
         p[i*4 + 3] = (uint8_t)w;
     }
+    if (lsa < g_spu_code_hi) spu_code_write_watch(lsa, 16);
 }
 
 /* ---------------------------------------------------------------------------

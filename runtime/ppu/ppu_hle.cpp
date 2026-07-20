@@ -74,6 +74,8 @@ extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+/* Weak: builds that don't link cellGcmSys.c (test harnesses) get a null and skip. */
+extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
 static inline void* ps3_GetModuleHandleA(const char* m){ return GetModuleHandleA(m); }
 
@@ -91,8 +93,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
     struct _TocGuard { ppu_context* c; uint64_t toc, sp;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc); } } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+    /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
+     * guest execution -- the vblank ticker only marks ticks pending; the handlers
+     * run here so guest code never executes concurrently on the ticker thread. */
+    if (ppu_gcm_pump) ppu_gcm_pump();
 
-    /* YDKJ_TUNERFIX (moved to the top so it wins over any registered handler): the
+    /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
      * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
      * _cellSpursIsLaunchedFromTuner (0x3000D318), must return 0x8001112E ("profiler not
      * loaded") on a normal run. Anything else trips the usertrace.c:123 assert AND makes

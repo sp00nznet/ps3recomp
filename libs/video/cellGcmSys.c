@@ -511,28 +511,71 @@ u32 cellGcmGetFlipStatus(void)
  * drives the title-screen state machine for many games. */
 #include "ps3emu/guest_call.h"
 
-void cellGcmTickVBlank(void)
+/* ---------------------------------------------------------------------------
+ * Serialized vblank/flip handler delivery.
+ *
+ * The vblank ticker runs on its own host thread. Invoking the guest vblank/flip
+ * handlers directly from it executes GUEST CODE concurrently with the main guest
+ * thread -- a data race on guest memory that made the demo nondeterministic (Cg
+ * shader loader aborting run-to-run). Instead the ticker only marks a tick
+ * PENDING (no guest code), and the handlers run on the MAIN guest thread, at HLE
+ * call boundaries (ppu_gcm_pump from ps3_hle_call). Guest handler execution is
+ * therefore serialized with the main thread -- no race.
+ * -----------------------------------------------------------------------*/
+#ifdef _WIN32
+#include <windows.h>
+static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
+#define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
+#define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
+#else
+#include <stdatomic.h>
+static atomic_int s_gcm_pending = 0;
+#define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
+#define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
+#endif
+
+/* Called by the vblank ticker thread. NO guest code -- advance the vblank count
+ * and mark a vblank+flip tick pending for the main thread to deliver. */
+void cellGcm_request_tick(void)
 {
     s_vblank_count++;
-    if (getenv("YDKJ_HANDLERTRACE")) { static int _n=0; if(_n++<4) fprintf(stderr,"[GCM-TICK] VBlank #%llu vblank_handler_opd=0x%08X flip_handler_opd=0x%08X caller=%p\n",(unsigned long long)s_vblank_count,s_vblank_handler_opd,s_flip_handler_opd,(void*)g_ps3_guest_caller); }
-    ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-    if (s_vblank_handler_opd && g_ps3_guest_caller) {
-        g_ps3_guest_caller(s_vblank_handler_opd,
-                           (uint64_t)s_vblank_count, 0, 0, 0);
-    }
+    GCM_PENDING_SET(3);
 }
 
-void cellGcmTickFlip(void)
+/* Run the pending vblank/flip handlers on the CURRENT (main guest) thread.
+ * Called from ps3_hle_call at each HLE boundary. Re-entrancy-guarded, and skipped
+ * while already inside a guest callback (shared scratch stack). */
+void ppu_gcm_pump(void)
 {
-    /* A display refresh: the pending flip is now complete (unblocks a guest
-     * cellGcmSetWaitFlip). */
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    if (getenv("YDKJ_HANDLERTRACE")) { static int _n=0; if(_n++<4) fprintf(stderr,"[GCM-TICK] Flip flip_handler_opd=0x%08X (invoked=%d)\n",s_flip_handler_opd,(s_flip_handler_opd && g_ps3_guest_caller)?1:0); }
-    ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
-    if (s_flip_handler_opd && g_ps3_guest_caller) {
-        g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
+    extern int ppu_in_guest_callback(void);
+    if (ppu_in_guest_callback()) return;
+#ifdef _WIN32
+    static __declspec(thread) int in = 0;
+#else
+    static __thread int in = 0;
+#endif
+    if (in) return;
+    long p = (long)GCM_PENDING_TAKE();
+    if (!p) return;
+    in = 1;
+    if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
+        ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count, 0, 0, 0);
     }
+    if (p & 2) {
+        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        if (s_flip_handler_opd && g_ps3_guest_caller) {
+            ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
+            g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
+        }
+    }
+    in = 0;
 }
+
+/* Back-compat: the old direct entry points now just mark a tick pending (so any
+ * caller other than the ticker still works) -- delivery stays on the main thread. */
+void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+void cellGcmTickFlip(void)   { GCM_PENDING_SET(2); }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
  * (boot_main vblank_ticker). Not yet active: s_control.put stays 0 because

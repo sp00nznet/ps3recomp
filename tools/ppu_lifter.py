@@ -3264,6 +3264,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         except ValueError:
             return None
     import os as _os
+    import types
     _DBG = int(_os.environ.get("JT_DEBUG", "0"), 0)
     def _dbg(addr, msg):
         if _DBG and addr == _DBG:
@@ -3287,6 +3288,26 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             continue
         # the indexed table load
         lwzx = next((w for w in reversed(win) if w.mnemonic == 'lwzx'), None)
+        # 64-bit offset-table idiom emits `sldi rIdx,idx,2; add rT,rIdx,rBase;
+        # lwz rEnt,0(rT)` instead of `lwzx rEnt,rIdx,rBase` (gcc -O2 PPC64).
+        # Synthesize the equivalent lwzx operands (rEnt,rA,rB) so the base/offset
+        # logic below applies unchanged. Without this the switch mis-lifts to a
+        # frame-leaking bctr landing on an unlifted intra-function label
+        # (e.g. JSGCM's ._jsGcmSetStencilCullHint).
+        if lwzx is None:
+            for w in reversed(win):
+                if w.mnemonic == 'lwz':
+                    a = [x.strip() for x in w.operands.split(',')]
+                    if len(a) == 2 and '(' in a[1] and mem_disp(a[1]) == 0:
+                        rT = a[1].split('(')[1].rstrip(')').strip()
+                        add = next((v for v in reversed(win) if v.mnemonic == 'add'
+                                    and [x.strip() for x in v.operands.split(',')][0] == rT), None)
+                        if add is not None:
+                            ap = [x.strip() for x in add.operands.split(',')]
+                            lwzx = types.SimpleNamespace(
+                                mnemonic='lwzx', addr=w.addr,
+                                operands=f"{a[0]}, {ap[1]}, {ap[2]}")
+                            break
         _dbg(all_insns[i].addr, f"lwzx={'None' if lwzx is None else lwzx.operands}")
         if lwzx is None:
             continue
@@ -3295,42 +3316,90 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             continue
         # `lwzx rD, rA, rB` computes MEM(rA + rB); the table-base register may be
         # EITHER operand — gcc emits both `lwzx rD, base, idx` and the swapped
-        # `lwzx rD, idx, base`. Try each candidate; the real base is the one
-        # loaded TOC-relative via `lwz base, disp(r2)`. (Hardcoding p[2] as the
-        # base silently skipped every dispatcher with the operands swapped.)
-        r_val = p[0]
-        disp = None; r_base = None; base_is_ld = False
-        for cand in (p[1], p[2]):
-            # Walk backward to the NEAREST instruction that defines `cand`, and
-            # accept it as the table base only if that definition is a TOC load
-            # (`lwz`/`ld cand, disp(r2)`). Stopping at the first definition is
-            # essential: the 30-instruction window bleeds across the function
-            # boundary, and the index register (e.g. `rldic r9, r3, 2, 30`) often
-            # collides with a stale `lwz r9, disp(r2)` from the PRECEDING function.
-            # Blindly grabbing any matching lwz picked the index reg as the base,
-            # read an unrelated table, decoded 0 targets, and silently dropped the
-            # dispatcher (every dense switch in newlib dtoa fell through -> the
-            # guest's printf("%f") spun forever). gcc (PSL1GHT/newlib) loads the
-            # base with `ld` (64-bit ELFv1 TOC entry); SN uses `lwz`. Accept both.
+        # `lwzx rD, idx, base`. Try each candidate for the table-base register.
+        #
+        # The base is loaded either directly TOC-relative (`lwz base, d(r2)`) or
+        # via ONE level of indirection through a TOC global — gcc's PIC switch
+        # idiom `lwz mid, d1(r2); lwz base, d2(mid)`, so the table pointer lives
+        # in a data global at *(TOC+d1) and the table at *(that + d2). Only
+        # matching the direct form silently dropped every two-level dispatcher
+        # (109 of 130 here), leaving each switch lifted as a failing bctr.
+        # (YDKJ merge: _lwz_of also matches `ld` -- the 64-bit ELFv1 TOC form.
+        # SN loads the base with `lwz`; gcc/PSL1GHT/newlib use `ld`. Accept both,
+        # or every newlib dtoa/printf("%f") dense switch falls through.)
+        def _lwz_of(reg):
+            """Most-recent `lwz/ld reg, disp(rA)` in the window -> (disp, rA_name)."""
             for w in reversed(win):
-                a = [x.strip() for x in w.operands.split(',')]
-                if not a or a[0] != cand:
-                    continue                    # not a definition of cand
-                if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
-                    disp = mem_disp(a[1]); r_base = cand
-                    base_is_ld = (w.mnemonic == 'ld')
-                break                           # first definition of cand wins/loses
-            if disp is not None:
-                break
-        _dbg(all_insns[i].addr, f"disp={disp} r_base={r_base} base_is_ld={base_is_ld} toc={toc}")
-        if disp is None or not toc:
-            continue
+                if w.mnemonic in ('lwz', 'ld'):
+                    a = [x.strip() for x in w.operands.split(',')]
+                    if len(a) == 2 and a[0] == reg and '(' in a[1]:
+                        d = mem_disp(a[1])
+                        rA = a[1].split('(')[1].rstrip(')').strip()
+                        return (d, rA)
+            return None
+        rC = p[0]
+        r_base = None; table_base = None
+        disp = None; mid_disp = None
+        # `toc` may be a single value or a list of TOC candidates (multi-TOC
+        # titles). This preliminary pass confirms which register holds the table
+        # base, the TOC displacement (`disp`) to it, and -- for the two-level
+        # (global-of-global) idiom -- the intermediate displacement (`mid_disp`).
+        # (Bug: this block used the raw `toc` list in `toc + d_base`, throwing
+        # "can only concatenate list (not int) to list"; the caller caught it and
+        # SILENTLY SKIPPED all jump-table discovery -- e.g. gcm/cube's printf
+        # _Putfld switch, mis-lifted as a bare bctr that leaked the frame. And
+        # the per-candidate loop below referenced undefined `disp`/`base_is_ld`.)
         toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
-        # offset table iff an `add rC, *, r_base` combines the loaded value + base
+        _tocs = [t for t in toc_candidates if t]
+        for cand in (p[1], p[2]):
+            ld = _lwz_of(cand)
+            if ld is None:
+                continue
+            d_base, rA = ld
+            if d_base is None:
+                continue
+            for _t in _tocs:
+                if rA == 'r2':                           # one-level: lwz base, d(r2)
+                    table_base = read_u32((_t + d_base) & 0xFFFFFFFF)
+                    if table_base is not None:
+                        disp = d_base; mid_disp = None
+                else:                                    # two-level: base <- global <- TOC
+                    mid = _lwz_of(rA)
+                    if mid is not None and mid[0] is not None and mid[1] == 'r2':
+                        midval = read_u32((_t + mid[0]) & 0xFFFFFFFF)
+                        if midval is not None:
+                            table_base = read_u32((midval + d_base) & 0xFFFFFFFF)
+                            if table_base is not None:
+                                disp = d_base; mid_disp = mid[0]
+                if table_base is not None:
+                    break
+            if table_base is not None:
+                r_base = cand; break
+        if table_base is None or disp is None or not _tocs:
+            continue
+        # offset table iff an `add ..., r_base` combines the loaded table value
+        # with the base. The loaded value flows from the lwzx dest (`rC`=p[0]) into
+        # the add, often through an intermediate `extsw`/`mr`/`clrldi`/`rldicl`
+        # (`lwzx r12,..; extsw r5,r12; add r3,r5,r_base; mtctr r3`). Track the set
+        # of registers that carry the (sign-/zero-extended) offset, then look for
+        # an `add` that combines any of them with r_base. Matching only `add rC,*`
+        # (the raw lwzx dest) missed every dispatcher with an extend in between --
+        # mis-lifting the switch as a frame-leaking bctr to an unlifted case (e.g.
+        # libxml2's xmlReportError offset-table @ 0x2B8448). */
+        off_regs = {rC}
+        for w in win:
+            # Only follow a sign/zero EXTEND of the loaded offset (the extra step
+            # gcc inserts, `extsw r5,r12`). Do NOT chase `mr`/`clrldi`/`rldicl`:
+            # those flow other values too and broadened is_offset enough to turn a
+            # correctly-absolute table into an offset decode -> wrong case targets.
+            if w.mnemonic in ('extsw', 'extsb', 'extsh'):
+                a = [x.strip() for x in w.operands.split(',')]
+                if len(a) >= 2 and a[1] in off_regs:
+                    off_regs.add(a[0])
         is_offset = any(
-            w.mnemonic == 'add' and
-            [x.strip() for x in w.operands.split(',')][0] == rC and
-            r_base in [x.strip() for x in w.operands.split(',')][1:]
+            w.mnemonic == 'add' and (
+                lambda ops: r_base in ops[1:] and any(o in off_regs for o in ops[1:])
+            )([x.strip() for x in w.operands.split(',')])
             for w in win)
         # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`. Match the
         # compare on the RAW INDEX register: the lwzx index (rIdx*4) is usually a
@@ -3394,12 +3463,10 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         for cand in toc_candidates:
             if not cand:
                 continue
-            if base_is_ld:
-                hi = read_u32((cand + disp) & 0xFFFFFFFF)
-                table_base = read_u32((cand + disp + 4) & 0xFFFFFFFF)
-                if hi:              # table addresses live in the 32-bit VA space
-                    table_base = None
-            else:
+            if mid_disp is not None:    # two-level: base <- *(*(TOC+mid)+disp)
+                midval = read_u32((cand + mid_disp) & 0xFFFFFFFF)
+                table_base = read_u32((midval + disp) & 0xFFFFFFFF) if midval else None
+            else:                       # one-level: base <- *(TOC+disp)
                 table_base = read_u32((cand + disp) & 0xFFFFFFFF)
             _dbg(all_insns[i].addr, f"cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
             if table_base is None:

@@ -23,6 +23,7 @@
 #include "sys_vm.h"
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
+#include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
 #include "sys_event.h"
 
 #include <stdio.h>
@@ -218,6 +219,7 @@ typedef struct {
      * the registered job expects. */
     uint32_t args_ea;
     uint32_t args_size;
+    uint32_t img_ea;         /* sys_spu_image descriptor EA (for LS segment load) */
     /* Async fallback execution. host_thread is set when group_start spawned
      * a host thread for this SPU thread's PPU fallback; finish_event is
      * signalled when the handler returns; running indicates the thread is
@@ -461,6 +463,7 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     /* Read entry point from the SPU image struct if available.
      * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
+    t->img_ea    = img_ea;
     t->args_ea   = args_ea;
     t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
 
@@ -529,6 +532,17 @@ static void* spu_fallback_thread_proc(void* arg)
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
     }
     t->exit_status = rc;
+    /* EXPERIMENT (RD_SPU_DONE_EVENT): on SPU thread completion, deliver an event
+     * to the connected queue -- PPU code may block in sys_event_queue_receive for
+     * the SPU's completion signal (which normally comes from a WrOutIntrMbox the
+     * SPU issues before finishing). Tests whether the render hang is that wait. */
+    if (getenv("RD_SPU_DONE_EVENT") && t->connected_queue) {
+        extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        sys_event_queue_push_by_id(t->connected_queue,
+            ((uint64_t)t->tid << 32) | 0x2u, (uint64_t)(uint32_t)rc, 0, 0);
+        fprintf(stderr, "[SPU-DONE-EVT] tid=0x%X rc=0x%X -> queue=%u\n",
+                t->tid, rc, t->connected_queue);
+    }
     /* Mark complete and signal anyone waiting in group_join. */
 #ifdef _WIN32
     t->running = 0;
@@ -542,6 +556,83 @@ static void* spu_fallback_thread_proc(void* arg)
     pthread_mutex_unlock(&t->finish_event.mu);
     return NULL;
 #endif
+}
+
+/* Load a sys_spu_image's segments into a 256 KB local store. COPY segments
+ * (type 1) are memcpy'd from their guest source EA; FILL segments (type 2) are
+ * zeroed. Mirrors sys_spu_image_import's segment layout {type,ls_start,size,
+ * src(pa64)} (0x18 bytes each). Returns the entry point, or 0 on failure. */
+static uint32_t spu_load_image_to_ls(uint32_t img_ea, uint8_t* ls)
+{
+    if (!img_ea || !ls || !vm_base) return 0;
+    uint32_t entry = vm_read_be32(img_ea + 4);
+    uint32_t segs  = vm_read_be32(img_ea + 8);
+    uint32_t nsegs = vm_read_be32(img_ea + 12);
+    for (uint32_t s = 0; s < nsegs && s < 64; s++) {
+        uint32_t b        = segs + s * 0x18;
+        uint32_t type     = vm_read_be32(b + 0x00);
+        uint32_t ls_start = vm_read_be32(b + 0x04) & (SPU_LS_SIZE - 1);
+        uint32_t size     = vm_read_be32(b + 0x08);
+        uint32_t src_lo   = vm_read_be32(b + 0x14);
+        if (ls_start + size > SPU_LS_SIZE) size = SPU_LS_SIZE - ls_start;
+        if (type == 1 && src_lo)              /* COPY: guest EA -> LS */
+            memcpy(ls + ls_start, vm_base + src_lo, size);
+        else if (type == 2)                   /* FILL: zero */
+            memset(ls + ls_start, 0, size);
+    }
+    return entry;
+}
+
+/* PPU-fallback that runs an un-lifted SPU thread via the interpreter. Registered
+ * for the currently-instant-completing thread groups when RD_SPU_INTERP is set
+ * (see group_start). Loads the thread's image into its LS and interprets from
+ * the entry point; DMA/mailbox/event ops go through the shared channel ABI. */
+static uint8_t* spu_thread_get_or_alloc_ls(spu_thread_t* t);   /* fwd (defined below) */
+static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
+                                   uint32_t args_size, void* user)
+{
+    (void)args_size; (void)user;
+    spu_thread_t* t = spu_find_thread(tid);
+    if (!t) return -1;
+    uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+    if (!ls) return -1;
+    uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+    if (getenv("RD_SPU_ARGS") && vm_base && args_ea) {
+        fprintf(stderr, "[SPU-ARGS] tid=0x%X args@0x%08X:", tid, args_ea);
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %08X", vm_read_be32(args_ea + i*4));
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
+            tid, entry, t->img_ea, args_ea);
+    int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1,  /* pure interp: no fast-path rejoin */
+                                    t->tid, t->group_id, 0); /* identify for mbox->event delivery */
+    { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+      fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
+              tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
+    return sc;
+}
+
+/* Per-frame sim-SPU dispatch. The game runs its SPU jobs as persistent workers:
+ * after init they stop, then each frame the game event-port-sends a work-
+ * descriptor EA and waits on the SPU's completion queue. Re-run the SPU whose
+ * connected completion queue is `comp_queue`, feeding `work_ea` into its inbound
+ * mailbox (its first rdch InMbox), so it DMAs that frame's descriptor, computes,
+ * and signals completion -- satisfying the PPU's wait. Returns 1 if dispatched. */
+int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
+{
+    if (!getenv("RD_SPU_INTERP")) return 0;
+    for (uint32_t i = 0; i < MAX_SPU_THREADS; i++) {
+        spu_thread_t* t = &s_spu_threads[i];
+        if (!t->in_use || t->connected_queue != comp_queue || !t->img_ea) continue;
+        uint8_t* ls = spu_thread_get_or_alloc_ls(t);
+        if (!ls) return 0;
+        uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+        fprintf(stderr, "[SPU-FRAME] tid=0x%X q=%u work=0x%08X -> re-run\n",
+                t->tid, comp_queue, work_ea);
+        spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id, work_ea);
+        return 1;
+    }
+    return 0;
 }
 
 /* sys_spu_thread_group_start(id) */
@@ -587,6 +678,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (!t->in_use) continue;
         void* user = NULL;
         spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
+        if (!fb && getenv("RD_SPU_INTERP") && t->img_ea) {
+            /* No lifted fallback: interpret the image instead of instant-
+             * completing. Additive + env-gated so it can't destabilize titles
+             * that rely on a registered fallback. */
+            fb = spu_interp_fallback;
+            user = NULL;
+        }
         if (!fb) {
             t->exit_status = 0;
             t->running = 0;
@@ -596,6 +694,20 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         t->fb_handler = fb;
         t->fb_user    = user;
         t->running    = 1;
+        /* Interpreted sim jobs are fire-and-forget compute (DMA in -> compute ->
+         * DMA out -> stop) that don't block on PPU input mid-run. Running them on
+         * an async host thread races the PPU's own use of the results (e.g. the
+         * ducky's initShaders aborts nondeterministically). Run them SYNCHRONOUSLY
+         * here so group_start returns only after the SPU has finished and written
+         * its output -- deterministic, and matches how the PPU expects to consume
+         * the results right after start/join. (RD_SPU_INTERP_ASYNC forces the old
+         * async path if a job ever needs to overlap with the PPU.) */
+        if (fb == spu_interp_fallback && !getenv("RD_SPU_INTERP_ASYNC")) {
+            t->exit_status = fb(t->tid, t->args_ea, t->args_size, user);
+            t->running = 0;
+            instant++;
+            continue;
+        }
 #ifdef _WIN32
         /* Manual-reset event so multiple group_join callers all see "set" */
         if (!t->finish_event)

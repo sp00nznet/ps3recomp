@@ -88,11 +88,25 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * appending a literal "app_home" directory that doesn't exist on disk. */
     const char* rel = ps3_path;
     const char* ah = strstr(ps3_path, "app_home/");
-    if (ah) rel = ah + 9;                 /* everything after "app_home/" */
+    /* Map anything from a "USRDIR/" component onward to <root>/USRDIR/... directly.
+     * This bypasses the full /dev_hdd0/game/<ID>/USRDIR install tree (which we
+     * normally provide via a filesystem junction) -- concurrent opens THROUGH a
+     * Windows junction intermittently fail (the source of the nondeterministic Cg
+     * shader "could not be read" abort). The real assets live under <root>/USRDIR,
+     * so resolve straight there. */
+    const char* usrp = strstr(ps3_path, "USRDIR/");
+    if (usrp) rel = usrp;                  /* "USRDIR/..." */
+    else if (ah) rel = ah + 9;             /* everything after "app_home/" */
     else if (rel[0] == '/') rel++;         /* otherwise just strip leading slash */
 
     snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
     fs_normalize_sep(host_path);
+    /* NOTE: do NOT stat() the direct path and fall back to the dev_hdd0 junction
+     * on failure. stat() intermittently returns ENOENT for an existing file here
+     * (a Windows transient), and the junction fallback made it WORSE -- the flaky
+     * stat sent a real open to a path that doesn't exist. The direct <root>/USRDIR
+     * layout holds the assets; a genuinely-missing direct path is handled by the
+     * caller's open retry + the extracted-dump fallback below. */
 
     /* Extracted-dump fallback: our test setups often hold a title's data at
      * <root>/extracted/USRDIR/... rather than the full /dev_hdd0/game/<ID>/USRDIR
@@ -211,13 +225,30 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     FILE* fp = fopen(host_path, mode);
 
+    /* Transient open failures: on Windows an existing, correctly-pathed file can
+     * intermittently fail to open (AV/indexer holding a share lock, or momentary
+     * handle pressure) -- which surfaced as a NONDETERMINISTIC "Cg shader file
+     * could not be read" abort. Retry a few times with a brief backoff for a
+     * read-only open of a file that exists; deterministic and cheap. */
+    if (!fp && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
+        for (int _r = 0; !fp && _r < 3000; _r++) {
+#ifdef _WIN32
+            Sleep(1);
+#endif
+            fp = fopen(host_path, mode);
+        }
+        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
+    }
+
     /* If CREAT flag set and file doesn't exist, try creating it */
     if (!fp && (flags & CELL_FS_O_CREAT)) {
         fp = fopen(host_path, "w+b");
     }
 
     if (!fp) {
-        fprintf(stderr, "[sys_fs] open FAILED: %s\n", host_path);
+        { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
+          fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
+                  host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 

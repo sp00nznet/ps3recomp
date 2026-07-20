@@ -298,6 +298,9 @@ int64_t sys_semaphore_post(ppu_context* ctx)
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     if (s->value + count > s->max_value) {
+        if (getenv("RD_SEMTRACE")) { static int _n=0; if(_n++<6)
+            fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
+                    sem_id, s->value, count, s->max_value); }
         LeaveCriticalSection(&s->value_lock);
         return (int64_t)(int32_t)CELL_EINVAL;
     }

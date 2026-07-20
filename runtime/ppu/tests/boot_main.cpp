@@ -169,7 +169,9 @@ extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
-    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "You Don't Know Jack (ps3recomp)") == 0);
+    const char* _title = getenv("PS3_TITLE");
+    if (!_title || !*_title) _title = "You Don't Know Jack (ps3recomp)";
+    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, _title) == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     unsigned last_flip = 0;
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must

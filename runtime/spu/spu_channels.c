@@ -13,6 +13,8 @@
  */
 
 #include "spu_dma.h"
+#include "spu_interp.h"        /* spu_dispatch — interpreter fallback on miss */
+#include "spu_fn_registry.h"   /* spu_lookup / spu_register_function */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -365,7 +367,15 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
                   (unsigned long long)s_cnt[3],(unsigned long long)s_cnt[4],(unsigned long long)s_cnt[5],
                   (unsigned long long)s_cnt[6],(unsigned long long)s_cnt[7], channel); } }
     switch (channel) {
-    case SPU_RdInMbox:       return ctx->ch_in_mbox.count;                 /* readable */
+    case SPU_RdInMbox:
+        /* Synchronous persistent-worker park: after its handshake the SPU polls
+         * the inbound mailbox for PPU commands; if empty and parking is armed,
+         * halt (longjmp out of spu_run_with_halt) instead of spinning forever. */
+        if (ctx->park_on_empty_inmbox && ctx->ch_in_mbox.count == 0) {
+            extern void spu_halt(spu_context*);
+            spu_halt(ctx);
+        }
+        return ctx->ch_in_mbox.count;                                     /* readable */
     case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
     case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count;
     case SPU_RdSigNotify1:   return ctx->ch_sig_notify[0].count;
@@ -377,48 +387,13 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 }
 
 /* ===========================================================================
- * Indirect-branch dispatch + function registry
+ * Indirect-branch dispatch
+ *
+ * The lifted-function registry (spu_begin_image / spu_register_function /
+ * spu_lookup) and its self-modification eviction (spu_invalidate) now live in
+ * spu_fn_registry.c so they can be unit-tested without the MFC/DMA world.
  * ===========================================================================*/
-typedef void (*spu_fn)(spu_context*);
-
-typedef struct {
-    uint32_t addr;
-    spu_fn   fn;
-    int      image_id;   /* which recompiled image this function belongs to */
-} spu_reg_entry;
-
-#define SPU_FN_REGISTRY_MAX 65536
-static spu_reg_entry s_registry[SPU_FN_REGISTRY_MAX];
-static uint32_t s_registry_count = 0;
-
-/* Image currently being registered. SPURS images (kernel/policy/job) overlap in
- * LS, so each registers under a distinct id via spu_begin_image() before calling
- * its (prefixed) spu_recomp_register(). Single-image callers leave it 0. */
-static int s_reg_image = 0;
-void spu_begin_image(int image_id) { s_reg_image = image_id; }
-
-void spu_register_function(uint32_t addr, spu_fn fn)
-{
-    if (s_registry_count < SPU_FN_REGISTRY_MAX) {
-        s_registry[s_registry_count].addr = addr;
-        s_registry[s_registry_count].fn = fn;
-        s_registry[s_registry_count].image_id = s_reg_image;
-        s_registry_count++;
-    }
-}
-
-static spu_fn spu_lookup(uint32_t addr, int image_id)
-{
-    /* Linear scan is fine for the small per-image tables. Match the context's
-     * active image; image_id 0 (context or entry) matches any, for back-compat
-     * with single-image contexts. */
-    for (uint32_t i = 0; i < s_registry_count; i++)
-        if (s_registry[i].addr == addr &&
-            (image_id == 0 || s_registry[i].image_id == 0 ||
-             s_registry[i].image_id == image_id))
-            return s_registry[i].fn;
-    return NULL;
-}
+#include "spu_fn_registry.h"
 
 /* HLE of the taskset Policy Module's task-syscall entry (LS 0xA70). A SPURS task
  * (e.g. the cri_mpv task, image 22) reads syscallAddr from its SpursTasksetContext
@@ -546,6 +521,17 @@ void spu_indirect_branch(spu_context* ctx)
     if (fn) {
         fn(ctx);
         return;
+    }
+    /* Miss: a computed branch into code with no registered lifted entry —
+     * non-lifted, a DMA'd overlay, or a self-modified region (post-eviction).
+     * Interpret from live local store (the correctness floor). spu_dispatch
+     * rejoins the fast path if it reaches a lifted entry, or runs to `stop`.
+     * Only a genuine branch-to-0 or an unimplemented opcode (HALT) falls
+     * through to the diagnostic dump below. */
+    if (ctx->pc != 0) {
+        spu_dispatch(ctx, ctx->pc);
+        if (!(ctx->status & SPU_STATUS_STOPPED_BY_HALT))
+            return;
     }
     { static int _bt0=0; if (_bt0++ < 12)
         fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
