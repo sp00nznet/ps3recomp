@@ -262,12 +262,28 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                * (0x22AAB31D) validates the same struct. Show what our recomp left there. */
               if (st && (nid==0x87630976u || nid==0x22AAB31Du)) {
                   extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
-                  /* 0x30015AA4's atomic stamps +0xC=0xFF only if struct+4(halfword)==0 &&
-                   * struct+7(byte)==0; else it branches away without stamping. Show both. */
-                  uint32_t p4 = (vm_base[s3+4]<<8)|vm_base[s3+5];
-                  fprintf(stderr, "  [state] struct@0x%08X: +0C=%02X +0E=%02X | stamp-precond +4=%04X +7=%02X"
-                      " (need both 0 to stamp +0C=FF)\n",
-                      s3, vm_base[s3+0xC], vm_base[s3+0xE], p4, vm_base[s3+7]); }
+                  #define _RW(o) ((vm_base[s3+(o)]<<24)|(vm_base[s3+(o)+1]<<16)|(vm_base[s3+(o)+2]<<8)|vm_base[s3+(o)+3])
+                  /* Full task-descriptor dump: +0xC state(need FF), +0xE type, +0x74/+0x7C
+                   * handles (the helper 0x3000b140 does an atomic on *(+0x74)+0xda8 -> if 0,
+                   * garbage), +0x4/+0x7 stamp preconds. */
+                  fprintf(stderr, "  [state] struct@0x%08X:", s3);
+                  for (uint32_t o=0; o<0x80; o+=16) {
+                      fprintf(stderr, " |+%02X:", o);
+                      for (uint32_t k=0;k<16;k+=4) fprintf(stderr, "%08X ", _RW(o+k));
+                  }
+                  fprintf(stderr, "\n    +0C=%02X(need FF) +0E=%02X +74=%08X +7C=%08X\n",
+                      vm_base[s3+0xC], vm_base[s3+0xE], _RW(0x74), _RW(0x7C));
+                  /* The helper 0x3000b140 does a bitmap atomic on taskset(+0x74)+0xda8 --
+                   * the task-slot free bitmap CreateTaskset should have initialized. Dump it. */
+                  uint32_t ts = _RW(0x74);
+                  if (ts >= 0x40000000u && ts < 0x50000000u) {
+                      #define _RT(o) ((vm_base[ts+(o)]<<24)|(vm_base[ts+(o)+1]<<16)|(vm_base[ts+(o)+2]<<8)|vm_base[ts+(o)+3])
+                      fprintf(stderr, "    taskset@0x%08X +0xda8 slot-bitmap: %08X %08X %08X %08X | +0x00:%08X +0x08:%08X\n",
+                          ts, _RT(0xda8), _RT(0xdac), _RT(0xdb0), _RT(0xdb4), _RT(0x00), _RT(0x08));
+                      #undef _RT
+                  }
+                  #undef _RW
+              }
             }
             /* Arm a page-guard on the CellSpurs struct at cellSpursInitializeWithAttribute2
              * ENTRY (nid 0xAA6269A8, r3=&spurs) — before the init writes it — to catch
