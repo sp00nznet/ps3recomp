@@ -60,10 +60,25 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     spu_context* ctx = s_pm_ctx[wid][spu_num];
     int first = 0;
+    /* SPURS_PM_FRESH=1: treat EVERY dispatch as first contact (zeroed LS, image
+     * reloaded). A/B against the persistent default: with persistence, the wwsjob
+     * PM's first entry attaches + claims exactly ONE ticket then yields, and every
+     * RE-entry takes a stale-state path that does NOTHING (LS 0x12A0/0x12C0/0x12F0
+     * job-pipeline slots persist; entry only partially re-inits them) -- LBP's
+     * 10-ticket loading queue stalls at lanes {1,2} forever. Fresh contexts make
+     * each dispatch run the full attach->claim->yield cycle, so repeated kernel
+     * dispatches drain the queue one ticket at a time (the persistent-LS claim
+     * that motivated the cache predates the r4 word0/word1 layout fix). */
+    static int s_fresh = -1;
+    if (s_fresh < 0) s_fresh = getenv("SPURS_PM_FRESH") ? 1 : 0;
     if (!ctx) {
         ctx = (spu_context*)malloc(sizeof(spu_context));
         if (!ctx) return -1;
         s_pm_ctx[wid][spu_num] = ctx;
+        first = 1;
+        memset(ctx, 0, sizeof(*ctx));
+        spu_context_init(ctx, 0);
+    } else if (s_fresh) {
         first = 1;
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
@@ -142,7 +157,70 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
+    /* SPURS_PM_FLOW=1: capture this run's cross-function transfer trail (drain
+     * hook in spu_drain.c) and dump it IF the run performed a PUTLLC (= a queue
+     * claim) -- reconstructs the post-claim decision path that ends in a bare
+     * exit-to-kernel instead of job staging. Only spu_num 0 is traced (the
+     * concurrent lanes would interleave the buffer). */
+    extern uint32_t g_pm_flow_buf[]; extern volatile unsigned g_pm_flow_n;
+    extern void* volatile g_pm_flow_ctx;
+    extern volatile unsigned g_spu_putllc_count;
+    extern volatile unsigned g_spu_putllc_sync_hit;
+    extern uint32_t g_barrier_sync_watch;
+    static int s_flow = -1;
+    if (s_flow < 0) s_flow = getenv("SPURS_PM_FLOW") ? 1 : 0;
+    unsigned putllc_before = g_spu_putllc_sync_hit;
+    (void)g_spu_putllc_count;
+    /* Trace ONLY the stalled queue's own runs: wkl_data == the sync EA the PPU
+     * barrier/ticket probes armed (ticket-pub arms it at first publish, before
+     * the PM's first work pass). Idle re-runs of this wid matter as much as the
+     * claim run -- the empty-cursor path returns without any PUTLLC. */
+    int tracing = (s_flow && spu_num == 0 && g_pm_flow_ctx == 0 &&
+                   g_barrier_sync_watch &&
+                   (uint32_t)wkl_data == g_barrier_sync_watch);
+    static volatile unsigned long long s_flow_arm_ms;
+    extern unsigned long long ps3_ms_now(void);
+    if (tracing) {
+        g_pm_flow_n = 0; g_pm_flow_ctx = ctx;
+        s_flow_arm_ms = ps3_ms_now();
+        { static int _a = 0; if (_a++ < 8) {
+            fprintf(stderr, "[pm-flow] ARM wid=%u spu=%u (watch=0x%08X)\n",
+                    wid, spu_num, g_barrier_sync_watch); fflush(stderr); } }
+        /* Watchdog: the traced run has been observed to HANG the jobmanager
+         * kernel thread (the claim run never returns -> no later dispatch can
+         * report). A detached thread dumps the partial trail after 5s; the
+         * trail's LAST pc names the looping lifted function. */
+        { static int s_wd_started = 0;
+          if (!s_wd_started) { s_wd_started = 1;
+            extern void spurs_pm_flow_watchdog_start(void);
+            spurs_pm_flow_watchdog_start(); } }
+    }
+
     spu_run_with_halt(entry, ctx);
+
+    if (tracing) {
+        g_pm_flow_ctx = 0;
+        static int s_dumps = 0;
+        /* Only dump once the PPU is actually spinning on a job barrier
+         * (g_barrier_sync_watch armed by the barrier probe): boot-time idle
+         * runs also PUTLLC (queue-check protocol) and would burn the cap. */
+        if (s_dumps < 6) {
+            s_dumps++;
+            unsigned n = g_pm_flow_n; if (n > 8192) n = 8192;
+            fprintf(stderr, "[pm-flow] dump#%d wid=%u %u transfers (sync-PUTLLC delta %u):",
+                    s_dumps, wid, n, g_spu_putllc_sync_hit - putllc_before);
+            uint32_t last = 0xFFFFFFFFu; unsigned rep = 0;
+            for (unsigned i = 0; i < n; i++) {
+                uint32_t pc = g_pm_flow_buf[i] & SPU_LS_MASK;
+                if (pc == last) { rep++; continue; }
+                if (rep) { fprintf(stderr, "*%u", rep + 1); rep = 0; }
+                fprintf(stderr, "%s%05X", (i % 16) ? " " : "\n  ", pc);
+                last = pc;
+            }
+            if (rep) fprintf(stderr, "*%u", rep + 1);
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
 
     if (log_this) {
         fprintf(stderr, "[spurs-pm] END wid=%u status=0x%X pc=0x%05X polls=%u exited=%u\n",
@@ -172,6 +250,48 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 extern const unsigned char g_taskset_policy_bytes[];
 extern const unsigned g_taskset_policy_size;
 extern void tsp_spu_func_00000A00(spu_context*);
+
+/* pm-flow hang watchdog: dump the traced run's partial transfer trail + live
+ * ctx state 5s after arm if the run hasn't returned (g_pm_flow_ctx still set).
+ * Reads of the running ctx are racy by design -- diagnostic only. */
+#ifdef _WIN32
+#include <windows.h>
+static DWORD WINAPI spurs_pm_flow_watchdog(LPVOID p)
+{
+    (void)p;
+    extern uint32_t g_pm_flow_buf[]; extern volatile unsigned g_pm_flow_n;
+    extern void* volatile g_pm_flow_ctx;
+    Sleep(5000);
+    spu_context* ctx = (spu_context*)g_pm_flow_ctx;
+    if (!ctx) { fprintf(stderr, "[pm-flow] watchdog: run returned (no hang)\n"); return 0; }
+    unsigned n = g_pm_flow_n; if (n > 8192) n = 8192;
+    fprintf(stderr, "[pm-flow] HUNG-RUN PARTIAL: %u transfers, live pc=0x%05X "
+            "LS12A0=%02X%02X LS12C0=%02X%02X LS12F0=%02X%02X%02X%02X LS1300=%02X%02X:",
+            n, ctx->pc & SPU_LS_MASK,
+            ctx->ls[0x12A0], ctx->ls[0x12A1],
+            ctx->ls[0x12C0], ctx->ls[0x12C1],
+            ctx->ls[0x12F0], ctx->ls[0x12F1], ctx->ls[0x12F2], ctx->ls[0x12F3],
+            ctx->ls[0x1300], ctx->ls[0x1301]);
+    uint32_t last = 0xFFFFFFFFu; unsigned rep = 0; unsigned col = 0;
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t pc = g_pm_flow_buf[i] & SPU_LS_MASK;
+        if (pc == last) { rep++; continue; }
+        if (rep) { fprintf(stderr, "*%u", rep + 1); rep = 0; }
+        fprintf(stderr, "%s%05X", (col++ % 16) ? " " : "\n  ", pc);
+        last = pc;
+    }
+    if (rep) fprintf(stderr, "*%u", rep + 1);
+    fprintf(stderr, "\n"); fflush(stderr);
+    return 0;
+}
+void spurs_pm_flow_watchdog_start(void)
+{
+    HANDLE h = CreateThread(NULL, 0, spurs_pm_flow_watchdog, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+#else
+void spurs_pm_flow_watchdog_start(void) {}
+#endif
 
 int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
                                    uint32_t spurs_ea, uint64_t wkl_data,

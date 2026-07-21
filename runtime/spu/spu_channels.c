@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -199,6 +200,13 @@ static volatile long g_resv_lock = 0;
 static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { } }
 static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
 
+/* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
+ * the delta across one policy run to find the run that performed a claim. */
+volatile unsigned g_spu_putllc_count = 0;
+/* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
+ * work-run on the stalled job queue from the dozen idle jobmanager instances. */
+volatile unsigned g_spu_putllc_sync_hit = 0;
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -297,6 +305,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
       } }
     switch (cmd) {
     case MFC_GETLLAR_CMD:
+        /* Lockstep tick: a guest GETLLAR..PUTLLC poll loop is intra-function
+         * (all gotos), so it never crosses the SPU_DRAIN tick site -- without a
+         * tick here a polling SPU would hold the run token forever while the
+         * peer that must WRITE the line waits for it (canersaka ticks the
+         * GETLLAR fast+slow paths for exactly this reason). */
+        yz_lockstep_tick(ctx);
         resv_lock();
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
         memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);  /* snapshot for compare */
@@ -305,6 +319,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
+        g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
+        { extern uint32_t g_barrier_sync_watch;
+          uint32_t b = g_barrier_sync_watch;
+          if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
         resv_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
@@ -764,7 +782,14 @@ static void spu_spurs_taskset_syscall(spu_context* ctx)
                        ((uint32_t)ctx->ls[0x27D6] << 8)  |  (uint32_t)ctx->ls[0x27D7];
         if (ts) {
             extern int spu_taskset_wait_signal(uint32_t, uint32_t);
+            /* Park = OS-level wait on this SPU's host thread. Under the lockstep
+             * gate the thread HOLDS the global run token here; parking without
+             * releasing it starves every other lifted SPU (observed: FMOD task 1
+             * parks in WAIT_SIGNAL holding the token -> the mixer never runs
+             * again -> the PPU audio pump blocks forever on flag 0x94F600). */
+            yz_lockstep_block_begin(ctx);
             spu_taskset_wait_signal(ts, tid);
+            yz_lockstep_block_end(ctx);
         }
         ctx->gpr[3]._u32[0] = 0;
         return;
@@ -772,6 +797,143 @@ static void spu_spurs_taskset_syscall(spu_context* ctx)
     /* EXIT(0, cri bootstrap)/YIELD(1)/POLL(3)/RECV_WKL_FLAG(4):
      * report success and resume (return -> lifted caller continues at its link). */
     ctx->gpr[3]._u32[0] = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Micro-interpreter for RUNTIME-GENERATED stub code (SMC).
+ *
+ * The WWS jobmanager's interrupt handler GENERATES a register save/restore
+ * stub above the static image (LS 0x3FEC0: a chain of stqd/lqd plus a `bi`
+ * terminator, written at interrupt entry) and calls it. No lift can exist for
+ * bytes that only come into being at runtime, so when the indirect dispatch
+ * finds no registered function we interpret the LIVE LS bytes directly for
+ * the small instruction set such stubs use, and exit back into lifted code at
+ * the first branch (trampoline re-dispatch). Returns 1 if it executed to a
+ * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
+static int spu_smc_microstep(spu_context* ctx)
+{
+    uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+    for (int steps = 0; steps < 4096; steps++) {
+        uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
+                     ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
+        uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
+        uint32_t rt = w & 0x7F, ra = (w >> 7) & 0x7F, rb = (w >> 14) & 0x7F;
+        int32_t  i10 = (int32_t)(w << 8) >> 22;               /* bits 14-23 sext */
+        int32_t  i16 = (int32_t)(int16_t)((w >> 7) & 0xFFFF);
+        (void)rb;
+
+        if (op11 == 0x1A8 || op11 == 0x1A9 || op11 == 0x1AA || op11 == 0x1AB) {
+            /* bi / bisl / iret / bisled (+E/D interrupt bits) */
+            if (op11 == 0x1AB &&                       /* bisled: only on event */
+                (ctx->event_status & ctx->event_mask) == 0) { pc += 4; continue; }
+            if (w & 0x40000) ctx->int_enable = 1;
+            else if (w & 0x80000) ctx->int_enable = 0;
+            uint32_t tgt = (op11 == 0x1AA) ? ctx->srr0
+                                           : ctx->gpr[ra]._u32[0];
+            if (op11 == 0x1A9 || op11 == 0x1AB)
+                ctx->gpr[rt] = spu_splat_u32(pc + 4);
+            ctx->pc = tgt & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1;
+        }
+        if (op11 >= 0x128 && op11 <= 0x12B) {
+            /* biz / binz / bihz / bihnz rt,ra (+E/D bits, taken-only) */
+            uint32_t cv = ctx->gpr[rt]._u32[0];
+            int taken;
+            switch (op11) {
+            case 0x128: taken = (cv == 0); break;                     /* biz  */
+            case 0x129: taken = (cv != 0); break;                     /* binz */
+            case 0x12A: taken = ((cv & 0xFFFF) == 0); break;          /* bihz */
+            default:    taken = ((cv & 0xFFFF) != 0); break;          /* bihnz*/
+            }
+            if (!taken) { pc += 4; continue; }
+            if (w & 0x40000) ctx->int_enable = 1;
+            else if (w & 0x80000) ctx->int_enable = 0;
+            ctx->pc = ctx->gpr[ra]._u32[0] & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1;
+        }
+        if (op9 == 0x064 || op9 == 0x060 || op9 == 0x066 || op9 == 0x062) {
+            /* br / bra / brsl / brasl */
+            uint32_t tgt = (op9 == 0x060 || op9 == 0x062)
+                         ? ((uint32_t)i16 << 2)
+                         : (pc + ((uint32_t)i16 << 2));
+            if (op9 == 0x066 || op9 == 0x062)
+                ctx->gpr[rt] = spu_splat_u32(pc + 4);
+            ctx->pc = tgt & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1;
+        }
+        if (op9 == 0x040 || op9 == 0x042 || op9 == 0x044 || op9 == 0x046) {
+            /* brz / brnz / brhz / brhnz rt,label (relative) */
+            uint32_t cv = ctx->gpr[rt]._u32[0];
+            int taken;
+            switch (op9) {
+            case 0x040: taken = (cv == 0); break;
+            case 0x042: taken = (cv != 0); break;
+            case 0x044: taken = ((cv & 0xFFFF) == 0); break;
+            default:    taken = ((cv & 0xFFFF) != 0); break;
+            }
+            if (!taken) { pc += 4; continue; }
+            ctx->pc = (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~3u;
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1;
+        }
+        if (op8 == 0x24) {                                    /* stqd rt,i10(ra) */
+            uint32_t a = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
+            spu_ls_write128(ctx, a, ctx->gpr[rt]);
+            pc += 4; continue;
+        }
+        if (op8 == 0x34) {                                    /* lqd rt,i10(ra) */
+            uint32_t a = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
+            ctx->gpr[rt] = spu_ls_read128(ctx, a);
+            pc += 4; continue;
+        }
+        if (op9 == 0x041 || op9 == 0x061) {                   /* stqa / lqa (abs) */
+            uint32_t a = (((w >> 7) & 0xFFFF) << 4) & SPU_LS_MASK & ~15u;
+            if (op9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[rt]);
+            else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
+            pc += 4; continue;
+        }
+        if (op9 == 0x047 || op9 == 0x067) {                   /* stqr / lqr (rel) */
+            uint32_t a = (pc + ((uint32_t)i16 << 2)) & SPU_LS_MASK & ~15u;
+            if (op9 == 0x047) spu_ls_write128(ctx, a, ctx->gpr[rt]);
+            else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
+            pc += 4; continue;
+        }
+        if (op8 == 0x1C) {                                    /* ai rt,ra,i10 */
+            u128 r = ctx->gpr[ra];
+            for (int k = 0; k < 4; k++) r._u32[k] += (uint32_t)i10;
+            ctx->gpr[rt] = r; pc += 4; continue;
+        }
+        if (op11 == 0x040 || op11 == 0x0C0) {                 /* sf / a (word) */
+            u128 x = ctx->gpr[ra], y = ctx->gpr[rb], r;
+            for (int k = 0; k < 4; k++)
+                r._u32[k] = (op11 == 0x040) ? y._u32[k] - x._u32[k]
+                                            : x._u32[k] + y._u32[k];
+            ctx->gpr[rt] = r; pc += 4; continue;
+        }
+        if (op9 == 0x081) { ctx->gpr[rt] = spu_splat_u32((uint32_t)i16); pc += 4; continue; }  /* il  */
+        if (op9 == 0x082) { ctx->gpr[rt] = spu_splat_u32(((w >> 7) & 0xFFFF) << 16); pc += 4; continue; } /* ilhu */
+        if (op9 == 0x0C1) { u128 r = ctx->gpr[rt];            /* iohl */
+            for (int k = 0; k < 4; k++) r._u32[k] |= (w >> 7) & 0xFFFF;
+            ctx->gpr[rt] = r; pc += 4; continue; }
+        if (op7 == 0x21)  { ctx->gpr[rt] = spu_splat_u32((w >> 7) & 0x3FFFF); pc += 4; continue; } /* ila */
+        if (op11 == 0x201 || op11 == 0x001) { pc += 4; continue; }  /* nop/lnop */
+        if (op11 == 0x002 || op11 == 0x003) { pc += 4; continue; }  /* sync/dsync */
+        if (op11 == 0x1AC || op9 == 0x008 || op9 == 0x009) { pc += 4; continue; } /* hbr hints */
+
+        { static int _n = 0;
+          if (_n++ < 8)
+              fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X UNKNOWN word 0x%08X "
+                      "(steps=%d from 0x%05X)\n", ctx->image_id, pc, w, steps,
+                      ctx->pc & SPU_LS_MASK); }
+        return 0;
+    }
+    { static int _n = 0; if (_n++ < 4)
+        fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
+                ctx->image_id, ctx->pc & SPU_LS_MASK); }
+    return 0;
 }
 
 void spu_indirect_branch(spu_context* ctx)
@@ -908,6 +1070,12 @@ void spu_indirect_branch(spu_context* ctx)
         return;
 #endif
     }
+    /* No lifted function at this PC: it may be RUNTIME-GENERATED code (the
+     * WWS jobmanager writes a register save/restore stub above its static
+     * image and calls it). Interpret the live LS bytes; on success the next
+     * branch re-enters lifted code via the trampoline. */
+    if (spu_smc_microstep(ctx))
+        return;
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
      * every other image's misses -- LBP's loading jobs skipped their command

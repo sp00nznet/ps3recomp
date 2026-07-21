@@ -285,11 +285,20 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
         for idx, insn in enumerate(fn):
             if _bi_target_reg(insn) != "0":
                 continue
-            # backward scan for the nearest instruction that writes r0
+            # backward scan for the nearest instruction that writes r0.
+            # STOP at any unconditional flow break (bi/br/bra/iret/stop): code
+            # above it belongs to a DIFFERENT basic block -- when function
+            # bounds are coarse (extra seed entries shift the partition), the
+            # scan otherwise crosses into the preceding function's tail and a
+            # stray `lqa $r0` there flips a genuine return into a computed
+            # jump (observed: pm_wwsjob 0x3570's `bi $r0` vs the `lqa $r0 ;
+            # bi $r78` ending the function above it).
             decided = False
             only_identity = False
             for j in range(idx - 1, -1, -1):
                 w = fn[j]
+                if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                    break                  # block boundary: r0 is a live-in here
                 if not _writes_r0(w):
                     continue
                 if _is_identity_move(w):
@@ -365,10 +374,13 @@ def compute_link_returns(insns, bounds) -> set:
             # rN must be a pure live-in (the link address the caller planted):
             # if any earlier insn in this block writes rN (other than an identity
             # move), the target was computed here -> a real indirect branch, not
-            # a return.
+            # a return. Scan stops at unconditional flow breaks (block boundary
+            # -- see the twin guard in compute_bi_r0_jumps).
             written = False
             for j in range(idx - 1, -1, -1):
                 w = fn[j]
+                if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                    break
                 if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
                         and not _is_identity_move(w)):
                     written = True
@@ -784,6 +796,13 @@ class SPULifter:
             # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
             return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
                     f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+        # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
+        # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
+        # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
+        # under bie/bid interrupt windows; dropping the bits starves its DMA
+        # stall-and-notify handler and wedges the whole job pipeline.
+        _ied = ("ctx->int_enable = 1; " if insn.raw & 0x40000 else
+                "ctx->int_enable = 0; " if insn.raw & 0x80000 else "")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
@@ -797,13 +816,13 @@ class SPULifter:
                     or addr in self.link_return:
                 # SPU_RET: host return while a matched brsl frame is live
                 # (host_depth>0); at 0 the frame was destroyed -> dispatch to r0.
-                return "SPU_RET(ctx);"
+                return f"{_ied}SPU_RET(ctx);"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
-            return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
+            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
-            return ("ctx->pc = ctx->srr0; "
+            return (f"{_ied}ctx->pc = ctx->srr0; "
                     "g_spu_trampoline_fn = spu_indirect_branch; return;")
         if mn in ("bisl",):
             # `bisl rt, ra`: rt = link, ra = TARGET. The disassembler emits BOTH
@@ -819,7 +838,7 @@ class SPULifter:
             # here and its `bi $r0` returns via host return.
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"{{ int32_t _si = (int32_t)ctx->image_id; "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
+                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
@@ -828,7 +847,7 @@ class SPULifter:
             tgt_reg = _reg(ops[-1])
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; "
+                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
@@ -841,8 +860,8 @@ class SPULifter:
             # land on an unregistered mid-function PC.
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
-                return f"if ({cond}) {{ SPU_RET(ctx); }}"
-            return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
+                return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
+            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop

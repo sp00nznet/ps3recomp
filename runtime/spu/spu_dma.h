@@ -416,6 +416,82 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
  * The list resides in the SPU's local store at `lsa`.
  * Each list element describes a (size, EA) pair for a sub-transfer.
  */
+/* Core list runner used by both the initial submit and the stall-ack resume.
+ * Transfers elements starting at elem_lsa; on a stall-and-notify element
+ * (bit 15 of the size halfword) it PARKS the remainder in the context, raises
+ * SPU event 0x2 (MFC DMA list stall-and-notify) and returns -- the WWS
+ * jobmanager's interrupt handler processes the arrived portion and writes
+ * MFC_WrListStallAck to resume the rest (mfc_list_stall_ack below). */
+static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
+                               uint32_t num_left, uint32_t dest_lsa,
+                               uint64_t ea_base, uint32_t base_cmd, uint32_t tag)
+{
+    for (uint32_t i = 0; i < num_left; i++) {
+        uint32_t el = (elem_lsa + i * 8) & SPU_LS_MASK;
+        uint32_t size_and_flags = spu_ls_read32(spu, el);
+        uint32_t eal = spu_ls_read32(spu, el + 4);
+
+        /* CBEA list element word0 = [S:1][reserved:16][size:15]: the stall-
+         * and-notify bit is BIT 31 (the wwsjob sentinel element is exactly
+         * 0x80000000 = S set, size 0 -- a pure notification). The old bit-15
+         * check never saw it, so the event was never raised. */
+        uint32_t xfer_size = size_and_flags & 0x7FFF; /* low 15 bits */
+        int stall_notify = (size_and_flags >> 31) & 1;
+
+        uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
+
+        if (xfer_size) {
+            int rc = mfc_do_transfer(spu, dest_lsa, ea, xfer_size, base_cmd);
+            if (rc != 0) return rc;
+            dest_lsa += xfer_size;
+        }
+
+        if (stall_notify) {
+            spu->list_stall_active    = 1;
+            spu->list_stall_elem_lsa  = (el + 8) & SPU_LS_MASK;
+            spu->list_stall_remaining = num_left - i - 1;
+            spu->list_stall_dest_lsa  = dest_lsa;
+            spu->list_stall_ea_base   = ea_base;
+            spu->list_stall_cmd       = base_cmd;
+            spu->list_stall_tag       = tag & 0x1F;
+            spu->event_status |= 0x2u;          /* DMA list stall-and-notify */
+            spu_ch_wake(spu);
+            { static int _n = 0; if (_n++ < 16)
+                fprintf(stderr, "[mfc-list] STALL img=%d tag=%u elem@0x%05X "
+                        "left=%u dest=0x%05X (event 0x2 raised)\n",
+                        spu->image_id, tag & 0x1F, el, num_left - i - 1, dest_lsa); }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* Resume a parked list after MFC_WrListStallAck names its tag group. May park
+ * again at the next stall element; on full drain the tag group completes. */
+static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
+                                     uint32_t tag)
+{
+    if (!spu->list_stall_active || (tag & 0x1F) != spu->list_stall_tag) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[mfc-list] StallAck tag=%u but %s (parked tag=%u)\n",
+                    tag & 0x1F, spu->list_stall_active ? "tag mismatch" : "no parked list",
+                    spu->list_stall_tag);
+        return 0;
+    }
+    spu->list_stall_active = 0;
+    { static int _n = 0; if (_n++ < 16)
+        fprintf(stderr, "[mfc-list] RESUME img=%d tag=%u elem@0x%05X left=%u\n",
+                spu->image_id, tag & 0x1F, spu->list_stall_elem_lsa,
+                spu->list_stall_remaining); }
+    int rc = mfc_run_list(spu, spu->list_stall_elem_lsa, spu->list_stall_remaining,
+                          spu->list_stall_dest_lsa, spu->list_stall_ea_base,
+                          spu->list_stall_cmd, spu->list_stall_tag);
+    if (!spu->list_stall_active)                 /* ran to the end: tag done */
+        mfc->tag_completed |= (1u << (tag & 0x1F));
+    return rc;
+}
+
 static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
                                         uint64_t ea_base, uint32_t list_size,
                                         uint32_t cmd)
@@ -423,33 +499,9 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
     /* list_size is in bytes; each element is 8 bytes */
     uint32_t num_elements = list_size / 8;
     uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
-
-    for (uint32_t i = 0; i < num_elements; i++) {
-        uint32_t elem_lsa = (list_lsa + i * 8) & SPU_LS_MASK;
-
-        /* Read list element from local store (big-endian) */
-        uint32_t size_and_flags = spu_ls_read32(spu, elem_lsa);
-        uint32_t eal = spu_ls_read32(spu, elem_lsa + 4);
-
-        uint32_t xfer_size = size_and_flags & 0x7FFF; /* low 15 bits */
-        int stall_notify = (size_and_flags >> 15) & 1;
-
-        uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
-
-        /* Calculate target LSA: for list commands, the data starts at
-         * the address given by the MFC_LSA channel and accumulates. */
-        int rc = mfc_do_transfer(spu, spu->mfc_lsa, ea, xfer_size, base_cmd);
-        if (rc != 0) return rc;
-
-        spu->mfc_lsa += xfer_size;
-
-        if (stall_notify) {
-            /* In a full emulator we would raise a stall-and-notify event.
-             * For recompiled code, we just continue. */
-        }
-    }
-
-    return 0;
+    return mfc_run_list(spu, list_lsa & SPU_LS_MASK, num_elements,
+                        spu->mfc_lsa & SPU_LS_MASK, ea_base, base_cmd,
+                        spu->mfc_tag);
 }
 
 /* ---------------------------------------------------------------------------
@@ -659,9 +711,14 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         _pn++;
     }
 
-    /* Execute the transfer */
+    /* Execute the transfer.
+     * List commands (GETL/PUTL...): per CBEA the LIST's local-store address is
+     * carried in MFC_EAL (the PM writes EAL=list, LSA=dest) and each element
+     * supplies the low-32 EA; only EAH carries through. Passing `lsa` as the
+     * list address read list elements from the transfer DESTINATION. */
     if (mfc_is_list(cmd)) {
-        rc = mfc_do_list_transfer(spu, lsa, ea, size, cmd);
+        rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
+                                  ea & 0xFFFFFFFF00000000ull, size, cmd);
     } else {
         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
     }
@@ -681,8 +738,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
-    /* Mark tag as completed */
-    mfc->tag_completed |= (1u << tag);
+    /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
+     * element: its tag group stays incomplete until MFC_WrListStallAck resumes
+     * it to the end (mfc_list_stall_ack marks completion then). */
+    if (!(spu->list_stall_active && (spu->list_stall_tag == (tag & 0x1F))))
+        mfc->tag_completed |= (1u << tag);
 
     return rc;
 }
@@ -763,7 +823,9 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
         break;
     case MFC_WrListStallAck:
-        /* Acknowledge stall -- no-op in synchronous mode */
+        /* Acknowledge a stalled list element's tag group: resume the parked
+         * list from the element after the stall point (may stall again). */
+        mfc_list_stall_ack(mfc, spu, value);
         break;
     default:
         break;
@@ -779,7 +841,8 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
     case MFC_RdTagMask:
         return spu->mfc_tag_mask;
     case MFC_RdListStallStat:
-        return 0; /* no stalls in synchronous mode */
+        /* Tag-group mask of lists currently stalled at a notify element. */
+        return spu->list_stall_active ? (1u << spu->list_stall_tag) : 0;
     case MFC_RdAtomicStat:
         /* Result of the last atomic line op (GETLLAR/PUTLLC/PUTLLUC), set by
          * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,

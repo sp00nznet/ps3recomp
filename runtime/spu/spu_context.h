@@ -271,6 +271,28 @@ typedef struct spu_context {
     void* ch_wait_cv;
     void* ch_wait_lock;
 
+    /* --- SPU interrupt facility (faithful; WWS jobmanager depends on it) ---
+     * The bi-family E/D bits (bie/bid, irete/iretd...) toggle int_enable; while
+     * enabled, a pending (event_status & event_mask) vectors execution to LS 0
+     * at the next trampoline transfer (SPU_DRAIN hook -> spu_take_interrupt):
+     * srr0 <- interrupted pc, int_enable <- 0, pc <- target of the guest-planted
+     * branch instruction AT LS 0 (pm_wwsjob's entry writes `bra 0xA2C` there).
+     * The handler returns via iret (pc <- srr0). */
+    uint32_t int_enable;
+
+    /* Parked DMA-list command (stall-and-notify). A GETL/PUTL that transfers a
+     * list element with bit15 (stall-and-notify) set raises SPU event 0x2 and
+     * parks the remainder here; MFC_WrListStallAck for the tag resumes it.
+     * Saved explicitly -- the live MFC channel registers may be reused for
+     * other commands between the stall and the ack. */
+    uint32_t list_stall_active;
+    uint32_t list_stall_elem_lsa;   /* LS addr of NEXT list element */
+    uint32_t list_stall_remaining;  /* elements left after the stall element */
+    uint32_t list_stall_dest_lsa;   /* accumulated destination LSA */
+    uint64_t list_stall_ea_base;    /* ea base (hi32 carries through) */
+    uint32_t list_stall_cmd;        /* base (non-list) MFC command */
+    uint32_t list_stall_tag;        /* tag group of the parked list */
+
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -496,6 +518,12 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
+/* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
+ * decode the guest-planted branch at LS 0 into ctx->pc, and return the
+ * dispatcher to run instead of the interrupted transfer. Returns `tf`
+ * unchanged (interrupt not taken) if LS 0 holds no branch instruction. */
+void (*spu_take_interrupt(spu_context* ctx,
+                          void (*tf)(spu_context*)))(spu_context*);
 
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
@@ -505,6 +533,9 @@ void spu_ch_wake(spu_context* ctx);
             g_spu_trampoline_fn = 0;                            \
             yz_lockstep_tick(ctx);                             \
             spu_task_launch_check((ctx), (void*)_tf);          \
+            if ((ctx)->int_enable &&                            \
+                ((ctx)->event_status & (ctx)->event_mask))      \
+                _tf = spu_take_interrupt((ctx), _tf);          \
             _tf(ctx);                                          \
         }                                                      \
     } while (0)
