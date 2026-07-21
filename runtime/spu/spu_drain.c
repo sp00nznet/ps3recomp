@@ -26,6 +26,4 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img)
     ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;
 }
 
-/* Wake a host thread blocked in a channel wait (milestone: channel-stall).
- * No-op until blocking channel reads exist. */
-void spu_ch_wake(spu_context* ctx) { (void)ctx; }
+/* spu_ch_wake now has its real body in spu_channels.c (milestone 3). */

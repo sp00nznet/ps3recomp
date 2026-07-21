@@ -402,10 +402,95 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 }
 
 /* ===========================================================================
+ * Channel-stall contract (faithful-adopt, from canersaka's fork).
+ *
+ * A blocking spu_rdch on an empty read channel parks the SPU host thread on a
+ * per-SPU CV until a producer (mailbox/signal write, event raise) calls
+ * spu_ch_wake -- never fabricating a value. Under YZ_SPU_LOCKSTEP the wait
+ * releases the run token first (block_begin) so a peer SPU that must post the
+ * awaited data is never blocked on this ctx. A 10 ms re-poll is the missed-wake
+ * safety net. Opt-in (env YZ_CH_BLOCK=1), default OFF while the producers
+ * (mailbox/signal writes, MFC tag-status event raise) are being wired -- until
+ * then blocking a read whose producer is missing would hang, so default stays
+ * legacy non-blocking with zero regression, exactly like the lockstep gate.
+ * ===========================================================================*/
+static int yz_ch_block(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("YZ_CH_BLOCK") ? 1 : 0;
+    return v;
+}
+
+/* Would rdch complete right now? Plain reads + the 10 ms re-poll cover cross-
+ * thread visibility (x86 TSO + the wait syscall's barrier); the s43 atomics are
+ * a later refinement. */
+static int spu_ch_ready(spu_context* ctx, uint32_t channel)
+{
+    switch (channel) {
+    case SPU_RdInMbox:      return ctx->ch_in_mbox.count != 0;
+    case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
+    case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
+    case SPU_RdEventStat:   return (ctx->event_status & ctx->event_mask) != 0;
+    default:                return 1;   /* non-blocking channels: always ready */
+    }
+}
+
+/* Signal the per-SPU wait CV so a blocked spu_rdch re-checks its predicate.
+ * MUST be called by every producer AFTER it makes a read predicate true. */
+void spu_ch_wake(spu_context* ctx)
+{
+    if (!ctx) return;
+    WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
+}
+
+/* Block the calling SPU host thread until `channel` is readable. */
+static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
+{
+    if (!yz_ch_block() || spu_ch_ready(ctx, channel)) return;
+
+    { static unsigned long bn = 0; unsigned long n = ++bn;
+      if (n <= 50 || (n % 512) == 0)
+        fprintf(stderr, "[ch-block] spu=%X pc=0x%05X op=%s ch=%u evstat=0x%X evmask=0x%X\n",
+                ctx->spu_id, ctx->pc & SPU_LS_MASK, op, channel,
+                ctx->event_status, ctx->event_mask); }
+
+    ctx->status = SPU_STATUS_WAITING_CHANNEL;
+    yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
+    {
+        unsigned long long start = GetTickCount64(), next_hb = 2000;
+        while (!spu_ch_ready(ctx, channel)) {
+            AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+            if (!spu_ch_ready(ctx, channel))
+                SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                          (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
+            ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+            unsigned long long waited = GetTickCount64() - start;
+            if (waited >= next_hb) {
+                fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums\n",
+                        ctx->spu_id, ctx->pc & SPU_LS_MASK, channel, waited);
+                fflush(stderr);
+                next_hb = ((waited / 2000) + 1) * 2000;
+            }
+        }
+    }
+    yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
+    ctx->status = SPU_STATUS_RUNNING;
+}
+
+/* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    /* Block (never fabricate) on an empty producer-fed read channel. RdEventStat
+     * is intentionally NOT blocked here yet -- its producer is the MFC tag-status
+     * event raise, wired in a later increment; blocking it before that would
+     * hang since event_status is currently never set. RdInMbox/RdSigNotify have
+     * live producers (PPU mailbox/signal writes -> spu_ch_wake) so the 10 ms
+     * net guarantees progress. */
+    if (channel == SPU_RdInMbox || channel == SPU_RdSigNotify1 || channel == SPU_RdSigNotify2)
+        spu_ch_wait(ctx, channel, "rdch");
+
     uint32_t v = 0;
 
     { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_POLLTRACE") ? 1 : 0;
