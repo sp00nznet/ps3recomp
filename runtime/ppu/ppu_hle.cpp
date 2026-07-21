@@ -256,7 +256,19 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             uint32_t toc  = vm_read32(opd + 4);
             { static int64_t st=-2; if(st==-2){const char*e=getenv("YDKJ_SPURSTRACE"); st=e?1:0;}
               if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X -> libsre code=0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
-                  nid, code, (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); }
+                  nid, code, (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]);
+              /* Dump the struct state at the failing task-attach calls: libsre 0x300158C4
+               * (nid 0x87630976) STATs unless struct+0xC==0xFF & +0xE in{1,3}; 0x30015AA4
+               * (0x22AAB31D) validates the same struct. Show what our recomp left there. */
+              if (st && (nid==0x87630976u || nid==0x22AAB31Du)) {
+                  extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
+                  /* 0x30015AA4's atomic stamps +0xC=0xFF only if struct+4(halfword)==0 &&
+                   * struct+7(byte)==0; else it branches away without stamping. Show both. */
+                  uint32_t p4 = (vm_base[s3+4]<<8)|vm_base[s3+5];
+                  fprintf(stderr, "  [state] struct@0x%08X: +0C=%02X +0E=%02X | stamp-precond +4=%04X +7=%02X"
+                      " (need both 0 to stamp +0C=FF)\n",
+                      s3, vm_base[s3+0xC], vm_base[s3+0xE], p4, vm_base[s3+7]); }
+            }
             /* Arm a page-guard on the CellSpurs struct at cellSpursInitializeWithAttribute2
              * ENTRY (nid 0xAA6269A8, r3=&spurs) — before the init writes it — to catch
              * where its struct stores actually land. Env YDKJ_GUARD_INST. */
