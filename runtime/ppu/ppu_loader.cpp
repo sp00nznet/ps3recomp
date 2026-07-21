@@ -775,6 +775,27 @@ extern "C" uint32_t g_main_toc = 0;
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     g_active_ctx = ctx;
+    /* YDKJ_VTORDER: trace the vtable dispatch of the SPURS-task create/init methods
+     * (func_002E0510 create, func_002DF320 init) that the game runs in the wrong order.
+     * Log the parent (lr), the object (r3), and a guest back-chain to find the dispatcher. */
+    if (getenv("YDKJ_VTORDER")) {
+        uint32_t tgt=(uint32_t)ctx->ctr;
+        if (tgt==0x002E0510u || tgt==0x002DF320u || tgt==0x00331210u) {
+            static int _n=0; if(_n++<12) {
+                const char* w = tgt==0x002DF320u?"INIT":(tgt==0x002E0510u?"CREATE(audio)":"CREATE(cri)");
+                uint32_t sp=(uint32_t)ctx->gpr[1];
+                fprintf(stderr,"[VTORDER] %-13s func_%08X r3(obj)=0x%08X lr=0x%08X chain:", w, tgt,
+                        (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+                extern uint8_t* vm_base;
+                for(int i=0;i<10 && sp && sp<0x10000000u;i++){ uint32_t nsp; memcpy(&nsp,vm_base+sp,4);
+                    nsp=((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
+                    if(nsp<=sp||nsp>=0x10000000u)break; uint32_t lr; memcpy(&lr,vm_base+nsp+0x10,4);
+                    lr=((lr>>24)&0xFF)|((lr>>8)&0xFF00)|((lr<<8)&0xFF0000)|((lr<<24)&0xFF000000);
+                    fprintf(stderr," %08X",lr); sp=nsp; }
+                fprintf(stderr,"\n"); fflush(stderr);
+            }
+        }
+    }
     /* ELFv1 glink-stub TOC save (kept from gcmtri bring-up). NOTE: investigated as a
      * suspect for the YDKJ func_002B03AC r2=0 spin -- removing it did NOT clear that
      * spin, so YDKJ's r2 corruption comes from a different mechanism (see memory).
