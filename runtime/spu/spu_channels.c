@@ -1184,10 +1184,28 @@ void spu_trace_init(const char* path)
  * per-instruction log into every boot. Enable with SPU_TRACE=1 (stderr) or
  * SPU_TRACE_FILE=<path>. */
 static long long s_trace_left = -1;     /* -1 uninit, -2 unbounded, 0 off */
+/* Set when spu_trace_pc suppressed its line (gates below): the paired
+ * spu_trace_rt call for the same instruction must also stay silent. */
+static SPU_THREAD_LOCAL int s_trace_suppress;
 
 void spu_trace_pc(spu_context* ctx, uint32_t pc)
 {
     (void)ctx;
+    /* SPU_TRACE_AT_WALL=1: hold the trace until the PPU's job-barrier probe
+     * arms g_barrier_sync_watch, so the budget covers the post-ticket claim/
+     * stage pass instead of boot-time idle polling. */
+    { static int s_aw = -1;
+      if (s_aw < 0) s_aw = getenv("SPU_TRACE_AT_WALL") ? 1 : 0;
+      if (s_aw) { extern uint32_t g_barrier_sync_watch;
+                  if (!g_barrier_sync_watch) { s_trace_suppress = 1; return; } } }
+    /* SPU_TRACE_FLOWCTX=1: trace ONLY the run the SPURS_PM_FLOW tracer armed
+     * (the stalled queue's spu0 dispatch) -- post-wall idle dispatches of the
+     * other 13 jobmanager wids otherwise exhaust the budget in under a second. */
+    { static int s_fc = -1;
+      if (s_fc < 0) s_fc = getenv("SPU_TRACE_FLOWCTX") ? 1 : 0;
+      if (s_fc) { extern void* volatile g_pm_flow_ctx;
+                  if (g_pm_flow_ctx != (void*)ctx) { s_trace_suppress = 1; return; } } }
+    s_trace_suppress = 0;
     if (s_trace_left < 0) {
         if (s_trace_left == -1) {
             const char* p = getenv("SPU_TRACE_FILE");
@@ -1210,6 +1228,7 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
 
 void spu_trace_rt(spu_context* ctx, uint32_t rt)
 {
+    if (s_trace_suppress) return;          /* paired _pc line was gated out */
     if (s_trace_left == 0) return;         /* tracing off/stopped (see _pc) */
     if (!s_trace_fp) s_trace_fp = stderr;
     u128 v = ctx->gpr[rt & 0x7F];

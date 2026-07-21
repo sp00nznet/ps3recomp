@@ -703,10 +703,17 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * bring-up signal: joblist fetch, job-module loads, output stores). */
     if (spu->policy_mode) {
         static int _pn = 0;
-        if (_pn < 96)
+        /* Cap the boot-time flood, but reopen the trace once the PPU is at the
+         * job barrier (g_barrier_sync_watch armed): the post-ticket DMA
+         * sequence is exactly what the pipeline diagnosis needs. */
+        extern uint32_t g_barrier_sync_watch;
+        static int _post = 0;
+        int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
+        if (open) {
+            if (_pn >= 96) _post++;
             fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
                     cmd, lsa, (unsigned long long)ea, size, tag);
-        else if (_pn == 96)
+        } else if (_pn == 96)
             fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
         _pn++;
     }
@@ -721,6 +728,21 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                                   ea & 0xFFFFFFFF00000000ull, size, cmd);
     } else {
         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
+    }
+
+    /* wwsjob batch-fetch probe: the claim path GETs the batch's command data
+     * to LS 0xC00; if this arrives empty/garbage the interrupt handler has
+     * nothing to stage and the pipeline idles forever. Dump the first words. */
+    if (spu->image_id == 2 && lsa == 0xC00 && cmd == 0x40 && rc == 0) {
+        static int _n = 0;
+        if (_n++ < 8) {
+            const uint8_t* p = spu->ls + 0xC00;
+            fprintf(stderr, "[wws-batch] GET 0xC00 ea=0x%09llX size=0x%X:",
+                    (unsigned long long)ea, size);
+            for (uint32_t i = 0; i < size && i < 0x40; i += 4)
+                fprintf(stderr, " %02X%02X%02X%02X", p[i], p[i+1], p[i+2], p[i+3]);
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
     }
 
     /* After a cri-task GET, dump the bytes it just read (the task context) so we

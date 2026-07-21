@@ -272,6 +272,24 @@ static DWORD WINAPI spurs_pm_flow_watchdog(LPVOID p)
             ctx->ls[0x12C0], ctx->ls[0x12C1],
             ctx->ls[0x12F0], ctx->ls[0x12F1], ctx->ls[0x12F2], ctx->ls[0x12F3],
             ctx->ls[0x1300], ctx->ls[0x1301]);
+    /* Pipeline-state hex dump: batch commands (0xC00), per-slot records (0xDF0),
+     * staging ring (0xEB0), FFFF markers (0x11B0), scheduler vars (0x1270-0x1340),
+     * queue caches (0x13B0-0x1520). One shot -- everything the state-2 cycle's
+     * stage decision reads, so the divergent condition can be hand-simulated. */
+    { static const struct { uint32_t a, len; const char* tag; } R[] = {
+          { 0xC00, 0x60, "cmds" }, { 0xDF0, 0x40, "rec" }, { 0xEB0, 0x40, "ring" },
+          { 0x11B0, 0x20, "mark" }, { 0x1270, 0x40, "sched" }, { 0x12C0, 0x50, "state" },
+          { 0x13B0, 0x30, "qvar" }, { 0x14A0, 0x30, "qcache" }, { 0x1440, 0x40, "batchrec" } };
+      for (unsigned r = 0; r < sizeof R / sizeof R[0]; r++) {
+          fprintf(stderr, "\n[pm-ls] %-8s 0x%04X:", R[r].tag, R[r].a);
+          for (uint32_t o = 0; o < R[r].len; o += 4) {
+              if (o && (o & 15) == 0) fprintf(stderr, " |");
+              fprintf(stderr, " %02X%02X%02X%02X",
+                      ctx->ls[R[r].a+o], ctx->ls[R[r].a+o+1],
+                      ctx->ls[R[r].a+o+2], ctx->ls[R[r].a+o+3]);
+          }
+      }
+      fprintf(stderr, "\n"); }
     uint32_t last = 0xFFFFFFFFu; unsigned rep = 0; unsigned col = 0;
     for (unsigned i = 0; i < n; i++) {
         uint32_t pc = g_pm_flow_buf[i] & SPU_LS_MASK;

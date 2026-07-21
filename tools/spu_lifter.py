@@ -359,6 +359,24 @@ def compute_link_returns(insns, bounds) -> set:
 
     returns = set()
     ordered = sorted(insns, key=lambda x: x.addr)
+
+    # Predecessor map for the refinement below: every br/bra source per target.
+    # A `bi $rN` whose block is ENTERED by a branch from a block that COMPUTED
+    # rN (jump-table rotqby etc.) is a dispatch, not a return -- the write is
+    # invisible to the in-bound liveness scan. Observed: pm_wwsjob's command
+    # interpreter loads the handler into r6 from the LS 0x15B0 table (0x1BD8),
+    # `br 0x2DF8` into the shared decode block, and dispatches via `bi $r6` at
+    # 0x2E74; classifying that as a link-return silently skipped EVERY job
+    # command handler (jobs never staged; LBP's loading queue never drained).
+    preds: dict = {}
+    for insn in ordered:
+        if insn.mnemonic in ("br", "bra"):
+            i16 = (insn.raw >> 7) & 0xFFFF
+            if i16 & 0x8000:
+                i16 -= 0x10000
+            t = (i16 << 2) if insn.mnemonic == "bra" else (insn.addr + (i16 << 2))
+            preds.setdefault(t & 0x3FFFF, []).append(insn.addr)
+    idx_of_all = {ins.addr: i for i, ins in enumerate(ordered)}
     for (s, e) in bounds:
         fn = [i for i in ordered if s <= i.addr < e]
         for idx, insn in enumerate(fn):
@@ -377,15 +395,42 @@ def compute_link_returns(insns, bounds) -> set:
             # a return. Scan stops at unconditional flow breaks (block boundary
             # -- see the twin guard in compute_bi_r0_jumps).
             written = False
+            block_start = s
             for j in range(idx - 1, -1, -1):
                 w = fn[j]
                 if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                    block_start = fn[j + 1].addr if j + 1 <= idx else s
                     break
                 if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
                         and not _is_identity_move(w)):
                     written = True
                     break
-            if not written:
+            if written:
+                continue
+            # Predecessor refinement: rN is a live-in here -- but if a br/bra
+            # ENTERS this block from a block whose tail COMPUTED rN, the value
+            # is a dispatch target (jump table), not a caller's link.
+            computed_in = False
+            for t, srcs in preds.items():
+                if not (block_start <= t <= insn.addr):
+                    continue
+                for src in srcs:
+                    k = idx_of_all.get(src)
+                    if k is None:
+                        continue
+                    for j in range(k - 1, max(-1, k - 24), -1):
+                        w = ordered[j]
+                        if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                            break
+                        if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
+                                and not _is_identity_move(w)):
+                            computed_in = True
+                            break
+                    if computed_in:
+                        break
+                if computed_in:
+                    break
+            if not computed_in:
                 returns.add(insn.addr)
     return returns
 
@@ -997,6 +1042,15 @@ def main() -> None:
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
+    p.add_argument("--force-indirect", default="",
+                   help="Comma-separated `bi $rN` addresses to emit as GENERIC "
+                        "indirect dispatch, overriding the link-register-return "
+                        "classifier. For jump-table dispatches whose target reg "
+                        "was computed in a block the bounded liveness scan cannot "
+                        "see (e.g. pm_wwsjob 0x2E74: r6 loaded from the command "
+                        "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
+                        "dispatched blocks later -- classified as a return, which "
+                        "silently skipped every job-command handler).")
     args = p.parse_args()
 
     if args.auto_functions:
@@ -1054,6 +1108,16 @@ def main() -> None:
               f"(r0 set by lqa/lqr/il/ila, not a link): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
     lifter.link_return = compute_link_returns(insns, bounds)
+    if args.force_indirect:
+        forced = {int(x, 0) for x in args.force_indirect.split(",") if x.strip()}
+        dropped = lifter.link_return & forced
+        lifter.link_return -= forced
+        lifter.bi_r0_jump |= forced          # also force `bi $r0` sites if listed
+        sys.stderr.write("[spu_lifter] forced indirect dispatch at: %s%s\n" %
+                         (", ".join("0x%X" % a for a in sorted(forced)),
+                          " (was link-return: %s)" %
+                          ", ".join("0x%X" % a for a in sorted(dropped))
+                          if dropped else ""))
     if lifter.link_return:
         print(f"  {len(lifter.link_return)} non-r0 link-register return site(s) "
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
