@@ -372,6 +372,18 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
             return;
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
+        /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
+         * DMA completes synchronously, so the instant the program arms tag
+         * notification (MFC_WrTagUpdate with a non-zero mode = any/all), the
+         * tags in MFC_WrTagMask are already complete -- pend the tag event
+         * (bit 0, MFC_TAG_STATUS_UPDATE_EVENT) when the SPU has it enabled, and
+         * wake any host thread blocked in rdch SPU_RdEventStat. This is the
+         * long-missing producer for event_status (previously only ever cleared
+         * via WrEventAck -> RdEventStat waits could never complete). */
+        if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
+            ctx->event_status |= 0x1u;
+            spu_ch_wake(ctx);
+        }
         return;
     }
 
@@ -482,13 +494,14 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
-    /* Block (never fabricate) on an empty producer-fed read channel. RdEventStat
-     * is intentionally NOT blocked here yet -- its producer is the MFC tag-status
-     * event raise, wired in a later increment; blocking it before that would
-     * hang since event_status is currently never set. RdInMbox/RdSigNotify have
-     * live producers (PPU mailbox/signal writes -> spu_ch_wake) so the 10 ms
-     * net guarantees progress. */
+    /* Block (never fabricate) on an empty producer-fed read channel (opt-in
+     * YZ_CH_BLOCK). RdEventStat now has a producer (the MFC tag-status event
+     * raise above), but only block it when the SPU has actually enabled events
+     * (event_mask != 0) -- a masked-off read must return 0 immediately, not
+     * park forever. RdInMbox/RdSigNotify park on their PPU producers. */
     if (channel == SPU_RdInMbox || channel == SPU_RdSigNotify1 || channel == SPU_RdSigNotify2)
+        spu_ch_wait(ctx, channel, "rdch");
+    else if (channel == SPU_RdEventStat && ctx->event_mask != 0)
         spu_ch_wait(ctx, channel, "rdch");
 
     uint32_t v = 0;
