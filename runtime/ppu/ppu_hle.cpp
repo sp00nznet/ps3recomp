@@ -285,6 +285,17 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                   #undef _RW
               }
             }
+            /* YDKJ_FORCEATTR (test): the create-task nid 0x87630976 (libsre 0x300158C4)
+             * STATs because the task-attr struct(r3)+0xC != 0xFF -- the game runs create
+             * before the attr-init (0x22AAB31D) that stamps it (a game-side vtable ordering
+             * mis-lift). Force +0xC=0xFF here to test whether the task then creates + the
+             * workload attaches + the cri decode runs (papering the ordering to probe the
+             * NEXT gate). */
+            if (nid==0x87630976u && getenv("YDKJ_FORCEATTR")) {
+                extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
+                if (vm_base[s3+0xC]!=0xFF) { vm_base[s3+0xC]=0xFF;
+                    static int _f=0; if(_f++<4) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
+            }
             /* Arm a page-guard on the CellSpurs struct at cellSpursInitializeWithAttribute2
              * ENTRY (nid 0xAA6269A8, r3=&spurs) — before the init writes it — to catch
              * where its struct stores actually land. Env YDKJ_GUARD_INST. */
