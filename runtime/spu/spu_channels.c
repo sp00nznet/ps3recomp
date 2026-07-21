@@ -123,8 +123,19 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
     s_spu_halt_armed = 1;
-    if (setjmp(s_spu_halt_env) != 0) halted = 1;   /* came back via longjmp */
-    else                             entry(ctx);    /* run the job          */
+    g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
+    if (setjmp(s_spu_halt_env) != 0) {
+        halted = 1;                                /* came back via longjmp     */
+        g_spu_trampoline_fn = 0;                   /* unwound mid-drain: discard */
+    } else {
+        /* SPU_DRAIN trampoline model: the top-level entry runs until its first
+         * cross-function tail transfer, which sets g_spu_trampoline_fn and
+         * returns; the drain loop re-enters each queued target until the SPU
+         * halts (stop -> longjmp) or the trampoline empties. Nested brsl/bisl
+         * calls drain inside their own call brackets (see the lifter). */
+        entry(ctx);
+        SPU_DRAIN(ctx);
+    }
     s_spu_halt_armed = 0;
     return halted;
 }

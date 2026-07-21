@@ -438,7 +438,8 @@ class SPULifter:
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; SPU_TAILCALL({self.prefix}spu_func_{end:08X}(ctx)); }}")
+                f"    {{ ctx->pc = 0x{end:X}; "
+                f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -763,7 +764,13 @@ class SPULifter:
                 return f"{link} {self._uncond_branch(addr + 4, func)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
-                return f"{link} {self.prefix}spu_func_{tgt:08X}(ctx);"
+                # Nested host call bracketed by host_depth (so the callee's
+                # `bi $r0` returns via host return) + SPU_DRAIN (drains the
+                # callee's own tail-chains so they don't grow the caller frame)
+                # + image save/restore (adopt-on-serve cannot leak upward).
+                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
+                        f"SPU_DRAIN(ctx); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -773,8 +780,10 @@ class SPULifter:
             if func.start_addr <= tgt < func.end_addr:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
+            # Cross-function conditional branch = conditional tail: hand the
+            # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
             return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"SPU_TAILCALL({self.prefix}spu_func_{tgt:08X}(ctx)); }}")
+                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
@@ -786,13 +795,16 @@ class SPULifter:
             # flagged by compute_bi_r0_jumps() — emit the indirect dispatch.
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
-                return "return;"
+                # SPU_RET: host return while a matched brsl frame is live
+                # (host_depth>0); at 0 the frame was destroyed -> dispatch to r0.
+                return "SPU_RET(ctx);"
+            # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"SPU_TAILCALL(SPU_IB_DISPATCH(ctx));")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
             return ("ctx->pc = ctx->srr0; "
-                    "SPU_TAILCALL(SPU_IB_DISPATCH(ctx));")
+                    "g_spu_trampoline_fn = spu_indirect_branch; return;")
         if mn in ("bisl",):
             # `bisl rt, ra`: rt = link, ra = TARGET. The disassembler emits BOTH
             # ("$r0, $r2"), so operand 0 is the link register -- taking it as the
@@ -802,8 +814,14 @@ class SPULifter:
             # kernel context, and we jumped to 0x359C (its own link) instead.
             link_rt = insn.raw & 0x7F            # rt = bits 25-31 of the encoding
             tgt_reg = _reg(ops[-1])
+            # Indirect call: nested dispatch bracketed like brsl (host_depth +
+            # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
+            # here and its `bi $r0` returns via host return.
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; SPU_IB_DISPATCH(ctx);")
+                    f"{{ int32_t _si = (int32_t)ctx->image_id; "
+                    f"ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
+                    f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
+                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
@@ -811,7 +829,7 @@ class SPULifter:
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"SPU_TAILCALL(SPU_IB_DISPATCH(ctx)); }}")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -823,9 +841,9 @@ class SPULifter:
             # land on an unregistered mid-function PC.
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
-                return f"if ({cond}) return;"
+                return f"if ({cond}) {{ SPU_RET(ctx); }}"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"SPU_TAILCALL(SPU_IB_DISPATCH(ctx)); }}")
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
@@ -857,7 +875,10 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        return f"{{ ctx->pc = 0x{tgt:X}; SPU_TAILCALL({self.prefix}spu_func_{tgt:08X}(ctx)); }}"
+        # Cross-function unconditional tail: hand the target to the trampoline
+        # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
+        return (f"{{ ctx->pc = 0x{tgt:X}; "
+                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -900,7 +921,8 @@ class SPULifter:
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
                 lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
-                lines.append(f"    ctx->pc = 0x{t:X}u; SPU_IB_DISPATCH(ctx);")
+                lines.append(f"    ctx->pc = 0x{t:X}u; "
+                             f"g_spu_trampoline_fn = spu_indirect_branch; return;")
                 lines.append("}")
             lines.append("")
 

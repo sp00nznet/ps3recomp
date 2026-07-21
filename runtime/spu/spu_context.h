@@ -242,6 +242,16 @@ typedef struct spu_context {
      * overlay is now resident; dispatch retries a missed lookup against it. */
     int resident_ovl;
 
+    /* --- SPU_DRAIN trampoline execution model (faithful-adopt, canersaka) ---
+     * host_depth counts live lifted call frames (matched brsl/bisl). SPU_RET
+     * (`bi $r0`) does a host `return` while host_depth>0 (the caller's frame is
+     * live); at 0 it dispatches to the link register instead (a cross-context
+     * task resume / restack unwind killed the frame). module_img_a00 is the
+     * persistent workload-module image adopted at LS 0xA00, re-applied at
+     * dispatch after a call-bracket image restore. */
+    uint32_t host_depth;
+    int      module_img_a00;
+
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -432,6 +442,64 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 {
     return ch->count > 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * SPU_DRAIN trampoline execution model (faithful-adopt, from canersaka's fork).
+ *
+ * Replaces the musttail SPU_TAILCALL chain: a cross-function transfer sets
+ * ctx->pc + g_spu_trampoline_fn and RETURNS (unwinds the host stack); the
+ * enclosing SPU_DRAIN loop re-enters. This keeps the host stack bounded and
+ * gives ONE central per-transfer hook (lockstep tick, later flight recorder).
+ * The lifter (tools/spu_lifter.py) emits: calls as a bracketed nested host call
+ * + SPU_DRAIN; tail/indirect branches as trampoline-set + return; `bi $r0` as
+ * SPU_RET. Hooks below are STUBS for now (spu_drain.c) -- lockstep/fltrec land
+ * in later milestones.
+ * -----------------------------------------------------------------------*/
+#if defined(_MSC_VER)
+#  define SPU_THREAD_LOCAL __declspec(thread)
+#else
+#  define SPU_THREAD_LOCAL __thread
+#endif
+
+/* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
+ * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
+void spu_indirect_branch(spu_context* ctx);
+
+/* Pending cross-function transfer target; NULL when none. Thread-local: each
+ * spu_context is pinned to one host thread for its lifetime. */
+extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+
+/* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
+void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
+void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    */
+/* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
+ * persistent LS-0xA00 workload module if one is set. */
+void spu_img_restore(spu_context* ctx, int32_t saved_img);
+/* Wake a host thread blocked in a channel wait (channel-stall milestone). */
+void spu_ch_wake(spu_context* ctx);
+
+/* Drain the pending trampoline chain: run each queued transfer target until
+ * none remain. The one central hook site for the faithful execution model. */
+#define SPU_DRAIN(ctx) do {                                    \
+        while (g_spu_trampoline_fn) {                           \
+            void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
+            g_spu_trampoline_fn = 0;                            \
+            yz_lockstep_tick(ctx);                             \
+            spu_task_launch_check((ctx), (void*)_tf);          \
+            _tf(ctx);                                          \
+        }                                                      \
+    } while (0)
+
+/* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
+ * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
+ * resume / restack unwind) so dispatch to the link register instead -- faithful
+ * to CBEA `bi` (branch to word 0 of RA). pc set unconditionally. */
+#define SPU_RET(ctx) do {                                      \
+        (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
+        if ((ctx)->host_depth == 0)                            \
+            g_spu_trampoline_fn = spu_indirect_branch;         \
+        return;                                                \
+    } while (0)
 
 #ifdef __cplusplus
 } /* extern "C" */
