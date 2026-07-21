@@ -10,8 +10,7 @@
 /* Pending cross-function transfer target for this host thread's SPU context. */
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
 
-/* Round-robin lockstep token gate (milestone: spu_lockstep). No-op until then. */
-void yz_lockstep_tick(spu_context* ctx) { (void)ctx; }
+/* yz_lockstep_tick now has its real body in spu_lockstep.c (milestone 2). */
 
 /* SPURS task-launch interception at a trampoline hop (milestone: SPURS kernel).
  * No-op until then. */

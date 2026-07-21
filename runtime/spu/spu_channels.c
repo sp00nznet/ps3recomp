@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "spu_lockstep.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +125,11 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     int halted = 0;
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
+    /* Lockstep gate (env YZ_SPU_LOCKSTEP, default off): join the round-robin
+     * ring and BLOCK until this ctx holds the run token, so only one lifted SPU
+     * executes at a time. No-op when unarmed. The thread-local halt env above
+     * makes a token pause/resume mid-run safe. */
+    yz_lockstep_register(ctx);
     if (setjmp(s_spu_halt_env) != 0) {
         halted = 1;                                /* came back via longjmp     */
         g_spu_trampoline_fn = 0;                   /* unwound mid-drain: discard */
@@ -136,6 +142,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         entry(ctx);
         SPU_DRAIN(ctx);
     }
+    yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = 0;
     return halted;
 }

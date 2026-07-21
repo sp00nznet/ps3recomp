@@ -252,6 +252,14 @@ typedef struct spu_context {
     uint32_t host_depth;
     int      module_img_a00;
 
+    /* SPU lockstep gate (spu_lockstep.c; env YZ_SPU_LOCKSTEP, default off).
+     * quantum_ctr counts tick sites toward a token handoff; release_tb stamps
+     * the guest-timebase moment this ctx last released the token. dec_start_tb
+     * is the lockstep decrementer-freeze anchor (written only while armed). */
+    uint64_t lockstep_quantum_ctr;
+    uint64_t lockstep_release_tb;
+    uint64_t dec_start_tb;
+
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
