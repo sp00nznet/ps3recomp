@@ -767,6 +767,37 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     fprintf(stderr, "%s\n", gs);
 }
 
+/* Guest call-stack tracer: recover the guest call chain from the HOST stack.
+ * Each lifted func_X(ctx) is a real host C frame, and an indirect dispatch runs
+ * NESTED as dispatcher -> ps3_indirect_call -> target, so the host backtrace
+ * (resolved to guest func_ via function_table) reliably names the dispatcher --
+ * unlike the guest-sp back-chain, which breaks on SPURS threads / non-standard
+ * frames. Trampolined tail-calls (g_trampoline_fn) flatten and won't appear, so
+ * this is paired with the raw-stack scan in ppu_dump_guest_stack for coverage. */
+extern "C" void ppu_guest_callstack(const char* tag)
+{
+#ifdef _WIN32
+    void* bt[48]; unsigned short fr = RtlCaptureStackBackTrace(0, 48, bt, 0);
+    char gs[1500]; int gp = snprintf(gs, sizeof gs, "[GCS:%s] host-bt->guest:", tag ? tag : "?");
+    uint32_t last = 0;
+    for (int i = 0; i < fr && gp < 1400; i++) {
+        uintptr_t tgt = (uintptr_t)bt[i];
+        uint32_t bg = 0; uintptr_t bh = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > bh) { bh = h; bg = function_table[k].addr; }
+        }
+        if (bg && (tgt - bh) < 0x8000 && bg != last) {
+            gp += snprintf(gs+gp, sizeof(gs)-gp, " func_%08X+0x%llX", bg, (unsigned long long)(tgt-bh));
+            last = bg;
+        }
+    }
+    fprintf(stderr, "%s\n", gs); fflush(stderr);
+#else
+    (void)tag;
+#endif
+}
+
 /* Indirect call (bctrl/bctr): CTR holds the already-OPD-resolved code address. */
 /* Main-module TOC, captured at entry dispatch. Every main-module (EBOOT .text)
  * function runs with this r2; used to recover a corrupt OPD toc (see below). */
@@ -783,16 +814,12 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         if (tgt==0x002E0510u || tgt==0x002DF320u || tgt==0x00331210u) {
             static int _n=0; if(_n++<12) {
                 const char* w = tgt==0x002DF320u?"INIT":(tgt==0x002E0510u?"CREATE(audio)":"CREATE(cri)");
-                uint32_t sp=(uint32_t)ctx->gpr[1];
-                fprintf(stderr,"[VTORDER] %-13s func_%08X r3(obj)=0x%08X lr=0x%08X chain:", w, tgt,
-                        (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
-                extern uint8_t* vm_base;
-                for(int i=0;i<10 && sp && sp<0x10000000u;i++){ uint32_t nsp; memcpy(&nsp,vm_base+sp,4);
-                    nsp=((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
-                    if(nsp<=sp||nsp>=0x10000000u)break; uint32_t lr; memcpy(&lr,vm_base+nsp+0x10,4);
-                    lr=((lr>>24)&0xFF)|((lr>>8)&0xFF00)|((lr<<8)&0xFF0000)|((lr<<24)&0xFF000000);
-                    fprintf(stderr," %08X",lr); sp=nsp; }
-                fprintf(stderr,"\n"); fflush(stderr);
+                fprintf(stderr,"[VTORDER] #%d %-13s func_%08X r3(obj)=0x%08X\n", _n, w, tgt,
+                        (uint32_t)ctx->gpr[3]);
+                extern void ppu_guest_callstack(const char*);
+                extern void ppu_dump_guest_stack(ppu_context*, const char*);
+                ppu_guest_callstack(w);          /* host-bt -> dispatcher (reliable for nested) */
+                ppu_dump_guest_stack(ctx, w);    /* raw-stack scan -> coverage for tail-calls   */
             }
         }
     }

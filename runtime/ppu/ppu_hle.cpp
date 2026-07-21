@@ -261,6 +261,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                * (nid 0x87630976) STATs unless struct+0xC==0xFF & +0xE in{1,3}; 0x30015AA4
                * (0x22AAB31D) validates the same struct. Show what our recomp left there. */
               if (st && (nid==0x87630976u || nid==0x22AAB31Du)) {
+                  extern void ppu_guest_callstack(const char*);
+                  ppu_guest_callstack(nid==0x87630976u?"CREATE-nid":"INIT-nid");
                   extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
                   #define _RW(o) ((vm_base[s3+(o)]<<24)|(vm_base[s3+(o)+1]<<16)|(vm_base[s3+(o)+2]<<8)|vm_base[s3+(o)+3])
                   /* Full task-descriptor dump: +0xC state(need FF), +0xE type, +0x74/+0x7C
