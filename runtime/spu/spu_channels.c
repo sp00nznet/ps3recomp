@@ -28,6 +28,10 @@
 extern "C" {
 #endif
 
+/* WWS code-buffer resolution probe counter (see spu_ls_write128 in spu_context.h). */
+int g_wws_code_probe = 0;
+int g_wws_read_probe = 0;
+
 /* The SPU decrementer ticks at the PS3 timebase, 79.8 MHz -- the same clock
  * sys_time_get_timebase_frequency reports to the PPU. Titles calibrate real
  * delays against it, so the rate has to be right, not merely non-zero. */
@@ -75,7 +79,21 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
 
 void spu_halt(spu_context* ctx)
 {
-    (void)ctx;
+    /* Register/context dump at halt-asserts: the WWS job's parameter guard
+     * (heqi 0x1650 in job_wws_7BD900) checks (r12 bit0) & (r9 16-aligned) &
+     * (r15 != 0) -- job descriptor/ABI values our execute path must supply.
+     * Dump the low registers + the job's parameter area so a firing assert
+     * names exactly which input is wrong. */
+    { static int _n = 0;
+      if (_n < 6 && ctx->status == SPU_STATUS_STOPPED_BY_HALT) { _n++;
+        fprintf(stderr, "[spu-halt] img=%d pc=0x%05X regs:", ctx->image_id,
+                ctx->pc & SPU_LS_MASK);
+        for (int r = 3; r <= 16; r++)
+            fprintf(stderr, " r%d=%08X", r, ctx->gpr[r]._u32[0]);
+        fprintf(stderr, " r80=%08X r85=%08X\n",
+                ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
+        fflush(stderr);
+      } }
     if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
 }
 
@@ -124,6 +142,17 @@ void spu_stop(spu_context* ctx)
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
+    /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
+     * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
+     * and stamp every image-1 run here to find the argless caller. */
+    if (ctx->image_id == 1) {
+        static int _n = 0;
+        if (_n < 12) { _n++;
+            fprintf(stderr, "[rwh] #%d img=1 ctx=%p r3=%08X r4=%08X entry=%p\n",
+                    _n, (void*)ctx, ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0],
+                    (void*)entry);
+            fflush(stderr); }
+    }
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
     /* Lockstep gate (env YZ_SPU_LOCKSTEP, default off): join the round-robin
@@ -606,6 +635,12 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
     case SPU_RdSigNotify2:   return ctx->ch_sig_notify[1].count;
     case MFC_Cmd:            return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
     case MFC_RdTagStat:      return 1;  /* synchronous: status always ready */
+    /* Stall-and-notify status is a single-value channel: count is 1 while a
+     * newly-stalled tag is pending to be read, else 0. The wwsjob interrupt
+     * handler gates on this (rchcnt $ch25; brz IhcExit) -- returning the old
+     * default of 1 made it enter on spurious interrupts with an empty stat,
+     * running IhcLoop on a zero mask (clz(0) -> bogus tagId/ack). */
+    case MFC_RdListStallStat: return ctx->list_stall_stat ? 1 : 0;
     default:                 return 1;  /* default: channel ready */
     }
 }
@@ -1063,9 +1098,52 @@ void spu_indirect_branch(spu_context* ctx)
      * job_wws_7BD900 at the 0x14400-region buffer); the PM's own table can
      * never contain them. On a policy-module miss inside the job-buffer
      * range, retry against the job image before falling to the interpreter. */
+    /* WWS job-code fallback -- but ONLY when real code is staged at the target.
+     * A PM job whose code buffer is empty (the {0xA400,0} null-code placeholder)
+     * must NOT resolve to image-1's unrelated function that happens to share the
+     * file offset: that ran garbage, the job did no work, and its ring slot
+     * never advanced -> the loader's job ring deadlocked. An empty buffer falls
+     * through to the null-job handling below. */
     if (!fn && ctx->image_id == 2 && ctx->policy_mode &&
-        ctx->pc >= 0x4000 && ctx->pc < 0x3E000)
-        fn = spu_lookup(ctx->pc, 1);
+        ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
+        uint32_t w0 = ((uint32_t)ctx->ls[ctx->pc] << 24) | ((uint32_t)ctx->ls[ctx->pc+1] << 16) |
+                      ((uint32_t)ctx->ls[ctx->pc+2] << 8) | ctx->ls[ctx->pc+3];
+        if (w0 != 0)
+            fn = spu_lookup(ctx->pc, 1);
+    }
+    /* Null-code PM job (empty buffer): return control to the dispatcher's own
+     * host-call bracket so its post-job continuation runs the completion
+     * bookkeeping -- exactly as a real job that did nothing and returned.
+     * (Falling to the SMC microstep would log a spurious BRANCH-TO-0 on the
+     * 0x00000000 word; this is the same outcome, quiet.) */
+    if (!fn && ctx->image_id == 2 && ctx->policy_mode &&
+        ctx->pc >= 0x4000 && ctx->pc < 0x3E000 &&
+        ((uint32_t)ctx->ls[ctx->pc] | ctx->ls[ctx->pc+1] |
+         ctx->ls[ctx->pc+2] | ctx->ls[ctx->pc+3]) == 0) {
+        static int _n = 0;
+        if (_n++ < 8) {
+            /* Ground-truth dump of the WWS code-buffer resolution at dispatch
+             * (wwsjob-rosetta offsets). jobEntry = lsaJobCodeBuffer + [buf+0x10];
+             * lsaJobCodeBuffer = Gbt_bufferPageNum<<10 from the RunJob command.
+             * If the code buffer really is 0x4000 but empty -> the code LOAD is
+             * the bug; if lsaJobCodeBuffer should be 0x14400 -> the RunJob
+             * buffer-set resolution is. Dump both + the bufferSetArray rows. */
+            uint32_t lsaCode = (uint32_t)ctx->ls[0x1330]<<24 | ctx->ls[0x1331]<<16 |
+                               ctx->ls[0x1332]<<8 | ctx->ls[0x1333];
+            uint32_t runJob  = (uint32_t)ctx->ls[0x12E0]<<24 | ctx->ls[0x12E1]<<16 |
+                               ctx->ls[0x12E2]<<8 | ctx->ls[0x12E3];
+            const uint8_t* bs = ctx->ls + 0xDF0;   /* g_WwsJob_bufferSetArray */
+            fprintf(stderr, "[pm-jobres] pc=0x%05X lsaJobCodeBuffer(0x1330)=0x%08X "
+                    "runJobNum(0x12E0)=0x%08X code@14400:%02X%02X%02X%02X\n"
+                    "           bufferSetArray[0xDF0]: %02X%02X%02X%02X %02X%02X%02X%02X "
+                    "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                    ctx->pc & SPU_LS_MASK, lsaCode, runJob,
+                    ctx->ls[0x14400],ctx->ls[0x14401],ctx->ls[0x14402],ctx->ls[0x14403],
+                    bs[0],bs[1],bs[2],bs[3], bs[4],bs[5],bs[6],bs[7],
+                    bs[8],bs[9],bs[10],bs[11], bs[12],bs[13],bs[14],bs[15]);
+        }
+        return;   /* enclosing SPU_DRAIN bracket resumes the dispatcher */
+    }
     if (fn) {
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host
@@ -1084,6 +1162,25 @@ void spu_indirect_branch(spu_context* ctx)
      * exists at those pcs (the code arrives at runtime), so the branch lands
      * here. Log the entry + leading bytes -- the bytes identify WHICH job
      * blob was staged (match against lifted job images for dispatch). */
+    /* Staged-job "return to kernel": a jm2-protocol job binary ends by
+     * jumping to LS 0 (the jm2 kernel's home on real hardware). Inside the
+     * wwsjob PM's LS, address 0 holds the interrupt VECTOR instead -- letting
+     * the jump proceed runs the interrupt handler as the job's continuation
+     * and wedges the pipeline (lanes freeze mid-queue). The PM called the job
+     * with a return link in r0 (0x31C8 sets 0x3258); route the kernel-return
+     * there: the PM resumes its post-job flow, which is exactly what the jm2
+     * kernel hand-back does on hardware. */
+    if (ctx->image_id == 2 && ctx->policy_mode && ctx->pc == 0 &&
+        (ctx->gpr[0]._u32[0] & SPU_LS_MASK) >= 0xA00 &&
+        (ctx->gpr[0]._u32[0] & SPU_LS_MASK) < 0x3700) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[wws-jobret] staged job returned to kernel (LS 0); "
+                    "resuming PM at link 0x%05X\n", ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+        ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+        spu_indirect_branch(ctx);      /* re-dispatch at the rewritten pc */
+        return;
+    }
     if (ctx->image_id == 2 &&
         ((ctx->pc >= 0x3700 && ctx->pc < 0x3FE80) ||
          (ctx->pc < 0xA00 && ctx->pc != SPURS_PM_EXIT_TO_KERNEL_LS &&
@@ -1249,6 +1346,12 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
       if (s_fc < 0) s_fc = getenv("SPU_TRACE_FLOWCTX") ? 1 : 0;
       if (s_fc) { extern void* volatile g_pm_flow_ctx;
                   if (g_pm_flow_ctx != (void*)ctx) { s_trace_suppress = 1; return; } } }
+    /* SPU_TRACE_IMG=<n>: trace only contexts running image n (e.g. 1 = the
+     * WWS job binary, to catch the crt corrupting the job's r3/r4 args). */
+    { static int64_t s_ti = -2;
+      if (s_ti == -2) { const char* e = getenv("SPU_TRACE_IMG");
+                        s_ti = e ? atoll(e) : -1; }
+      if (s_ti >= 0 && ctx->image_id != (int)s_ti) { s_trace_suppress = 1; return; } }
     s_trace_suppress = 0;
     if (s_trace_left < 0) {
         if (s_trace_left == -1) {

@@ -280,18 +280,27 @@ typedef struct spu_context {
      * The handler returns via iret (pc <- srr0). */
     uint32_t int_enable;
 
-    /* Parked DMA-list command (stall-and-notify). A GETL/PUTL that transfers a
-     * list element with bit15 (stall-and-notify) set raises SPU event 0x2 and
-     * parks the remainder here; MFC_WrListStallAck for the tag resumes it.
-     * Saved explicitly -- the live MFC channel registers may be reused for
-     * other commands between the stall and the ack. */
-    uint32_t list_stall_active;
-    uint32_t list_stall_elem_lsa;   /* LS addr of NEXT list element */
-    uint32_t list_stall_remaining;  /* elements left after the stall element */
-    uint32_t list_stall_dest_lsa;   /* accumulated destination LSA */
-    uint64_t list_stall_ea_base;    /* ea base (hi32 carries through) */
-    uint32_t list_stall_cmd;        /* base (non-list) MFC command */
-    uint32_t list_stall_tag;        /* tag group of the parked list */
+    /* Parked DMA-list commands (stall-and-notify), keyed PER TAG GROUP. A
+     * GETL/PUTL that transfers a list element with the stall-and-notify bit
+     * (bit 31 of word0) set raises SPU event 0x2 (SPU_EVENT_SN) and parks the
+     * remainder here; MFC_WrListStallAck for the tag resumes it.
+     *
+     * The WWS job manager pipelines Load/Run/Store stages, each issuing its own
+     * barriered-null-list interrupt on a DISTINCT tag (readCommands=0,
+     * writeShareableBuffers=3, writeAllShareableBuffers=5, writeJobBuffers=6 --
+     * see jobmanagerdmatags.h), so multiple stalls can be outstanding at once.
+     * A single-slot park dropped all but the last -> a pipeline stage's
+     * completion interrupt was lost -> the job ring deadlocked. Hardware (and
+     * RPCS3) accumulate: ch_stall_stat ORs (1<<tag) per stall; rdch returns the
+     * accumulated mask then clears it; ch_stall_mask tracks parked tags and is
+     * cleared per-tag by WrListStallAck. Modelled here as per-tag arrays. */
+    uint32_t list_stall_mask;             /* bit t set = tag t has a parked list */
+    uint32_t list_stall_stat;             /* readable notify mask (rdch clears) */
+    uint32_t list_stall_elem_lsa[32];     /* LS addr of NEXT element, per tag */
+    uint32_t list_stall_remaining[32];    /* elements left after stall, per tag */
+    uint32_t list_stall_dest_lsa[32];     /* accumulated destination LSA, per tag */
+    uint64_t list_stall_ea_base[32];      /* ea base (hi32 carries), per tag */
+    uint32_t list_stall_cmd[32];          /* base (non-list) MFC command, per tag */
 
 } spu_context;
 
@@ -366,6 +375,19 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+    /* WWS buffer-resolution probe: GetLogicalBuffer reads bufferSetArray at
+     * 0xDF0 + (jobNum<<6) + (logBufSet<<2), so the raw address encodes both.
+     * Log them (capped) to see which set each command -- especially RunJob --
+     * resolves to. Uses the RAW lsa before 16-byte alignment masking. */
+    if (ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
+        extern int g_wws_read_probe;
+        if (g_wws_read_probe < 48) {
+            g_wws_read_probe++;
+            uint32_t off = lsa - 0xDF0;
+            fprintf(stderr, "[wws-res] bufferSetArray read jobNum=%u logBufSet=%u off=0x%X\n",
+                    off >> 6, (off >> 2) & 0xF, off);
+        }
+    }
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
@@ -391,6 +413,38 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
+    /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
+     * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
+     * that code-buffer LS address, dump the RunJob decision inputs so we can see
+     * why it resolves to an empty buffer: the resolved address, the whole
+     * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
+     * command (commandNum==5) names the code buffer set. */
+    if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
+        extern int g_wws_code_probe;   /* defined in spu_channels.c, capped */
+        if (g_wws_code_probe < 6) {
+            g_wws_code_probe++;
+            uint32_t codeLsa = val._u32[0];
+            #define _RD32(o) (((uint32_t)ctx->ls[o]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)| \
+                              ((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
+            uint32_t loadJob = _RD32(0x12D0), nextLoad = _RD32(0x12C0), runJob = _RD32(0x12E0);
+            /* GetLogicalBuffer keys the bufferSet on jobNum(=loadJobNum): row at
+             * 0xDF0 + jobNum*64. Dump THAT row (and job0's) so we see which set
+             * the code resolves from. codeLsa>>10 = the resolved page. */
+            fprintf(stderr, "[wws-code] codeLS=0x%05X (page 0x%X) loadJobNum=0x%X nextLoad=0x%X runJobNum=0x%X\n",
+                    codeLsa & 0x3FFFF, (codeLsa>>10)&0xFF, loadJob, nextLoad, runJob);
+            uint32_t row = (loadJob <= 3) ? (0xDF0 + loadJob*64) : 0xDF0;
+            const uint8_t* bs = &ctx->ls[row];
+            fprintf(stderr, "  bufferSetArray[job=0x%X @0x%X]:", loadJob, row);
+            for (int i = 0; i < 32; i += 4)
+                fprintf(stderr, " %02X%02X%02X%02X", bs[i],bs[i+1],bs[i+2],bs[i+3]);
+            const uint8_t* lc = &ctx->ls[0xC00];
+            fprintf(stderr, "\n  loadCommands[0xC00]:");
+            for (int i = 0; i < 0x80; i += 4)
+                fprintf(stderr, " %02X%02X%02X%02X", lc[i],lc[i+1],lc[i+2],lc[i+3]);
+            fprintf(stderr, "\n");
+            #undef _RD32
+        }
+    }
 #if SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);

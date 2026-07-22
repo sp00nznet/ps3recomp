@@ -447,19 +447,21 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
         }
 
         if (stall_notify) {
-            spu->list_stall_active    = 1;
-            spu->list_stall_elem_lsa  = (el + 8) & SPU_LS_MASK;
-            spu->list_stall_remaining = num_left - i - 1;
-            spu->list_stall_dest_lsa  = dest_lsa;
-            spu->list_stall_ea_base   = ea_base;
-            spu->list_stall_cmd       = base_cmd;
-            spu->list_stall_tag       = tag & 0x1F;
-            spu->event_status |= 0x2u;          /* DMA list stall-and-notify */
+            uint32_t t = tag & 0x1F;
+            spu->list_stall_elem_lsa[t]  = (el + 8) & SPU_LS_MASK;
+            spu->list_stall_remaining[t] = num_left - i - 1;
+            spu->list_stall_dest_lsa[t]  = dest_lsa;
+            spu->list_stall_ea_base[t]   = ea_base;
+            spu->list_stall_cmd[t]       = base_cmd;
+            spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
+            spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
+            spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
             spu_ch_wake(spu);
             { static int _n = 0; if (_n++ < 16)
                 fprintf(stderr, "[mfc-list] STALL img=%d tag=%u elem@0x%05X "
-                        "left=%u dest=0x%05X (event 0x2 raised)\n",
-                        spu->image_id, tag & 0x1F, el, num_left - i - 1, dest_lsa); }
+                        "left=%u dest=0x%05X (SN raised, parked mask=0x%X)\n",
+                        spu->image_id, t, el, num_left - i - 1, dest_lsa,
+                        spu->list_stall_mask); }
             return 0;
         }
     }
@@ -471,24 +473,24 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
 static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
                                      uint32_t tag)
 {
-    if (!spu->list_stall_active || (tag & 0x1F) != spu->list_stall_tag) {
+    uint32_t t = tag & 0x1F;
+    if (!(spu->list_stall_mask & (1u << t))) {
         static int _n = 0;
         if (_n++ < 8)
-            fprintf(stderr, "[mfc-list] StallAck tag=%u but %s (parked tag=%u)\n",
-                    tag & 0x1F, spu->list_stall_active ? "tag mismatch" : "no parked list",
-                    spu->list_stall_tag);
+            fprintf(stderr, "[mfc-list] StallAck tag=%u but no parked list "
+                    "(parked mask=0x%X)\n", t, spu->list_stall_mask);
         return 0;
     }
-    spu->list_stall_active = 0;
+    spu->list_stall_mask &= ~(1u << t);          /* clears; re-set if it re-parks */
     { static int _n = 0; if (_n++ < 16)
         fprintf(stderr, "[mfc-list] RESUME img=%d tag=%u elem@0x%05X left=%u\n",
-                spu->image_id, tag & 0x1F, spu->list_stall_elem_lsa,
-                spu->list_stall_remaining); }
-    int rc = mfc_run_list(spu, spu->list_stall_elem_lsa, spu->list_stall_remaining,
-                          spu->list_stall_dest_lsa, spu->list_stall_ea_base,
-                          spu->list_stall_cmd, spu->list_stall_tag);
-    if (!spu->list_stall_active)                 /* ran to the end: tag done */
-        mfc->tag_completed |= (1u << (tag & 0x1F));
+                spu->image_id, t, spu->list_stall_elem_lsa[t],
+                spu->list_stall_remaining[t]); }
+    int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
+                          spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
+                          spu->list_stall_cmd[t], t);
+    if (!(spu->list_stall_mask & (1u << t)))      /* ran to the end: tag done */
+        mfc->tag_completed |= (1u << t);
     return rc;
 }
 
@@ -763,7 +765,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
      * element: its tag group stays incomplete until MFC_WrListStallAck resumes
      * it to the end (mfc_list_stall_ack marks completion then). */
-    if (!(spu->list_stall_active && (spu->list_stall_tag == (tag & 0x1F))))
+    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))))
         mfc->tag_completed |= (1u << tag);
 
     return rc;
@@ -862,9 +864,14 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
         return spu->mfc_tag_status;
     case MFC_RdTagMask:
         return spu->mfc_tag_mask;
-    case MFC_RdListStallStat:
-        /* Tag-group mask of lists currently stalled at a notify element. */
-        return spu->list_stall_active ? (1u << spu->list_stall_tag) : 0;
+    case MFC_RdListStallStat: {
+        /* Accumulated tag-group mask of newly-stalled lists. Reading returns
+         * the mask and clears it (RPCS3 ch_stall_stat semantics); the interrupt
+         * handler's IhcLoop then drains every set bit, acking each via ch26. */
+        uint32_t m = spu->list_stall_stat;
+        spu->list_stall_stat = 0;
+        return m;
+    }
     case MFC_RdAtomicStat:
         /* Result of the last atomic line op (GETLLAR/PUTLLC/PUTLLUC), set by
          * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,
