@@ -1057,6 +1057,15 @@ void spu_indirect_branch(spu_context* ctx)
      * addresses may also be registered (historical junk lifts) and must lose. */
     spu_fn fn = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
     if (!fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* WWS job-code fallback: the jobmanager PM (image 2) stages each job's
+     * code into an LS buffer and branches into it. The staged blobs are
+     * lifted as their own images at their LS residence addresses (image 1 =
+     * job_wws_7BD900 at the 0x14400-region buffer); the PM's own table can
+     * never contain them. On a policy-module miss inside the job-buffer
+     * range, retry against the job image before falling to the interpreter. */
+    if (!fn && ctx->image_id == 2 && ctx->policy_mode &&
+        ctx->pc >= 0x4000 && ctx->pc < 0x3E000)
+        fn = spu_lookup(ctx->pc, 1);
     if (fn) {
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host
@@ -1088,6 +1097,20 @@ void spu_indirect_branch(spu_context* ctx)
                     ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                     p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
                     p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+            /* Companion state: the OTHER load target (the real 0x100-byte
+             * loads land at 0x14400 -- possibly the actual job code, with the
+             * entry computed from the wrong slot's base) + the job records
+             * the entry math reads (0x1320 base block, 0x1440 batch record). */
+            { const uint8_t* q = ctx->ls + 0x14400;
+              const uint8_t* r1 = ctx->ls + 0x1320;
+              const uint8_t* r2 = ctx->ls + 0x1440;
+              fprintf(stderr, "[wws-jobentry]   LS14400: %02X%02X%02X%02X %02X%02X%02X%02X"
+                      "  LS1320: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X"
+                      "  LS1440: %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                      r1[0],r1[1],r1[2],r1[3], r1[4],r1[5],r1[6],r1[7],
+                      r1[8],r1[9],r1[10],r1[11], r1[12],r1[13],r1[14],r1[15],
+                      r2[0],r2[1],r2[2],r2[3], r2[4],r2[5],r2[6],r2[7]); }
             fflush(stderr);
         }
     }
