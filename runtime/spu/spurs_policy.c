@@ -71,6 +71,14 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * that motivated the cache predates the r4 word0/word1 layout fix). */
     static int s_fresh = -1;
     if (s_fresh < 0) s_fresh = getenv("SPURS_PM_FRESH") ? 1 : 0;
+    /* Reset the persistent context when the workload's DATA (queue EA)
+     * changes: the game re-points a wid at a NEW job queue once the old one
+     * drains, and a real SPURS kernel reloads the policy module fresh on a
+     * workload switch. Carrying queue A's LS (header cache 0x14B0, busy
+     * masks 0x1270/0x1280, records) into queue B made the PM see stale
+     * state and claim nothing (observed: LBP's second loading queue sat at
+     * lanes {0,...} while the first drained fine). */
+    static uint64_t s_pm_data[SPURS_PM_MAX_WKL][6];
     if (!ctx) {
         ctx = (spu_context*)malloc(sizeof(spu_context));
         if (!ctx) return -1;
@@ -78,11 +86,20 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         first = 1;
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
-    } else if (s_fresh) {
+    } else if (s_fresh || s_pm_data[wid][spu_num] != wkl_data) {
+        if (!s_fresh) {
+            static int _n = 0;
+            if (_n++ < 8)
+                fprintf(stderr, "[spurs-pm] wid=%u spu=%u workload data changed "
+                        "0x%llX -> 0x%llX: fresh PM context\n", wid, spu_num,
+                        (unsigned long long)s_pm_data[wid][spu_num],
+                        (unsigned long long)wkl_data);
+        }
         first = 1;
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
     }
+    s_pm_data[wid][spu_num] = wkl_data;
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
 
@@ -218,7 +235,26 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                 last = pc;
             }
             if (rep) fprintf(stderr, "*%u", rep + 1);
-            fprintf(stderr, "\n"); fflush(stderr);
+            fprintf(stderr, "\n");
+            /* Pipeline LS state right after this traced run: same regions the
+             * hung-run watchdog dumps -- shows what the 5 type-1 passes built
+             * (records/ring) and why the type-2 loads never dispatch. */
+            { static const struct { uint32_t a, len; const char* tag; } R[] = {
+                  { 0xC00, 0x60, "cmds" }, { 0xDF0, 0x40, "rec" },
+                  { 0xEB0, 0x60, "ring" }, { 0x11B0, 0x20, "mark" },
+                  { 0x1270, 0x20, "busy" }, { 0x12A0, 0x10, "st12A0" },
+                  { 0x12C0, 0x40, "state" } };
+              for (unsigned r = 0; r < sizeof R / sizeof R[0]; r++) {
+                  fprintf(stderr, "[pm-ls] %-6s 0x%04X:", R[r].tag, R[r].a);
+                  for (uint32_t o = 0; o < R[r].len; o += 4) {
+                      if (o && (o & 15) == 0) fprintf(stderr, " |");
+                      fprintf(stderr, " %02X%02X%02X%02X",
+                              ctx->ls[R[r].a+o], ctx->ls[R[r].a+o+1],
+                              ctx->ls[R[r].a+o+2], ctx->ls[R[r].a+o+3]);
+                  }
+                  fprintf(stderr, "\n");
+              } }
+            fflush(stderr);
         }
     }
 

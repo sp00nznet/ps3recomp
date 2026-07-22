@@ -701,14 +701,33 @@ void* cellGcm_fifo_kick_event(void)
     return (void*)s_gcm_kick_ev;
 }
 
+/* Serializes fence publication between the present ticker and every guest
+ * thread poll-reading the ref register (REFPOLL default-on made this path
+ * multi-threaded; the SPSC queue head raced and publication order broke --
+ * boot froze with all threads parked on fences that were never published in
+ * order). TryAcquire: a contended poll just reads the current ref. */
+static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
+
 void cellGcm_ref_on_poll(void)
 {
-    /* Advance one queued fence per guest POLL-READ (no wall-clock cap). The
-     * old <=1-per-ms pacing throttled a movie frame with hundreds of fences
-     * to hundreds of ms. LBP's waits compare with >, not ==, so fast
-     * advancement is not a hang risk. */
-    gcm_ref_publish_one();
-    if (s_ref_qhead == s_ref_qtail && s_gcm_kick_ev)
+    /* Pace: leave each published value observable for >= ~200us of spins
+     * (equality-waiters at any poll rate see every value; still ~5000/s so
+     * loading's fence storms clear in seconds, not minutes). */
+    static LARGE_INTEGER s_freq;
+    static volatile LONGLONG s_last_pub;
+    if (!TryAcquireSRWLockExclusive(&s_ref_pub_lock))
+        return;
+    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    LONGLONG min_gap = s_freq.QuadPart / 5000;          /* ~200us */
+    int dry = 0;
+    if (now.QuadPart - s_last_pub >= min_gap) {
+        gcm_ref_publish_one();
+        s_last_pub = now.QuadPart;
+        dry = (s_ref_qhead == s_ref_qtail);
+    }
+    ReleaseSRWLockExclusive(&s_ref_pub_lock);
+    if (dry && s_gcm_kick_ev)
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
 }
 
@@ -824,7 +843,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * the drained EA. */
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
-    gcm_ref_publish_one();                                              /* ref */
+    AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+    gcm_ref_publish_one();
+    ReleaseSRWLockExclusive(&s_ref_pub_lock);
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls

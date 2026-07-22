@@ -350,7 +350,12 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
      * <=1/ms), so cellGcmFinish makes progress even when the 60 Hz present
      * ticker is starved during heavy boot load (fixes the [finspin] crawl).
      * Publish BEFORE the read so this poll observes the freshly-advanced ref. */
-    if ((uint32_t)a == 0x03002008u) { static int _rp=-1; if(_rp<0)_rp=getenv("GCM_REFPOLL")?1:0;
+    /* Default ON (GCM_REFPOLL=0 disables): with only the 60 Hz ticker
+     * publishing, LBP's asset loading -- thousands of fence-waits -- crawled
+     * at ~28 fences/s (minutes-to-hours of [finspin]); read-driven pacing
+     * publishes at up to 1/ms and the loading progresses ~35x faster. */
+    if ((uint32_t)a == 0x03002008u) { static int _rp=-1;
+        if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
         if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
@@ -367,13 +372,16 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
 #endif
     { static int64_t rw=-2; if (rw==-2) { const char* e=getenv("YDKJ_RWATCH"); rw=e?(int64_t)strtoul(e,0,0):-1; }
       if (rw>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)rw && ea<(uint32_t)rw+0x80) {
-        static int _n=0; if (_n++<40) {
+        static int _n=0; if (_n<40) {
           char ln[820]; int p=snprintf(ln,sizeof ln,"[RWATCH] read32 0x%08X = 0x%08X guest:", ea, __builtin_bswap32(v));
           void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
+          int guest=0;
           for(int i=0;i<fr;i++){ uintptr_t tgt=(uintptr_t)bt[i]; uint32_t bg=0; uintptr_t bh=0;
             for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
-            if(bg&&(tgt-bh)<0x2000) p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh)); }
-          fprintf(stderr,"%s\n",ln); } } } }
+            if(bg&&(tgt-bh)<0x2000){ p+=snprintf(ln+p,sizeof(ln)-p," func_%08X+0x%llX",bg,(unsigned long long)(tgt-bh)); guest=1; } }
+          /* Host-side reads (our HLE bitset walks) drown the budget; only
+           * GUEST-attributed reads name the actual polling game code. */
+          if (guest) { _n++; fprintf(stderr,"%s\n",ln); } } } } }
     /* FLOW_RVAL=<hex>: catch where a value is READ FROM memory (its source loc) —
      * the complement to FLOW_WVAL, to find the origin of the 0xC708C708 poison. */
     { static int64_t rv=-2; if (rv==-2){ const char* e=getenv("FLOW_RVAL"); rv=e?(int64_t)strtoul(e,0,16):-1; }
@@ -474,6 +482,23 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
 extern "C" uint32_t g_barrier_sync_watch = 0;
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    /* LBP_WW=<hexEA>: log every PPU store into the 16-byte line at that EA,
+     * with the writing guest function -- to find who fills (or fails to fill)
+     * a struct field (e.g. FMOD's overlay descriptor source at 0x94F680). */
+    { static uint32_t s_ww = 0xFFFFFFFFu;
+      if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("LBP_WW"); s_ww = e ? (uint32_t)strtoul(e,0,0) : 0; }
+      if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + 0x20) {
+          static int _n = 0;
+          if (_n++ < 64) {
+              fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
+                      a, v, width, ppu_prof_resolve_host(ra));
+              /* On the first write to the watched word, dump the guest caller
+               * chain so the origin of a null field can be walked up-stack. */
+              extern __declspec(thread) ppu_context* g_active_ctx;
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              if (_n == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "ww");
+          }
+      } }
     uint32_t b = g_barrier_sync_watch;
     if (!b) return;
     if (a >= b + 0x40 && a < b + 0xC0) {

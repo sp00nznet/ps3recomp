@@ -1070,8 +1070,29 @@ void spu_indirect_branch(spu_context* ctx)
         return;
 #endif
     }
+    /* wwsjob JOB-CODE entry probe: the PM stages each job's code into a
+     * buffer above its static image (0x3700..) and branches into it. No lift
+     * exists at those pcs (the code arrives at runtime), so the branch lands
+     * here. Log the entry + leading bytes -- the bytes identify WHICH job
+     * blob was staged (match against lifted job images for dispatch). */
+    if (ctx->image_id == 2 &&
+        ((ctx->pc >= 0x3700 && ctx->pc < 0x3FE80) ||
+         (ctx->pc < 0xA00 && ctx->pc != SPURS_PM_EXIT_TO_KERNEL_LS &&
+          ctx->pc != SPURS_PM_SELECT_WORKLOAD_LS))) {
+        static int _n = 0;
+        if (_n < 12) {
+            _n++;
+            const uint8_t* p = ctx->ls + (ctx->pc & SPU_LS_MASK);
+            fprintf(stderr, "[wws-jobentry] pc=0x%05X lr=0x%05X bytes:"
+                    " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                    ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                    p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+                    p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+            fflush(stderr);
+        }
+    }
     /* No lifted function at this PC: it may be RUNTIME-GENERATED code (the
-     * WWS jobmanager writes a register save/restore stub above its static
+     * WWS jobmanager writes a save/restore stub above its static
      * image and calls it). Interpret the live LS bytes; on success the next
      * branch re-enters lifted code via the trampoline. */
     if (spu_smc_microstep(ctx))
