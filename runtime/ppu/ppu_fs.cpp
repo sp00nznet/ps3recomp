@@ -15,6 +15,7 @@
  */
 #include "ppu_recomp.h"      /* ppu_context */
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
+#include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -158,6 +159,82 @@ static void cellFsOpen(ppu_context* ctx)
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
+    ctx->gpr[3] = CELL_OK;
+}
+
+/* cellFsSdataOpen(path, flags, fd*, arg*, size): opens a PS3 SDATA/EDAT
+ * encrypted-data file and returns an fd whose reads yield the DECRYPTED
+ * plaintext. LBP 1.30 stores its SPU job code modules inside patch.sdat (an
+ * FSHb container, zlib-compressed C0DEC0DE modules) and opens it via this call;
+ * leaving it faked (default CELL_OK, no handle) meant the container was never
+ * read -> zero job modules loaded -> every SPU physics job dispatched into an
+ * empty code buffer -> the loading freeze.
+ *
+ * Our run env's PS3_HDD0_ROOT (RPCS3 dev_hdd0) already holds patch.sdat in
+ * DECRYPTED form (magic "FSHb", not "NPD"), so we just open it read-only --
+ * no EDAT decryption needed. (A title supplying a still-encrypted NPD .sdat
+ * would need the SDATA block cipher; not required here.) The license `arg`
+ * (gpr[6]) and its size (gpr[7]) are ignored. */
+static void cellFsSdataOpen(ppu_context* ctx)
+{
+    char gpath[1024], hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
+    host_path(hpath, sizeof hpath, gpath);
+
+    int hfd = open(hpath, O_RDONLY | O_BINARY, 0666);
+    if (hfd < 0) {
+        fprintf(stderr, "[fs] SdataOpen FAIL '%s' -> '%s'\n", gpath, hpath);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+    }
+    FILE* f = fdopen(hfd, "rb");
+    if (!f) { close(hfd); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    /* If the file IS still NPD-encrypted, we can't serve it plaintext here --
+     * warn loudly rather than hand back ciphertext the title will choke on.
+     * Use portable fread/fseek (POSIX read()/ssize_t aren't available under the
+     * exe's compiler). */
+    unsigned char magic[4] = {0};
+    size_t got = fread(magic, 1, 4, f);
+    fseek(f, 0, SEEK_SET);
+    if (got == 4 && magic[0]=='N' && magic[1]=='P' && magic[2]=='D') {
+        /* NPD-encrypted SDATA: decrypt it in full and serve the plaintext from
+         * an anonymous tmpfile so the title's reads see the real container. */
+        fseek(f, 0, SEEK_END); long enc_sz = ftell(f); fseek(f, 0, SEEK_SET);
+        uint8_t* enc = (enc_sz > 0) ? (uint8_t*)malloc((size_t)enc_sz) : nullptr;
+        size_t rd = enc ? fread(enc, 1, (size_t)enc_sz, f) : 0;
+        fclose(f);
+        size_t dec_sz = 0;
+        uint8_t* dec = (enc && rd == (size_t)enc_sz) ? sdata_decrypt(enc, rd, &dec_sz) : nullptr;
+        free(enc);
+        if (!dec) {
+            fprintf(stderr, "[fs] SdataOpen '%s' NPD decrypt FAILED (unsupported "
+                    "EDAT/needs license); returning success without a handle\n", gpath);
+            ctx->gpr[3] = CELL_OK; return;   /* don't feed the title ciphertext */
+        }
+        char dmagic[4] = {0};
+        if (dec_sz >= 4) memcpy(dmagic, dec, 4);
+        FILE* tf = tmpfile();
+        if (!tf || fwrite(dec, 1, dec_sz, tf) != dec_sz) {
+            if (tf) fclose(tf); free(dec);
+            ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+        }
+        free(dec);
+        rewind(tf);
+        int fd = fd_alloc_file(tf);
+        if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+        if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+        fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
+                gpath, fd, dec_sz,
+                dmagic[0]?dmagic[0]:'?', dmagic[1]?dmagic[1]:'?',
+                dmagic[2]?dmagic[2]:'?', dmagic[3]?dmagic[3]:'?');
+        ctx->gpr[3] = CELL_OK;
+        return;
+    }
+    int fd = fd_alloc_file(f);
+    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+    fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
+            magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -360,6 +437,10 @@ static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3
 extern "C" void ppu_fs_register(void)
 {
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
+    /* Register by the literal import NID: LBP imports 0xB1840B53 for
+     * cellFsSdataOpen, which ps3_compute_nid("cellFsSdataOpen") does NOT match
+     * (the real exported symbol name differs from the friendly name). */
+    ps3_hle_register_ctx(0xB1840B53u, "cellFsSdataOpen", cellFsSdataOpen);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClose"),    "cellFsClose",    cellFsClose);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
