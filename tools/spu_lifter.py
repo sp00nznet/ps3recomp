@@ -172,7 +172,15 @@ def _imm(token: str) -> str:
     try:
         return str(int(token))
     except ValueError:
-        return token
+        pass
+    # An immediate-form instruction whose imm operand disassembled to a register
+    # token ($rN) only happens when a data region is mis-decoded as code (e.g. a
+    # CRC/constant table the function-boundary detector over-included). The code
+    # is unreachable; emit a valid C constant from the field value so it compiles.
+    m = re.match(r"\$r(\d+)$", token)
+    if m:
+        return m.group(1)
+    return "0"
 
 
 def _chan(token: str) -> str:
@@ -654,7 +662,7 @@ class SPULifter:
             "shlqbybi": "spu_shlqbybi", "rotqbybi": "spu_rotqbybi",
             # Phase 3: rotate-and-mask (register-variable)
             "rotm": "spu_rotm", "rotma": "spu_rotma",
-            "rothm": "spu_rothm", "rothma": "spu_rothma",
+            "rothm": "spu_rothm", "rotmah": "spu_rothma",
             "rotqmbi": "spu_rotqmbi", "rotqmby": "spu_rotqmby",
             "rotqmbybi": "spu_rotqmbybi",
             # Phase 3: indexed constant generators (insertion masks)
@@ -1095,7 +1103,15 @@ def main() -> None:
             if not split and not any(s == a for s, _ in bset):
                 newb.append((a, base + len(data)))
             bset = sorted(set(newb))
-        bounds = bset
+        # Dedup by start: if an extra addr lands inside two overlapping auto-
+        # detected bounds, splitting both yields two bounds with the same start
+        # -> two functions emitted with the same name (redefinition). Keep one
+        # per start (the tightest end); the start is what dispatch resolves to.
+        by_start = {}
+        for s, e in bset:
+            if s not in by_start or e < by_start[s]:
+                by_start[s] = e
+        bounds = sorted(by_start.items())
         sys.stderr.write("[spu_lifter] added extra funcs: %s\n" %
                          ", ".join("0x%X" % a for a in extra))
 

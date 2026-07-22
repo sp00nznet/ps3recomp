@@ -59,7 +59,8 @@ if(LBP_ENABLE_SPU)
     list(LENGTH SPU_LIFTED N_SPU)
     message(STATUS "lifted SPU images: ${N_SPU}")
     # Embedded raw SPURS taskset-policy bytes (not a *_recomp.c, so not glob-caught).
-    set(SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gen/spu_workloads.c" ${SPU_LIFTED}
+    set(SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gen/spu_workloads.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gen/jobmods_register.c" ${SPU_LIFTED}
         "${CMAKE_CURRENT_SOURCE_DIR}/spu_dispatch_mt.c"
         "${PS3RECOMP_DIR}/lbp_spu/lifted/taskset_policy/taskset_policy_bytes.c")
 else()

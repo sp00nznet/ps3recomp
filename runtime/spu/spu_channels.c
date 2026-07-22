@@ -722,7 +722,9 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
 typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; } spu_ovl_src;
-#define SPU_OVL_SRC_MAX 16
+/* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
+ * the same job code buffer at LS 0x4000, dispatched by content signature). */
+#define SPU_OVL_SRC_MAX 128
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
 
@@ -771,6 +773,21 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             return;
         }
     }
+}
+
+/* Match a 16-byte module header against the registered content signatures.
+ * Returns the overlay image id, or 0 if none. Used by the WWS job-code dispatch
+ * path: the job manager streams a module into the code buffer via a DMA LIST
+ * (per-element GETs the single-transfer note_get hook doesn't see as one >=512
+ * chunk), so resident_ovl is set at branch-in time by matching the buffer head. */
+int spu_overlay_match_sig(const uint8_t hdr[16])
+{
+    for (int i = 0; i < s_ovl_src_count; i++) {
+        const spu_ovl_src* o = &s_ovl_src[i];
+        if (o->has_sig && memcmp(hdr, o->sig, 16) == 0)
+            return o->image_id;
+    }
+    return 0;
 }
 
 /* HLE of the taskset Policy Module's task-syscall entry (LS 0xA70). A SPURS task
@@ -1092,6 +1109,28 @@ void spu_indirect_branch(spu_context* ctx)
      * addresses may also be registered (historical junk lifts) and must lose. */
     spu_fn fn = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
     if (!fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* WWS job-code overlay match: the PM (image 2) streams a job module into the
+     * code buffer (base = LS[0x1320]) and branches to base+entryOffset. Its 16-byte
+     * ila header identifies which of the 89 lifted job modules it is; match it and
+     * mark that overlay resident so the module's lifted functions dispatch. The
+     * module arrives via a DMA LIST, so the single-GET note_get hook never fired. */
+    if (!fn && ctx->image_id == 2 && ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
+        uint32_t codeBase = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
+                            ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
+        if (codeBase + 16 <= SPU_LS_SIZE) {
+            extern int spu_overlay_match_sig(const uint8_t hdr[16]);
+            int img = spu_overlay_match_sig(&ctx->ls[codeBase]);
+            if (img) {
+                if (ctx->resident_ovl != img) {
+                    ctx->resident_ovl = img;
+                    static int _n = 0; if (_n++ < 32)
+                        fprintf(stderr, "[spu-ovl] WWS job module resident: codeBase=0x%05X "
+                                "pc=0x%05X -> overlay image %d\n", codeBase, ctx->pc & SPU_LS_MASK, img);
+                }
+                fn = spu_lookup(ctx->pc, img);
+            }
+        }
+    }
     /* WWS job-code fallback: the jobmanager PM (image 2) stages each job's
      * code into an LS buffer and branches into it. The staged blobs are
      * lifted as their own images at their LS residence addresses (image 1 =
