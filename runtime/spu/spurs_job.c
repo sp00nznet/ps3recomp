@@ -264,6 +264,17 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx.gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
+    { static int _n = 0;
+      if (_n++ < 4)
+          fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
+                  ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
+                  image_id); }
+    /* NOTE: after its work the job's runtime jumps to LS 0 ("return to the
+     * jm2 kernel" -- real layout has the kernel at 0, jobs above; we load the
+     * job at 0). That second lap re-enters the job's crt with dead registers
+     * and trips its parameter guard, which HALTS -- ending the run. So the
+     * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
+     * noise, not a failure: the job's real work finished before the jump. */
     spu_run_with_halt(entry, &ctx);
 
     if (getenv("LBP_JOB_DUMP")) {

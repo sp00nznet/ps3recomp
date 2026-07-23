@@ -998,6 +998,29 @@ enum {
     WKATTR_HOOK_ARG   = 0x34,   /* be u32 */
 };
 
+static volatile u32 s_pmwatch_ea = 0, s_pmwatch_sz = 0;
+static DWORD WINAPI pm_write_watch(LPVOID unused)
+{
+    (void)unused;
+    u32 ea = s_pmwatch_ea, sz = s_pmwatch_sz;
+    u32 last_exe = vm_read32(ea + 0xAF4), last_hot = vm_read32(ea + 0x7E4); /* 0x14f4, 0x11e4 */
+    for (int t = 0; t < 6000; t++) {          /* ~60s at 10ms */
+        u32 exe = vm_read32(ea + 0xAF4), hot = vm_read32(ea + 0x7E4);
+        if ((exe != last_exe && exe != 0) || (hot != last_hot && hot != 0xFFFFFFFFu)) {
+            fprintf(stderr, "[pm-watch] PM ASSEMBLED at ~%dms: exe@0x14f4 %08X->%08X hot@0x11e4 %08X->%08X\n",
+                    t * 10, last_exe, exe, last_hot, hot);
+            FILE* pf = fopen("lbp_spu/pm_wwsjob_complete.bin", "wb");
+            if (pf) { fwrite(vm_base + ea, 1, sz, pf); fclose(pf);
+                fprintf(stderr, "[pm-watch] wrote lbp_spu/pm_wwsjob_complete.bin (0x%X bytes)\n", sz); }
+            return 0;
+        }
+        Sleep(10);
+    }
+    fprintf(stderr, "[pm-watch] PM NEVER assembled in 60s (exe@0x14f4=%08X hot@0x11e4=%08X) "
+            "-> assembly is HLE'd/external\n", vm_read32(ea + 0xAF4), vm_read32(ea + 0x7E4));
+    return 0;
+}
+
 s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
                                        CellSpursWorkloadId* wid,
                                        const CellSpursWorkloadAttribute* attr)
@@ -1038,6 +1061,33 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
                 printf(" %08X", vm_read32(pm_ea + o));
             }
             printf("\n");
+        }
+        /* PM-COMPLETENESS PROBE (LBP_PM_DUMP): the wwsjob job-manager PM is
+         * ASSEMBLED at runtime -- the embedded ELF (LS 0xA00) has zero HOLES at
+         * LS 0xAEE..0x11B0 and the executeStage lives at LS 0x14f4, both filled
+         * by SPURS setup. Report whether OUR runtime's PM has that code or the
+         * holes, and (once) write the whole image out so we can re-lift it. */
+        if (getenv("LBP_PM_DUMP") && pm_ea && pm_sz >= 0x2200 && pm_sz <= 0x4000) {
+            u32 exe = vm_read32(pm_ea + 0xAF4);          /* LS 0x14f4 executeStage */
+            int zeros = 0; for (u32 o = 0xEE; o < 0x7B0; o += 4)
+                if (vm_read32(pm_ea + o) == 0) zeros += 4;
+            fprintf(stderr, "[pm-dump] wid-PM ea=0x%08X sz=0x%X exe@+0xAF4=%08X (want 24F880ED) "
+                    "holeZeros=%d/1730 -> %s\n", pm_ea, pm_sz, exe, zeros,
+                    (exe == 0x24F880EDu ? "COMPLETE (we assemble it)"
+                                        : zeros > 1000 ? "HOLEY (assembly skipped)" : "PARTIAL"));
+            static int _dumped = 0;
+            if (!_dumped) { _dumped = 1;
+                FILE* pf = fopen("lbp_spu/pm_wwsjob_runtime.bin", "wb");
+                if (pf) { fwrite(vm_base + pm_ea, 1, pm_sz, pf); fclose(pf);
+                    fprintf(stderr, "[pm-dump] wrote lbp_spu/pm_wwsjob_runtime.bin (0x%X bytes)\n", pm_sz); }
+                /* WRITE-WATCH: spawn a poller that reports if/when the PM's
+                 * placeholder hot-loop (LS 0x11e4, currently 0xFFFFFFFF) and
+                 * executeStage (LS 0x14f4, currently 0) get real code written by
+                 * PPU code at runtime -> tells us whether our recompiled game
+                 * assembles the PM (dump it) or the assembly is HLE'd away. */
+                s_pmwatch_ea = pm_ea; s_pmwatch_sz = pm_sz;
+                CreateThread(NULL, 1u << 18, pm_write_watch, NULL, 0, NULL);
+            }
         }
         _n++;
     }
@@ -1334,7 +1384,15 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * (spurs_policy.c), not extra lanes. */
             /* SPURS_FORCE_SPUS=<n>: dispatch every workload for n virtual SPUs
              * regardless of maxContention (A/B: LBP publishes its loading
-             * tickets on sync row 3, and the PM's row index = spuNum). */
+             * tickets on sync row 3, and the PM's row index = spuNum).
+             * 2026-07-23 FINDING: with the completion HLE (LBP_HLE_JOBDONE) in
+             * place, forcing 2+ lanes is now COUNTERPRODUCTIVE -- two host
+             * threads race on the shared jobIndex atomic in WwsJob_AllocateJob
+             * (GETLLAR 0xD0/PUTLLC 0xB4 on the joblist header), making the boot
+             * nondeterministic. Single-lane (leave SPURS_FORCE_SPUS unset) is
+             * both correct (RPCS3 oracle: jobmanager runs one SPU at a time) and
+             * far more stable -- it reaches the furthest boot yet (LBP renders to
+             * finish#922: glyphthread+network+camera up). PREFER single-lane. */
             { static int s_fs = -2;
               if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS");
                 s_fs = e ? atoi(e) : -1; }
