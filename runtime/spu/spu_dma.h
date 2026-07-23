@@ -259,6 +259,26 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
 
+    /* SPU_STACKEA_WATCH=1: the LBP JobManagerWorker completion protocol hands the
+     * SPU job a completion-word EA (param[4]) that lives on the PPU stack
+     * (0xD00Cxxxx = VM_STACK_BASE region); the job must DMA a nonzero word there
+     * on completion. This catches (a) any DMA whose EA targets the stack region
+     * -- a completion-write attempt -- and (b) any GET payload carrying a
+     * 0xD00Cxxxx dword -- the completion EA arriving in a loaded job buffer.
+     * Answers whether the EA ever reaches / is ever written by the SPU. */
+    { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+      if (s_se) {
+        uint32_t e32 = (uint32_t)ea;
+        if ((e32 & 0xFF000000u) == 0xD0000000u) {   /* DMA targeting the PPU stack */
+            static int _n = 0; if (_n++ < 60) {
+                uint32_t v0 = mfc_is_put(cmd) && size>=4 ?
+                    ((ls_ptr[0]<<24)|(ls_ptr[1]<<16)|(ls_ptr[2]<<8)|ls_ptr[3]) : 0;
+                fprintf(stderr, "[stackea] %s ea=0x%08X lsa=0x%05X size=%u img=%d pc=0x%05X"
+                        " ls_word0=0x%08X\n", mfc_is_get(cmd)?"GET":"PUT", e32, lsa, size,
+                        spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, v0);
+                fflush(stderr); } }
+      } }
+
 #ifdef SPU_DMA_LOG
     { extern int g_spu_dma_log; if (g_spu_dma_log-- > 0)
         fprintf(stderr, "[spu-dma] %s lsa=0x%05X ea=0x%08X size=%u\n",
@@ -336,6 +356,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
+         * dword = the completion-word EA arriving in a job buffer. */
+        { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+          if (s_se && size >= 4) { static int _n = 0;
+            for (uint32_t o = 0; o + 4 <= size && _n < 60; o += 4) {
+                uint32_t w = (ls_ptr[o]<<24)|(ls_ptr[o+1]<<16)|(ls_ptr[o+2]<<8)|ls_ptr[o+3];
+                if ((w & 0xFFFF0000u) == 0xD00C0000u) { _n++;
+                    fprintf(stderr, "[stackea] GET-payload has EA 0x%08X at LS 0x%05X"
+                            " (from ea=0x%08X size=%u img=%d)\n", w, lsa + o,
+                            (uint32_t)ea, size, spu->image_id);
+                    fflush(stderr); } } } }
         /* SPU_SMC_WATCH: a DMA GET that lands inside the image's own code
          * segment is a code overlay = self-modification. */
         { static int s = -2; static uint32_t lo, hi, img;
