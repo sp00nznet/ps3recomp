@@ -298,6 +298,26 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 if (vm_base[s3+0xC]!=0xFF) { vm_base[s3+0xC]=0xFF;
                     static int _f=0; if(_f++<4) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
             }
+            /* YDKJ_GUESTINIT: the create-task (0x87630976) runs BEFORE the game's own
+             * init of its task descriptor (r3), so descriptor+0xC != 0xFF -> STAT. Eagerly
+             * invoke the REAL init (0x22AAB31D) on the descriptor first via the guest-caller
+             * (ppu_guest_call runs it in a scratch ctx, so the create's args survive). This
+             * does the FULL init incl. the task-slot alloc syscall -- unlike the raw +0xC
+             * force (FORCEATTR) that hung -- then create proceeds against a valid descriptor. */
+            if (nid==0x87630976u && getenv("YDKJ_GUESTINIT")) {
+                extern uint8_t* vm_base; uint32_t desc=(uint32_t)ctx->gpr[3];
+                /* YDKJ_GUESTINIT_CRI: scope the eager-init to the CRI/movie create only
+                 * (taskset r4=0x40131000); leave the audio create (r4=0x4000C900) to its
+                 * tolerated STAT so the legal screen still renders while we test the movie. */
+                uint32_t _ts=(uint32_t)ctx->gpr[4];
+                if (getenv("YDKJ_GUESTINIT_CRI") && _ts!=0x40131000u) { /* skip audio */ }
+                else if (vm_base[desc+0xC]!=0xFF) {
+                    uint32_t iopd = prx_resolve_export(0x22AAB31Du);
+                    static int _g=0; if(_g++<6) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
+                    if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398);
+                        if(_g<=6) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
+                }
+            }
             /* Arm a page-guard on the CellSpurs struct at cellSpursInitializeWithAttribute2
              * ENTRY (nid 0xAA6269A8, r3=&spurs) — before the init writes it — to catch
              * where its struct stores actually land. Env YDKJ_GUARD_INST. */
