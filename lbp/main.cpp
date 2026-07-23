@@ -361,6 +361,7 @@ static void scan_ret_rvas(HMODULE self, const CONTEXT* tc, int cap)
  * values each tick: whether the SPU jobs the frozen loader waits on ever
  * complete (word goes nonzero) is THE loading-wall question. */
 uint32_t g_lbp_hot_cw[8]; unsigned g_lbp_hot_n;   /* C++ linkage, matches the probe's extern */
+extern "C" uint32_t g_barrier_sync_watch;          /* ppu_loader.cpp; armed by ticket-pub */
 
 static void dump_threads(const char* label, HMODULE self)
 {
@@ -375,6 +376,26 @@ static void dump_threads(const char* label, HMODULE self)
         }
         fprintf(stderr, "\n");
     }
+    /* WWS joblist snapshot: g_barrier_sync_watch (armed by the lifted ticket-pub
+     * probe) holds the joblist base. Oracle layout (RPCS3 drained dump
+     * @0x38503780): +0x00 mmaJobManager, +0x04 jmSize, +0x40..0x7F the 4 ticket
+     * rows (row3 live: {counter, lane...,-1}), +0x80 jobHeader[]={0x00700001,
+     * cmdsEA}. Drained at the loading screen = row3 {0x49 0x49 FFFF...} with 73
+     * jobs; ours stalls at 1-4 -- this prints how far we get + the batch size. */
+    { uint32_t jl = g_barrier_sync_watch;
+      if (jl && vm_base) {
+        #define RD32(o) ((vm_base[jl+(o)]<<24)|(vm_base[jl+(o)+1]<<16)|(vm_base[jl+(o)+2]<<8)|vm_base[jl+(o)+3])
+        #define RD16(o) ((uint16_t)((vm_base[jl+(o)]<<8)|vm_base[jl+(o)+1]))
+        unsigned njobs = 0;
+        while (njobs < 256 && RD32(0x80 + njobs*8) == 0x00700001u) njobs++;
+        fprintf(stderr, "[WATCHDOG] joblist 0x%08X pm=0x%08X sz=0x%X jobs=%u row3:", jl,
+                (unsigned)RD32(0), (unsigned)RD32(4), njobs);
+        for (int k = 0; k < 8; k++) fprintf(stderr, " %04X", RD16(0x70 + k*2));
+        fprintf(stderr, "  hdr10-3F: %08X %08X %08X %08X\n",
+                (unsigned)RD32(0x10), (unsigned)RD32(0x1C), (unsigned)RD32(0x2C), (unsigned)RD32(0x3C));
+        #undef RD32
+        #undef RD16
+      } }
     /* WWS job code-module census: scan guest RAM for the SpuModuleHeader code
      * marker 0xC0DEC0DE (big-endian). RPCS3's working state has 30+ resident
      * job modules; if we have ZERO, the PPU-side module streaming from .farc
