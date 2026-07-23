@@ -1242,6 +1242,37 @@ void spu_indirect_branch(spu_context* ctx)
             fprintf(stderr, "\n");
         }
       } }
+    /* LBP_HLE_JOBDONE=1: HLE the WWS job COMPLETION. Our lifted SPURS PM never
+     * reaches the store/DecrementDependency phase (the multi-SPU barrier never
+     * converges), so a job's completion word -- passed by the PPU as param[4],
+     * an EA in the 0x470Axxxx pool, embedded in the job's command list at LS
+     * ~0xC00 -- is never written, and the PPU JobManagerWorker (guest-fn
+     * 0x521BD4) spins on it forever (loading freeze). When a job body actually
+     * dispatches (overlay >=200, entry 0x4A40), scan its staged command list
+     * for the completion EA and write it nonzero, unblocking the worker. This
+     * fakes ONLY the done-signal (not the job's data DMA), so it tests how far
+     * the boot gets once loading stops deadlocking. */
+    if (ctx->pc == 0x4A40 && ctx->resident_ovl >= 200) {
+        static int s_hd = -1;
+        if (s_hd < 0) { const char* e = getenv("LBP_HLE_JOBDONE"); s_hd = e ? 1 : 0; }
+        if (s_hd) {
+            extern uint8_t* vm_base;
+            int wrote = 0;
+            for (uint32_t o = 0xC00; o + 4 <= 0xE80 && wrote < 4; o += 4) {
+                uint32_t w = (ctx->ls[o]<<24)|(ctx->ls[o+1]<<16)|(ctx->ls[o+2]<<8)|ctx->ls[o+3];
+                if ((w & 0xFFFF0000u) == 0x470A0000u && vm_base) {
+                    /* write nonzero to the completion word in main RAM (BE) */
+                    if (vm_base[w]==0 && vm_base[w+1]==0 && vm_base[w+2]==0 && vm_base[w+3]==0) {
+                        vm_base[w+3] = 1;
+                        static int _n = 0; if (_n++ < 24)
+                            fprintf(stderr, "[hle-jobdone] wrote completion 0x%08X=1 (job overlay %d)\n",
+                                    w, ctx->resident_ovl);
+                        wrote++;
+                    }
+                }
+            }
+        }
+    }
     if (fn && ctx->pc >= 0x4000 && ctx->resident_ovl >= 200) {
         static int s_je = -1;
         if (s_je < 0) { const char* e = getenv("SPU_JOBEXEC"); s_je = e ? 1 : 0; }

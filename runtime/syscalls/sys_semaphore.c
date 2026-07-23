@@ -303,6 +303,10 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 {
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    /* LBP_HLE_JOBDONE: the JobManagerWorker spins on sys_semaphore_wait/trywait
+     * while waiting for SPU-job completions our lifted PM never writes; satisfy
+     * them here (no-op unless the env is set + jobs are pending). */
+    { extern void lbp_hle_complete_pending(void); lbp_hle_complete_pending(); }
     { static int _n = 0; if (getenv("SEMTID") && _n++ < 60000)
         fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu)\n",
                 (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us);
@@ -396,6 +400,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 int64_t sys_semaphore_trywait(ppu_context* ctx)
 {
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
+    { extern void lbp_hle_complete_pending(void); lbp_hle_complete_pending(); }
 
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;

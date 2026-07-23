@@ -360,8 +360,34 @@ static void scan_ret_rvas(HMODULE self, const CONTEXT* tc, int cap)
  * probe in the recompiled func_005281AC. The watchdog prints their current
  * values each tick: whether the SPU jobs the frozen loader waits on ever
  * complete (word goes nonzero) is THE loading-wall question. */
-uint32_t g_lbp_hot_cw[8]; unsigned g_lbp_hot_n;   /* C++ linkage, matches the probe's extern */
+/* Completion-word EAs of submitted SPU jobs, recorded (as a RING) by the
+ * LBP_SUBMIT_TRACE probe in recompiled func_005281AC. */
+#define LBP_HOT_CW_MAX 256
+uint32_t g_lbp_hot_cw[LBP_HOT_CW_MAX]; unsigned g_lbp_hot_n;
 extern "C" uint32_t g_barrier_sync_watch;          /* ppu_loader.cpp; armed by ticket-pub */
+
+/* LBP_HLE_JOBDONE: our lifted SPURS PM never reaches the store/completion phase
+ * (the multi-SPU barrier never converges), so submitted SPU jobs' completion
+ * words stay 0 and the PPU JobManagerWorker (guest-fn 0x521BD4) deadlocks.
+ * Write every recorded completion word nonzero -- driven from the hot
+ * sys_semaphore path the frozen worker spins on. Fakes ONLY the done-signal,
+ * not the job's data DMA. Called from runtime/syscalls (extern "C"). */
+extern "C" void lbp_hle_complete_pending(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) s_on = getenv("LBP_HLE_JOBDONE") ? 1 : 0;
+    if (!s_on || !vm_base) return;
+    unsigned n = g_lbp_hot_n; if (n > LBP_HOT_CW_MAX) n = LBP_HOT_CW_MAX;
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t ea = g_lbp_hot_cw[i];
+        if (!ea) continue;
+        if (vm_base[ea]==0 && vm_base[ea+1]==0 && vm_base[ea+2]==0 && vm_base[ea+3]==0) {
+            vm_base[ea+3] = 1;                     /* nonzero => job "done" (BE) */
+            static int _n = 0; if (_n++ < 40)
+                fprintf(stderr, "[hle-jobdone] completed 0x%08X\n", ea);
+        }
+    }
+}
 
 static void dump_threads(const char* label, HMODULE self)
 {
@@ -369,7 +395,8 @@ static void dump_threads(const char* label, HMODULE self)
             label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
     if (g_lbp_hot_n && vm_base) {
         fprintf(stderr, "[WATCHDOG] SPU-job completion words:");
-        for (unsigned i = 0; i < g_lbp_hot_n && i < 8; i++) {
+        unsigned _wn = g_lbp_hot_n; if (_wn > LBP_HOT_CW_MAX) _wn = LBP_HOT_CW_MAX;
+        for (unsigned i = 0; i < _wn && i < 8; i++) {
             uint32_t ea = g_lbp_hot_cw[i];
             uint32_t v = (vm_base[ea]<<24)|(vm_base[ea+1]<<16)|(vm_base[ea+2]<<8)|vm_base[ea+3];
             fprintf(stderr, " [0x%08X]=0x%08X", ea, v);
