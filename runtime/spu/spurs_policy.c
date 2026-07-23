@@ -232,7 +232,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * or reset/stall it? Only wid<=1 (jobmanager) traced, first 4000 runs. */
     static int s_pipe = -1;
     if (s_pipe < 0) s_pipe = getenv("SPURS_PM_PIPE") ? 1 : 0;
-    int pipe_this = s_pipe && wid <= 1 && spu_num == 0;
+    /* trace ALL workloads (the jobmanager is wid=12, not <=1); 4000-run cap bounds volume */
+    int pipe_this = s_pipe && spu_num == 0;
     uint32_t st_before = 0;
     if (pipe_this) {
         const uint8_t* L = ctx->ls;
@@ -278,8 +279,12 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     }
 
     if (pipe_this) {
-        static unsigned long s_pn = 0;
-        if (s_pn++ < 4000) {
+        /* PER-WID cap: a shared cap gets exhausted by idle wid=0/1 before the
+         * jobmanager (wid=12) ever runs in a long/good run. Give each wid its
+         * own budget so wid=12's pipeline is always captured. */
+        static unsigned long s_pn_wid[16] = {0};
+        unsigned long s_pn = ++s_pn_wid[wid & 15];
+        if (s_pn < 300) {
             const uint8_t* L = ctx->ls;
             #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])
             #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
@@ -289,6 +294,33 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                     wid, s_pn, first, ctx->pc & SPU_LS_MASK,
                     st_before, HW(0x12A0), W(0x12C0), W(0x12D0), W(0x12E0),
                     W(0x12F0), W(0x1300));
+            /* WHY-NO-JOB1 probe: AllocateJob (via TryChangeFreeToLoadJob) stores
+             * its result at g_WwsJob_jobHeader(0x1420) + g_WwsJob_jobIndex(0x1410).
+             * jobHeader low-hword: 0=none(PPU hasn't published)/1=exists/3=nop.
+             * Also dump the joblist header in RAM (eaWorkLoad@0x13F0) to see the
+             * PPU-published numJobs + claimed jobIndex -- decides whether the PM
+             * stops because the header is unpublished (PPU-side) or because our
+             * load path bails after claiming. */
+            {
+                extern uint8_t* vm_base;
+                uint32_t eaWL = W(0x13F0);
+                fprintf(stderr, "         jobIndex=0x%X jobHeader=0x%08X(cmd=%u) eaWL=0x%08X\n",
+                        W(0x1410), W(0x1420), HW(0x1420), eaWL);
+                /* Dump the joblist header region eaWL+0x00..0x9F so we can see the
+                 * ticket/counter rows AND where the PPU actually wrote the job
+                 * headers (ref AllocateJob reads eaWL+0x20; oracle layout puts
+                 * jobHeaders at +0x80). If +0x20 is 0 but +0x80 has 0x00xx0001
+                 * entries, our AllocateJob reads the WRONG offset. */
+                if (vm_base && eaWL) {
+                    for (uint32_t o = 0; o < 0xA0; o += 0x10) {
+                        const uint8_t* r = vm_base + eaWL + o;
+                        #define RW(i) ((r[i]<<24)|(r[i+1]<<16)|(r[i+2]<<8)|r[i+3])
+                        fprintf(stderr, "         jl+%02X: %08X %08X %08X %08X\n",
+                                o, RW(0), RW(4), RW(8), RW(12));
+                        #undef RW
+                    }
+                }
+            }
             fflush(stderr);
             #undef HW
             #undef W
