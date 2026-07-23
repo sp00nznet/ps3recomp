@@ -192,9 +192,19 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * barrier/ticket probes armed (ticket-pub arms it at first publish, before
      * the PM's first work pass). Idle re-runs of this wid matter as much as the
      * claim run -- the empty-cursor path returns without any PUTLLC. */
+    /* SPURS_PM_FLOW_ALL=1: trace EVERY spu_num-0 run of this workload without
+     * requiring the PPU-side barrier probe to have armed g_barrier_sync_watch.
+     * Needed to answer "does the job's buffer-binding routine (pm 0x3098, the
+     * only writer of logicalToBufferNumArray@0x11B0 + jobState@0x12C0) ever
+     * execute?" on a run that never reaches the barrier at all -- the RPCS3
+     * guest dump shows a working SPU has 0x11B0 bound and runJobNum=0, ours
+     * has 0x11B0 == 0 and runJobNum == -1. */
+    static int s_flow_all = -1;
+    if (s_flow_all < 0) s_flow_all = getenv("SPURS_PM_FLOW_ALL") ? 1 : 0;
     int tracing = (s_flow && spu_num == 0 && g_pm_flow_ctx == 0 &&
-                   g_barrier_sync_watch &&
-                   (uint32_t)wkl_data == g_barrier_sync_watch);
+                   (s_flow_all ||
+                    (g_barrier_sync_watch &&
+                     (uint32_t)wkl_data == g_barrier_sync_watch)));
     static volatile unsigned long long s_flow_arm_ms;
     extern unsigned long long ps3_ms_now(void);
     if (tracing) {
@@ -221,7 +231,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         /* Only dump once the PPU is actually spinning on a job barrier
          * (g_barrier_sync_watch armed by the barrier probe): boot-time idle
          * runs also PUTLLC (queue-check protocol) and would burn the cap. */
-        if (s_dumps < 6) {
+        /* Only dump runs that actually had a JOB STAGED. A boot-time idle run
+         * has empty loadCommands(0xC00)/bufferSetArray(0xDF0) and its trail says
+         * nothing about the Load->Run gate -- with SPURS_PM_FLOW_ALL tracing
+         * every run, the dump budget was being spent entirely on idle runs. */
+        int has_job = 0;
+        for (uint32_t _i = 0xDF0; _i < 0xE10 && !has_job; _i++)
+            if (ctx->ls[_i]) has_job = 1;
+        for (uint32_t _i = 0xC00; _i < 0xC60 && !has_job; _i++)
+            if (ctx->ls[_i]) has_job = 1;
+        if (has_job && s_dumps < 6) {
             s_dumps++;
             unsigned n = g_pm_flow_n; if (n > 8192) n = 8192;
             fprintf(stderr, "[pm-flow] dump#%d wid=%u %u transfers (sync-PUTLLC delta %u):",

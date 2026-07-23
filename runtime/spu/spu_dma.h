@@ -456,12 +456,28 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
             spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
             spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
+            /* Real MFC runs a queued list asynchronously, so the notify lands
+             * AFTER the arming code finishes. We run it inline here, so hold the
+             * resulting interrupt off for a few drain ticks -- otherwise the WWS
+             * handler sees g_WwsJob_loadJobState still kNone and (correctly)
+             * declines the Load->Run advance, and clear-on-read ch25 eats the
+             * only stall. See spu_drain.c: g_sn_defer / SPU_SN_DEFER. */
+            { extern void* volatile g_sn_defer_ctx;
+              extern volatile unsigned g_sn_defer;
+              extern unsigned spu_sn_defer_ticks(void);
+              unsigned d = spu_sn_defer_ticks();
+              if (d) { g_sn_defer_ctx = (void*)spu; g_sn_defer = d; } }
             spu_ch_wake(spu);
             { static int _n = 0; if (_n++ < 16)
                 fprintf(stderr, "[mfc-list] STALL img=%d tag=%u elem@0x%05X "
-                        "left=%u dest=0x%05X (SN raised, parked mask=0x%X)\n",
+                        "left=%u dest=0x%05X (SN raised, parked mask=0x%X) "
+                        "loadJobState@12A0=%02X%02X%02X%02X %02X%02X%02X%02X\n",
                         spu->image_id, t, el, num_left - i - 1, dest_lsa,
-                        spu->list_stall_mask); }
+                        spu->list_stall_mask,
+                        spu->ls[0x12A0], spu->ls[0x12A1],
+                        spu->ls[0x12A2], spu->ls[0x12A3],
+                        spu->ls[0x12A4], spu->ls[0x12A5],
+                        spu->ls[0x12A6], spu->ls[0x12A7]); }
             return 0;
         }
     }
@@ -845,6 +861,18 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
         break;
     case MFC_WrTagUpdate:
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
+        /* WWS Run-promotion gate probe: after kCommandsExecuted the job manager
+         * only calls ChangeLoadToRunJob if `ceq(RdTagStat, tagMask)` holds, i.e.
+         * RdTagStat must equal the mask EXACTLY (mask 2 = tag 1 =
+         * kLoadJob_readBuffers). Log the inputs so we can see whether the tag
+         * really is reported complete. Env SPU_TAGPROBE=1. */
+        { static int s_tp = -1;
+          if (s_tp < 0) { const char* e = getenv("SPU_TAGPROBE"); s_tp = e ? 1 : 0; }
+          if (s_tp && spu->image_id == 2) { static int _n = 0; if (_n++ < 40)
+              fprintf(stderr, "[tagprobe] img=%d upd=%u mask=0x%X completed=0x%X -> RdTagStat=0x%X%s\n",
+                      spu->image_id, value, spu->mfc_tag_mask, mfc->tag_completed,
+                      spu->mfc_tag_status,
+                      (spu->mfc_tag_status == spu->mfc_tag_mask) ? "  (== mask: PROMOTE)" : "  (!= mask: idle)"); } }
         break;
     case MFC_WrListStallAck:
         /* Acknowledge a stalled list element's tag group: resume the parked
