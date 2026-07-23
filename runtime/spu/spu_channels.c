@@ -996,6 +996,15 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
+     * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
+     * enforce the preserve-all-registers hardware contract here -- the first
+     * interrupts-enabled dispatch at the saved srr0 is the irete. */
+    { extern int spu_irq_regs_maybe_restore(spu_context*);
+      static int _r = 0;
+      if (spu_irq_regs_maybe_restore(ctx) && _r++ < 8)
+          fprintf(stderr, "[spu-int] IRET restore at pc=0x%05X (regs recovered)\n",
+                  ctx->pc); }
     /* SPURS kernel services (policy-module runs only): the HLE kernel plants
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
@@ -1212,6 +1221,14 @@ void spu_indirect_branch(spu_context* ctx)
                         ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1],
                         ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
                         ctx->gpr[80]._u32[0], ctx->gpr[80]._u32[1]);
+            /* Mid-GetBufferTag: r8 = the set/buf id bytes computed at 0x2F30
+             * entry; if wrong here, something clobbered it ACROSS the
+             * GetLogicalBuffer call (interrupt delivery?). */
+            if (p == 0x2F6C)
+                fprintf(stderr, " r8=%08X r10=%08X r13=%08X r15=%08X int=%d",
+                        ctx->gpr[8]._u32[0], ctx->gpr[10]._u32[0],
+                        ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0],
+                        ctx->int_enable);
             fprintf(stderr, "\n");
         }
       } }

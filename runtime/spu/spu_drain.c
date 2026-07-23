@@ -125,6 +125,62 @@ unsigned spu_sn_defer_ticks(void)
     return (unsigned)(s_n < 0 ? 0 : s_n);
 }
 
+/* ---- Interrupt register preservation --------------------------------------
+ * Hardware contract: an SPU interrupt handler preserves every register (the
+ * WWS jobmanager guarantees it with a save/restore shim it installs at the
+ * TOP of LS, ~0x3FEC0 -- interrupthandlerasm.spu.s). That shim lies OUTSIDE
+ * the PM image our lifter processed, so the lifted handler runs WITHOUT the
+ * save/restore and eats the interrupted code's live registers. Measured
+ * mid-GetBufferTag: the fsmbi mask registers (r13/r15) arrived zeroed at the
+ * packing selbs, the BufferTag's lanes collapsed, the job saw a NULL buffer
+ * and bailed -- LBP's loading freeze.
+ *
+ * Enforce the contract host-side: snapshot the full GPR file when the
+ * interrupt is taken, restore it when the handler irets (detected in
+ * spu_indirect_branch: pc == saved srr0 with interrupts re-enabled -- during
+ * the handler int_enable stays 0, so the first enabled dispatch at srr0 IS
+ * the irete). State the handler legitimately publishes lives in LS/channels
+ * and is untouched. Per-ctx slots; no nesting (interrupts stay disabled
+ * until iret). */
+#define SPU_IRQ_SLOTS 8
+struct spu_irq_save {
+    spu_context* ctx;          /* NULL = free */
+    uint32_t     resume_pc;    /* srr0 at take */
+    u128         gpr[128];
+};
+static struct spu_irq_save g_irq_save[SPU_IRQ_SLOTS];
+
+static void spu_irq_regs_save(spu_context* ctx)
+{
+    struct spu_irq_save* s = 0;
+    for (int i = 0; i < SPU_IRQ_SLOTS; i++)
+        if (g_irq_save[i].ctx == ctx) { s = &g_irq_save[i]; break; }
+    if (!s) for (int i = 0; i < SPU_IRQ_SLOTS; i++)
+        if (!g_irq_save[i].ctx) { s = &g_irq_save[i]; break; }
+    if (!s) return;                        /* out of slots: behave as before */
+    s->ctx = ctx;
+    s->resume_pc = ctx->srr0;
+    memcpy(s->gpr, ctx->gpr, sizeof s->gpr);
+}
+
+/* Called from spu_indirect_branch on every dispatch. Restores + clears when
+ * the iret lands. Returns 1 if a restore happened (diagnostic). */
+int spu_irq_regs_maybe_restore(spu_context* ctx)
+{
+    for (int i = 0; i < SPU_IRQ_SLOTS; i++) {
+        if (g_irq_save[i].ctx == ctx) {
+            if ((ctx->pc & SPU_LS_MASK) == (g_irq_save[i].resume_pc & SPU_LS_MASK) &&
+                ctx->int_enable) {
+                memcpy(ctx->gpr, g_irq_save[i].gpr, sizeof g_irq_save[i].gpr);
+                g_irq_save[i].ctx = 0;
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
 {
@@ -152,6 +208,7 @@ void (*spu_take_interrupt(spu_context* ctx,
     }
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
+    spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
     ctx->pc = target & SPU_LS_MASK;
     { static int _n = 0;
       if (_n++ < 16) {
