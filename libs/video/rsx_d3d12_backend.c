@@ -78,6 +78,7 @@ typedef struct {
         u32 off;        /* resolved vm offset (guest upload source), 0 = none */
         u32 raw;        /* raw RSX offset (offscreen-RT matching) */
         u32 w, h, fmt;  /* dims + RSX base format */
+        u32 ctrl1;      /* NV4097 TEXTURE_CONTROL1: component remap crossbar */
         int set;
     } tex[4];
     int tex_rt[4];      /* pre-pass: OffRT index sampled by unit, -1 = none */
@@ -259,7 +260,7 @@ typedef struct {
     int                   vp_fp_n;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt; int set; } cur_texs[4];
+    struct { u32 off, raw, w, h, fmt, ctrl1; int set; } cur_texs[4];
 
     /* Render-to-texture: offscreen RT pool + their RTV heap. */
     OffRT                 off_rt[MAX_OFF_RTS];
@@ -1274,13 +1275,21 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                 fprintf(mf, "op%03u CLEAR rt=0x%08X mrt=0x%X/0x%X/0x%X cc=(%.3f,%.3f,%.3f,%.3f)\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
                         r->cc[0], r->cc[1], r->cc[2], r->cc[3]);
-            else
+            else {
                 fprintf(mf, "op%03u DRAW  rt=0x%08X mrt=0x%X/0x%X/0x%X vp=%u,%u,%ux%u fp=0x%08X vs=%d "
                             "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
                         r->vp_x, r->vp_y, r->vp_w, r->vp_h,
                         r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend, r->blend_key,
                         r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw);
+                for (int u = 0; u < 4; u++)
+                    if (r->tex[u].set)
+                        fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X\n", u,
+                                r->tex[u].off, r->tex[u].fmt,
+                                (r->tex[u].fmt & 0x20) ? "LN" : "SZ",
+                                (r->tex[u].fmt & 0x40) ? ",NR" : "",
+                                r->tex[u].w, r->tex[u].h, r->tex[u].ctrl1 & 0xFFFF);
+            }
         }
         /* Per-draw VP constant banks for the first few offscreen-RT geometry
          * draws: c[0..3] is the projection row-major for most CG VPs; also scan
@@ -1765,6 +1774,45 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
  * (re-uploaded every frame: gcm/cube's plasma animates in guest memory).
  * Returns the slot index (SRV at heap 1+slot) or -1. Must run while the
  * command list is open, before the draw passes. */
+/* NV4097 TEXTURE_CONTROL1 component remap -> D3D12 Shader4ComponentMapping.
+ * Low byte = crossbar: bits[1:0] select the SOURCE (0=A,1=R,2=G,3=B) for
+ * output A, [3:2] for R, [5:4] for G, [7:6] for B. Next byte = per-output op:
+ * 0 = force ZERO, 1 = force ONE, 2 = use crossbar (identity word = 0xAAE4).
+ * Our uploaded resource holds guest R,G,B,A at comps 0,1,2,3. */
+static u32 rsx_remap_to_d3d(u32 c1)
+{
+    /* Field order LSB->MSB is B,G,R,A (measured: LBP's identity word is
+     * 0xAA1B = B<-B, G<-G, R<-R, A<-A with all ops = 2/remap), source codes
+     * 0=A,1=R,2=G,3=B. NOT the 0xE4-identity ordering. */
+    if (!(c1 & 0xFFFF)) c1 = 0xAA1B;               /* unset -> identity */
+    static const u8 src2res[4] = {3, 0, 1, 2};     /* src code A,R,G,B -> resource comp */
+    u32 out[4];                                    /* outputs in field order B,G,R,A */
+    for (int i = 0; i < 4; i++) {
+        u32 s = (c1 >> (i * 2)) & 3, op = (c1 >> (8 + i * 2)) & 3;
+        out[i] = (op == 0) ? 4u : (op == 1) ? 5u : (u32)src2res[s];
+    }
+    /* D3D12 mapping: destR | destG<<3 | destB<<6 | destA<<9 | valid bit */
+    return out[2] | (out[1] << 3) | (out[0] << 6) | (out[3] << 9) | (1u << 12);
+}
+
+/* Morton/Z-order texel offset for RSX swizzled textures (LN bit clear).
+ * Interleaves x (even bit positions) and y (odd) until the smaller dimension's
+ * bits run out, then the larger dimension's remaining bits ride above -- the
+ * NV40 layout (matches RPCS3 convert_linear_swizzle). POT dims only, which is
+ * what the hardware requires for swizzled textures. */
+static inline u32 rsx_swz_off(u32 x, u32 y, u32 log2w, u32 log2h)
+{
+    u32 off = 0, shift = 0;
+    while (log2w && log2h) {
+        off |= (x & 1u) << shift; x >>= 1; shift++;
+        off |= (y & 1u) << shift; y >>= 1; shift++;
+        log2w--; log2h--;
+    }
+    off |= (x | y) << shift;     /* only one of x/y still has bits */
+    return off;
+}
+static inline u32 rsx_log2u(u32 v) { u32 l = 0; while ((1u << l) < v) l++; return l; }
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
 {
     extern uint8_t* vm_base;
@@ -1827,15 +1875,30 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
         for (int _b=0;_b<8;_b++) fprintf(stderr, " %02X", sp[240*w*bpp+320*bpp+_b]);
         fprintf(stderr, "%s", "\n");
     } }
+    /* Swizzled (LN bit 0x20 clear): texels live in Morton/Z-order, not rows.
+     * Uploading them as linear rows produced the diagonal-stripe garbage on
+     * LBP's loading screen (every texture there is 0x85 swizzled). POT dims
+     * only -- the hardware requires that for swizzled textures anyway. */
+    int swz = !(fmt & 0x20) && (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
+    u32 l2w = rsx_log2u(w), l2h = rsx_log2u(h);
     if (argb) {
         /* guest big-endian A8R8G8B8 (bytes A,R,G,B) -> DXGI R8G8B8A8 (R,G,B,A) */
+        const u8* sbase = vm_base + off;
         for (u32 y = 0; y < h; y++) {
-            const u8* srow = vm_base + off + (u64)y * w * 4;
             u8* drow = (u8*)mapped + (u64)y * pitch;
             for (u32 x = 0; x < w; x++) {
-                drow[x*4+0] = srow[x*4+1]; drow[x*4+1] = srow[x*4+2];
-                drow[x*4+2] = srow[x*4+3]; drow[x*4+3] = srow[x*4+0];
+                const u8* s = sbase + (u64)(swz ? rsx_swz_off(x, y, l2w, l2h)
+                                                : y * w + x) * 4;
+                drow[x*4+0] = s[1]; drow[x*4+1] = s[2];
+                drow[x*4+2] = s[3]; drow[x*4+3] = s[0];
             }
+        }
+    } else if (swz) {
+        const u8* sbase = vm_base + off;
+        for (u32 y = 0; y < h; y++) {
+            u8* drow = (u8*)mapped + (u64)y * pitch;
+            for (u32 x = 0; x < w; x++)
+                drow[x] = sbase[rsx_swz_off(x, y, l2w, l2h)];
         }
     } else {
         for (u32 y = 0; y < h; y++)
@@ -2585,7 +2648,7 @@ static void render_frame(void)
                         int argb = ((s_d3d.vp_tex[ts].fmt & 0x9F) == 0x85);
                         srv_write(wslot, s_d3d.vp_tex[ts].res,
                                   argb ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8_UNORM,
-                                  argb ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING : 0x1000);
+                                  argb ? rsx_remap_to_d3d(dr->tex[_u].ctrl1) : 0x1000);
                         continue;
                     }
                 }
@@ -3736,6 +3799,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
                     dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
                     dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
+                    dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                     dr->tex_rt[_u]  = -1;
                 }
@@ -3813,6 +3877,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
                 dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
                 dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
+                    dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                 dr->tex_rt[_u]  = -1;
             }
@@ -3921,6 +3986,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
             dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
             dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
+                    dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
             dr->tex_rt[_u]  = -1;
         }
@@ -4005,6 +4071,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].raw = offset;
         s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
+        s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].set = 1;
     }
     if (base_fmt == 0x81 /* B8 */) {
