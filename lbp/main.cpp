@@ -375,17 +375,45 @@ extern "C" uint32_t g_barrier_sync_watch;          /* ppu_loader.cpp; armed by t
 extern "C" void lbp_hle_complete_pending(void)
 {
     static int s_on = -1;
-    if (s_on < 0) s_on = getenv("LBP_HLE_JOBDONE") ? 1 : 0;
+    static int s_age_ms = -1;
+    if (s_on < 0) {
+        s_on = getenv("LBP_HLE_JOBDONE") ? 1 : 0;
+        const char* a = getenv("LBP_HLE_AGE_MS");
+        s_age_ms = a ? atoi(a) : 100;   /* only rescue words stuck >= this long */
+        if (s_age_ms < 0) s_age_ms = 0;
+    }
     if (!s_on || !vm_base) return;
+
+    /* AGING: most submitted tasks take the PPU-worker path (fork==0) and
+     * complete on their own; writing their completion word on the FIRST
+     * semaphore-wait would clobber a task that is about to finish for real,
+     * leaving its output buffer garbage (-> downstream wild-vtable crash).
+     * Only fake a word that has stayed zero for >= LBP_HLE_AGE_MS, so genuine
+     * PPU/SPU completions win the race and only TRULY stuck jobs get rescued. */
+    static uint32_t s_prev[LBP_HOT_CW_MAX];        /* last cw seen per slot (detect recycle) */
+    static int64_t  s_zero_since[LBP_HOT_CW_MAX];  /* QPC us the slot first went pending; 0=not timing */
+    static int64_t  s_freq = 0;
+    LARGE_INTEGER li;
+    if (!s_freq) { QueryPerformanceFrequency(&li); s_freq = li.QuadPart ? li.QuadPart : 1; }
+    QueryPerformanceCounter(&li);
+    int64_t now_us = (li.QuadPart * 1000000) / s_freq;
+    int64_t age_us = (int64_t)s_age_ms * 1000;
+
     unsigned n = g_lbp_hot_n; if (n > LBP_HOT_CW_MAX) n = LBP_HOT_CW_MAX;
     for (unsigned i = 0; i < n; i++) {
         uint32_t ea = g_lbp_hot_cw[i];
         if (!ea) continue;
-        if (vm_base[ea]==0 && vm_base[ea+1]==0 && vm_base[ea+2]==0 && vm_base[ea+3]==0) {
-            vm_base[ea+3] = 1;                     /* nonzero => job "done" (BE) */
-            static int _n = 0; if (_n++ < 40)
-                fprintf(stderr, "[hle-jobdone] completed 0x%08X\n", ea);
-        }
+        if (ea != s_prev[i]) { s_prev[i] = ea; s_zero_since[i] = 0; }  /* recycled slot -> restart timer */
+        int done = !(vm_base[ea]==0 && vm_base[ea+1]==0 && vm_base[ea+2]==0 && vm_base[ea+3]==0);
+        if (done) { s_zero_since[i] = 0; continue; }   /* completed for real */
+        if (s_zero_since[i] == 0) { s_zero_since[i] = now_us; continue; }  /* start aging */
+        int64_t stuck_us = now_us - s_zero_since[i];
+        if (stuck_us < age_us) continue;               /* not old enough yet */
+        vm_base[ea+3] = 1;                             /* nonzero => job "done" (BE) */
+        s_zero_since[i] = 0;
+        static int _n = 0; if (_n++ < 40)
+            fprintf(stderr, "[hle-jobdone] rescued 0x%08X (stuck %lldms)\n",
+                    ea, (long long)(stuck_us / 1000));
     }
 }
 
