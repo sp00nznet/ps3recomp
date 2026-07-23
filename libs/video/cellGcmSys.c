@@ -663,12 +663,17 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     s_ref_qtail = t + 1;
 }
 
+/* Global fence-publication counter: lets the lwmutex convoy trace correlate a
+ * long lock hold with the number of paced fence publications inside it (the
+ * 200us pacing x hundreds of one-ahead fences = the ~156ms holds). */
+volatile long long g_gcm_ref_pub_count = 0;
 static void gcm_ref_publish_one(void)
 {
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
     s_ref_qhead = h + 1;
+    g_gcm_ref_pub_count++;
 }
 
 /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the

@@ -164,6 +164,35 @@ uint64_t ppu_thread_register_main(void)
  * r9 = thread name pointer
  * -----------------------------------------------------------------------*/
 
+/* CPU-time accessor for the lwmutex convoy trace: user+kernel CPU consumed by
+ * guest thread `tid`'s HOST thread, in microseconds. Distinguishes a lock
+ * holder that is CPU-BOUND in recompiled code (cpu delta ~= wall delta) from
+ * one BLOCKED in a wait (cpu delta ~= 0). Returns 0 if unknown. */
+unsigned long long ppu_thread_cpu_us(unsigned tid)
+{
+#ifdef _WIN32
+    if (tid < 2 || tid > PPU_THREAD_MAX) return 0;   /* main (tid 1) not in table */
+    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+    if (t->state == PPU_THREAD_STATE_FREE || !t->host_thread) return 0;
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(t->host_thread, &c, &e, &k, &u)) return 0;
+    ULARGE_INTEGER ku, uu;
+    ku.LowPart = k.dwLowDateTime; ku.HighPart = k.dwHighDateTime;
+    uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+    return (ku.QuadPart + uu.QuadPart) / 10ull;      /* 100ns -> us */
+#else
+    (void)tid; return 0;
+#endif
+}
+/* Last syscall/HLE callsite of guest thread `tid` (see prof_pc). */
+unsigned ppu_thread_prof_pc(unsigned tid)
+{
+    if (tid < 2 || tid > PPU_THREAD_MAX) return 0;
+    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+    if (t->state == PPU_THREAD_STATE_FREE) return 0;
+    return t->prof_pc;
+}
+
 /* Profiler accessor: snapshot slot idx (0-based). Returns 1 if the slot holds
  * a live thread, filling tid/cia/name. Lets a host-side sampling profiler
  * iterate guest threads without depending on ppu_thread_info's layout. */

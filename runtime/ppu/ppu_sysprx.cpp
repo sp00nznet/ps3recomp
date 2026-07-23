@@ -147,7 +147,11 @@ static void sys_lwmutex_create(ppu_context* ctx)
 #ifdef _WIN32
 #define LWM_HASH 65536u
 static struct LwmSlot { volatile long addr; HANDLE sem;
-    volatile long holder; volatile long long acq_us; } g_lwm[LWM_HASH];
+    volatile long holder; volatile long long acq_us; volatile long long acq_fences;
+    volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
+extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
+             unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
+             unsigned ppu_thread_prof_pc(unsigned tid); }
 static volatile long g_lwm_tab_lock = 0;
 /* LBP_LWM_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader.
  * Records, per mutex, the acquiring tid + a QPC microsecond timestamp; on a
@@ -253,7 +257,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
         }
     }
-    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); } }
+    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
 #endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
@@ -273,7 +277,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
         }
         if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
     }
-    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); } }
+    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
 #endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
@@ -293,8 +297,30 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
 #ifdef _WIN32
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
         if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
-            if (held > 100000) fprintf(stderr, "[LWM-CONVOY] tid=%ld RELEASES lwm=0x%08X after holding %lldus (LONG HOLD)\n",
-                sl->holder, lwm, held);
+            if (held > 100000) {
+                long long fences = g_gcm_ref_pub_count - sl->acq_fences;
+                unsigned long long cpu_now = ppu_thread_cpu_us((unsigned)sl->holder);
+                long long cpu_delta = (cpu_now && sl->acq_cpu_us) ? (long long)(cpu_now - sl->acq_cpu_us) : -1;
+                fprintf(stderr, "[LWM-CONVOY] tid=%ld RELEASES lwm=0x%08X after holding %lldus (LONG HOLD) fences=%lld cpu=%lldus (%.0f%% cpu-bound) last-hle-from=0x%08X\n",
+                    sl->holder, lwm, held, fences, cpu_delta,
+                    cpu_delta >= 0 ? 100.0 * (double)cpu_delta / (double)held : -1.0,
+                    ppu_thread_prof_pc((unsigned)sl->holder));
+                /* Name the critical section: the unlocker IS the holder, so its
+                 * guest stack right now is the exit of the long-held region.
+                 * Back-chain LR slots are 0 under the DRAIN/fragment model, so
+                 * scan the stack for words in the lifted code range instead
+                 * (saved return addresses; a lifted func name IS its guest
+                 * addr). Same idiom as [exit-chain] in ppu_hle.cpp. */
+                uint32_t sp = (uint32_t)ctx->gpr[1];
+                char b[1600]; int p = snprintf(b, sizeof b, "[LWM-CONVOY]   holder-bt sp=0x%08X codeptrs:", sp);
+                uint32_t prev = 0; int found = 0;
+                for (uint32_t a = sp; a < sp + 0x3000 && found < 48; a += 4) {
+                    uint32_t v = vm_read32(a);
+                    if (v >= 0x00010000u && v < 0x00900000u && v != prev) {
+                        p += snprintf(b + p, sizeof(b) - p, " %08X", v); prev = v; found++; }
+                }
+                fprintf(stderr, "%s\n", b); fflush(stderr);
+            }
             sl->holder = 0; } }
     HANDLE s = lwm_sem(lwm);
     /* Semaphore release works from ANY thread (unlike a CS) -- guest code
