@@ -1195,7 +1195,17 @@ void spu_indirect_branch(spu_context* ctx)
             fprintf(stderr, "[jobexec] DISPATCH job code pc=0x%05X overlay=%d "
                     "runJobNum=0x%02X%02X%02X%02X\n",
                     ctx->pc & SPU_LS_MASK, ctx->resident_ovl,
-                    ctx->ls[0x12E0], ctx->ls[0x12E1], ctx->ls[0x12E2], ctx->ls[0x12E3]); }
+                    ctx->ls[0x12E0], ctx->ls[0x12E1], ctx->ls[0x12E2], ctx->ls[0x12E3]);
+          /* SPU_JOBEXEC_DUMP=<path>: write the full 256KB LS the first time a job
+           * entry (pc==codeBuffer+entryOffset) dispatches, to diff vs the RPCS3
+           * oracle SPU4 dump (why our job bails where the oracle's runs). */
+          static int s_dumped = 0;
+          if (!s_dumped && ctx->pc == 0x4A40) {
+              const char* dp = getenv("SPU_JOBEXEC_DUMP");
+              if (dp) { FILE* f = fopen(dp, "wb");
+                  if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f);
+                      fprintf(stderr, "[jobexec] dumped LS at job entry -> %s\n", dp); }
+                  s_dumped = 1; } } }
     }
     if (fn) {
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the

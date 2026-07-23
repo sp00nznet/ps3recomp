@@ -223,7 +223,43 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
             spurs_pm_flow_watchdog_start(); } }
     }
 
+    /* SPURS_PM_PIPE=1: trace how the WWS job PIPELINE state evolves across
+     * kernel dispatches. Prints the pipeline counters (loadJobState@0x12A0
+     * preferred hword, nextLoadJobNum@0x12C0, loadJobNum@0x12D0, runJobNum@
+     * 0x12E0, storeJobNum@0x12F0) before and after each PM run, plus the pc
+     * spu_run_with_halt halted at. Answers: does re-entry advance the pipeline
+     * or reset/stall it? Only wid<=1 (jobmanager) traced, first 4000 runs. */
+    static int s_pipe = -1;
+    if (s_pipe < 0) s_pipe = getenv("SPURS_PM_PIPE") ? 1 : 0;
+    int pipe_this = s_pipe && wid <= 1 && spu_num == 0;
+    uint32_t st_before = 0;
+    if (pipe_this) {
+        const uint8_t* L = ctx->ls;
+        #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])   /* preferred hword (bytes 2-3) */
+        st_before = HW(0x12A0);
+        (void)st_before;
+        #undef HW
+    }
+
     spu_run_with_halt(entry, ctx);
+
+    if (pipe_this) {
+        static unsigned long s_pn = 0;
+        if (s_pn++ < 4000) {
+            const uint8_t* L = ctx->ls;
+            #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])
+            #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
+            fprintf(stderr, "[pm-pipe] wid=%u run#%lu first=%d halt_pc=0x%05X "
+                    "loadState=%u->%u nextLoad=0x%X loadJob=0x%X runJob=0x%X storeJob=0x%X "
+                    "lastStore=0x%X\n",
+                    wid, s_pn, first, ctx->pc & SPU_LS_MASK,
+                    st_before, HW(0x12A0), W(0x12C0), W(0x12D0), W(0x12E0),
+                    W(0x12F0), W(0x1300));
+            fflush(stderr);
+            #undef HW
+            #undef W
+        }
+    }
 
     if (tracing) {
         g_pm_flow_ctx = 0;
