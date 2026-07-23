@@ -811,9 +811,9 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * Log the parent (lr), the object (r3), and a guest back-chain to find the dispatcher. */
     if (getenv("YDKJ_VTORDER")) {
         uint32_t tgt=(uint32_t)ctx->ctr;
-        if (tgt==0x002E0510u || tgt==0x002DF320u || tgt==0x00331210u) {
-            static int _n=0; if(_n++<12) {
-                const char* w = tgt==0x002DF320u?"INIT":(tgt==0x002E0510u?"CREATE(audio)":"CREATE(cri)");
+        if (tgt==0x002E0638u || tgt==0x002B4200u || tgt==0x002DF518u || tgt==0x002DF320u) {
+            static int _n=0; if(_n++<16) {
+                const char* w = (tgt==0x002E0638u)?"CREATE-method":(tgt==0x002B4200u?"INIT-outer":(tgt==0x002DF518u?"INIT-inner":"INIT-320"));
                 fprintf(stderr,"[VTORDER] #%d %-13s func_%08X r3(obj)=0x%08X\n", _n, w, tgt,
                         (uint32_t)ctx->gpr[3]);
                 extern void ppu_guest_callstack(const char*);
