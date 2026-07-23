@@ -146,8 +146,34 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * race-free). Keyed by guest address in an open-addressed table. */
 #ifdef _WIN32
 #define LWM_HASH 65536u
-static struct LwmSlot { volatile long addr; HANDLE sem; } g_lwm[LWM_HASH];
+static struct LwmSlot { volatile long addr; HANDLE sem;
+    volatile long holder; volatile long long acq_us; } g_lwm[LWM_HASH];
 static volatile long g_lwm_tab_lock = 0;
+/* LBP_LWM_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader.
+ * Records, per mutex, the acquiring tid + a QPC microsecond timestamp; on a
+ * contended block it logs who holds it and for how long; on unlock it flags a
+ * long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the
+ * convoy root. Default OFF. */
+static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("LBP_LWM_TRACE"); v=e?1:0;} return v; }
+static long long lwm_now_us(void){
+#ifdef _WIN32
+    static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (long long)(c.QuadPart*1000000ll/freq.QuadPart);
+#else
+    return 0;
+#endif
+}
+/* Find an EXISTING slot (no create) for hold-tracking. */
+static struct LwmSlot* lwm_find(uint32_t addr){
+    if(!addr) return nullptr;
+    uint32_t h=(addr*2654435761u)&(LWM_HASH-1);
+    for(uint32_t i=0;i<LWM_HASH;i++){ uint32_t idx=(h+i)&(LWM_HASH-1);
+        long cur=g_lwm[idx].addr;
+        if((uint32_t)cur==addr) return &g_lwm[idx];
+        if(cur==0) return nullptr; }
+    return nullptr;
+}
 static HANDLE lwm_sem(uint32_t addr)
 {
     if (!addr) return nullptr;
@@ -208,16 +234,26 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u tmo=%lluus\n",
                 (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), vm_read32(lwm + LWM_RECUR),
                 (unsigned long long)timeout_us);
+            if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
+                long h = sl ? sl->holder : 0; long long held = (sl && h) ? (lwm_now_us() - sl->acq_us) : 0;
+                fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
+                    (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
+            long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
             DWORD wr = WaitForSingleObject(s, ms);
             if (wr == WAIT_TIMEOUT) {           /* honor the timeout: ETIMEDOUT, no acquire */
+                if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
+                    (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
                 ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
                 return;
             }
+            if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu ACQUIRED lwm=0x%08X after waiting %lldus\n",
+                (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
             if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
         }
     }
+    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); } }
 #endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
@@ -237,6 +273,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
         }
         if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
     }
+    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); } }
 #endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
@@ -254,6 +291,11 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     vm_write32(lwm + LWM_RECUR, 0);
     vm_write32(lwm + LWM_OWNER, 0);
 #ifdef _WIN32
+    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
+        if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
+            if (held > 100000) fprintf(stderr, "[LWM-CONVOY] tid=%ld RELEASES lwm=0x%08X after holding %lldus (LONG HOLD)\n",
+                sl->holder, lwm, held);
+            sl->holder = 0; } }
     HANDLE s = lwm_sem(lwm);
     /* Semaphore release works from ANY thread (unlike a CS) -- guest code
      * hands lwmutex ownership across threads. Over-release (unlock of a free
