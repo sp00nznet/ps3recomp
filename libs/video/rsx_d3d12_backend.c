@@ -1779,13 +1779,23 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
  * output A, [3:2] for R, [5:4] for G, [7:6] for B. Next byte = per-output op:
  * 0 = force ZERO, 1 = force ONE, 2 = use crossbar (identity word = 0xAAE4).
  * Our uploaded resource holds guest R,G,B,A at comps 0,1,2,3. */
-static u32 rsx_remap_to_d3d(u32 c1)
+static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
 {
-    /* Field order LSB->MSB is B,G,R,A (measured: LBP's identity word is
-     * 0xAA1B = B<-B, G<-G, R<-R, A<-A with all ops = 2/remap), source codes
-     * 0=A,1=R,2=G,3=B. NOT the 0xE4-identity ordering. */
-    if (!(c1 & 0xFFFF)) c1 = 0xAA1B;               /* unset -> identity */
-    static const u8 src2res[4] = {3, 0, 1, 2};     /* src code A,R,G,B -> resource comp */
+    /* Crossbar field order LSB->MSB is B,G,R,A; source codes index the
+     * format's PHYSICAL sampled lanes (identity words differ per format:
+     * LBP uses 0xAA1B on A8R8G8B8 but 0xAAE4 on DXT). Measured lane orders:
+     *   A8R8G8B8: lanes A,R,G,B (memory byte order)  -> res comps {3,0,1,2}
+     *   DXT1/2/3: lanes B,G,R,A (decoded BGRA)       -> res comps {2,1,0,3}
+     *   G8B8:     presented vector {G,R,G,R} (RPCS3) -> res comps {1,0,1,0}
+     * Ops byte (same field order): 0 = force ZERO, 1 = force ONE, 2 = remap. */
+    static const u8 lanes_argb[4] = {3, 0, 1, 2};
+    static const u8 lanes_dxt[4]  = {2, 1, 0, 3};
+    static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
+    const u8* src2res = (basef == 0x8B) ? lanes_g8b8
+                      : (basef >= 0x86 && basef <= 0x88) ? lanes_dxt
+                      : lanes_argb;
+    if (!(c1 & 0xFFFF))                            /* unset -> identity */
+        c1 = (basef >= 0x86 && basef <= 0x88) ? 0xAAE4 : 0xAA1B;
     u32 out[4];                                    /* outputs in field order B,G,R,A */
     for (int i = 0; i < 4; i++) {
         u32 s = (c1 >> (i * 2)) & 3, op = (c1 >> (8 + i * 2)) & 3;
@@ -1817,9 +1827,29 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
 {
     extern uint8_t* vm_base;
     if (!off || !w || !h || !vm_base || !s_d3d.srv_heap) return -1;
-    int argb = ((fmt & 0x9F) == 0x85);            /* A8R8G8B8 vs B8 */
-    u32 bpp = argb ? 4u : 1u;
-    DXGI_FORMAT dxfmt = argb ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8_UNORM;
+    /* Format classes (base = fmt & 0x9F). The LBP loading screen uses:
+     * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
+     * atlas -- without it no text renders at all), 0x86/87/88 DXT1/23/45
+     * (512x512 detail/LUT layers bound at t1/t3 on every draw). */
+    u32 basef = fmt & 0x9F;
+    int argb = (basef == 0x85);
+    int g8b8 = (basef == 0x8B);
+    int dxt  = (basef == 0x86 || basef == 0x87 || basef == 0x88);
+    u32 bpp = argb ? 4u : g8b8 ? 2u : 1u;
+    DXGI_FORMAT dxfmt = argb ? DXGI_FORMAT_R8G8B8A8_UNORM
+                      : g8b8 ? DXGI_FORMAT_R8G8_UNORM
+                      : (basef == 0x86) ? DXGI_FORMAT_BC1_UNORM
+                      : (basef == 0x87) ? DXGI_FORMAT_BC2_UNORM
+                      : (basef == 0x88) ? DXGI_FORMAT_BC3_UNORM
+                      : DXGI_FORMAT_R8_UNORM;
+    /* DXT data is stored as linear 4x4 block rows (compressed formats are
+     * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
+    u32 blkrow = 0, blkrows = 0;
+    if (dxt) {
+        u32 bs = (basef == 0x86) ? 8u : 16u;
+        blkrow  = ((w + 3) / 4) * bs;
+        blkrows = (h + 3) / 4;
+    }
     int slot = -1, freeslot = -1;
     for (int i = 0; i < VP_TEX_SLOTS; i++) {
         if (s_d3d.vp_tex[i].used && s_d3d.vp_tex[i].off == off &&
@@ -1830,7 +1860,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
     if (freeslot < 0) return -1;                  /* out of slots this frame */
     slot = freeslot;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
-    u32 pitch = (w * bpp + 255) & ~255u;
+    u32 pitch = ((dxt ? blkrow : w * bpp) + 255) & ~255u;
     int fresh = 0;
 
     if (t->res && (t->w != w || t->h != h || t->fmt != fmt)) {
@@ -1852,7 +1882,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
         D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {0};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = (u64)pitch * h; bd.Height = 1; bd.DepthOrArraySize = 1;
+        bd.Width = (u64)pitch * (dxt ? blkrows : h); bd.Height = 1; bd.DepthOrArraySize = 1;
         bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
                 s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
@@ -1879,9 +1909,28 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
      * Uploading them as linear rows produced the diagonal-stripe garbage on
      * LBP's loading screen (every texture there is 0x85 swizzled). POT dims
      * only -- the hardware requires that for swizzled textures anyway. */
-    int swz = !(fmt & 0x20) && (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
+    int swz = !dxt && !(fmt & 0x20) && (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
     u32 l2w = rsx_log2u(w), l2h = rsx_log2u(h);
-    if (argb) {
+    if (dxt) {
+        /* DXT: linear rows of 4x4 blocks, copied straight into BC1/2/3. */
+        for (u32 y = 0; y < blkrows; y++)
+            memcpy((u8*)mapped + (u64)y * pitch, vm_base + off + (u64)y * blkrow, blkrow);
+    } else if (g8b8) {
+        /* G8B8: 2 bytes/texel -> R8G8; channel placement is done by the SRV
+         * remap (native vector {G,R,G,R}, see rsx_remap_to_d3d). */
+        const u8* sbase = vm_base + off;
+        for (u32 y = 0; y < h; y++) {
+            u8* drow = (u8*)mapped + (u64)y * pitch;
+            if (swz) {
+                for (u32 x = 0; x < w; x++) {
+                    const u8* s = sbase + (u64)rsx_swz_off(x, y, l2w, l2h) * 2;
+                    drow[x*2+0] = s[0]; drow[x*2+1] = s[1];
+                }
+            } else {
+                memcpy(drow, sbase + (u64)y * w * 2, (u64)w * 2);
+            }
+        }
+    } else if (argb) {
         /* guest big-endian A8R8G8B8 (bytes A,R,G,B) -> DXGI R8G8B8A8 (R,G,B,A) */
         const u8* sbase = vm_base + off;
         for (u32 y = 0; y < h; y++) {
@@ -2092,7 +2141,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt)
      * coverage from .w); DXGI R8 defaults to (r,0,0,1), so swizzle (R,R,R,R)
      * = encoded 0x1000 (component 0 in all lanes + always-set bit). ARGB8
      * keeps the identity mapping. */
-    sv.Shader4ComponentMapping = argb ? D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING : 0x1000;
+    sv.Shader4ComponentMapping = (basef == 0x81) ? 0x1000 : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;
     D3D12_CPU_DESCRIPTOR_HANDLE sh;
     s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
@@ -2640,15 +2689,23 @@ static void render_frame(void)
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                     continue;
                 }
+                u32 _bf = dr->tex[_u].fmt & 0x9F;
                 if (dr->tex[_u].off &&
-                    ((dr->tex[_u].fmt & 0x9F) == 0x81 || (dr->tex[_u].fmt & 0x9F) == 0x85)) {
+                    (_bf == 0x81 || _bf == 0x85 || _bf == 0x8B ||
+                     (_bf >= 0x86 && _bf <= 0x88))) {
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt);
                     if (ts >= 0) {
-                        int argb = ((s_d3d.vp_tex[ts].fmt & 0x9F) == 0x85);
-                        srv_write(wslot, s_d3d.vp_tex[ts].res,
-                                  argb ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8_UNORM,
-                                  argb ? rsx_remap_to_d3d(dr->tex[_u].ctrl1) : 0x1000);
+                        DXGI_FORMAT sf =
+                            (_bf == 0x85) ? DXGI_FORMAT_R8G8B8A8_UNORM :
+                            (_bf == 0x8B) ? DXGI_FORMAT_R8G8_UNORM :
+                            (_bf == 0x86) ? DXGI_FORMAT_BC1_UNORM :
+                            (_bf == 0x87) ? DXGI_FORMAT_BC2_UNORM :
+                            (_bf == 0x88) ? DXGI_FORMAT_BC3_UNORM :
+                                            DXGI_FORMAT_R8_UNORM;
+                        srv_write(wslot, s_d3d.vp_tex[ts].res, sf,
+                                  (_bf == 0x81) ? 0x1000
+                                                : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf));
                         continue;
                     }
                 }
@@ -4066,6 +4123,8 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     if (unit < 4 &&
         (base_fmt == 0x81 /* B8 */ || base_fmt == 0x85 /* A8R8G8B8 */ ||
+         base_fmt == 0x8B /* G8B8: LBP's font atlas */ ||
+         (base_fmt >= 0x86 && base_fmt <= 0x88) /* DXT1/23/45 */ ||
          base_fmt == 0x9A /* W16Z16Y16X16 half-float: RTT intermediates */)) {
         s_d3d.cur_texs[unit].off = cellGcmResolveLocated((tex->format & 3) == 1, offset);
         s_d3d.cur_texs[unit].raw = offset;
