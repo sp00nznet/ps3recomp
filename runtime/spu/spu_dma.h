@@ -761,6 +761,26 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                 fprintf(stderr, " %02X%02X%02X%02X", p[i], p[i+1], p[i+2], p[i+3]);
             fprintf(stderr, "\n"); fflush(stderr);
         }
+        /* SPU_CMDDUMP=1: decode the FULL WWS command list (8-byte cmds). Each
+         * CommandFlags u32: commandNum=(f>>9)&7, outputShareable=(f>>13)&1,
+         * shareableWriteIfDiscarded=(f>>12)&1, logBufSet=(f>>5)&0xF, logBuf=f&0x1F.
+         * Answers lifter-vs-builder: are shareable-output UseBuffer + kRunJob +
+         * store commands PRESENT in the list the PPU built? */
+        { static int s_cd = -1; if (s_cd < 0) s_cd = getenv("SPU_CMDDUMP") ? 1 : 0;
+          if (s_cd) { static int _c = 0; if (_c++ < 6) {
+            static const char* NM[8] = {"kNop","kReserveBufSet","kUseBuffer",
+                "kUnreserveBufSets","kReqDepDec","kRunJob","kEndCommand","kInvalid"};
+            const uint8_t* p = spu->ls + 0xC00;
+            fprintf(stderr, "[cmddump] list ea=0x%09llX size=0x%X:\n", (unsigned long long)ea, size);
+            for (uint32_t i = 0; i + 8 <= size && i < 0x400; i += 8) {
+                uint32_t f = ((uint32_t)p[i]<<24)|((uint32_t)p[i+1]<<16)|((uint32_t)p[i+2]<<8)|p[i+3];
+                uint32_t d = ((uint32_t)p[i+4]<<24)|((uint32_t)p[i+5]<<16)|((uint32_t)p[i+6]<<8)|p[i+7];
+                unsigned cn = (f>>9)&7, sh = (f>>13)&1, sw = (f>>12)&1, lbs = (f>>5)&0xF, lb = f&0x1F;
+                fprintf(stderr, "   +0x%03X f=%08X d=%08X  %-16s%s%s bufSet=%u buf=%u\n",
+                        i, f, d, NM[cn], sh?" OUTSHARE":"", sw?" WRITEIFDISC":"", lbs, lb);
+            }
+            fflush(stderr);
+          } } }
     }
 
     /* After a cri-task GET, dump the bytes it just read (the task context) so we
