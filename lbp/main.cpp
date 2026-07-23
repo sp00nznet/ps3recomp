@@ -356,10 +356,46 @@ static void scan_ret_rvas(HMODULE self, const CONTEXT* tc, int cap)
     }
 }
 
+/* HOT (SPU-path) submit completion words, recorded by the LBP_SUBMIT_TRACE
+ * probe in the recompiled func_005281AC. The watchdog prints their current
+ * values each tick: whether the SPU jobs the frozen loader waits on ever
+ * complete (word goes nonzero) is THE loading-wall question. */
+uint32_t g_lbp_hot_cw[8]; unsigned g_lbp_hot_n;   /* C++ linkage, matches the probe's extern */
+
 static void dump_threads(const char* label, HMODULE self)
 {
     fprintf(stderr, "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
             label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+    if (g_lbp_hot_n && vm_base) {
+        fprintf(stderr, "[WATCHDOG] SPU-job completion words:");
+        for (unsigned i = 0; i < g_lbp_hot_n && i < 8; i++) {
+            uint32_t ea = g_lbp_hot_cw[i];
+            uint32_t v = (vm_base[ea]<<24)|(vm_base[ea+1]<<16)|(vm_base[ea+2]<<8)|vm_base[ea+3];
+            fprintf(stderr, " [0x%08X]=0x%08X", ea, v);
+        }
+        fprintf(stderr, "\n");
+    }
+    /* WWS job code-module census: scan guest RAM for the SpuModuleHeader code
+     * marker 0xC0DEC0DE (big-endian). RPCS3's working state has 30+ resident
+     * job modules; if we have ZERO, the PPU-side module streaming from .farc
+     * never loaded them (the real bug), not the SPU job pipeline. Env-gated. */
+    if (getenv("C0DESCAN") && vm_base) {
+        static const uint8_t pat[4] = {0xC0,0xDE,0xC0,0xDE};
+        unsigned found = 0; uint32_t first[16] = {0};
+        /* Scan the FULL guest address space -- the WWS job blobs (with their
+         * embedded code modules) live at 0x48xxxxxx, ABOVE the old 0x40000000
+         * limit that made the first scan wrongly report zero. */
+        for (uint64_t a = 0; a + 4 <= 0x100000000ull; a++) {
+            if (vm_base[a]==pat[0] && vm_base[a+1]==pat[1] &&
+                vm_base[a+2]==pat[2] && vm_base[a+3]==pat[3]) {
+                if (found < 16) first[found] = (uint32_t)a;
+                found++;
+            }
+        }
+        fprintf(stderr, "[c0descan] SpuModuleHeader markers in guest RAM: %u", found);
+        for (unsigned i = 0; i < found && i < 16; i++) fprintf(stderr, " 0x%08X", first[i]);
+        fprintf(stderr, "\n");
+    }
     /* LBP resource-pump census: dump the 3 work-queue depths + their semaphore
      * runtime values, to tell "work stranded" from "queues drained / completion
      * never signalled". Env-gated so it only runs under a debugging session. */
