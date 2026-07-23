@@ -756,8 +756,9 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
     attr->sizeContext = sizeContext;
     attr->eaContext   = eaContext;
     attr->eaElf       = eaElf;
-    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u)\n",
-           (u32)eaElf, (u32)eaContext, sizeContext);
+    { extern uint32_t g_last_hle_nid; fprintf(stderr,
+        "[cellSpurs] _TaskAttributeInitialize NID=0x%08X eaElf=0x%08X ctx=0x%08X szctx=%u attr_ea=live\n",
+        g_last_hle_nid, (u32)eaElf, (u32)eaContext, sizeContext); }
     return CELL_OK;
 }
 

@@ -326,6 +326,20 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[GUARD] arming on CellSpurs &spurs=0x%08X at init entry\n", (uint32_t)ctx->gpr[3]);
                 ppu_guard_page((uint32_t)ctx->gpr[3]);
             }
+            /* CRI_ATTR: the real task-add libsre_func_30012310 (nid 0x1D46FEDF) STATs
+             * 0x80410902 unless *(u32*)(r5+0)==1 -- r5 is the task-attribute struct the
+             * game builds on the stack. Dump it to see how the game left it. */
+            if (nid==0x1D46FEDFu && getenv("YDKJ_SPURSTRACE")) {
+                extern uint8_t* vm_base; uint32_t a5=(uint32_t)ctx->gpr[5], a4=(uint32_t)ctx->gpr[4];
+                #define _RD(b,o) ((vm_base[(b)+(o)]<<24)|(vm_base[(b)+(o)+1]<<16)|(vm_base[(b)+(o)+2]<<8)|vm_base[(b)+(o)+3])
+                static int _a=0; if(_a++<2) fprintf(stderr,
+                    "[CRI_ATTR] task-add r3(taskset)=0x%08X r4=0x%08X r5(attr)=0x%08X r6(elf)=0x%08X\n"
+                    "           attr[0..0x1C]= %08X %08X %08X %08X %08X %08X %08X %08X  (attr[0] must be 1)\n",
+                    (uint32_t)ctx->gpr[3],a4,a5,(uint32_t)ctx->gpr[6],
+                    _RD(a5,0),_RD(a5,4),_RD(a5,8),_RD(a5,0xC),_RD(a5,0x10),_RD(a5,0x14),_RD(a5,0x18),_RD(a5,0x1C));
+                #undef _RD
+            }
+            uint32_t _cap_ts = (nid==0x87630976u) ? (uint32_t)ctx->gpr[4] : 0; /* taskset EA before the call clobbers r4 */
             ctx->gpr[2] = toc;            /* libsre's own TOC */
             ctx->ctr    = code;
             /* FLOW_REENTRY_ISO: the libsre fn re-enters lifted guest code at the PPU
@@ -345,7 +359,35 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
             { static int64_t st=-2; if(st==-2){const char*e=getenv("YDKJ_SPURSTRACE"); st=e?1:0;}
               if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X RETURNED r3=0x%08X\n",
-                  nid, (uint32_t)ctx->gpr[3]); }
+                  nid, (uint32_t)ctx->gpr[3]);
+              /* After a create-task (0x87630976), scan the taskset TaskInfo array to see
+               * WHICH taskId the real libsre create actually populated (elf!=0). Our
+               * CRI_INTERP dispatch hardcodes task 0; if create used a different slot we'd
+               * read task 0's empty elf=0. _cap_ts was the r4 taskset before the call. */
+              /* YDKJ_CRI_CREATE_OK: the cri caller func_00331DA4 checks create's return
+               * and BAILS on the STAT (0x8041090F) -> it never calls the ELF-carrying init
+               * (0x22AAB31D, r6=0x004F5F80 = movie image 22) that actually sets up the task.
+               * Force ONLY create's return value to success -- leave the descriptor pristine
+               * (unlike FORCEATTR/GUESTINIT, which mutate +0xC and make the real ELF-init
+               * STAT as already-init) -- so the game proceeds to the ELF-init on a clean
+               * descriptor. Scoped to the cri taskset (0x40131000). */
+              if (nid==0x87630976u && _cap_ts==0x40131000u && (uint32_t)ctx->gpr[3]==0x8041090Fu
+                  && getenv("YDKJ_CRI_CREATE_OK")) {
+                  ctx->gpr[3]=0; static int _co=0;
+                  if(_co++<2) fprintf(stderr,"[CRI_CREATE_OK] forced cri create return 0 (descriptor pristine) so ELF-init can run\n");
+              }
+              extern uint64_t vm_read64(uint64_t a);
+              if (st && nid==0x87630976u && _cap_ts) {
+                  fprintf(stderr,"[TSDUMP] taskset 0x%08X after create (r3=0x%08X): ready=%08X.%08X run=%08X.%08X\n",
+                      _cap_ts,(uint32_t)ctx->gpr[3],
+                      vm_read32(_cap_ts+0x10),vm_read32(_cap_ts+0x14),
+                      vm_read32(_cap_ts+0x00),vm_read32(_cap_ts+0x04));
+                  for (uint32_t t=0;t<16;t++){ uint32_t ti=_cap_ts+0x80+t*48;
+                      uint64_t elf=vm_read64(ti+0x10);
+                      if (elf) fprintf(stderr,"[TSDUMP]   task %u: elf=0x%llX args=%08X %08X %08X %08X ctx=0x%llX\n",
+                          t,(unsigned long long)elf,vm_read32(ti+0),vm_read32(ti+4),vm_read32(ti+8),vm_read32(ti+12),
+                          (unsigned long long)vm_read64(ti+0x18)); }
+              } }
             /* cellSpursInitialize (0xACFC8DBC) just returned -> the CellSpurs
              * instance is now populated; spawn the lifted SPURS SPU kernel against
              * it (flОw libsre never calls group_start; spawning during init reads
