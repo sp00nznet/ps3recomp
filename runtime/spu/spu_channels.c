@@ -1183,6 +1183,20 @@ void spu_indirect_branch(spu_context* ctx)
         }
         return;   /* enclosing SPU_DRAIN bracket resumes the dispatcher */
     }
+    /* JOB-BODY EXECUTION probe: the WWS job manager enters a staged job via
+     * `bie pJobCode` (changeloadtorunjob.spu), an INDIRECT branch to
+     * lsaJobCodeBuffer + entryOffset. A successful dispatch with the pc inside
+     * the job code buffer and a jobmod overlay resident (image ids 200+) is the
+     * proof the lifted job module actually runs. Env SPU_JOBEXEC=1. */
+    if (fn && ctx->pc >= 0x4000 && ctx->resident_ovl >= 200) {
+        static int s_je = -1;
+        if (s_je < 0) { const char* e = getenv("SPU_JOBEXEC"); s_je = e ? 1 : 0; }
+        if (s_je) { static int _n = 0; if (_n++ < 24)
+            fprintf(stderr, "[jobexec] DISPATCH job code pc=0x%05X overlay=%d "
+                    "runJobNum=0x%02X%02X%02X%02X\n",
+                    ctx->pc & SPU_LS_MASK, ctx->resident_ovl,
+                    ctx->ls[0x12E0], ctx->ls[0x12E1], ctx->ls[0x12E2], ctx->ls[0x12E3]); }
+    }
     if (fn) {
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
          * Bink decoder's per-command dispatch does) must not grow the host
