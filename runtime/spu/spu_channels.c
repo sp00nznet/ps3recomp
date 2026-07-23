@@ -1188,6 +1188,33 @@ void spu_indirect_branch(spu_context* ctx)
      * lsaJobCodeBuffer + entryOffset. A successful dispatch with the pc inside
      * the job code buffer and a jobmod overlay resident (image ids 200+) is the
      * proof the lifted job module actually runs. Env SPU_JOBEXEC=1. */
+    /* SPU_JOBTRACE=1: log EVERY dispatcher entry while a job module (overlay
+     * id >= 200) is resident -- the job's cross-function control-flow trail.
+     * The pm-flow drain hook can't see a job that performs no channel ops
+     * (LBP's frozen job runs as a complete no-op: entry, no DMAs, return);
+     * this names its early-out path instead. */
+    { static int s_jt = -1;
+      if (s_jt < 0) { const char* e = getenv("SPU_JOBTRACE"); s_jt = e ? 1 : 0; }
+      if (s_jt && ctx->resident_ovl >= 200) { static int _n = 0;
+        if (_n++ < 400) {
+            fprintf(stderr, "[jobtrace] pc=0x%05X lr=0x%05X%s",
+                    ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                    fn ? "" : " (no lift)");
+            uint32_t p = ctx->pc & SPU_LS_MASK;
+            /* JobApi entries: args r3-r5. Post-job return 0x3308: result r3 +
+             * the job's saved GetBufferTag result r80. */
+            if (p == 0x2F30 || p == 0x1700 || p == 0x1770 || p == 0x17C8)
+                fprintf(stderr, " args r3=%08X.%08X r4=%08X r5=%08X",
+                        ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1],
+                        ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0]);
+            if (p == 0x3308 || p == 0x3258)
+                fprintf(stderr, " r3=%08X.%08X.%08X.%08X r80=%08X.%08X",
+                        ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1],
+                        ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
+                        ctx->gpr[80]._u32[0], ctx->gpr[80]._u32[1]);
+            fprintf(stderr, "\n");
+        }
+      } }
     if (fn && ctx->pc >= 0x4000 && ctx->resident_ovl >= 200) {
         static int s_je = -1;
         if (s_je < 0) { const char* e = getenv("SPU_JOBEXEC"); s_je = e ? 1 : 0; }

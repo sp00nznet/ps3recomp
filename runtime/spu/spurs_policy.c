@@ -34,6 +34,7 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
  * (single writer per run; reads are diagnostic). */
 volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
 volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
@@ -241,7 +242,40 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         #undef HW
     }
 
+    /* SPURS_PM_CLAIMLOG=1: per-run claim-vs-stage summary for BOTH lanes.
+     * The loading freeze's signature is a dispatch that CLAIMS a ticket
+     * (sync-PUTLLC hit) but never STAGES its job (no loadCommands GET): the
+     * claimed ticket is eaten and the batch's barrier can never release
+     * (observed: 4-job batch, counter=4, lanes {2,1}). Diffing the sync-PUTLLC
+     * and 0xC00-GET counters across each run names that dispatch and shows the
+     * LS pipeline state it left behind. */
+    static int s_claimlog = -1;
+    if (s_claimlog < 0) s_claimlog = getenv("SPURS_PM_CLAIMLOG") ? 1 : 0;
+    unsigned batch_before = g_wws_batch_gets;
+    unsigned claim_before = g_spu_putllc_sync_hit;
+
     spu_run_with_halt(entry, ctx);
+
+    if (s_claimlog) {
+        unsigned claims = g_spu_putllc_sync_hit - claim_before;
+        unsigned stages = g_wws_batch_gets - batch_before;
+        if (claims || stages) {
+            static unsigned s_cl = 0;
+            if (s_cl++ < 64) {
+                const uint8_t* L = ctx->ls;
+                #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
+                fprintf(stderr, "[pm-claim] wid=%u spu=%u first=%d claims=%u stages=%u%s halt_pc=0x%05X "
+                        "nextLoad=0x%X loadJob=0x%X runJob=0x%X storeJob=0x%X q13F0=%08X q14E0=%08X\n",
+                        wid, spu_num, first, claims, stages,
+                        (claims && !stages) ? " <-- CLAIM EATEN" : "",
+                        ctx->pc & SPU_LS_MASK,
+                        W(0x12C0), W(0x12D0), W(0x12E0), W(0x12F0),
+                        W(0x13F0), W(0x14E0));
+                fflush(stderr);
+                #undef W
+            }
+        }
+    }
 
     if (pipe_this) {
         static unsigned long s_pn = 0;

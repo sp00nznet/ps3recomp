@@ -269,7 +269,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
       if (s_se) {
         uint32_t e32 = (uint32_t)ea;
-        if ((e32 & 0xFF000000u) == 0xD0000000u) {   /* DMA targeting the PPU stack */
+        if ((e32 & 0xFF000000u) == 0xD0000000u ||   /* DMA targeting the PPU stack */
+            (e32 & 0xFFFF0000u) == 0x470A0000u) {   /* ...or the completion-word POOL */
             static int _n = 0; if (_n++ < 60) {
                 uint32_t v0 = mfc_is_put(cmd) && size>=4 ?
                     ((ls_ptr[0]<<24)|(ls_ptr[1]<<16)|(ls_ptr[2]<<8)|ls_ptr[3]) : 0;
@@ -362,7 +363,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           if (s_se && size >= 4) { static int _n = 0;
             for (uint32_t o = 0; o + 4 <= size && _n < 60; o += 4) {
                 uint32_t w = (ls_ptr[o]<<24)|(ls_ptr[o+1]<<16)|(ls_ptr[o+2]<<8)|ls_ptr[o+3];
-                if ((w & 0xFFFF0000u) == 0xD00C0000u) { _n++;
+                if ((w & 0xFFFF0000u) == 0xD00C0000u ||
+                    (w & 0xFFFF0000u) == 0x470A0000u) { _n++;   /* completion-pool EA in payload */
                     fprintf(stderr, "[stackea] GET-payload has EA 0x%08X at LS 0x%05X"
                             " (from ea=0x%08X size=%u img=%d)\n", w, lsa + o,
                             (uint32_t)ea, size, spu->image_id);
@@ -783,6 +785,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * to LS 0xC00; if this arrives empty/garbage the interrupt handler has
      * nothing to stage and the pipeline idles forever. Dump the first words. */
     if (spu->image_id == 2 && lsa == 0xC00 && cmd == 0x40 && rc == 0) {
+        /* Global count of loadCommands fetches: the per-run claim-vs-stage
+         * summary in spurs_policy.c diffs this across a PM run to catch the
+         * dispatch that CLAIMS a ticket but never stages its job. */
+        { extern volatile unsigned g_wws_batch_gets; g_wws_batch_gets++; }
         static int _n = 0;
         if (_n++ < 8) {
             const uint8_t* p = spu->ls + 0xC00;
