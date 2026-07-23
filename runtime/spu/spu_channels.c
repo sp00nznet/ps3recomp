@@ -1001,10 +1001,12 @@ void spu_indirect_branch(spu_context* ctx)
      * enforce the preserve-all-registers hardware contract here -- the first
      * interrupts-enabled dispatch at the saved srr0 is the irete. */
     { extern int spu_irq_regs_maybe_restore(spu_context*);
-      static int _r = 0;
-      if (spu_irq_regs_maybe_restore(ctx) && _r++ < 8)
-          fprintf(stderr, "[spu-int] IRET restore at pc=0x%05X (regs recovered)\n",
-                  ctx->pc); }
+      if (spu_irq_regs_maybe_restore(ctx)) {
+          static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+          static int _r = 0;
+          if (s_it && _r++ < 200)
+              fprintf(stderr, "[irq] IRET restore at srr0=0x%05X\n", ctx->pc & SPU_LS_MASK);
+      } }
     /* SPURS kernel services (policy-module runs only): the HLE kernel plants
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
@@ -1205,11 +1207,16 @@ void spu_indirect_branch(spu_context* ctx)
     { static int s_jt = -1;
       if (s_jt < 0) { const char* e = getenv("SPU_JOBTRACE"); s_jt = e ? 1 : 0; }
       if (s_jt && ctx->resident_ovl >= 200) { static int _n = 0;
-        if (_n++ < 400) {
+        uint32_t p = ctx->pc & SPU_LS_MASK;
+        /* Full trail, but only start logging once the job body proper begins
+         * (pc in the job code buffer >= 0x4000) so the cap isn't spent on the
+         * PM code the job calls back into -- and keep logging thereafter. */
+        static int _armed = 0;
+        if (p >= 0x4000) _armed = 1;
+        if (_armed && _n++ < 1500) {
             fprintf(stderr, "[jobtrace] pc=0x%05X lr=0x%05X%s",
-                    ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                    p, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                     fn ? "" : " (no lift)");
-            uint32_t p = ctx->pc & SPU_LS_MASK;
             /* JobApi entries: args r3-r5. Post-job return 0x3308: result r3 +
              * the job's saved GetBufferTag result r80. */
             if (p == 0x2F30 || p == 0x1700 || p == 0x1770 || p == 0x17C8)
@@ -1229,6 +1236,9 @@ void spu_indirect_branch(spu_context* ctx)
                         ctx->gpr[8]._u32[0], ctx->gpr[10]._u32[0],
                         ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0],
                         ctx->int_enable);
+            if (p == 0x3030)   /* final BufferTag in r7 (result) */
+                fprintf(stderr, " BufferTag r7=%08X.%08X",
+                        ctx->gpr[7]._u32[0], ctx->gpr[7]._u32[1]);
             fprintf(stderr, "\n");
         }
       } }
