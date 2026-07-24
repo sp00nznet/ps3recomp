@@ -323,6 +323,37 @@ static void spu_async_run(spu_async_job* j)
                 if (!g_ydkj_real_taskset_ea) { const char* _cts=getenv("YDKJ_CRI_TS");
                     if (_cts && *_cts) { g_ydkj_real_taskset_ea=(uint32_t)strtoul(_cts,0,16); g_ydkj_real_taskid=0;
                         fprintf(stderr,"[cri] YDKJ_CRI_TS: forcing cri taskset=0x%08X\n", g_ydkj_real_taskset_ea); } }
+                /* YDKJ_CRI_WAIT: the LLE task-add (0x1D46FEDF) writes the task's ELF into
+                 * the taskset TaskInfo AFTER this SPU workload is dispatched (~150 log lines
+                 * earlier than the create). Reading the taskset once here gets elf=0. We run
+                 * on a detached thread, so poll (up to ~6s) for the PPU to populate
+                 * TaskInfo[taskid].elf before building the context. Opt out: YDKJ_NO_CRI_WAIT. */
+                if (g_ydkj_real_taskset_ea && !getenv("YDKJ_NO_CRI_WAIT")) {
+                    extern uint64_t vm_read64(uint32_t);
+                    uint32_t ti_elf = g_ydkj_real_taskset_ea + 0x80 + g_ydkj_real_taskid*48 + 0x10;
+                    int waited=0; for (; waited<6000; waited++) { if ((vm_read64(ti_elf)&~7ull)!=0) break;
+#ifdef _WIN32
+                        Sleep(1);
+#else
+                        { struct timespec _t={0,1000000}; nanosleep(&_t,0); }
+#endif
+                    }
+                    fprintf(stderr,"[cri] CRI_WAIT: taskset TaskInfo[%u].elf=0x%llX after %d ms\n",
+                            g_ydkj_real_taskid,(unsigned long long)(vm_read64(ti_elf)&~7ull),waited);
+                }
+                /* YDKJ_CRI_READY: the LLE task-add leaves tasks in PENDING_READY+ENABLED
+                 * (bitsets @0x20/0x30) but NOT READY (@0x10); the real SPURS kernel promotes
+                 * pending->ready on its scheduling pass. Our policy interp reads the taskset
+                 * once, so promote pending->ready here (per 32-bit word) so the policy finds a
+                 * runnable task instead of exiting at entry. Opt out: YDKJ_NO_CRI_READY. */
+                if (g_ydkj_real_taskset_ea && !getenv("YDKJ_NO_CRI_READY")) {
+                    extern uint32_t vm_read32(uint32_t); extern void vm_write32(uint32_t,uint32_t);
+                    for (int w=0; w<4; w++){ uint32_t pend=vm_read32(g_ydkj_real_taskset_ea+0x20+w*4);
+                        if (pend) vm_write32(g_ydkj_real_taskset_ea+0x10+w*4,
+                                    vm_read32(g_ydkj_real_taskset_ea+0x10+w*4)|pend); }
+                    fprintf(stderr,"[cri] CRI_READY: promoted pending->ready (ready now=0x%08X)\n",
+                        vm_read32(g_ydkj_real_taskset_ea+0x10));
+                }
                 if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
@@ -435,10 +466,28 @@ static void spu_async_run(spu_async_job* j)
             if (j->image_id == 22 && getenv("YDKJ_CRI_INTERP")) {
                 spu_context ictx;
                 spu_context_init(&ictx, 0);
-                ictx.image_id = 22;
+                /* image_id = -1 => PURE interpretation. image 22 HAS lifted functions, and
+                 * spu_interp_run rejoins the compiled fast path the instant it finds one at
+                 * the PC (spu_interp.c:340, gated on image_id>=0) -- so with image_id=22 it
+                 * returned at the entry without interpreting anything. Pure interp is the whole
+                 * point here (execute the jump-table/computed-branch code the static lift can't
+                 * resolve), so mark it un-lifted. */
+                ictx.image_id = -1;
                 ictx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* stack top */
                 memcpy(ictx.ls, ls, SPU_LS_SIZE);
-                if (j->have_r3) {
+                /* SPURS task entry ABI: r3 = the task's CellSpursTaskArgument (16 bytes)
+                 * from the taskset TaskInfo (TI_ARGS @ +0x00), NOT the stale j->r3 that was
+                 * captured at dispatch time before the LLE task-add populated the task. Read
+                 * it from the real taskset now that CRI_WAIT confirmed it's written. */
+                extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                if (g_ydkj_real_taskset_ea) {
+                    extern uint32_t vm_read32(uint32_t);
+                    uint32_t ti = g_ydkj_real_taskset_ea + 0x80 + g_ydkj_real_taskid*48;
+                    ictx.gpr[3]._u32[0] = vm_read32(ti+0x0);
+                    ictx.gpr[3]._u32[1] = vm_read32(ti+0x4);
+                    ictx.gpr[3]._u32[2] = vm_read32(ti+0x8);
+                    ictx.gpr[3]._u32[3] = vm_read32(ti+0xC);
+                } else if (j->have_r3) {
                     ictx.gpr[3]._u32[0] = j->r3[0];     /* 0x40-marker handle   */
                     ictx.gpr[3]._u32[1] = j->args_ea;   /* eaContext (DMA'd 1st)*/
                     ictx.gpr[3]._u32[2] = j->r3[2];     /* queue/lock EA        */
@@ -447,6 +496,15 @@ static void spu_async_run(spu_async_job* j)
                 fprintf(stderr, "[cri] YDKJ_CRI_INTERP: interpret image 22 entry=0x%X "
                         "r3=[%08X %08X %08X %08X]\n", entry, ictx.gpr[3]._u32[0],
                         ictx.gpr[3]._u32[1], ictx.gpr[3]._u32[2], ictx.gpr[3]._u32[3]);
+                /* Is there real code at the entry, and is any task actually READY/PENDING in
+                 * the taskset? (halt-at-entry stop 0 = policy found nothing to run.) */
+                fprintf(stderr, "[cri] LS[entry 0x%X]: %02X%02X%02X%02X %02X%02X%02X%02X   taskset bitsets ready=%08X pend=%08X enabled=%08X run=%08X\n",
+                        entry, ictx.ls[entry],ictx.ls[entry+1],ictx.ls[entry+2],ictx.ls[entry+3],
+                        ictx.ls[entry+4],ictx.ls[entry+5],ictx.ls[entry+6],ictx.ls[entry+7],
+                        g_ydkj_real_taskset_ea?vm_read32(g_ydkj_real_taskset_ea+0x10):0,
+                        g_ydkj_real_taskset_ea?vm_read32(g_ydkj_real_taskset_ea+0x20):0,
+                        g_ydkj_real_taskset_ea?vm_read32(g_ydkj_real_taskset_ea+0x30):0,
+                        g_ydkj_real_taskset_ea?vm_read32(g_ydkj_real_taskset_ea+0x00):0);
                 fflush(stderr);
                 uint32_t stop_lsa = spu_interp_run(&ictx, entry);
                 memcpy(ls, ictx.ls, SPU_LS_SIZE);
