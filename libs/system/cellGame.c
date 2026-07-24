@@ -33,6 +33,8 @@
 
 static char s_title_id[64]  = "BLES00000";
 static char s_title[256]    = "Unknown Title";
+static char s_version[16]   = "01.00";
+static char s_system_ver[16] = "00.0000";
 static char s_app_ver[16]   = "01.00";
 
 /* Content info / usrdir paths */
@@ -171,7 +173,7 @@ static int sfo_read_string(const char* sfo_path, const char* key,
     return ret;
 }
 
-/* Read TITLE_ID / TITLE / APP_VER from the game's PARAM.SFO at boot. Call once
+/* Read title/version fields from the game's PARAM.SFO at boot. Call once
  * from main.cpp before the guest runs. Falls back to the defaults if the SFO
  * can't be read (keeps the game working without it). */
 void cellGame_init_from_paramsfo(const char* sfo_path)
@@ -187,6 +189,13 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
     }
     if (sfo_read_string(sfo_path, "TITLE", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_title, tmp, sizeof(s_title) - 1); s_title[sizeof(s_title) - 1] = '\0';
+    }
+    if (sfo_read_string(sfo_path, "VERSION", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_version, tmp, sizeof(s_version) - 1); s_version[sizeof(s_version) - 1] = '\0';
+    }
+    if (sfo_read_string(sfo_path, "PS3_SYSTEM_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        strncpy(s_system_ver, tmp, sizeof(s_system_ver) - 1);
+        s_system_ver[sizeof(s_system_ver) - 1] = '\0';
     }
     if (sfo_read_string(sfo_path, "APP_VER", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_app_ver, tmp, sizeof(s_app_ver) - 1); s_app_ver[sizeof(s_app_ver) - 1] = '\0';
@@ -235,7 +244,7 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
 
     if (dir_ea) {
         size_t len = strlen(s_title_id);
-        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
+        if (len > CELL_GAME_DIRNAME_SIZE - 1) len = CELL_GAME_DIRNAME_SIZE - 1;
         memcpy(vm_base + dir_ea, s_title_id, len);
         vm_base[dir_ea + len] = '\0';
     }
@@ -411,9 +420,6 @@ s32 cellGameGetParamInt(s32 id, s32* value)
 
     uint32_t v = 0;
     switch (id) {
-    case CELL_GAME_PARAMID_APP_VER:
-        v = 100; /* 1.00 as integer */
-        break;
     case CELL_GAME_PARAMID_PARENTAL_LEVEL:
     case CELL_GAME_PARAMID_RESOLUTION:
     case CELL_GAME_PARAMID_SOUND_FORMAT:
@@ -441,16 +447,21 @@ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
         return CELL_GAME_ERROR_PARAM;
     char* hbuf = (char*)(vm_base + buf_ea);
 
-    const char* src = "";
-    switch (id) {
-    case CELL_GAME_PARAMID_TITLE:
-    case CELL_GAME_PARAMID_TITLE_DEFAULT:  src = s_title;    break;
-    case CELL_GAME_PARAMID_TITLE_ID:       src = s_title_id; break;
-    case CELL_GAME_PARAMID_APP_VER_STR:
-    case CELL_GAME_PARAMID_VERSION:        src = s_app_ver;  break;
-    default:
-        printf("[cellGame] WARNING: unknown param string id %d\n", id);
-        break;
+    const char* src;
+    if (id >= CELL_GAME_PARAMID_TITLE && id <= CELL_GAME_PARAMID_TITLE_TURKISH) {
+        /* Localized TITLE_## fields are not tracked separately yet. */
+        src = s_title;
+    } else {
+        switch (id) {
+        case CELL_GAME_PARAMID_TITLE_ID:       src = s_title_id;   break;
+        case CELL_GAME_PARAMID_VERSION:        src = s_version;    break;
+        case CELL_GAME_PARAMID_PS3_SYSTEM_VER: src = s_system_ver; break;
+        case CELL_GAME_PARAMID_APP_VER:        src = s_app_ver;    break;
+        default:
+            printf("[cellGame] WARNING: unknown param string id %d\n", id);
+            src = "";
+            break;
+        }
     }
     strncpy(hbuf, src, bufsize - 1);
     hbuf[bufsize - 1] = '\0';
