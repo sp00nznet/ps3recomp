@@ -50,11 +50,15 @@ cmake -B build
 cmake --build build --config Release
 ```
 
-### Running Tests (if available)
+### Running Tests
+
 ```bash
-cmake -B build -DPS3RECOMP_BUILD_TESTS=ON
-cmake --build build --target test
+cmake -S . -B build-tests -G Ninja -DPS3RECOMP_BUILD_TESTS=ON
+cmake --build build-tests
+ctest --test-dir build-tests --output-on-failure
 ```
+
+This builds and runs the deterministic runtime synchronization stress suite.
 
 ---
 

@@ -12,7 +12,10 @@
 #   .\tests\sync_stress\build\sync_stress.exe [seed]
 #
 cmake_minimum_required(VERSION 3.20)
-project(sync_stress LANGUAGES C)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(sync_stress LANGUAGES C)
+    enable_testing()
+endif()
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -40,6 +43,7 @@ endif()
 
 add_executable(sync_stress
     main.c
+    test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
     "${RUNTIME_SYNC_DIR}/sys_cond.c"
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
@@ -53,9 +57,18 @@ target_include_directories(sync_stress PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(sync_stress PRIVATE /W3 /wd4100 /wd4244 /wd4267)
+    target_compile_options(sync_stress PRIVATE
+        /W3 /wd4100 /wd4244 /wd4267
+        /experimental:c11atomics
+    )
     target_compile_definitions(sync_stress PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(sync_stress PRIVATE -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(sync_stress PRIVATE pthread)
 endif()
+
+add_test(NAME sync_stress COMMAND sync_stress)
+set_tests_properties(sync_stress PROPERTIES
+    LABELS "stress;runtime;sync"
+    TIMEOUT 120
+)
