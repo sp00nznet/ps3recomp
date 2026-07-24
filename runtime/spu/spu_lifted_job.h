@@ -17,6 +17,7 @@
 #include "spu_interp.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
 
@@ -108,6 +109,13 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * negative -> garbage stack -> null function pointers -> branch to LS 0. */
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
+    /* A SpursTasksetContext at LS 0x2700 (built by spurs_pm_build_context) writes
+     * syscallAddr=0xA70 at STC_SYSCALL_ADDR (0x27C4). That sentinel means "this is
+     * a generic SPURS taskset task" (LBP's audio SPEEX/MultiStream tasks) -- flOw
+     * jobs never plant it, so keying off it cannot change their behaviour. */
+    #define _LB(o) (((uint32_t)ctx.ls[(o)]<<24)|((uint32_t)ctx.ls[(o)+1]<<16)| \
+                    ((uint32_t)ctx.ls[(o)+2]<<8)|ctx.ls[(o)+3])
+    int taskset_ctx = (_LB(0x27C4) == 0xA70u);
     if (spurs_task_abi) {
         if (r3_override) {
             ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle      */
@@ -124,6 +132,14 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
              * to 0 and FAILS the gate -> no decode, no DMA. Use 0x00400000. */
             ctx.gpr[3]._u32[0] = 0x00400000u;   /* >>16 == 64 -> cri real decode path */
             ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
+        } else if (taskset_ctx) {
+            /* Generic SPURS task (RPCS3 spursTasksetStartTask): r3 = the task's
+             * 16-byte CellSpursTaskArgument (TaskInfo.args, DMA'd to LS 0x2780 by
+             * spurs_pm_build_context), passed by value -- NOT the cri 0x40 marker. */
+            ctx.gpr[3]._u32[0] = _LB(0x2780);
+            ctx.gpr[3]._u32[1] = _LB(0x2784);
+            ctx.gpr[3]._u32[2] = _LB(0x2788);
+            ctx.gpr[3]._u32[3] = _LB(0x278C);
         } else {
             ctx.gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
             ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
@@ -140,16 +156,22 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * (planted by spurs_pm_build_context). Without it the leaf reads a garbage SPURS base
      * and DMAs from a bad address / bails at init. Set for image 22 (cri) when the context
      * carries a non-zero spurs ptr. */
-    if (spurs_task_abi && image_id == 22) {
-        #define LB(o) (((uint32_t)ctx.ls[(o)]<<24)|((uint32_t)ctx.ls[(o)+1]<<16)|((uint32_t)ctx.ls[(o)+2]<<8)|ctx.ls[(o)+3])
-        uint32_t spurs_lo = LB(0x2764);
+    if (spurs_task_abi && (image_id == 22 || taskset_ctx)) {
+        uint32_t spurs_lo = _LB(0x2764);
         if (spurs_lo) {
-            ctx.gpr[4]._u32[0] = LB(0x2768);   /* args hi (d0) */
-            ctx.gpr[4]._u32[1] = LB(0x276C);   /* args lo      */
-            ctx.gpr[4]._u32[2] = LB(0x2760);   /* spurs hi (d1)*/
+            ctx.gpr[4]._u32[0] = _LB(0x2768);  /* args hi (d0) */
+            ctx.gpr[4]._u32[1] = _LB(0x276C);  /* args lo      */
+            ctx.gpr[4]._u32[2] = _LB(0x2760);  /* spurs hi (d1)*/
             ctx.gpr[4]._u32[3] = spurs_lo;     /* spurs lo = CellSpurs EA */
         }
-        #undef LB
+    }
+    #undef _LB
+    if (taskset_ctx && getenv("LBP_TASKSET_TRACE")) {
+        fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
+                "r4=%08X %08X %08X %08X\n", image_id,
+                ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3],
+                ctx.gpr[4]._u32[0], ctx.gpr[4]._u32[1], ctx.gpr[4]._u32[2], ctx.gpr[4]._u32[3]);
+        fflush(stderr);
     }
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
       spu_run_with_halt(entry, &ctx); }                         /* run with halt pad   */

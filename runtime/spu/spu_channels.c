@@ -403,7 +403,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
  * syscall. num = r3&0xF (0x10 bit = the "2" variant), args in r4. Adopted from the
  * JonathanDC64/ps3recomp fork (aaea4158) which uses this to run SPURS tasks clean. */
 #define YDKJ_TASKSET_PM_SYSCALL_ADDR 0xA70u
-static void spu_spurs_taskset_syscall(spu_context* ctx)
+void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
     uint32_t num = raw & 0x0F;
@@ -423,7 +423,26 @@ static void spu_spurs_taskset_syscall(spu_context* ctx)
         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
         return;
     }
-    /* EXIT(0, cri bootstrap)/YIELD(1)/WAIT_SIGNAL(2)/POLL(3)/RECV_WKL_FLAG(4):
+    /* WAIT_SIGNAL(2): REAL semantics (ported from sagemono def73da, RPCS3
+     * spursTasksetProcessSyscall) -- consume the task's bit in the guest
+     * taskset's `signalled` bitset, or SLEEP this task's host thread until
+     * cellSpursEventFlagSet / _cellSpursSendSignal delivers one (the FMOD mixer
+     * flag-A wait path). Returning "success" without waiting made the task spin
+     * on empty work state forever -- the FMOD/LBP boot deadlock. taskset/taskId
+     * come from the SpursTasksetContext this runtime planted at LS 0x2700. */
+    if (num == 2) {
+        uint32_t ts  = ((uint32_t)ctx->ls[0x27BC] << 24) | ((uint32_t)ctx->ls[0x27BD] << 16) |
+                       ((uint32_t)ctx->ls[0x27BE] << 8)  |  (uint32_t)ctx->ls[0x27BF];
+        uint32_t tid = ((uint32_t)ctx->ls[0x27D4] << 24) | ((uint32_t)ctx->ls[0x27D5] << 16) |
+                       ((uint32_t)ctx->ls[0x27D6] << 8)  |  (uint32_t)ctx->ls[0x27D7];
+        if (ts) {
+            extern int spu_taskset_wait_signal(uint32_t, uint32_t);
+            spu_taskset_wait_signal(ts, tid);
+        }
+        ctx->gpr[3]._u32[0] = 0;
+        return;
+    }
+    /* EXIT(0, cri bootstrap)/YIELD(1)/POLL(3)/RECV_WKL_FLAG(4):
      * report success and resume (return -> lifted caller continues at its link). */
     ctx->gpr[3]._u32[0] = 0;
 }
@@ -437,9 +456,18 @@ void spu_indirect_branch(spu_context* ctx)
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
     /* Taskset PM task-syscall entry (LS 0xA70): HLE it instead of branching into
-     * (absent) PM code. The cri task (image 22) reaches here via syscallAddr. */
-    if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR && ctx->image_id == 22) {
-        spu_spurs_taskset_syscall(ctx); return;
+     * (absent) PM code. Fires for the cri task (image 22) AND any generic taskset
+     * task whose SpursTasksetContext we planted -- detected by the syscallAddr
+     * sentinel at LS 0x27C4 (== 0xA70), which only spurs_pm_build_context writes.
+     * Without generalizing this, an LBP FMOD task that reaches its EXIT/YIELD
+     * syscall would branch into empty LS 0xA70 and halt as "branch-to-0" instead
+     * of cleanly exiting. */
+    if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
+        uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
+                    | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
+        if (ctx->image_id == 22 || sc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
+            spu_spurs_taskset_syscall(ctx); return;
+        }
     }
     /* YDKJ_CRI_R4: the taskset policy entry (LS 0xA00, image 23) writes r4 into
      * SpursTasksetContext.taskset @LS 0x27B8 (per RPCS3 cellSpursSpu.cpp). Our

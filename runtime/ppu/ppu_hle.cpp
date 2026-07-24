@@ -97,15 +97,33 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
     if (ppu_gcm_pump) ppu_gcm_pump();
+
+    /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
+     * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
+     * _cellSpursIsLaunchedFromTuner (0x3000D318), must return 0x8001112E ("profiler not
+     * loaded") on a normal run. Anything else trips the usertrace.c:123 assert AND makes
+     * the fn report "launched from tuner", so the caller runs tuner/trace setup that fails
+     * with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
+    if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
+        static int _tn = 0; if (_tn++ < 3)
+            fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
+        return;
+    }
     g_last_hle_nid = nid;
     /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
     { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;
-        int gfx=0,dds=0,png=0; for(uint32_t a=0x10000; a<0x0FF00000u; a++){
+        int gfx=0,cfx=0,swf=0,dds=0,png=0; for(uint32_t a=0x10000; a<0x0FF00000u; a++){
           uint8_t m0=vm_base[a],m1=vm_base[a+1],m2=vm_base[a+2],vv=vm_base[a+3];
-          if(m0==0x47&&m1==0x46&&(m2==0x58||m2==0x43)&&(vv>=8&&vv<=12)){ if(gfx<3)fprintf(stderr,"[GFX-SCAN] GFX movie @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); gfx++; }
+          /* uncompressed GFx: 'GFX'/'GFC' ver 4..20 */
+          if(m0==0x47&&m1==0x46&&(m2==0x58||m2==0x43)&&(vv>=4&&vv<=20)){ if(gfx<3)fprintf(stderr,"[GFX-SCAN] GFX @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); gfx++; }
+          /* compressed GFx: 'CFX' (zlib) */
+          else if(m0==0x43&&m1==0x46&&m2==0x58&&(vv>=4&&vv<=20)){ if(cfx<3)fprintf(stderr,"[GFX-SCAN] CFX(zlib) @0x%08X ver=%d\n",a,vv); cfx++; }
+          /* SWF: 'FWS'(raw) / 'CWS'(zlib) / 'ZWS'(lzma) */
+          else if((m0==0x46||m0==0x43||m0==0x5A)&&m1==0x57&&m2==0x53&&(vv>=4&&vv<=20)){ if(swf<3)fprintf(stderr,"[GFX-SCAN] SWF @0x%08X %c%c%c ver=%d\n",a,m0,m1,m2,vv); swf++; }
           else if(m0==0x44&&m1==0x44&&m2==0x53&&vv==0x20){ dds++; }
           else if(m0==0x89&&m1==0x50&&m2==0x4E&&vv==0x47){ png++; } }
-        fprintf(stderr,"[GFX-SCAN #%ld] GFX-movies=%d DDS=%d PNG=%d\n",_c/200000,gfx,dds,png); fflush(stderr); } }
+        fprintf(stderr,"[GFX-SCAN #%ld] GFX=%d CFX=%d SWF=%d DDS=%d PNG=%d\n",_c/200000,gfx,cfx,swf,dds,png); fflush(stderr); } }
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
@@ -202,15 +220,129 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { static int _ns=-1; if(_ns<0)_ns=getenv("FLOW_NOSPILL")?1:0;
       if(!_ns) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); }
 
-    /* Real libsre (loaded PRX) takes priority over the HLE stub. */
+    /* Real libsre (loaded PRX) takes priority over the HLE stub -- EXCEPT for NIDs
+     * listed in YDKJ_FORCE_HLE (comma-separated hex). Some LLE entry points fail
+     * against our partially-modelled SPURS state and the CALLER ASSERTS on it:
+     * YDKJ's CRI calls _cellSpursEventFlagInitialize (0x5EF96465), libsre returns
+     * 0x80410910 (CELL_SPURS_TASK_ERROR_STAT), and CRI's own
+     * "CellSpursTaskset.cc:423: ret == CELL_OK -- assertion failed" kills its
+     * taskset init => the movie decode task is never created. Forcing the HLE
+     * (which succeeds) lets the caller proceed. */
     {
         uint32_t opd = prx_resolve_export(nid);
+        if (opd) {
+            static const char* s_force = (const char*)1;
+            if (s_force == (const char*)1) s_force = getenv("YDKJ_FORCE_HLE");
+            if (s_force && *s_force) {
+                char want[16]; snprintf(want, sizeof want, "%08X", nid);
+                /* case-insensitive substring match on the 8-hex-digit NID */
+                for (const char* p2 = s_force; *p2; p2++) {
+                    int k = 0;
+                    while (k < 8 && p2[k] &&
+                           (p2[k] == want[k] ||
+                            (p2[k] >= 'a' && p2[k] - 32 == want[k]))) k++;
+                    if (k == 8) {
+                        /* CRI exception: cellSpursEventFlagInitialize (0x5EF96465) is
+                         * force-HLE'd because libsre's version STAT'd and tripped CRI's
+                         * CellSpursTaskset.cc:423 assertion -- but that was before the
+                         * taskset/attr fixes. The HLE stub does NOT stamp the eventFlag's
+                         * +0xC=0xFF magic that the create-task pre-check (0x300158C4) then
+                         * requires, so the CRI create STATs. Route ONLY the cri event flag
+                         * (r4 == YDKJ_CRI_EVFLAG, default 0x006B4600) to real libsre so it
+                         * stamps +0xC=0xFF and the create passes; keep the audio flags on
+                         * the HLE stub (their create STAT is tolerated -- routing them makes
+                         * the game wait for the audio SPU task we don't dispatch -> hang). */
+                        if (nid == 0x5EF96465u) {
+                            const char* ce = getenv("YDKJ_CRI_EVFLAG");
+                            uint32_t crif = ce ? (uint32_t)strtoul(ce, 0, 16) : 0x006B4600u;
+                            static int _cd=0; if(getenv("YDKJ_SPURSTRACE") && _cd++<4) fprintf(stderr,
+                                "[EVFLAG] 0x5EF96465 r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
+                                (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]);
+                            /* the eventFlag EA can be r3/r4/r5 depending on the (public vs _internal)
+                             * variant behind this NID; the cri flag is a unique address so match any. */
+                            if ((uint32_t)ctx->gpr[3] == crif || (uint32_t)ctx->gpr[4] == crif ||
+                                (uint32_t)ctx->gpr[5] == crif) {
+                                static int _c=0; if(_c++<2) fprintf(stderr,
+                                    "[FORCE-HLE] cri eventflag 0x%08X -> REAL libsre (stamps +0xC=0xFF)\n", crif);
+                                break;   /* keep opd (libsre); do NOT force HLE */
+                            }
+                        }
+                        static int _n = 0;
+                        if (_n++ < 8)
+                            fprintf(stderr, "[FORCE-HLE] nid=0x%08X: bypassing libsre, using HLE\n", nid);
+                        opd = 0;   /* fall through to the HLE handler below */
+                        break;
+                    }
+                }
+            }
+        }
         if (opd) {
             uint32_t code = vm_read32(opd);
             uint32_t toc  = vm_read32(opd + 4);
             { static int64_t st=-2; if(st==-2){const char*e=getenv("YDKJ_SPURSTRACE"); st=e?1:0;}
-              if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X -> libsre code=0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
-                  nid, code, (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); }
+              if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X -> libsre code=0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X lr=0x%08X\n",
+                  nid, code, (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6],(uint32_t)ctx->lr);
+              /* Dump the struct state at the failing task-attach calls: libsre 0x300158C4
+               * (nid 0x87630976) STATs unless struct+0xC==0xFF & +0xE in{1,3}; 0x30015AA4
+               * (0x22AAB31D) validates the same struct. Show what our recomp left there. */
+              if (st && (nid==0x87630976u || nid==0x22AAB31Du)) {
+                  extern void ppu_guest_callstack(const char*);
+                  ppu_guest_callstack(nid==0x87630976u?"CREATE-nid":"INIT-nid");
+                  extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
+                  #define _RW(o) ((vm_base[s3+(o)]<<24)|(vm_base[s3+(o)+1]<<16)|(vm_base[s3+(o)+2]<<8)|vm_base[s3+(o)+3])
+                  /* Full task-descriptor dump: +0xC state(need FF), +0xE type, +0x74/+0x7C
+                   * handles (the helper 0x3000b140 does an atomic on *(+0x74)+0xda8 -> if 0,
+                   * garbage), +0x4/+0x7 stamp preconds. */
+                  fprintf(stderr, "  [state] struct@0x%08X:", s3);
+                  for (uint32_t o=0; o<0x80; o+=16) {
+                      fprintf(stderr, " |+%02X:", o);
+                      for (uint32_t k=0;k<16;k+=4) fprintf(stderr, "%08X ", _RW(o+k));
+                  }
+                  fprintf(stderr, "\n    +0C=%02X(need FF) +0E=%02X +74=%08X +7C=%08X\n",
+                      vm_base[s3+0xC], vm_base[s3+0xE], _RW(0x74), _RW(0x7C));
+                  /* The helper 0x3000b140 does a bitmap atomic on taskset(+0x74)+0xda8 --
+                   * the task-slot free bitmap CreateTaskset should have initialized. Dump it. */
+                  uint32_t ts = _RW(0x74);
+                  if (ts >= 0x40000000u && ts < 0x50000000u) {
+                      #define _RT(o) ((vm_base[ts+(o)]<<24)|(vm_base[ts+(o)+1]<<16)|(vm_base[ts+(o)+2]<<8)|vm_base[ts+(o)+3])
+                      fprintf(stderr, "    taskset@0x%08X +0xda8 slot-bitmap: %08X %08X %08X %08X | +0x00:%08X +0x08:%08X\n",
+                          ts, _RT(0xda8), _RT(0xdac), _RT(0xdb0), _RT(0xdb4), _RT(0x00), _RT(0x08));
+                      #undef _RT
+                  }
+                  #undef _RW
+              }
+            }
+            /* YDKJ_FORCEATTR (test): the create-task nid 0x87630976 (libsre 0x300158C4)
+             * STATs because the task-attr struct(r3)+0xC != 0xFF -- the game runs create
+             * before the attr-init (0x22AAB31D) that stamps it (a game-side vtable ordering
+             * mis-lift). Force +0xC=0xFF here to test whether the task then creates + the
+             * workload attaches + the cri decode runs (papering the ordering to probe the
+             * NEXT gate). */
+            if (nid==0x87630976u && getenv("YDKJ_FORCEATTR")) {
+                extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
+                if (vm_base[s3+0xC]!=0xFF) { vm_base[s3+0xC]=0xFF;
+                    static int _f=0; if(_f++<4) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
+            }
+            /* YDKJ_GUESTINIT: the create-task (0x87630976) runs BEFORE the game's own
+             * init of its task descriptor (r3), so descriptor+0xC != 0xFF -> STAT. Eagerly
+             * invoke the REAL init (0x22AAB31D) on the descriptor first via the guest-caller
+             * (ppu_guest_call runs it in a scratch ctx, so the create's args survive). This
+             * does the FULL init incl. the task-slot alloc syscall -- unlike the raw +0xC
+             * force (FORCEATTR) that hung -- then create proceeds against a valid descriptor. */
+            if (nid==0x87630976u && getenv("YDKJ_GUESTINIT")) {
+                extern uint8_t* vm_base; uint32_t desc=(uint32_t)ctx->gpr[3];
+                /* YDKJ_GUESTINIT_CRI: scope the eager-init to the CRI/movie create only
+                 * (taskset r4=0x40131000); leave the audio create (r4=0x4000C900) to its
+                 * tolerated STAT so the legal screen still renders while we test the movie. */
+                uint32_t _ts=(uint32_t)ctx->gpr[4];
+                if (getenv("YDKJ_GUESTINIT_CRI") && _ts!=0x40131000u) { /* skip audio */ }
+                else if (vm_base[desc+0xC]!=0xFF) {
+                    uint32_t iopd = prx_resolve_export(0x22AAB31Du);
+                    static int _g=0; if(_g++<6) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
+                    if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398);
+                        if(_g<=6) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
+                }
+            }
             /* Arm a page-guard on the CellSpurs struct at cellSpursInitializeWithAttribute2
              * ENTRY (nid 0xAA6269A8, r3=&spurs) — before the init writes it — to catch
              * where its struct stores actually land. Env YDKJ_GUARD_INST. */
@@ -219,6 +351,20 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[GUARD] arming on CellSpurs &spurs=0x%08X at init entry\n", (uint32_t)ctx->gpr[3]);
                 ppu_guard_page((uint32_t)ctx->gpr[3]);
             }
+            /* CRI_ATTR: the real task-add libsre_func_30012310 (nid 0x1D46FEDF) STATs
+             * 0x80410902 unless *(u32*)(r5+0)==1 -- r5 is the task-attribute struct the
+             * game builds on the stack. Dump it to see how the game left it. */
+            if (nid==0x1D46FEDFu && getenv("YDKJ_SPURSTRACE")) {
+                extern uint8_t* vm_base; uint32_t a5=(uint32_t)ctx->gpr[5], a4=(uint32_t)ctx->gpr[4];
+                #define _RD(b,o) ((vm_base[(b)+(o)]<<24)|(vm_base[(b)+(o)+1]<<16)|(vm_base[(b)+(o)+2]<<8)|vm_base[(b)+(o)+3])
+                static int _a=0; if(_a++<2) fprintf(stderr,
+                    "[CRI_ATTR] task-add r3(taskset)=0x%08X r4=0x%08X r5(attr)=0x%08X r6(elf)=0x%08X\n"
+                    "           attr[0..0x1C]= %08X %08X %08X %08X %08X %08X %08X %08X  (attr[0] must be 1)\n",
+                    (uint32_t)ctx->gpr[3],a4,a5,(uint32_t)ctx->gpr[6],
+                    _RD(a5,0),_RD(a5,4),_RD(a5,8),_RD(a5,0xC),_RD(a5,0x10),_RD(a5,0x14),_RD(a5,0x18),_RD(a5,0x1C));
+                #undef _RD
+            }
+            uint32_t _cap_ts = (nid==0x87630976u) ? (uint32_t)ctx->gpr[4] : 0; /* taskset EA before the call clobbers r4 */
             ctx->gpr[2] = toc;            /* libsre's own TOC */
             ctx->ctr    = code;
             /* FLOW_REENTRY_ISO: the libsre fn re-enters lifted guest code at the PPU
@@ -238,7 +384,35 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
             { static int64_t st=-2; if(st==-2){const char*e=getenv("YDKJ_SPURSTRACE"); st=e?1:0;}
               if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X RETURNED r3=0x%08X\n",
-                  nid, (uint32_t)ctx->gpr[3]); }
+                  nid, (uint32_t)ctx->gpr[3]);
+              /* After a create-task (0x87630976), scan the taskset TaskInfo array to see
+               * WHICH taskId the real libsre create actually populated (elf!=0). Our
+               * CRI_INTERP dispatch hardcodes task 0; if create used a different slot we'd
+               * read task 0's empty elf=0. _cap_ts was the r4 taskset before the call. */
+              /* YDKJ_CRI_CREATE_OK: the cri caller func_00331DA4 checks create's return
+               * and BAILS on the STAT (0x8041090F) -> it never calls the ELF-carrying init
+               * (0x22AAB31D, r6=0x004F5F80 = movie image 22) that actually sets up the task.
+               * Force ONLY create's return value to success -- leave the descriptor pristine
+               * (unlike FORCEATTR/GUESTINIT, which mutate +0xC and make the real ELF-init
+               * STAT as already-init) -- so the game proceeds to the ELF-init on a clean
+               * descriptor. Scoped to the cri taskset (0x40131000). */
+              if (nid==0x87630976u && _cap_ts==0x40131000u && (uint32_t)ctx->gpr[3]==0x8041090Fu
+                  && getenv("YDKJ_CRI_CREATE_OK")) {
+                  ctx->gpr[3]=0; static int _co=0;
+                  if(_co++<2) fprintf(stderr,"[CRI_CREATE_OK] forced cri create return 0 (descriptor pristine) so ELF-init can run\n");
+              }
+              extern uint64_t vm_read64(uint64_t a);
+              if (st && nid==0x87630976u && _cap_ts) {
+                  fprintf(stderr,"[TSDUMP] taskset 0x%08X after create (r3=0x%08X): ready=%08X.%08X run=%08X.%08X\n",
+                      _cap_ts,(uint32_t)ctx->gpr[3],
+                      vm_read32(_cap_ts+0x10),vm_read32(_cap_ts+0x14),
+                      vm_read32(_cap_ts+0x00),vm_read32(_cap_ts+0x04));
+                  for (uint32_t t=0;t<16;t++){ uint32_t ti=_cap_ts+0x80+t*48;
+                      uint64_t elf=vm_read64(ti+0x10);
+                      if (elf) fprintf(stderr,"[TSDUMP]   task %u: elf=0x%llX args=%08X %08X %08X %08X ctx=0x%llX\n",
+                          t,(unsigned long long)elf,vm_read32(ti+0),vm_read32(ti+4),vm_read32(ti+8),vm_read32(ti+12),
+                          (unsigned long long)vm_read64(ti+0x18)); }
+              } }
             /* cellSpursInitialize (0xACFC8DBC) just returned -> the CellSpurs
              * instance is now populated; spawn the lifted SPURS SPU kernel against
              * it (flОw libsre never calls group_start; spawning during init reads
@@ -258,6 +432,18 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
     ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
     if (!e || !e->handler) {
+        /* YDKJ_TUNERFIX: sysPrxForUser 0xE0998DBF is the profiler-presence query called
+         * by libsre _cellSpursIsLaunchedFromTuner (0x3000D318). On a normal (non-tuner)
+         * run it must return 0x8001112E ("profiler not loaded"); an unresolved-NID error
+         * instead trips the usertrace.c:123 assert AND makes the fn return "launched=1",
+         * so the caller does tuner/trace setup that fails with CELL_SPURS_CORE_ERROR_STAT
+         * -> the SPURS task workload never attaches -> no movie decode. Return not-loaded. */
+        if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
+            static int _tn = 0; if (_tn++ < 3)
+                fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
+            return;
+        }
         static int logged = 0;
         if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD

@@ -332,15 +332,62 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
+    /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
+     * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
+    static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
+    static uint64_t _cap=0; { static int _ci=0; if(!_ci){_ci=1; const char*e=getenv("YDKJ_SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0;} }
+    uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
+        /* Taskset PM task-syscall entry (LS 0xA70): the pure interpreter has no PM
+         * code resident there, so a task's task-API call (EXIT/YIELD/WAIT/POLL via
+         * func_00026DE0 -> syscallAddr@0x27C4) would execute empty LS and stop 0.
+         * HLE it exactly like the lifted path (spu_channels.c spu_indirect_branch),
+         * then resume at the task's link (r0). Gated by the syscallAddr sentinel at
+         * LS 0x27C4 (only spurs_pm_build_context writes 0xA70 there). The handler
+         * halts on EXIT(num=0) unless image_id==22; present that momentarily so an
+         * interp'd cri task (image_id set to -1 for pure interp) resumes instead of
+         * longjmp-ing out of a context that isn't wrapped for it. */
+        if (ctx->pc == 0xA70u) {
+            uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
+                        | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
+            if (sc == 0xA70u) {
+                extern void spu_spurs_taskset_syscall(spu_context*);
+                int _save = ctx->image_id; ctx->image_id = 22;
+                spu_spurs_taskset_syscall(ctx);
+                ctx->image_id = _save;
+                ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;   /* resume at link r0 */
+                continue;
+            }
+        }
         /* Rejoin the compiled fast path only for images that HAVE lifted
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         if (ctx->image_id >= 0 && spu_lifted_lookup(ctx, ctx->pc)) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
+        if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
-        if (spu_step(ctx)) { g_spu_interp_steps = steps; return ctx->stop_code; }
+        /* YDKJ_SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
+         * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
+        if (_tr>0 && _cap && steps == _cap) {
+            fprintf(stderr,"[spu-trace] STEPCAP pc=0x%05X after %llu steps; last %d PCs:",
+                    ctx->pc, (unsigned long long)steps, rn);
+            for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
+            fprintf(stderr,"\n");
+            /* dump the LS 0x2700 SpursTasksetContext the poll reads -- compare to the
+             * working RPCS3 SPU0 dump (RUNNING/READY/ENABLED=0x80000000, SIGNALLED=0). */
+            #define LB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
+            fprintf(stderr,"[spu-trace] LS ctx: RUN=%08X READY=%08X PEND=%08X ENA=%08X SIG=%08X WAIT=%08X | 2790=%08X 2794=%08X 27D8=%08X 2FB0=%08X\n",
+                LB(0x2700),LB(0x2710),LB(0x2720),LB(0x2730),LB(0x2740),LB(0x2750),LB(0x2790),LB(0x2794),LB(0x27D8),LB(0x2FB0));
+            #undef LB
+            fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
+        }
+        if (spu_step(ctx)) { g_spu_interp_steps = steps;
+            if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
+                    ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
+                for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
+                fprintf(stderr,"\n"); fflush(stderr); _tr--; }
+            return ctx->stop_code; }
     }
 }
 

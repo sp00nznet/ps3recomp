@@ -24,6 +24,55 @@
 uint32_t g_ydkj_real_taskset_ea = 0;
 uint32_t g_ydkj_real_taskid     = 0;
 uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the taskset-policy handoff) */
+uint32_t g_ydkj_cri_elf_ea = 0, g_ydkj_cri_ctx_ea = 0;   /* captured from the cri task's attr (LLE create) */
+
+/* Called from the lifted libsre cellSpursCreateTaskset entry (0x30014DC4): the cri
+ * decode taskset is created via the game-static/LLE path (never the HLE CreateTaskset),
+ * so capture the real spurs+taskset EAs here for the image-23 taskset-policy handoff
+ * (spu_workload.c YDKJ_CRI_TASKSET). Latest-wins, matching sagemono's HLE capture. */
+void ydkj_cri_capture_taskset(uint32_t spurs_ea, uint32_t taskset_ea)
+{
+    g_ydkj_real_spurs_ea   = spurs_ea;
+    g_ydkj_real_taskset_ea = taskset_ea;
+    g_ydkj_real_taskid     = 0;
+    if (getenv("YDKJ_CRI_CAP")) {
+        static int _n = 0; if (_n++ < 12)
+            fprintf(stderr, "[cri-cap] libsre CreateTaskset #%d spurs=0x%08X taskset=0x%08X\n",
+                    _n, spurs_ea, taskset_ea);
+    }
+}
+
+/* Capture the cri decode task's real params at the LLE cellSpursCreateTaskWithAttribute
+ * (libsre 0x300121EC): r3=taskset, r5=attr. The attr holds eaElf(=0x4F5F80)/eaContext(the
+ * decode job)/argument -- the LLE never copies them into a taskset TaskInfo our HLE reader
+ * can find (RAM scan for 0x4F5F80 = 0 hits), so grab them straight from the attr here. */
+void ydkj_cri_cap(uint32_t taskset, uint32_t attr)
+{
+    g_ydkj_real_taskset_ea = taskset;
+    if (getenv("YDKJ_CRI_CAP")) {
+        static int _n = 0; if (_n++ < 3) {
+            fprintf(stderr, "[cri-cap] taskset=0x%08X attr=0x%08X  attr dump (find eaElf 0x4F5F80 / eaContext):\n", taskset, attr);
+            for (int o = 0; o < 0x40; o += 4) {
+                uint32_t w = attr ? vm_read32(attr + o) : 0;
+                fprintf(stderr, "   attr+0x%02X = 0x%08X%s\n", o, w, ((w & ~7u) == 0x004F5F80u) ? "  <-- eaElf!" : "");
+                if ((w & ~7u) == 0x004F5F80u) { g_ydkj_cri_elf_ea = w; if (o >= 8) g_ydkj_cri_ctx_ea = vm_read32(attr + o + 4); }
+            }
+        }
+    }
+}
+
+/* C-linkage setter so the LLE libsre lift (compiled as C) can wire the real
+ * SPURS+taskset EAs it sees in cellSpursCreateTaskset -> the cri-task
+ * SpursTasksetContext builder. (LLE bypasses the HLE cellSpurs CreateTaskset.) */
+void ydkj_set_real_taskset_ea(uint32_t spurs_ea, uint32_t taskset_ea)
+{
+    g_ydkj_real_spurs_ea   = spurs_ea;
+    g_ydkj_real_taskset_ea = taskset_ea;
+    { static int n = 0; if (n++ < 3) {
+        fprintf(stderr, "[cri] wired REAL taskset: spurs=0x%08X taskset=0x%08X (from LLE libsre)\n",
+                spurs_ea, taskset_ea);
+        { extern void ydkj_host_bt(const char*); ydkj_host_bt("CreateTaskset caller"); } } }
+}
 
 /* Generic HLE adapter passes GUEST addresses; translate pointer args. CellSpurs
  * is treated opaquely by the game (passed back as a handle), so translating the
@@ -77,7 +126,7 @@ static u32           s_next_task_id = 0;
 #define MAX_EVENT_FLAGS 64
 
 typedef struct {
-    CellSpursEventFlag* ef;
+    uint32_t            ea;      /* guest EA of the 128-byte flag */
 #ifdef _WIN32
     CRITICAL_SECTION    cs;
     CONDITION_VARIABLE  cv;
@@ -90,20 +139,20 @@ typedef struct {
 
 static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
 
-static EventFlagSync* ef_sync_find(CellSpursEventFlag* ef)
+static EventFlagSync* ef_sync_find(uint32_t ea)
 {
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
-        if (s_ef_sync[i].initialized && s_ef_sync[i].ef == ef)
+        if (s_ef_sync[i].initialized && s_ef_sync[i].ea == ea)
             return &s_ef_sync[i];
     }
     return NULL;
 }
 
-static EventFlagSync* ef_sync_alloc(CellSpursEventFlag* ef)
+static EventFlagSync* ef_sync_alloc(uint32_t ea)
 {
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
         if (!s_ef_sync[i].initialized) {
-            s_ef_sync[i].ef = ef;
+            s_ef_sync[i].ea = ea;
             s_ef_sync[i].initialized = 1;
 #ifdef _WIN32
             InitializeCriticalSection(&s_ef_sync[i].cs);
@@ -118,6 +167,20 @@ static EventFlagSync* ef_sync_alloc(CellSpursEventFlag* ef)
     return NULL;
 }
 
+/* Lenient lookup: a flag touched before we saw its Initialize (alternate init
+ * paths, e.g. taskset2) still gets a sync slot instead of an error. */
+static EventFlagSync* ef_sync_get(uint32_t ea)
+{
+    EventFlagSync* s = ef_sync_find(ea);
+    if (!s) {
+        s = ef_sync_alloc(ea);
+        if (s)
+            fprintf(stderr, "[cellSpurs] event flag 0x%08X used before Initialize "
+                            "-- sync slot auto-allocated\n", ea);
+    }
+    return s;
+}
+
 static void ef_sync_free(EventFlagSync* sync)
 {
     if (!sync) return;
@@ -128,7 +191,7 @@ static void ef_sync_free(EventFlagSync* sync)
     pthread_mutex_destroy(&sync->mtx);
     pthread_cond_destroy(&sync->cond);
 #endif
-    sync->ef = NULL;
+    sync->ea = 0;
     sync->initialized = 0;
 }
 
@@ -170,6 +233,98 @@ static inline void ef_broadcast(EventFlagSync* s)
 #else
     pthread_cond_broadcast(&s->cond);
 #endif
+}
+
+/* ---------------------------------------------------------------------------
+ * REAL CellSpursEventFlag guest layout (128 bytes, big-endian; RPCS3
+ * cellSpurs.h is the reference). The SPU task library manipulates this exact
+ * layout with GETLLAR/PUTLLC, so every PPU-side access goes through vm_*.
+ * -----------------------------------------------------------------------*/
+#define EF_EVENTS            0x00u  /* be u16: the event bits */
+#define EF_SPU_PENDING_RECV  0x02u  /* be u16: slot bits with met conditions */
+#define EF_PPU_WAIT_MASK     0x04u  /* be u16: blocked PPU thread's mask */
+#define EF_PPU_WAIT_SLOTMODE 0x06u  /* u8: hi4 = wait slot, lo4 = wait mode */
+#define EF_PPU_PENDING_RECV  0x07u  /* u8: 1 when the PPU waiter's cond met */
+#define EF_SPU_USED_SLOTS    0x08u  /* be u16: wait slots in use (bit 0x8000>>s) */
+#define EF_SPU_WAIT_MODE     0x0Au  /* be u16: per-slot mode (1 = AND) */
+#define EF_SPU_PORT          0x0Cu  /* u8 */
+#define EF_IS_IWL            0x0Du  /* u8: addr is a wkl instead of taskset */
+#define EF_DIRECTION         0x0Eu  /* u8: CELL_SPURS_EVENT_FLAG_* direction */
+#define EF_CLEAR_MODE        0x0Fu  /* u8: 0 = AUTO, 1 = MANUAL */
+#define EF_SPU_WAIT_MASK_ARR 0x10u  /* be u16 [16]: per-slot wait masks */
+#define EF_PENDING_RECV_EVT  0x30u  /* be u16 [16]: events handed to waiters */
+#define EF_WAITING_TASK_ID   0x50u  /* u8 [16]: waiting task ids */
+#define EF_WAITING_WKL_ID    0x60u  /* u8 [16]: waiting workload ids */
+#define EF_ADDR              0x70u  /* be u64: taskset EA (isIwl=0) */
+#define EF_EVENT_PORT_ID     0x78u  /* be u32 */
+#define EF_EVENT_QUEUE_ID    0x7Cu  /* be u32 */
+#define EF_GUEST_SIZE        0x80u
+
+/* Layer-2 hook: wake an SPU task that registered a wait slot and slept via
+ * the taskset syscall. Implemented in runtime/spu (task park/wake); the
+ * event-flag core only reports WHO must wake. */
+extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
+
+/* Core Set protocol on the guest struct (sync lock held). Mirrors the real
+ * kernel/RPCS3 semantics: satisfy registered SPU-task wait slots (slot s uses
+ * bit 0x8000>>s in the used/pending/mode words), hand each its received
+ * events, auto-clear consumed bits, then signal the tasks. PPU waiters are
+ * poll-based here (ef_wait_timed ticks re-check EF_EVENTS), so no PPU
+ * wait-slot registration is needed — and deliberately NOT written, so the
+ * SPU-side lifted Set code takes its "no PPU waiter" path and simply ORs
+ * bits that our poll then observes. */
+static void spurs_ef_set_locked(uint32_t ea, u16 bits)
+{
+    u16 events        = vm_read16(ea + EF_EVENTS);
+    u16 used          = (u16)(vm_read16(ea + EF_SPU_USED_SLOTS) &
+                              ~vm_read16(ea + EF_SPU_PENDING_RECV));
+    u16 waitmode      = vm_read16(ea + EF_SPU_WAIT_MODE);
+    u16 eventsToClear = 0;
+    u16 pendingRecv   = 0;
+
+    for (int s = 0; s < CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS; s++) {
+        u16 bit = (u16)(0x8000u >> s);
+        if (!(used & bit)) continue;
+        u16 mask = vm_read16(ea + EF_SPU_WAIT_MASK_ARR + 2u * s);
+        u16 rel  = (u16)((events | bits) & mask);
+        int mode_and = (waitmode & bit) != 0;
+        if ((mask & ~rel) == 0 || (!mode_and && rel != 0)) {
+            eventsToClear |= rel;
+            pendingRecv   |= bit;
+            vm_write16(ea + EF_PENDING_RECV_EVT + 2u * s, rel);
+        }
+    }
+
+    events = (u16)(events | bits);
+    if (pendingRecv) {
+        vm_write16(ea + EF_SPU_PENDING_RECV,
+                   (u16)(vm_read16(ea + EF_SPU_PENDING_RECV) | pendingRecv));
+        if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
+            events = (u16)(events & ~eventsToClear);
+    }
+    vm_write16(ea + EF_EVENTS, events);
+
+    for (int s = 0; s < CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS; s++) {
+        if (pendingRecv & (0x8000u >> s)) {
+            uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
+            u32 taskId = vm_read8(ea + EF_WAITING_TASK_ID + s);
+            fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X satisfies SPU task "
+                    "slot %d (taskset=0x%08X task=%u)\n", ea, s, taskset_ea, taskId);
+            spu_taskset_signal_task(taskset_ea, taskId);
+        }
+    }
+}
+
+/* SPU-side entry (Layer 2): a task's flag Set arriving via the taskset
+ * syscall or a runtime bridge. Same protocol, takes the lock itself. */
+void spurs_ef_set_from_spu(uint32_t flag_ea, uint16_t bits)
+{
+    EventFlagSync* sync = ef_sync_get(flag_ea);
+    if (!sync) return;
+    ef_lock(sync);
+    spurs_ef_set_locked(flag_ea, (u16)bits);
+    ef_broadcast(sync);
+    ef_unlock(sync);
 }
 
 /* =========================================================================
@@ -372,6 +527,8 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 
     /* Args arrive as guest effective addresses (ps3_hle_call passes raw guest
      * register values); translate to host before dereferencing. */
+    if (getenv("YDKJ_TSCHK")) fprintf(stderr, "[TSCHK] HLE CreateTaskset: spurs_ea=0x%08X taskset_ea=0x%08X args=0x%llX\n", spurs_ea, taskset_ea, (unsigned long long)args);
+
     spurs   = GUEST_PTR(spurs, CellSpurs*);
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
 
@@ -459,11 +616,27 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * Task
  * =====================================================================*/
 
+/* Real SDK ABI (verified against RPCS3 cellSpurs.cpp:370):
+ *   cellSpursCreateTask(taskset, taskId, elf, context, sizeContext,
+ *                       CellSpursTaskLsPattern* lsPattern,
+ *                       CellSpursTaskArgument*  argument)
+ * -- SEVEN args (r3..r9), not six. The old 6-arg form treated r8 as an opaque
+ * `attr` and never read r9 (the argument), so the task's 16-byte work-descriptor
+ * argument was dropped and TaskInfo.args stayed 0. LBP's audio task DMAs its work
+ * from an EA computed out of r3 = that argument (spu_0003 task main @0x17e70:
+ * `wrch $ch18, f(r3.word3)`), so a zero argument makes it GET from EA 0 and
+ * stall. lsPattern/argument arrive as guest EAs (generic adapter forwards r3..r10). */
 s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
-                        CellSpursTaskAttribute* attr)
+                        u32 lsPattern_ea, u32 argument_ea)
 {
-    (void)context; (void)sizeContext; (void)attr;
+    (void)context; (void)sizeContext;
+
+    /* Read the 16-byte CellSpursTaskArgument + optional LS pattern from guest mem. */
+    uint32_t task_arg[4] = {0,0,0,0};
+    uint32_t task_lsp[4] = {0,0,0,0};
+    if (argument_ea)  for (int _i=0;_i<4;_i++) task_arg[_i] = vm_read32(argument_ea + _i*4);
+    if (lsPattern_ea) for (int _i=0;_i<4;_i++) task_lsp[_i] = vm_read32(lsPattern_ea + _i*4);
 
     /* Capture guest EAs BEFORE host translation (the real BE taskset builder + the
      * SPU DMA use guest EAs). */
@@ -499,13 +672,41 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
             spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
-                                   (uint64_t)context_ea, /*arg*/NULL, /*ls_pattern*/NULL);
+                                   (uint64_t)context_ea, task_arg, task_lsp);
             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p) - task logged\n",
-                   s_tasks[i].id, elf);
+            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X)\n",
+                   s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3]);
+
+            /* One-shot: dump the memory the task argument points at, to find the
+             * pointer that reads back 0 (the task GETs from EA 0 -> some field of
+             * its work descriptor is null in our run). Each of the 4 arg words that
+             * looks like a valid guest EA gets 64 bytes dumped as BE u32s. */
+            if (getenv("LBP_TASKSET_TRACE")) {
+                for (int a = 0; a < 4; a++) {
+                    uint32_t p = task_arg[a];
+                    if (p < 0x10000 || p >= 0x50000000u) continue;   /* not a plausible EA */
+                    fprintf(stderr, "[argdump] arg[%d]=0x%08X ->", a, p);
+                    for (int o = 0; o < 64; o += 4)
+                        fprintf(stderr, " %08X", vm_read32(p + o));
+                    fprintf(stderr, "\n");
+                }
+                /* Full heap object (arg[2], the audio engine object): the count the
+                 * PPU validated is at +0xC8 (16-aligned, <=0x160 = stream count); the
+                 * task's per-stream buffer pointers live at +0x124 (=arg[1]). Dump
+                 * +0x00..+0x160 so we can see: 0 streams (task should yield) vs N
+                 * streams with null data buffers (fill gap). */
+                uint32_t ho = task_arg[2];
+                if (ho >= 0x10000 && ho < 0x50000000u) {
+                    fprintf(stderr, "[heapobj] 0x%08X count@+0xC8=0x%08X\n", ho, vm_read32(ho + 0xC8));
+                    for (int o = 0; o < 0x160; o += 16)
+                        fprintf(stderr, "  +%03X: %08X %08X %08X %08X\n", o,
+                                vm_read32(ho+o), vm_read32(ho+o+4), vm_read32(ho+o+8), vm_read32(ho+o+12));
+                }
+                fflush(stderr);
+            }
 
             /* Run the task's SPU program if a lifted build is registered for it.
              * The registry maps the task ELF (by content fingerprint) to its
@@ -555,8 +756,9 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
     attr->sizeContext = sizeContext;
     attr->eaContext   = eaContext;
     attr->eaElf       = eaElf;
-    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u)\n",
-           (u32)eaElf, (u32)eaContext, sizeContext);
+    { extern uint32_t g_last_hle_nid; fprintf(stderr,
+        "[cellSpurs] _TaskAttributeInitialize NID=0x%08X eaElf=0x%08X ctx=0x%08X szctx=%u attr_ea=live\n",
+        g_last_hle_nid, (u32)eaElf, (u32)eaContext, sizeContext); }
     return CELL_OK;
 }
 
@@ -570,10 +772,13 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
     /* taskset/taskId forwarded raw (callee translates); elf/context are guest EAs. */
+    /* lsPattern/argument live inside the 256-byte attribute; our struct doesn't
+     * model them yet. LBP uses the plain 7-arg cellSpursCreateTask (which carries
+     * the argument explicitly), so pass 0 here until a title exercises this path. */
     return cellSpursCreateTask(taskset, taskId,
                                (void*)(uintptr_t)(u32)attr_h->eaElf,
                                (void*)(uintptr_t)(u32)attr_h->eaContext,
-                               attr_h->sizeContext, attr);
+                               attr_h->sizeContext, /*lsPattern*/0, /*argument*/0);
 }
 
 /* The SDK's versioned taskset-attribute initializer. We forward taskset creation
@@ -788,31 +993,37 @@ s32 cellSpursEventFlagInitialize(CellSpursTaskset* taskset,
                                  CellSpursEventFlag* eventFlag,
                                  u32 clearMode, u32 direction)
 {
-    taskset = GUEST_PTR(taskset, CellSpursTaskset*);
-    eventFlag = GUEST_PTR(eventFlag, CellSpursEventFlag*);
-    (void)taskset;
+    /* All pointers are raw guest EAs; the flag lives in guest memory in the
+     * REAL BE layout (the SPU task library DMAs this exact struct). */
+    uint32_t eventFlag_ea = (uint32_t)(uintptr_t)eventFlag;
+    uint32_t taskset_ea   = (uint32_t)(uintptr_t)taskset;
 
-    if (!eventFlag)
+    if (!eventFlag_ea)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (eventFlag_ea & 0x7F)
+        return CELL_SPURS_TASK_ERROR_ALIGN;
 
-    /* If this event flag was previously initialized, free old sync slot */
-    EventFlagSync* old = ef_sync_find(eventFlag);
+    /* Re-initialization: recycle the sync slot. */
+    EventFlagSync* old = ef_sync_find(eventFlag_ea);
     if (old) ef_sync_free(old);
 
-    memset(eventFlag, 0, sizeof(CellSpursEventFlag));
-    eventFlag->initialized = 1;
-    eventFlag->clearMode = (u16)clearMode;
-    eventFlag->direction = (u16)direction;
-    eventFlag->bits = 0;
+    for (uint32_t o = 0; o < EF_GUEST_SIZE; o += 8)
+        vm_write64(eventFlag_ea + o, 0);
+    vm_write8(eventFlag_ea + EF_DIRECTION,  (uint8_t)direction);
+    vm_write8(eventFlag_ea + EF_CLEAR_MODE, (uint8_t)clearMode);
+    /* addr = the owning taskset (isIwl=0); SPU-side Set uses it to find whom
+     * to signal, and our Set hook passes it to spu_taskset_signal_task. */
+    vm_write8(eventFlag_ea + EF_IS_IWL, 0);
+    vm_write64(eventFlag_ea + EF_ADDR, (uint64_t)taskset_ea);
 
-    EventFlagSync* sync = ef_sync_alloc(eventFlag);
+    EventFlagSync* sync = ef_sync_alloc(eventFlag_ea);
     if (!sync) {
         printf("[cellSpurs] EventFlagInitialize: no free sync slots!\n");
         return CELL_SPURS_TASK_ERROR_NOMEM;
     }
 
-    printf("[cellSpurs] EventFlagInitialize(clearMode=%u, direction=%u)\n",
-           clearMode, direction);
+    printf("[cellSpurs] EventFlagInitialize(clearMode=%u, direction=%u) flagEA=0x%08X taskset=0x%08X\n",
+           clearMode, direction, eventFlag_ea, taskset_ea);
     return CELL_OK;
 }
 
@@ -834,19 +1045,16 @@ s32 cellSpursEventFlagDetachLv2EventQueue(CellSpursEventFlag* eventFlag)
 
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
 {
-    eventFlag = GUEST_PTR(eventFlag, CellSpursEventFlag*);
-    if (!eventFlag)
+    uint32_t ea = (uint32_t)(uintptr_t)eventFlag;
+    if (!ea)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    if (!eventFlag->initialized)
-        return CELL_SPURS_TASK_ERROR_STAT;
-
-    EventFlagSync* sync = ef_sync_find(eventFlag);
+    EventFlagSync* sync = ef_sync_get(ea);
     if (!sync)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
-    eventFlag->bits |= bits;
+    spurs_ef_set_locked(ea, bits);
     ef_broadcast(sync);
     ef_unlock(sync);
 
@@ -856,30 +1064,34 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                            u32 mode)
 {
-    eventFlag = GUEST_PTR(eventFlag, CellSpursEventFlag*);
-    bits = GUEST_PTR(bits, u16*);
-    if (!eventFlag || !bits)
+    uint32_t ea      = (uint32_t)(uintptr_t)eventFlag;
+    uint32_t bits_ea = (uint32_t)(uintptr_t)bits;
+    if (!ea || !bits_ea)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    if (!eventFlag->initialized)
-        return CELL_SPURS_TASK_ERROR_STAT;
-
-    EventFlagSync* sync = ef_sync_find(eventFlag);
+    EventFlagSync* sync = ef_sync_get(ea);
     if (!sync)
         return CELL_SPURS_TASK_ERROR_STAT;
 
-    u16 pattern = *bits;
+    u16 pattern = vm_read16(bits_ea);
 
     ef_lock(sync);
 
-    /* Block until the requested bit pattern is satisfied */
-    /* SPU-completion shim: the bits this wait expects are normally set by an SPU
-     * workload via cellSpursEventFlagSet. We don't execute SPU code, so after a
-     * short grace period with no signal we force-satisfy the pattern (as if the
-     * SPU finished) so the title's boot proceeds. Correct fix is SPU execution. */
-    unsigned timeouts = 0;
+    /* Block until the requested bit pattern is satisfied in the GUEST struct
+     * (BE events word at +0x00) — set by an SPU task (lifted code / taskset
+     * syscall) or another PPU thread. Poll-based: ef_wait_timed ticks re-read
+     * guest memory, so task-side PUTLLC stores are observed without needing
+     * the real lv2-event-queue notification path.
+     *
+     * A wait the SPU never satisfies is a REAL deadlock and must present as
+     * one — that is the signal naming the workload that is not executing.
+     * SPURS_EF_FORCE=1 restores the old fake for A/B comparison only. */
+    static int s_force = -1;
+    if (s_force < 0) s_force = getenv("SPURS_EF_FORCE") ? 1 : 0;
+    unsigned waits = 0;
+    u16 current;
     for (;;) {
-        u16 current = eventFlag->bits;
+        current = vm_read16(ea + EF_EVENTS);
 
         if (mode == CELL_SPURS_EVENT_FLAG_AND) {
             if ((current & pattern) == pattern)
@@ -890,18 +1102,34 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                 break;
         }
 
-        if (!ef_wait_timed(sync, 50) && ++timeouts >= 4) {
-            fprintf(stderr, "[cellSpurs] EventFlagWait: no SPU signal for pattern "
-                            "0x%04X -- force-satisfying (SPU not executed)\n", pattern);
-            eventFlag->bits |= pattern;
+        if (!ef_wait_timed(sync, 2)) {
+            /* Report the stall once per second, naming what would have to run. */
+            if (++waits % 500 == 0) {
+                static int _n = 0;
+                if (_n < 24) { _n++;
+                    fprintf(stderr, "[cellSpurs] EventFlagWait BLOCKED %us on pattern 0x%04X "
+                                    "(mode=%s, bits=0x%04X) flagEA=0x%08X -- waiting for an SPU "
+                                    "workload to cellSpursEventFlagSet it\n",
+                            waits / 500, pattern,
+                            mode == CELL_SPURS_EVENT_FLAG_AND ? "AND" : "OR",
+                            current, ea);
+                    fflush(stderr);
+                }
+            }
+            if (s_force && waits >= 1000) {
+                fprintf(stderr, "[cellSpurs] EventFlagWait: SPURS_EF_FORCE -- faking pattern "
+                                "0x%04X (NOT real; A/B only)\n", pattern);
+                vm_write16(ea + EF_EVENTS, (u16)(current | pattern));
+            }
         }
     }
 
-    *bits = eventFlag->bits;
-
-    /* Auto-clear if configured */
-    if (eventFlag->clearMode == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
-        eventFlag->bits &= ~pattern;
+    /* Hand back the observed bits; consume the received ones on AUTO clear. */
+    vm_write16(bits_ea, current);
+    u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
+                                                       : (u16)(current & pattern);
+    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
+        vm_write16(ea + EF_EVENTS, (u16)(current & ~received));
 
     ef_unlock(sync);
 
@@ -911,23 +1139,20 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
 s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
                               u32 mode)
 {
-    eventFlag = GUEST_PTR(eventFlag, CellSpursEventFlag*);
-    bits = GUEST_PTR(bits, u16*);
-    if (!eventFlag || !bits)
+    uint32_t ea      = (uint32_t)(uintptr_t)eventFlag;
+    uint32_t bits_ea = (uint32_t)(uintptr_t)bits;
+    if (!ea || !bits_ea)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    if (!eventFlag->initialized)
-        return CELL_SPURS_TASK_ERROR_STAT;
-
-    EventFlagSync* sync = ef_sync_find(eventFlag);
+    EventFlagSync* sync = ef_sync_get(ea);
     if (!sync)
         return CELL_SPURS_TASK_ERROR_STAT;
 
-    u16 pattern = *bits;
+    u16 pattern = vm_read16(bits_ea);
 
     ef_lock(sync);
 
-    u16 current = eventFlag->bits;
+    u16 current = vm_read16(ea + EF_EVENTS);
 
     if (mode == CELL_SPURS_EVENT_FLAG_AND) {
         if ((current & pattern) != pattern) {
@@ -941,10 +1166,11 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
         }
     }
 
-    *bits = current;
-
-    if (eventFlag->clearMode == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
-        eventFlag->bits &= ~pattern;
+    vm_write16(bits_ea, current);
+    u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
+                                                       : (u16)(current & pattern);
+    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
+        vm_write16(ea + EF_EVENTS, (u16)(current & ~received));
 
     ef_unlock(sync);
     return CELL_OK;
@@ -952,19 +1178,16 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
 
 s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
 {
-    eventFlag = GUEST_PTR(eventFlag, CellSpursEventFlag*);
-    if (!eventFlag)
+    uint32_t ea = (uint32_t)(uintptr_t)eventFlag;
+    if (!ea)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    if (!eventFlag->initialized)
-        return CELL_SPURS_TASK_ERROR_STAT;
-
-    EventFlagSync* sync = ef_sync_find(eventFlag);
+    EventFlagSync* sync = ef_sync_get(ea);
     if (!sync)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
-    eventFlag->bits &= ~bits;
+    vm_write16(ea + EF_EVENTS, (u16)(vm_read16(ea + EF_EVENTS) & ~bits));
     ef_unlock(sync);
 
     return CELL_OK;
@@ -973,12 +1196,12 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
 s32 cellSpursEventFlagGetDirection(CellSpursEventFlag* eventFlag,
                                    u32* direction)
 {
-    eventFlag = GUEST_PTR(eventFlag, CellSpursEventFlag*);
-    direction = GUEST_PTR(direction, u32*);
-    if (!eventFlag || !direction)
+    uint32_t ea     = (uint32_t)(uintptr_t)eventFlag;
+    uint32_t dir_ea = (uint32_t)(uintptr_t)direction;
+    if (!ea || !dir_ea)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    *direction = eventFlag->direction;
+    vm_write32(dir_ea, vm_read8(ea + EF_DIRECTION));
     return CELL_OK;
 }
 
