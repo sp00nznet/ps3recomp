@@ -201,6 +201,25 @@ homebrew TUI (cellmark), vkcube, wave, and a PSL1GHT/Tiny3D bring-up
 - **`sys_spu_image_import`** implemented (SPU ELF → entry point + segment table)
   and the SPU image syscall numbers corrected (#57).
 
+A **guest-ABI HLE correctness batch**, mostly surfaced by LBP and DeferredShading
+bring-ups (folded via `integrate/fold-2026-07-24`):
+- **Guest-EA / big-endian out-param marshalling** across the HLE surface — a run
+  of handlers were writing host pointers or native-endian values into what are
+  actually guest VM addresses: `cellUserInfo` (overflow), trophy u64s,
+  `cellGameGetParamInt` DISC type, open PSID, `cellRtc`, save-data user paths,
+  `cellJpgDecDecodeData`, `cellPngDec` (first live use, DeferredShading), and the
+  `cellAudio` read index as a BE u64.
+- **`cellFsSdataOpen` with real SDATA/EDAT (NPD) decryption**, `cellFsMkdir` + the
+  game-data dir created where the VFS actually looks, and a `/dev_hdd0` overlay
+  onto the installed-update tree (`PS3_HDD0_ROOT`).
+- **Honest state, not silently-faked CELL_OK** — a module name that matches no
+  file now fails; net reports a real offline state with real SDK NP error codes;
+  `sys_time_get_system_time` returns real microseconds instead of a call counter.
+- **Raw-`sys_fs` path parity** — strip mount prefixes so raw `sys_fs` opens hit
+  the same host tree as the cellFs layer; `cellHttpCreateClient` guest-EA
+  translation (fixed a boot crash); HLSL-safe NaN/Inf fragment-program constants;
+  `sys_spu_image_import` segment source EA at the correct offset.
+
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
 in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
