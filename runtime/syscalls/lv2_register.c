@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>   /* calloc, free */
+#include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
 #include "sys_ppu_thread.h"
 #include "sys_mutex.h"
@@ -98,6 +99,20 @@ static int64_t sys_tty_write(ppu_context* ctx)
                     }
                     fprintf(stderr, "\n"); fflush(stderr);
                 }
+            }
+        }
+        /* POOL CORRUPTION TRACE: when the game's debug allocator reports a bad
+         * block / wrong pool / zeroed sentinel, dump the host call chain (resolved
+         * to guest funcs) to find who passed/corrupted the block. */
+        if (len < 4096) {
+            char ptmp[256]; uint32_t pn = len < 255 ? len : 255;
+            memcpy(ptmp, vm_base + buf_ea, pn); ptmp[pn] = 0;
+            if (strstr(ptmp, "Pool possibly") || strstr(ptmp, "Bad signature") ||
+                strstr(ptmp, "double-deallocate") ||
+                strstr(ptmp, "out of memory on request")) {
+                extern void ppu_log_host_chain(const char*);
+                static int _pn = 0;
+                if (_pn++ < 3) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
             }
         }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
@@ -548,6 +563,9 @@ static DWORD WINAPI spu_fallback_thread_proc(LPVOID arg)
 static void* spu_fallback_thread_proc(void* arg)
 #endif
 {
+#ifdef _WIN32
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+#endif
     spu_thread_t* t = (spu_thread_t*)arg;
     int32_t rc = 0;
     if (t->fb_handler) {
@@ -1250,6 +1268,57 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
 
     fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -> entry=0x%05X nsegs=%d\n",
             img_ea, src_ea, entry, nsegs);
+    /* LBP_DUMP_IMPORT=<dir>: save each unique imported ELF (FMOD's runtime-
+     * materialized SPU overlay plugins) so they can be lifted + registered.
+     * Extent = max(p_off+p_fsz) over PT_LOADs, re-walked here cheaply. */
+    { const char* dd = getenv("LBP_DUMP_IMPORT");
+      if (dd && *dd) {
+          static uint32_t s_seen[16]; static int s_nseen = 0;
+          int dup = 0;
+          for (int k = 0; k < s_nseen; k++) if (s_seen[k] == src_ea) dup = 1;
+          if (!dup && s_nseen < 16) {
+              s_seen[s_nseen++] = src_ea;
+              uint32_t ext = 0x40;
+              for (uint16_t i2 = 0; i2 < phnum; i2++) {
+                  uint32_t ph2 = phoff + (uint32_t)i2 * phentsz;
+                  if (vm_read_be32(src_ea + ph2 + 0x00) != 1) continue;
+                  uint32_t end2 = vm_read_be32(src_ea + ph2 + 0x04) + vm_read_be32(src_ea + ph2 + 0x10);
+                  if (end2 > ext) ext = end2;
+              }
+              uint32_t shend = vm_read_be32(src_ea + 0x20) +
+                               (uint32_t)vm_read_be16(src_ea + 0x2E) * vm_read_be16(src_ea + 0x30);
+              if (shend > ext && shend < 0x400000) ext = shend;
+              char path[512];
+              snprintf(path, sizeof path, "%s/import_%08X.elf", dd, src_ea);
+              FILE* fo = fopen(path, "wb");
+              if (fo) { fwrite(vm_base + src_ea, 1, ext, fo); fclose(fo);
+                        fprintf(stderr, "[SPU] import dumped: %s (%u bytes)\n", path, ext); }
+          }
+      } }
+#ifdef _WIN32
+    /* LBP retries this import in a tight loop (134x observed) with no other
+     * syscall in between -- something it derives from the filled struct keeps
+     * it unsatisfied. Print the guest caller chain for the first few so the
+     * retry loop can be identified. */
+    { static int _bt_n = 0;
+      if (_bt_n++ < 3) {
+          /* Matches func_entry in the generated ppu_recomp.h. */
+          struct lv2_bt_fentry { uint64_t addr; void* func; const char* name; };
+          extern const struct lv2_bt_fentry function_table[];
+          extern const uint64_t function_table_count;
+          void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
+          char ln[800]; int p = snprintf(ln, sizeof ln, "[SPU]   import bt:");
+          for (int i = 0; i < fr; i++) {
+              uintptr_t t = (uintptr_t)bt[i]; uint32_t bg = 0; uintptr_t bh = 0;
+              for (uint64_t k = 0; k < function_table_count; k++) {
+                  uintptr_t h = (uintptr_t)function_table[k].func;
+                  if (h <= t && h > bh) { bh = h; bg = (uint32_t)function_table[k].addr; }
+              }
+              if (bg && (t - bh) < 0x14000) p += snprintf(ln + p, sizeof(ln) - p, " %08X", bg);
+          }
+          fprintf(stderr, "%s\n", ln);
+      } }
+#endif
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -1423,9 +1492,36 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
  * -----------------------------------------------------------------------*/
 lv2_syscall_table g_lv2_syscalls;
 
+/* Firmware imports that are ALSO lv2 syscalls.
+ *
+ * A title can reach these two ways: issue the raw `sc` (-> the syscall table
+ * above) or call the sysPrxForUser userland wrapper by NID (-> ps3_hle_call).
+ * LBP does the latter, and an unregistered NID falls to the unresolved-NID
+ * stub, which returns CELL_OK WITHOUT touching the caller's out-params -- so
+ * the caller reads its own uninitialised stack as the result. For
+ * sys_spu_image_import that means a garbage sys_spu_image {segs, nsegs}, and
+ * the caller (LBP func_00483498) then walks the bogus segment array until it
+ * runs off the end of memory: on hardware that segfaults immediately, but our
+ * demand-committed flat VM answers every stray read with a zero page, so it
+ * silently swept ~3 GB of address space and hung the boot.
+ *
+ * Bridge them onto the NID path so both entries hit the same implementation.
+ * The handlers already take the ppu_context and set gpr[3] themselves. */
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+
+#define LV2_HLE_BRIDGE(fn_name, handler)                                       static void fn_name(ppu_context* ctx) { (void)handler(ctx); }
+
+LV2_HLE_BRIDGE(hle_sys_spu_image_import, sys_spu_image_import_handler)
+LV2_HLE_BRIDGE(hle_sys_spu_image_open,   sys_spu_image_open_handler)
+
 void lv2_init_syscalls(void)
 {
     lv2_register_all_syscalls(&g_lv2_syscalls);
+
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spu_image_import"),
+                         "sys_spu_image_import", hle_sys_spu_image_import);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spu_image_open"),
+                         "sys_spu_image_open",   hle_sys_spu_image_open);
 }
 
 /* Returns 1 (and sets gpr[3] from the handler) if `num` is a registered

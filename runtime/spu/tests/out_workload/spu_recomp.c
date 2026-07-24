@@ -20,26 +20,26 @@ void spu_func_00000000(spu_context* ctx) {
         spu_wrch(ctx, MFC_Size, ctx->gpr[6]);
         spu_wrch(ctx, MFC_TagID, ctx->gpr[7]);
         spu_wrch(ctx, MFC_Cmd, ctx->gpr[8]);
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->gpr[13] = spu_mpya(ctx->gpr[96], ctx->gpr[123], ctx->gpr[87]);
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->gpr[87] = spu_mpya(ctx->gpr[96], ctx->gpr[123], ctx->gpr[13]);
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 }
 
 /* Function table */

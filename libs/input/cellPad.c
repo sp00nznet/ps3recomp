@@ -13,6 +13,7 @@
 #include <time.h>
 #include "cellPad.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -469,6 +470,19 @@ skip_inject: ;
     data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = (u16)(hs->buttons & 0xFF);
     data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = (u16)((hs->buttons >> 8) & 0xFF);
 
+    /* LBP_AUTOPRESS: headless bring-up input -- pulse CROSS then START every few
+     * seconds of polling so boot screens that wait for input advance without a
+     * human at the pad. Env-gated test scaffolding, off by default. */
+    { static int s_ap = -1; static unsigned s_apn = 0;
+      if (s_ap < 0) s_ap = getenv("LBP_AUTOPRESS") ? 1 : 0;
+      if (s_ap && port_no == 0) {
+          unsigned ph = s_apn++ % 240;
+          if (ph < 12)
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= 0x40;   /* CROSS */
+          else if (ph >= 120 && ph < 132)
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
+      } }
+
     /* Analog sticks */
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
@@ -587,6 +601,65 @@ s32 cellPadGetInfo2(CellPadInfo2* info_guest)
         for (unsigned int _o = 0; _o < sizeof(CellPadInfo2); _o += 4)
             vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o));
     }
+    return CELL_OK;
+}
+
+/* cellPadPeriphGetInfo -- the peripheral-class view of the pad ports (NID
+ * 0x4CC9B68D). LBP polls this during boot; leaving it unresolved returned
+ * CELL_OK with the caller's CellPadPeriphInfo left as uninitialised stack
+ * garbage, so the game read junk port_status/pclass_type for all 7 ports.
+ *
+ * Layout (SDK cell/pad/pad_codes.h) -- all u32, so the whole struct marshals
+ * big-endian in one sweep like cellPadGetInfo2:
+ *   max_connect, now_connect, system_info,
+ *   port_status[7], port_setting[7], device_capability[7],
+ *   device_type[7], pclass_type[7], pclass_profile[7]
+ * We report a standard DUALSHOCK-class pad (pclass_type STANDARD = 0, no
+ * profile bits) mirroring the ports cellPadGetInfo2 already reports. */
+s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (!info_guest)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+
+    pad_poll_backend();
+
+    CellPadPeriphInfo _in; CellPadPeriphInfo* info = &_in;
+    memset(info, 0, sizeof(CellPadPeriphInfo));
+    info->max_connect = s_max_connect;
+    info->system_info = 0;
+
+    u32 connected = 0;
+    for (u32 i = 0; i < s_max_connect && i < CELL_PAD_MAX_PORT_NUM; i++) {
+        /* Same virtual-pad-on-port-0 rule as cellPadGetInfo2, so both views of
+         * the ports agree (a game that cross-checks them must see one truth). */
+        if ((i < PAD_MAX_HOST_PORTS && s_host_state[i].connected) || i == 0) {
+            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED;
+            info->port_setting[i]      = s_port_setting[i];
+            info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
+                                       | CELL_PAD_CAPABILITY_PRESS_MODE
+                                       | CELL_PAD_CAPABILITY_SENSOR_MODE
+                                       | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
+                                       | CELL_PAD_CAPABILITY_ACTUATOR;
+            info->device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
+            info->pclass_type[i]       = CELL_PAD_PCLASS_TYPE_STANDARD;
+            info->pclass_profile[i]    = 0;
+            connected++;
+        } else {
+            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED;
+        }
+    }
+    info->now_connect = connected;
+
+    { unsigned int ea = (unsigned int)(uintptr_t)info_guest;
+      for (unsigned int _o = 0; _o < sizeof(CellPadPeriphInfo); _o += 4)
+          vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o)); }
+
+    { static int _n = 0;
+      if (_n++ < 2)
+          printf("[cellPad] PeriphGetInfo(max=%u now=%u) -> STANDARD class\n",
+                 info->max_connect, connected); }
     return CELL_OK;
 }
 

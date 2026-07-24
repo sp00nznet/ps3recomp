@@ -79,6 +79,64 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
 static inline void* ps3_GetModuleHandleA(const char* m){ return GetModuleHandleA(m); }
 
+/* An unresolved NID is a firmware import we never registered. Returning
+ * CELL_OK "so the game keeps going" is the single biggest source of
+ * days-long debugging in this project: the title reads back untouched
+ * out-params and proceeds on fabricated state, then deadlocks or crashes
+ * far from the actual gap. The unregistered mouse (a phantom device polled
+ * forever) and six whole modules whose names never matched a source file
+ * all reached the game this way.
+ *
+ * So: report every DISTINCT unresolved NID exactly once (not a global
+ * first-40 cap that hides everything after the 40th unique import), count
+ * how often each is hit, and make the fabricated return an explicit CHOICE
+ * rather than the silent default.
+ *
+ * The default stays CELL_OK, because faking is currently LOAD-BEARING: LBP
+ * calls cellFsSdataOpen (0xB1840B53, its encrypted data file) and cellHttpsInit
+ * (0x522180BC) during early boot and shuts down cleanly if either fails, so
+ * PS3_HLE_UNRESOLVED=fail dies at 144 log lines vs ~148,000. The days-long
+ * debugging was never caused by the fake per se -- it was caused by the fake
+ * being SILENT (a global first-40-line cap hid every import past the 40th). So
+ * the fix is visibility: report each DISTINCT unresolved NID once, with a hit
+ * count, always. `fail` remains available to A/B which missing import is
+ * load-bearing -- run it and read the two or three NIDs it reports.
+ *
+ *   PS3_HLE_UNRESOLVED = ok   (default): r3 = CELL_OK, reported once per NID.
+ *                        = fail: r3 = CELL_ERROR_ERROR, to find load-bearing
+ *                                imports (expect an early, clean shutdown).
+ */
+static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
+{
+    enum { CELL_ERROR_ERROR = (int)0x8001003Fu };  /* generic CELL failure */
+    static int s_fake = -1;
+    if (s_fake < 0) {
+        const char* m = getenv("PS3_HLE_UNRESOLVED");
+        s_fake = (m && (m[0]=='f' || m[0]=='F')) ? 0 : 1;   /* "fail" -> error, else fake */
+    }
+    /* First-seen set: report each NID once, then count silently. Linear scan
+     * over a small array -- the count of DISTINCT unresolved NIDs a title hits
+     * is tens, not thousands (the log-flooders are all the SAME NID). */
+    static uint32_t seen[512];
+    static uint32_t hits[512];
+    static uint32_t n_seen = 0;
+    uint32_t i = 0;
+    for (; i < n_seen; i++) if (seen[i] == nid) break;
+    if (i == n_seen && n_seen < 512) { seen[n_seen] = nid; hits[n_seen] = 0; n_seen++; }
+    uint32_t count = (i < 512) ? ++hits[i] : 0;
+    (void)count;
+    if (count == 1)
+        fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> faking %s "
+                        "(unregistered import%s)\n",
+                nid, s_fake ? "CELL_OK" : "CELL_ERROR_ERROR",
+                s_fake ? "; PS3_HLE_UNRESOLVED=fail to find load-bearing ones"
+                       : "");
+
+    ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
+}
+
+extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
@@ -110,6 +168,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
         return;
     }
+    /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
+    ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     g_last_hle_nid = nid;
     /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
     { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;
@@ -180,8 +240,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { static int tr=-1; if(tr<0){const char*e=getenv("FLOW_HLETRACE"); tr=e?1:0;}
       if(tr) fprintf(stderr,"[hletrace] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
           nid,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); }
-    /* sys_process_exit (abort path): dump the guest back-chain so we see WHO aborted. */
-    if (nid == 0xE6F2C1E7u && getenv("FLOW_EXITCHAIN")) {
+    /* sys_process_exit (abort path): dump the guest back-chain so we see WHO aborted.
+     * Always-on for a NONZERO exit code (error/abort) -- the rare loader-thread
+     * abort in LBP is a race we can't reliably reproduce, so capture it whenever
+     * it fires. Clean code=0 exits (normal shutdown) stay quiet. */
+    if (nid == 0xE6F2C1E7u && ((uint32_t)ctx->gpr[3] != 0 || getenv("FLOW_EXITCHAIN"))) {
         uint32_t sp = (uint32_t)ctx->gpr[1];
         fprintf(stderr, "[exit-chain] code=0x%X lr=0x%08X sp=0x%08X\n", (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, sp);
         /* Scan the guest stack for words in the lifted code range — saved return

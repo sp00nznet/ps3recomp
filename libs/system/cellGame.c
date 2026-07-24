@@ -45,6 +45,15 @@ static char s_exit_param[256] = "";
 static int  s_boot_checked = 0;
 static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;
 
+/* Current content-check session. BootCheck/DataCheck open a session naming
+ * some content; ContentPermit reports THAT content's paths and closes it.
+ * Disc sessions must yield /dev_bdvd/PS3_GAME -- always returning the
+ * game-data dir sent LBP hunting for data.farc on /dev_hdd0 (ENOENT), so
+ * every resource load failed and the loader stalled polling its completion
+ * semaphore forever. */
+static int  s_check_is_disc = 1;
+static char s_check_dir[64] = "";
+
 static void ensure_dirs(const char* path)
 {
     char tmp[CELL_GAME_PATH_MAX];
@@ -232,40 +241,54 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     }
 
     s_boot_checked = 1;
+    /* Open a check session for the BOOT content (disc titles boot from
+     * /dev_bdvd, not from the game-data dir). */
+    s_check_is_disc = (s_game_type == CELL_GAME_GAMETYPE_DISC);
+    strncpy(s_check_dir, s_title_id, sizeof(s_check_dir) - 1);
+    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
     printf("[cellGame] BootCheck: type=%u, titleId='%s'\n", s_game_type, s_title_id);
     return CELL_OK;
 }
 
 s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
 {
-    printf("[cellGame] ContentPermit()\n");
+    printf("[cellGame] ContentPermit() -> %s\n",
+           s_check_is_disc ? "/dev_bdvd/PS3_GAME" : "game-data dir");
 
-    /* Ensure directories exist. IMPORTANT: also create them at the SAME host
-     * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
-     * i.e. $ppu_vfs_root/game/<title>/. cellGame historically only created
-     * ./gamedata/dev_hdd0/game/... which cellFs never looks at, so a game that
-     * polls cellFsStat for its game-data USRDIR (LBP's boot bringup stage) stalls
-     * forever and exits. Create it where cellFs will actually find it. */
-    ensure_dirs(s_content_info_path);
-    ensure_dirs(s_usrdir_path);
-    {
-        extern const char* ppu_vfs_root;
-        char vpath[CELL_GAME_PATH_MAX];
-        snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_title_id);
-        ensure_dirs(vpath);
+    if (!s_check_is_disc) {
+        /* Ensure directories exist. IMPORTANT: also create them at the SAME host
+         * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
+         * i.e. $ppu_vfs_root/game/<title>/. cellGame historically only created
+         * ./gamedata/dev_hdd0/game/... which cellFs never looks at, so a game that
+         * polls cellFsStat for its game-data USRDIR (LBP's boot bringup stage) stalls
+         * forever and exits. Create it where cellFs will actually find it. */
+        ensure_dirs(s_content_info_path);
+        ensure_dirs(s_usrdir_path);
+        {
+            extern const char* ppu_vfs_root;
+            char vpath[CELL_GAME_PATH_MAX];
+            snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_check_dir);
+            ensure_dirs(vpath);
+        }
     }
 
     /* Both paths are GUEST addresses; format into a host temp, copy into the
-     * guest buffer through vm_base (a raw snprintf to the guest addr faults). */
+     * guest buffer through vm_base (a raw snprintf to the guest addr faults).
+     * The paths must match the content the current session checked: the disc
+     * for BootCheck/DataCheck(DISC), the game-data dir otherwise. */
     char tmp[CELL_GAME_PATH_MAX];
     uint32_t cip_ea = (uint32_t)(uintptr_t)contentInfoPath;
     uint32_t usr_ea = (uint32_t)(uintptr_t)usrdirPath;
     if (cip_ea) {
-        int n = snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s", s_title_id);
+        int n = s_check_is_disc
+              ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME")
+              : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s", s_check_dir);
         memcpy(vm_base + cip_ea, tmp, (size_t)n + 1);
     }
     if (usr_ea) {
-        int n = snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s/USRDIR", s_title_id);
+        int n = s_check_is_disc
+              ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME/USRDIR")
+              : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s/USRDIR", s_check_dir);
         memcpy(vm_base + usr_ea, tmp, (size_t)n + 1);
     }
 
@@ -280,6 +303,12 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     uint32_t dir_ea = (uint32_t)(uintptr_t)dirName;   /* guest addr */
     const char* check_dir = dir_ea ? (const char*)(vm_base + dir_ea) : s_title_id;
     printf("[cellGame] DataCheck(type=%u, dir='%s')\n", type, check_dir);
+
+    /* Open a check session for this content; the next ContentPermit reports
+     * its paths (disc -> /dev_bdvd/PS3_GAME, else the game-data dir). */
+    s_check_is_disc = (type == CELL_GAME_GAMETYPE_DISC);
+    strncpy(s_check_dir, check_dir, sizeof(s_check_dir) - 1);
+    s_check_dir[sizeof(s_check_dir) - 1] = '\0';
 
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", s_content_path, check_dir);

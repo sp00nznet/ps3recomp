@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
@@ -203,9 +204,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* YDKJ_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
-    fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
-            queue_id, (unsigned long long)timeout_us,
-            (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+    if (ps3_log_verbose())
+        fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
+                queue_id, (unsigned long long)timeout_us,
+                (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
 
     /* YDKJ_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
      * exact game function the main thread is stuck polling in the flip loop. */

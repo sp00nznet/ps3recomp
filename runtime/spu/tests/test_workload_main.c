@@ -45,6 +45,12 @@ static uint32_t be32(const uint8_t* p) {
            ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
 }
 
+/* diagnostics externs referenced from spu_dma.h in the full runtime */
+int g_cri_video_dma = 0;
+/* stop/halt hooks required by current lifter output */
+void spu_stop(spu_context* ctx) { (void)ctx; }
+void spu_halt(spu_context* ctx) { (void)ctx; }
+
 int main(void) {
     mfc_engine_init(&g_mfc);
     int ok = 1;

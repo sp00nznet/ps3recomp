@@ -19,7 +19,7 @@ void spu_func_00000000(spu_context* ctx) {
         ctx->gpr[9] = spu_il(0);
         ctx->gpr[10] = spu_ls_read128(ctx, ctx->gpr[9]._u32[0] + 0x100);
         spu_wrch(ctx, SPU_WrOutMbox, ctx->gpr[10]);
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 }
 
 /* Function table */

@@ -167,6 +167,56 @@ extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->pu
 extern "C" unsigned cellGcm_flip_request_count(void);
 extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
 
+/* ---- Guest-PC sampling profiler (PS3_GUEST_PROF=1) -----------------------
+ * Samples every guest thread's ctx.cia every ~5ms and dumps the top sites
+ * every 5s. cia is refreshed at every syscall, and guest spin loops issue a
+ * syscall per iteration (yield/usleep), so a thread stuck in a wait loop
+ * shows its loop's PC dominating the histogram. This is the tool that
+ * answers "where does thread X spend its wall time" without a debugger. */
+#include "../../syscalls/sys_ppu_thread.h"
+static DWORD WINAPI guest_prof_thread(LPVOID)
+{
+    struct Site { uint32_t tid, cia; uint32_t hits; };
+    static Site sites[256];
+    int nsites = 0;
+    ULONGLONG t0 = GetTickCount64();
+    unsigned total = 0;
+    for (;;) {
+        Sleep(5);
+        for (int i = 0; i < PPU_THREAD_MAX; i++) {
+            ppu_thread_info* t = &g_ppu_threads[i];
+            if (t->state != 1 /*RUNNING-ish; harmless if enum differs*/ && t->state != 2) continue;
+            uint32_t cia = (uint32_t)t->ctx.cia;
+            if (!cia) continue;
+            uint32_t tid = (uint32_t)(i + 1);
+            total++;
+            int f = -1;
+            for (int k = 0; k < nsites; k++)
+                if (sites[k].tid == tid && sites[k].cia == cia) { f = k; break; }
+            if (f < 0 && nsites < 256) { f = nsites++; sites[f].tid = tid; sites[f].cia = cia; sites[f].hits = 0; }
+            if (f >= 0) sites[f].hits++;
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now - t0 >= 5000) {
+            /* top 10 by hits */
+            fprintf(stderr, "[gprof] %u samples/5s; top sites:\n", total);
+            for (int rank = 0; rank < 10; rank++) {
+                int best = -1; uint32_t bh = 0;
+                for (int k = 0; k < nsites; k++)
+                    if (sites[k].hits > bh) { bh = sites[k].hits; best = k; }
+                if (best < 0 || bh == 0) break;
+                fprintf(stderr, "[gprof]   tid=%-3u cia=0x%08X  %5.1f%%  (%s)\n",
+                        sites[best].tid, sites[best].cia,
+                        100.0 * sites[best].hits / (total ? total : 1),
+                        g_ppu_threads[sites[best].tid - 1].name);
+                sites[best].hits = 0;   /* consume */
+            }
+            fflush(stderr);
+            nsites = 0; total = 0; t0 = now;
+        }
+    }
+}
+
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     const char* _title = getenv("PS3_TITLE");
@@ -308,10 +358,17 @@ static void dump_threads(const char* label, HMODULE self)
                 {
                     uint64_t* sp = (uint64_t*)ctx.Rsp;
                     /* Bound the scan to the committed stack region so we never read
-                     * past the guard page (VirtualQuery gives this region's end). */
+                     * past the guard page. If the query fails or the region is not
+                     * committed+readable (thread mid-create, guard page, garbage
+                     * Rsp), skip the scan entirely -- a diagnostic AV here gets
+                     * caught by the crash filter and kills the whole run. */
                     MEMORY_BASIC_INFORMATION mbi;
-                    uint64_t region_end = (uint64_t)sp + 0x8000;
-                    if (VirtualQuery((LPCVOID)sp, &mbi, sizeof mbi))
+                    uint64_t region_end = (uint64_t)sp;
+                    if (VirtualQuery((LPCVOID)sp, &mbi, sizeof mbi) &&
+                        mbi.State == MEM_COMMIT &&
+                        !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                        (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
                         region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
                     int maxk = (int)((region_end - (uint64_t)sp) / 8);
                     if (maxk > 0x20000 / 8) maxk = 0x20000 / 8;
@@ -371,6 +428,30 @@ static DWORD WINAPI hang_watchdog(LPVOID)
  * crashing the process (essential now that the recompiled engine runs deep and
  * worker threads touch incomplete state). Out-of-arena faults fall through to
  * the crash reporter. */
+/* Guard-page-violation reporter: STATUS_GUARD_PAGE_VIOLATION (0x80000001)
+ * bypasses every ACCESS_VIOLATION-only handler and kills the process SILENTLY
+ * (observed the moment the Bink SPU decoder first really ran). Log full context
+ * before letting the chain continue. */
+static LONG WINAPI guard_report_veh(EXCEPTION_POINTERS* ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == 0x80000001u /*STATUS_GUARD_PAGE_VIOLATION*/) {
+        static LONG s_n = 0;
+        if (InterlockedIncrement(&s_n) <= 8) {
+            char* mbase = (char*)GetModuleHandleA(NULL);
+            fprintf(stderr, "\n[GUARDVIOLATION] tid=%lu %s fault=0x%llX rip-rva=0x%llX\n",
+                    GetCurrentThreadId(),
+                    ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+                    (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1],
+                    (unsigned long long)((char*)ep->ExceptionRecord->ExceptionAddress - mbase));
+            void* fr[24]; USHORT n = RtlCaptureStackBackTrace(0, 24, fr, NULL);
+            fprintf(stderr, "[GUARDVIOLATION] bt-rva:");
+            for (USHORT i = 0; i < n; i++)
+                fprintf(stderr, " %llX", (unsigned long long)((char*)fr[i] - mbase));
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -420,6 +501,7 @@ int main(int argc, char** argv)
      * buffer's offset incorrectly. */
 #ifdef _WIN32
     /* Reserve the full 4 GB guest space; pages commit on first touch via the VEH. */
+    AddVectoredExceptionHandler(1, guard_report_veh);  /* diagnose 0x80000001 silent deaths */
     AddVectoredExceptionHandler(1, vm_commit_veh);
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
@@ -454,6 +536,8 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
     CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
+    if (getenv("PS3_GUEST_PROF"))
+        CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);

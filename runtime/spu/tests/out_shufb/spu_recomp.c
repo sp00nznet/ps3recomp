@@ -7,9 +7,9 @@ void spu_func_00000000(spu_context* ctx) {
         ctx->gpr[3] = spu_il(32767);
         ctx->gpr[4] = spu_il(32766);
         ctx->gpr[5] = spu_ilh(0xC0E0);
-        ctx->gpr[6] = spu_shufb(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5]);
+        ctx->gpr[5] = spu_selb(ctx->gpr[3], ctx->gpr[4], ctx->gpr[6]);
         spu_wrch(ctx, SPU_WrOutMbox, ctx->gpr[6]);
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return;
+        ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 }
 
 /* Function table */

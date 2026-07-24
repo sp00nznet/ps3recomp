@@ -244,11 +244,12 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
          *   [15:8]  stride (bytes between consecutive elements)
          *   [16]    enable
          */
-        attr->type    = data & 0xF;
-        attr->size    = (data >> 4) & 0xF;
-        attr->stride  = (data >> 8) & 0xFF;
-        attr->enabled = (attr->type != 0); /* type 0 = disabled */
-        attr->format  = data;
+        attr->type      = data & 0xF;
+        attr->size      = (data >> 4) & 0xF;
+        attr->stride    = (data >> 8) & 0xFF;
+        attr->frequency = (data >> 16) & 0xFFFF;   /* instancing divisor */
+        attr->enabled   = (attr->type != 0); /* type 0 = disabled */
+        attr->format    = data;
         state->vertex_dirty = 1;
         return 0;
     }
@@ -280,6 +281,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * into the GCM label window @0x03000000); NV4097_BACK_END_WRITE_SEMAPHORE_
      * RELEASE(0x1D70)=value. Also NV406E semaphore release (0x0010 offset/0x0014
      * value) for the sub-channel path. */
+    /* NV4097_SET_FREQUENCY_DIVIDER_OPERATION: per-attribute modulo/divide mask
+     * for the frequency divisor (instancing). Captured for read_vp_vertex. */
+    if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
+
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if (method == 0x1D70) {
@@ -519,6 +524,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
+        { static int _n=0; if (getenv("LOAD_DBG") && _n++ < 200)
+            fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
         state->transform_constant_load = data;
         return 0;
     }
@@ -539,8 +546,12 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             float f;
             memcpy(&f, &data, 4);
             { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
-              static int _n=0; if(_en && _n++<64) fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); }
+              static int _n=0;
+              int _hit = _en && (getenv("TCONST_ALL") ? (_n<64) : (slot>=12 && slot<=30 && _n<400));
+              if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
             state->vertex_constants[slot][lane] = f;
+            { static int _sq=0; if (getenv("SEQ_DBG") && slot==256 && lane==0 && _sq++ < 500)
+                fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;
                 state->vertex_constants_hi = slot;
@@ -609,6 +620,24 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
         { static int _d=0; if (_d++ < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
+        { static int _sq=0; if (getenv("SEQ_DBG") && _sq++ < 500)
+            fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
+                    state->surface_color_offset[0], state->vertex_constants[256][0],
+                    state->vertex_constants[257][1]); }
+        /* MVPDBG: dump every non-zero vertex-constant slot the FIRST time a
+         * G-buffer draw (surf0=0xCC0000) is dispatched -- the true MVP the GPU
+         * will use, read live (no snapshot/parity indirection). */
+        if (getenv("MVPDBG") && state->surface_color_offset[0] == 0xCC0000) {
+            static int _once = 0;
+            if (!_once) { _once = 1;
+                for (int s = 0; s < RSX_MAX_VERTEX_CONSTANTS; s++) {
+                    float* v = state->vertex_constants[s];
+                    if (v[0]||v[1]||v[2]||v[3])
+                        fprintf(stderr, "[MVP] c[%3d] = %10.4f %10.4f %10.4f %10.4f\n",
+                                s, v[0], v[1], v[2], v[3]);
+                }
+            }
+        }
         if (s_backend && s_backend->draw_arrays)
             s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
         return 0;

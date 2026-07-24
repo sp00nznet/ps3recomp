@@ -41,11 +41,43 @@ def scan(c_path):
     return out
 
 
+def discover_all():
+    """Every PRX-style HLE module compiled into the runtime lib.
+
+    The registration table must cover EVERY library the runtime implements:
+    an unregistered import silently fakes CELL_OK (see the note below), and a
+    hand-passed module list is the single point where a whole library gets
+    dropped by accident -- exactly what happened when gen/ppu_hle_nids.cpp was
+    regenerated with only cellFs/cellGcmSys/cellSysmodule and LBP then called
+    cellSysutilCheckCallback unregistered, faked it, and diverged at boot. So
+    `--all` is the canonical invocation; discover the same dirs CMakeLists.txt
+    globs into ps3recomp_runtime, and take the cell*/sce*/sys* file names."""
+    dirs = ["system", "filesystem", "input", "audio", "video", "network",
+            "spurs", "sync", "codec", "font", "misc", "hardware"]
+    names = set()
+    for d in dirs:
+        for p in glob.glob(os.path.join(ROOT, "libs", d, "*.c")):
+            n = os.path.splitext(os.path.basename(p))[0]
+            if re.match(r"^(cell|sce|sys)", n) and not re.match(r"^(test_|validate_)", n):
+                names.add(n)
+    return sorted(names)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("libs", nargs="+")
+    ap.add_argument("libs", nargs="*",
+                    help="Module (file) names to register; omit with --all.")
+    ap.add_argument("--all", action="store_true",
+                    help="Register EVERY PRX module compiled into the runtime "
+                         "(the canonical invocation -- can't silently drop a "
+                         "library the way a hand-typed list can).")
     ap.add_argument("--out", default="ppu_hle_nids.cpp")
     args = ap.parse_args()
+
+    if args.all:
+        args.libs = discover_all() + list(args.libs)
+    if not args.libs:
+        ap.error("no modules given; pass module names or --all")
 
     regs, seen, nlibs, missing = [], set(), 0, []
     for lib in args.libs:

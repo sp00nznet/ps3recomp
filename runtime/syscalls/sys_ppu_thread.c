@@ -2,6 +2,7 @@
  * ps3recomp - PPU thread management syscalls (implementation)
  */
 
+#include <stddef.h>
 #include "sys_ppu_thread.h"
 #include <string.h>
 #include <stdio.h>
@@ -79,6 +80,11 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
 
+    /* Register this thread's context for lwarx/stwcx cross-thread reservation
+     * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
+     * reservation and prevents ABA corruption of the guest's lock-free lists. */
+    { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX\n",
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr);
@@ -144,6 +150,39 @@ void ydkj_release_pending_threads(void) {}
 #endif
 
 /* ---------------------------------------------------------------------------
+
+ * Main-thread registration. The main guest thread used to run with
+ * thread_id 0 -- an id every owner-tracking primitive treated specially:
+ * sys_lwmutex mapped 0 to owner id 1 (COLLIDING with the first created
+ * thread, so main and that thread mutually satisfied each other's recursive
+ * re-lock check and both "owned" the lock -- LBP: main + "bringup" emitted
+ * GCM concurrently and fences vanished), and sys_mutex uses owner_tid==0 as
+ * its FREE marker (a mutex held by main read as free). Claim slot 0 (id 1)
+ * for main before any sys_ppu_thread_create so every thread has a unique
+ * nonzero id and the special cases die.
+ * -----------------------------------------------------------------------*/
+uint64_t ppu_thread_register_main(void)
+{
+    table_lock();
+    ppu_thread_info* t = &g_ppu_threads[0];
+    if (t->state == PPU_THREAD_STATE_FREE) {
+        memset(t, 0, sizeof(*t));
+        t->ctx.thread_id = 1;
+        t->state    = PPU_THREAD_STATE_RUNNING;
+        t->joinable = 0;                    /* nobody joins the main thread */
+        strncpy(t->name, "main", sizeof(t->name) - 1);
+#ifdef _WIN32
+        t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+#else
+        pthread_mutex_init(&t->finish_mutex, NULL);
+        pthread_cond_init(&t->finish_cond, NULL);
+#endif
+    }
+    table_unlock();
+    return 1;
+}
+
+/* ---------------------------------------------------------------------------
  * sys_ppu_thread_create
  *
  * r3 = pointer to receive thread ID (u64*)
@@ -154,6 +193,73 @@ void ydkj_release_pending_threads(void) {}
  * r8 = flags
  * r9 = thread name pointer
  * -----------------------------------------------------------------------*/
+
+/* CPU-time accessor for the lwmutex convoy trace: user+kernel CPU consumed by
+ * guest thread `tid`'s HOST thread, in microseconds. Distinguishes a lock
+ * holder that is CPU-BOUND in recompiled code (cpu delta ~= wall delta) from
+ * one BLOCKED in a wait (cpu delta ~= 0). Returns 0 if unknown. */
+unsigned long long ppu_thread_cpu_us(unsigned tid)
+{
+#ifdef _WIN32
+    if (tid < 2 || tid > PPU_THREAD_MAX) return 0;   /* main (tid 1) not in table */
+    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+    if (t->state == PPU_THREAD_STATE_FREE || !t->host_thread) return 0;
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(t->host_thread, &c, &e, &k, &u)) return 0;
+    ULARGE_INTEGER ku, uu;
+    ku.LowPart = k.dwLowDateTime; ku.HighPart = k.dwHighDateTime;
+    uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+    return (ku.QuadPart + uu.QuadPart) / 10ull;      /* 100ns -> us */
+#else
+    (void)tid; return 0;
+#endif
+}
+/* Last syscall/HLE callsite of guest thread `tid` (see prof_pc). */
+unsigned ppu_thread_prof_pc(unsigned tid)
+{
+    if (tid < 2 || tid > PPU_THREAD_MAX) return 0;
+    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+    if (t->state == PPU_THREAD_STATE_FREE) return 0;
+    return t->prof_pc;
+}
+
+/* Profiler accessor: snapshot slot idx (0-based). Returns 1 if the slot holds
+ * a live thread, filling tid/cia/name. Lets a host-side sampling profiler
+ * iterate guest threads without depending on ppu_thread_info's layout. */
+static unsigned s_prof_main_pc = 0;   /* main guest thread: ctx lives outside the table */
+
+int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
+{
+    if (idx < 0 || idx >= PPU_THREAD_MAX) return 0;
+    ppu_thread_info* t = &g_ppu_threads[idx];
+    if (idx == 0 && t->state == PPU_THREAD_STATE_FREE) {
+        /* slot 0 stays FREE (the main thread never registers) -- serve its
+         * dispatcher breadcrumb here so the profiler sees tid 1. */
+        *tid = 1; *cia = s_prof_main_pc; *name = "main";
+        return s_prof_main_pc != 0;
+    }
+    if (t->state == PPU_THREAD_STATE_FREE) return 0;
+    *tid  = (unsigned)(idx + 1);
+    *cia  = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    *name = t->name;
+    return 1;
+}
+
+/* Called from the lv2/HLE dispatchers with the guest ctx (== &info->ctx). */
+void ppu_prof_stamp(void* vctx, unsigned lr)
+{
+    /* container-of: every dispatched ctx is embedded in its ppu_thread_info */
+    char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
+    ppu_thread_info* t = (ppu_thread_info*)p;
+    int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
+    if (!in_range) { s_prof_main_pc = lr; return; }
+    { static int _n = 0; if (_n++ < 0)
+        fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
+                vctx, (void*)g_ppu_threads, in_range, lr); }
+    if (in_range)
+        t->prof_pc = lr;
+}
+
 int64_t sys_ppu_thread_create(ppu_context* ctx)
 {
     uint32_t tid_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -237,8 +343,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
-            t->name, (unsigned long long)entry, (unsigned long long)arg,
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+            (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
             stack_size, priority);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null

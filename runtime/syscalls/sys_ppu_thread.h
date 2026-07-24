@@ -51,6 +51,7 @@ typedef struct ppu_thread_info {
     uint32_t     stack_size;
     uint64_t     entry_addr;   /* guest entry point */
     uint64_t     tls_addr;
+    uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
 
 #ifdef _WIN32
     HANDLE       host_thread;
@@ -83,6 +84,11 @@ extern ppu_thread_entry_fn g_ppu_thread_entry_trampoline;
  * Syscall handlers
  * -----------------------------------------------------------------------*/
 int64_t sys_ppu_thread_create(ppu_context* ctx);
+
+/* Claim thread-table slot 0 (id 1) for the main guest thread; returns the id.
+ * Call before the first sys_ppu_thread_create so no created thread aliases
+ * main (thread_id 0 broke every owner-tracking sync primitive). */
+uint64_t ppu_thread_register_main(void);
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

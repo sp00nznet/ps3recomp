@@ -90,8 +90,22 @@ extern "C" {
 
 /* Indirect branch dispatch (bi/bisl/bid...): PC has been set to the target
  * local-store address; the runtime resolves it to the matching lifted
- * function and continues execution. Implemented by the SPU program glue. */
+ * function and continues execution. Implemented by the SPU program glue.
+ *
+ * The full resolver lives in the (MSVC-built) runtime lib, where musttail is
+ * unavailable -- its dispatch is a plain call, so guest loops that iterate
+ * through a computed jump leak a resolver frame per iteration. Title builds
+ * that compile their lifted sources with clang should provide the thin
+ * musttail fast path spu_indirect_branch_mt (see lbp/spu_dispatch_mt.c) and
+ * define SPU_USE_DISPATCH_MT for the lifted TUs; dispatch sites below go
+ * through SPU_IB_DISPATCH so the choice is a compile-time switch. */
 void spu_indirect_branch(spu_context* ctx);
+void spu_indirect_branch_mt(spu_context* ctx);
+#ifdef SPU_USE_DISPATCH_MT
+#  define SPU_IB_DISPATCH spu_indirect_branch_mt
+#else
+#  define SPU_IB_DISPATCH spu_indirect_branch
+#endif
 
 /* stop/stopd hook (YDKJ): the runtime inspects the stop code, may deliver a
  * stop-and-signal event to the PPU (SPURS bring-up handshake), and longjmps the
@@ -158,7 +172,15 @@ def _imm(token: str) -> str:
     try:
         return str(int(token))
     except ValueError:
-        return token
+        pass
+    # An immediate-form instruction whose imm operand disassembled to a register
+    # token ($rN) only happens when a data region is mis-decoded as code (e.g. a
+    # CRC/constant table the function-boundary detector over-included). The code
+    # is unreachable; emit a valid C constant from the field value so it compiles.
+    m = re.match(r"\$r(\d+)$", token)
+    if m:
+        return m.group(1)
+    return "0"
 
 
 def _chan(token: str) -> str:
@@ -223,6 +245,21 @@ def _dest_reg(insn) -> int:
     return insn.raw & 0x7F
 
 
+def _is_identity_move(insn) -> bool:
+    """`ai $rX,$rX,0` / `ori $rX,$rX,0` -- writes rX but preserves its value.
+
+    Sony's interrupt-window idiom needs a real instruction slot between the
+    `bie` that enables interrupts and the `bid` that disables them again (that
+    is the window a pending interrupt fires in), and uses `ai $r0,$r0,0` for it.
+    A nearest-writer scan must look straight through it: it "writes" r0 without
+    changing it, so the classification depends on whatever wrote r0 before.
+    """
+    if insn.mnemonic not in ("ai", "ori"):
+        return False
+    ops = _ops(insn.operands)
+    return len(ops) == 3 and ops[0] == ops[1] and ops[2].strip() in ("0", "0x0")
+
+
 def compute_bi_r0_jumps(insns, bounds) -> set:
     """`bi $r0` (and conditional `biz/binz $r0`) is normally a function RETURN
     (r0 = link register). But Sony's SPU code also uses it as a COMPUTED TAIL
@@ -232,23 +269,178 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     the launch fall through and the taskset dispatcher loop forever (same bug
     class as the brsl mislifts). Detect it: within each function, a `bi $r0`
     is a computed jump iff the NEAREST preceding write to r0 is an ABSOLUTE
-    load (lqa/lqr). A genuine return restores the link via a register/stack
-    load (lqd/lqx) or never rewrites r0 -- those stay returns. Returns the
-    set of such bi addrs."""
+    load (lqa/lqr) or an IMMEDIATE load (il/ila). A genuine return restores the
+    link via a register/stack load (lqd/lqx) or never rewrites r0 -- those stay
+    returns. Returns the set of such bi addrs.
+
+    The il/ila case is the interrupt-window idiom: `bid $r0` (branch indirect
+    and disable interrupts -- we decode it as plain `bi $r0`, since the D/E bits
+    only gate interrupts and the branch is identical) after `ila $r0, <resume>`
+    JUMPS to the resume address; it does not return. Mislifting it as `return;`
+    unwinds to the caller and silently skips everything after the window. Found
+    in LBP's wwsjob SPURS policy module at 0x2D3C, where the sequence
+    `ila $r0,0x2D40 / ila $r2,0x2D38 / bie $r2 / ai $r0,$r0,0 / bid $r0` opens a
+    one-instruction window for a pending interrupt and resumes at 0x2D40."""
     jumps = set()
+    ordered = sorted(insns, key=lambda x: x.addr)
+    idx_of = {ins.addr: i for i, ins in enumerate(ordered)}
+
+    def _writes_r0(w):
+        return w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == 0
+
     for (s, e) in bounds:
-        fn = sorted((i for i in insns if s <= i.addr < e), key=lambda x: x.addr)
+        fn = [i for i in ordered if s <= i.addr < e]
         for idx, insn in enumerate(fn):
             if _bi_target_reg(insn) != "0":
                 continue
-            # backward scan for the nearest instruction that writes r0
+            # backward scan for the nearest instruction that writes r0.
+            # STOP at any unconditional flow break (bi/br/bra/iret/stop): code
+            # above it belongs to a DIFFERENT basic block -- when function
+            # bounds are coarse (extra seed entries shift the partition), the
+            # scan otherwise crosses into the preceding function's tail and a
+            # stray `lqa $r0` there flips a genuine return into a computed
+            # jump (observed: pm_wwsjob 0x3570's `bi $r0` vs the `lqa $r0 ;
+            # bi $r78` ending the function above it).
+            decided = False
+            only_identity = False
             for j in range(idx - 1, -1, -1):
                 w = fn[j]
-                if w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == 0:
-                    if w.mnemonic in ("lqa", "lqr"):
-                        jumps.add(insn.addr)
-                    break  # nearest r0 writer found; classification decided
+                if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                    break                  # block boundary: r0 is a live-in here
+                if not _writes_r0(w):
+                    continue
+                if _is_identity_move(w):
+                    only_identity = True   # preserves r0; keep looking
+                    continue
+                if w.mnemonic in ("lqa", "lqr", "il", "ila"):
+                    jumps.add(insn.addr)
+                decided = True
+                break  # nearest real r0 writer found; classification decided
+            if decided or not only_identity:
+                continue
+            # The ONLY r0 write in this function was an identity move, so r0 was
+            # set by the predecessor block. That is the interrupt-window idiom:
+            # `bie $rN` branches here, making this a function of its own, and the
+            # matching `ila $r0,<resume>` sits a few instructions back in LINEAR
+            # order (outside these bounds). Follow it, bounded, so `bid $r0`
+            # jumps to the resume address instead of unwinding to the caller.
+            # Gated on only_identity so a normal `brsl`-called function -- whose
+            # `bi $r0` genuinely returns and never touches r0 -- can never reach
+            # this scan and be misread as a jump.
+            g = idx_of[insn.addr]
+            for j in range(g - 1, max(-1, g - 1 - 12), -1):
+                w = ordered[j]
+                if not _writes_r0(w) or _is_identity_move(w):
+                    continue
+                if w.mnemonic in ("il", "ila"):
+                    jumps.add(insn.addr)
+                break
     return jumps
+
+
+def compute_link_returns(insns, bounds) -> set:
+    """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
+    as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
+    caller-saved register as the LINK register for leaf/helper calls: the caller
+    does `brsl $rN, helper` (or `bisl $rN, ...`) and the helper returns via
+    `bi $rN`. Modelled as a generic indirect branch, that return targets the
+    caller's mid-function return address -- which is NOT a registered function
+    entry -> branch-to-0 (observed: LBP's wwsjob policy module uses r4/r5/r6/r8/
+    r78/r79 as link registers; e.g. `bi $r78` returned to 0x2C58/0x2D28/0x3048
+    and stalled the whole WWS job engine).
+
+    Detect it: rN is used as a link register somewhere in the image (the rt of
+    some brsl/brasl/bisl/bisled), AND within the enclosing function block rN is a
+    pure live-in -- never written before the branch. A COMPUTED branch (tail
+    call, jump table, vtable dispatch) always materialises its target register
+    in-block (lqx/rotqby/ai/il/ila...), so the write check excludes it; only a
+    genuine link-register return leaves rN untouched. Then the branch is a
+    RETURN -> emit a host `return;` so it composes with the brsl->C-call nesting,
+    exactly like `bi $r0`. Returns the set of such branch addresses."""
+    link_regs = set()
+    for insn in insns:
+        if insn.mnemonic in ("brsl", "brasl", "bisl", "bisled"):
+            link_regs.add(insn.raw & 0x7F)
+    link_regs.discard(0)   # r0 is handled by compute_bi_r0_jumps()
+    if not link_regs:
+        return set()
+
+    returns = set()
+    ordered = sorted(insns, key=lambda x: x.addr)
+
+    # Predecessor map for the refinement below: every br/bra source per target.
+    # A `bi $rN` whose block is ENTERED by a branch from a block that COMPUTED
+    # rN (jump-table rotqby etc.) is a dispatch, not a return -- the write is
+    # invisible to the in-bound liveness scan. Observed: pm_wwsjob's command
+    # interpreter loads the handler into r6 from the LS 0x15B0 table (0x1BD8),
+    # `br 0x2DF8` into the shared decode block, and dispatches via `bi $r6` at
+    # 0x2E74; classifying that as a link-return silently skipped EVERY job
+    # command handler (jobs never staged; LBP's loading queue never drained).
+    preds: dict = {}
+    for insn in ordered:
+        if insn.mnemonic in ("br", "bra"):
+            i16 = (insn.raw >> 7) & 0xFFFF
+            if i16 & 0x8000:
+                i16 -= 0x10000
+            t = (i16 << 2) if insn.mnemonic == "bra" else (insn.addr + (i16 << 2))
+            preds.setdefault(t & 0x3FFFF, []).append(insn.addr)
+    idx_of_all = {ins.addr: i for i, ins in enumerate(ordered)}
+    for (s, e) in bounds:
+        fn = [i for i in ordered if s <= i.addr < e]
+        for idx, insn in enumerate(fn):
+            tr = _bi_target_reg(insn)
+            if tr is None or tr == "0":
+                continue
+            try:
+                rn = int(tr)
+            except ValueError:
+                continue
+            if rn not in link_regs:
+                continue
+            # rN must be a pure live-in (the link address the caller planted):
+            # if any earlier insn in this block writes rN (other than an identity
+            # move), the target was computed here -> a real indirect branch, not
+            # a return. Scan stops at unconditional flow breaks (block boundary
+            # -- see the twin guard in compute_bi_r0_jumps).
+            written = False
+            block_start = s
+            for j in range(idx - 1, -1, -1):
+                w = fn[j]
+                if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                    block_start = fn[j + 1].addr if j + 1 <= idx else s
+                    break
+                if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
+                        and not _is_identity_move(w)):
+                    written = True
+                    break
+            if written:
+                continue
+            # Predecessor refinement: rN is a live-in here -- but if a br/bra
+            # ENTERS this block from a block whose tail COMPUTED rN, the value
+            # is a dispatch target (jump table), not a caller's link.
+            computed_in = False
+            for t, srcs in preds.items():
+                if not (block_start <= t <= insn.addr):
+                    continue
+                for src in srcs:
+                    k = idx_of_all.get(src)
+                    if k is None:
+                        continue
+                    for j in range(k - 1, max(-1, k - 24), -1):
+                        w = ordered[j]
+                        if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                            break
+                        if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
+                                and not _is_identity_move(w)):
+                            computed_in = True
+                            break
+                    if computed_in:
+                        break
+                if computed_in:
+                    break
+            if not computed_in:
+                returns.add(insn.addr)
+    return returns
 
 
 class SPULifter:
@@ -257,11 +449,6 @@ class SPULifter:
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
         self.unsupported: dict[str, int] = {}
-        # brsl/brasl whose target could not be resolved and lifted as a no-op
-        # (a MISCOMPILE: the call is silently dropped). Warned loudly in the
-        # summary -- a lifted SPURS job binary shipped with every one of its
-        # calls dropped this way and the only symptom was "0 call target(s)".
-        self.unresolved_calls: list[int] = []
         self.trace = trace
         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
         # Lets multiple lifted SPU images link into one binary without collisions
@@ -271,6 +458,11 @@ class SPULifter:
         # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
         # set => every `bi $r0` is a return (the prior behaviour).
         self.bi_r0_jump: set = set()
+        # Addresses of `bi/biz/... $rN` (N != 0) that are LINK-REGISTER RETURNS
+        # (rN is a non-r0 link register the caller set via brsl/bisl) -- see
+        # compute_link_returns(). Emitted as `return;` so they compose with the
+        # brsl->C-call nesting instead of branching to an unregistered PC.
+        self.link_return: set = set()
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -311,7 +503,8 @@ class SPULifter:
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; SPU_TAILCALL({self.prefix}spu_func_{end:08X}(ctx)); }}")
+                f"    {{ ctx->pc = 0x{end:X}; "
+                f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -336,20 +529,29 @@ class SPULifter:
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
+        """The literal target of a direct branch, or None if it has none.
+
+        The target is always the LAST operand. `br`/`bra` carry only a target
+        ("0x2D40"), but `brsl`/`brasl` carry the link register first
+        ("$r0, 0x35A0") -- so reading operand 0 got the link register for every
+        call, never matched "0x", and returned None. That made _translate emit
+        `/* TODO spu: brsl unresolved target */` for EVERY brsl in EVERY image:
+        the link register was set and the call silently dropped. 1,484 of them
+        across LBP's 25 SPU images -- no SPU function call had ever run.
+
+        It hid well because nothing downstream depends on this: the callee is
+        still lifted (find_spu_functions scans all operands for targets, so the
+        function exists and links), and a dropped call just falls through to the
+        next instruction, which usually looks like plausible progress. LBP's
+        wwsjob policy module spun forever at LS 0x2D68 because the one call in
+        its loop -- `brsl $0,0x35a0`, which is what polls the workload and
+        issues the DMA -- was one of these.
+        """
         mn = insn.mnemonic
         ops = _ops(insn.operands)
-        tok = None
-        if mn in ("br", "bra") and ops:
-            tok = ops[0]
-        elif mn in ("brsl", "brasl") and ops:
-            # The disasm fix that added the link register to brsl/brasl
-            # operand text ("brsl $r0, 0x5488") moved the target to the LAST
-            # operand. ops[0] was correct only for the pre-fix format ("brsl
-            # 0x5488") and silently returned None afterwards, lifting EVERY
-            # brsl call as a no-op. ops[-1] handles both formats.
-            tok = ops[-1]
-        elif mn in _COND_BR and ops:
-            tok = ops[-1]
+        if mn not in ("br", "brsl", "bra", "brasl") and mn not in _COND_BR:
+            return None
+        tok = ops[-1] if ops else None
         if tok and tok.startswith("0x"):
             try:
                 return int(tok, 16)
@@ -401,10 +603,29 @@ class SPULifter:
         if mn == "bgx":
             return f"{g(rt())} = spu_bgx({g(ra())}, {g(rb())}, {g(rt())});"
 
-        # Halt-on-condition + stopd: pure stop semantics in recompiled code;
-        # we just continue execution (no host halt path for these yet).
+        # Halt-on-condition: compiler/middleware assert traps (e.g. FMOD's
+        # heqi rX,0 null-pointer guards). On real HW a taken halt stops the
+        # SPU at the faulty data; emitting a no-op here let bad data sail
+        # into silent million-iteration wedges. Honor the halt with a log.
         if mn in ("hgti", "hlgti", "heqi", "hgt", "hlgt", "heq"):
-            return f"/* {mn}: halt-on-condition (no-op in recomp) */;"
+            pw = lambda i: f"{g(i)}._u32[0]"
+            if mn == "heqi":
+                cond = f"(int32_t){pw(ra())} == (int32_t)({_imm(ops[2])})"
+            elif mn == "hgti":
+                cond = f"(int32_t){pw(ra())} > (int32_t)({_imm(ops[2])})"
+            elif mn == "hlgti":
+                cond = f"{pw(ra())} > (uint32_t)({_imm(ops[2])})"
+            elif mn == "heq":
+                cond = f"{pw(ra())} == {pw(rb())}"
+            elif mn == "hgt":
+                cond = f"(int32_t){pw(ra())} > (int32_t){pw(rb())}"
+            else:  # hlgt
+                cond = f"{pw(ra())} > {pw(rb())}"
+            return (f"if ({cond}) {{ extern void spu_halt(spu_context*); "
+                    f"fprintf(stderr, \"[spu] HALT-ASSERT {mn} pc=0x{addr:05X} "
+                    f"img=%d\\n\", ctx->image_id); "
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
+                    f"spu_halt(ctx); return; }}")
         if mn == "stopd":
             return ("ctx->stop_code = 0u; "
                     "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
@@ -441,7 +662,7 @@ class SPULifter:
             "shlqbybi": "spu_shlqbybi", "rotqbybi": "spu_rotqbybi",
             # Phase 3: rotate-and-mask (register-variable)
             "rotm": "spu_rotm", "rotma": "spu_rotma",
-            "rothm": "spu_rothm", "rothma": "spu_rothma",
+            "rothm": "spu_rothm", "rotmah": "spu_rothma",
             "rotqmbi": "spu_rotqmbi", "rotqmby": "spu_rotqmby",
             "rotqmbybi": "spu_rotqmbybi",
             # Phase 3: indexed constant generators (insertion masks)
@@ -608,8 +829,13 @@ class SPULifter:
                 return f"{link} {self._uncond_branch(addr + 4, func)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
-                return f"{link} {self.prefix}spu_func_{tgt:08X}(ctx);"
-            self.unresolved_calls.append(addr)
+                # Nested host call bracketed by host_depth (so the callee's
+                # `bi $r0` returns via host return) + SPU_DRAIN (drains the
+                # callee's own tail-chains so they don't grow the caller frame)
+                # + image save/restore (adopt-on-serve cannot leak upward).
+                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
+                        f"SPU_DRAIN(ctx); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -619,8 +845,17 @@ class SPULifter:
             if func.start_addr <= tgt < func.end_addr:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
+            # Cross-function conditional branch = conditional tail: hand the
+            # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
             return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"SPU_TAILCALL({self.prefix}spu_func_{tgt:08X}(ctx)); }}")
+                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+        # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
+        # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
+        # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
+        # under bie/bid interrupt windows; dropping the bits starves its DMA
+        # stall-and-notify handler and wedges the whole job pipeline.
+        _ied = ("ctx->int_enable = 1; " if insn.raw & 0x40000 else
+                "ctx->int_enable = 0; " if insn.raw & 0x80000 else "")
         # For bi/bisl the disassembler emits only "$rA" (ops[0] = target reg).
         if mn in ("bi",):
             tgt_reg = _reg(ops[0])
@@ -630,33 +865,43 @@ class SPULifter:
             # when r0 was reloaded from memory (lqa/lqr) it is a COMPUTED TAIL
             # JUMP (e.g. the SPURS task launch `lqa $r0,savedContextLr; bi $r0`),
             # flagged by compute_bi_r0_jumps() — emit the indirect dispatch.
-            if tgt_reg == "0" and addr not in self.bi_r0_jump:
-                return "return;"
-            return (f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return;")
+            if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
+                    or addr in self.link_return:
+                # SPU_RET: host return while a matched brsl frame is live
+                # (host_depth>0); at 0 the frame was destroyed -> dispatch to r0.
+                return f"{_ied}SPU_RET(ctx);"
+            # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
+            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
-            return ("ctx->pc = ctx->srr0; "
-                    "spu_indirect_branch(ctx); return;")
+            return (f"{_ied}ctx->pc = ctx->srr0; "
+                    "g_spu_trampoline_fn = spu_indirect_branch; return;")
         if mn in ("bisl",):
-            link_rt = insn.raw & 0x7F
-            # Same interface break as brsl: the disasm fix added the link
-            # register to bisl operand text ("bisl $r0, $r11"), so the TARGET
-            # register is now the LAST operand. ops[0] grabbed the LINK
-            # register, so the emitted indirect call dispatched to link
-            # (= addr+4) and the callee was silently skipped. ops[-1]
-            # handles both operand formats.
+            # `bisl rt, ra`: rt = link, ra = TARGET. The disassembler emits BOTH
+            # ("$r0, $r2"), so operand 0 is the link register -- taking it as the
+            # target made every indirect call branch to its own return address
+            # instead of the callee. LBP's wwsjob policy module halted at exactly
+            # that: `bisl $0,$2` at LS 0x3598 calls selectWorkload through the
+            # kernel context, and we jumped to 0x359C (its own link) instead.
+            link_rt = insn.raw & 0x7F            # rt = bits 25-31 of the encoding
             tgt_reg = _reg(ops[-1])
+            # Indirect call: nested dispatch bracketed like brsl (host_depth +
+            # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
+            # here and its `bi $r0` returns via host return.
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; spu_indirect_branch(ctx);")
+                    f"{{ int32_t _si = (int32_t)ctx->image_id; "
+                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
+                    f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
+                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
-            link_rt = insn.raw & 0x7F
-            tgt_reg = _reg(ops[-1])   # last operand = target (see bisl above)
+            link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
+            tgt_reg = _reg(ops[-1])
             return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
-                    f"ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return; }}")
+                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -666,10 +911,11 @@ class SPULifter:
             # with the brsl->C-call nesting (mirrors the `bi $r0` case above).
             # Dispatching to the return address would miss the C frame and
             # land on an unregistered mid-function PC.
-            if tgt_reg == "0" and addr not in self.bi_r0_jump:
-                return f"if ({cond}) return;"
-            return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"spu_indirect_branch(ctx); return; }}")
+            if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
+                    or addr in self.link_return:
+                return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
+            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
@@ -686,7 +932,7 @@ class SPULifter:
     def _cond(self, mn: str, reg: str) -> str:
         """Condition expression on preferred slot for conditional branches."""
         word = f"ctx->gpr[{reg}]._u32[0]"
-        half = f"ctx->gpr[{reg}]._u16[1]"   # preferred halfword (lane 1 of word 0)
+        half = f"ctx->gpr[{reg}]._u16[0]"   # preferred halfword = BE bytes 2-3 = LOW half of native _u32[0]
         table = {
             "brz": f"{word} == 0",      "brnz": f"{word} != 0",
             "brhz": f"{half} == 0",     "brhnz": f"{half} != 0",
@@ -701,7 +947,10 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        return f"{{ ctx->pc = 0x{tgt:X}; SPU_TAILCALL({self.prefix}spu_func_{tgt:08X}(ctx)); }}"
+        # Cross-function unconditional tail: hand the target to the trampoline
+        # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
+        return (f"{{ ctx->pc = 0x{tgt:X}; "
+                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -744,7 +993,8 @@ class SPULifter:
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
                 lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
-                lines.append(f"    ctx->pc = 0x{t:X}u; spu_indirect_branch(ctx);")
+                lines.append(f"    ctx->pc = 0x{t:X}u; "
+                             f"g_spu_trampoline_fn = spu_indirect_branch; return;")
                 lines.append("}")
             lines.append("")
 
@@ -800,6 +1050,25 @@ def main() -> None:
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
+    p.add_argument("--code-end", type=lambda x: int(x, 0), default=0,
+                   help="Address where executable code ends and an embedded "
+                        "rodata/const tail begins. Drops any auto-detected "
+                        "function starting at/after this address and caps any "
+                        "function's end here, so the data tail is left "
+                        "un-disassembled. For images with a large data tail in "
+                        ".text whose bytes decode as in-range branches and seed "
+                        "garbage `functions` (e.g. the LBP WWS physics jobmods, "
+                        "which append a zlib inflate string table + float tables "
+                        "after the code at 0xAE68 / 0xAE48).")
+    p.add_argument("--force-indirect", default="",
+                   help="Comma-separated `bi $rN` addresses to emit as GENERIC "
+                        "indirect dispatch, overriding the link-register-return "
+                        "classifier. For jump-table dispatches whose target reg "
+                        "was computed in a block the bounded liveness scan cannot "
+                        "see (e.g. pm_wwsjob 0x2E74: r6 loaded from the command "
+                        "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
+                        "dispatched blocks later -- classified as a return, which "
+                        "silently skipped every job-command handler).")
     args = p.parse_args()
 
     if args.auto_functions:
@@ -844,9 +1113,31 @@ def main() -> None:
             if not split and not any(s == a for s, _ in bset):
                 newb.append((a, base + len(data)))
             bset = sorted(set(newb))
-        bounds = bset
+        # Dedup by start: if an extra addr lands inside two overlapping auto-
+        # detected bounds, splitting both yields two bounds with the same start
+        # -> two functions emitted with the same name (redefinition). Keep one
+        # per start (the tightest end); the start is what dispatch resolves to.
+        by_start = {}
+        for s, e in bset:
+            if s not in by_start or e < by_start[s]:
+                by_start[s] = e
+        bounds = sorted(by_start.items())
         sys.stderr.write("[spu_lifter] added extra funcs: %s\n" %
                          ", ".join("0x%X" % a for a in extra))
+
+    # Cap the code/data boundary. Some images embed a large rodata/const tail
+    # inside the executable segment; its bytes decode as in-range branches
+    # (br/brsl/brhz ...) whose targets seed spurious "functions", which then
+    # disassemble the data as code (garbage + `.word` for undecodable words).
+    # Reachability from the entry can't bound it (the entry is an indirect
+    # dispatch stub), so the boundary is supplied explicitly per image.
+    if args.code_end:
+        ce = args.code_end
+        before = len(bounds)
+        bounds = [(s, min(e, ce)) for (s, e) in bounds if s < ce]
+        sys.stderr.write("[spu_lifter] code-end 0x%X: kept %d/%d bound(s), "
+                         "data tail left un-disassembled\n"
+                         % (ce, len(bounds), before))
 
     insns = disassemble_spu(data, base)
 
@@ -854,8 +1145,23 @@ def main() -> None:
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
-              f"(r0 reloaded via lqa/lqr): "
+              f"(r0 set by lqa/lqr/il/ila, not a link): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
+    lifter.link_return = compute_link_returns(insns, bounds)
+    if args.force_indirect:
+        forced = {int(x, 0) for x in args.force_indirect.split(",") if x.strip()}
+        dropped = lifter.link_return & forced
+        lifter.link_return -= forced
+        lifter.bi_r0_jump |= forced          # also force `bi $r0` sites if listed
+        sys.stderr.write("[spu_lifter] forced indirect dispatch at: %s%s\n" %
+                         (", ".join("0x%X" % a for a in sorted(forced)),
+                          " (was link-return: %s)" %
+                          ", ".join("0x%X" % a for a in sorted(dropped))
+                          if dropped else ""))
+    if lifter.link_return:
+        print(f"  {len(lifter.link_return)} non-r0 link-register return site(s) "
+              f"(`bi $rN` where rN is a brsl/bisl link reg): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)
@@ -872,11 +1178,6 @@ def main() -> None:
     print(f"Wrote {sp}")
     print(f"  {len(lifter.functions)} function(s) lifted")
     print(f"  {len(lifter.call_targets)} call target(s)")
-    if lifter.unresolved_calls:
-        print(f"  WARNING: {len(lifter.unresolved_calls)} brsl/brasl call(s) with "
-              f"UNRESOLVED targets lifted as NO-OPS (dropped calls = miscompile!): "
-              + ", ".join(f"0x{a:X}" for a in lifter.unresolved_calls[:12])
-              + (" ..." if len(lifter.unresolved_calls) > 12 else ""))
     if lifter.unsupported:
         total = sum(lifter.unsupported.values())
         print(f"  {total} unsupported instruction(s) across "

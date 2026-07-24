@@ -40,15 +40,40 @@ extern uint8_t* vm_base;
  * committed and accessible. Returns 1 if the range is safe to memcpy. */
 static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
 {
+    /* The flat VM reserves the FULL 32-bit guest space and demand-commits
+     * pages on first touch (ppu_loader's vectored handler), so every 32-bit
+     * EA is safe host memory by construction -- a garbage EA reads zeros /
+     * commits an empty page, exactly like vm_read32. The old implementation
+     * additionally VirtualQuery'd the range on EVERY MFC transfer: VTune
+     * measured that at 94 CPU-seconds in a 50 s movie run -- 60x the entire
+     * lifted-SPU execution cost, and the real reason the Bink intro decoded
+     * at 1-2 FPS. Bounds-check only. */
     uint32_t e = (uint32_t)ea;
     if (size == 0) return 0;
     if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
+#ifdef _WIN32
     if (!vm_base) return 0;
-    /* The 4 GB bound above is the only check needed. The guest VM is either fully
-     * committed or demand-committed via a page-fault handler (boot_main), so an
-     * in-bounds DMA to an uncommitted page is committed on access, not a crash.
-     * The old per-DMA VirtualQuery (up to 2 OS calls) was pure overhead -- ~60x
-     * slowdown on DMA-heavy SPU workloads (reported by contributors). Dropped. */
+    /* Committed-page bitmap as a self-healing CACHE of VirtualQuery. The
+     * demand-commit fault handler seeds it, but regions the host commits
+     * directly (the D3D12 backend's VRAM window never faults) start unseeded
+     * -- treating the bitmap as authoritative rejected every Bink decode DMA
+     * (green movie). On a miss, fall back to ONE VirtualQuery and remember
+     * the answer: first touch per 64K page pays the syscall, steady state is
+     * two bit tests. (The all-syscall version was 94 CPU-s per 50 s run.) */
+    { extern uint8_t g_vm_page_bitmap[65536 / 8];
+      uint32_t last = e + size - 1;
+      uint32_t pg[2] = { e >> 16, last >> 16 };
+      for (int i = 0; i < (pg[0] == pg[1] ? 1 : 2); i++) {
+          if ((g_vm_page_bitmap[pg[i] >> 3] >> (pg[i] & 7)) & 1) continue;
+          MEMORY_BASIC_INFORMATION mbi;
+          uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
+          if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
+          if (mbi.State != MEM_COMMIT) return 0;
+          if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+          g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
+      }
+    }
+#endif
     return 1;
 }
 
@@ -147,6 +172,65 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* LBP_MFC_TRACE: attribute silent DMA-poll loops (a wedged task whose
+     * host thread samples "in ntdll" because VirtualQuery dominates). Prints
+     * every 64k-th transfer per thread: enough to see the loop's pc/ea. */
+    { static int s_t = -1; if (s_t < 0) { const char* e = getenv("LBP_MFC_TRACE");
+        s_t = e ? atoi(e) : 0; if (e && !s_t) s_t = 1; }
+      if (s_t) { static _Thread_local unsigned long long _n; ++_n;
+        /* level 2+: also print each thread's first 192 transfers (setup DMAs
+         * -- shows WHERE round configs/headers are fetched from). */
+        if ((s_t >= 2 && _n <= 192) || (_n & 0xFFFFu) == 0)
+            fprintf(stderr, "[mfc-trace] img=%d pc=0x%05X cmd=0x%X lsa=0x%05X "
+                    "ea=0x%08X size=%u (#%llu this thread)\n",
+                    spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa,
+                    (uint32_t)ea, size, _n);
+        /* Forensic one-shot: on the FIRST GET from EA 0 (the FMOD node-walk
+         * wedge), dump the previously staged node still in LS at this lsa
+         * (its link field produced the null) and the same node's bytes in
+         * guest RAM, so "stale LS staging" vs "PPU wrote a null link" is
+         * decidable from one run. last-good EA tracked per (thread, GET). */
+        { static _Thread_local uint32_t last_node_ea; static _Thread_local int dumped;
+          if ((cmd & 0x40) && (uint32_t)ea == 0 && size >= 160 && !dumped) {
+              dumped = 1;
+              extern uint8_t* vm_base;
+              fprintf(stderr, "[mfc-null] img=%d pc=0x%05X first null-EA GET "
+                      "(lsa=0x%05X size=%u); last node GET ea=0x%08X -- dumping "
+                      "staged node LS[0x25200] vs guest RAM copy\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, lsa, size,
+                      last_node_ea);
+              for (int r = 0; r < 336; r += 16) {
+                  fprintf(stderr, "[mfc-null]  LS[0x25200+%03X]:", r);
+                  for (int k = 0; k < 16; k += 4)
+                      fprintf(stderr, " %02X%02X%02X%02X", spu->ls[(0x25200+r+k)&SPU_LS_MASK],
+                              spu->ls[(0x25200+r+k+1)&SPU_LS_MASK], spu->ls[(0x25200+r+k+2)&SPU_LS_MASK],
+                              spu->ls[(0x25200+r+k+3)&SPU_LS_MASK]);
+                  if (vm_base && last_node_ea) {
+                      fprintf(stderr, "  | RAM[0x%08X+%03X]:", last_node_ea, r);
+                      for (int k = 0; k < 16; k += 4)
+                          fprintf(stderr, " %02X%02X%02X%02X", vm_base[last_node_ea+r+k],
+                                  vm_base[last_node_ea+r+k+1], vm_base[last_node_ea+r+k+2],
+                                  vm_base[last_node_ea+r+k+3]);
+                  }
+                  fprintf(stderr, "\n");
+              }
+              fflush(stderr);
+          }
+          if ((cmd & 0x40) && (uint32_t)ea != 0 && lsa == 0x25200 && size == 336)
+              last_node_ea = (uint32_t)ea;
+        } } }
+    /* cellAudio port-ring window: log every guest write into it (rare, load-
+     * bearing -- the audio OUTPUT path). Same env gate as the sampler. */
+    { static int s_pr = -1; if (s_pr < 0) s_pr = getenv("LBP_MFC_TRACE") ? 1 : 0;
+      if (s_pr && (cmd & 0x20) && !(cmd & 0x40) &&
+          (((uint32_t)ea >= 0x01000000u && (uint32_t)ea < 0x01800000u) ||
+           ((uint32_t)ea >= 0x00927D00u && (uint32_t)ea < 0x00928000u))) {
+          static int _n = 0;
+          if (_n++ < 48)
+              fprintf(stderr, "[ring-PUT] img=%d pc=0x%05X ea=0x%08X size=%u lsa=0x%05X\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                      (uint32_t)ea, size, lsa);
+      } }
     /* Validate size */
     if (size == 0 || size > MFC_MAX_DMA_SIZE)
         return -1;
@@ -175,6 +259,27 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
 
+    /* SPU_STACKEA_WATCH=1: the LBP JobManagerWorker completion protocol hands the
+     * SPU job a completion-word EA (param[4]) that lives on the PPU stack
+     * (0xD00Cxxxx = VM_STACK_BASE region); the job must DMA a nonzero word there
+     * on completion. This catches (a) any DMA whose EA targets the stack region
+     * -- a completion-write attempt -- and (b) any GET payload carrying a
+     * 0xD00Cxxxx dword -- the completion EA arriving in a loaded job buffer.
+     * Answers whether the EA ever reaches / is ever written by the SPU. */
+    { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+      if (s_se) {
+        uint32_t e32 = (uint32_t)ea;
+        if ((e32 & 0xFF000000u) == 0xD0000000u ||   /* DMA targeting the PPU stack */
+            (e32 & 0xFFFF0000u) == 0x470A0000u) {   /* ...or the completion-word POOL */
+            static int _n = 0; if (_n++ < 60) {
+                uint32_t v0 = mfc_is_put(cmd) && size>=4 ?
+                    ((ls_ptr[0]<<24)|(ls_ptr[1]<<16)|(ls_ptr[2]<<8)|ls_ptr[3]) : 0;
+                fprintf(stderr, "[stackea] %s ea=0x%08X lsa=0x%05X size=%u img=%d pc=0x%05X"
+                        " ls_word0=0x%08X\n", mfc_is_get(cmd)?"GET":"PUT", e32, lsa, size,
+                        spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, v0);
+                fflush(stderr); } }
+      } }
+
 #ifdef SPU_DMA_LOG
     { extern int g_spu_dma_log; if (g_spu_dma_log-- > 0)
         fprintf(stderr, "[spu-dma] %s lsa=0x%05X ea=0x%08X size=%u\n",
@@ -186,13 +291,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
       /* YDKJ_DMA_IMG=N: trace ONLY image N, uncapped (the 300-cap otherwise fills
        * with the always-running PM's DMA and hides a late image entirely). */
       if (s_t) {
+        /* pc = the issuing code's LS address (maps 1:1 to a lifted spu_func_
+         * name) — names the loop a task is spinning in without a debugger. */
         if (s_img >= 0) {
             if (spu->image_id == s_img)
-                fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d\n",
-                        mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id);
+                fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d pc=0x%05X\n",
+                        mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id,
+                        (uint32_t)spu->pc);
         } else { static int _n = 0; if (_n++ < 300)
-            fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d\n",
-                    mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id); }
+            fprintf(stderr, "[dmatrace] %s lsa=0x%05X ea=0x%08X size=%u img=%d pc=0x%05X\n",
+                    mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size, spu->image_id,
+                    (uint32_t)spu->pc); }
       } }
     /* Detect the cri task actually DECODING: a GET of the real video payload
      * (large, from a non-context EA) as opposed to the 64-byte context handshake
@@ -200,16 +309,119 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     { extern int g_cri_video_dma;
       if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
+    /* DIAGNOSTIC (LBP_SKIP_NULL_DMA): a GET from a null/near-null EA reads guest
+     * memory at ~0 (the ELF header / low mem) = garbage. The FMOD SPU mixer's DSP
+     * buffer pointers are 0 in our run; if the real task would SKIP a null DSP
+     * input (output silence), zeroing the LS target instead of reading garbage
+     * lets us test whether the task then PROGRESSES (reaches a PUT / signals the
+     * event flag) vs still loops. If it progresses, the null buffers are tolerable
+     * and our lift is DMAing where HW skips; if not, the buffers must be real. */
+    if (mfc_is_get(cmd) && (uint32_t)ea < 0x10000u) {
+        static int s_skip = -1; if (s_skip < 0) s_skip = getenv("LBP_SKIP_NULL_DMA") ? 1 : 0;
+        if (s_skip) {
+            static int _n = 0; if (_n++ < 20)
+                fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
+                        spu->image_id, (uint32_t)ea, size);
+            memset(ls_ptr, 0, size);
+            return 0;
+        }
+    }
     if (mfc_is_get(cmd)) {
+        /* LBP overlay-load diagnosis: a GET of the FMOD overlay descriptor
+         * (32B from ~0x94Fxxx) then a large GET from a NULL source = the
+         * overlay never loads. Dump the descriptor content to see where the
+         * real source EA was dropped. */
+        { static int s_ovl = -1; if (s_ovl < 0) s_ovl = getenv("LBP_OVL_DIAG") ? 1 : 0;
+          if (s_ovl) {
+              /* overlay-load map: image-6 GET of a code-sized chunk into the
+               * high LS overlay region, with its (now-correct) plugin source.
+               * plugin EA = source - 0x100 (ELF header offset). */
+              if (spu->image_id == 6 && size > 256 &&
+                  lsa >= 0x20000 && lsa < 0x3A000 && (uint32_t)ea >= 0x800000) {
+                  static int _n=0; if(_n++<40)
+                      fprintf(stderr, "[ovl-load] plugin~0x%08X -> LS 0x%05X size=%u pc=0x%05X%s",
+                              (uint32_t)ea - 0x100, lsa, size, (uint32_t)spu->pc, "\n");
+              }
+              if (size == 32 && (uint32_t)ea >= 0x94F000 && (uint32_t)ea < 0x950000) {
+                  static int _n=0; if(_n++<12) {
+                      const uint8_t* d = ea_ptr;
+                      fprintf(stderr, "[ovl-desc] ea=0x%08X:", (uint32_t)ea);
+                      for (int i=0;i<32;i+=4) fprintf(stderr," %02X%02X%02X%02X",d[i],d[i+1],d[i+2],d[i+3]);
+                      fprintf(stderr, "%s", "\n"); }
+              }
+              if ((uint32_t)ea < 0x1000 && size > 256) {
+                  static int _n=0; if(_n++<12)
+                      fprintf(stderr, "[ovl-NULL] GET lsa=0x%05X ea=0x%08X size=%u pc=0x%05X img=%d%s",
+                              lsa, (uint32_t)ea, size, (uint32_t)spu->pc, spu->image_id, "\n");
+              }
+          } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
-        /* Overlay watch: a GET into the code segment (LBP-style DMA'd code)
-         * invalidates the stale lifted functions so dispatch re-interprets. */
-        if ((lsa & SPU_LS_MASK) < g_spu_code_hi)
-            spu_code_write_watch(lsa & SPU_LS_MASK, size);
+        /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
+         * dword = the completion-word EA arriving in a job buffer. */
+        { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+          if (s_se && size >= 4) { static int _n = 0;
+            for (uint32_t o = 0; o + 4 <= size && _n < 60; o += 4) {
+                uint32_t w = (ls_ptr[o]<<24)|(ls_ptr[o+1]<<16)|(ls_ptr[o+2]<<8)|ls_ptr[o+3];
+                if ((w & 0xFFFF0000u) == 0xD00C0000u ||
+                    (w & 0xFFFF0000u) == 0x470A0000u) { _n++;   /* completion-pool EA in payload */
+                    fprintf(stderr, "[stackea] GET-payload has EA 0x%08X at LS 0x%05X"
+                            " (from ea=0x%08X size=%u img=%d)\n", w, lsa + o,
+                            (uint32_t)ea, size, spu->image_id);
+                    fflush(stderr); } } } }
+        /* SPU_SMC_WATCH: a DMA GET that lands inside the image's own code
+         * segment is a code overlay = self-modification. */
+        { static int s = -2; static uint32_t lo, hi, img;
+          if (s == -2) { const char* e = getenv("SPU_SMC_WATCH");
+            s = e ? atoi(e) : -1; img = (uint32_t)s;
+            const char* l = getenv("SPU_SMC_LO"); lo = l ? (uint32_t)strtoul(l,0,0) : 0xA00;
+            const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
+          if (s >= 0 && (uint32_t)spu->image_id == img &&
+              lsa < hi && lsa + size > lo) {
+              static int _n = 0;
+              if (_n++ < 32)
+                  fprintf(stderr, "[spu-SMC] img=%d DMA-GET into CODE @0x%05X size=%u ea=0x%08X pc=0x%05X\n",
+                          spu->image_id, lsa, size, (uint32_t)ea, (uint32_t)spu->pc & SPU_LS_MASK);
+          } }
+        /* Swappable-overlay tracking: a GET from a registered overlay source
+         * (by EA or by content signature) marks that overlay's lifted
+         * functions resident for this context. */
+        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+          spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+        /* LBP_SPU_WATCH: a DMA GET landing on a watched LS line is how the PPU
+         * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
+        { int _n; unsigned* _w = spu_ls_watch_list(&_n);
+          for (int _i = 0; _i < _n; _i++) {
+              if (_w[_i] >= lsa && _w[_i] < lsa + size) {
+                  const uint8_t* q = &spu->ls[_w[_i] & (SPU_LS_MASK & ~0xFu)];
+                  fprintf(stderr, "[spu-watch DMA-GET 0x%05X <- ea=0x%08X sz=%u img=%d] "
+                          "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                          _w[_i], (uint32_t)ea, size, spu->image_id,
+                          q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                          q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
+                  fflush(stderr);
+              }
+          } }
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory */
         memcpy(ea_ptr, ls_ptr, size);
+        /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
+         * that touch the per-SPU lane counters. */
+        { extern uint32_t g_barrier_sync_watch;
+          uint32_t b = g_barrier_sync_watch;
+          if (b && (uint32_t)ea < b + 0xC0 && (uint32_t)ea + size > b + 0x40) {
+              static int _n = 0;
+              if (_n++ < 64) {
+                  /* spuNum lives in the kernel context at LS 0x1C8 (BE u32). */
+                  uint32_t sn = ((uint32_t)spu->ls[0x1C8]<<24)|((uint32_t)spu->ls[0x1C9]<<16)|
+                                ((uint32_t)spu->ls[0x1CA]<<8)|spu->ls[0x1CB];
+                  const uint8_t* lp = (const uint8_t*)ls_ptr;   /* the 16B being PUT */
+                  fprintf(stderr, "[sync-PUT] spuNum=%u pc=0x%05X ea=0x%08X (sync+0x%X) row={%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X}\n",
+                          sn, (uint32_t)spu->pc, (uint32_t)ea, (uint32_t)ea - b,
+                          lp[0],lp[1],lp[2],lp[3],lp[4],lp[5],lp[6],lp[7],
+                          lp[8],lp[9],lp[10],lp[11],lp[12],lp[13],lp[14],lp[15]);
+              }
+          } }
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
@@ -237,6 +449,100 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
  * The list resides in the SPU's local store at `lsa`.
  * Each list element describes a (size, EA) pair for a sub-transfer.
  */
+/* Core list runner used by both the initial submit and the stall-ack resume.
+ * Transfers elements starting at elem_lsa; on a stall-and-notify element
+ * (bit 15 of the size halfword) it PARKS the remainder in the context, raises
+ * SPU event 0x2 (MFC DMA list stall-and-notify) and returns -- the WWS
+ * jobmanager's interrupt handler processes the arrived portion and writes
+ * MFC_WrListStallAck to resume the rest (mfc_list_stall_ack below). */
+static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
+                               uint32_t num_left, uint32_t dest_lsa,
+                               uint64_t ea_base, uint32_t base_cmd, uint32_t tag)
+{
+    for (uint32_t i = 0; i < num_left; i++) {
+        uint32_t el = (elem_lsa + i * 8) & SPU_LS_MASK;
+        uint32_t size_and_flags = spu_ls_read32(spu, el);
+        uint32_t eal = spu_ls_read32(spu, el + 4);
+
+        /* CBEA list element word0 = [S:1][reserved:16][size:15]: the stall-
+         * and-notify bit is BIT 31 (the wwsjob sentinel element is exactly
+         * 0x80000000 = S set, size 0 -- a pure notification). The old bit-15
+         * check never saw it, so the event was never raised. */
+        uint32_t xfer_size = size_and_flags & 0x7FFF; /* low 15 bits */
+        int stall_notify = (size_and_flags >> 31) & 1;
+
+        uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
+
+        if (xfer_size) {
+            int rc = mfc_do_transfer(spu, dest_lsa, ea, xfer_size, base_cmd);
+            if (rc != 0) return rc;
+            dest_lsa += xfer_size;
+        }
+
+        if (stall_notify) {
+            uint32_t t = tag & 0x1F;
+            spu->list_stall_elem_lsa[t]  = (el + 8) & SPU_LS_MASK;
+            spu->list_stall_remaining[t] = num_left - i - 1;
+            spu->list_stall_dest_lsa[t]  = dest_lsa;
+            spu->list_stall_ea_base[t]   = ea_base;
+            spu->list_stall_cmd[t]       = base_cmd;
+            spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
+            spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
+            spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
+            /* Real MFC runs a queued list asynchronously, so the notify lands
+             * AFTER the arming code finishes. We run it inline here, so hold the
+             * resulting interrupt off for a few drain ticks -- otherwise the WWS
+             * handler sees g_WwsJob_loadJobState still kNone and (correctly)
+             * declines the Load->Run advance, and clear-on-read ch25 eats the
+             * only stall. See spu_drain.c: g_sn_defer / SPU_SN_DEFER. */
+            { extern void* volatile g_sn_defer_ctx;
+              extern volatile unsigned g_sn_defer;
+              extern unsigned spu_sn_defer_ticks(void);
+              unsigned d = spu_sn_defer_ticks();
+              if (d) { g_sn_defer_ctx = (void*)spu; g_sn_defer = d; } }
+            spu_ch_wake(spu);
+            { static int _n = 0; if (_n++ < 16)
+                fprintf(stderr, "[mfc-list] STALL img=%d tag=%u elem@0x%05X "
+                        "left=%u dest=0x%05X (SN raised, parked mask=0x%X) "
+                        "loadJobState@12A0=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                        spu->image_id, t, el, num_left - i - 1, dest_lsa,
+                        spu->list_stall_mask,
+                        spu->ls[0x12A0], spu->ls[0x12A1],
+                        spu->ls[0x12A2], spu->ls[0x12A3],
+                        spu->ls[0x12A4], spu->ls[0x12A5],
+                        spu->ls[0x12A6], spu->ls[0x12A7]); }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* Resume a parked list after MFC_WrListStallAck names its tag group. May park
+ * again at the next stall element; on full drain the tag group completes. */
+static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
+                                     uint32_t tag)
+{
+    uint32_t t = tag & 0x1F;
+    if (!(spu->list_stall_mask & (1u << t))) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[mfc-list] StallAck tag=%u but no parked list "
+                    "(parked mask=0x%X)\n", t, spu->list_stall_mask);
+        return 0;
+    }
+    spu->list_stall_mask &= ~(1u << t);          /* clears; re-set if it re-parks */
+    { static int _n = 0; if (_n++ < 16)
+        fprintf(stderr, "[mfc-list] RESUME img=%d tag=%u elem@0x%05X left=%u\n",
+                spu->image_id, t, spu->list_stall_elem_lsa[t],
+                spu->list_stall_remaining[t]); }
+    int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
+                          spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
+                          spu->list_stall_cmd[t], t);
+    if (!(spu->list_stall_mask & (1u << t)))      /* ran to the end: tag done */
+        mfc->tag_completed |= (1u << t);
+    return rc;
+}
+
 static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
                                         uint64_t ea_base, uint32_t list_size,
                                         uint32_t cmd)
@@ -244,33 +550,9 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
     /* list_size is in bytes; each element is 8 bytes */
     uint32_t num_elements = list_size / 8;
     uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
-
-    for (uint32_t i = 0; i < num_elements; i++) {
-        uint32_t elem_lsa = (list_lsa + i * 8) & SPU_LS_MASK;
-
-        /* Read list element from local store (big-endian) */
-        uint32_t size_and_flags = spu_ls_read32(spu, elem_lsa);
-        uint32_t eal = spu_ls_read32(spu, elem_lsa + 4);
-
-        uint32_t xfer_size = size_and_flags & 0x7FFF; /* low 15 bits */
-        int stall_notify = (size_and_flags >> 15) & 1;
-
-        uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
-
-        /* Calculate target LSA: for list commands, the data starts at
-         * the address given by the MFC_LSA channel and accumulates. */
-        int rc = mfc_do_transfer(spu, spu->mfc_lsa, ea, xfer_size, base_cmd);
-        if (rc != 0) return rc;
-
-        spu->mfc_lsa += xfer_size;
-
-        if (stall_notify) {
-            /* In a full emulator we would raise a stall-and-notify event.
-             * For recompiled code, we just continue. */
-        }
-    }
-
-    return 0;
+    return mfc_run_list(spu, list_lsa & SPU_LS_MASK, num_elements,
+                        spu->mfc_lsa & SPU_LS_MASK, ea_base, base_cmd,
+                        spu->mfc_tag);
 }
 
 /* ---------------------------------------------------------------------------
@@ -388,11 +670,154 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
-    /* Execute the transfer */
+    /* Bink SPU (image 3) DMA trace: is the video decode dispatching real work?
+     * Log only the INTERESTING transfers -- frame-sized (>256B) or targeting the
+     * movie-plane main-heap region (0x40C00000..0x41000000) -- so if the log
+     * stays empty the task only ever does <=128B control DMAs (stuck in the
+     * SPURS job-queue kernel, never dispatching decode); if plane-sized PUTs
+     * appear we learn where the decoded frame actually lands. Env LBP_DMATRACE. */
+    {
+        static int64_t bt=-2; if (bt==-2){ const char* e=getenv("LBP_DMATRACE"); bt=e?1:0; }
+        if (bt && spu->image_id==3) {
+            uint32_t ea32 = (uint32_t)ea;
+            int is_put   = ((cmd & 0x20) && !(cmd & 0x40));   /* PUT-family */
+            /* Uncapped histogram: total GET/PUT counts + bytes + the single
+             * largest PUT (and its target) -- settles definitively whether the
+             * task EVER outputs a frame-sized block, without per-entry caps. */
+            static uint64_t n_get=0, n_put=0, b_get=0, b_put=0;
+            static uint32_t max_put=0, max_put_ea=0, max_get=0;
+            static uint64_t ticks=0;
+            /* Track the unique DMA-issuing PCs (which code sites fire) + the
+             * distinct GET-source / PUT-dest page set, so we see whether the
+             * frame-output DMA site is ever reached and where data would land. */
+            static uint32_t pcs[32]; static int npc=0;
+            /* Dump the task-context/descriptor the kernel reads (GET from the
+             * 0x49xxxxxx SPURS task region) -- reveals whether task 2 is marked
+             * ready-with-work, scoping the dispatch fix. First 8 distinct EAs. */
+            if (!is_put && (ea32 & 0xFF000000u) == 0x49000000u) {
+                extern uint8_t* vm_base;
+                static uint32_t seen[8]; static int ns=0; int f=0;
+                for(int i=0;i<ns;i++) if(seen[i]==ea32){f=1;break;}
+                if(!f && ns<8 && vm_base){ seen[ns++]=ea32;
+                    const uint8_t* c = vm_base + ea32;
+                    fprintf(stderr,"[bink-taskctx] GET ea=0x%08X size=0x%X:",ea32,size);
+                    for(int i=0;i<0x40;i++){ if((i&15)==0) fprintf(stderr,"\n  +%02X:",i); fprintf(stderr," %02X",c[i]); }
+                    fprintf(stderr,"\n"); }
+            }
+            { uint32_t p=(uint32_t)spu->pc & 0x3FFFF; int f=0;
+              for(int i=0;i<npc;i++) if(pcs[i]==p){f=1;break;}
+              if(!f && npc<32){ pcs[npc++]=p;
+                fprintf(stderr,"[bink-dmapc] NEW dma site pc=0x%05X %s ea=0x%08X size=0x%X\n",
+                    p, is_put?"PUT":"GET", ea32, size); } }
+            /* Control-block command protocol dump: binkspu GETs the request at
+             * 0x927E00 (what the PPU BinkDoFrame commands) and PUTs the response
+             * at 0x927E80. Dump the first ~24 of each so we see the actual command
+             * words + how binkspu answers -- pinpoints where the decode handshake
+             * stalls (e.g. a "needs-decode"/frame-ready word the PPU never sets). */
+            if (ea32 >= 0x00927E00u && ea32 < 0x00927F00u) {
+                extern uint8_t* vm_base;
+                static int nreq=0, nrsp=0;
+                const uint8_t* c = is_put ? (spu->ls + (lsa & SPU_LS_MASK)) : (vm_base + ea32);
+                int* cnt = is_put ? &nrsp : &nreq;
+                /* Dump the first ~40 of each + then every 400th, so we see both the
+                 * steady-state command binkspu keeps re-reading AND its response --
+                 * to find the field the busy-loop polls that never changes. */
+                if (*cnt < 40 || ((*cnt) % 400)==0) {
+                    fprintf(stderr, "[bink-ctl] #%d %s ea=0x%08X pc=0x%05X:", *cnt, is_put?"RSP(put)":"REQ(get)",
+                            ea32, (uint32_t)spu->pc & 0x3FFFF);
+                    for (int i=0;i<0x20;i+=4)
+                        fprintf(stderr, " %02X%02X%02X%02X", c[i],c[i+1],c[i+2],c[i+3]);
+                    fprintf(stderr, "\n");
+                }
+                (*cnt)++;
+            }
+            if (is_put) { n_put++; b_put+=size; if (size>max_put){max_put=size;max_put_ea=ea32;} }
+            else        { n_get++; b_get+=size; if (size>max_get) max_get=size; }
+            /* Decode-progress tracker: the compressed-frame ring lives at 0x49Bxxxxx.
+             * Record the lowest+highest frame-data EA read so we can see, over time,
+             * whether binkspu advances forward through the stream (slow-but-decoding)
+             * or freezes on the same window (truly stuck). */
+            static uint32_t fd_lo=0xFFFFFFFFu, fd_hi=0;
+            if (!is_put && (ea32 & 0xFFF00000u)==0x49B00000u) {
+                if (ea32<fd_lo) fd_lo=ea32; if (ea32>fd_hi) fd_hi=ea32;
+            }
+            if ((++ticks % 2000)==0)
+                fprintf(stderr, "[bink-dmahist] GET n=%llu bytes=%llu maxsz=0x%X | PUT n=%llu bytes=%llu maxsz=0x%X @0x%08X | sites=%d | framedata 0x%08X..0x%08X (span=0x%X)\n",
+                        (unsigned long long)n_get,(unsigned long long)b_get,max_get,
+                        (unsigned long long)n_put,(unsigned long long)b_put,max_put,max_put_ea,npc,
+                        fd_lo,fd_hi, (fd_hi>=fd_lo)?(fd_hi-fd_lo):0);
+        }
+    }
+
+    /* Policy-module observation trace: every SPURS PM run's first transfers,
+     * always on (policy runs are rare and their DMA pattern is the primary
+     * bring-up signal: joblist fetch, job-module loads, output stores). */
+    if (spu->policy_mode) {
+        static int _pn = 0;
+        /* Cap the boot-time flood, but reopen the trace once the PPU is at the
+         * job barrier (g_barrier_sync_watch armed): the post-ticket DMA
+         * sequence is exactly what the pipeline diagnosis needs. */
+        extern uint32_t g_barrier_sync_watch;
+        static int _post = 0;
+        int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
+        if (open) {
+            if (_pn >= 96) _post++;
+            fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
+                    cmd, lsa, (unsigned long long)ea, size, tag);
+        } else if (_pn == 96)
+            fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
+        _pn++;
+    }
+
+    /* Execute the transfer.
+     * List commands (GETL/PUTL...): per CBEA the LIST's local-store address is
+     * carried in MFC_EAL (the PM writes EAL=list, LSA=dest) and each element
+     * supplies the low-32 EA; only EAH carries through. Passing `lsa` as the
+     * list address read list elements from the transfer DESTINATION. */
     if (mfc_is_list(cmd)) {
-        rc = mfc_do_list_transfer(spu, lsa, ea, size, cmd);
+        rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
+                                  ea & 0xFFFFFFFF00000000ull, size, cmd);
     } else {
         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
+    }
+
+    /* wwsjob batch-fetch probe: the claim path GETs the batch's command data
+     * to LS 0xC00; if this arrives empty/garbage the interrupt handler has
+     * nothing to stage and the pipeline idles forever. Dump the first words. */
+    if (spu->image_id == 2 && lsa == 0xC00 && cmd == 0x40 && rc == 0) {
+        /* Global count of loadCommands fetches: the per-run claim-vs-stage
+         * summary in spurs_policy.c diffs this across a PM run to catch the
+         * dispatch that CLAIMS a ticket but never stages its job. */
+        { extern volatile unsigned g_wws_batch_gets; g_wws_batch_gets++; }
+        static int _n = 0;
+        if (_n++ < 8) {
+            const uint8_t* p = spu->ls + 0xC00;
+            fprintf(stderr, "[wws-batch] GET 0xC00 ea=0x%09llX size=0x%X:",
+                    (unsigned long long)ea, size);
+            for (uint32_t i = 0; i < size && i < 0x40; i += 4)
+                fprintf(stderr, " %02X%02X%02X%02X", p[i], p[i+1], p[i+2], p[i+3]);
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+        /* SPU_CMDDUMP=1: decode the FULL WWS command list (8-byte cmds). Each
+         * CommandFlags u32: commandNum=(f>>9)&7, outputShareable=(f>>13)&1,
+         * shareableWriteIfDiscarded=(f>>12)&1, logBufSet=(f>>5)&0xF, logBuf=f&0x1F.
+         * Answers lifter-vs-builder: are shareable-output UseBuffer + kRunJob +
+         * store commands PRESENT in the list the PPU built? */
+        { static int s_cd = -1; if (s_cd < 0) s_cd = getenv("SPU_CMDDUMP") ? 1 : 0;
+          if (s_cd) { static int _c = 0; if (_c++ < 6) {
+            static const char* NM[8] = {"kNop","kReserveBufSet","kUseBuffer",
+                "kUnreserveBufSets","kReqDepDec","kRunJob","kEndCommand","kInvalid"};
+            const uint8_t* p = spu->ls + 0xC00;
+            fprintf(stderr, "[cmddump] list ea=0x%09llX size=0x%X:\n", (unsigned long long)ea, size);
+            for (uint32_t i = 0; i + 8 <= size && i < 0x400; i += 8) {
+                uint32_t f = ((uint32_t)p[i]<<24)|((uint32_t)p[i+1]<<16)|((uint32_t)p[i+2]<<8)|p[i+3];
+                uint32_t d = ((uint32_t)p[i+4]<<24)|((uint32_t)p[i+5]<<16)|((uint32_t)p[i+6]<<8)|p[i+7];
+                unsigned cn = (f>>9)&7, sh = (f>>13)&1, sw = (f>>12)&1, lbs = (f>>5)&0xF, lb = f&0x1F;
+                fprintf(stderr, "   +0x%03X f=%08X d=%08X  %-16s%s%s bufSet=%u buf=%u\n",
+                        i, f, d, NM[cn], sh?" OUTSHARE":"", sw?" WRITEIFDISC":"", lbs, lb);
+            }
+            fflush(stderr);
+          } } }
     }
 
     /* After a cri-task GET, dump the bytes it just read (the task context) so we
@@ -410,8 +835,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
-    /* Mark tag as completed */
-    mfc->tag_completed |= (1u << tag);
+    /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
+     * element: its tag group stays incomplete until MFC_WrListStallAck resumes
+     * it to the end (mfc_list_stall_ack marks completion then). */
+    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))))
+        mfc->tag_completed |= (1u << tag);
 
     return rc;
 }
@@ -490,9 +918,23 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
         break;
     case MFC_WrTagUpdate:
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
+        /* WWS Run-promotion gate probe: after kCommandsExecuted the job manager
+         * only calls ChangeLoadToRunJob if `ceq(RdTagStat, tagMask)` holds, i.e.
+         * RdTagStat must equal the mask EXACTLY (mask 2 = tag 1 =
+         * kLoadJob_readBuffers). Log the inputs so we can see whether the tag
+         * really is reported complete. Env SPU_TAGPROBE=1. */
+        { static int s_tp = -1;
+          if (s_tp < 0) { const char* e = getenv("SPU_TAGPROBE"); s_tp = e ? 1 : 0; }
+          if (s_tp && spu->image_id == 2) { static int _n = 0; if (_n++ < 40)
+              fprintf(stderr, "[tagprobe] img=%d upd=%u mask=0x%X completed=0x%X -> RdTagStat=0x%X%s\n",
+                      spu->image_id, value, spu->mfc_tag_mask, mfc->tag_completed,
+                      spu->mfc_tag_status,
+                      (spu->mfc_tag_status == spu->mfc_tag_mask) ? "  (== mask: PROMOTE)" : "  (!= mask: idle)"); } }
         break;
     case MFC_WrListStallAck:
-        /* Acknowledge stall -- no-op in synchronous mode */
+        /* Acknowledge a stalled list element's tag group: resume the parked
+         * list from the element after the stall point (may stall again). */
+        mfc_list_stall_ack(mfc, spu, value);
         break;
     default:
         break;
@@ -507,8 +949,14 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
         return spu->mfc_tag_status;
     case MFC_RdTagMask:
         return spu->mfc_tag_mask;
-    case MFC_RdListStallStat:
-        return 0; /* no stalls in synchronous mode */
+    case MFC_RdListStallStat: {
+        /* Accumulated tag-group mask of newly-stalled lists. Reading returns
+         * the mask and clears it (RPCS3 ch_stall_stat semantics); the interrupt
+         * handler's IhcLoop then drains every set bit, acking each via ch26. */
+        uint32_t m = spu->list_stall_stat;
+        spu->list_stall_stat = 0;
+        return m;
+    }
     case MFC_RdAtomicStat:
         /* Result of the last atomic line op (GETLLAR/PUTLLC/PUTLLUC), set by
          * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,

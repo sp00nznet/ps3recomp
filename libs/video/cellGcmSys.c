@@ -696,7 +696,117 @@ int cellGcm_take_flip_pending_synced(void)
     return 1;
 }
 
+/* ---- fence (SET_REFERENCE) observability ---------------------------------
+ * cellGcmFinish waits for ctrl->ref with EQUALITY. On hardware every fence
+ * value persists in the register for the RSX-time until the next fence
+ * (~a frame), so an equality poll cannot miss it. Our drain consumes a whole
+ * backlog in microseconds; publishing only the final value made intermediate
+ * fences invisible -- LBP's boot deadlocked with a thread spinning on a fence
+ * the counter had already passed (waiting 0x13 while ref climbed 0x51->0x1F4).
+ * Queue every fence as it is drained and publish ONE per tick: the GPU work
+ * is never throttled (draw/recycle proceed at full speed), only the ref
+ * register advances at most one fence per tick, so every value is observable
+ * for >= 16 ms, like hardware. (Throttling the DRAIN at fence boundaries
+ * instead starved wrap recycles and wedged the backend -- don't.) */
+#define GCM_REF_QLEN 4096
+static u32 s_ref_q[GCM_REF_QLEN];
+static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
+
+static void gcm_ref_push_at(u32 v, u32 getoff)
+{
+    { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
+      if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
+    u32 t = s_ref_qtail;
+    if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
+        s_ref_qhead++;
+        static int _o = 0;
+        if (_o++ < 4) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+    }
+    s_ref_q[t % GCM_REF_QLEN] = v;
+    s_ref_qtail = t + 1;
+}
+
+/* Global fence-publication counter: lets the lwmutex convoy trace correlate a
+ * long lock hold with the number of paced fence publications inside it (the
+ * 200us pacing x hundreds of one-ahead fences = the ~156ms holds). */
+volatile long long g_gcm_ref_pub_count = 0;
+static void gcm_ref_publish_one(void)
+{
+    u32 h = s_ref_qhead;
+    if (h == s_ref_qtail) return;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+    s_ref_qhead = h + 1;
+    g_gcm_ref_pub_count++;
+}
+
+/* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
+ * ref register (GCM_CONTROL+8). The 60 Hz present-thread ticker publishes only
+ * one queued fence per frame, so when present overruns during heavy boot load
+ * the tick rate -- and thus fence publication -- collapses and an equality-
+ * waiter stalls seconds per fence (the [finspin] boot crawl; the game is not
+ * deadlocked, just starved). Let the spinning reader drive publication too:
+ * this is called from vm_read32 on each ref read, advancing one queued fence,
+ * globally paced to at most one per millisecond so every value stays visible
+ * >= 1 ms to any equality-waiter (no skip-past). Decoupled from present, so a
+ * wait makes progress even when the ticker is starved. Idempotent + additive:
+ * it only ever publishes fences the ticker would eventually publish anyway. */
+/* Serializes the FIFO walker between the 60 Hz present thread and the
+ * poll-path below. TryAcquire on the poll path avoids re-entrancy (the walker
+ * itself performs guest reads) and never blocks a spinning game thread. */
+static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
+static void gcm_rsx_process_fifo_unlocked(void);
+
+/* Kick event: a game thread whose fence wait finds the queue DRY signals the
+ * present thread to run the FIFO walker NOW instead of on its next 16 ms
+ * tick. A movie frame issues ~46 one-ahead cellGcmFinish waits; paying a
+ * 16 ms tick per fence was ~0.75 s/frame (the 2 FPS intro). The walker (and
+ * the D3D12 backend it feeds) stays on the present thread -- running it from
+ * the polling game thread killed the process silently. */
+static HANDLE s_gcm_kick_ev = NULL;
+void* cellGcm_fifo_kick_event(void)
+{
+    if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    return (void*)s_gcm_kick_ev;
+}
+
+/* Serializes fence publication between the present ticker and every guest
+ * thread poll-reading the ref register (REFPOLL default-on made this path
+ * multi-threaded; the SPSC queue head raced and publication order broke --
+ * boot froze with all threads parked on fences that were never published in
+ * order). TryAcquire: a contended poll just reads the current ref. */
+static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
+
+void cellGcm_ref_on_poll(void)
+{
+    /* Pace: leave each published value observable for >= ~200us of spins
+     * (equality-waiters at any poll rate see every value; still ~5000/s so
+     * loading's fence storms clear in seconds, not minutes). */
+    static LARGE_INTEGER s_freq;
+    static volatile LONGLONG s_last_pub;
+    if (!TryAcquireSRWLockExclusive(&s_ref_pub_lock))
+        return;
+    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    LONGLONG min_gap = s_freq.QuadPart / 5000;          /* ~200us */
+    int dry = 0;
+    if (now.QuadPart - s_last_pub >= min_gap) {
+        gcm_ref_publish_one();
+        s_last_pub = now.QuadPart;
+        dry = (s_ref_qhead == s_ref_qtail);
+    }
+    ReleaseSRWLockExclusive(&s_ref_pub_lock);
+    if (dry && s_gcm_kick_ev)
+        SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+}
+
 void cellGcm_rsx_process_fifo(void)
+{
+    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    gcm_rsx_process_fifo_unlocked();
+    ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+}
+
+static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
@@ -754,6 +864,9 @@ void cellGcm_rsx_process_fifo(void)
         }
 
         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+            { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+              if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
+                               s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             s_fifo_getoff = w & 0x1FFFFFFCu;
             continue;
         }
@@ -775,9 +888,13 @@ void cellGcm_rsx_process_fifo(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
-                if (subch == 0)
+                if (subch == 0) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
-                else
+                    /* NV406E_SET_REFERENCE: queue the fence value for PACED
+                     * publication (gcm_ref_publish below) instead of letting a
+                     * later fence in the same batch overwrite it. */
+                    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+                } else
                     gcm_2d_method(subch, m, vm_read32(dea));
             }
             s_fifo_getoff += 4 + count * 4;
@@ -788,12 +905,15 @@ void cellGcm_rsx_process_fifo(void)
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
-    /* Publish progress: get chases put; ref reflects the last SET_REFERENCE
-     * (cellGcmFinish / wait-label spins read these big-endian). The wrap
-     * recycle path also polls the drained EA. */
+    /* Publish progress: get chases put; ref advances at most ONE queued fence
+     * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
+     * value stays observable to equality-waiters. The wrap recycle path polls
+     * the drained EA. */
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, g_rsx_last_reference);       /* ref */
+    AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+    gcm_ref_publish_one();
+    ReleaseSRWLockExclusive(&s_ref_pub_lock);
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
@@ -824,6 +944,15 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     if (getenv("CELLMARK_BLINKDBG"))
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
 
+    static int s_recdbg = -1;
+    if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+    if (s_recdbg)
+        fprintf(stderr, "[REC>] tid=%lu begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
+                GetCurrentThreadId(), begin, current,
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
+                g_gcm_fifo_drained_ea);
+
     /* Do what the SDK's default command-buffer-full callback does: append a
      * JUMP-to-begin at the write head and move `put` to begin. The FIFO walker
      * consumes the tail, follows the jump, and idles at begin; then it's safe
@@ -846,6 +975,13 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
+
+    if (s_recdbg)
+        fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
+                GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
+                g_gcm_fifo_drained_ea, spins);
 }
 
 /* NID: 0xDC09357E */
@@ -881,6 +1017,9 @@ int cellGcmOffsetIsDisplay(u32 offset)
 /* NID: 0xEAA52F23 */
 s32 cellGcmSetFlipCommand(u32 bufferId)
 {
+    { static int _n=0; if (getenv("FLIP_DBG") && _n++ < 20)
+        fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
+                bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
@@ -1262,7 +1401,7 @@ u32 cellGcmResolveLocated(int local, u32 offset)
  * Label / report / timestamp
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x21397818 */
+/* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index)
 {
     if (index >= CELL_GCM_MAX_LABEL_COUNT) {
@@ -1472,12 +1611,19 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
  * bufferId as arg1 made the range check eat the context pointer, so the
  * flip counter never advanced (wave: presents free-ran 4x per frame,
  * layout flashing/zooming). */
+/* NID 0x21397818 is gcmSetFlipCommand (PSL1GHT libgcm_sys exports.h) -- it
+ * was misassigned to cellGcmGetLabelAddress (real NID 0xF80196C1), so every
+ * import-based flip (LBP: cellGcmSetFlip -> stub 0x7482FC(ctx, id)) landed
+ * in the label getter and no flip was EVER issued: the intro-movie pump ran,
+ * drew, "flipped" into the wrong function, and the screen stayed black. */
+/* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
     (void)ctx;
     return cellGcmSetFlipCommand(bufferId);
 }
 
+/* NID: 0xD8F88E1A */
 s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
                                         u32 labelIndex, u32 labelValue)
 {

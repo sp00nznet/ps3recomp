@@ -322,14 +322,14 @@ loc_000002A4:
         /* TODO spu: .word 0x36802341 */;
         ctx->gpr[69] = spu_selb(ctx->gpr[68], ctx->gpr[67], ctx->gpr[63]);
         ctx->gpr[65] = spu_shufb(ctx->gpr[66], ctx->gpr[64], ctx->gpr[12]);
-        if (ctx->gpr[63]._u16[1] != 0) goto loc_00000160;
+        if (ctx->gpr[63]._u16[0] != 0) goto loc_00000160;
         ctx->gpr[62] = spu_ceq(ctx->gpr[20], ctx->gpr[12]);
         ctx->gpr[7] = spu_rotqbyi(ctx->gpr[12], 0);
         ctx->gpr[61] = spu_sfi(ctx->gpr[62], 0);
         ctx->gpr[60] = spu_or(ctx->gpr[29], ctx->gpr[61]);
         ctx->gpr[59] = spu_ceqbi(ctx->gpr[60], 0);
         ctx->gpr[58] = spu_fscrrd(ctx->gpr[59]);
-        if (ctx->gpr[58]._u16[1] == 0) goto loc_00000610;
+        if (ctx->gpr[58]._u16[0] == 0) goto loc_00000610;
         ctx->gpr[4] = spu_sfi(ctx->gpr[12], 0);
         ctx->gpr[10] = spu_andi(ctx->gpr[23], 255);
         ctx->gpr[18] = spu_rotmai(ctx->gpr[127], -3);
@@ -338,7 +338,7 @@ loc_000002A4:
         ctx->gpr[4] = spu_ceq(ctx->gpr[12], ctx->gpr[10]);
         ctx->gpr[73] = spu_orc(ctx->gpr[19], ctx->gpr[13]);
         ctx->gpr[15] = spu_selb(ctx->gpr[73], ctx->gpr[18], ctx->gpr[67]);
-        if (ctx->gpr[67]._u16[1] != 0) goto loc_000000F0;
+        if (ctx->gpr[67]._u16[0] != 0) goto loc_000000F0;
         goto loc_00000558;
 loc_00000514:
         ctx->gpr[16] = spu_rotmahi(ctx->gpr[26], 0);
@@ -348,15 +348,15 @@ loc_00000514:
         ctx->gpr[55] = spu_rotmi(ctx->gpr[0], -480);
         /* TODO spu: .word 0x16081B8C */;
         ctx->gpr[54] = spu_selb(ctx->gpr[38], ctx->gpr[53], ctx->gpr[17]);
-        if (ctx->gpr[17]._u16[1] != 0) goto loc_00000160;
-        if (ctx->gpr[31]._u16[1] == 0) goto loc_0000057C;
+        if (ctx->gpr[17]._u16[0] != 0) goto loc_00000160;
+        if (ctx->gpr[31]._u16[0] == 0) goto loc_0000057C;
         ctx->gpr[9] = spu_orc(ctx->gpr[6], ctx->gpr[4]);
         ctx->gpr[57] = spu_rotmai(ctx->gpr[109], -3);
         ctx->gpr[58] = spu_rotmhi(ctx->gpr[1], -510);
         ctx->gpr[59] = spu_rotmi(ctx->gpr[0], -480);
         /* TODO spu: .word 0x16081D8C */;
         ctx->gpr[58] = spu_selb(ctx->gpr[9], ctx->gpr[57], ctx->gpr[56]);
-        if (ctx->gpr[56]._u16[1] != 0) goto loc_000000F0;
+        if (ctx->gpr[56]._u16[0] != 0) goto loc_000000F0;
         goto loc_0000057C;
 loc_00000558:
         ctx->gpr[64] = spu_or(ctx->gpr[24], ctx->gpr[4]);
@@ -366,7 +366,7 @@ loc_00000558:
         /* TODO spu: .word 0x3A81C0BE */;
         ctx->gpr[68] = spu_selb(ctx->gpr[64], ctx->gpr[63], ctx->gpr[61]);
         ctx->gpr[62] = spu_selb(ctx->gpr[39], ctx->gpr[27], ctx->gpr[8]);
-        if (ctx->gpr[61]._u16[1] != 0) goto loc_000000E0;
+        if (ctx->gpr[61]._u16[0] != 0) goto loc_000000E0;
         if (ctx->gpr[60]._u32[0] == 0) goto loc_00000580;
 loc_0000057C:
         ctx->gpr[8] = spu_il(0);
@@ -384,9 +384,9 @@ loc_00000580:
         ctx->gpr[74] = spu_ceqi(ctx->gpr[14], 0);
         ctx->gpr[9] = spu_shufb(ctx->gpr[26], ctx->gpr[65], ctx->gpr[69]);
         /* TODO spu: .word 0x36802506 */;
-        if (ctx->gpr[69]._u16[1] != 0) goto loc_000000A0;
+        if (ctx->gpr[69]._u16[0] != 0) goto loc_000000A0;
         ctx->gpr[6] = spu_shufb(ctx->gpr[72], ctx->gpr[21], ctx->gpr[71]);
-        if (ctx->gpr[71]._u16[1] != 0) goto loc_000000B0;
+        if (ctx->gpr[71]._u16[0] != 0) goto loc_000000B0;
         /* sync */;
         ctx->gpr[70] = spu_rotmai(ctx->gpr[95], -3);
         spu_wrch(ctx, MFC_LSA, ctx->gpr[28]);
@@ -401,9 +401,9 @@ loc_00000580:
         ctx->gpr[27] = spu_rotmai(ctx->gpr[69], -3);
         ctx->gpr[30] = spu_il(0);
         ctx->gpr[6] = spu_shufb(ctx->gpr[8], ctx->gpr[30], ctx->gpr[29]);
-        if (ctx->gpr[29]._u16[1] != 0) goto loc_00000110;
+        if (ctx->gpr[29]._u16[0] != 0) goto loc_00000110;
         ctx->gpr[9] = spu_shufb(ctx->gpr[8], ctx->gpr[27], ctx->gpr[22]);
-        if (ctx->gpr[22]._u16[1] != 0) goto loc_00000100;
+        if (ctx->gpr[22]._u16[0] != 0) goto loc_00000100;
         if (ctx->gpr[10]._u32[0] != 0) goto loc_00000628;
         ctx->gpr[7] = spu_ori(ctx->gpr[20], 0);
         goto loc_00000628;
@@ -412,14 +412,14 @@ loc_00000610:
         ctx->gpr[11] = spu_rotmai(ctx->gpr[55], -3);
         ctx->gpr[66] = spu_rotmhi(ctx->gpr[1], -384);
         ctx->gpr[66] = spu_selb(ctx->gpr[19], ctx->gpr[11], ctx->gpr[79]);
-        if (ctx->gpr[79]._u16[1] != 0) goto loc_000000F0;
+        if (ctx->gpr[79]._u16[0] != 0) goto loc_000000F0;
         goto loc_00000558;
 loc_00000628:
         ctx->gpr[3] = spu_ori(ctx->gpr[12], 0);
         ctx->gpr[32] = spu_rotmai(ctx->gpr[73], -3);
         ctx->gpr[33] = spu_rotmhi(ctx->gpr[1], -244);
         ctx->gpr[33] = spu_selb(ctx->gpr[7], ctx->gpr[32], ctx->gpr[31]);
-        if (ctx->gpr[31]._u16[1] != 0) goto loc_00000150;
+        if (ctx->gpr[31]._u16[0] != 0) goto loc_00000150;
         return;
 loc_00000640:
         ctx->gpr[23] = spu_shlqbii(ctx->gpr[3], 5);
@@ -490,14 +490,14 @@ loc_00000640:
         ctx->gpr[33] = spu_andi(ctx->gpr[35], 255);
         ctx->gpr[34] = spu_selb(ctx->gpr[33], ctx->gpr[32], ctx->gpr[30]);
         ctx->gpr[31] = spu_selb(ctx->gpr[29], ctx->gpr[30], ctx->gpr[28]);
-        if (ctx->gpr[28]._u16[1] != 0) goto loc_00000150;
+        if (ctx->gpr[28]._u16[0] != 0) goto loc_00000150;
         /* sync */;
 loc_00000758:
         ctx->gpr[44] = spu_il(0);
         ctx->gpr[43] = spu_rotmai(ctx->gpr[1], -3);
         ctx->gpr[45] = spu_rotmhi(ctx->gpr[1], -376);
         ctx->gpr[45] = spu_selb(ctx->gpr[44], ctx->gpr[43], ctx->gpr[42]);
-        if (ctx->gpr[42]._u16[1] != 0) goto loc_00000160;
+        if (ctx->gpr[42]._u16[0] != 0) goto loc_00000160;
         ctx->gpr[41] = spu_roti(ctx->gpr[120], -1);
         ctx->gpr[5] = spu_ori(ctx->gpr[11], 0);
         ctx->gpr[3] = spu_ila(0x100);
@@ -517,7 +517,7 @@ loc_00000758:
         ctx->gpr[5] = spu_selb(ctx->gpr[4], ctx->gpr[8], ctx->gpr[7]);
         ctx->gpr[6] = spu_selb(ctx->gpr[3], ctx->gpr[7], ctx->gpr[2]);
         ctx->gpr[3] = spu_rotmi(ctx->gpr[0], -480);
-        if (ctx->gpr[2]._u16[1] != 0) goto loc_00000140;
+        if (ctx->gpr[2]._u16[0] != 0) goto loc_00000140;
         /* TODO spu: .word 0x16080183 */;
         ctx->gpr[0] = spu_splat_u32(0x7C4); spu_func_00000640(ctx);
         /* nop */;

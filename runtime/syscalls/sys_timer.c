@@ -105,7 +105,14 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
-    { static int n=0; if (n++ < 30) fprintf(stderr, "[WAIT] timer_usleep(%llu us)\n", (unsigned long long)usec); }
+    { static int n=0; if (n++ < 60) fprintf(stderr, "[WAIT] timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n",
+        (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
+    /* POLLSITE: resolve the host chain of the 1ms poller (LBP bringup) to
+     * guest functions -- names the stage that is starving. */
+    { static int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
+      if (_ps > 0 && usec == 1000) { _ps--;
+        extern void ppu_log_host_chain(const char*);
+        ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */

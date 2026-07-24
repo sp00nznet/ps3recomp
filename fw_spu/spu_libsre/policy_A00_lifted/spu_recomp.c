@@ -193,7 +193,7 @@ void spu_func_00000BF8(spu_context* ctx) {
         ctx->gpr[56] = spu_ceqbi(ctx->gpr[57], 0);
         ctx->gpr[54] = spu_xsbh(ctx->gpr[56]);
         spu_ls_write128(ctx, 0xAE0, ctx->gpr[55]);
-        if (ctx->gpr[54]._u16[1] != 0) { ctx->pc = 0xFB8; spu_func_00000FB8(ctx); return; }
+        if (ctx->gpr[54]._u16[0] != 0) { ctx->pc = 0xFB8; spu_func_00000FB8(ctx); return; }
         ctx->gpr[2] = spu_sfi(ctx->gpr[18], 0);
         ctx->gpr[78] = spu_ls_read128(ctx, 0xA70);
         ctx->gpr[20] = spu_sfi(ctx->gpr[18], 0);
@@ -228,7 +228,7 @@ void spu_func_00000EC8(spu_context* ctx) {
         ctx->gpr[18] = spu_andbi(ctx->gpr[56], 32);
         ctx->gpr[55] = spu_selb(ctx->gpr[44], ctx->gpr[52], ctx->gpr[51]);
         spu_ls_write128(ctx, 0xAE0, ctx->gpr[51]);
-        if (ctx->gpr[36]._u16[1] != 0) { ctx->pc = 0xF04; spu_func_00000F04(ctx); return; }
+        if (ctx->gpr[36]._u16[0] != 0) { ctx->pc = 0xF04; spu_func_00000F04(ctx); return; }
         ctx->gpr[7] = spu_andc(ctx->gpr[9], ctx->gpr[4]);
         ctx->gpr[5] = spu_ls_read128(ctx, 0xA70);
         ctx->gpr[17] = spu_cbd(ctx->gpr[1], 2);

@@ -5,11 +5,13 @@ Find SPU function boundaries inside an embedded SPU ELF.
 Emits a JSON list of {"start": addr, "end": addr} ready for
 `spu_lifter.py --functions`.
 
-Seeds the function set from three sources:
+Seeds the function set from four sources:
   1. ELF entry point (e_entry).
   2. Symbol table -- STT_FUNC entries (with their st_value/st_size if size
      is non-zero, which gives us *exact* boundaries when present).
   3. All brsl/brasl targets the disassembler can resolve in the code.
+  4. Addresses loaded into $r0 by `il`/`ila` -- the link-register resume
+     idiom (see collect_link_register_targets).
 
 For each function start without a symbol-provided size, the end is
 determined by scanning forward until we hit one of:
@@ -165,6 +167,364 @@ def collect_branch_targets(insns):
     return targets
 
 
+def collect_link_register_targets(insns):
+    """Addresses loaded into $r0 (the SPU ABI link register) by an immediate.
+
+    Not every call site is a `brsl`. Both hand-written SPU code and the SDK's
+    shared stubs set up a resume address by hand and then reach the stub with a
+    PLAIN branch, because the stub is entered from several places and spills the
+    link register to LS rather than keeping it in $r0:
+
+        2ce0:  ila  $r0, 0x2cf0      <- resume address, set by hand
+        2ce4:  lqa  $r2, 0x12c0
+        2ce8:  cgti $r2, $r2, -1
+        2cec:  brnz $r2, 0x3038      <- plain branch, NOT brsl
+        2cf0:  lqa  $r0, 0x12a0      <- the stub returns HERE via `bi $r0`
+        ...
+        3038:  lqa  $r3, 0x13f0
+        3040:  stqa $r0, 0x1570      <- stub spills the hand-set link register
+
+    Nothing ever *branches* to 0x2cf0, so the branch-target scan cannot see it,
+    and the address is only ever materialised as an immediate. Without seeding
+    it the address is a mid-function label: the `bi $r0` return resolves through
+    spu_indirect_branch -> spu_lookup(), finds no registered function, and halts
+    the SPU (SPU_STATUS_STOPPED_BY_HALT). Observed in LBP's wwsjob SPURS policy
+    module, which halted at LS 0x2cf0 on every dispatch.
+
+    Restricted to $r0: setting the *link register* to a code address means
+    "resume here", which is a strong signal. Loading a code-looking constant
+    into any other register is usually just data (the same PM does
+    `ila $r81, 0x1440` for a table base). Over-seeding is cheap anyway -- the
+    lifter chains fall-through between adjacent functions -- but a tight filter
+    keeps the output honest.
+    """
+    targets = set()
+    for ins in insns:
+        if ins.mnemonic not in ("il", "ila"):
+            continue
+        ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        if len(ops) != 2 or ops[0] != "$r0":
+            continue
+        tok = ops[1]
+        try:
+            # `ila` renders hex ("0x2CF0"), `il` renders signed decimal.
+            targets.add(int(tok, 16) if tok.lower().startswith(("0x", "-0x"))
+                        else int(tok, 10))
+        except ValueError:
+            pass
+    return targets
+
+
+_INDIRECT_BR = {"bi", "bisl", "bisled", "biz", "binz", "bihz", "bihnz"}
+
+
+def collect_computed_branch_targets(insns, window=8):
+    """Targets of `bi $rN` where $rN was just loaded with an immediate address.
+
+    The link-register form (collect_link_register_targets) is not the only way
+    the SPU materialises a branch target as a constant. The interrupt-window
+    idiom uses a *scratch* register, because `bie`/`bid` (branch indirect and
+    enable/disable interrupts) are the only way to toggle the interrupt bit
+    atomically with a jump:
+
+        2d2c:  ila $r0, 0x2d40     <- where to resume once interrupts are off
+        2d30:  ila $r2, 0x2d38     <- where to land with interrupts on
+        2d34:  bie $r2             <- jump to 0x2d38, interrupts ENABLED
+        2d38:  ai  $r0, $r0, 0     <- the window: any pending interrupt fires here
+        2d3c:  bid $r0             <- jump to 0x2d40, interrupts DISABLED
+        2d40:  ...
+
+    We decode `bie`/`bid` as plain `bi` (the D/E bits only gate interrupts,
+    which we do not model -- the branch itself is identical), so both land in
+    spu_indirect_branch and both targets must be registered. 0x2d40 comes from
+    the $r0 scan; 0x2d38 only from here. Observed in LBP's wwsjob SPURS policy
+    module, which halted at 0x2d38 once the $r0 case was fixed.
+
+    Scans backward a short window for the nearest `il`/`ila` writing the branch
+    register -- the same "nearest preceding writer" technique compute_bi_r0_jumps
+    uses. Keeping the window local is what makes this precise: an `ila` feeding a
+    branch two instructions later is a jump target; a code-shaped constant loaded
+    somewhere else entirely is usually just data.
+    """
+    targets = set()
+    for idx, ins in enumerate(insns):
+        if ins.mnemonic not in _INDIRECT_BR:
+            continue
+        ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        # bi/bisl emit only the target reg; biz/binz/bihz/bihnz emit (cond, target).
+        if not ops or not ops[-1].startswith("$r"):
+            continue
+        reg = ops[-1]
+        for j in range(idx - 1, max(-1, idx - 1 - window), -1):
+            w = insns[j]
+            if w.mnemonic not in ("il", "ila"):
+                continue
+            wops = [t.strip() for t in w.operands.split(",") if t.strip()]
+            if len(wops) != 2 or wops[0] != reg:
+                continue
+            tok = wops[1]
+            try:
+                targets.add(int(tok, 16) if tok.lower().startswith(("0x", "-0x"))
+                            else int(tok, 10))
+            except ValueError:
+                pass
+            break   # nearest writer decides
+    return targets
+
+
+def collect_jump_table_targets(insns, code, code_start, code_end,
+                               window=48, max_entries=32):
+    """Targets reached through an in-code JUMP TABLE:
+
+        ila  $r14, 0x1724C          <- TABLE base (an LS address in .text)
+        shli $r13, $r15, 2          <- selector * 4
+        lqx  $r11, $r13, $r14       <- load the 16-byte line holding the entry
+        rotqby $r3, $r11, $r12      <- extract the 32-bit entry
+        bi   $r3                    <- dispatch
+
+    The `ila` materialises the table ADDRESS, not a branch target, so the
+    il/ila-into-branch-register scans never see the entries — none of the
+    handlers get lifted, every dispatch lands in spu_indirect_branch as a
+    lookup MISS, and the C call chain silently unwinds to the lifted caller:
+    the handler is skipped AND the guest stack frame is never restored.
+    (Observed in LBP's FMOD SPU mixer: the 7-entry DSP-node table at LS
+    0x1724C leaked 0x60 of guest stack per mix cycle until the task's LS was
+    destroyed — and the skipped handlers were the entire DSP graph.)
+
+    Recognizer: anchored on the `il`/`ila` itself, NOT on the branch. Pairing
+    the table load with its `bi` by scanning a linear window fails in real
+    code: compilers hoist the handler computation far above the dispatch and
+    REACH the `bi` by a jump (LBP's shared loading job computes the handler
+    ~140 instructions before the function epilogue's `bi $r2` and jumps
+    there), so no window connects them. Instead, EVERY `il`/`ila` whose
+    immediate is a 4-aligned in-code address is tried as a table base; it
+    qualifies if the words there form a plausible table (below). A false
+    positive only adds an entry point at a valid instruction boundary — cheap;
+    a false negative silently skips an entire handler class — fatal.
+
+    A table entry can be ABSOLUTE (the word is the handler address —
+    pm_wwsjob's DSP table) or TABLE-RELATIVE (the code adds the table base
+    before branching — LBP's loading job: table @0x198C = {0x8C,0x2F4,...},
+    handlers at 0x198C+off). Which one it is can't be decided locally, so BOTH
+    in-code-segment interpretations are seeded: a wrong-side seed is just an
+    extra entry point at a valid instruction boundary, while a missing
+    right-side seed loses the whole handler. Consecutive BE u32 words are read
+    while at least one interpretation is a 4-aligned VALID INSTRUCTION START
+    (the first word where neither is — adjacent float/data constants —
+    terminates the table); bases yielding fewer than 2 entries are ignored.
+    """
+    del window                       # kept in the signature for compatibility
+    valid_starts = {ins.addr for ins in insns}
+    targets = set()
+    seen_bases = set()
+    for ins in insns:
+        if ins.mnemonic not in ("il", "ila"):
+            continue
+        wops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        if len(wops) != 2:
+            continue
+        try:
+            tok = wops[1]
+            tbl = int(tok, 16) if tok.lower().startswith(("0x", "-0x")) else int(tok, 10)
+        except ValueError:
+            continue
+        if tbl == 0 or (tbl & 3) or not (code_start <= tbl < code_end):
+            continue
+        if tbl in seen_bases:
+            continue
+        seen_bases.add(tbl)
+        off = tbl - code_start
+        entries = set()
+        for k in range(max_entries):
+            o = off + 4 * k
+            if o + 4 > len(code):
+                break
+            wrd = int.from_bytes(code[o:o + 4], "big")
+            if wrd & 3:
+                break
+            abs_ok = wrd in valid_starts
+            # SIGNED table-relative entries: Bink's dispatch table at LS 0xCC7C
+            # mixes positive and negative offsets (0xFFFFBF64 = -0x409C ->
+            # 0x8BE0). The unsigned add produced 0x100008BE0, failed
+            # validation, and ended the table walk one entry in -- masking to
+            # the 18-bit LS space is what the hardware add does anyway.
+            rel = (tbl + wrd) & 0x3FFFF
+            rel_ok = (rel & 3) == 0 and rel in valid_starts
+            if not abs_ok and not rel_ok:
+                break           # neither reading decodes as code -- table end
+            if abs_ok:
+                entries.add(wrd)
+            if rel_ok:
+                entries.add(rel)
+        if len(entries) >= 2:
+            targets.update(entries)
+    return targets
+
+
+def collect_ila_continuation_targets(insns, code_start, code_end):
+    """Continuation addresses materialised as plain immediates:
+
+        6114:  ila $r29, 0x52D8      <- where the SUBROUTINE should return to
+        ...    (30+ scheduled setup instructions)
+        61A0:  br  0x8500            <- enter the subroutine
+        ...
+        8500:  ...  bi $r29          <- 'return' to the caller's continuation
+
+    The manual-link idiom, but with the `ila` in the CALLER and the `bi` in the
+    CALLEE — no local window ever connects them, so neither the link-register
+    scan nor collect_computed_branch_targets sees 0x52D8, and the whole basic
+    block at the continuation is never lifted. LBP's Bink SPU decoder chains
+    dozens of these; missing them dropped the ENTIRE back half of the decoder
+    (IDCT/motion-comp, ~59 functions) from the lift, surfacing at runtime as
+    unresolved-indirect-branch misses (the C call chain then silently unwinds).
+
+    Also pairs `ilhu $rN, hi` + `iohl $rN, lo` (the 32-bit two-step form —
+    Bink builds 0xDE94 that way).
+
+    Seeds EVERY il/ila/ilhu+iohl immediate that is a 4-aligned in-code address
+    decoding at an instruction boundary. Same cost argument as the jump-table
+    scan above: a false positive only adds an entry point at a valid
+    instruction boundary; a false negative loses an entire code region.
+    """
+    valid_starts = {ins.addr for ins in insns}
+    targets = set()
+    ilhu_val = {}                     # reg -> pending high halfword
+    for ins in insns:
+        wops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        if len(wops) != 2:
+            continue
+        try:
+            tok = wops[1]
+            imm = int(tok, 16) if tok.lower().startswith(("0x", "-0x")) else int(tok, 10)
+        except ValueError:
+            continue
+        cand = None
+        if ins.mnemonic in ("il", "ila"):
+            cand = imm
+        elif ins.mnemonic == "ilhu":
+            ilhu_val[wops[0]] = (imm & 0xFFFF) << 16
+            continue
+        elif ins.mnemonic == "iohl" and wops[0] in ilhu_val:
+            cand = ilhu_val.pop(wops[0]) | (imm & 0xFFFF)
+        if cand is None:
+            continue
+        if cand and (cand & 3) == 0 and code_start <= cand < code_end \
+           and cand in valid_starts:
+            targets.add(cand)
+    return targets
+
+
+def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
+    """Mid-ladder entries of a Duff's device (computed jump into an unrolled
+    loop). Sony's SPU job CRT clears BSS with one:
+
+        brsl $r8, .+4               <- PC-getter: r8 = link address
+        andi $r6, $r6, 112          <- residual = (count & 112)
+        rotmi $r4, $r6, -2          <- ... >> 2  (0,4,...,28)
+        ai   $r8, $r8, 36           <- base = link + 36
+        a    $r8, $r8, $r4          <- + residual
+        bi   $r8                    <- jump INTO the stqd ladder
+
+    The targets are mid-function addresses no table scan can see; the miss
+    unwinds the C call chain out of the CRT, skipping everything after the
+    clear loop (observed in LBP's loading job as branch-to-0 pc=0x207E4).
+    Recognizer: a `bi $rX` whose register was built from a PC-getter
+    (`brsl $rX, .+4`) plus an immediate `ai $rX, $rX, K` within `window`
+    instructions. Seed link+K plus the following `span` bytes at 4-byte
+    stride — the ladder entries are all real instruction starts, and the
+    final in-code/valid-instruction filter drops any overshoot."""
+    targets = set()
+    for idx, ins in enumerate(insns):
+        if ins.mnemonic != "bi":
+            continue
+        ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+        if len(ops) != 1 or not ops[0].startswith("$r") or ops[0] == "$r0":
+            continue
+        reg = ops[0]
+        link = None
+        imm = 0
+        for j in range(idx - 1, max(-1, idx - 1 - window), -1):
+            w = insns[j]
+            wops = [t.strip() for t in w.operands.split(",") if t.strip()]
+            if w.mnemonic == "ai" and len(wops) == 3 \
+                    and wops[0] == reg and wops[1] == reg:
+                try:
+                    imm += int(wops[2], 0)
+                except ValueError:
+                    break
+                continue
+            if w.mnemonic in ("brsl", "brasl") and wops and wops[0] == reg:
+                try:
+                    tgt = int(wops[-1], 0)
+                except ValueError:
+                    break
+                if tgt == w.addr + 4:       # PC-getter, not a real call
+                    link = w.addr + 4
+                break
+        if link is None or imm <= 0:
+            continue
+        base = link + imm
+        for o in range(0, span + 4, 4):
+            t = base + o
+            if code_start <= t < code_end:
+                targets.add(t)
+    return targets
+
+
+def collect_function_pointer_tables(buf, phs, code_start, code_end,
+                                    insns_by_addr, min_run=3, max_run=1024):
+    """Function-pointer tables that live in DATA, not .text.
+
+    A program can dispatch through an array of code addresses: it loads an entry
+    from a table in the data segment and calls/branches through it. LBP's FMOD
+    SPU mixer does exactly this -- it walks a DSP-node handler table and calls
+    each node's process function via `bisl $r0,$r3`, r3 loaded from the table.
+    Because the pointers live in the R/W data segment and are materialised by a
+    memory load (no `ila <target>` in the code), NONE of the code-scan seeders
+    (branch / link-register / computed / jump-table) can find them: every
+    dispatch through an entry lands in spu_indirect_branch as a lookup MISS ->
+    branch-to-0, and the handler (an entire DSP effect) is skipped, so the mixer
+    never finishes and never sets its completion event flag (the FMOD boot
+    deadlock's audio-path form).
+
+    Observed: a 5-entry table at LS 0x1AB04 in the flags=6 (R/W) segment =
+    {0x0B980,0x0C5F0,0x15CF8,0x16D70,0x17100}; the trailing 0x0 sentinel is why
+    a dispatch also reached pc=0x00000.
+
+    Recogniser: scan every PT_LOAD segment for runs of >= min_run consecutive
+    4-aligned BE32 words that are ALL valid instruction starts inside .text
+    (present in insns_by_addr). A run that long of in-range, aligned code
+    addresses is a pointer table, not incidental data: the text base is well
+    above 0 so small counters/sizes/enums fall below code_start, real SPU
+    opcodes encode high bits far above code_end, and float/vector constants
+    almost never form a 3+ aligned-in-range sequence. A distinct-value guard
+    stops a filled/repeated constant region from seeding.
+    """
+    targets = set()
+    for ph in phs:
+        if ph.get("type") != 1:            # PT_LOAD only
+            continue
+        off, fsz, vaddr = ph["off"], ph["filesz"], ph["vaddr"]
+        seg = buf[off:off + fsz]
+        skew = (-vaddr) & 3                 # keep words on the LS 4-byte grid
+        run = []
+        def _flush(r):
+            if len(r) >= min_run and len(set(r)) >= 2:
+                targets.update(r)
+        i = skew
+        while i + 4 <= len(seg):
+            w = int.from_bytes(seg[i:i + 4], "big")
+            if (w & 3) == 0 and code_start <= w < code_end and w in insns_by_addr:
+                run.append(w)
+                if len(run) >= max_run:
+                    _flush(run); run = []
+            else:
+                _flush(run); run = []
+            i += 4
+        _flush(run)
+    return targets
+
+
 # Kept for backwards compatibility / call-only counting.
 def collect_brsl_targets(insns):
     return {t for ins in insns if ins.mnemonic in ("brsl", "brasl")
@@ -239,6 +599,23 @@ def detect_functions(buf, base_override=None, verbose=True):
     for t in collect_branch_targets(insns):
         if code_start <= t < code_end:
             seed_starts.add(t)
+    # Link-register resume addresses (`il`/`ila $r0, <code>` + a plain branch to
+    # a stub that returns via `bi $r0`). Require the target to be 4-byte aligned
+    # AND to decode as an instruction, so a scratch use of $r0 that happens to
+    # hold a small constant cannot seed a bogus function.
+    fptr_targets = collect_function_pointer_tables(
+        buf, elf["phs"], code_start, code_end, insns_by_addr)
+    for t in (collect_link_register_targets(insns)
+              | collect_computed_branch_targets(insns)
+              | collect_jump_table_targets(insns, code, code_start, code_end)
+              | collect_ila_continuation_targets(insns, code_start, code_end)
+              | collect_duff_targets(insns, code_start, code_end)
+              | fptr_targets):
+        if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
+            seed_starts.add(t)
+    if fptr_targets and verbose:
+        print(f"  {len(fptr_targets)} data function-pointer-table target(s): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(fptr_targets))}")
 
     # Always cover the entry of the text segment itself (some images have no
     # entry point but a function at va 0).
