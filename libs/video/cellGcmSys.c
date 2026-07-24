@@ -547,8 +547,10 @@ void cellGcm_request_tick(void)
  * while already inside a guest callback (shared scratch stack). */
 void ppu_gcm_pump(void)
 {
-    extern int ppu_in_guest_callback(void);
-    if (ppu_in_guest_callback()) return;
+    /* (faithful-adopt-caner fold: dropped the ydkj ppu_in_guest_callback() guard
+     * -- sagemono's runtime has no guest-call-depth counter; the local `in`
+     * re-entrancy guard below still holds. Re-add depth tracking if a nested-
+     * callback flip regression appears in flow.) */
 #ifdef _WIN32
     static __declspec(thread) int in = 0;
 #else

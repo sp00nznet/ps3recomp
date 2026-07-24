@@ -1861,3 +1861,36 @@ extern "C" void ydkj_host_bt(const char* tag)
     (void)tag;
 #endif
 }
+
+/* Re-added on the faithful-adopt-caner fold: referenced by kept ydkj diagnostics. */
+/* Guest call-stack tracer: recover the guest call chain from the HOST stack.
+ * Each lifted func_X(ctx) is a real host C frame, and an indirect dispatch runs
+ * NESTED as dispatcher -> ps3_indirect_call -> target, so the host backtrace
+ * (resolved to guest func_ via function_table) reliably names the dispatcher --
+ * unlike the guest-sp back-chain, which breaks on SPURS threads / non-standard
+ * frames. Trampolined tail-calls (g_trampoline_fn) flatten and won't appear, so
+ * this is paired with the raw-stack scan in ppu_dump_guest_stack for coverage. */
+extern "C" void ppu_guest_callstack(const char* tag)
+{
+#ifdef _WIN32
+    void* bt[48]; unsigned short fr = RtlCaptureStackBackTrace(0, 48, bt, 0);
+    char gs[1500]; int gp = snprintf(gs, sizeof gs, "[GCS:%s] host-bt->guest:", tag ? tag : "?");
+    uint32_t last = 0;
+    for (int i = 0; i < fr && gp < 1400; i++) {
+        uintptr_t tgt = (uintptr_t)bt[i];
+        uint32_t bg = 0; uintptr_t bh = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > bh) { bh = h; bg = function_table[k].addr; }
+        }
+        if (bg && (tgt - bh) < 0x8000 && bg != last) {
+            gp += snprintf(gs+gp, sizeof(gs)-gp, " func_%08X+0x%llX", bg, (unsigned long long)(tgt-bh));
+            last = bg;
+        }
+    }
+    fprintf(stderr, "%s\n", gs); fflush(stderr);
+#else
+    (void)tag;
+#endif
+}
+

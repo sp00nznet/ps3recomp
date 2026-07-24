@@ -86,70 +86,8 @@ static inline u128 spu_mpy(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._s3
 static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
 /* sfx: extended subtract rb-ra-1+carry; carry-in = low bit of old rt (RT is 3rd src). */
 static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
-/* fi: floating interpolate. RB is disassembled per the Floating Reciprocal
- * Estimate encoding (SPU_ISA_v1.2_27Jan2007_pub.pdf, "Floating Reciprocal
- * Estimate" p.214, "Floating Reciprocal Absolute Square Root Estimate"
- * p.216 -- same base/step field layout in both): sign(1) | biased
- * exponent(8) | base fraction(13) | step fraction(10). RA bits 13:31 (its
- * low 19 bits) supply the interpolation fraction Y = (RA & 0x7FFFF) / 2^19.
- * Per ISA "Floating Interpolate" p.219:
- *   RT = (-1)^S * (1.BaseFraction - 0.000_StepFraction * Y) * 2^(exp-127)
- * sign|exp|BaseFraction (RB's top 22 bits) is already a valid IEEE-754 bit
- * pattern for the Base term, so `RB & 0xFFFFFC00` reinterpreted as float
- * gives Base directly; StepFraction has 3 implicit leading zero bits ahead
- * of its own 10 bits (the "0.000" prefix), i.e. Step = StepFrac*2^(exp-127-13),
- * same sign as Base.
- *
- * Verified bit-exact against RPCS3's ASMJIT recompiler
- * (rpcs3/rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp, spu_recompiler::FI,
- * lines 3997-4044) by transcribing its integer bit-manipulation sequence
- * and comparing outputs across 500,000 random 32-bit RA/RB patterns (zero
- * mismatches > 1e-6 relative) plus 300,000 realistic reciprocal-shaped
- * patterns (zero mismatches).
- *
- * ORACLE TRAP: RPCS3's *interpreter* FI (SPUInterpreter.cpp:2679-2684) is
- * an unimplemented stub -- `spu.gpr[op.rt] = spu.gpr[op.rb]; return true;`
- * with a `// TODO` comment. Do NOT use it as an oracle; only the ASMJIT
- * recompiler (or LLVM recompiler, if checked) has real fi semantics.
- *
- * Old code (`y*(2.0f-a*b*y)`, a generic self-contained Newton-Raphson step)
- * never decoded RB's base/step bit-fields at all -- confirmed wrong, not
- * merely imprecise:
- *
- *   Example 1: x=5.331123525209338
- *     RA(bits)=0x40aa9890  RB(bits)=0x3e401460
- *     true 1/x            = 0.18757772076960696
- *     correct fi (ISA)    = 0.18710096180438995   (RPCS3 ASMJIT: same)
- *     old spu_fi output   = 0.3399700402100933    (~2x off)
- *
- *   Example 2: x=-76.91874321984837
- *     RA(bits)=0xc299d666  RB(bits)=0xbc550106
- *     true 1/x            = -0.013000732437109771
- *     correct fi (ISA)    = -0.012943098139658105 (RPCS3 ASMJIT: -0.01294309739023447)
- *     old spu_fi output   = -0.026170483918120862  (~2x off)
- *
- *   Example 3: x=10.859253470350062
- *     RA(bits)=0x412dbf81  RB(bits)=0x3dbc984c
- *     true 1/x            = 0.09208736150513334
- *     correct fi (ISA)    = 0.09167017677100375   (RPCS3 ASMJIT: 0.09167017042636871)
- *     old spu_fi output   = 0.17569464086128958    (~2x off)
- */
-static inline u128 spu_fi(u128 a, u128 b) {
-    u128 r;
-    for (int i = 0; i < 4; i++) {
-        uint32_t rb = b._u32[i];
-        uint32_t ra = a._u32[i];
-        uint32_t exp = (rb >> 23) & 0xFFu;
-        uint32_t base_bits = rb & 0xFFFFFC00u;
-        float base; memcpy(&base, &base_bits, sizeof base);
-        uint32_t step_frac = rb & 0x3FFu;
-        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
-        if (base < 0.0f) step = -step;
-        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
-        r._f32[i] = base - step * y;
-    }
-    return r;
-}
+/* fi: floating interpolate (reciprocal refine after frest) — Newton-step approximation. */
+static inline u128 spu_fi(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ float y=b._f32[i]; r._f32[i]=y*(2.0f-a._f32[i]*y); } return r; }
 static inline u128 spu_mpyu(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[i*2]*(uint32_t)b._u16[i*2]; return r; }
 static inline u128 spu_mpyi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int16_t)imm; return r; }
 
@@ -257,18 +195,9 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; float f=exp2f((float)(155-
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; float f=exp2f((float)(155-i8)-155.0f);
     for(int i=0;i<4;i++) r._f32[i]=(float)a._u32[i]*f; return r; }
 static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
-/* fma/fms/fnms: the SPU multiply is EXACT (single final rounding = true fused
- * multiply-add), ISA v1.2 p208/210/212 "the multiplication is exact and not
- * subject to limits on its range". Plain a*b+c under /fp:precise double-rounds
- * (rounds the product to f32 first) -> sparse 1-ULP errors; fmaf() gives the
- * single-rounded result RPCS3's precise interpreter (std::fma) also uses.
- * fms = a*b - c => fmaf(a,b,-c); fnms = c - a*b => fmaf(a,-b,c) (negate BEFORE
- * the FMA so the one rounding lands on the full expression). Note: on a build
- * without /arch:AVX2, MSVC lowers fmaf to a CRT software-FMA call (correctness
- * over the old 2-instruction product; RPCS3 pays the same cost). */
-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
+static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]+c._f32[i]; return r; }
+static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]-c._f32[i]; return r; }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=c._f32[i]-a._f32[i]*b._f32[i]; return r; }
 static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
 
@@ -294,14 +223,10 @@ static inline u128 spu_dfnma(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<2;i
 /* double compares -> per-lane 64-bit mask (RPCS3 stubs these; sane impl here). */
 static inline u128 spu_dfceq(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 static inline u128 spu_dfcmeq(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-/* fesd: extend single from the LEFT/first word of each dword pair (slots 0,2)
- * -> double (dwords 0,1). frds: round double -> single into slots 0,2, zero
- * slots 1,3. ISA v1.2 p224/225 "single-precision value in the left slot...
- * right word slot ignored" / "placed in the left word slot... zeros in the
- * right". (Was reading slots 1,3 -- the wrong lane; RPCS3 precise FESD/FRDS
- * confirm the left word = 2i.) */
-static inline u128 spu_fesd(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) spu__dset(&r,i,(double)a._f32[i*2]); return r; }
-static inline u128 spu_frds(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) r._f32[i*2]=(float)spu__dget(a,i); return r; }
+/* fesd: extend single (word slots 1,3) -> double (dwords 0,1). frds: round
+ * double -> single in slots 1,3 and zero slots 0,2 (RPCS3 FESD/FRDS). */
+static inline u128 spu_fesd(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) spu__dset(&r,i,(double)a._f32[i*2+1]); return r; }
+static inline u128 spu_frds(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) r._f32[i*2+1]=(float)spu__dget(a,i); return r; }
 /* mpyhhu: high-16 x high-16 of each word, unsigned, full 32-bit product. */
 static inline u128 spu_mpyhhu(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
 /* cgx: extended carry-generate, carry-in = low bit of old rt (RPCS3 CGX). */
@@ -394,227 +319,10 @@ static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int3
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
 static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
 static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
-/* spu_frest / spu_frsqest: floating reciprocal estimate / floating reciprocal
- * absolute square root estimate. Both must emit the packed base+step encoding
- * that spu_fi (above) decodes -- NOT a plain full-precision 1/x or 1/sqrt(x)
- * float. This is the second half of the fi/frest/frsqest COUPLED fix: fi
- * alone was already wrong (fixed), but fi is a no-op-shaped bug generator
- * unless its *inputs* are also HW-shaped.
- *
- * ---- Sources ----
- * ISA: SPU_ISA_v1.2_27Jan2007_pub.pdf
- *   "Floating Reciprocal Estimate" p.214-215 (frest)
- *   "Floating Reciprocal Absolute Square Root Estimate" p.216-217 (frsqest)
- * Result format (both instructions, same layout fi already assumes):
- *   S(1) | BiasedExponent(8) | BaseFraction(13) | StepFraction(10)
- *   Base = S 1.BaseFraction * 2^(BiasedExponent-127)
- *   Step = 0.000 StepFraction * 2^(BiasedExponent-127)   (frest: sign of Base;
- *          frsqest: sign always 0 per ISA p.216 "The sign bit (S) will be zero")
- * ISA text documents the FIELD LAYOUT but does NOT print the lookup-table
- * CONSTANTS (they are silicon facts, not derivable from the prose) -- those
- * come from the oracle below.
- *
- * ORACLE = RPCS3's ASMJIT recompiler tables + logic, NOT the interpreter:
- *   rpcs3/rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp
- *     FREST   lines 2753-2797 (fraction_lut + exponent_lut, both gathered by index)
- *     FRSQEST lines 2799-2836 (fraction_lut gathered by index; exponent computed
- *              inline: "(exponent==0)? 0xFF : 190 - (exponent + 1) / 2", integer div)
- *   Raw LUT constants: rpcs3/rpcs3/Emu/Cell/SPUThread.cpp lines 51-105
- *     spu_frest_fraction_lut[32], spu_frest_exponent_lut[256],
- *     spu_frsqest_fraction_lut[64], spu_frsqest_exponent_lut[256]
- *   Independent second source: rpcs3/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
- *     FREST lines 7389-7427, FRSQEST lines 7435-7461 -- a SEPARATE recompiler
- *     backend using the same fraction LUTs and an equivalent (algebraically
- *     verified, see below) inline exponent formula for frest:
- *       r_exponent = saturating(0x7E80 - a_exponent_u16lane), else 0x7F800000
- *     ASMJIT and LLVM formulas independently agree with the raw 256-entry
- *     tables (below) -- three-source cross-check.
- *
- * ORACLE TRAP (same class as fi's, confirmed here too): RPCS3's *interpreter*
- * FREST/FRSQEST (SPUInterpreter.cpp:2194-2238, spu_interpreter_precise::FREST/
- * FRSQEST) are ALSO not the packed encoding -- they call _mm_rcp_ps / std::sqrt
- * and store a plain full-precision reciprocal / rsqrt into rt. This is the
- * SAME approximation our current (wrong) spu_frest/spu_frsqest already use --
- * i.e. our bug independently reproduces RPCS3's interpreter-stub bug. Do NOT
- * use the interpreter as an oracle for these two instructions; only the
- * ASMJIT or LLVM recompiler paths implement real hardware semantics.
- *
- * ---- Closed-form verification of the exponent fields (this session) ----
- * The two 256-entry *exponent* LUTs (SPUThread.cpp lines 59-77, 87-105) were
- * checked by exhaustive Python cross-check (all 256 entries each) against:
- *   frest:   rexp = (exp==0) ? 0xFF : ( (253-exp)>0 ? (253-exp) : 0 )
- *   frsqest: rexp = (exp==0) ? 0xFF : (190 - (exp+1)/2)          [int div]
- * Result: frsqest formula matched the raw table on 256/256 entries with ZERO
- * mismatches. frest formula matched 254/256 directly (idx 0..253); the
- * remaining 2 (idx 254,255, i.e. input exponent so large that the reciprocal
- * exponent would go negative) resolve to 0 in the raw table, i.e. reciprocal
- * underflow-to-zero -- exactly the ISA's documented "Big: if |x|>=2^126, 1/x
- * underflows to zero" rule (p.215) -- and the clamped formula then matches
- * 256/256. Because these two fields are provably closed-form, this file does
- * NOT embed either 256-entry exponent table; it computes them directly,
- * which is simpler and removes 512 magic constants. The two *fraction* LUTs
- * (32 and 64 entries) have NO closed form (verified: not an arithmetic or
- * simple bit-derived sequence) -- they are genuine hardware lookup tables and
- * ARE reproduced verbatim below (hardware facts, not GPL'd code -- only the
- * numeric constants are taken; all surrounding C is original).
- *
- * ---- Pipeline validation (hand/script-verified this session, not fuzzed --
- * frest/frsqest ISA specs are error-bound-only, so single-instruction fuzzing
- * has no ground truth; the PIPELINE has one) ----
- * Reciprocal pipeline (ISA p.215): FREST y0,x / FI y1,x,y0 /
- *   FNMS t1,x,y1,ONE / FMA y2,t1,y1,y1
- * Rsqrt pipeline (ISA p.217): FRSQEST y0,x / AND ax,x,mask / FI y1,ax,y0 /
- *   FM t1,ax,y1 / FM t2,y1,HALF / FNMS t1,t1,y1,ONE / FMA y2,t1,t2,y1
- * Both pipelines were run in Python (float32-rounded at each step) using
- * THIS file's frest/frsqest bit-packing plus scratch/fix_fi_spu.c's fi
- * decode, across: two of fix_fi_spu.c's own worked examples, a third
- * representative value, 1.0 (identity), and 2^+-100 (extreme exponents
- * exercising the exponent-field arithmetic far from the biased-127 center):
- *
- *   x=5.331123525209338      y2=0.187577724   true 1/x=0.187577721   rel~2.0e-8
- *   x=-76.91874321984837     y2=-0.0130007323 true 1/x=-0.0130007324 rel~1.1e-8
- *   x=10.859253470350062     y2=0.0920873582  true 1/x=0.0920873615  rel~3.6e-8
- *   x=1.0                    y2=1.0           true 1/x=1.0           exact
- *   x=2^-100                 y2=2^100         true 1/x=2^100         exact
- *   x=2^100                  y2=2^-100        true 1/x=2^-100        exact
- *
- *   x=5.331123525209338  rsqrt y2=0.433102429 true=0.433102437 rel~1.8e-8
- *   x=76.91874321984837  rsqrt y2=0.114020757 true=0.114020754 rel~2.6e-8
- *   x=10.859253470350062 rsqrt y2=0.303458989 true=0.303458995 rel~2.0e-8
- *   x=1.0                rsqrt y2=1.0          true=1.0         exact
- *   x=2^-100 / 2^100      rsqrt exact to displayed precision
- *
- * All within ~1e-8 relative error (a handful of float32 ULPs) after the
- * documented one-Newton-Raphson-step refine, matching the ISA's claim of
- * "within 1 ulp of the IEEE single-precision reciprocal" (p.215) and
- * "sufficient to produce an IEEE single-precision reciprocal" for rsqrt
- * (p.217). Edge cases checked separately:
- *   - x=0.0 (and -0.0): input exponent field is 0 -> frest returns the ISA's
- *     documented special "maximum sfp" pattern sign|0x7FFFFF... i.e. bits
- *     sign|0xFF800000|0x7FFFFF = 0x7FFFFFFF (or 0xFFFFFFFF for -0.0) exactly
- *     matching ISA p.215 "1/0 is defined to give ... x`7FFF FFFF' (1.999*2^128)".
- *   - True denormals (smallest float32 subnormal, bits=0x1): biased exponent
- *     field is also 0, so they fall into the SAME special-case bucket as
- *     zero (matches HW: SPU treats a zero-exponent operand as the
- *     divide-by-zero-flagged case regardless of a nonzero mantissa).
- *   - Powers of 2 (tested above via 2^+-100): exercise the exponent-field
- *     arithmetic away from the fraction-LUT boundary; StepFraction happens to
- *     be at its max-magnitude-relative-to-exponent case for the fraction
- *     index that borders LUT rows 20-31/54-63 (identical adjacent entries in
- *     both fraction tables -- see NOTE below); no mismatch found.
- *
- * NOTE on the fraction LUTs' repeated-adjacent-pairs: spu_frest_fraction_lut
- * indices 20/21, 22/23, ..., 30/31 are IDENTICAL pairs, and
- * spu_frsqest_fraction_lut has many repeated adjacent pairs too. This is a
- * real hardware artifact (the table has fewer effective ulps of index
- * resolution at small fraction-index values) -- reproduced verbatim, not a
- * transcription bug (cross-checked against the LLVM recompiler's identical
- * constant arrays, SPULLVMRecompiler.cpp lines 1623-1624 referencing the same
- * spu_frest_fraction_lut / spu_frsqest_fraction_lut symbols).
- *
- * ---- Consistency with spu_fi (above) ----
- * spu_fi decodes RB as:
- *   exp        = (rb>>23) & 0xFF
- *   base_bits  = rb & 0xFFFFFC00        (sign(1)+exp(8)+basefrac(13), verbatim IEEE bits)
- *   step_frac  = rb & 0x3FF             (10 bits)
- *   step       = ldexp((float)step_frac, exp-127-13), sign-matched to base
- * This file's spu_frest/spu_frsqest PRODUCE exactly that layout: sign in bit
- * 31 (frest only; frsqest forces 0), exponent in bits 23-30, a 13-bit base
- * fraction in bits 10-22 (bits 5-17 of the LUT constant, which is already
- * pre-shifted so it can be OR'd straight into bits 0-22 alongside the 8-bit
- * exponent -- verified: every fraction_lut constant here is < 0x800000, i.e.
- * occupies only bits 0-22, so `exponent_field | fraction_field` cannot
- * collide), and the low 10 bits as StepFraction. CONFIRMED CONSISTENT: no
- * mismatch between what this file emits and what spu_fi consumes.
- *
- * Old code (bug, same class in both instructions): full-precision 1/x or
- * 1/sqrt(x) as a plain IEEE float, none of the base/step field structure --
- * confirmed wrong the same way old spu_fi was, and independently matches
- * RPCS3's interpreter-stub bug (see ORACLE TRAP above), which is presumably
- * how it entered this codebase (an early port likely used the interpreter as
- * its reference before this session's ASMJIT-recompiler cross-check).
- */
-
-/* ---- hardware lookup tables (RPCS3 SPUThread.cpp:51-57, 79-85) ----
- * Pre-shifted 23-bit BaseFraction|StepFraction fields, indexed by the top 5
- * (frest) or 6 (frsqest) bits of RA's IEEE fraction. No closed form exists
- * for these (verified not to follow an arithmetic sequence); they are
- * hardware facts reproduced verbatim, cited from RPCS3, not copied logic. */
-static const uint32_t spu_frest_fraction_lut[32] = {
-    0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
-    0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,
-    0x2AA9BE, 0x2A85AC, 0x23D59A, 0x23BD8E, 0x1D8576, 0x1D8576, 0x17AD5A, 0x17AD5A,
-    0x124543, 0x124543, 0x0D392D, 0x0D392D, 0x08851A, 0x08851A, 0x041D07, 0x041D07
-};
-
-static const uint32_t spu_frsqest_fraction_lut[64] = {
-    0x350160, 0x34E954, 0x2F993D, 0x2F993D, 0x2AA523, 0x2AA523, 0x26190D, 0x26190D,
-    0x21E4F9, 0x21E4F9, 0x1E00E9, 0x1E00E9, 0x1A5CD9, 0x1A5CD9, 0x16F8CB, 0x16F8CB,
-    0x13CCC0, 0x13CCC0, 0x10CCB3, 0x10CCB3, 0x0E00AA, 0x0E00AA, 0x0B58A1, 0x0B58A1,
-    0x08D498, 0x08D498, 0x067491, 0x067491, 0x043089, 0x043089, 0x020C83, 0x020C83,
-    0x7FFDF4, 0x7FD1DE, 0x7859C8, 0x783DBA, 0x71559C, 0x71559C, 0x6AE57C, 0x6AE57C,
-    0x64F561, 0x64F561, 0x5F7149, 0x5F7149, 0x5A4D33, 0x5A4D33, 0x55811F, 0x55811F,
-    0x51050F, 0x51050F, 0x4CC8FE, 0x4CC8FE, 0x48D0F0, 0x48D0F0, 0x4510E4, 0x4510E4,
-    0x4180D7, 0x4180D7, 0x3E24CC, 0x3E24CC, 0x3AF4C3, 0x3AF4C3, 0x37E8BA, 0x37E8BA
-};
-
-/* frest: floating reciprocal estimate. Produces the packed base+step encoding
- * consumed by spu_fi (above), NOT a plain 1/x float.
- * ISA "Floating Reciprocal Estimate" p.214-215; RPCS3 ASMJIT recompiler
- * SPUASMJITRecompiler.cpp:2753-2797 + LLVM recompiler
- * SPULLVMRecompiler.cpp:7389-7427 (independent cross-check). */
-static inline u128 spu_frest(u128 a) {
-    u128 r;
-    for (int i = 0; i < 4; i++) {
-        uint32_t bits = a._u32[i];
-        uint32_t sign = bits & 0x80000000u;
-        uint32_t exp  = (bits >> 23) & 0xFFu;
-        uint32_t frac_idx = (bits >> 18) & 0x1Fu;
-        uint32_t out;
-        if (exp == 0u) {
-            /* zero or denormal operand: ISA p.215 "1/0 is defined to give the
-             * maximum SPU single-precision extended-range fp number", sign of
-             * the (zero) input preserved. Same bucket for true denormals
-             * (their biased exponent field is also 0). */
-            out = sign | 0x7FFFFFFFu;
-        } else {
-            /* result biased exponent = 253 - input biased exponent (253 =
-             * 2*127-1, i.e. reciprocal negates the unbiased exponent),
-             * clamped to 0 on underflow (ISA p.215 "Big: if |x|>=2^126,
-             * 1/x underflows to zero"). Verified bit-exact against RPCS3's
-             * raw 256-entry spu_frest_exponent_lut for all 256 inputs. */
-            uint32_t rexp = (exp >= 253u) ? 0u : (253u - exp);
-            uint32_t fraction = spu_frest_fraction_lut[frac_idx];
-            out = sign | (rexp << 23) | (fraction & 0x7FFFFFu);
-        }
-        memcpy(&r._f32[i], &out, sizeof out);
-    }
-    return r;
-}
-
-/* frsqest: floating reciprocal absolute square-root estimate. Produces the
- * packed base+step encoding consumed by spu_fi; sign bit is ALWAYS 0 per
- * ISA ("The sign bit (S) will be zero", p.216) -- frsqest(x) estimates
- * 1/sqrt(|x|), always positive.
- * ISA "Floating Reciprocal Absolute Square Root Estimate" p.216-217; RPCS3
- * ASMJIT recompiler SPUASMJITRecompiler.cpp:2799-2836 (exponent computed
- * inline: "(exponent==0)? 0xFF : 190-(exponent+1)/2", integer division) +
- * LLVM recompiler SPULLVMRecompiler.cpp:7435-7461 (independent formula,
- * algebraically identical). Verified bit-exact against RPCS3's raw 256-entry
- * spu_frsqest_exponent_lut for ALL 256 inputs (zero mismatches). */
-static inline u128 spu_frsqest(u128 a) {
-    u128 r;
-    for (int i = 0; i < 4; i++) {
-        uint32_t bits = a._u32[i];
-        uint32_t exp  = (bits >> 23) & 0xFFu;
-        uint32_t frac_idx = (bits >> 18) & 0x3Fu;
-        uint32_t rexp = (exp == 0u) ? 0xFFu : (190u - (exp + 1u) / 2u);
-        uint32_t fraction = spu_frsqest_fraction_lut[frac_idx];
-        uint32_t out = (rexp << 23) | (fraction & 0x7FFFFFu);
-        memcpy(&r._f32[i], &out, sizeof out);
-    }
-    return r;
-}
+static inline u128 spu_frsqest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= a._f32[i]>0.0f ? 1.0f/sqrtf(a._f32[i]) : 0.0f; return r; }
+/* frest: reciprocal estimate (refined by the following spu_fi Newton step).
+ * Full-precision 1/x is exact after fi and >= HW-estimate accuracy. */
+static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= 1.0f/a._f32[i]; return r; }
 
 /* ---- Phase 3: sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word
