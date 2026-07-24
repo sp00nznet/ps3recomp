@@ -453,6 +453,11 @@ static void audio_mix_one_block(void)
             s_mix_buffer[s * 2 + 1] += right;
         }
 
+        /* Firmware clears a ring-buffer block after consuming it. Besides
+         * preventing stale PCM from replaying when a producer stalls, the
+         * cleared block is an observable consumption signal for producers. */
+        memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+
         /* Advance read index and publish it to the guest-visible counter so the
          * game can tell how far playback has consumed. The counter is a 64-bit
          * big-endian value: LBP's audio watchdog reads it with `ld` and compares
