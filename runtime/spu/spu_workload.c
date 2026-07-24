@@ -370,11 +370,22 @@ static void spu_async_run(spu_async_job* j)
                  * runnable task instead of exiting at entry. Opt out: YDKJ_NO_CRI_READY. */
                 if (g_ydkj_real_taskset_ea && !getenv("YDKJ_NO_CRI_READY")) {
                     extern uint32_t vm_read32(uint32_t); extern void vm_write32(uint32_t,uint32_t);
+                    /* Complete the FULL pending->running transition the kernel does, matching
+                     * the working RPCS3 SPU0 dump: RUNNING(0x00) set, READY(0x10) set,
+                     * PENDING(0x20) CLEARED. Our old code left the task PENDING and not
+                     * RUNNING, so the task's poll (func_00026E80 reads RUNNING) saw "not
+                     * running" and busy-spun forever. */
                     for (int w=0; w<4; w++){ uint32_t pend=vm_read32(g_ydkj_real_taskset_ea+0x20+w*4);
-                        if (pend) vm_write32(g_ydkj_real_taskset_ea+0x10+w*4,
-                                    vm_read32(g_ydkj_real_taskset_ea+0x10+w*4)|pend); }
-                    fprintf(stderr,"[cri] CRI_READY: promoted pending->ready (ready now=0x%08X)\n",
-                        vm_read32(g_ydkj_real_taskset_ea+0x10));
+                        if (pend) {
+                            vm_write32(g_ydkj_real_taskset_ea+0x10+w*4,   /* READY  |= pending */
+                                       vm_read32(g_ydkj_real_taskset_ea+0x10+w*4)|pend);
+                            vm_write32(g_ydkj_real_taskset_ea+0x00+w*4,   /* RUNNING|= pending */
+                                       vm_read32(g_ydkj_real_taskset_ea+0x00+w*4)|pend);
+                            vm_write32(g_ydkj_real_taskset_ea+0x20+w*4, 0); /* PENDING = 0 */
+                        } }
+                    fprintf(stderr,"[cri] CRI_READY: pending->running (run=0x%08X ready=0x%08X pend=0x%08X)\n",
+                        vm_read32(g_ydkj_real_taskset_ea+0x00), vm_read32(g_ydkj_real_taskset_ea+0x10),
+                        vm_read32(g_ydkj_real_taskset_ea+0x20));
                 }
                 if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
