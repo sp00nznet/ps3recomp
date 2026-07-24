@@ -328,11 +328,25 @@ int64_t sys_fs_read(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     void* buf = vm_to_host(buf_addr);
+    long pos_before = ftell(f->fp);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
     if (nread_addr != 0) {
         write_be64(nread_addr, (uint64_t)nread);
     }
+
+    /* FLOW_FSDBG: the lv2 path is what PhyreEngine titles actually use (they do
+     * not go through the cellFs HLE), so YDKJ_FSDBG in ppu_fs.cpp never fires. */
+    { extern char* getenv(const char*);
+      if (getenv("FLOW_FSDBG")) {
+        const unsigned char* b = (const unsigned char*)buf;
+        fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
+                        " head=%02X%02X%02X%02X lr=0x%08X\n",
+                fd, f->path, pos_before, (unsigned long long)size, nread,
+                nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
+                nread > 2 ? b[2] : 0, nread > 3 ? b[3] : 0,
+                (uint32_t)ctx->lr);
+      } }
 
     return CELL_OK;
 }

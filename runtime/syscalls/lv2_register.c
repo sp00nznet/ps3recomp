@@ -111,9 +111,12 @@ static int64_t sys_tty_write(ppu_context* ctx)
              * carrying init/error/Phyre keywords. */
             if (strstr(tmp, "PSSG") || strstr(tmp, "Init") || strstr(tmp, "App") ||
                 strstr(tmp, "fail") || strstr(tmp, "Error") || strstr(tmp, "rror") ||
-                strstr(tmp, "PSpu") || strstr(tmp, "ation")) {
+                strstr(tmp, "PSpu") || strstr(tmp, "ation") || strstr(tmp, "Mystery")) {
                 uint32_t sp = (uint32_t)ctx->gpr[1];
                 fprintf(stderr, "[pssg-bt] tty_write \"%.50s\" lr=0x%08X\n", tmp, (uint32_t)ctx->lr);
+                /* The back-chain below is unreliable under the DRAIN/fragment
+                 * model (LR slots read 0); the host-backtrace mapper is not. */
+                { extern void ppu_guest_callstack(const char*); ppu_guest_callstack("tty"); }
                 for (int i = 0; i < 28 && sp && sp < 0x10000000u; i++) {
                     uint32_t nsp; memcpy(&nsp, vm_base + sp, 4);
                     nsp = ((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
