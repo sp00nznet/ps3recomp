@@ -40,20 +40,48 @@
 #define CELL_EAUTHFAIL                  0x80010017  /* Authentication failed */
 #define CELL_ENOTMSELF                  0x80010018  /* Not a valid MSELF */
 #define CELL_ESYSVER                    0x80010019  /* System version error */
-#define CELL_EAUTHDENIED                0x80010020  /* Authorization denied */
-#define CELL_EOPNOTSUPP                 0x80010021  /* Operation not supported */
-#define CELL_ENOTDIR                    0x80010022  /* Not a directory */
-#define CELL_ERANGE                     0x80010023  /* Result out of range */
-#define CELL_ENAMETOOLONG               0x80010024  /* Name too long */
-#define CELL_EBADF                      0x80010025  /* Bad file descriptor */
-#define CELL_EFSSPECIFIC                0x80010025  /* FS-specific error (alias) */
-#define CELL_EOVERFLOW                  0x80010026  /* Overflow */
-#define CELL_ENOTMOUNTED                0x80010027  /* Not mounted */
-#define CELL_ENOTSUP                    0x80010028  /* Not supported */
-#define CELL_ENOTSDATA                  0x80010029  /* Not SDATA */
-#define CELL_ESDKVER                    0x80010030  /* SDK version error */
-#define CELL_ENOLICDISC                 0x80010031  /* No license disc */
-#define CELL_ENOLICENT                  0x80010032  /* No license entitlement */
+#define CELL_EAUTHFATAL                 0x8001001A  /* Fatal authentication error */
+#define CELL_EDOM                       0x8001001B  /* Math domain error */
+#define CELL_ERANGE                     0x8001001C  /* Math range error */
+#define CELL_EILSEQ                     0x8001001D  /* Illegal byte sequence */
+#define CELL_EFPOS                      0x8001001E  /* File position error */
+#define CELL_EINTR                      0x8001001F  /* Interrupted syscall */
+#define CELL_EFBIG                      0x80010020  /* File too large */
+#define CELL_EMLINK                     0x80010021  /* Too many links */
+#define CELL_ENFILE                     0x80010022  /* File table overflow */
+#define CELL_ENOSPC                     0x80010023  /* No space left */
+#define CELL_ENOTTY                     0x80010024  /* Not a TTY */
+#define CELL_EPIPE                      0x80010025  /* Broken pipe */
+#define CELL_EROFS                      0x80010026  /* Read-only filesystem */
+#define CELL_ESPIPE                     0x80010027  /* Illegal seek */
+#define CELL_E2BIG                      0x80010028  /* Argument list too long */
+#define CELL_EACCES                     0x80010029  /* Access denied */
+#define CELL_EBADF                      0x8001002A  /* Bad file descriptor */
+#define CELL_EIO                        0x8001002B  /* I/O error */
+#define CELL_EMFILE                     0x8001002C  /* Too many open files */
+#define CELL_ENODEV                     0x8001002D  /* No device */
+#define CELL_ENOTDIR                    0x8001002E  /* Not a directory */
+#define CELL_ENXIO                      0x8001002F  /* No such device or address */
+#define CELL_EXDEV                      0x80010030  /* Cross-device link */
+#define CELL_EBADMSG                    0x80010031  /* Bad message */
+#define CELL_EINPROGRESS                0x80010032  /* Operation in progress */
+#define CELL_EMSGSIZE                   0x80010033  /* Message too large */
+#define CELL_ENAMETOOLONG               0x80010034  /* Name too long */
+#define CELL_ENOLCK                     0x80010035  /* No locks available */
+#define CELL_ENOTEMPTY                  0x80010036  /* Directory not empty */
+#define CELL_ENOTSUP                    0x80010037  /* Not supported */
+#define CELL_EFSSPECIFIC                0x80010038  /* Filesystem-specific error */
+#define CELL_EOVERFLOW                  0x80010039  /* Overflow */
+#define CELL_ENOTMOUNTED                0x8001003A  /* Not mounted */
+#define CELL_ENOTSDATA                  0x8001003B  /* Not SDATA */
+#define CELL_ESDKVER                    0x8001003C  /* SDK version error */
+#define CELL_ENOLICDISC                 0x8001003D  /* No license disc */
+#define CELL_ENOLICENT                  0x8001003E  /* No license entitlement */
+
+/* Compatibility names used by a few HLE modules; CellOS exposes the
+ * corresponding generic errors under the canonical names above. */
+#define CELL_EAUTHDENIED                CELL_EPERM
+#define CELL_EOPNOTSUPP                 CELL_ENOTSUP
 
 /* ---------------------------------------------------------------------------
  * Mutex / synchronization errors  (0x80010100-range)
