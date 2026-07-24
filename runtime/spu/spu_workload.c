@@ -381,9 +381,21 @@ static void spu_async_run(spu_async_job* j)
                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
                      * so the cri leaf reads valid data instead of my planted guesses. */
                     uint64_t elf = spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                    /* --- Golden-reference context fields for the CRI task, recovered from a
+                     * WORKING RPCS3 SPU-LS snapshot via caner's rpcs3-guest-memory-dumper fork
+                     * (github.com/canersaka/rpcs3-guest-memory-dumper): YDKJ BLUS30569, SPU0
+                     * "CellSpursKernel0" mid-cri-decode. These are what the cri task's context
+                     * validator (func_00026E80/F18/FC4) reads; our values differed and tripped
+                     * its 0x80410911 error path. CRI-SCOPED (image 22 only) -- overriding these
+                     * in the shared build_context breaks the audio SPURS task. */
+                    LSBE32(0x2840, 0x53505552u); LSBE32(0x2844, 0x53544153u); /* moduleId "SPURSTASK MODULE" */
+                    LSBE32(0x2848, 0x4B204D4Fu); LSBE32(0x284C, 0x44554C45u);
+                    LSBE32(0x27A0, 0); LSBE32(0x27A4, 0);       /* TI_LS_PATTERN = 0 (build_context forced all-ones; validator andc r21) */
+                    LSBE32(0x27A8, 0); LSBE32(0x27AC, 0);
+                    LSBE32(0x27D0, 0x1F);                       /* dmaTagId = 0x1F (build_context wrote 0) */
                     /* still plant the cri-specific task descriptor @0x2FB0 that build_context
                      * doesn't cover (cri func_00026DE0 reads it). */
-                    LSBE32(0x2FB0, 0xFFFFFFFFu); LSBE32(0x2FB4, 0x400);
+                    LSBE32(0x2FB0, 0); LSBE32(0x2FB4, 0);   /* RPCS3 dump: descriptor word0/word1 = 0 (was 0xFFFFFFFF/0x400) */
                     LSBE32(0x2FB8, 0x2700);      LSBE32(0x2FBC, 0x3000);
                     fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
                             g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
