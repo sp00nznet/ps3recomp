@@ -696,7 +696,7 @@ s32 cellFsOpendir(const char* path, CellFsDir* fd)
 }
 
 /* NID: 0x9F951810 */
-s32 cellFsReaddir(CellFsDir fd, CellFsDirectoryEntry* entry, u64* nread)
+s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread)
 {
     if (fd < 0 || fd >= MAX_OPEN_DIRS || !s_dirs[fd].in_use)
         return CELL_FS_ERROR_EBADF;
@@ -719,26 +719,15 @@ s32 cellFsReaddir(CellFsDir fd, CellFsDirectoryEntry* entry, u64* nread)
     }
     s_dirs[fd].first_read = 0;
 
-    memset(entry, 0, sizeof(CellFsDirectoryEntry));
-    strncpy(entry->entry_name, s_dirs[fd].find_data.cFileName,
+    memset(entry, 0, sizeof(*entry));
+    entry->d_type = (s_dirs[fd].find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        ? CELL_FS_TYPE_DIRECTORY : CELL_FS_TYPE_REGULAR;
+    strncpy(entry->d_name, s_dirs[fd].find_data.cFileName,
             CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1);
-    entry->entry_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
+    entry->d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
+    entry->d_namlen = (u8)strlen(entry->d_name);
 
-    /* Fill attributes */
-    if (s_dirs[fd].find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-        entry->attribute.st_mode = CELL_FS_S_IFDIR | CELL_FS_S_IRUSR |
-                                   CELL_FS_S_IWUSR | CELL_FS_S_IXUSR;
-    } else {
-        entry->attribute.st_mode = CELL_FS_S_IFREG | CELL_FS_S_IRUSR | CELL_FS_S_IWUSR;
-        ULARGE_INTEGER file_size;
-        file_size.HighPart = s_dirs[fd].find_data.nFileSizeHigh;
-        file_size.LowPart  = s_dirs[fd].find_data.nFileSizeLow;
-        entry->attribute.st_size = (u64)file_size.QuadPart;
-    }
-    entry->attribute.st_blksize = 4096;
-    cellfs_stat_to_be(&entry->attribute);
-
-    *nread = ps3_bswap64(1);
+    *nread = ps3_bswap64(sizeof(*entry));
 #else
     struct dirent* de = readdir(s_dirs[fd].host_dir);
     if (!de) {
@@ -746,24 +735,19 @@ s32 cellFsReaddir(CellFsDir fd, CellFsDirectoryEntry* entry, u64* nread)
         return CELL_OK;
     }
 
-    memset(entry, 0, sizeof(CellFsDirectoryEntry));
-    strncpy(entry->entry_name, de->d_name, CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1);
-    entry->entry_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
-
-    /* Stat the entry for full info */
+    memset(entry, 0, sizeof(*entry));
     char full_path[CELL_FS_MAX_FS_PATH_LENGTH];
     snprintf(full_path, sizeof(full_path), "%s/%s", s_dirs[fd].host_path, de->d_name);
     HOST_STAT_T hst;
-    if (HOST_STAT(full_path, &hst) == 0) {
-        fill_cellfs_stat(&entry->attribute, &hst);
-    } else {
-        /* Minimal fallback */
-        entry->attribute.st_mode = CELL_FS_S_IFREG | CELL_FS_S_IRUSR | CELL_FS_S_IWUSR;
-        entry->attribute.st_blksize = 4096;
-        cellfs_stat_to_be(&entry->attribute);
-    }
+    if (HOST_STAT(full_path, &hst) == 0 && (hst.st_mode & S_IFDIR))
+        entry->d_type = CELL_FS_TYPE_DIRECTORY;
+    else
+        entry->d_type = CELL_FS_TYPE_REGULAR;
+    strncpy(entry->d_name, de->d_name, CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1);
+    entry->d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
+    entry->d_namlen = (u8)strlen(entry->d_name);
 
-    *nread = ps3_bswap64(1);
+    *nread = ps3_bswap64(sizeof(*entry));
 #endif
 
     return CELL_OK;

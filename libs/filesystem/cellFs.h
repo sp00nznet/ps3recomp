@@ -18,8 +18,8 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * FS-specific error codes
  * -----------------------------------------------------------------------*/
-#define CELL_FS_ERROR_EBADF         (s32)0x80010009
-#define CELL_FS_ERROR_EMFILE        (s32)0x80010018
+#define CELL_FS_ERROR_EBADF         (s32)CELL_EBADF
+#define CELL_FS_ERROR_EMFILE        (s32)CELL_EMFILE
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -88,6 +88,27 @@ typedef struct CellFsDirectoryEntry {
 } CellFsDirectoryEntry;
 #pragma pack(pop)
 
+/* cellFsReaddir writes this compact dirent. CellFsDirectoryEntry is the
+ * separate stat-carrying shape used by cellFsGetDirectoryEntries. */
+#pragma pack(push, 1)
+typedef struct CellFsDirent {
+    u8   d_type;
+    u8   d_namlen;
+    char d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH];
+} CellFsDirent;
+#pragma pack(pop)
+
+#define CELL_FS_TYPE_UNKNOWN       0
+#define CELL_FS_TYPE_DIRECTORY     1
+#define CELL_FS_TYPE_REGULAR       2
+#define CELL_FS_TYPE_SYMLINK       3
+
+#ifdef __cplusplus
+static_assert(sizeof(CellFsDirent) == 258, "CellFsDirent ABI size");
+#else
+_Static_assert(sizeof(CellFsDirent) == 258, "CellFsDirent ABI size");
+#endif
+
 /* Opaque file/directory descriptors */
 typedef s32 CellFsFd;
 typedef s32 CellFsDir;
@@ -154,7 +175,7 @@ s32 cellFsChmod(const char* path, s32 mode);
 s32 cellFsOpendir(const char* path, CellFsDir* fd);
 
 /* NID: 0x9F951810 */
-s32 cellFsReaddir(CellFsDir fd, CellFsDirectoryEntry* entry, u64* nread);
+s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread);
 
 /* NID: 0xFF42DCC3 */
 s32 cellFsClosedir(CellFsDir fd);
