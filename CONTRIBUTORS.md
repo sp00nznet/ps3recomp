@@ -220,6 +220,17 @@ bring-ups (folded via `integrate/fold-2026-07-24`):
   translation (fixed a boot crash); HLSL-safe NaN/Inf fragment-program constants;
   `sys_spu_image_import` segment source EA at the correct offset.
 
+The **SPU-lifter "faithful adoption"** (branch `spu/faithful-adopt-caner`, folded
+via `integrate/faithful-adopt-caner`) — a from-scratch re-implementation of the
+SPU decode/lift + runtime, consolidating the interpreter and function registry
+into `spu_channels.c`, plus LBP SPU/SPURS bring-up and RSX texture support
+(G8B8/DXT, deswizzle). **This work re-adopts the original SPU decoder/lifter and
+runtime that [@sp00nznet](https://github.com/sp00nznet) and
+[@canersaka](https://github.com/canersaka) authored** — their commit history for
+that work stands on its own (the `caner/ppu-*`, `c6*/c7*`, and the core SPU
+subsystem commits); the faithful-adoption branch is a parallel re-derivation, and
+credit for the underlying design belongs to them.
+
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
 in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
