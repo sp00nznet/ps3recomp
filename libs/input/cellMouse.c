@@ -11,6 +11,13 @@
 #include "cellMouse.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+
+/* HLE struct args are GUEST EAs -- write through the vm accessors (also
+ * declared above cellMouseGetInfo; harmless duplicates). */
+extern void vm_write8 (unsigned long long a, unsigned char  v);
+extern void vm_write16(unsigned long long a, unsigned short v);
+extern void vm_write32(unsigned long long a, unsigned int   v);
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -124,9 +131,12 @@ s32 cellMouseInit(u32 max_connect)
     s_mouse_max_connect = max_connect;
     memset(s_mouse_ports, 0, sizeof(s_mouse_ports));
 
-    /* Assume mouse 0 is always connected on the host */
-    s_mouse_ports[0].connected = 1;
-    s_mouse_ports[0].mode = CELL_MOUSE_MODE_RELATIVE;
+    /* No mouse is connected until the host says one is (cellMouse_moveEvent
+     * and friends set ports[n].connected). This used to assert port 0 was
+     * always present, which reports hardware that is not there: a title is
+     * then entitled to open a mouse-driven path and wait on input that can
+     * never arrive. Report what actually exists -- an unplugged port is a
+     * perfectly normal thing for a title to see. */
 
     return CELL_OK;
 }
@@ -142,8 +152,27 @@ s32 cellMouseEnd(void)
     return CELL_OK;
 }
 
+/* Guest CellMouseData layout (big-endian, 8 bytes): +0 update u8, +1 buttons
+ * u8, +2 x_axis s8, +3 y_axis s8, +4 wheel s8, +5 tilt s8, +6..7 pad. The
+ * arg is a GUEST EA -- write via vm accessors (see cellMouseGetInfo below);
+ * dereferencing it as a host pointer is an instant AV. */
+static void mouse_write_data(unsigned long long ea, u8 update, u8 buttons,
+                             s8 x, s8 y, s8 wheel)
+{
+    vm_write8(ea + 0, update);
+    vm_write8(ea + 1, buttons);
+    vm_write8(ea + 2, (u8)x);
+    vm_write8(ea + 3, (u8)y);
+    vm_write8(ea + 4, (u8)wheel);
+    vm_write8(ea + 5, 0);           /* tilt */
+    vm_write8(ea + 6, 0);
+    vm_write8(ea + 7, 0);
+}
+
 s32 cellMouseGetData(u32 port_no, CellMouseData* data)
 {
+    unsigned long long ea = (unsigned int)(uintptr_t)data;
+
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
@@ -153,12 +182,9 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     MousePortState* ms = &s_mouse_ports[port_no];
 
     if (!ms->connected) {
-        memset(data, 0, sizeof(CellMouseData));
+        mouse_write_data(ea, 0, 0, 0, 0, 0);
         return CELL_MOUSE_ERROR_NO_DEVICE;
     }
-
-    data->update  = ms->updated ? 1 : 0;
-    data->buttons = ms->buttons;
 
     /* Clamp accumulated deltas to s8 range */
     s32 dx = ms->acc_dx;
@@ -168,10 +194,8 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     if (dy > 127) dy = 127; if (dy < -128) dy = -128;
     if (wh > 127) wh = 127; if (wh < -128) wh = -128;
 
-    data->x_axis = (s8)dx;
-    data->y_axis = (s8)dy;
-    data->wheel  = (s8)wh;
-    data->tilt   = 0;
+    mouse_write_data(ea, ms->updated ? 1 : 0, ms->buttons,
+                     (s8)dx, (s8)dy, (s8)wh);
 
     /* Reset accumulated state */
     ms->acc_dx = 0;
@@ -182,8 +206,11 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     return CELL_OK;
 }
 
+/* Guest CellMouseDataList layout: +0x00 list_num u32, +0x04 CellMouseData[8]. */
 s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
 {
+    unsigned long long ea = (unsigned int)(uintptr_t)data;
+
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
@@ -193,7 +220,7 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
     MousePortState* ms = &s_mouse_ports[port_no];
 
     if (!ms->connected) {
-        memset(data, 0, sizeof(CellMouseDataList));
+        vm_write32(ea + 0x00, 0);
         return CELL_MOUSE_ERROR_NO_DEVICE;
     }
 
@@ -206,14 +233,16 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
         ms->updated = 0;
     }
 
-    data->list_num = ms->ring_count;
+    vm_write32(ea + 0x00, ms->ring_count);
     u32 start = 0;
     if (ms->ring_write > CELL_MOUSE_MAX_DATA_LIST_NUM)
         start = ms->ring_write - CELL_MOUSE_MAX_DATA_LIST_NUM;
 
     for (u32 i = 0; i < ms->ring_count; i++) {
         u32 idx = (start + i) % CELL_MOUSE_MAX_DATA_LIST_NUM;
-        data->list[i] = ms->ring[idx];
+        CellMouseData* d = &ms->ring[idx];
+        mouse_write_data(ea + 0x04 + i * 8, d->update, d->buttons,
+                         d->x_axis, d->y_axis, d->wheel);
     }
 
     /* Clear ring */
@@ -223,27 +252,58 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
     return CELL_OK;
 }
 
-s32 cellMouseGetInfo(CellMouseInfo* info)
+/* CellMouseInfo lives in GUEST memory and is BIG-ENDIAN. Layout is the SDK's
+ * (cell/mouse/mouse_codes.h, CELL_MAX_MICE = 127):
+ *   +0x000 u32 max_connect
+ *   +0x004 u32 now_connect
+ *   +0x008 u32 info
+ *   +0x00C u16 vendor_id[127]    (ends +0x10A)
+ *   +0x10A u16 product_id[127]   (ends +0x208)
+ *   +0x208 u8  status[127]       (ends +0x287 -- 647 bytes total)
+ *
+ * This took a CellMouseInfo* and memset/assigned through it, which dereferences
+ * the raw guest EA as a host pointer (instant AV), and the local struct declares
+ * u32 arrays where hardware has u16/u16/u8, so even a translated pointer would
+ * lay the fields out wrong. Neither showed up because the NID was never
+ * registered: gen_hle_nids.py was handed the PRX name "sys_io", but the file is
+ * cellMouse.c, so it warned once into the build noise and left every mouse NID
+ * unresolved -- and the dispatcher's unresolved path answers CELL_OK, so LBP
+ * polled a mouse that silently never existed.
+ */
+extern void vm_write8 (unsigned long long a, unsigned char  v);
+extern void vm_write16(unsigned long long a, unsigned short v);
+extern void vm_write32(unsigned long long a, unsigned int   v);
+
+#define MOUSE_INFO_VENDOR    0x00Cu
+#define MOUSE_INFO_PRODUCT   0x10Au
+#define MOUSE_INFO_STATUS    0x208u
+#define MOUSE_INFO_SIZE      0x287u
+#define MOUSE_INFO_MAX_MICE  127u
+
+s32 cellMouseGetInfo(u32 info_ea)
 {
     if (!s_mouse_initialized)
         return CELL_MOUSE_ERROR_UNINITIALIZED;
 
-    if (!info)
+    if (!info_ea)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
 
-    memset(info, 0, sizeof(CellMouseInfo));
-    info->max_connect = s_mouse_max_connect;
+    for (u32 i = 0; i < MOUSE_INFO_SIZE; i++)
+        vm_write8((unsigned long long)info_ea + i, 0);
+
+    vm_write32((unsigned long long)info_ea + 0, s_mouse_max_connect);
 
     u32 connected = 0;
-    for (u32 i = 0; i < s_mouse_max_connect; i++) {
-        if (s_mouse_ports[i].connected) {
-            info->status[i] = CELL_MOUSE_STATUS_CONNECTED;
-            info->vendor_id[i]  = 0x054C; /* Sony */
-            info->product_id[i] = 0x0001;
-            connected++;
-        }
+    for (u32 i = 0; i < s_mouse_max_connect && i < MOUSE_INFO_MAX_MICE
+                    && i < CELL_MOUSE_MAX_MICE; i++) {
+        if (!s_mouse_ports[i].connected)
+            continue;
+        vm_write8 ((unsigned long long)info_ea + MOUSE_INFO_STATUS  + i,     CELL_MOUSE_STATUS_CONNECTED);
+        vm_write16((unsigned long long)info_ea + MOUSE_INFO_VENDOR  + i * 2, 0x054C); /* Sony */
+        vm_write16((unsigned long long)info_ea + MOUSE_INFO_PRODUCT + i * 2, 0x0001);
+        connected++;
     }
-    info->now_connect = connected;
+    vm_write32((unsigned long long)info_ea + 4, connected);
 
     return CELL_OK;
 }

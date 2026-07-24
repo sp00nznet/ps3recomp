@@ -15,6 +15,7 @@
  */
 #include "ppu_recomp.h"      /* ppu_context */
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
+#include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -78,6 +79,18 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 static void host_path(char* out, size_t cap, const char* guest)
 {
     const char* rel = guest;
+    /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
+     * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
+     * /dev_hdd0/game/<title>/), mirroring the PS3/RPCS3 layout: base data on
+     * /dev_bdvd (disc), update data on /dev_hdd0. Set PS3_HDD0_ROOT to the host
+     * dir that /dev_hdd0 maps into (the one containing game/<title>/). */
+    static const char* hdd0_root = nullptr; static int hdd0_init = 0;
+    if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
+    if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
+        snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+        return;
+    }
     static const char* mounts[] = {
         "/dev_bdvd/", "/app_home/", "/dev_hdd0/", "/dev_hdd1/",
         "/dev_flash/", "/host_root/", "/dev_usb000/", "/dev_usb/"
@@ -148,6 +161,82 @@ static void cellFsOpen(ppu_context* ctx)
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
+    ctx->gpr[3] = CELL_OK;
+}
+
+/* cellFsSdataOpen(path, flags, fd*, arg*, size): opens a PS3 SDATA/EDAT
+ * encrypted-data file and returns an fd whose reads yield the DECRYPTED
+ * plaintext. LBP 1.30 stores its SPU job code modules inside patch.sdat (an
+ * FSHb container, zlib-compressed C0DEC0DE modules) and opens it via this call;
+ * leaving it faked (default CELL_OK, no handle) meant the container was never
+ * read -> zero job modules loaded -> every SPU physics job dispatched into an
+ * empty code buffer -> the loading freeze.
+ *
+ * Our run env's PS3_HDD0_ROOT (RPCS3 dev_hdd0) already holds patch.sdat in
+ * DECRYPTED form (magic "FSHb", not "NPD"), so we just open it read-only --
+ * no EDAT decryption needed. (A title supplying a still-encrypted NPD .sdat
+ * would need the SDATA block cipher; not required here.) The license `arg`
+ * (gpr[6]) and its size (gpr[7]) are ignored. */
+static void cellFsSdataOpen(ppu_context* ctx)
+{
+    char gpath[1024], hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
+    host_path(hpath, sizeof hpath, gpath);
+
+    int hfd = open(hpath, O_RDONLY | O_BINARY, 0666);
+    if (hfd < 0) {
+        fprintf(stderr, "[fs] SdataOpen FAIL '%s' -> '%s'\n", gpath, hpath);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+    }
+    FILE* f = fdopen(hfd, "rb");
+    if (!f) { close(hfd); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    /* If the file IS still NPD-encrypted, we can't serve it plaintext here --
+     * warn loudly rather than hand back ciphertext the title will choke on.
+     * Use portable fread/fseek (POSIX read()/ssize_t aren't available under the
+     * exe's compiler). */
+    unsigned char magic[4] = {0};
+    size_t got = fread(magic, 1, 4, f);
+    fseek(f, 0, SEEK_SET);
+    if (got == 4 && magic[0]=='N' && magic[1]=='P' && magic[2]=='D') {
+        /* NPD-encrypted SDATA: decrypt it in full and serve the plaintext from
+         * an anonymous tmpfile so the title's reads see the real container. */
+        fseek(f, 0, SEEK_END); long enc_sz = ftell(f); fseek(f, 0, SEEK_SET);
+        uint8_t* enc = (enc_sz > 0) ? (uint8_t*)malloc((size_t)enc_sz) : nullptr;
+        size_t rd = enc ? fread(enc, 1, (size_t)enc_sz, f) : 0;
+        fclose(f);
+        size_t dec_sz = 0;
+        uint8_t* dec = (enc && rd == (size_t)enc_sz) ? sdata_decrypt(enc, rd, &dec_sz) : nullptr;
+        free(enc);
+        if (!dec) {
+            fprintf(stderr, "[fs] SdataOpen '%s' NPD decrypt FAILED (unsupported "
+                    "EDAT/needs license); returning success without a handle\n", gpath);
+            ctx->gpr[3] = CELL_OK; return;   /* don't feed the title ciphertext */
+        }
+        char dmagic[4] = {0};
+        if (dec_sz >= 4) memcpy(dmagic, dec, 4);
+        FILE* tf = tmpfile();
+        if (!tf || fwrite(dec, 1, dec_sz, tf) != dec_sz) {
+            if (tf) fclose(tf); free(dec);
+            ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+        }
+        free(dec);
+        rewind(tf);
+        int fd = fd_alloc_file(tf);
+        if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+        if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+        fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
+                gpath, fd, dec_sz,
+                dmagic[0]?dmagic[0]:'?', dmagic[1]?dmagic[1]:'?',
+                dmagic[2]?dmagic[2]:'?', dmagic[3]?dmagic[3]:'?');
+        ctx->gpr[3] = CELL_OK;
+        return;
+    }
+    int fd = fd_alloc_file(f);
+    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+    fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
+            magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -260,7 +349,11 @@ static void cellFsStat(ppu_context* ctx)
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
     struct stat st;
-    if (stat(hpath, &st) != 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
+    if (stat(hpath, &st) != 0) {
+        if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+    }
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
     if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
@@ -289,6 +382,7 @@ static void cellFsOpendir(ppu_context* ctx)
     uint32_t fd_ptr = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
     DIR* d = opendir(hpath);
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
     int fd = fd_alloc_dir(d);
     if (fd < 0) { closedir(d); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
@@ -326,7 +420,41 @@ static void cellFsClosedir(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
-static void cellFsMkdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+#ifdef _WIN32
+#include <direct.h>
+#define HOST_MKDIR(p) _mkdir(p)
+#else
+#define HOST_MKDIR(p) mkdir((p), 0777)
+#endif
+
+/* Create `path` and any missing parent dirs on the host. Returns 0 on
+ * success or if the directory already exists. */
+static int host_mkdir_p(const char* path)
+{
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    size_t len = strlen(tmp);
+    while (len > 1 && (tmp[len-1] == '/' || tmp[len-1] == '\\')) tmp[--len] = 0;
+    for (char* p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') { char c = *p; *p = 0; HOST_MKDIR(tmp); *p = c; }
+    }
+    int r = HOST_MKDIR(tmp);
+    if (r != 0) { struct stat st; if (stat(tmp, &st) == 0 && (st.st_mode & S_IFDIR)) r = 0; }
+    return r;
+}
+
+/* cellFsMkdir(path, mode): create the guest directory on the host. A no-op stub
+ * here silently breaks games that create then poll a dir (e.g. LBP's boot waits
+ * for /dev_hdd0/game/<title>/USRDIR to appear). Create parents too. */
+static void cellFsMkdir(ppu_context* ctx)
+{
+    char gpath[1024], hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    host_path(hpath, sizeof hpath, gpath);
+    int r = host_mkdir_p(hpath);
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+    ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
+}
 static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
 static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 static void cellFsFsync(ppu_context* ctx)
@@ -335,10 +463,17 @@ static void cellFsFsync(ppu_context* ctx)
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) fflush(g_files[fd]);
     ctx->gpr[3] = CELL_OK;
 }
+/* File-area preallocation (LBP cache warm-up spams this): host filesystems
+ * grow files on write, so accepting is correct -- no preallocation needed. */
+static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 
 extern "C" void ppu_fs_register(void)
 {
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
+    /* Register by the literal import NID: LBP imports 0xB1840B53 for
+     * cellFsSdataOpen, which ps3_compute_nid("cellFsSdataOpen") does NOT match
+     * (the real exported symbol name differs from the friendly name). */
+    ps3_hle_register_ctx(0xB1840B53u, "cellFsSdataOpen", cellFsSdataOpen);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClose"),    "cellFsClose",    cellFsClose);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
@@ -352,4 +487,6 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
+                         "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
 }

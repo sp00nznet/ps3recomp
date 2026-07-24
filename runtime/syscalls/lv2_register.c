@@ -309,6 +309,25 @@ static uint32_t vm_read_be32(uint32_t guest_addr)
            ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
 }
 
+/* syscall 872: sys_ss_get_open_psid(CellSsOpenPSID* psid { u64 high; u64 low })
+ * Returns the console "Open PSID" (a per-console PSN/NP identity, also used for
+ * save-data/trophy keying). The prior unimplemented stub returned without
+ * touching the out-param, so the caller (an LBP 1.30 boot job) read heap
+ * garbage. Fill it — zeros, matching RPCS3's default unconfigured console_psid —
+ * and return CELL_OK. */
+static int64_t sys_ss_get_open_psid_handler(ppu_context* ctx)
+{
+    uint32_t ptr = (uint32_t)ctx->gpr[3];
+    if (ptr) {
+        vm_write_be32(ptr + 0,  0);   /* high[63:32] */
+        vm_write_be32(ptr + 4,  0);   /* high[31:0]  */
+        vm_write_be32(ptr + 8,  0);   /* low[63:32]  */
+        vm_write_be32(ptr + 12, 0);   /* low[31:0]   */
+    }
+    ctx->gpr[3] = 0;   /* CELL_OK */
+    return 0;
+}
+
 /* sys_spu_initialize(nspu, nrawspu) — one-shot global init */
 static int64_t sys_spu_initialize_handler(ppu_context* ctx)
 {
@@ -1175,8 +1194,13 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
         vm_write_be32(seg + 0x00, 1);                           /* SYS_SPU_SEGMENT_TYPE_COPY */
         vm_write_be32(seg + 0x04, p_va);                        /* ls_start   */
         vm_write_be32(seg + 0x08, p_fsz);                       /* size       */
-        vm_write_be32(seg + 0x10, 0);                           /* src_pa hi  */
-        vm_write_be32(seg + 0x14, src_ea + p_off);              /* src_pa lo  */
+        /* sys_spu_segment.src is a u32 EA at +0x10 (not a BE u64 hi/lo pair):
+         * LBP's FMOD overlay loader reads read32(seg+0x10) as the DMA source,
+         * so the address must sit at +0x10. Putting it at +0x14 (as a u64 lo)
+         * left +0x10 zero -> overlays DMA'd from NULL -> empty LS -> unresolved
+         * branch. +0x14 kept = addr too, harmless for any u64-lo reader. */
+        vm_write_be32(seg + 0x10, src_ea + p_off);              /* src EA (@+0x10) */
+        vm_write_be32(seg + 0x14, src_ea + p_off);
         nsegs++;
 
         if (p_msz > p_fsz && nsegs < 32) {                      /* BSS tail -> FILL 0 */
@@ -1323,6 +1347,10 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
      * sys_tty_write under the alternate number 988 (0x3DC) instead of 403; an
      * unimplemented return derails the CRT init table-walk into abort(). Alias it. */
     lv2_syscall_register(tbl, 988, sys_tty_write);
+
+    /* sys_ss_get_open_psid (console PSN/NP identity) — LBP 1.30 reads it during
+     * boot; the unimplemented stub left the out-param as garbage. */
+    lv2_syscall_register(tbl, 872, sys_ss_get_open_psid_handler);
 
     /* SPU syscalls — we don't execute SPU code but the PPU-side wrappers
      * need consistent IDs and out-params. See the stateful group tracker

@@ -10,6 +10,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
 #include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -33,6 +34,19 @@
  * -----------------------------------------------------------------------*/
 
 static int s_netctl_initialized = 0;
+
+/* Offline by default: titles gate their whole online boot path on this state
+ * and hang waiting on PSN jobs that can never complete if we claim a live
+ * connection. A real console with no link reports Disconnected and games take
+ * their offline path (verified against LBP's working RPCS3 boot, where
+ * GetState never reported a connection). PS3_NET_ONLINE=1 restores the old
+ * fake-connected behaviour for online experiments. */
+static int netctl_online(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("PS3_NET_ONLINE") ? 1 : 0;
+    return v;
+}
 
 typedef struct {
     int              in_use;
@@ -139,9 +153,19 @@ s32 cellNetCtlGetState(s32* state)
     if (!state)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    /* Report that we have a full IP connection (guest out-param) */
-    vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_IPObtained);
+    if (!netctl_online()) {
+        /* Offline: FAIL the query rather than report state=Disconnected.
+         * LBP's connect job (sub_F433C(0)) polls GetState forever until
+         * IPObtained and only exits on ret<0 -- and the working RPCS3 boot
+         * shows exactly one GetState call failing with NOT_INITIALIZED,
+         * after which the game proceeds offline. Still write a sane state
+         * for callers that ignore the return value. */
+        vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_Disconnected);
+        printf("[cellNetCtl] GetState() -> error NOT_INITIALIZED (offline mode)\n");
+        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
+    }
 
+    vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_IPObtained);
     printf("[cellNetCtl] GetState() -> IPObtained\n");
     return CELL_OK;
 }
@@ -178,7 +202,8 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_LINK:
-        info->link = ps3_bswap32((u32)CELL_NET_CTL_LINK_CONNECTED);
+        info->link = ps3_bswap32((u32)(netctl_online() ? CELL_NET_CTL_LINK_CONNECTED
+                                                       : CELL_NET_CTL_LINK_DISCONNECTED));
         break;
 
     case CELL_NET_CTL_INFO_LINK_TYPE:

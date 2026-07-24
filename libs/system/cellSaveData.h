@@ -310,6 +310,14 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
                           CellSaveDataFileCallback funcFile,
                           u32 container, void* userdata);
 s32 cellSaveDataDelete(u32 version, const char* dirName, u32 container);
+s32 cellSaveDataUserAutoSave(u32 version, u32 userId, const char* dirName,
+                             u32 errDialog, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile, u32 container);
+s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
+                             u32 errDialog, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile, u32 container);
 
 #ifdef __cplusplus
 }

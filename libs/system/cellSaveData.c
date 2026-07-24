@@ -80,6 +80,17 @@ static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 #endif
 }
 
+/* The generic HLE adapter passes PPC register values raw, so string args
+ * arrive as GUEST addresses (< 4GB). Translate to a host pointer once at
+ * the entry point; the internal helpers all expect host char*. */
+static const char* savedata_host_str(const char* p)
+{
+    uintptr_t v = (uintptr_t)p;
+    if (v && v < 0x100000000ull)
+        return (const char*)(vm_base + (uint32_t)v);
+    return p;
+}
+
 static int dir_exists(const char* path)
 {
     HOST_STAT_T st;
@@ -875,6 +886,7 @@ s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata)
 {
+    dirName = savedata_host_str(dirName);
     printf("[cellSaveData] AutoSave2(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
 
@@ -891,6 +903,7 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata)
 {
+    dirName = savedata_host_str(dirName);
     (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
     (void)container; (void)userdata;
     printf("[cellSaveData] AutoLoad2(version=%u, dir='%s')\n",
@@ -948,6 +961,7 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
                           CellSaveDataFileCallback funcFile,
                           u32 container, void* userdata)
 {
+    dirName = savedata_host_str(dirName);
     printf("[cellSaveData] AutoSave(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
     if (!dirName || !setBuf || !funcStat)
@@ -963,6 +977,7 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
                           CellSaveDataFileCallback funcFile,
                           u32 container, void* userdata)
 {
+    dirName = savedata_host_str(dirName);
     (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
     (void)container; (void)userdata;
     if (!dirName || !setBuf || !funcStat)
@@ -997,7 +1012,37 @@ s32 cellSaveDataDelete(u32 version, const char* dirName,
                         u32 container)
 {
     (void)version;
+    dirName = savedata_host_str(dirName);
     printf("[cellSaveData] Delete(dir='%s', container=%u)\n",
            dirName ? dirName : "<null>", container);
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * User variants (cellSaveDataUserAutoSave/Load): same as the non-User forms
+ * with a userId inserted after version. The trailing userdata is the guest's
+ * NINTH argument (on the guest stack, not in r3-r10) — the generic adapter
+ * only passes 8 registers, so declare 8 params and pass NULL through.
+ * LittleBigPlanet auto-loads its profile through UserAutoLoad at boot.
+ * -----------------------------------------------------------------------*/
+s32 cellSaveDataUserAutoSave(u32 version, u32 userId, const char* dirName,
+                             u32 errDialog, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile, u32 container)
+{
+    (void)userId;
+    printf("[cellSaveData] UserAutoSave(user=%u)\n", userId);
+    return cellSaveDataAutoSave(version, dirName, errDialog, setBuf,
+                                funcStat, funcFile, container, NULL);
+}
+
+s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
+                             u32 errDialog, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile, u32 container)
+{
+    (void)userId;
+    printf("[cellSaveData] UserAutoLoad(user=%u)\n", userId);
+    return cellSaveDataAutoLoad(version, dirName, errDialog, setBuf,
+                                funcStat, funcFile, container, NULL);
 }

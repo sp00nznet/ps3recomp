@@ -12,6 +12,21 @@
 #include "rsx_fp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
+
+/* Format one FP constant lane as an HLSL float literal. NaN/Inf constants
+ * (a light-pass FP embeds them; %g prints the bare tokens "nan"/"inf" which
+ * HLSL rejects -- X3004 undeclared identifier -> the whole PS fails to compile
+ * and its pass renders black) are reproduced bit-exactly via asfloat(). */
+static void fp_fmt_float(float v, char* buf, size_t n)
+{
+    if (isnan(v) || isinf(v)) {
+        u32 bits; memcpy(&bits, &v, 4);
+        snprintf(buf, n, "asfloat(0x%08Xu)", bits);
+    } else {
+        snprintf(buf, n, "%g", (double)v);
+    }
+}
 
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
@@ -185,10 +200,12 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
     } else if (s->type == FP_REG_TYPE_INPUT) {
         snprintf(base, sizeof(base), "%s", input_expr(input_src));
     } else { /* CONST */
-        if (has_k)
-            snprintf(base, sizeof(base), "float4(%g,%g,%g,%g)",
-                     k[0], k[1], k[2], k[3]);
-        else
+        if (has_k) {
+            char c0[24], c1[24], c2[24], c3[24];
+            fp_fmt_float(k[0], c0, sizeof c0); fp_fmt_float(k[1], c1, sizeof c1);
+            fp_fmt_float(k[2], c2, sizeof c2); fp_fmt_float(k[3], c3, sizeof c3);
+            snprintf(base, sizeof(base), "float4(%s,%s,%s,%s)", c0, c1, c2, c3);
+        } else
             snprintf(base, sizeof(base), "float4(0,0,0,0)");
     }
 

@@ -82,22 +82,58 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
     }
 
-    /* /app_home/ is the game's install dir (== the USRDIR root); the title opens
-     * it in several spellings ("/app_home/...", "app_home/...", "e:/app_home/...").
-     * Map anything from "app_home/" onward to <root>/... directly rather than
-     * appending a literal "app_home" directory that doesn't exist on disk. */
+    /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
+     * for a disc title patched to e.g. v1.30) -- mirror ppu_fs.cpp host_path.
+     * PS3_HDD0_ROOT = host dir that /dev_hdd0 maps into (contains game/<title>/). */
+    {
+        static const char* hdd0_root = NULL; static int hdd0_init = 0;
+        if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
+        if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
+            fs_normalize_sep(host_path);
+            return;
+        }
+    }
+
+    /* Strip a known mount prefix so this sys_fs layer resolves to the SAME host
+     * tree as the cellFs layer (ppu_fs.cpp host_path). Previously /dev_bdvd/X
+     * mapped to <root>/dev_bdvd/X -- a directory that doesn't exist -- so a title
+     * that opens disc content through the raw sys_fs path (LBP's Bink videos,
+     * e.g. gamedata/videos/localisation_test.bik) failed even though the file is
+     * present, stalling the loader waiting on the resource. /app_home/ is the
+     * game's install dir (== the USRDIR root); the title also opens it in
+     * non-leading spellings ("app_home/...", "e:/app_home/..."). */
+    static const char* const mounts[] = {
+        "/dev_bdvd/", "/app_home/", "/dev_hdd0/", "/dev_hdd1/",
+        "/dev_flash/", "/host_root/", "/dev_usb000/", "/dev_usb/"
+    };
     const char* rel = ps3_path;
-    const char* ah = strstr(ps3_path, "app_home/");
-    /* Map anything from a "USRDIR/" component onward to <root>/USRDIR/... directly.
-     * This bypasses the full /dev_hdd0/game/<ID>/USRDIR install tree (which we
+    /* flОw first: map anything from a "USRDIR/" component onward to <root>/USRDIR/...
+     * directly, bypassing the full /dev_hdd0/game/<ID>/USRDIR install tree (which we
      * normally provide via a filesystem junction) -- concurrent opens THROUGH a
-     * Windows junction intermittently fail (the source of the nondeterministic Cg
-     * shader "could not be read" abort). The real assets live under <root>/USRDIR,
-     * so resolve straight there. */
+     * Windows junction intermittently fail (the nondeterministic Cg shader "could
+     * not be read" abort). The real assets live under <root>/USRDIR. flОw's failing
+     * paths carry "USRDIR/"; LBP's raw-sys_fs disc paths (/dev_bdvd Bink videos) do
+     * not, so they fall through to sagemono's mount-prefix stripping below. */
     const char* usrp = strstr(ps3_path, "USRDIR/");
-    if (usrp) rel = usrp;                  /* "USRDIR/..." */
-    else if (ah) rel = ah + 9;             /* everything after "app_home/" */
-    else if (rel[0] == '/') rel++;         /* otherwise just strip leading slash */
+    if (usrp) {
+        rel = usrp;                        /* "USRDIR/..." */
+    } else {
+        /* Otherwise strip a known mount prefix so this sys_fs layer resolves to the
+         * SAME host tree as the cellFs layer (ppu_fs.cpp). /dev_bdvd/X previously
+         * mapped to <root>/dev_bdvd/X -- a dir that doesn't exist -- stalling titles
+         * that open disc content through raw sys_fs. */
+        int matched = 0;
+        for (size_t i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
+            size_t n = strlen(mounts[i]);
+            if (strncmp(ps3_path, mounts[i], n) == 0) { rel = ps3_path + n; matched = 1; break; }
+        }
+        if (!matched) {
+            const char* ah = strstr(ps3_path, "app_home/");
+            if (ah) rel = ah + 9;          /* non-leading app_home spelling */
+            else if (rel[0] == '/') rel++; /* otherwise just strip leading slash */
+        }
+    }
 
     snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
     fs_normalize_sep(host_path);
