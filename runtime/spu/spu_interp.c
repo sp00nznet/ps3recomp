@@ -332,6 +332,10 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
+    /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
+     * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
+    static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
+    uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
         /* Rejoin the compiled fast path only for images that HAVE lifted
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
@@ -339,8 +343,14 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
          * another image's functions that happen to share an LS address. */
         if (ctx->image_id >= 0 && spu_lifted_lookup(ctx, ctx->pc)) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
+        if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
-        if (spu_step(ctx)) { g_spu_interp_steps = steps; return ctx->stop_code; }
+        if (spu_step(ctx)) { g_spu_interp_steps = steps;
+            if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
+                    ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
+                for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
+                fprintf(stderr,"\n"); fflush(stderr); _tr--; }
+            return ctx->stop_code; }
     }
 }
 

@@ -270,36 +270,58 @@ static void spu_async_run(spu_async_job* j)
              * task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then
              * run the cri task, to see how much further it gets. Diagnostic only. */
             if (j->image_id == 22 && getenv("YDKJ_CRI_TASKSET")) {
-                /* cri build: load the TASKSET POLICY module (libsre 0x23680 ->
-                 * LS 0xA00) alongside the cri task (already at 0x3000), then RUN
-                 * THE POLICY ENTRY (tsp_spu_func_00000A00) under image 23. The
-                 * policy builds the 0x2700 task-API table + dispatches the cri
-                 * task. Needs the SpursKernelContext at LS[0x1C0] (instance ptr)
-                 * + r80=0x100 context base, mirroring the kernel->policy handoff. */
+                /* Load the TASKSET POLICY module (libsre 0x30023680 -> LS 0xA00) alongside
+                 * the cri task (already at 0x3000), then INTERPRET the policy entry (0xA00):
+                 * the policy builds the 0x2700 task-API jump table + dispatches the ready cri
+                 * task itself, so the task's computed branches (which branch-to-0 when we run
+                 * the task directly) resolve through the policy's live table. Runs the policy
+                 * INTERPRETED (not lifted) because the policy has the same computed-branch /
+                 * jump-table code the static lift can't resolve. */
                 extern uint8_t* vm_base;
-                extern void tsp_spu_func_00000A00(spu_context*);
-                if (vm_base) memcpy(ls + 0xA00, vm_base + 0x30023680, 0x2200);
-                /* Build the REAL SpursTasksetContext at LS 0x2700 (taskset ptr @0x27B8,
-                 * TaskInfo @0x2780, syscallAddr @0x27C4) from the actual game taskset,
-                 * so the policy's DMAs read valid data instead of garbage. The instance
-                 * ptr (LS[0x1C0]) was a hardcoded 0x40009D00 that mismatched the game's
-                 * real 0x40009F00 -> policy DMA'd garbage -> null branches. */
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 extern uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                extern uint32_t vm_read32(uint32_t); extern void vm_write32(uint32_t,uint32_t);
+                extern uint64_t vm_read64(uint32_t);
+                if (!g_ydkj_real_taskset_ea) { const char* _cts=getenv("YDKJ_CRI_TS");
+                    if (_cts && *_cts) { g_ydkj_real_taskset_ea=(uint32_t)strtoul(_cts,0,16); g_ydkj_real_taskid=0; } }
+                if (g_ydkj_real_taskset_ea) {
+                    /* wait for the LLE task-add to populate TaskInfo[].elf, then promote
+                     * PENDING_READY -> READY so the policy finds a runnable task. */
+                    uint32_t ti_elf = g_ydkj_real_taskset_ea + 0x80 + g_ydkj_real_taskid*48 + 0x10;
+                    int i=0; for (; i<6000 && (vm_read64(ti_elf)&~7ull)==0; i++) {
+#ifdef _WIN32
+                        Sleep(1);
+#else
+                        { struct timespec _t={0,1000000}; nanosleep(&_t,0); }
+#endif
+                    }
+                    for (int w=0; w<4; w++){ uint32_t pend=vm_read32(g_ydkj_real_taskset_ea+0x20+w*4);
+                        if (pend) vm_write32(g_ydkj_real_taskset_ea+0x10+w*4,
+                                    vm_read32(g_ydkj_real_taskset_ea+0x10+w*4)|pend); }
+                    fprintf(stderr,"[cri] CRI_TASKSET: taskset elf=0x%llX ready=0x%08X after %dms\n",
+                        (unsigned long long)(vm_read64(ti_elf)&~7ull), vm_read32(g_ydkj_real_taskset_ea+0x10), i);
+                }
+                if (vm_base) memcpy(ls + 0xA00, vm_base + 0x30023680, 0x2200);
                 if (g_ydkj_real_taskset_ea)
                     spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
-                uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009D00u;
+                uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009F00u;
                 uint8_t* p = ls + 0x1C0;
                 p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
                 p[4]=(uint8_t)(inst>>24); p[5]=(uint8_t)(inst>>16);
                 p[6]=(uint8_t)(inst>>8);  p[7]=(uint8_t)inst;   /* lo32 */
-                fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
+                /* INTERPRET the policy entry (kernel->policy handoff: r80=0x100 context base,
+                 * r3=SpursTasksetContext @0x2700). image_id=-1 => pure interpretation. */
+                spu_context pctx; spu_context_init(&pctx, 0); pctx.image_id = -1;
+                pctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;
+                memcpy(pctx.ls, ls, SPU_LS_SIZE);
+                pctx.gpr[80]._u32[0] = 0x100;
+                pctx.gpr[3]._u32[0]  = 0x2700;
+                fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: policy@0xA00 resident, interpreting policy entry 0xA00 (inst=0x%08X)\n", inst);
                 fflush(stderr);
-                /* Run the taskset policy entry instead of the cri task entry.
-                 * (spu_run_lifted_job_abi is declared in spu_lifted_job.h.) */
-                int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
-                                                     j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0);
-                fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
+                uint32_t pstop = spu_interp_run(&pctx, 0xA00);
+                memcpy(ls, pctx.ls, SPU_LS_SIZE);
+                fprintf(stderr, "[cri] CRI_TASKSET: policy interp halted LSA=0x%X stop=0x%X (video_dma=%d)\n",
+                        pstop, pctx.stop_code, g_cri_video_dma);
                 fflush(stderr);
                 free(ls); free(j); return;
             }
@@ -507,9 +529,14 @@ static void spu_async_run(spu_async_job* j)
                         g_ydkj_real_taskset_ea?vm_read32(g_ydkj_real_taskset_ea+0x00):0);
                 fflush(stderr);
                 uint32_t stop_lsa = spu_interp_run(&ictx, entry);
+                extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
                 memcpy(ls, ictx.ls, SPU_LS_SIZE);
-                fprintf(stderr, "[cri] YDKJ_CRI_INTERP: image 22 interp halted at LSA=0x%X "
-                        "stop_code=0x%X (video_dma=%d)\n", stop_lsa, ictx.stop_code, g_cri_video_dma);
+                /* NB: spu_interp_run returns the STOP_CODE, not the PC. Report the real halt
+                 * PC (g_spu_interp_last_pc) + step count so "stopped" isn't misread as "at 0". */
+                fprintf(stderr, "[cri] YDKJ_CRI_INTERP: image 22 interp halted at pc=0x%X "
+                        "stop_code=0x%X after %llu steps (video_dma=%d) [ret=0x%X]\n",
+                        g_spu_interp_last_pc, ictx.stop_code, (unsigned long long)g_spu_interp_steps,
+                        g_cri_video_dma, stop_lsa);
                 fflush(stderr);
                 free(ls); free(j); return;
             }
