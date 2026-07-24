@@ -403,7 +403,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
  * syscall. num = r3&0xF (0x10 bit = the "2" variant), args in r4. Adopted from the
  * JonathanDC64/ps3recomp fork (aaea4158) which uses this to run SPURS tasks clean. */
 #define YDKJ_TASKSET_PM_SYSCALL_ADDR 0xA70u
-static void spu_spurs_taskset_syscall(spu_context* ctx)
+void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
     uint32_t num = raw & 0x0F;

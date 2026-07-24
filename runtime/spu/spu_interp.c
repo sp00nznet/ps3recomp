@@ -337,6 +337,27 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
+        /* Taskset PM task-syscall entry (LS 0xA70): the pure interpreter has no PM
+         * code resident there, so a task's task-API call (EXIT/YIELD/WAIT/POLL via
+         * func_00026DE0 -> syscallAddr@0x27C4) would execute empty LS and stop 0.
+         * HLE it exactly like the lifted path (spu_channels.c spu_indirect_branch),
+         * then resume at the task's link (r0). Gated by the syscallAddr sentinel at
+         * LS 0x27C4 (only spurs_pm_build_context writes 0xA70 there). The handler
+         * halts on EXIT(num=0) unless image_id==22; present that momentarily so an
+         * interp'd cri task (image_id set to -1 for pure interp) resumes instead of
+         * longjmp-ing out of a context that isn't wrapped for it. */
+        if (ctx->pc == 0xA70u) {
+            uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
+                        | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
+            if (sc == 0xA70u) {
+                extern void spu_spurs_taskset_syscall(spu_context*);
+                int _save = ctx->image_id; ctx->image_id = 22;
+                spu_spurs_taskset_syscall(ctx);
+                ctx->image_id = _save;
+                ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;   /* resume at link r0 */
+                continue;
+            }
+        }
         /* Rejoin the compiled fast path only for images that HAVE lifted
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
