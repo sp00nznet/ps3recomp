@@ -335,6 +335,7 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
     static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
+    static uint64_t _cap=0; { static int _ci=0; if(!_ci){_ci=1; const char*e=getenv("YDKJ_SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0;} }
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
         /* Taskset PM task-syscall entry (LS 0xA70): the pure interpreter has no PM
@@ -366,6 +367,14 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
         g_spu_interp_last_pc = ctx->pc;
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
+        /* YDKJ_SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
+         * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
+        if (_tr>0 && _cap && steps == _cap) {
+            fprintf(stderr,"[spu-trace] STEPCAP pc=0x%05X after %llu steps; last %d PCs:",
+                    ctx->pc, (unsigned long long)steps, rn);
+            for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
+            fprintf(stderr,"\n"); fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
+        }
         if (spu_step(ctx)) { g_spu_interp_steps = steps;
             if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
