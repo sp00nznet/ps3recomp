@@ -19,6 +19,14 @@
  * otherwise).
  */
 #include "ppu_recomp.h"
+/* The lifted ppu_recomp.h already defines `struct ppu_context` (identical to
+ * runtime/ppu/ppu_context.h by design -- "keep the two in sync"). A syscall
+ * header included later (sys_ppu_thread.h -> lv2_syscall_table.h -> ppu_context.h)
+ * would redefine it, so claim ppu_context.h's guard now: this TU has the struct,
+ * and boot_main uses none of that header's PPU_CR or XER bit macros. */
+#ifndef PPU_CONTEXT_H
+#define PPU_CONTEXT_H
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

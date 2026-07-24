@@ -798,7 +798,9 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
  * syscall. num = r3&0xF (0x10 bit = the "2" variant), args in r4. Adopted from the
  * JonathanDC64/ps3recomp fork (aaea4158) which uses this to run SPURS tasks clean. */
 #define YDKJ_TASKSET_PM_SYSCALL_ADDR 0xA70u
-static void spu_spurs_taskset_syscall(spu_context* ctx)
+/* External linkage: spu_interp.c calls this across TUs (was static -> undefined
+ * symbol at link when a title pulls spu_interp.obj). */
+void spu_spurs_taskset_syscall(spu_context* ctx)
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
     uint32_t num = raw & 0x0F;
