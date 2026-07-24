@@ -3327,6 +3327,21 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # (YDKJ merge: _lwz_of also matches `ld` -- the 64-bit ELFv1 TOC form.
         # SN loads the base with `lwz`; gcc/PSL1GHT/newlib use `ld`. Accept both,
         # or every newlib dtoa/printf("%f") dense switch falls through.)
+        def _extended_from(window, reg):
+            """{reg} plus every register a sign-extend of it flows into.
+
+            gcc inserts `extsw r5,r12` between the table load and the add. Do
+            NOT chase `mr`/`clrldi`/`rldicl`: those carry other values too, and
+            broadening this turned correctly-absolute tables into offset decodes.
+            """
+            regs = {reg}
+            for w in window:
+                if w.mnemonic in ('extsw', 'extsb', 'extsh'):
+                    a = [x.strip() for x in w.operands.split(',')]
+                    if len(a) >= 2 and a[1] in regs:
+                        regs.add(a[0])
+            return regs
+
         def _lwz_of(reg):
             """Most-recent `lwz/ld reg, disp(rA)` in the window -> (disp, rA_name)."""
             for w in reversed(win):
@@ -3351,7 +3366,31 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # the per-candidate loop below referenced undefined `disp`/`base_is_ld`.)
         toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
         _tocs = [t for t in toc_candidates if t]
-        for cand in (p[1], p[2]):
+        # Which lwzx operand is the table base? Both are often TOC-loaded, so
+        # "first one whose TOC slot reads back" picks whichever comes first in
+        # the operand list -- and an unrelated `lwz rIdx, d(r2)` earlier in the
+        # window reads back a perfectly valid (wrong) address. The offset-table
+        # idiom ends in `add rD, rOff, rBase` feeding mtctr, so the base is
+        # unambiguous there: prefer the operand that add combines with the
+        # loaded offset. (flOw's app state machine @0x89300 decoded its table
+        # from r9's global 0x10157F30 instead of r11's real base 0x00089304 ->
+        # the switch fell through to an unresolved bctr and hung the boot.)
+        _off_regs = _extended_from(win, p[0])
+        _cands = [p[1], p[2]]
+        for w in win:
+            if w.mnemonic != 'add':
+                continue
+            a = [x.strip() for x in w.operands.split(',')]
+            if len(a) != 3:
+                continue
+            for _o, _b in ((a[1], a[2]), (a[2], a[1])):
+                if _o in _off_regs and _b in _cands:
+                    _cands = [_b] + [c for c in _cands if c != _b]
+                    break
+            else:
+                continue
+            break
+        for cand in _cands:
             ld = _lwz_of(cand)
             if ld is None:
                 continue
@@ -3386,16 +3425,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # (the raw lwzx dest) missed every dispatcher with an extend in between --
         # mis-lifting the switch as a frame-leaking bctr to an unlifted case (e.g.
         # libxml2's xmlReportError offset-table @ 0x2B8448). */
-        off_regs = {rC}
-        for w in win:
-            # Only follow a sign/zero EXTEND of the loaded offset (the extra step
-            # gcc inserts, `extsw r5,r12`). Do NOT chase `mr`/`clrldi`/`rldicl`:
-            # those flow other values too and broadened is_offset enough to turn a
-            # correctly-absolute table into an offset decode -> wrong case targets.
-            if w.mnemonic in ('extsw', 'extsb', 'extsh'):
-                a = [x.strip() for x in w.operands.split(',')]
-                if len(a) >= 2 and a[1] in off_regs:
-                    off_regs.add(a[0])
+        off_regs = _off_regs
         is_offset = any(
             w.mnemonic == 'add' and (
                 lambda ops: r_base in ops[1:] and any(o in off_regs for o in ops[1:])
