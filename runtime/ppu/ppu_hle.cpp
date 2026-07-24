@@ -242,6 +242,31 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                            (p2[k] == want[k] ||
                             (p2[k] >= 'a' && p2[k] - 32 == want[k]))) k++;
                     if (k == 8) {
+                        /* CRI exception: cellSpursEventFlagInitialize (0x5EF96465) is
+                         * force-HLE'd because libsre's version STAT'd and tripped CRI's
+                         * CellSpursTaskset.cc:423 assertion -- but that was before the
+                         * taskset/attr fixes. The HLE stub does NOT stamp the eventFlag's
+                         * +0xC=0xFF magic that the create-task pre-check (0x300158C4) then
+                         * requires, so the CRI create STATs. Route ONLY the cri event flag
+                         * (r4 == YDKJ_CRI_EVFLAG, default 0x006B4600) to real libsre so it
+                         * stamps +0xC=0xFF and the create passes; keep the audio flags on
+                         * the HLE stub (their create STAT is tolerated -- routing them makes
+                         * the game wait for the audio SPU task we don't dispatch -> hang). */
+                        if (nid == 0x5EF96465u) {
+                            const char* ce = getenv("YDKJ_CRI_EVFLAG");
+                            uint32_t crif = ce ? (uint32_t)strtoul(ce, 0, 16) : 0x006B4600u;
+                            static int _cd=0; if(getenv("YDKJ_SPURSTRACE") && _cd++<4) fprintf(stderr,
+                                "[EVFLAG] 0x5EF96465 r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
+                                (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]);
+                            /* the eventFlag EA can be r3/r4/r5 depending on the (public vs _internal)
+                             * variant behind this NID; the cri flag is a unique address so match any. */
+                            if ((uint32_t)ctx->gpr[3] == crif || (uint32_t)ctx->gpr[4] == crif ||
+                                (uint32_t)ctx->gpr[5] == crif) {
+                                static int _c=0; if(_c++<2) fprintf(stderr,
+                                    "[FORCE-HLE] cri eventflag 0x%08X -> REAL libsre (stamps +0xC=0xFF)\n", crif);
+                                break;   /* keep opd (libsre); do NOT force HLE */
+                            }
+                        }
                         static int _n = 0;
                         if (_n++ < 8)
                             fprintf(stderr, "[FORCE-HLE] nid=0x%08X: bypassing libsre, using HLE\n", nid);
