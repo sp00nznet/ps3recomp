@@ -550,7 +550,15 @@ static void spu_async_run(spu_async_job* j)
                         g_ydkj_real_taskset_ea?vm_read32(g_ydkj_real_taskset_ea+0x20):0,
                         g_ydkj_real_taskset_ea?vm_read32(g_ydkj_real_taskset_ea+0x30):0,
                         g_ydkj_real_taskset_ea?vm_read32(g_ydkj_real_taskset_ea+0x00):0);
-                fflush(stderr);
+                /* Dump the task-argument targets (r3 = CellSpursTaskArgument) so they can be
+                 * diffed vs the RPCS3 dump's [007A0000 3002EE44 3002ED00 005C3580] to check
+                 * whether the game built a valid work descriptor. */
+                { extern uint8_t* vm_base;
+                  for (int a=0;a<4;a++){ uint32_t p=ictx.gpr[3]._u32[a];
+                    if (p>=0x10000 && p<0x0F000000u){ fprintf(stderr,"[cri] arg%d @0x%08X:",a,p);
+                      for(int k=0;k<0x20;k+=4) fprintf(stderr," %08X",
+                        (vm_base[p+k]<<24)|(vm_base[p+k+1]<<16)|(vm_base[p+k+2]<<8)|vm_base[p+k+3]);
+                      fprintf(stderr,"\n"); } } fflush(stderr); }
                 uint32_t stop_lsa = spu_interp_run(&ictx, entry);
                 extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
                 memcpy(ls, ictx.ls, SPU_LS_SIZE);
