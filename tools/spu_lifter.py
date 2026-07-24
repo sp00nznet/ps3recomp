@@ -1050,6 +1050,16 @@ def main() -> None:
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
+    p.add_argument("--code-end", type=lambda x: int(x, 0), default=0,
+                   help="Address where executable code ends and an embedded "
+                        "rodata/const tail begins. Drops any auto-detected "
+                        "function starting at/after this address and caps any "
+                        "function's end here, so the data tail is left "
+                        "un-disassembled. For images with a large data tail in "
+                        ".text whose bytes decode as in-range branches and seed "
+                        "garbage `functions` (e.g. the LBP WWS physics jobmods, "
+                        "which append a zlib inflate string table + float tables "
+                        "after the code at 0xAE68 / 0xAE48).")
     p.add_argument("--force-indirect", default="",
                    help="Comma-separated `bi $rN` addresses to emit as GENERIC "
                         "indirect dispatch, overriding the link-register-return "
@@ -1114,6 +1124,20 @@ def main() -> None:
         bounds = sorted(by_start.items())
         sys.stderr.write("[spu_lifter] added extra funcs: %s\n" %
                          ", ".join("0x%X" % a for a in extra))
+
+    # Cap the code/data boundary. Some images embed a large rodata/const tail
+    # inside the executable segment; its bytes decode as in-range branches
+    # (br/brsl/brhz ...) whose targets seed spurious "functions", which then
+    # disassemble the data as code (garbage + `.word` for undecodable words).
+    # Reachability from the entry can't bound it (the entry is an indirect
+    # dispatch stub), so the boundary is supplied explicitly per image.
+    if args.code_end:
+        ce = args.code_end
+        before = len(bounds)
+        bounds = [(s, min(e, ce)) for (s, e) in bounds if s < ce]
+        sys.stderr.write("[spu_lifter] code-end 0x%X: kept %d/%d bound(s), "
+                         "data tail left un-disassembled\n"
+                         % (ce, len(bounds), before))
 
     insns = disassemble_spu(data, base)
 

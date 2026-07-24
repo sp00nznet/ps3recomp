@@ -28,6 +28,19 @@ OUTDIR = os.path.join(ROOT, "lbp_spu", "lifted")
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
 BASE   = 0x4000
 
+# Per-module code/data boundary. A few images embed a large rodata/const tail
+# inside the executable segment; its bytes decode as in-range branches that
+# seed spurious "functions", disassembling the data as code (garbage + `.word`
+# for undecodable words). The boundary was found by disassembly: after the
+# last real unconditional `br`, a zlib-inflate error-string table + float
+# const tables run to the image end. Passed to spu_lifter.py --code-end so the
+# tail is left un-disassembled. Without it, these two physics jobmods each lift
+# ~97 `.word` unsupported (was 0 in the original, pre-git-clean lift).
+CODE_END = {
+    "jobmod_ef33c6c99dc7_e0A40": 0xAE68,   # real code ends at br 0xA554 @ 0xAE60
+    "jobmod_6943e26934ea_e0A20": 0xAE48,   # real code ends at br 0xA534 @ 0xAE40
+}
+
 def main():
     mods = sorted(glob.glob(os.path.join(JOBMODS, "*.bin")))
     os.makedirs(OUTDIR, exist_ok=True)
@@ -48,11 +61,12 @@ def main():
         with open(tmp_elf, "wb") as f:
             f.write(elf)
 
-        r = subprocess.run(
-            [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(BASE),
-             "--symbol-prefix", prefix, "-o", outsub,
-             "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h"],
-            capture_output=True, text=True)
+        cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(BASE),
+               "--symbol-prefix", prefix, "-o", outsub,
+               "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h"]
+        if name in CODE_END:
+            cmd += ["--code-end", hex(CODE_END[name])]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)
             continue
