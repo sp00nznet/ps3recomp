@@ -1637,7 +1637,8 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
 }
 
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
-                                   uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+                                   uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                   uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     if (!opd_addr) return 0;
     uint32_t code = 0, toc = 0;
@@ -1662,6 +1663,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     ctx.gpr[1]  = s_cb_sp;
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+    ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
     ctx.gpr[13] = PPU_TLS_TP;
     ctx.cia     = code;
     /* Save/restore g_active_ctx: this scratch ctx lives on the stack, so leaving
@@ -1691,7 +1693,8 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
  * clobbered in guest memory (e.g. the GCM flip/vblank handler OPDs). Same
  * scratch-stack + trampoline-drain behaviour as ppu_guest_call. */
 extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
-                                      uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+                                      uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                      uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     if (!code) return 0;
     ppu_fn fn = ppu_lookup(code);
@@ -1705,6 +1708,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ctx.gpr[1]  = s_cb_sp;
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+    ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
     ctx.gpr[13] = PPU_TLS_TP;
     ctx.cia     = code;
     /* Save/restore g_active_ctx (see ppu_guest_call): the scratch ctx is stack-local,

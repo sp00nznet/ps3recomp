@@ -161,11 +161,15 @@ extern "C" uint8_t* vm_base = nullptr;
 extern "C" uint32_t ppu_vm_size;
 extern "C" void lv2_init_syscalls(void);
 
-typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                    uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" ps3_guest_caller_fn g_ps3_guest_caller;
-extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
-static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
-{ ppu_guest_call(opd, a0, a1, a2, a3); }
+extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t, uint64_t);
+static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
+                                 uint64_t a2, uint64_t a3, uint64_t a4,
+                                 uint64_t a5, uint64_t a6, uint64_t a7)
+{ ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7); }
 
 #ifdef _WIN32
 static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)

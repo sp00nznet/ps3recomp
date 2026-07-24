@@ -73,7 +73,9 @@ extern "C" uint32_t prx_resolve_export(uint32_t nid);
 extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
-extern "C" uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+extern "C" uint64_t ppu_guest_call(uint32_t opd,
+                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
 /* Weak: builds that don't link cellGcmSys.c (test harnesses) get a null and skip. */
 extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char*);
@@ -528,7 +530,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             /* copy dirName ("BLUS30569-AUTO-") into dir.dirName @ 0x08+0x18=0x20 */
             { uint32_t src=(uint32_t)ctx->gpr[5]; for(int i=0;i<31;i++){ uint32_t w=vm_read32((src+i)&~3u); uint8_t b=(w>>((3-((src+i)&3))*8))&0xFF; vm_write32((SG+0x20+i)&~3u, (vm_read32((SG+0x20+i)&~3u) & ~(0xFFu<<((3-((SG+0x20+i)&3))*8))) | ((uint32_t)b<<((3-((SG+0x20+i)&3))*8))); if(!b)break; } }
             fprintf(stderr,"[SAVEDATA-HLE] cellSaveDataAutoLoad2: calling game statCallback OPD=0x%08X (isNewData=1)\n",statCb);
-            uint64_t r=ppu_guest_call(statCb, SC, SG, SS, 0);
+            uint64_t r=ppu_guest_call(statCb, SC, SG, SS, 0, 0, 0, 0, 0);
             int32_t cbres=(int32_t)vm_read32(SC+0x00);
             fprintf(stderr,"[SAVEDATA-HLE] statCallback returned r3=0x%llX cbResult->result=%d -> returning OK\n",(unsigned long long)r,cbres);
             ctx->gpr[3]=0; /* CELL_SAVEDATA_RET_OK */

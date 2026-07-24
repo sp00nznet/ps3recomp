@@ -151,7 +151,7 @@ s32 cellSysutilCheckCallback(void)
                                (uint64_t)e.status,
                                (uint64_t)e.param,
                                (uint64_t)s_callbacks[e.slot].userdata,
-                               0);
+                               0, 0, 0, 0, 0);
         }
     }
     return CELL_OK;

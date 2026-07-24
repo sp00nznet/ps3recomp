@@ -24,7 +24,8 @@ void     ppu_hle_init(void);
 
 /* Host-provided symbols the HLE libs need. */
 extern "C" uint8_t* vm_base = nullptr;
-typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                    uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 
 static int fails = 0;

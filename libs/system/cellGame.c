@@ -399,7 +399,7 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
 
     /* StatSet left zeroed (setParam = NULL: callback chooses whether to modify). */
 
-    g_ps3_guest_caller(func_opd, cb, get, set, 0);
+    g_ps3_guest_caller(func_opd, cb, get, set, 0, 0, 0, 0, 0);
 
     s32 result = (s32)vm_read32(cb + 0x000);
     printf("[cellGame] DataCheckCreate2: funcStat returned result=%d\n", result);

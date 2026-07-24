@@ -562,13 +562,14 @@ void ppu_gcm_pump(void)
     in = 1;
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count, 0, 0, 0);
+        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
+                           0, 0, 0, 0, 0, 0, 0);
     }
     if (p & 2) {
         s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
-            g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0);
+            g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
     }
     in = 0;
@@ -1039,7 +1040,7 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
 
     /* Invoke via OPD resolution, not a raw call into guest code. */
     if (s_flip_handler_opd && g_ps3_guest_caller)
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);  /* head 0 = primary display */
+        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
 }
@@ -1088,7 +1089,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
      * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
      * jumps into guest code and crashes. */
     if (s_flip_handler_opd && g_ps3_guest_caller)
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0);
+        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
 
     return CELL_OK;
 }
