@@ -374,6 +374,18 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             { static int64_t st=-2; if(st==-2){const char*e=getenv("YDKJ_SPURSTRACE"); st=e?1:0;}
               if (st) fprintf(stderr, "[SPURSTRACE] nid=0x%08X -> libsre code=0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X lr=0x%08X\n",
                   nid, code, (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6],(uint32_t)ctx->lr);
+              /* CRI task-arg trace: _cellSpursTaskAttributeInitialize (0xB8474EFF) carries the
+               * CellSpursTaskArgument (16B). Dump all 8 arg regs + the r9/r10 targets so we can
+               * find which game value becomes the task's r3 (wrong vs the RPCS3 dump). */
+              if (st && nid==0xB8474EFFu) { extern uint8_t* vm_base;
+                  fprintf(stderr,"[TASKARG] 0xB8474EFF r3..r10= %08X %08X %08X %08X %08X %08X %08X %08X (lr=0x%08X)\n",
+                      (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6],
+                      (uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8],(uint32_t)ctx->gpr[9],(uint32_t)ctx->gpr[10],(uint32_t)ctx->lr);
+                  for (int rr=9; rr<=10; rr++){ uint32_t p=(uint32_t)ctx->gpr[rr];
+                      if (p>=0x10000 && p<0x0F000000u){ fprintf(stderr,"[TASKARG]   r%d@0x%08X:",rr,p);
+                          for(int k=0;k<0x20;k+=4) fprintf(stderr," %08X",
+                              (vm_base[p+k]<<24)|(vm_base[p+k+1]<<16)|(vm_base[p+k+2]<<8)|vm_base[p+k+3]);
+                          fprintf(stderr,"\n"); } } }
               /* Dump the struct state at the failing task-attach calls: libsre 0x300158C4
                * (nid 0x87630976) STATs unless struct+0xC==0xFF & +0xE in{1,3}; 0x30015AA4
                * (0x22AAB31D) validates the same struct. Show what our recomp left there. */
