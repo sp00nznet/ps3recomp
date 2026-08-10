@@ -945,8 +945,17 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     s32 cb = dispatch_func_stat(func_opd, is_new, dirName, userdata_ea);
 
     if (cb < 0) {
+        /* flОw first-boot: its funcStat returns ERR_NODATA on a new profile
+         * (isNewData=1). The callback already ran and told the game "no save",
+         * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
+         * parked in MODE_AUTO_LOAD (no app loop, no flips).
+         * Per the SDK the correct return here is CELL_SAVEDATA_ERROR_NODATA,
+         * and a real title handles it; that flОw does not is a bug somewhere in
+         * its MODE_AUTO_LOAD state machine we have not tracked down. Keep the
+         * compat return until that is understood -- it was dropped once already
+         * in the fold merge and cost a boot regression. */
         if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_SAVEDATA_ERROR_NODATA;
+            return CELL_OK;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
     /* OK_LAST or OK_NEXT — with no actual file load infrastructure for
@@ -1034,8 +1043,12 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
     s32 cb = dispatch_func_stat(func_opd, is_new, dirName, userdata_ea);
 
     if (cb < 0) {
+        /* Same first-boot compat return as cellSaveDataAutoLoad2 above (flОw
+         * calls this old non-_2 variant): ERR_NODATA from funcStat on a new
+         * profile must not surface as an error, or the title parks in
+         * MODE_AUTO_LOAD. See the longer note there. */
         if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_SAVEDATA_ERROR_NODATA;
+            return CELL_OK;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
     return CELL_OK;
