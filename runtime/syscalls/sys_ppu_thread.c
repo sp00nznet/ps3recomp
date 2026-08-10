@@ -80,6 +80,16 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
 
+#ifdef _WIN32
+    /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
+     * main thread. Deep recompiled call chains DO overflow even a 256 MB stack
+     * (a lifter bug that turns a tail call into recursion is unbounded), and
+     * without the guarantee the handler faults while reporting -- the process
+     * then dies silently with an access violation INSIDE the handler and the
+     * backtrace that would name the recursing function is lost. */
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#endif
+
     /* Register this thread's context for lwarx/stwcx cross-thread reservation
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
