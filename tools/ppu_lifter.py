@@ -353,6 +353,13 @@ def _xea(ra, rb):
     return f"ctx->gpr[{rb}]" if str(ra) == "0" else f"(ctx->gpr[{ra}] + ctx->gpr[{rb}])"
 
 
+def _mem_base(base):
+    """D-form (displacement) effective-address base: the same rA=0-means-literal-0
+    rule as _xea (PowerISA V2.03 3.3.2/3.3.3). Update forms are excluded by the
+    architecture (rA=0 is an invalid form there) so they keep the plain register."""
+    return "0" if str(base) == "0" else f"ctx->gpr[{base}]"
+
+
 def _disp_base(token: str):
     """Parse 'disp(rN)' -> (disp_str, N)."""
     m = re.match(r"(-?0x[0-9A-Fa-f]+|[0-9-]+)\(r(\d+)\)", token)
@@ -459,6 +466,9 @@ class PPULifter:
         # `.lib.stub` trampoline (which derefs an import pointer table the recomp
         # never populates -> bctrl to garbage). Populated from --hle-stubs.
         self.hle_stub_nids: dict[int, int] = {}
+        # Module primary TOC (r2). Set by main() only when the ELF yields exactly
+        # one TOC candidate; enables the `ld r2, N(r1)` restore lowering below.
+        self.toc_base: int = 0
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -1028,8 +1038,21 @@ class PPULifter:
             helper, signed = load_map[mn]
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
+            # ELFv1 TOC restore (`ld r2,N(r1)` after a call): on HW the glink stub
+            # saved the caller's r2 to N(r1) before the call and this reloads it.
+            # The recomp has no glink stub, so N(r1) is never written -> the reload
+            # pulls uninitialized stack into r2 -> garbage TOC -> every `ld rT,disp(r2)`
+            # OPD/table load reads code-as-data -> `unresolved indirect call ->
+            # 0x39800000` at the first bctrl, cascading into null-vtable crashes.
+            # A single-module executable keeps r2 constant, so lower the restore to
+            # the literal module TOC. NOT a no-op: r2 is a general reg that
+            # intervening code clobbers as scratch, so keeping it "as-is" is also
+            # garbage -- only the literal is safe. Guarded on a known single TOC;
+            # multi-TOC titles keep the stack read.
+            if mn == "ld" and str(rd_i) == "2" and str(base) == "1" and self.toc_base:
+                return f"ctx->gpr[2] = 0x{self.toc_base:08X}ULL; /*TOCFIX ld r2,N(r1)*/"
             if disp is not None:
-                expr = f"{helper}(ctx->gpr[{base}] + {disp})"
+                expr = f"{helper}({_mem_base(base)} + {disp})"
                 if signed and "16" in helper:
                     expr = f"(int64_t)(int16_t){expr}"
                 line = f"ctx->gpr[{rd_i}] = {expr};"
@@ -1075,7 +1098,7 @@ class PPULifter:
             rs_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                line = f"{helper}(ctx->gpr[{base}] + {disp}, ctx->gpr[{rs_i}]);"
+                line = f"{helper}({_mem_base(base)} + {disp}, ctx->gpr[{rs_i}]);"
                 # Handle update forms
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
@@ -1282,7 +1305,10 @@ class PPULifter:
                     return f"/* bl -> non-code 0x{tgt:08X} */;"
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
-                return f"{self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
+                # PPC `bl` sets LR = return address (next instr). Emit it so mflr
+                # reads the correct value AND stack-saved LRs are real return
+                # addresses -> reliable back-chain unwinding for diagnostics.
+                return f"ctx->lr = 0x{insn.addr + 4:08X}; {self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
                 return f"/* bl {target} */;"
 
@@ -3217,11 +3243,13 @@ _WORKER_STATE: dict = {}
 
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
-                 function_entries=None, code_lo=0, code_hi=None, jump_tables=None):
+                 function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
+                 toc_base=0):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
     _WORKER_STATE["prefix"] = prefix
+    _WORKER_STATE["toc_base"] = toc_base
     _WORKER_STATE["hle_stub_nids"] = hle_stub_nids or {}
     # Branch-routing context the body lift needs -- previously omitted, so the
     # parallel path lost the code-window filter (out-of-range branches became
@@ -3245,6 +3273,7 @@ def _worker_lift(task):
     lifter.code_lo = _WORKER_STATE.get("code_lo", 0)
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
+    lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     results = []
     for start, end in bounds:
         blob = b""
@@ -3278,7 +3307,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
     pool = mp.Pool(processes=jobs, initializer=_worker_init,
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
-                             lifter.code_lo, lifter.code_hi, lifter.jump_tables))
+                             lifter.code_lo, lifter.code_hi, lifter.jump_tables,
+                             getattr(lifter, "toc_base", 0)))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -3557,6 +3587,7 @@ def main() -> None:
     # mechanism lifts target..func_end, so a far end explodes the output.)
     jt_targets = set()
     jt_dispatchers: dict[int, list[int]] = {}   # {bctr_addr: [case targets]}
+    toc_candidates: list[int] = []              # raw mode has no ELF TOC; ELF path fills this below
     if not args.raw:
         try:
             seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
@@ -3728,6 +3759,14 @@ def main() -> None:
     print(f"Lifting {len(func_bounds)} functions...")
 
     lifter = PPULifter(prefix=args.symbol_prefix)
+    # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
+    # restore can be lowered to this literal instead of a stack read (the recomp has
+    # no glink stub writing the save slot, so the stack read returns garbage -> r2
+    # corruption -> OPD loads read code-as-data -> `unresolved indirect call ->
+    # 0x39800000` at the first bctrl). Only when exactly one TOC candidate exists
+    # (multi-TOC titles keep the stack read). See `ld r2, N(r1)` in the load path.
+    if len(toc_candidates) == 1:
+        lifter.toc_base = toc_candidates[0]
     lifter.code_hi = args.code_end
     # Without --code-end, default the executable window to the function-bounds
     # span so branches into data still get clamped. With no window at all, a
