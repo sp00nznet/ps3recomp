@@ -606,8 +606,9 @@ static volatile long g_vm_commits = 0;
  * (8 KB total), set on every demand-commit below. The MFC DMA guard
  * (mfc_ea_range_committed) tests these bits instead of calling VirtualQuery
  * per transfer -- the syscall version measured 94 CPU-s in a 50 s run. */
+/* Storage moved to runtime/spu/spu_vm_pagemap.c so every port links; the VEH
+ * below still seeds it. */
 extern "C" uint8_t g_vm_page_bitmap[65536 / 8];
-uint8_t g_vm_page_bitmap[65536 / 8];
 
 static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 {

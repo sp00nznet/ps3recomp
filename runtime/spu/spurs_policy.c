@@ -479,7 +479,10 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
     ctx->policy_mode = 1;
 
     /* Policy module image at its load base LS 0xA00 (code + data tables). */
-    if (g_taskset_policy_size > SPU_LS_SIZE - 0xA00) { free(ctx); return -1; }
+    /* size 0 = this port linked the default stub blob (spurs_policy_blob_weak.c),
+     * i.e. it has no lifted taskset policy image -- don't run an empty LS. */
+    if (!g_taskset_policy_size ||
+        g_taskset_policy_size > SPU_LS_SIZE - 0xA00) { free(ctx); return -1; }
     memcpy(ctx->ls + 0xA00, g_taskset_policy_bytes, g_taskset_policy_size);
 
     /* SpursKernelContext at LS 0x100 (same layout as spu_run_policy_module). */

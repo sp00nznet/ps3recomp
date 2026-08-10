@@ -15,6 +15,7 @@
 #include "spu_dma.h"
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -716,6 +717,15 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
     return NULL;
 }
 
+/* The pure interpreter's fast-path "is this LSA already lifted?" probe
+ * (spu_interp.c, rejoin path). It IS the registry lookup, so overlay eviction and
+ * self-modifying-code invalidation are honored automatically. Lived in
+ * spu_fn_registry.c before the registry was consolidated into this TU. */
+spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+{
+    return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
+}
+
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
  * A title registers each runtime-streamed overlay's SOURCE content EA with
  * the image id its lifted functions were registered under. The MFC GET path
@@ -798,7 +808,7 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
  * syscall. num = r3&0xF (0x10 bit = the "2" variant), args in r4. Adopted from the
  * JonathanDC64/ps3recomp fork (aaea4158) which uses this to run SPURS tasks clean. */
 #define YDKJ_TASKSET_PM_SYSCALL_ADDR 0xA70u
-static void spu_spurs_taskset_syscall(spu_context* ctx)
+void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
     uint32_t num = raw & 0x0F;
