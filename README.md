@@ -339,6 +339,27 @@ for who did what — thank you, everyone.
 
 ## Changelog
 
+### Unreleased
+*Everything folded via `integrate/fold-2026-08-14` — [@sagemono](https://github.com/sagemono)'s
+guest-ABI HLE batch and SPU-lifter faithful adoption, plus
+[@canersaka](https://github.com/canersaka)'s guest-callback/lv2/ABI batch.*
+
+**HLE & guest ABI**
+- **Guest-EA / big-endian out-param marshalling** across the HLE surface — `cellUserInfo`, trophy u64s, `cellGameGetParamInt` DISC type, open PSID, `cellRtc`, save-data user paths, `cellJpgDecDecodeData`, `cellPngDec`, and the `cellAudio` read index as a BE u64 — *[@sagemono](https://github.com/sagemono)* (#79, #81)
+- **`cellFsSdataOpen` with real SDATA/EDAT (NPD) decryption**, `cellFsMkdir` + the game-data dir created where the VFS looks, and a `/dev_hdd0` overlay onto the installed-update tree (`PS3_HDD0_ROOT`) — *[@sagemono](https://github.com/sagemono)* (#79)
+- **Honest state, not silently-faked `CELL_OK`** — a module name matching no file fails; net reports a real offline state with real SDK NP error codes; `sys_time_get_system_time` returns real microseconds instead of a call counter — *[@sagemono](https://github.com/sagemono)* (#79)
+- **Guest callbacks receive r3 through r10** — the dispatch hook plumbed only four arguments, so any callback taking more read stale registers — *[@canersaka](https://github.com/canersaka)* (#86)
+- **`cellFsReaddir` writes the real 258-byte dirent ABI** + a corrected CellOS generic error-code table (#85), and **`cellGame` firmware parameter IDs, error values and buffer bounds** matched to the SDK (#84) — *[@canersaka](https://github.com/canersaka)*
+- **`cellAudio` clears each consumed ring-buffer block** — an underrun replayed the previous block instead of silence — *[@canersaka](https://github.com/canersaka)* (#83)
+
+**lv2**
+- **One authoritative semaphore count** — the count lived twice (in `sys_semaphore_info::value` and in the Win32 handle), so timeout/wake races could lose tokens or park a waiter while `value` was already positive. `value` under `value_lock` is now the only count, the handle is a wake channel, and overflow returns lv2 `CELL_EBUSY`. The `sync_stress` target is wired into the build so this stays executable outside a generated title — *[@canersaka](https://github.com/canersaka)* (#88)
+
+**Lift & decode**
+- **SPU-lifter faithful adoption** — a from-scratch re-derivation of the SPU decode/lift + runtime, consolidating the interpreter and function registry into `spu_channels.c`, plus LBP SPU/SPURS bring-up and RSX texture support (G8B8/DXT, deswizzle). Credit for the underlying decoder/lifter design belongs to [@sp00nznet](https://github.com/sp00nznet) and [@canersaka](https://github.com/canersaka) — *[@sagemono](https://github.com/sagemono)* (#82)
+- **SPU `sync`/`dsync`/`syncc` emit real host memory fences**, with the `sync` C bit decoded instead of folded into plain `sync` — *[@canersaka](https://github.com/canersaka)* (#87)
+- **Jump-table discovery no longer silently skips every table** — a `toc` list was concatenated as an int, and the caller swallowed the exception; plus `rA=0` base resolution and generic `ld`/offset-table discovery (#78, #81)
+
 ### v0.7.0 — *"First Draw"* (July 2026)
 <!-- TODO(maintainer): version + codename are a guess -- rename freely. -->
 *The RSX draw engine lands. [@sagemono](https://github.com/sagemono)'s renderer executes the title's own NV4097 vertex and fragment programs on D3D12, and **You Don't Know Jack now renders** — a real double-buffered flip loop, verified by booting it. Plus [@canersaka](https://github.com/canersaka)'s PPU/SPU correctness batch, and the SPU image-import path SPURS titles need before any SPU work can run.*
