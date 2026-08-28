@@ -993,6 +993,11 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
              * reach it even though it registered no wait slot in the flag. */
             extern void spu_taskset_parked_add(uint32_t, uint32_t);
             extern void spu_taskset_parked_del(uint32_t, uint32_t);
+            extern int spu_taskset_consume_wake(uint32_t);
+            if (spu_taskset_consume_wake(ts)) {   /* a Set beat us to the park */
+                ctx->gpr[3]._u32[0] = 0;
+                return;
+            }
             yz_lockstep_block_begin(ctx);
             spu_taskset_parked_add(ts, tid);
             spu_taskset_wait_signal(ts, tid);

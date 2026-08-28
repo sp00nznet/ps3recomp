@@ -288,6 +288,10 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
             uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
             extern int spu_taskset_signal_parked(uint32_t);
             int woke = spu_taskset_signal_parked(taskset_ea);
+            if (!woke) {   /* nobody parked yet -- do not lose the wakeup */
+                extern void spu_taskset_latch_wake(uint32_t);
+                spu_taskset_latch_wake(taskset_ea);
+            }
             static int _n = 0;
             if (woke && _n++ < 12)
                 fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X woke %d parked "

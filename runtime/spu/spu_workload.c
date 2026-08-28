@@ -784,6 +784,32 @@ void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
         if (s_parked[i] == key) { s_parked[i] = 0; return; }
 }
 
+/* A direction-2 Set that finds NOBODY parked yet is a lost wakeup: the task
+ * parks a moment later and sleeps through the signal it was meant to get. Latch
+ * one pending wake per taskset; the next task to park consumes it instead of
+ * sleeping. One bit, not a counter -- SPURS signals are latched, not queued, so
+ * two Sets before a park must not buy two passes through the wait. */
+#define SPU_WAKE_LATCH_MAX 16
+static volatile uint32_t s_wake_latch[SPU_WAKE_LATCH_MAX];   /* taskset EA, 0 = free */
+
+void spu_taskset_latch_wake(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return;
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == taskset_ea) return;          /* already latched */
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == 0) { s_wake_latch[i] = taskset_ea; return; }
+}
+
+/* Consume a latched wake for this taskset. Returns 1 if one was pending. */
+int spu_taskset_consume_wake(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return 0;
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == taskset_ea) { s_wake_latch[i] = 0; return 1; }
+    return 0;
+}
+
 /* Signal every task of `taskset_ea` currently parked. Returns how many. */
 int spu_taskset_signal_parked(uint32_t taskset_ea)
 {
