@@ -751,6 +751,53 @@ static pthread_mutex_t s_sig_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
 #endif
 
+/* Which (taskset, task) pairs are currently parked in WAIT_SIGNAL.
+ *
+ * A PPU->SPU event-flag Set must be able to reach a task that parked WITHOUT
+ * registering a wait slot in the flag: our Set path only signalled tasks listed
+ * in the flag`s `used` bitmask, so such a task slept forever while the producer`s
+ * memory looked perfectly intact. Same failure class canersaka documented for
+ * SPURS queues in Yakuza Dead Souls ("the HLE previously woke only its host
+ * condvar, which lifted SPU consumer tasks never wait on").
+ *
+ * ponytail: deliberately lock-free and racy. A missed entry costs one 1s poll
+ * timeout in the waiter; a stale entry costs one spurious signal, which is safe
+ * because signals are LATCHED in guest state (CSTS_SIGNALLED) and every wait
+ * loop re-checks its own predicate. Add a lock only if this ever needs to be
+ * authoritative rather than a hint. */
+void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined below */
+
+#define SPU_PARKED_MAX 64
+static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
+
+void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId)
+{
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++)
+        if (s_parked[i] == 0) { s_parked[i] = key; return; }
+}
+
+void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
+{
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++)
+        if (s_parked[i] == key) { s_parked[i] = 0; return; }
+}
+
+/* Signal every task of `taskset_ea` currently parked. Returns how many. */
+int spu_taskset_signal_parked(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return 0;
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k || (uint32_t)(k >> 32) != taskset_ea) continue;
+        spu_taskset_signal_task(taskset_ea, (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
 /* Deliver a signal to a task (callable from any PPU/host thread). */
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {

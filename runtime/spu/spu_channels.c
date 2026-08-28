@@ -369,6 +369,20 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               if (cmd == MFC_PUTLLC_CMD) {
                   fprintf(stderr, " STORE=%02X%02X%02X%02X %02X%02X%02X%02X",
                           ls[0],ls[1],ls[2],ls[3], ls[4],ls[5],ls[6],ls[7]);
+              /* SPU_ATOM_FULL=1: also dump the offsets a SPURS parked-waiter
+               * record lives at. A task registers itself in its own guest object
+               * (has-waiter@0x20, taskId@0x21, wid@0x41, taskset EA@0x60) and THEN
+               * issues WAIT_SIGNAL; the 8-byte preview above cannot show any of
+               * it, so a park that looks like a no-op store is indistinguishable
+               * from one that published a waiter. */
+              { static int s_af = -1;
+                if (s_af < 0) s_af = getenv("SPU_ATOM_FULL") ? 1 : 0;
+                if (s_af && cmd == MFC_PUTLLC_CMD)
+                  fprintf(stderr, "  wait[+20]=%02X id[+21]=%02X wid[+41]=%02X"
+                                  " ts[+60]=%02X%02X%02X%02X%02X%02X%02X%02X",
+                          ls[0x20], ls[0x21], ls[0x41],
+                          ls[0x60],ls[0x61],ls[0x62],ls[0x63],
+                          ls[0x64],ls[0x65],ls[0x66],ls[0x67]); }
               }
               fprintf(stderr, "\n"); fflush(stderr);
           }
@@ -975,8 +989,14 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
              * releasing it starves every other lifted SPU (observed: FMOD task 1
              * parks in WAIT_SIGNAL holding the token -> the mixer never runs
              * again -> the PPU audio pump blocks forever on flag 0x94F600). */
+            /* Publish that this task is parked so a PPU-side event-flag Set can
+             * reach it even though it registered no wait slot in the flag. */
+            extern void spu_taskset_parked_add(uint32_t, uint32_t);
+            extern void spu_taskset_parked_del(uint32_t, uint32_t);
             yz_lockstep_block_begin(ctx);
+            spu_taskset_parked_add(ts, tid);
             spu_taskset_wait_signal(ts, tid);
+            spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);
         }
         ctx->gpr[3]._u32[0] = 0;

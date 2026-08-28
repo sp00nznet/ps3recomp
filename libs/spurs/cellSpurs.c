@@ -272,6 +272,29 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
             spu_taskset_signal_task(taskset_ea, taskId);
         }
     }
+
+    /* SPURS_EF_WAKE_PARKED: a task that parked in WAIT_SIGNAL WITHOUT registering
+     * a wait slot in this flag is unreachable by the loop above, which only
+     * signals slots present in `used`. YDKJ CRI tasks do exactly that, so a
+     * PPU->SPU Set (direction 2) delivered nothing and they slept forever. Same
+     * failure class canersaka documented for SPURS queues in Yakuza Dead Souls:
+     * the HLE woke only its host condvar, which lifted SPU tasks never wait on.
+     * Signalling a task that was not waiting on THIS flag is safe -- signals are
+     * latched in guest state and every wait loop re-checks its own predicate. */
+    if (!pendingRecv) {
+        static int s_wp = -1;
+        if (s_wp < 0) s_wp = getenv("SPURS_EF_WAKE_PARKED") ? 1 : 0;
+        if (s_wp && vm_read8(ea + EF_DIRECTION) == 2) {
+            uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
+            extern int spu_taskset_signal_parked(uint32_t);
+            int woke = spu_taskset_signal_parked(taskset_ea);
+            static int _n = 0;
+            if (woke && _n++ < 12)
+                fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X woke %d parked "
+                                "task(s) on taskset 0x%08X (no wait slot)\n",
+                        ea, woke, taskset_ea);
+        }
+    }
 }
 
 /* SPU-side entry (Layer 2): a task's flag Set arriving via the taskset
