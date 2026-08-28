@@ -785,6 +785,39 @@ void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
         if (s_parked[i] == key) { s_parked[i] = 0; return; }
 }
 
+/* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
+ *
+ * Writing the bits at Set time loses a race: the guest reads them from
+ * object+0x30 immediately on resuming, and a task that took the latched-wake
+ * path was never parked for the Set to target. So the Set only RECORDS what is
+ * owed, and the WAIT_SIGNAL handler writes it into guest memory just before it
+ * hands control back -- at which point the guest cannot yet have read it. */
+#define SPU_EFBITS_MAX 16
+static volatile uint32_t s_efbits_obj[SPU_EFBITS_MAX];
+static volatile uint32_t s_efbits_val[SPU_EFBITS_MAX];
+
+void spu_ef_bits_post(uint32_t obj, uint16_t bits)
+{
+    if (!obj) return;
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == obj) { s_efbits_val[i] |= bits; return; }
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == 0) { s_efbits_val[i] = bits; s_efbits_obj[i] = obj; return; }
+}
+
+/* Take (and clear) whatever is owed to `obj`. 0 = nothing pending. */
+uint16_t spu_ef_bits_take(uint32_t obj)
+{
+    if (!obj) return 0;
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == obj) {
+            uint16_t v = (uint16_t)s_efbits_val[i];
+            s_efbits_obj[i] = 0; s_efbits_val[i] = 0;
+            return v;
+        }
+    return 0;
+}
+
 /* A direction-2 Set that finds NOBODY parked yet is a lost wakeup: the task
  * parks a moment later and sleeps through the signal it was meant to get. Latch
  * one pending wake per taskset; the next task to park consumes it instead of

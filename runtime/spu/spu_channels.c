@@ -945,6 +945,37 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
  * syscallAddr (in the cri dispatch) and INTERCEPT a branch to it here to HLE the
  * syscall. num = r3&0xF (0x10 bit = the "2" variant), args in r4. Adopted from the
  * JonathanDC64/ps3recomp fork (aaea4158) which uses this to run SPURS tasks clean. */
+/* Write the event bits a PPU-side Set owed this wait object into guest memory,
+ * at object+0x00 (events) and every object+0x30 slot (pendingRecv).
+ *
+ * Called from the WAIT_SIGNAL handler immediately before control returns to the
+ * guest. Doing it at Set time loses a race: the guest reads object+0x30 the
+ * instant it resumes, and a task that took the latched-wake path was never
+ * parked for the Set to target. Here the guest demonstrably has not read yet.
+ *
+ * ponytail: fills all 16 slots rather than the one the guest picked -- the slot
+ * index is derived from state we do not model, and a wrong slot delivers
+ * nothing. Narrow it if a title ever cares which slot fired. */
+static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
+{
+    (void)ctx;
+    static int s_od = -1;
+    if (s_od < 0) s_od = getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0;
+    if (!s_od || !wobj || !vm_base) return;
+    extern uint16_t spu_ef_bits_take(uint32_t);
+    uint16_t bits = spu_ef_bits_take(wobj);
+    if (!bits) return;
+    uint8_t* m = vm_base + wobj;
+    m[0] = (uint8_t)(bits >> 8); m[1] = (uint8_t)bits;          /* +0x00 events */
+    for (uint32_t s = 0; s < 16; s++) {                          /* +0x30 slots */
+        m[0x30 + 2*s]     = (uint8_t)(bits >> 8);
+        m[0x30 + 2*s + 1] = (uint8_t)bits;
+    }
+    { static int _n = 0; if (_n++ < 8)
+        fprintf(stderr, "[spu] delivered owed bits=0x%04X to object 0x%08X \n",
+                (unsigned)bits, wobj); }
+}
+
 #define YDKJ_TASKSET_PM_SYSCALL_ADDR 0xA70u
 void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
@@ -1008,6 +1039,13 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
                        ((uint32_t)ctx->ls[0x27BE] << 8)  |  (uint32_t)ctx->ls[0x27BF];
         uint32_t tid = ((uint32_t)ctx->ls[0x27D4] << 24) | ((uint32_t)ctx->ls[0x27D5] << 16) |
                        ((uint32_t)ctx->ls[0x27D6] << 8)  |  (uint32_t)ctx->ls[0x27D7];
+        /* The guest names its wait OBJECT in the task-API argument at LS 0x2FD0
+         * (low nibble is flags). It reads its received event bits from
+         * object+0x30, so this is both who to wake and where to deliver. */
+        uint32_t wobj = (((uint32_t)ctx->ls[0x2FDC] << 24) |
+                         ((uint32_t)ctx->ls[0x2FDD] << 16) |
+                         ((uint32_t)ctx->ls[0x2FDE] << 8)  |
+                          (uint32_t)ctx->ls[0x2FDF]) & ~0xFu;
         if (ts) {
             extern int spu_taskset_wait_signal(uint32_t, uint32_t);
             /* Park = OS-level wait on this SPU's host thread. Under the lockstep
@@ -1021,21 +1059,16 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
             extern void spu_taskset_parked_del(uint32_t, uint32_t);
             extern int spu_taskset_consume_wake(uint32_t);
             if (spu_taskset_consume_wake(ts)) {   /* a Set beat us to the park */
+                spu_ef_deliver_owed(ctx, wobj);
                 ctx->gpr[3]._u32[0] = 0;
                 return;
             }
             yz_lockstep_block_begin(ctx);
-            /* The guest names its wait object in the task-API argument at LS
-             * 0x2FD0 (low nibble is flags). Record it so a Set can wake exactly
-             * the task that was waiting on it. */
-            { uint32_t wobj = ((uint32_t)ctx->ls[0x2FDC] << 24) |
-                              ((uint32_t)ctx->ls[0x2FDD] << 16) |
-                              ((uint32_t)ctx->ls[0x2FDE] << 8)  |
-                               (uint32_t)ctx->ls[0x2FDF];
-              spu_taskset_parked_add(ts, tid, wobj & ~0xFu); }
+            spu_taskset_parked_add(ts, tid, wobj);
             spu_taskset_wait_signal(ts, tid);
             spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);
+            spu_ef_deliver_owed(ctx, wobj);
         }
         ctx->gpr[3]._u32[0] = 0;
         return;
