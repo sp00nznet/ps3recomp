@@ -286,8 +286,12 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
         if (s_wp < 0) s_wp = getenv("SPURS_EF_WAKE_PARKED") ? 1 : 0;
         if (s_wp && vm_read8(ea + EF_DIRECTION) == 2) {
             uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
-            extern int spu_taskset_signal_parked(uint32_t);
-            int woke = spu_taskset_signal_parked(taskset_ea);
+            /* The task waiting for THIS flag parked on object (flag - 0x80):
+             * YDKJ CRI obj 0x006B4500/4780/4A00 <-> flag 0x006B4580/4800/4A80.
+             * Fall back to any parked task of the taskset if none matches. */
+            extern int spu_taskset_signal_parked_obj(uint32_t, uint32_t);
+            int woke = spu_taskset_signal_parked_obj(taskset_ea, ea - 0x80u);
+            if (!woke) woke = spu_taskset_signal_parked_obj(taskset_ea, 0);
             if (!woke) {   /* nobody parked yet -- do not lose the wakeup */
                 extern void spu_taskset_latch_wake(uint32_t);
                 spu_taskset_latch_wake(taskset_ea);

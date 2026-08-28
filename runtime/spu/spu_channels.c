@@ -955,6 +955,18 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
     { static int _n = 0; if (_n++ < 24)
         fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X\n",
                 num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+    /* The task-API argument is passed in LOCAL STORE at 0x2FD0, not in r4: the
+     * caller does shufb(arg,...) -> stqd 0x2FD0 and only then sets r3 = number
+     * (see func_00026DE0 / func_000272AC in image 22). Logging r4 shows caller
+     * leftovers and hides what the task actually asked for. */
+    { static int s_sa = -1; if (s_sa < 0) s_sa = getenv("YDKJ_SYSCALL_ARG") ? 1 : 0;
+      if (s_sa) { static int _n = 0; if (_n++ < 40) {
+        const uint8_t* a = &ctx->ls[0x2FD0];
+        fprintf(stderr, "[spu] syscall num=%u LS[0x2FD0]=%02X%02X%02X%02X %02X%02X%02X%02X"
+                        " %02X%02X%02X%02X %02X%02X%02X%02X img=%d\n",
+                num, a[0],a[1],a[2],a[3], a[4],a[5],a[6],a[7],
+                a[8],a[9],a[10],a[11], a[12],a[13],a[14],a[15], ctx->image_id);
+        fflush(stderr); } } }
     /* NOTE (YDKJ cri_mpv): the cri task's BOOTSTRAP (func_00003040) calls the
      * task-API syscall and EXPECTS IT TO RETURN, then branches to the real task
      * entry (0x3050). Halting on num=0 here kills the task at bootstrap before it
@@ -1007,7 +1019,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
              * again -> the PPU audio pump blocks forever on flag 0x94F600). */
             /* Publish that this task is parked so a PPU-side event-flag Set can
              * reach it even though it registered no wait slot in the flag. */
-            extern void spu_taskset_parked_add(uint32_t, uint32_t);
+            extern void spu_taskset_parked_add(uint32_t, uint32_t, uint32_t);
             extern void spu_taskset_parked_del(uint32_t, uint32_t);
             extern int spu_taskset_consume_wake(uint32_t);
             if (spu_taskset_consume_wake(ts)) {   /* a Set beat us to the park */
@@ -1015,7 +1027,14 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
                 return;
             }
             yz_lockstep_block_begin(ctx);
-            spu_taskset_parked_add(ts, tid);
+            /* The guest names its wait object in the task-API argument at LS
+             * 0x2FD0 (low nibble is flags). Record it so a Set can wake exactly
+             * the task that was waiting on it. */
+            { uint32_t wobj = ((uint32_t)ctx->ls[0x2FDC] << 24) |
+                              ((uint32_t)ctx->ls[0x2FDD] << 16) |
+                              ((uint32_t)ctx->ls[0x2FDE] << 8)  |
+                               (uint32_t)ctx->ls[0x2FDF];
+              spu_taskset_parked_add(ts, tid, wobj & ~0xFu); }
             spu_taskset_wait_signal(ts, tid);
             spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);

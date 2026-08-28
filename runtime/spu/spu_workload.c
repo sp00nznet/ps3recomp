@@ -769,12 +769,13 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined 
 
 #define SPU_PARKED_MAX 64
 static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
+static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
 
-void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId)
+void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == 0) { s_parked[i] = key; return; }
+        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
 }
 
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
@@ -811,13 +812,18 @@ int spu_taskset_consume_wake(uint32_t taskset_ea)
 }
 
 /* Signal every task of `taskset_ea` currently parked. Returns how many. */
-int spu_taskset_signal_parked(uint32_t taskset_ea)
+/* Wake only the task parked on `wait_obj` (0 = any task of the taskset).
+ * The guest names its wait object in the WAIT_SIGNAL argument, and for YDKJ`s
+ * CRI tasks the flag the PPU sets is exactly wait_obj + 0x80 -- so a Set can
+ * address the one task that was waiting for it instead of every parked task. */
+int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
 {
     if (!taskset_ea) return 0;
     int n = 0;
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         uint64_t k = s_parked[i];
         if (!k || (uint32_t)(k >> 32) != taskset_ea) continue;
+        if (wait_obj && s_parked_obj[i] && s_parked_obj[i] != wait_obj) continue;
         spu_taskset_signal_task(taskset_ea, (uint32_t)(k & 0xFFFFFFFFu) - 1u);
         n++;
     }
