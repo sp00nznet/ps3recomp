@@ -5,6 +5,11 @@
 > Static recompilation runtime libraries for PlayStation 3 titles.
 > Turn PS3 binaries into native executables. No emulator required.
 
+**[Join the sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** — the
+community hub for sp00nznet's recomp projects, where ps3recomp development
+happens in the open. Good place to ask questions, show a port you are working
+on, or find out what people are stuck on before you duplicate the effort.
+
 ---
 
 ## What Is This?
@@ -347,6 +352,10 @@ This is a massive undertaking and we need help. Here's how to get involved:
 - **Documentation** — Help us map out the PS3's system library landscape
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+Not sure where to start, or want to sanity-check an idea first? Ask in the
+[Discord](https://discord.gg/CRpzGWZFcu) — several of the people working on ports
+and on the lifter are there.
 
 ## Legal
 
