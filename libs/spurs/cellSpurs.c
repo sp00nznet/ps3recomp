@@ -913,10 +913,13 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
      * SPU task later receives in r3. A zero/garbage argument makes the SPU task
      * library refuse every blocking wait (0x8041090F), which is exactly how the
      * CRI tasks end up parked in WAIT_SIGNAL forever.
-     * Opt-in while the true prototype is being confirmed: getting this wrong
-     * shifts every later argument, and LBP uses this same path. */
+     * CONFIRMED by a second, independently lifted title: Jackbox Party Pack
+     * calls the same NID with the same shape -- r3=attr, r4=1, r5=0x00330000,
+     * r6=eaElf, r7=sp+0x180, r8=sp+0x170 (two adjacent 16-byte blocks), and
+     * r9/r10 never written. Two unrelated callers agreeing settles it, so this
+     * is now the default; SPURS_TASKATTR_LEGACY=1 restores the old 8-arg read. */
     { static int s_r8 = -1;
-      if (s_r8 < 0) s_r8 = getenv("SPURS_TASKATTR_R8") ? 1 : 0;
+      if (s_r8 < 0) s_r8 = getenv("SPURS_TASKATTR_LEGACY") ? 0 : 1;
       if (s_r8) {
           attr->argument_ea  = (u32)sizeContext;   /* r8 */
           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
