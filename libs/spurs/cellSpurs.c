@@ -290,6 +290,29 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
              * YDKJ CRI obj 0x006B4500/4780/4A00 <-> flag 0x006B4580/4800/4A80.
              * Fall back to any parked task of the taskset if none matches. */
             extern int spu_taskset_signal_parked_obj(uint32_t, uint32_t);
+            /* SPURS_EF_OBJ_DELIVER: the guest task reads its received bits from
+             * ITS OWN OBJECT at +0x30 (the EF_PENDING_RECV_EVT offset), not from
+             * the flag EA the PPU passed -- traced in image 22: the object is
+             * DMA`d to LS 0x80 and 0x273AC reads LS 0xB0 = object+0x30, then
+             * writes the result to the caller`s out-param at 0x27430. The object
+             * sits at flag-0x80. Without this the task wakes, reads 0, and takes
+             * the "bits != 1" branch (0x40F0) instead of its work path.
+             * Fill every slot: which slot index the guest uses is derived from
+             * state we do not model, and a wrong slot delivers nothing. */
+            { static int s_od = -1;
+              if (s_od < 0) s_od = getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0;
+              if (s_od) {
+                  uint32_t obj = ea - 0x80u;
+                  vm_write16(obj + EF_EVENTS, bits);
+                  for (uint32_t s = 0; s < 16; s++)
+                      vm_write16(obj + EF_PENDING_RECV_EVT + 2u * s, bits);
+                  static int _n = 0;
+                  if (_n++ < 8)
+                      fprintf(stderr, "[cellSpurs] delivered bits=0x%04X into object "
+                                      "0x%08X (+0x00 and +0x30[16]) for flag 0x%08X\n",
+                              (unsigned)bits, obj, ea);
+              } }
+
             int woke = spu_taskset_signal_parked_obj(taskset_ea, ea - 0x80u);
             if (!woke) woke = spu_taskset_signal_parked_obj(taskset_ea, 0);
             if (!woke) {   /* nobody parked yet -- do not lose the wakeup */

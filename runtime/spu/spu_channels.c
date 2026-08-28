@@ -346,8 +346,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
     }
 
-    /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA's 128B
-     * line (e.g. a SPURS event flag) -- who tries to set it, from where. */
+    /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA`s 128B line.
+     * SPU_ATOM_FULL=1 additionally dumps 32 bytes of the line before and after.
+     *
+     * Built into ONE buffer and written with a single fprintf: several SPU host
+     * threads and the PPU all write stderr, so a dump split across many fprintf
+     * calls comes out shredded and unreadable exactly when it matters. */
     { static int s_ae = -1; static uint32_t s_aea;
       if (s_ae < 0) { const char* e = getenv("SPU_ATOM_EA");
         s_aea = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_ae = s_aea ? 1 : 0;
@@ -358,33 +362,27 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (_n++ < 48) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
-              /* lr (gpr[0]) too: these atomics sit in generic inc/dec helpers, so
-               * pc names the HELPER and only the link register names the caller
-               * that gives the counter its meaning. */
-              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X lr=0x%05X ea=0x%08X "
-                      "RAM=%02X%02X%02X%02X %02X%02X%02X%02X",
-                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)ea,
-                      r[0],r[1],r[2],r[3], r[4],r[5],r[6],r[7]);
+              static int s_af = -1;
+              if (s_af < 0) s_af = getenv("SPU_ATOM_FULL") ? 1 : 0;
+              char buf[640]; int p = 0;
+              /* lr (gpr[0]) as well as pc: these atomics sit in generic helpers,
+               * so pc names the HELPER and only lr names the real caller. */
+              p += snprintf(buf + p, sizeof buf - p,
+                            "[atom-ea] cmd=0x%X img=%d pc=0x%05X lr=0x%05X ea=0x%08X",
+                            cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                            ctx->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)ea);
+              int nb = s_af ? 64 : 8;   /* 64 covers +0x30 pendingRecv */
+              p += snprintf(buf + p, sizeof buf - p, " RAM=");
+              for (int i = 0; i < nb && p < (int)sizeof buf - 4; i++)
+                  p += snprintf(buf + p, sizeof buf - p, "%02X%s", r[i],
+                                (i % 4 == 3) ? " " : "");
               if (cmd == MFC_PUTLLC_CMD) {
-                  fprintf(stderr, " STORE=%02X%02X%02X%02X %02X%02X%02X%02X",
-                          ls[0],ls[1],ls[2],ls[3], ls[4],ls[5],ls[6],ls[7]);
-              /* SPU_ATOM_FULL=1: also dump the offsets a SPURS parked-waiter
-               * record lives at. A task registers itself in its own guest object
-               * (has-waiter@0x20, taskId@0x21, wid@0x41, taskset EA@0x60) and THEN
-               * issues WAIT_SIGNAL; the 8-byte preview above cannot show any of
-               * it, so a park that looks like a no-op store is indistinguishable
-               * from one that published a waiter. */
-              { static int s_af = -1;
-                if (s_af < 0) s_af = getenv("SPU_ATOM_FULL") ? 1 : 0;
-                if (s_af && cmd == MFC_PUTLLC_CMD)
-                  fprintf(stderr, "  wait[+20]=%02X id[+21]=%02X wid[+41]=%02X"
-                                  " ts[+60]=%02X%02X%02X%02X%02X%02X%02X%02X",
-                          ls[0x20], ls[0x21], ls[0x41],
-                          ls[0x60],ls[0x61],ls[0x62],ls[0x63],
-                          ls[0x64],ls[0x65],ls[0x66],ls[0x67]); }
+                  p += snprintf(buf + p, sizeof buf - p, " STORE=");
+                  for (int i = 0; i < nb && p < (int)sizeof buf - 4; i++)
+                      p += snprintf(buf + p, sizeof buf - p, "%02X%s", ls[i],
+                                    (i % 4 == 3) ? " " : "");
               }
-              fprintf(stderr, "\n"); fflush(stderr);
+              fprintf(stderr, "%s\n", buf); fflush(stderr);
           }
       } }
     /* Bink sync-line atomic trace (armed by the PPU-side producer probe). */
