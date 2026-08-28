@@ -872,6 +872,26 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
      * whose lsPattern doesn't cover its stack (0x8041090F). */
     attr->lsPattern_ea = (u32)(uintptr_t)lsPattern;
     attr->argument_ea  = (u32)(uintptr_t)argument;
+
+    /* SPURS_TASKATTR_R8: some callers use a SIX-argument form, passing only
+     * r3..r8 -- r9/r10 then hold caller leftovers, not arguments. YDKJ is one:
+     * func_00331DA4 sets r3..r8 and nothing else, so our 8-parameter prototype
+     * reads lsPattern=r9 (a size, 0x0003D400) and argument=r10 (0x2E, the ASCII
+     * terminator its hex-string parser stopped on). r8 is the real 16-byte
+     * CellSpursTaskArgument -- proven by its contents matching the quadword the
+     * SPU task later receives in r3. A zero/garbage argument makes the SPU task
+     * library refuse every blocking wait (0x8041090F), which is exactly how the
+     * CRI tasks end up parked in WAIT_SIGNAL forever.
+     * Opt-in while the true prototype is being confirmed: getting this wrong
+     * shifts every later argument, and LBP uses this same path. */
+    { static int s_r8 = -1;
+      if (s_r8 < 0) s_r8 = getenv("SPURS_TASKATTR_R8") ? 1 : 0;
+      if (s_r8) {
+          attr->argument_ea  = (u32)sizeContext;   /* r8 */
+          attr->lsPattern_ea = 0;                  /* r9 was a leftover */
+          printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
+                 attr->argument_ea, (u32)(uintptr_t)argument);
+      } }
     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
            (u32)eaElf, (u32)eaContext, sizeContext,
            attr->lsPattern_ea, attr->argument_ea);
@@ -1897,6 +1917,24 @@ s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea)
     return CELL_OK;
 }
 
+/* Register (or re-register) a job chain handle. Shared by both Create forms. */
+static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
+                       const char* who)
+{
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
+            s_jobchains[i].jc_ea     = jc_ea;
+            s_jobchains[i].entry_ea  = entry_ea;
+            s_jobchains[i].size_desc = size_desc;
+            s_jobchains[i].max_grab  = max_grab;
+            s_jobchains[i].run_count = 0;
+            return CELL_OK;
+        }
+    }
+    printf("[cellSpurs] %s: registry full\n", who);
+    return CELL_OK;
+}
+
 s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
 {
     if (!spurs_ea || !jc_ea || !attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
@@ -1923,18 +1961,43 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
            name_ea ? (const char*)(vm_base + name_ea) : "-");
 
-    for (int i = 0; i < MAX_JOBCHAINS; i++) {
-        if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == (u32)jc_ea) {
-            s_jobchains[i].jc_ea     = (u32)jc_ea;
-            s_jobchains[i].entry_ea  = entry;
-            s_jobchains[i].size_desc = (u16)(sd_mg >> 16);
-            s_jobchains[i].max_grab  = (u16)(sd_mg & 0xFFFFu);
-            s_jobchains[i].run_count = 0;
-            return CELL_OK;
-        }
+    return jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
+                       "CreateJobChainWithAttribute");
+}
+
+/* cellSpursCreateJobChain -- the no-attribute form, and the one the WWS job
+ * manager's own wrapper calls. Same registration, with the fields passed
+ * directly instead of read back out of a CellSpursJobChainAttribute:
+ *
+ *   cellSpursCreateJobChain(CellSpurs*, CellSpursJobChain*, const u64* entry,
+ *                           u16 sizeJobDescriptor, u16 maxGrabbedJob,
+ *                           const u8 priorityTable[8], u32 maxContention,
+ *                           bool autoRequestSpuCount, u32 tag1, u32 tag2)
+ *
+ * tag1/tag2 are guest-stack args, past the 8-GPR HLE adapter; nothing here
+ * needs them. Without this entry point the chain is never registered at all,
+ * so the later kick finds "UNKNOWN chain (no Create seen)" and returns
+ * CELL_OK having walked nothing -- and the title waits forever on SPU work
+ * that was never started. Gran Turismo 5 Prologue parks its whole boot there. */
+s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
+                            u32 sizeJobDescriptor, u32 maxGrabbedJob,
+                            u64 prio_ea, u32 maxContention,
+                            u32 autoRequestSpuCount)
+{
+    (void)spurs_ea; (void)prio_ea;
+    if (!jc_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+
+    static int _n = 0;
+    if (_n++ < 3) {
+        printf("[cellSpurs] CreateJobChain(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u "
+               "maxCont=%u autoReq=%u)\n",
+               (u32)jc_ea, (u32)entry_ea, sizeJobDescriptor, maxGrabbedJob,
+               maxContention, autoRequestSpuCount);
+        if (entry_ea && (u32)entry_ea < 0x10000000u)
+            jc_dump_commands("CreateJobChain", (u32)entry_ea, 16);
     }
-    printf("[cellSpurs] CreateJobChainWithAttribute: registry full\n");
-    return CELL_OK;
+    return jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
+                       (u16)maxGrabbedJob, "CreateJobChain");
 }
 
 /* ---------------------------------------------------------------------------
@@ -2279,7 +2342,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
  * Verified against the guest: Create takes the chain in r4 (r3 is the CellSpurs)
  * and passes 0x02932A80; Run then arrives with r3=0x02932A80. Join and Shutdown
  * are the same one-argument shape. */
-s32 cellSpursRunJobChain(u64 jc_ea)
+static s32 jc_start(u64 jc_ea, const char* who)
 {
     static int s_off = -1;
     if (s_off < 0) s_off = getenv("PS3_NO_JOBCHAIN") ? 1 : 0;
@@ -2288,9 +2351,9 @@ s32 cellSpursRunJobChain(u64 jc_ea)
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
         s_jobchains[i].run_count++;
         if (s_jobchains[i].run_count <= 3) {
-            printf("[cellSpurs] RunJobChain(jc=0x%08X) run#%d entry=0x%08X\n",
-                   (u32)jc_ea, s_jobchains[i].run_count, s_jobchains[i].entry_ea);
-            jc_dump_commands("RunJobChain", s_jobchains[i].entry_ea, 16);
+            printf("[cellSpurs] %s(jc=0x%08X) run#%d entry=0x%08X\n",
+                   who, (u32)jc_ea, s_jobchains[i].run_count, s_jobchains[i].entry_ea);
+            jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
 #ifdef _WIN32
@@ -2303,8 +2366,13 @@ s32 cellSpursRunJobChain(u64 jc_ea)
 #endif
         return CELL_OK;
     }
-    printf("[cellSpurs] RunJobChain(jc=0x%08X) -- UNKNOWN chain (no Create seen)\n", (u32)jc_ea);
+    printf("[cellSpurs] %s(jc=0x%08X) -- UNKNOWN chain (no Create seen)\n", who, (u32)jc_ea);
     return CELL_OK;
+}
+
+s32 cellSpursRunJobChain(u64 jc_ea)
+{
+    return jc_start(jc_ea, "RunJobChain");
 }
 
 /* cellSpursJoinJobChain(const CellSpursJobChain*) -- one argument, as above. */
@@ -2323,11 +2391,18 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
     return CELL_OK;
 }
 
-/* cellSpursKickJobChain — kick a running job chain */
-s32 cellSpursKickJobChain(void* spurs, void* jobChain)
+/* cellSpursKickJobChain(CellSpursJobChain* jobChain, u8 numReadyCount)
+ *
+ * Two arguments, jobChain in r3 -- the same one-handle shape as Run/Join, not
+ * (spurs, jobChain). It is the *other* way a title starts a chain: Run for one
+ * that was created ready to go, Kick to hand the SPUs another `numReadyCount`
+ * units of an already-created chain. Titles built on the WWS job manager use
+ * Kick, so leaving this a no-op meant their chains were created and then never
+ * walked -- which looks exactly like a hang with no error anywhere. */
+s32 cellSpursKickJobChain(u64 jc_ea, u32 numReadyCount)
 {
-    (void)spurs; (void)jobChain;
-    return CELL_OK;
+    (void)numReadyCount;
+    return jc_start(jc_ea, "KickJobChain");
 }
 
 /* =========================================================================
