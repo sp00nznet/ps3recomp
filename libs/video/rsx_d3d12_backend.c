@@ -2334,36 +2334,17 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
  * Returns the slot index (SRV at heap 1+slot) or -1. Must run while the
  * command list is open, before the draw passes. */
 /* NV4097 TEXTURE_CONTROL1 component remap -> D3D12 Shader4ComponentMapping.
- * Low byte = crossbar: bits[1:0] select the SOURCE (0=A,1=R,2=G,3=B) for
- * output A, [3:2] for R, [5:4] for G, [7:6] for B. Next byte = per-output op:
- * 0 = force ZERO, 1 = force ONE, 2 = use crossbar (identity word = 0xAAE4).
- * Our uploaded resource holds guest R,G,B,A at comps 0,1,2,3. */
+ * The crossbar decode itself is RSX semantics and lives in
+ * rsx_texture_layout.c; all that is left here is packing the four selectors
+ * into D3D12's word. Its force-zero/force-one encodings are 4 and 5, which is
+ * what RSX_REMAP_ZERO/ONE already are, so the selectors pass straight through.
+ *
+ * out[] arrives in the crossbar's field order A,R,G,B; D3D12 wants
+ * destR | destG<<3 | destB<<6 | destA<<9 | valid<<12. */
 static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
 {
-    /* Crossbar field order LSB->MSB is A,R,G,B -- the order the header
-     * describes, and the one that makes RSX's documented identity word 0xAAE4
-     * actually decode to an identity mapping. The body used to run the fields
-     * backwards (B,G,R,A), which made 0xAAE4 a channel rotation and 0xAA1B the
-     * "identity"; lanes_dxt was then bent to {2,1,0,3} to cancel the reversal
-     * on DXT, so DXT looked right while every A8R8G8B8 texture sampled a
-     * permuted vector. Rubber Ducky sets 0xAAE4 on its lightmaps and 0xAA93 on
-     * its bump maps: the wall's normal map came back as (R,A,A), which is what
-     * drove the green channel to an extreme and gave the scene its magenta and
-     * green casts.
-     *
-     * Source codes index the presented vector {A,R,G,B}; our uploaded resource
-     * holds guest R,G,B,A at comps 0,1,2,3, and BC decodes to RGBA the same
-     * way, so both use {3,0,1,2}.
-     * Ops byte (same field order): 0 = force ZERO, 1 = force ONE, 2 = remap. */
-    static const u8 lanes_argb[4] = {3, 0, 1, 2};
-    static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
-    const u8* src2res = (basef == 0x8B) ? lanes_g8b8 : lanes_argb;
-    if (!(c1 & 0xFFFF)) c1 = 0xAAE4;               /* unset -> identity */
-    u32 out[4];                                    /* outputs in field order A,R,G,B */
-    for (int i = 0; i < 4; i++) {
-        u32 s = (c1 >> (i * 2)) & 3, op = (c1 >> (8 + i * 2)) & 3;
-        out[i] = (op == 0) ? 4u : (op == 1) ? 5u : (u32)src2res[s];
-    }
+    u8 out[4];
+    rsx_texture_component_remap(c1, basef, out);
     /* TEX_REMAP_ID=<n>: override the derived crossbar with a fixed mapping, to
      * test channel order directly. The resource holds the guest's A8R8G8B8
      * bytes straight through, so its components are (R=A, G=R, B=G, A=B) and

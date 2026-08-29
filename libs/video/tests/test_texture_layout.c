@@ -302,6 +302,116 @@ static void test_decode_rejects_nonsense(void)
     for (u32 i = 0; i < sizeof dst; i++) CHECK_EQ(dst[i], 0xA5);
 }
 
+/* --- component remap (TEXTURE_CONTROL1 crossbar) ------------------------ */
+
+/* out[] is in the crossbar's field order: A, R, G, B. */
+#define A_ 0
+#define R_ 1
+#define G_ 2
+#define B_ 3
+
+/* The uploaded resource is always R,G,B,A at components 0..3, so the identity
+ * mapping is R->0, G->1, B->2, A->3. */
+static void test_remap_identity(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, m);
+    CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 1);
+    CHECK_EQ(m[B_], 2); CHECK_EQ(m[A_], 3);
+
+    /* An unset control word means identity, not "all channels read A". */
+    u8 z[4];
+    rsx_texture_component_remap(0u, FMT_A8R8G8B8, z);
+    for (int i = 0; i < 4; i++) CHECK_EQ(z[i], m[i]);
+}
+
+/* Packed the way D3D12 wants it, the identity must equal
+ * D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING (0x1688). That constant is not
+ * available here, so it is spelled out -- it is what makes this assertion
+ * meaningful rather than self-referential. */
+static void test_remap_identity_packs_to_d3d_default(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, m);
+    u32 packed = m[R_] | (m[G_] << 3) | (m[B_] << 6) | (m[A_] << 9) | (1u << 12);
+    CHECK_EQ(packed, 0x1688u);
+}
+
+/* THE regression this file exists for. Reading the crossbar fields backwards
+ * (B,G,R,A instead of A,R,G,B) makes 0xAA1B decode as the identity and 0xAAE4
+ * as a rotation -- the exact inversion that permuted every A8R8G8B8 texture
+ * and gave Rubber Ducky its magenta and green casts. */
+static void test_remap_field_order_is_not_reversed(void)
+{
+    u8 e4[4], b1[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, e4);
+    rsx_texture_component_remap(0xAA1Bu, FMT_A8R8G8B8, b1);
+
+    /* 0xAA1B is the REVERSE mapping, so it must not be the identity... */
+    int is_identity = (b1[R_] == 0 && b1[G_] == 1 && b1[B_] == 2 && b1[A_] == 3);
+    CHECK(!is_identity);
+    /* ...and it must differ from the real identity somewhere. */
+    int differs = 0;
+    for (int i = 0; i < 4; i++) if (e4[i] != b1[i]) differs = 1;
+    CHECK(differs);
+
+    /* Spelled out: 0x1B selects sources 3,2,1,0 for A,R,G,B. */
+    CHECK_EQ(b1[A_], 2);   /* source 3 (B) -> resource comp 2 */
+    CHECK_EQ(b1[R_], 1);   /* source 2 (G) -> comp 1 */
+    CHECK_EQ(b1[G_], 0);   /* source 1 (R) -> comp 0 */
+    CHECK_EQ(b1[B_], 3);   /* source 0 (A) -> comp 3 */
+}
+
+/* The high byte forces constants per output, overriding the crossbar. */
+static void test_remap_force_zero_and_one(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0x00E4u, FMT_A8R8G8B8, m);      /* all ops = 0 */
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], RSX_REMAP_ZERO);
+
+    rsx_texture_component_remap(0x55E4u, FMT_A8R8G8B8, m);      /* all ops = 1 */
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], RSX_REMAP_ONE);
+
+    /* Mixed: ops byte 0xA1 is, from the low bits up, 01 00 10 10 --
+     * force ONE for A, force ZERO for R, crossbar for G and B. Forcing is
+     * per-output, not all-or-nothing. */
+    rsx_texture_component_remap(0xA1E4u, FMT_A8R8G8B8, m);
+    CHECK_EQ(m[A_], RSX_REMAP_ONE);
+    CHECK_EQ(m[R_], RSX_REMAP_ZERO);
+    CHECK_EQ(m[G_], 1);
+    CHECK_EQ(m[B_], 2);
+}
+
+/* G8B8 has two real channels, presented as {G,R,G,R}. */
+static void test_remap_g8b8_lanes(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_G8B8, m);
+    CHECK_EQ(m[A_], 1); CHECK_EQ(m[R_], 0);
+    CHECK_EQ(m[G_], 1); CHECK_EQ(m[B_], 0);
+
+    /* The LN flag must not change the crossbar decode. */
+    u8 n[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_G8B8 | FMT_LN, n);
+    for (int i = 0; i < 4; i++) CHECK_EQ(n[i], m[i]);
+}
+
+/* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
+ * NOT a bent table cancelling a reversed crossbar, which is how the old bug
+ * hid on DXT while breaking everything else. */
+static void test_remap_dxt_matches_argb(void)
+{
+    u8 a[4], d[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, a);
+    rsx_texture_component_remap(0xAAE4u, FMT_DXT1,     d);
+    for (int i = 0; i < 4; i++) CHECK_EQ(d[i], a[i]);
+}
+
+static void test_remap_rejects_null(void)
+{
+    rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, NULL);   /* must not crash */
+}
+
 int main(void)
 {
     test_argb();
@@ -315,6 +425,13 @@ int main(void)
     test_decode_g8b8_swizzled();
     test_decode_compressed_is_verbatim();
     test_decode_rejects_nonsense();
+    test_remap_identity();
+    test_remap_identity_packs_to_d3d_default();
+    test_remap_field_order_is_not_reversed();
+    test_remap_force_zero_and_one();
+    test_remap_g8b8_lanes();
+    test_remap_dxt_matches_argb();
+    test_remap_rejects_null();
 
     if (g_fail) { printf("\nRSX texture layout: %d FAILED\n", g_fail); return 1; }
     printf("RSX texture layout tests: all passed\n");
