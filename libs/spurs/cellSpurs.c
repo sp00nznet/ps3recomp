@@ -1842,6 +1842,7 @@ static struct {
     u16 max_grab;
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
+    volatile long shutdown;  /* set by cellSpursShutdownJobChain           */
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -1908,6 +1909,7 @@ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
             s_jobchains[i].run_count = 0;
+            s_jobchains[i].shutdown  = 0;
             return CELL_OK;
         }
     }
@@ -2226,7 +2228,8 @@ static void jc_signal_done(u32 jc_ea)
     }
 }
 
-static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc,
+                       volatile long* shutdown)
 {
     u32 pc = entry_ea, ret_pc = 0;
     int jobs = 0;
@@ -2240,6 +2243,13 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
     int idle = 0;
     for (;; idle++) {
         if (idle > 4096) break;
+        /* A shutdown request ends the walk wherever it is. A service chain
+         * loops forever by design, so without this the walker outlives the
+         * subsystem that asked it to stop. */
+        if (shutdown && *shutdown) {
+            printf("[cellSpurs] chain 0x%08X: shutdown after %d job(s)\n", jc_ea, jobs);
+            return;
+        }
         u64 cmd = vm_read64(pc);
         u32 op  = (u32)(cmd & 7);
         u32 ext = (u32)(cmd & 127);
@@ -2300,7 +2310,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
     { const char* d = getenv("LBP_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
     jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-               s_jobchains[slot].size_desc);
+               s_jobchains[slot].size_desc, &s_jobchains[slot].shutdown);
     s_jobchains[slot].running = 0;
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
@@ -2335,7 +2345,8 @@ static s32 jc_start(u64 jc_ea, const char* who)
                    who, (u32)jc_ea, s_jobchains[i].run_count, s_jobchains[i].entry_ea);
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
-        if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
+        if (s_off || !s_jobchains[i].entry_ea || s_jobchains[i].shutdown)
+            return CELL_OK;
 #ifdef _WIN32
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
@@ -2353,6 +2364,32 @@ static s32 jc_start(u64 jc_ea, const char* who)
 s32 cellSpursRunJobChain(u64 jc_ea)
 {
     return jc_start(jc_ea, "RunJobChain");
+}
+
+/* cellSpursShutdownJobChain(CellSpursJobChain*) -- one argument, as Run/Join.
+ *
+ * Asks the chain to stop; Join then waits for it to have stopped. With no
+ * implementation the NID fell through to the unresolved default, faked
+ * CELL_OK, and nothing ever told the walker anything -- so a title that shuts
+ * a chain down and joins it waits on a state that never arrives. In Gran
+ * Turismo 5 Prologue the SGX audio thread holds the chain's own lwmutex across
+ * that wait, and the main thread blocks behind it for the rest of the boot.
+ *
+ * Signal completion on the way out: a thread already parked in
+ * sys_event_queue_receive waiting for the chain has to be woken, or the
+ * shutdown it asked for never reaches it. */
+s32 cellSpursShutdownJobChain(u64 jc_ea)
+{
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
+        s_jobchains[i].shutdown = 1;
+        { static int _n = 0;
+          if (_n++ < 8) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea); }
+        jc_signal_done((u32)jc_ea);
+        return CELL_OK;
+    }
+    printf("[cellSpurs] ShutdownJobChain(jc=0x%08X) -- unknown chain\n", (u32)jc_ea);
+    return CELL_OK;
 }
 
 /* cellSpursJoinJobChain(const CellSpursJobChain*) -- one argument, as above. */
