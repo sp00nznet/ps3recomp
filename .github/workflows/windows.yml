@@ -92,7 +92,7 @@ jobs:
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
-      - name: Run self-contained RSX texture layout tests
+      - name: Run self-contained RSX tests
         # NOT shell: bash. Git Bash rewrites a leading-slash argument into a
         # Windows path, so /nologo arrived at the linker as an .obj under the
         # Git install directory. PowerShell leaves MSVC-style flags alone.
@@ -100,4 +100,8 @@ jobs:
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/video /Fe:test_texture_layout.exe libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_texture_layout.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/video /Fe:test_rsx_primitives.exe libs/video/tests/test_rsx_primitives.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_rsx_primitives.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }

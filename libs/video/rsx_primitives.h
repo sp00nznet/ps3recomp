@@ -1,11 +1,22 @@
 /*
- * ps3recomp - RSX Primitive Type Mapping
+ * ps3recomp - RSX primitive types
  *
- * Maps RSX GPU primitive types to host API topologies.
- * Some RSX types (triangle fans, quads, line loops) don't have direct
- * D3D12/Vulkan equivalents and need index buffer conversion.
+ * Two questions every backend has to answer about a primitive, and neither is
+ * host-API business:
+ *
+ *   - can the hardware draw it directly, or must the CPU expand it first?
+ *   - which of the topologies every modern API does have does it become?
+ *
+ * Both were being answered separately in three places, and the three did not
+ * agree. The D3D12 backend dispatched on bare numbers (`primitive == 8`) with
+ * the name only in a comment. The Metal backend had its own prim_to_metal and
+ * prim_needs_expansion. This header had a third set that nothing called at all
+ * -- and which counted LINE_LOOP as needing conversion while leaving POLYGON
+ * out, the opposite of what Metal did. Those dead helpers generated index
+ * buffers, which is not how either backend actually works: both expand
+ * vertices on the CPU. They are gone rather than reconciled; a third backend
+ * following them would have written the wrong thing.
  */
-
 #ifndef PS3RECOMP_RSX_PRIMITIVES_H
 #define PS3RECOMP_RSX_PRIMITIVES_H
 
@@ -15,95 +26,56 @@
 extern "C" {
 #endif
 
-/* D3D12 topology values (from d3dcommon.h) */
-#define D3D_TOPOLOGY_UNDEFINED          0
-#define D3D_TOPOLOGY_POINTLIST          1
-#define D3D_TOPOLOGY_LINELIST           2
-#define D3D_TOPOLOGY_LINESTRIP          3
-#define D3D_TOPOLOGY_TRIANGLELIST       4
-#define D3D_TOPOLOGY_TRIANGLESTRIP      5
+/* The topologies every modern host API has. A backend maps these to its own
+ * enum; nothing here assumes any particular API's numbering. */
+typedef enum {
+    RSX_TOPOLOGY_UNSUPPORTED = 0,
+    RSX_TOPOLOGY_POINTS,
+    RSX_TOPOLOGY_LINES,
+    RSX_TOPOLOGY_LINE_STRIP,
+    RSX_TOPOLOGY_TRIANGLES,
+    RSX_TOPOLOGY_TRIANGLE_STRIP
+} rsx_topology;
 
-/* Map RSX primitive type to D3D12 topology.
- * Returns 0 (undefined) for types that need index conversion. */
-static inline u32 rsx_to_d3d12_topology(u32 rsx_prim)
+/* Does drawing this primitive require the CPU to expand it into triangles
+ * first?
+ *
+ * Quads, quad strips, triangle fans and polygons have no equivalent on any
+ * modern API, so their vertices must be re-emitted as a triangle list.
+ *
+ * LINE_LOOP is deliberately NOT in that set. It is a line strip plus one
+ * closing edge, which is a smaller fix than a full expansion, and both
+ * backends currently approximate it as a plain strip -- so saying "yes" here
+ * would claim an expansion that neither performs. Whoever closes the loop
+ * should revisit this, and the test says so. */
+static inline int rsx_primitive_needs_expansion(u32 rsx_prim)
+{
+    return rsx_prim == RSX_PRIMITIVE_QUADS      ||
+           rsx_prim == RSX_PRIMITIVE_QUAD_STRIP ||
+           rsx_prim == RSX_PRIMITIVE_TRIANGLE_FAN ||
+           rsx_prim == RSX_PRIMITIVE_POLYGON;
+}
+
+/* The topology this primitive is DRAWN as, after any expansion above.
+ *
+ * So the expandable types report TRIANGLES: that is what comes out of the
+ * expansion, not a claim the hardware understands them. LINE_LOOP reports
+ * LINE_STRIP, matching the approximation described above. */
+static inline rsx_topology rsx_primitive_topology(u32 rsx_prim)
 {
     switch (rsx_prim) {
-    case RSX_PRIMITIVE_POINTS:         return D3D_TOPOLOGY_POINTLIST;
-    case RSX_PRIMITIVE_LINES:          return D3D_TOPOLOGY_LINELIST;
-    case RSX_PRIMITIVE_LINE_STRIP:     return D3D_TOPOLOGY_LINESTRIP;
-    case RSX_PRIMITIVE_TRIANGLES:      return D3D_TOPOLOGY_TRIANGLELIST;
-    case RSX_PRIMITIVE_TRIANGLE_STRIP: return D3D_TOPOLOGY_TRIANGLESTRIP;
-    /* These need index buffer conversion: */
-    case RSX_PRIMITIVE_LINE_LOOP:      return D3D_TOPOLOGY_LINESTRIP;  /* + extra edge */
-    case RSX_PRIMITIVE_TRIANGLE_FAN:   return D3D_TOPOLOGY_TRIANGLELIST; /* expand */
-    case RSX_PRIMITIVE_QUADS:          return D3D_TOPOLOGY_TRIANGLELIST; /* 2 tris/quad */
-    case RSX_PRIMITIVE_QUAD_STRIP:     return D3D_TOPOLOGY_TRIANGLELIST; /* expand */
-    default:                           return D3D_TOPOLOGY_UNDEFINED;
+    case RSX_PRIMITIVE_POINTS:         return RSX_TOPOLOGY_POINTS;
+    case RSX_PRIMITIVE_LINES:          return RSX_TOPOLOGY_LINES;
+    case RSX_PRIMITIVE_LINE_LOOP:      /* approximated: no closing edge yet */
+    case RSX_PRIMITIVE_LINE_STRIP:     return RSX_TOPOLOGY_LINE_STRIP;
+    case RSX_PRIMITIVE_TRIANGLE_STRIP: return RSX_TOPOLOGY_TRIANGLE_STRIP;
+    case RSX_PRIMITIVE_TRIANGLES:
+    case RSX_PRIMITIVE_TRIANGLE_FAN:   /* expanded to a list */
+    case RSX_PRIMITIVE_QUADS:
+    case RSX_PRIMITIVE_QUAD_STRIP:
+    case RSX_PRIMITIVE_POLYGON:        return RSX_TOPOLOGY_TRIANGLES;
+    default:                           return RSX_TOPOLOGY_UNSUPPORTED;
     }
-}
-
-/* Check if a primitive type needs index conversion.
- * Returns 1 if indices need to be generated. */
-static inline int rsx_prim_needs_conversion(u32 rsx_prim)
-{
-    return (rsx_prim == RSX_PRIMITIVE_LINE_LOOP ||
-            rsx_prim == RSX_PRIMITIVE_TRIANGLE_FAN ||
-            rsx_prim == RSX_PRIMITIVE_QUADS ||
-            rsx_prim == RSX_PRIMITIVE_QUAD_STRIP);
-}
-
-/* Convert a triangle fan (N vertices) to triangle list indices.
- * Writes (N-2)*3 indices to out_indices.
- * Returns the number of indices written. */
-static inline u32 rsx_convert_triangle_fan(u32 first, u32 count,
-                                            u32* out_indices, u32 max_indices)
-{
-    if (count < 3) return 0;
-    u32 num_tris = count - 2;
-    u32 num_indices = num_tris * 3;
-    if (num_indices > max_indices) return 0;
-
-    for (u32 i = 0; i < num_tris; i++) {
-        out_indices[i * 3]     = first;         /* center vertex */
-        out_indices[i * 3 + 1] = first + i + 1;
-        out_indices[i * 3 + 2] = first + i + 2;
-    }
-    return num_indices;
-}
-
-/* Convert quads (N vertices, N/4 quads) to triangle list indices.
- * Writes (N/4)*6 indices.
- * Returns the number of indices written. */
-static inline u32 rsx_convert_quads(u32 first, u32 count,
-                                     u32* out_indices, u32 max_indices)
-{
-    u32 num_quads = count / 4;
-    u32 num_indices = num_quads * 6;
-    if (num_indices > max_indices) return 0;
-
-    for (u32 i = 0; i < num_quads; i++) {
-        u32 base = first + i * 4;
-        out_indices[i * 6]     = base;
-        out_indices[i * 6 + 1] = base + 1;
-        out_indices[i * 6 + 2] = base + 2;
-        out_indices[i * 6 + 3] = base;
-        out_indices[i * 6 + 4] = base + 2;
-        out_indices[i * 6 + 5] = base + 3;
-    }
-    return num_indices;
-}
-
-/* Convert line loop (N vertices) to line strip + closing edge.
- * Returns the original count (line strip renders N-1 segments,
- * caller needs to add one extra segment from last to first). */
-static inline u32 rsx_convert_line_loop(u32 first, u32 count,
-                                         u32* out_indices, u32 max_indices)
-{
-    if (count < 2 || count + 1 > max_indices) return 0;
-    for (u32 i = 0; i < count; i++)
-        out_indices[i] = first + i;
-    out_indices[count] = first; /* close the loop */
-    return count + 1;
 }
 
 #ifdef __cplusplus
