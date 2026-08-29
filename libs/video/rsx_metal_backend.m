@@ -243,7 +243,6 @@ static MTLPrimitiveType topo_to_metal(rsx_topology t)
     default:                          return MTLPrimitiveTypeTriangle;
     }
 }
-}
 
 /* Emit `count` vertices starting at `first`, expanding fans/quads/polygons.
  * `resolve` maps a sequence position to a guest vertex index, so the same code
