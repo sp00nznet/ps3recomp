@@ -24,6 +24,7 @@
  * qualifier existed do not define it, so the scaffold must carry its own
  * reachable definition. */
 #include "../ppu_tls.h"
+#include "../../platform/win32_compat.h"      /* Sleep, GetTickCount64, threads on POSIX */
 #include "../../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 /* The lifted ppu_recomp.h already defines `struct ppu_context` (identical to
  * runtime/ppu/ppu_context.h by design -- "keep the two in sync"). A syscall
@@ -178,13 +179,32 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
                                  uint64_t a5, uint64_t a6, uint64_t a7)
 { ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7); }
 
-#ifdef _WIN32
-/* RSX present backend (libs/video/rsx_d3d12_backend.c). Driven on the vblank
- * thread so the D3D12 device + window message pump live on one thread. */
+/* RSX present backend. D3D12 on Windows, Metal on Apple, and the null
+ * backend's headless software path anywhere else -- the same selection
+ * runtime/host/host_posix.c makes, so the ticker below is backend-agnostic
+ * and a POSIX host gets a frame clock instead of no clock at all. */
+#if defined(_WIN32)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
-extern "C" int cellGcm_take_flip_pending(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
+#  define rsx_backend_init    rsx_d3d12_backend_init
+#  define rsx_backend_present rsx_d3d12_backend_present
+#  define rsx_backend_pump    rsx_d3d12_backend_pump_messages
+#elif defined(__APPLE__)
+extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_metal_backend_present(void);
+extern "C" int  rsx_metal_backend_pump_messages(void);
+#  define rsx_backend_init    rsx_metal_backend_init
+#  define rsx_backend_present rsx_metal_backend_present
+#  define rsx_backend_pump    rsx_metal_backend_pump_messages
+#else
+extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_null_backend_present(void);
+extern "C" int  rsx_null_backend_pump_messages(void);
+#  define rsx_backend_init    rsx_null_backend_init
+#  define rsx_backend_present rsx_null_backend_present
+#  define rsx_backend_pump    rsx_null_backend_pump_messages
+#endif
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" unsigned cellGcm_flip_request_count(void);
 extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
@@ -243,7 +263,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
 {
     const char* _title = getenv("PS3_TITLE");
     if (!_title || !*_title) _title = "You Don't Know Jack (ps3recomp)";
-    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, _title) == 0);
+    int rsx_ok = (rsx_backend_init(1280, 720, _title) == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     unsigned last_flip = 0;
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
@@ -266,7 +286,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * writes and showed empty or mixed batches. */
             {
                 if (rsx_ok && cellGcm_take_flip_pending()) {
-                    rsx_d3d12_backend_present();
+                    rsx_backend_present();
                     last_flip = cellGcm_flip_request_count();
                 }
             }
@@ -285,7 +305,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * The real RSX writes those fences in microseconds. */
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
-                rsx_d3d12_backend_present();
+                rsx_backend_present();
                 last_flip = cellGcm_flip_request_count();
             }
             cellGcm_rsx_process_fifo();
@@ -299,11 +319,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
               static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
-            if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
+            if (rsx_backend_pump() != 0) { rsx_ok = 0; }
             if (getenv("YDKJ_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
-                ULONGLONG t0=GetTickCount64(); rsx_d3d12_backend_present(); ULONGLONG t1=GetTickCount64();
+                ULONGLONG t0=GetTickCount64(); rsx_backend_present(); ULONGLONG t1=GetTickCount64();
                 s_presms += (t1-t0);
                 if (s_win==0) s_win=now;
                 if (now - s_win >= 1000) {
@@ -320,7 +340,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                  * during boot. */
                 unsigned fc = cellGcm_flip_request_count();
                 if (fc != last_flip || fc == 0) {
-                    rsx_d3d12_backend_present();
+                    rsx_backend_present();
                     last_flip = fc;
                 }
             }
@@ -331,6 +351,13 @@ static DWORD WINAPI vblank_ticker(LPVOID)
 
 extern "C" uint32_t    g_last_hle_nid;
 extern "C" const char* g_last_hle_name;
+
+/* Windows-only from here to the end of hang_watchdog. Snapshotting every
+ * OTHER thread and reading its instruction pointer needs tlhelp32 plus
+ * SuspendThread/GetThreadContext; POSIX has no equivalent that does not
+ * amount to writing a debugger. The vblank ticker above, which is what the
+ * frame loop actually depends on, is deliberately outside this. */
+#ifdef _WIN32
 #include <tlhelp32.h>
 /* When the boot wedges, snapshot every other thread's instruction pointer as a
  * module RVA (symbolize with llvm-symbolizer) so a guest spin/wait is pinned to
@@ -583,11 +610,14 @@ int main(int argc, char** argv)
      * so the game's frame loop advances (it no-ops until the game registers its
      * vblank/flip handlers during init). */
     g_ps3_guest_caller = harness_guest_caller;
-#ifdef _WIN32
+    /* CreateThread is a pthread wrapper off Windows (win32_compat.h), so the
+     * frame clock now runs everywhere. Without it a POSIX host never ticks
+     * vblank or drains the FIFO, and the guest waits on fences forever. */
     CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
-    CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
     if (getenv("PS3_GUEST_PROF"))
         CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
+#ifdef _WIN32
+    CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);   /* tlhelp32-based */
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);

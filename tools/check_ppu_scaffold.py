@@ -45,14 +45,18 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "tools", "ppu_scaffold_baseline.json")
 
-# The scaffold translation units. boot_main.cpp is deliberately absent: it also
-# includes the per-game SPU recomp header and pulls in the generated function
-# table, so a stub cannot stand in for it.
+# The scaffold translation units.
+#
+# boot_main.cpp used to be excluded here on the grounds that it needed the
+# per-game SPU recomp header too. It does not -- ppu_recomp.h is the only
+# generated header it wants, and the stub covers that. Leaving it out meant
+# the file the frame clock lives in was the one file nothing checked.
 SOURCES = [
     "runtime/ppu/ppu_loader.cpp",
     "runtime/ppu/ppu_hle.cpp",
     "runtime/ppu/ppu_fs.cpp",
     "runtime/ppu/ppu_sysprx.cpp",
+    "runtime/ppu/tests/boot_main.cpp",
 ]
 
 INCLUDE_DIRS = [
@@ -60,6 +64,7 @@ INCLUDE_DIRS = [
     "runtime/ppu",
     "runtime/spu",
     "runtime/memory",
+    "runtime/syscalls",
     "libs/video",
 ]
 
