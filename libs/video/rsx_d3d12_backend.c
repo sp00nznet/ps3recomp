@@ -71,7 +71,7 @@
 typedef struct {
     u32 vb_byte_offset; /* offset into vb_mapped where this draw's verts live */
     u32 vertex_count;
-    u32 topology;       /* D3D_PRIMITIVE_TOPOLOGY_* */
+    u32 topology;       /* rsx_topology (NOT a D3D value; see topo_to_d3d) */
     int textured;       /* 1 = sample the bound font/atlas texture (dbgfont) */
     int is_vp;          /* 1 = real VP path: vb_byte_offset indexes vp_vb (float4) */
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
@@ -3486,6 +3486,22 @@ static void screen_copy_capture(u32 fi)
 
 }
 
+/* rsx_topology -> D3D_PRIMITIVE_TOPOLOGY. Spelled out rather than relying on
+ * the two enums happening to agree: the draw record carries the neutral value
+ * so a second backend can read it, and this is the one place it becomes a D3D
+ * one. */
+static D3D12_PRIMITIVE_TOPOLOGY topo_to_d3d(u32 t)
+{
+    switch (t) {
+    case RSX_TOPOLOGY_POINTS:         return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+    case RSX_TOPOLOGY_LINES:          return D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+    case RSX_TOPOLOGY_LINE_STRIP:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+    case RSX_TOPOLOGY_TRIANGLE_STRIP: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+    case RSX_TOPOLOGY_TRIANGLES:      return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    default:                          return D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    }
+}
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
@@ -4081,11 +4097,11 @@ static void render_frame(void)
             ID3D12PipelineState* target_pso = s_d3d.pipeline_state; /* default triangle */
             if (dr->textured && s_d3d.tex_ready && s_d3d.pipeline_state_tex) {
                 target_pso = s_d3d.pipeline_state_tex;
-            } else if (dr->topology == D3D_TOPOLOGY_POINTLIST) {
+            } else if (dr->topology == RSX_TOPOLOGY_POINTS) {
                 target_pso = s_d3d.pipeline_state_points
                              ? s_d3d.pipeline_state_points : s_d3d.pipeline_state;
-            } else if (dr->topology == D3D_TOPOLOGY_LINELIST ||
-                       dr->topology == D3D_TOPOLOGY_LINESTRIP) {
+            } else if (dr->topology == RSX_TOPOLOGY_LINES ||
+                       dr->topology == RSX_TOPOLOGY_LINE_STRIP) {
                 target_pso = s_d3d.pipeline_state_lines
                              ? s_d3d.pipeline_state_lines : s_d3d.pipeline_state;
             }
@@ -4094,7 +4110,7 @@ static void render_frame(void)
                 last_pso = target_pso;
             }
             if (dr->topology != last_topo) {
-                s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, dr->topology);
+                s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, topo_to_d3d(dr->topology));
                 last_topo = dr->topology;
             }
             u32 start_vert = dr->vb_byte_offset / VERTEX_STRIDE;
@@ -4129,7 +4145,7 @@ static void render_frame(void)
         if (any && vpso) {
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
             s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, vpso);
-            s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_TOPOLOGY_TRIANGLELIST);
+            s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                 s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb));
             ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
@@ -5598,7 +5614,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * (exact position + texcoord): upload raw float4 attrib0 into vp_vb and
      * mark the draw is_vp; render_frame compiles the VP and draws it. Fall
      * back to the frac-approximation textured path if VP resources are absent. */
-    if (primitive == 8 /* CELL_GCM_PRIMITIVE_QUADS */) {
+    if (primitive == RSX_PRIMITIVE_QUADS) {
         /* Prefer the real vertex-program path whenever VP resources exist --
          * NOT only when a texture is bound. Requiring tex_bound routed vkcube's
          * UNtextured cube to the fixed-function fallback, which never applies the
@@ -5611,7 +5627,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
                 dr->vb_byte_offset = rec;
                 dr->vertex_count   = emitted;
-                dr->topology       = D3D_TOPOLOGY_TRIANGLELIST;
+                dr->topology       = RSX_TOPOLOGY_TRIANGLES;
                 dr->textured       = s_d3d.tex_bound;
                 dr->is_vp          = 1;
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
@@ -5676,7 +5692,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         if (s_d3d.draw_count < MAX_DRAWS) {
             s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
             s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
-            s_d3d.draws[s_d3d.draw_count].topology       = D3D_TOPOLOGY_TRIANGLELIST;
+            s_d3d.draws[s_d3d.draw_count].topology       = RSX_TOPOLOGY_TRIANGLES;
             s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
             s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
             s_d3d.draws[s_d3d.draw_count].is_clear       = 0;
@@ -5697,14 +5713,14 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * zero pixels (it also uploads to vp_vb, leaving the fixed-function vb empty).
      * Geometry already in clip space with no VP -- flOw's injected scene -- must
      * go down the fixed-function passthrough below instead. */
-    if ((primitive == 5 /* TRIANGLES */ || primitive == 6 /* TRIANGLE_STRIP */
-         || primitive == 7 /* TRIANGLE_FAN */) &&
+    if ((primitive == RSX_PRIMITIVE_TRIANGLES || primitive == RSX_PRIMITIVE_TRIANGLE_STRIP
+         || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
         s_d3d.vp_vb_mapped && s_d3d.vp_root_sig &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
         u32 rec = s_d3d.vp_vb_offset;
-        u32 emitted = (primitive == 5)
+        u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
             ? upload_tris_vp(s_d3d.current_rsx_state, first, count)
-            : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == 7);
+            : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == RSX_PRIMITIVE_TRIANGLE_FAN);
         /* RSX splits one primitive stream across several DRAW_ARRAYS entries
          * inside a single BEGIN/END (each carries at most 256 vertices), and the
          * hardware concatenates them before assembling primitives. Recording a
@@ -5719,8 +5735,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
             u32 fpnow = s_d3d.current_rsx_state
                         ? s_d3d.current_rsx_state->shader_program : 0;
-            if (pv->is_vp && pv->topology == D3D_TOPOLOGY_TRIANGLELIST &&
-                pv->fp_addr == fpnow && primitive == 5 &&
+            if (pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
+                pv->fp_addr == fpnow && primitive == RSX_PRIMITIVE_TRIANGLES &&
                 pv->begin_epoch == (s_d3d.current_rsx_state
                                     ? s_d3d.current_rsx_state->begin_epoch : 0) &&
                 pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
@@ -5733,7 +5749,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
             dr->vb_byte_offset = rec;
             dr->vertex_count   = emitted;
-            dr->topology       = D3D_TOPOLOGY_TRIANGLELIST;
+            dr->topology       = RSX_TOPOLOGY_TRIANGLES;
             dr->textured       = s_d3d.tex_bound;
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
@@ -5784,15 +5800,15 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
             s_d3d.draw_count++;
             /* Anchor for merging the next DRAW_ARRAYS batch of this stream. */
-            s_d3d.merge_prev_draw  = (primitive == 5);
+            s_d3d.merge_prev_draw  = (primitive == RSX_PRIMITIVE_TRIANGLES);
             s_d3d.merge_first_end  = first + count;
         }
         return;
     }
     s_d3d.merge_prev_draw = 0;   /* any other primitive breaks the stream */
 
-    u32 topo = rsx_to_d3d12_topology(primitive);
-    if (topo == D3D_TOPOLOGY_UNDEFINED) {
+    u32 topo = (u32)rsx_primitive_topology(primitive);
+    if (topo == RSX_TOPOLOGY_UNSUPPORTED) {
         /* Other primitives still needing index-buffer conversion
          * (line loops, triangle fans) — skip rather than draw wrong. */
         static int s_skipped_nontri = 0;
@@ -5838,10 +5854,10 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
      * list. Other primitives are skipped rather than drawn wrong. */
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
-    if (primitive == 8)      emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
-    else if (primitive == 5) emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
-    else if (primitive == 6) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
-    else if (primitive == 7) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1);
+    if (primitive == RSX_PRIMITIVE_QUADS)             emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLES)    emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN)   emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1);
     else {
         static int _skip = 0;
         if (_skip++ < 3)
@@ -5852,11 +5868,11 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
      * fluid arrives as ~3000 DRAW_INDEX_ARRAY batches of 256, and 256 is not a
      * multiple of 3, so every batch after the first assembled out of phase. */
     if (emitted && s_d3d.merge_prev_draw && s_d3d.draw_count > 0 &&
-        s_d3d.merge_first_end == first && primitive == 5) {
+        s_d3d.merge_first_end == first && primitive == RSX_PRIMITIVE_TRIANGLES) {
         D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
         u32 fpnow = s_d3d.current_rsx_state
                     ? s_d3d.current_rsx_state->shader_program : 0;
-        if (pv->is_vp && pv->topology == D3D_TOPOLOGY_TRIANGLELIST &&
+        if (pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
             pv->fp_addr == fpnow &&
             pv->begin_epoch == (s_d3d.current_rsx_state
                                 ? s_d3d.current_rsx_state->begin_epoch : 0) &&
@@ -5870,7 +5886,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
         dr->vb_byte_offset = rec;
         dr->vertex_count   = emitted;
-        dr->topology       = D3D_TOPOLOGY_TRIANGLELIST;
+        dr->topology       = RSX_TOPOLOGY_TRIANGLES;
         dr->textured       = s_d3d.tex_bound;
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
@@ -5920,7 +5936,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         s_d3d.draw_count++;
         /* Anchor for merging the next batch of this indexed stream. */
-        s_d3d.merge_prev_draw = (primitive == 5);
+        s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES);
         s_d3d.merge_first_end = first + count;
     }
 }
