@@ -3,24 +3,28 @@
     "runtime/ppu/ppu_fs.cpp": 0,
     "runtime/ppu/ppu_hle.cpp": 0,
     "runtime/ppu/ppu_loader.cpp": 0,
-    "runtime/ppu/ppu_sysprx.cpp": 0
+    "runtime/ppu/ppu_sysprx.cpp": 0,
+    "runtime/ppu/tests/boot_main.cpp": 0
   },
   "linux-clang": {
     "runtime/ppu/ppu_fs.cpp": 0,
     "runtime/ppu/ppu_hle.cpp": 0,
     "runtime/ppu/ppu_loader.cpp": 0,
-    "runtime/ppu/ppu_sysprx.cpp": 0
+    "runtime/ppu/ppu_sysprx.cpp": 0,
+    "runtime/ppu/tests/boot_main.cpp": 0
   },
   "linux-gcc": {
     "runtime/ppu/ppu_fs.cpp": 0,
     "runtime/ppu/ppu_hle.cpp": 0,
     "runtime/ppu/ppu_loader.cpp": 0,
-    "runtime/ppu/ppu_sysprx.cpp": 0
+    "runtime/ppu/ppu_sysprx.cpp": 0,
+    "runtime/ppu/tests/boot_main.cpp": 0
   },
   "windows-clang-cl": {
     "runtime/ppu/ppu_fs.cpp": 0,
     "runtime/ppu/ppu_hle.cpp": 0,
     "runtime/ppu/ppu_loader.cpp": 0,
-    "runtime/ppu/ppu_sysprx.cpp": 0
+    "runtime/ppu/ppu_sysprx.cpp": 0,
+    "runtime/ppu/tests/boot_main.cpp": 0
   }
 }
