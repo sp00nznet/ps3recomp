@@ -2205,13 +2205,25 @@ static u64 spurs_event_data3_probe(void)
     return (u64)(unsigned)v;
 }
 
-static void jc_signal_done(u32 jc_ea)
+static void jc_signal_done(u32 jc_ea, int job_index)
 {
     /* Carry the job's mailbox answer in the completion event. On hardware the
      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
      * synthetic payload means the caller reads back zero for whatever it
-     * asked. Keep the chain EA in data1 for anything that used it. */
-    u64 d2 = 0, d3 = 0;
+     * asked. Keep the chain EA in data1 for anything that used it.
+     *
+     * data2 was hardcoded to 0 here -- d2/d3 were computed and then dropped --
+     * and that is not a cosmetic loss: the PPU side of a job chain reads data2
+     * as WHICH job finished. GT5P's audio service does
+     *     do { JobGuardNotify; receive(q); i = data2; run_callback(i); }
+     *     while (i + 1 < queued);
+     * so a data2 that is always 0 pins i at 0 and the loop never terminates --
+     * with the chain's lwmutex held the whole time, which blocks the main
+     * thread's teardown behind it. When the SPU produced no mailbox value,
+     * fall back to the job's ordinal in the chain, which is what that loop is
+     * counting. */
+    u64 d2 = (u64)(unsigned)(job_index < 0 ? 0 : job_index);
+    u64 d3 = spurs_event_data3_probe();
     if (g_spurs_job_mbox_valid) {
         d2 = g_spurs_job_mbox;
         d3 = g_spurs_job_mbox_intr;
@@ -2219,12 +2231,13 @@ static void jc_signal_done(u32 jc_ea)
     }
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
-                                            SPURS_EVENT_PORT, jc_ea, 0,
-                                            spurs_event_data3_probe());
+                                            SPURS_EVENT_PORT, jc_ea, d2, d3);
         static int n = 0;
         if (n++ < 8)
-            printf("[cellSpurs] chain 0x%08X work done -> event queue %u (rc=%d)\n",
-                   jc_ea, s_spurs_event_queue[i], rc);
+            printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
+                   "(data2=%llu rc=%d)\n",
+                   jc_ea, job_index, s_spurs_event_queue[i],
+                   (unsigned long long)d2, rc);
     }
 }
 
@@ -2256,14 +2269,15 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc,
 
         if (cmd != 0 && op == 0) {                    /* JOB */
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
-            jc_run_one_job((u32)(cmd & ~7ull), jobs++, size_desc);
+            int idx = jobs++;
+            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
             idle = 0;                    /* real work: the chain is healthy */
             /* Signal per JOB, not per lap. The application waits once for each
              * unit of work it queued -- this title notified the guard 7 times
              * and sat in event_queue_receive 30 times -- so batching the
              * completion into one event per pass leaves it waiting for
              * completions that, from its point of view, never arrive. */
-            jc_signal_done(jc_ea);
+            jc_signal_done(jc_ea, idx);
             pc += 8; continue;
         }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
@@ -2272,7 +2286,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc,
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
                 printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
-                if (jobs) jc_signal_done(jc_ea);
+                if (jobs) jc_signal_done(jc_ea, jobs - 1);
                 return;
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
@@ -2314,7 +2328,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
     s_jobchains[slot].running = 0;
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
-    jc_signal_done(s_jobchains[slot].jc_ea);
+    jc_signal_done(s_jobchains[slot].jc_ea, -1);
     return 0;
 }
 #endif
@@ -2385,7 +2399,7 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
         s_jobchains[i].shutdown = 1;
         { static int _n = 0;
           if (_n++ < 8) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea); }
-        jc_signal_done((u32)jc_ea);
+        jc_signal_done((u32)jc_ea, -1);
         return CELL_OK;
     }
     printf("[cellSpurs] ShutdownJobChain(jc=0x%08X) -- unknown chain\n", (u32)jc_ea);
