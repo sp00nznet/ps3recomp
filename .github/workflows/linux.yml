@@ -121,6 +121,11 @@ jobs:
           # the draw path, not just the clear.
           ./build/ps3recomp_host --draw
           ./build/ps3recomp_host --draw --frames=60
+          # Bind a texture and sample it: the quad is green, the texture is
+          # not, so a path that dropped the texture still draws something
+          # plausible and still fails here. Exercises rsx_texture_layout and
+          # rsx_texture_decode end to end with no GPU involved.
+          ./build/ps3recomp_host --tex
 
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # arithmetic with no host API in it, so it runs everywhere, and it is the
