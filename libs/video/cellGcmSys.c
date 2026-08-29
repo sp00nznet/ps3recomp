@@ -123,6 +123,10 @@ static CellGcmControl s_control;
  * and control blocks, published on each call. 4096 pages covers the 4 GiB
  * address space at 1 MiB granularity, 8 KiB a side, and this is not a hot path.
  * 0xFFFF means "not mapped", as it does in the host tables. */
+/* Default home for the HLE-visible GCM window; a port overrides it before
+ * running guest code when its title claims this address range. */
+uint32_t ppu_hle_inject_base = 0x20000000u;
+
 static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
 
