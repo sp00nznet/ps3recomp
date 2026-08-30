@@ -967,7 +967,16 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         fprintf(stderr,"%s\n",ln); } } }
 #endif
     v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
-void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return;
+void vm_write64(uint64_t a, uint64_t v) {
+    /* A 64-bit std used to be invisible to LBP_WW / LBP_WV: only write8/16/32
+     * fed the watch, so "nothing writes this field" was a routine false
+     * negative. GT5P's PDI task flag at 0x0107B798 reads back as 1 with no
+     * store in the log, and the store that sets it is a std covering it.
+     * Report both halves at their own addresses, so a watch on either word
+     * sees it and the printed value is the word that landed there. */
+    barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 8, __builtin_return_address(0));
+    barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         8, __builtin_return_address(0));
+    if (vm_oob((uint32_t)a,8)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
         void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(NULL);
