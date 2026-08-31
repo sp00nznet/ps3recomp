@@ -57,4 +57,8 @@ u32 rsx_null_backend_readback_center(void);
 #ifdef __cplusplus
 }
 #endif
+
+/* The live draw engine binds to this window and takes over presentation. */
+void* rsx_null_backend_get_hwnd(void);
+void  rsx_null_backend_suppress_present(int on);
 #endif

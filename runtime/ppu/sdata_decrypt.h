@@ -140,9 +140,15 @@ static inline uint8_t* sdata_decrypt(const uint8_t* d, size_t n, size_t* out_siz
     uint64_t file_size = sd_be64(d + 0x88);
     if(!(flags & 0x01000000u)) return NULL;   /* not SDATA (would need NPDRM license) */
     if(block_size == 0 || file_size == 0 || file_size > (uint64_t)n) return NULL;
-    /* Only the plain (non-"compressed", non-0x20-metadata) layout is needed for
-     * LBP's .sdat; bail (caller keeps ciphertext) on the exotic variants. */
-    if((flags & 0x01/*COMPRESSED*/) || (flags & 0x20)) return NULL;
+    /* Compression is still unsupported; bail (caller keeps ciphertext). */
+    if(flags & 0x01/*COMPRESSED*/) return NULL;
+    /* EDAT_FLAG_0x20 changes only the block LAYOUT: instead of one 0x10-byte
+     * metadata table before the data, a 0x20-byte metadata record precedes
+     * every block. The crypto below is identical. Twisted Metal's
+     * tmxconfig.sdat is flags=0x0100003C, i.e. SDATA with 0x20 set, and
+     * bailing here meant cellFsSdataOpen handed the title a success with no
+     * handle and its config document never loaded. */
+    const int meta_0x20 = (flags & 0x20) != 0;
     int enc_key = (flags & 0x08) != 0;   /* EDAT_ENCRYPTED_KEY_FLAG */
     uint8_t crypt_key[16]; for(int i=0;i<16;i++) crypt_key[i]=dev_hash[i]^SDAT_KEY[i];
     uint64_t total_blocks = (file_size + block_size - 1) / block_size;
@@ -150,7 +156,8 @@ static inline uint8_t* sdata_decrypt(const uint8_t* d, size_t n, size_t* out_siz
     if(!out) return NULL;
     size_t written = 0;
     for(uint64_t bn=0; bn<total_blocks; bn++){
-        uint64_t off = 0x100 + total_blocks*0x10 + bn*block_size;
+        uint64_t off = meta_0x20 ? 0x100 + bn*(0x20 + (uint64_t)block_size) + 0x20
+                                 : 0x100 + total_blocks*0x10 + bn*block_size;
         uint32_t length = block_size;
         if(bn==total_blocks-1 && (file_size % block_size)) length = (uint32_t)(file_size % block_size);
         uint32_t padlen = (length + 15) & ~15u;

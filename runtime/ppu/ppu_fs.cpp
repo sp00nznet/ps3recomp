@@ -312,6 +312,28 @@ static void cellFsClose(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
+/* Pre-fault a guest range so the kernel can write into it.
+ *
+ * The flat VM is MEM_RESERVEd and each page is committed on FIRST ACCESS by a
+ * vectored exception handler. That covers CPU access from lifted code, but
+ * fread/fwrite move data through the kernel, and a kernel write to a reserved
+ * page does not raise a user-mode exception -- the I/O just fails, returning 0
+ * with ferror set. Twisted Metal hit this on every read whose destination the
+ * guest had not touched yet: read 1 of a file succeeded, read 2 into a fresh
+ * page came back n=0 eof=0 err=1, and the title logged its own
+ * "Short read ... Possible reasons include disc eject" and gave up.
+ *
+ * Touch each page read-then-write so the fault happens here, in user mode,
+ * where the handler can commit it. Read-then-write rather than a plain store so
+ * nothing already in the buffer is disturbed. */
+static inline void fs_prefault(uint32_t buf, uint64_t len)
+{
+    if (!vm_base || !len) return;
+    volatile uint8_t* p = (volatile uint8_t*)(vm_base + buf);
+    for (uint64_t o = 0; o < len; o += 0x1000) p[o] = p[o];
+    p[len - 1] = p[len - 1];
+}
+
 static void cellFsRead(ppu_context* ctx)
 {
     int fd          = (int)(uint32_t)ctx->gpr[3];
@@ -322,8 +344,31 @@ static void cellFsRead(ppu_context* ctx)
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
+    fs_prefault(buf, nbytes);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    /* TM_FSEOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
+     * The intro cinematic is 28 seconds and this port renders it at a few frames
+     * a second, so it cannot be watched to its end -- truncating the stream makes
+     * the demuxer see EOF and the movie finish, which is what advances the title
+     * to whatever follows the intro. Deliberately a testing knob, not a fix. */
+    { static int efd = -2; static long elim = 0;
+      if (efd == -2) { const char* e = getenv("TM_FSEOF");
+          if (e) { efd = atoi(e); const char* c = strchr(e, 44); elim = c ? atol(c + 1) : 0; }
+          else efd = -1; }
+      if (efd >= 0 && fd == efd && elim > 0 && fpos_before >= elim) {
+          static int once = 0;
+          if (!once++) fprintf(stderr, "[fs] TM_FSEOF: fd=%d truncated at %ld bytes\n", fd, elim);
+          n = 0;
+      } }
     if (g_fd_usm[fd] && getenv("YDKJ_USMRD")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
+    /* TM_FSREADS=<fd>: log every read on one descriptor. YDKJ_FSDBG caps at 20
+     * lines and they are all spent before a movie ever opens, so it cannot
+     * answer "is the streamer reading the .avi". */
+    { static int wfd = -2;
+      if (wfd == -2) { const char* e = getenv("TM_FSREADS"); wfd = e ? atoi(e) : -1; }
+      if (wfd >= 0 && fd == wfd)
+          fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
+                  fd, (unsigned long long)nbytes, n, fpos_before); }
     if (getenv("YDKJ_FSDBG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
 #ifdef _WIN32
     if (getenv("YDKJ_FSDBG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
@@ -348,6 +393,7 @@ static void cellFsWrite(ppu_context* ctx)
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
     /* DIAGNOSTIC (FLOW_CFGBT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */

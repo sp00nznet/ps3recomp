@@ -2,6 +2,21 @@
  * ps3recomp - PPU thread management syscalls (implementation)
  */
 
+#include <setjmp.h>
+
+/* sys_ppu_thread_exit never returns on hardware. Returning CELL_OK to the
+ * guest lets it run on past the call: Twisted Metal has a thread that exits
+ * from inside a loop and so called exit 1,435 times in one run, staying alive
+ * and holding whatever it held. Arm a jump in the thread proc and unwind to it
+ * instead. PS3_NO_THREAD_EXIT_UNWIND=1 restores the old behaviour. */
+#if defined(_WIN32)
+#  define PPU_TLS __declspec(thread)
+#else
+#  define PPU_TLS __thread
+#endif
+static PPU_TLS jmp_buf s_exit_jmp;
+static PPU_TLS int     s_exit_armed = 0;
+
 #include <stddef.h>
 #include "sys_ppu_thread.h"
 #include <string.h>
@@ -101,7 +116,13 @@ static void* ppu_host_thread_proc(void* param)
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
-        g_ppu_thread_entry_trampoline(&info->ctx);
+        s_exit_armed = 1;
+        if (setjmp(s_exit_jmp) == 0)
+            g_ppu_thread_entry_trampoline(&info->ctx);
+        else
+            fprintf(stderr, "[THREAD %llu] unwound out of sys_ppu_thread_exit\n",
+                    (unsigned long long)info->ctx.thread_id);
+        s_exit_armed = 0;
         fprintf(stderr, "[THREAD %llu] entry RETURNED (r3=0x%llX) -- thread finished\n",
                 (unsigned long long)info->ctx.thread_id,
                 (unsigned long long)info->ctx.gpr[3]);
@@ -448,8 +469,13 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     }
     table_unlock();
 
-    /* In a real implementation this would terminate the calling thread.
-     * The thread proc wrapper handles this after return. */
+    /* Hardware never returns from this. Unwind to the thread proc so the guest
+     * cannot keep running past its own exit. */
+    {
+        static int allow = -1;
+        if (allow < 0) allow = getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1;
+        if (allow && s_exit_armed) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
+    }
     return CELL_OK;
 }
 
