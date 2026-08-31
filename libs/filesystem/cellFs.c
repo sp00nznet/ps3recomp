@@ -406,7 +406,13 @@ static void ensure_parent_dirs(const char* path)
 /* NID: 0x718BF5F8 */
 s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 size)
 {
-    printf("[cellFs] Open(path='%s', flags=0x%X)\n", gpath(path) ? gpath(path) : "<null>", flags);
+    /* Tag the opening thread. When asset loading stalls, "which thread was
+     * the loader" is the first thing you need and the last thing the log
+     * says -- with a tid you can find that thread's final wait. */
+    { extern __declspec(thread) ppu_context* g_active_ctx;
+      printf("[cellFs] Open(path='%s', flags=0x%X) tid=%llu\n",
+             gpath(path) ? gpath(path) : "<null>", flags,
+             g_active_ctx ? (unsigned long long)g_active_ctx->thread_id : 0ull); }
 
     if (!path || !fd)
         return CELL_EFAULT;

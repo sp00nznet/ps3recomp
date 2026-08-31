@@ -338,6 +338,23 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
                                 (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
                                 (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31],
                                 (uint32_t)g_active_ctx->lr);
+                    /* On the first hit, every GPR. A bulk fill keeps its
+                     * destination and remaining count in registers the ABI
+                     * argument slots say nothing about, and those two numbers
+                     * are what identify the range. */
+                    if (_cs == 1 && g_active_ctx) {
+                        for (int r = 0; r < 32; r += 8)
+                            fprintf(stderr, "[GUARD]   r%-2d: %08X %08X %08X %08X"
+                                            " %08X %08X %08X %08X\n", r,
+                                    (uint32_t)g_active_ctx->gpr[r + 0],
+                                    (uint32_t)g_active_ctx->gpr[r + 1],
+                                    (uint32_t)g_active_ctx->gpr[r + 2],
+                                    (uint32_t)g_active_ctx->gpr[r + 3],
+                                    (uint32_t)g_active_ctx->gpr[r + 4],
+                                    (uint32_t)g_active_ctx->gpr[r + 5],
+                                    (uint32_t)g_active_ctx->gpr[r + 6],
+                                    (uint32_t)g_active_ctx->gpr[r + 7]);
+                    }
                     ppu_guest_callstack("guard-clear");
                 }
             }
@@ -650,8 +667,14 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("YDKJ_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
           if(wa>=0 && (uint32_t)a==(uint32_t)wa){ static int once=0; if(!once){ once=1;
             void* bt[28]; unsigned short fr=RtlCaptureStackBackTrace(0,28,bt,0);
-            char* mb=(char*)GetModuleHandleA(0); char line[800]; int p=snprintf(line,sizeof line,"[SPINBT32 0x%08X] rva:",(uint32_t)a);
-            for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
+            char* mb=(char*)GetModuleHandleA(0); char line[900]; int p=snprintf(line,sizeof line,"[SPINBT32 0x%08X] rva:",(uint32_t)a);
+            /* Resolve each frame back to the guest function that generated it,
+             * the same way ppu_dump_guest_stack does. A bare RVA list needs a
+             * linker map to be worth anything; a named frame does not. */
+            for(int i=0;i<fr && p<860;i++){ extern uint32_t ppu_prof_resolve_host(void*);
+              uint32_t gf=ppu_prof_resolve_host(bt[i]);
+              p+=snprintf(line+p,sizeof(line)-p, gf?" %llX(f_%08X)":" %llX",
+                          (unsigned long long)((char*)bt[i]-mb), gf); }
             fprintf(stderr,"%s\n",line); fflush(stderr); } } }
 #endif
       } }
@@ -719,6 +742,38 @@ static void ww_arm_inline_window(uint32_t ww)
 }
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    /* LBP_WV=<hexvalue>: log every PPU store that WRITES this value, wherever
+     * it lands. LBP_WW answers "who writes this address"; when a bad value is
+     * copied from node to node down a list, that only ever catches the copy.
+     * GT5P's heap carries a free-block end of 0x42C80000 (= 100.0f) that each
+     * split propagates to the next node, so the address watch reported a
+     * different innocent writer every run. Watching the value finds the first
+     * one instead. */
+    { static uint32_t s_wv = 0xFFFFFFFFu, s_wvlo, s_wvhi;
+      if (s_wv == 0xFFFFFFFFu) { const char* e = getenv("LBP_WV");
+                                 s_wv = e ? (uint32_t)strtoul(e, 0, 0) : 0;
+                                 /* LBP_WV_LO/HI: restrict to a destination
+                                  * range. A distinctive value is usually also a
+                                  * common constant -- 100.0f lands in .data
+                                  * dozens of times before it ever reaches the
+                                  * heap -- so without this the interesting hit
+                                  * is past the print cap before it happens. */
+                                 const char* lo = getenv("LBP_WV_LO");
+                                 const char* hi = getenv("LBP_WV_HI");
+                                 s_wvlo = lo ? (uint32_t)strtoul(lo, 0, 0) : 0;
+                                 s_wvhi = hi ? (uint32_t)strtoul(hi, 0, 0) : 0xFFFFFFFFu; }
+      if (s_wv && v == s_wv && a >= s_wvlo && a < s_wvhi) {
+          static int _n = 0;
+          if (_n++ < 24) {
+              fprintf(stderr, "[wv] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
+                      a, v, width, ppu_prof_resolve_host(ra));
+              extern __declspec(thread) ppu_context* g_active_ctx;
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              if (_n <= 3 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "wv");
+              fflush(stderr);
+          }
+      } }
+
     /* LBP_WW=<hexEA>: log every PPU store into the 16-byte line at that EA,
      * with the writing guest function -- to find who fills (or fails to fill)
      * a struct field (e.g. FMOD's overlay descriptor source at 0x94F680). */
@@ -748,15 +803,33 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                     ppu_guard_page(a); }
             } }
 
-          static int _n = 0;
-          if (_n++ < 64) {
+          /* LBP_WW_MAX=<n>: how many hits to print (default 64, 0 = unlimited).
+           *
+           * The cap used to be a bare 64 with no announcement, and silence
+           * after it is indistinguishable from "nothing writes this address".
+           * That is a trap: on a stack slot or a busy struct the first 64 hits
+           * are spent during init, and every later write -- the interesting one
+           * -- is dropped without a word. It produced four separate wrong
+           * "nothing writes this field" conclusions in one debugging session.
+           * Say so when the cap is reached, and let it be raised. */
+          static long _n = 0;
+          static long _cap = -1;
+          if (_cap < 0) { const char* e = getenv("LBP_WW_MAX");
+                          _cap = e ? atol(e) : 64; }
+          long _i = ++_n;
+          if (_cap == 0 || _i <= _cap) {
               fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
                       a, v, width, ppu_prof_resolve_host(ra));
               /* On the first write to the watched word, dump the guest caller
                * chain so the origin of a null field can be walked up-stack. */
               extern __declspec(thread) ppu_context* g_active_ctx;
               extern void ppu_dump_guest_stack(ppu_context*, const char*);
-              if (_n == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "ww");
+              if (_i == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "ww");
+          } else if (_i == _cap + 1) {
+              fprintf(stderr, "[ww] --- print cap %ld reached; further writes to "
+                              "this window are NOT shown (raise LBP_WW_MAX, "
+                              "0 = unlimited) ---\n", _cap);
+              fflush(stderr);
           }
       } }
     uint32_t b = g_barrier_sync_watch;
@@ -918,7 +991,16 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         fprintf(stderr,"%s\n",ln); } } }
 #endif
     v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
-void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return;
+void vm_write64(uint64_t a, uint64_t v) {
+    /* A 64-bit std used to be invisible to LBP_WW / LBP_WV: only write8/16/32
+     * fed the watch, so "nothing writes this field" was a routine false
+     * negative. GT5P's PDI task flag at 0x0107B798 reads back as 1 with no
+     * store in the log, and the store that sets it is a std covering it.
+     * Report both halves at their own addresses, so a watch on either word
+     * sees it and the printed value is the word that landed there. */
+    barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 8, __builtin_return_address(0));
+    barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         8, __builtin_return_address(0));
+    if (vm_oob((uint32_t)a,8)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
         void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(NULL);
@@ -1943,10 +2025,49 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         }
         static int logged = 0;
         if (logged < 30) {
-            fprintf(stderr, "[ppu] lv2_syscall %llu (stub)\n", (unsigned long long)num);
+            /* GT5P_SC_STACK=<num>: dump the guest call chain for one
+             * syscall number. "Who is asking for three megabytes" is not
+             * answerable from the argument list alone. */
+            { const char* w = getenv("GT5P_SC_STACK");
+              if (w && (unsigned long long)atoi(w) == (unsigned long long)num) {
+                  extern void ppu_dump_guest_stack(ppu_context*, const char*);
+                  ppu_dump_guest_stack(ctx, "sc-stub");
+              } }
+            /* Print the arguments too. A stub that returns CELL_OK tells the
+             * guest an allocation succeeded while writing no handle back, so
+             * the shape of the call is the difference between "unused
+             * syscall" and "silently broken allocation". */
+            fprintf(stderr, "[ppu] lv2_syscall %llu (stub) r3=0x%llX r4=0x%llX r5=0x%llX r6=0x%llX r7=0x%llX\n",
+                    (unsigned long long)num,
+                    (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+                    (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->gpr[6],
+                    (unsigned long long)ctx->gpr[7]);
             logged++;
         }
-        ctx->gpr[3] = 0;   /* CELL_OK */
+        /* An unimplemented syscall that answers CELL_OK tells the guest an
+         * operation succeeded that never happened -- for an allocator that
+         * means it proceeds on memory it does not have. GT5P_SC_FAIL lists
+         * syscall numbers that should report failure instead, so a title with
+         * a fallback path can take it. */
+        {
+            static const char* fail = (const char*)1;
+            if (fail == (const char*)1) fail = getenv("GT5P_SC_FAIL");
+            int as_error = 0;
+            if (fail && *fail) {
+                char needle[24];
+                snprintf(needle, sizeof needle, "%llu", (unsigned long long)num);
+                const char* p = strstr(fail, needle);
+                if (p) {
+                    char before = (p == fail) ? ',' : p[-1];
+                    char after  = p[strlen(needle)];
+                    if ((before == ',' || before == ' ') &&
+                        (after == 0 || after == ',' || after == ' '))
+                        as_error = 1;
+                }
+            }
+            ctx->gpr[3] = as_error ? (uint64_t)(int64_t)(int32_t)0x80010004  /* ENOMEM */
+                                   : 0;                                     /* CELL_OK */
+        }
         return;
     }
     }

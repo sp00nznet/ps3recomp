@@ -424,6 +424,32 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
     return CELL_EAGAIN;
 }
 
+/* GT5P_LWMUTEX_GLOBAL: force every lwmutex onto one global critical section.
+ *
+ * A heap free list that ends up containing a LIVE block, with the damage
+ * landing in a different place every run, is what broken mutual exclusion
+ * looks like. If serialising all guest lwmutexes makes that corruption go
+ * away, the per-mutex slot mapping is at fault; if it does not, the bug is in
+ * single-threaded logic and the locks are exonerated. Diagnostic only --
+ * serialising every lock in the title is not a fix. */
+#ifdef _WIN32
+static CRITICAL_SECTION s_lw_global;
+static int s_lw_global_on = -1;
+static int lw_global(void)
+{
+    if (s_lw_global_on < 0) {
+        s_lw_global_on = getenv("GT5P_LWMUTEX_GLOBAL") ? 1 : 0;
+        if (s_lw_global_on) {
+            InitializeCriticalSection(&s_lw_global);
+            fprintf(stderr, "[lwmutex] GLOBAL mode: all lwmutexes serialised\n");
+        }
+    }
+    return s_lw_global_on;
+}
+#else
+static int lw_global(void) { return 0; }
+#endif
+
 s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 {
     (void)timeout;
@@ -450,6 +476,12 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     }
 
 #ifdef _WIN32
+    if (lw_global()) {
+        EnterCriticalSection(&s_lw_global);
+        lwmutex->lock_var = 1;
+        lwmutex->recursive_count++;
+        return CELL_OK;
+    }
     if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
         fprintf(stderr, "[LWMTX] tid %lu BLOCKING on lwmutex slot %u (guest 0x%08X)\n",
                 GetCurrentThreadId(), slot, YZ_GUEST_ADDR(lwmutex));
@@ -501,6 +533,7 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
         lwmutex->lock_var = 0;
 
 #ifdef _WIN32
+    if (lw_global()) { LeaveCriticalSection(&s_lw_global); return CELL_OK; }
     LeaveCriticalSection(&s_lwmutex[slot].cs);
 #else
     pthread_mutex_unlock(&s_lwmutex[slot].mtx);

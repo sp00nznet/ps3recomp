@@ -182,8 +182,10 @@ s32 cellVideoOutGetConfiguration(u32 videoOut, CellVideoOutConfiguration* config
 s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
                                CellVideoOutDeviceInfo* info)
 {
-    printf("[cellVideoOut] GetDeviceInfo(videoOut=%u, deviceIndex=%u)\n",
-           videoOut, deviceIndex);
+    printf("[cellVideoOut] GetDeviceInfo(videoOut=%u, deviceIndex=%u, info=0x%08X, "
+           "writes %u bytes)\n",
+           videoOut, deviceIndex, (u32)(uintptr_t)info,
+           (u32)sizeof(CellVideoOutDeviceInfo));
 
     if (!info)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;

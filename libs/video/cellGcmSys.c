@@ -123,6 +123,10 @@ static CellGcmControl s_control;
  * and control blocks, published on each call. 4096 pages covers the 4 GiB
  * address space at 1 MiB granularity, 8 KiB a side, and this is not a hot path.
  * 0xFFFF means "not mapped", as it does in the host tables. */
+/* Default home for the HLE-visible GCM window; a port overrides it before
+ * running guest code when its title claims this address range. */
+uint32_t ppu_hle_inject_base = 0x20000000u;
+
 static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
 
@@ -468,6 +472,9 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config)
     vm_write32(cfg + 12, s_config.ioSize);
     vm_write32(cfg + 16, s_config.memoryFrequency);
     vm_write32(cfg + 20, s_config.coreFrequency);
+    printf("[cellGcmSys] GetConfiguration(cfg=0x%08X) local=0x%08X/0x%X "
+           "io=0x%08X/0x%X\n", cfg, s_config.localAddress, s_config.localSize,
+           s_config.ioAddress, s_config.ioSize);
     return CELL_OK;
 }
 
@@ -478,6 +485,12 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config)
 /* NID: 0x8572A8E0 */
 CellGcmControl* cellGcmGetControlRegister(void)
 {
+    /* Whether the title ever asks for this separates "the FIFO is broken"
+     * from "the title never started rendering" -- two very different bugs
+     * that look identical from a put pointer that never moves. */
+    { static int _n = 0; if (_n++ < 3)
+        fprintf(stderr, "[cellGcmSys] GetControlRegister -> 0x%08X\n",
+                (unsigned)GCM_CONTROL_GUEST_ADDR); }
     /* Return the GUEST address of the control register (not &s_control, a host
      * pointer). The recompiled title reads/writes it through vm_base, so it must
      * be a guest EA for put/get/ref to actually flow. */

@@ -90,6 +90,8 @@ extern "C" {
 /* Disc game types */
 #define CELL_DISCGAME_TYPE_DISC    1
 #define CELL_DISCGAME_TYPE_HDD     2
+#define CELL_DISCGAME_SYSP_TITLEID_SIZE   10
+#define CELL_DISCGAME_ERROR_NOT_DISCBOOT  0x8002BD02
 
 /* Callback function type */
 typedef void (*CellSysutilCallback)(u64 status, u64 param, void* userdata);
@@ -136,7 +138,7 @@ s32 cellSysCacheClear(void);
  * Disc game check
  * -----------------------------------------------------------------------*/
 
-s32 cellDiscGameGetBootDiscInfo(u32* type, char* titleId, u32 titleIdSize);
+s32 cellDiscGameGetBootDiscInfo(void* getParam);
 s32 cellDiscGameRegisterDiscChangeCallback(void (*callback)(void*), void* arg);
 s32 cellDiscGameUnregisterDiscChangeCallback(void);
 
