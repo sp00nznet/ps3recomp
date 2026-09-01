@@ -164,6 +164,25 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
+     * call it makes. WAITBT_EVERY only samples threads that are blocking on an
+     * event queue, which misses a thread that stops looping while it is BUSY --
+     * and "the title ran for a while and then quietly stopped advancing" is
+     * exactly that shape. Every guest frame goes through HLE calls, so the last
+     * dump in the log names the frame the loop was in when it stopped. */
+    { static int every = -1;
+      if (every < 0) { const char* e = getenv("HLE_BT_EVERY"); every = e ? atoi(e) : 0; }
+      if (every > 0 && ctx) {
+          static unsigned n[8] = {0};
+          unsigned t = (unsigned)ctx->thread_id & 7;
+          if ((n[t]++ % (unsigned)every) == 0) {
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              char tag[64];
+              snprintf(tag, sizeof tag, "hle#%u tid=%u nid=0x%08X", n[t] - 1u, t, nid);
+              ppu_dump_guest_stack(ctx, tag);
+          }
+      } }
+
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
      * across a cross-module call: the glink stub does `std r2,40(r1)` before jumping and
      * the caller does `ld r2,40(r1)` after. Our HLE import stubs (`ps3_hle_call(nid);
