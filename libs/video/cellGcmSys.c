@@ -246,6 +246,12 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
  * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
 volatile u32 g_gcm_fifo_drained_ea = 0;
 
+/* The guest variable cellGcmInit's ctx_out pointed at -- the title's own
+ * gCellGcmCurrentContext. A title that switches to a command buffer of its own
+ * does it by repointing this, and until something reads it back the runtime has
+ * no way to notice. GCM_CTXDBG=1 reports it. */
+static u32 s_gcm_ctx_out_ea = 0;
+
 /* ---------------------------------------------------------------------------
  * Internal helpers
  * -----------------------------------------------------------------------*/
@@ -449,6 +455,7 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         }
         if (ctx_out_addr)
             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
+        s_gcm_ctx_out_ea = ctx_out_addr;   /* the title's gCellGcmCurrentContext */
         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
     }
     return cdata;
@@ -687,6 +694,11 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
+/* How close `current` must get to `end` before the runtime will recycle a ring
+ * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
+ * title that is merely near the end from being touched. */
+#define GCM_RECYCLE_SLACK 0x1000u
+static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
 static u32 s_fifo_getoff  = 0;
 static u32 s_fifo_calloff = 0;
 
@@ -1186,6 +1198,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
 
+    /* GCM_CTXDBG=1: which context the title is actually driving. Ours is written
+     * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
+     * its own, every field below moves with it and the FIFO the runtime walks
+     * stops being the one the title fills. Reported on change, not per tick. */
+    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+        static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
+        u32 ptr = vm_read32(s_gcm_ctx_out_ea);
+        u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
+        if (ptr != last_ptr || cur != last_cur) {
+            last_ptr = ptr; last_cur = cur;
+            fprintf(stderr, "[CTX] gCellGcmCurrentContext@0x%08X -> 0x%08X  "
+                    "begin=%08X end=%08X current=%08X callback=%08X  (ours=0x%08X)\n",
+                    s_gcm_ctx_out_ea, ptr,
+                    ptr ? vm_read32(ptr + 0x0) : 0, ptr ? vm_read32(ptr + 0x4) : 0,
+                    cur, ptr ? vm_read32(ptr + 0xC) : 0, s_gcm_context_ea);
+            fflush(stderr);
+        }
+    }
+
     u32 start_off = s_fifo_getoff;
     if (getenv("GCM_DRAINDBG")) {
         static int n = 0;
@@ -1510,6 +1541,48 @@ static void gcm_rsx_process_fifo_unlocked(void)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
                     why, start_off, s_fifo_getoff, s_fifo_getoff - start_off, put);
     }
+    /* Recycle the TITLE'S OWN command buffer when its callback will not.
+     *
+     * gCellGcmCurrentContext points at the title's context, not the one
+     * cellGcmInit handed back: Virtua Fighter 5's is a 512 KB ring at EA
+     * 0x4AE00000, and the buffer-full callback AMGL installs (0x006A8030) only
+     * prints "[AMGL]:[ERROR] Command Buffer Overflow!" and returns 0 -- which
+     * libgcm's gcmReserve reads as "retry", so the title writes straight past
+     * `end` into unmapped memory and never renders again.
+     *
+     * Hardware never reaches that state because the ring is recycled once the
+     * RSX has consumed it. Do the same here, on the title's context, and only
+     * when it is provably safe: the walker has drained everything the title
+     * submitted (get == put) and `current` is within one reserve of `end`.
+     * A title whose own callback recycles never reaches that state, so this is
+     * inert for every port that works today.
+     *
+     * ponytail: append the JUMP at `current` the way the SDK's own callback
+     * does, rather than tracking a second copy of the ring's geometry. */
+    if (s_gcm_ctx_out_ea) {
+        u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+        u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
+        u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
+        u32 cur   = ctx ? vm_read32(ctx + 0x8) : 0;
+        if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
+                && s_fifo_getoff == put) {
+            u32 io_begin = gcm_ea2io(begin);
+            if (io_begin != 0xFFFFFFFFu) {
+                u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
+                vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
+                vm_write32(ctx + 0x8, begin);                 /* current = begin */
+                vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
+                s_fifo_getoff = io_begin;                          /* get */
+                put = io_begin;
+                static int n = 0;
+                if (n++ < 8)
+                    fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
+                            "(ctx=0x%08X begin=0x%08X end=0x%08X) -- its callback "
+                            "does not%c", ctx, begin, end, 10);
+            }
+        }
+    }
+
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
