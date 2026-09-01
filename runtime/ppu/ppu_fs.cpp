@@ -37,6 +37,7 @@ extern "C" void ydkj_host_bt(const char* tag);
 #endif
 
 extern "C" uint8_t* vm_base;
+extern "C" void ppu_guest_caller(char* out, size_t n);
 extern "C" uint32_t ppu_vm_size;
 extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
@@ -215,7 +216,14 @@ static void cellFsOpen(ppu_context* ctx)
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
-    fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
+    /* FS_CALLER=1: name the guest function that opened each file. A title whose
+     * streaming layer opens a file and never reads it (You Don't Know Jack's
+     * movies) is diagnosed from the opener: its sibling read path is the one
+     * that is not running. */
+    { char who[64] = "?";
+      if (getenv("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
+          fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who); }
+      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
     if (getenv("YDKJ_USMBT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
          * which criMv/criFs function opened the movie, so the reader-attach path
@@ -373,7 +381,23 @@ static void cellFsRead(ppu_context* ctx)
 #ifdef _WIN32
     if (getenv("YDKJ_FSDBG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
 #endif
-    { static uint64_t tot=0; static int _n=0; tot+=n; if(_n++<50) fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)\n",fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],(unsigned long long)tot); }
+    /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
+     * opened and never read" unfalsifiable: reads on a later-opened fd fall off
+     * the end of the log and look identical to reads that never happen.
+     * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
+     * periodic summary is enough to tell the two apart. */
+    { static uint64_t tot=0; static int _n=0;
+      static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
+      tot+=n;
+      if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
+      int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
+      if(_n++<50 || first_for_fd || getenv("FS_READ_ALL"))
+        fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
+                fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
+                (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
+      if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
+          for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
+          fprintf(stderr,"\n"); } }
     if (getenv("YDKJ_TOCTRACE") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
         fprintf(stderr, "[TOC] data.toc read into buf=0x%08X n=%zu; lr=0x%08llX; guest-stack RAs:\n", buf, n, (unsigned long long)ctx->lr);
         uint32_t sp = (uint32_t)ctx->gpr[1];
