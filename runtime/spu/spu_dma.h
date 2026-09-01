@@ -455,6 +455,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      *
      * This is opt-in: it repairs a pointer the guest should have supplied, so
      * it must not mask the real defect by default. */
+    /* The DSP descriptor arrives as a 368-byte GET shortly before the section
+     * load; remember where it came from so the substitution below can name it.
+     * That guest address is what a write-watch needs to find its producer. */
+    static uint32_t s_desc_ea = 0;
+    if (mfc_is_get(cmd) && size == 368) s_desc_ea = (uint32_t)ea;
     if (mfc_is_get(cmd) && !(uint32_t)ea && size) {
         static int s_di = -1;
         if (s_di < 0) s_di = getenv("SPU_DSP_IMAGE_EA") ? 1 : 0;
@@ -463,9 +468,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             static int _n = 0;
             if (_n++ < 8)
                 fprintf(stderr, "[dsp-image] img%d GET ea=0 size=%u dest=0x%05X -> 0x%08X "
-                        "(last imported SPU image: ls_start=0x%X span=%u)\n",
+                        "(last imported SPU image: ls_start=0x%X span=%u) descriptor@0x%08X\n",
                         spu->image_id, size, lsa, g_spu_image_src_ea,
-                        g_spu_image_ls_start, g_spu_image_span);
+                        g_spu_image_ls_start, g_spu_image_span, s_desc_ea);
             ea = g_spu_image_src_ea;
             ea_ptr = vm_base + (uint32_t)ea;   /* the copy reads ea_ptr, not ea */
         }
