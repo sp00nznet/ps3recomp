@@ -178,7 +178,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
           if ((n[t]++ % (unsigned)every) == 0) {
               extern void ppu_dump_guest_stack(ppu_context*, const char*);
               char tag[64];
-              snprintf(tag, sizeof tag, "hle#%u tid=%u nid=0x%08X", n[t] - 1u, t, nid);
+              /* Print the REAL thread id, not the ring index: tid&7 collides
+               * (1, 9 and 17 all land on slot 1) and a stack from a CRI worker
+               * reads exactly like one from the main thread. That collision
+               * cost a round. */
+              snprintf(tag, sizeof tag, "hle#%u tid=%llu nid=0x%08X", n[t] - 1u,
+                       (unsigned long long)ctx->thread_id, nid);
               ppu_dump_guest_stack(ctx, tag);
               { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
                 ppu_dump_bctrl_ring((uint32_t)ctx->thread_id, tag); }
