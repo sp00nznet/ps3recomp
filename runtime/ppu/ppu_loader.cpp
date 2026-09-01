@@ -1656,6 +1656,19 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     if (cur == last) {
         if (++streak == stuckmax) {
             fprintf(stderr, "[ppu] FATAL: stuck calling 0x%08X (%u times) -- aborting run\n", cur, streak);
+            /* The target alone rarely says why. Dump the descriptor the guest
+             * dereferenced (r9/r11/r12 are where the ELFv1 idiom keeps it) and
+             * the words at the target, so a garbage OPD is distinguishable from
+             * a real one pointing at an unlifted address. */
+            for (int _r = 9; _r <= 12; _r++) {
+                uint32_t a_ = (uint32_t)ctx->gpr[_r];
+                if (!a_ || (ppu_vm_size && a_ + 16 > ppu_vm_size)) continue;
+                fprintf(stderr, "[ppu]   r%d=0x%08X -> %08X %08X %08X %08X\n", _r, a_,
+                        vm_read32(a_), vm_read32(a_+4), vm_read32(a_+8), vm_read32(a_+12));
+            }
+            if (!ppu_vm_size || cur + 16 <= ppu_vm_size)
+                fprintf(stderr, "[ppu]   [target]=0x%08X -> %08X %08X %08X %08X\n", cur,
+                        vm_read32(cur), vm_read32(cur+4), vm_read32(cur+8), vm_read32(cur+12));
             fprintf(stderr, "[ppu]   tid=%llu lr=0x%08X r2=0x%08X r3=0x%08X r31=0x%08X\n",
                     (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[2],
                     (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[31]);
