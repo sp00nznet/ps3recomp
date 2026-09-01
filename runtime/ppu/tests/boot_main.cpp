@@ -189,6 +189,59 @@ extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->pu
 extern "C" unsigned cellGcm_flip_request_count(void);
 extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
 
+/* Live NV4097->D3D12 engine (libs/video/rsx_live_draw.c, from caner /
+ * canersaka's Yakuza: Dead Souls port). Opt-in with RSX_LIVE_DRAW=1: the null
+ * backend opens the window, the engine binds its swap chain to that HWND and
+ * owns presentation, so rsx_d3d12_backend is left out entirely rather than run
+ * alongside it. Unset, every path below is exactly what it was. */
+extern "C" int   rsx_live_draw_enabled(void);
+extern "C" int   rsx_live_draw_init(void* hwnd, uint32_t w, uint32_t h,
+                                    const uint8_t* (*guest_ptr)(void*, uint32_t,
+                                                                uint32_t, uint32_t),
+                                    void* user);
+extern "C" void  rsx_live_draw_present(uint32_t buffer_id);
+extern "C" uint32_t rsx_live_draw_get_frames(void);
+extern "C" uint32_t rsx_live_draw_get_last_draws(void);
+extern "C" int   rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" int   rsx_null_backend_pump_messages(void);
+extern "C" void* rsx_null_backend_get_hwnd(void);
+extern "C" void  rsx_null_backend_suppress_present(int on);
+extern "C" uint32_t cellGcmResolveLocated(int local, uint32_t offset);
+extern "C" uint32_t cellGcmResolveIO(uint32_t offset);
+
+static int s_rsx_live = 0;   /* live engine selected AND up */
+
+/* Resolve (location, offset) to host memory for the engine. location 0 is RSX
+ * local VRAM, 1 is main/IO memory; the engine promises its callers the whole
+ * min_bytes span is readable, so validate the interval, not just its start.
+ * The location comes straight from the RSX DMA context selector and is
+ * authoritative -- cellGcmResolveOffset()'s heuristic prefers VRAM for any page
+ * the guest ever derived from a local EA, which maps a title's MAIN-memory
+ * textures into local memory where they read as garbage (caner hit exactly
+ * that in the Yakuza port; the geometry came out flat white). */
+static const uint8_t* rsx_live_guest_ptr(void* user, uint32_t location,
+                                         uint32_t offset, uint32_t min_bytes)
+{
+    (void)user;
+    if (!vm_base) return nullptr;
+    uint32_t ea;
+    if (location == 0) {
+        ea = cellGcmResolveLocated(1, offset);          /* RSX local VRAM */
+    } else {
+        ea = cellGcmResolveIO(offset);                  /* main, via the IO table */
+        if (!ea) ea = cellGcmResolveLocated(0, offset); /* unmapped: old behaviour */
+    }
+    if (!ea || ea == 0xFFFFFFFFu ||
+        (uint64_t)ea + min_bytes > 0x100000000ull) return nullptr;
+    return (const uint8_t*)vm_base + ea;
+}
+
+/* Present / pump through whichever backend is live. */
+static void rsx_present_frame(void)
+{ if (s_rsx_live) rsx_live_draw_present(0); else rsx_d3d12_backend_present(); }
+static int rsx_pump_messages(void)
+{ return s_rsx_live ? rsx_null_backend_pump_messages() : rsx_d3d12_backend_pump_messages(); }
+
 /* ---- Guest-PC sampling profiler (PS3_GUEST_PROF=1) -----------------------
  * Samples every guest thread's ctx.cia every ~5ms and dumps the top sites
  * every 5s. cia is refreshed at every syscall, and guest spin loops issue a
@@ -243,7 +296,27 @@ static DWORD WINAPI vblank_ticker(LPVOID)
 {
     const char* _title = getenv("PS3_TITLE");
     if (!_title || !*_title) _title = "You Don't Know Jack (ps3recomp)";
-    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, _title) == 0);
+    /* The live engine's RT-as-backbuffer rescue only treats a surface as the
+     * backbuffer when its clip EQUALS the backend size, so a title that renders
+     * into something other than 1280x720 must say so: RSX_W / RSX_H. */
+    uint32_t rsx_w = 1280, rsx_h = 720;
+    if (const char* e = getenv("RSX_W")) rsx_w = (uint32_t)strtoul(e, 0, 0);
+    if (const char* e = getenv("RSX_H")) rsx_h = (uint32_t)strtoul(e, 0, 0);
+    int rsx_ok;
+    if (rsx_live_draw_enabled()) {
+        rsx_ok = (rsx_null_backend_init(rsx_w, rsx_h, _title) == 0);
+        if (rsx_ok && rsx_live_draw_init(rsx_null_backend_get_hwnd(), rsx_w, rsx_h,
+                                         rsx_live_guest_ptr, nullptr) == 0) {
+            s_rsx_live = 1;
+            rsx_null_backend_suppress_present(1);
+            fprintf(stderr, "[rsx] live-draw engine up (D3D12); GDI present suppressed\n");
+        } else {
+            fprintf(stderr, "[rsx] live-draw init FAILED -- falling back to the D3D12 backend\n");
+            rsx_ok = (rsx_d3d12_backend_init(rsx_w, rsx_h, _title) == 0);
+        }
+    } else {
+        rsx_ok = (rsx_d3d12_backend_init(rsx_w, rsx_h, _title) == 0);
+    }
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     unsigned last_flip = 0;
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
@@ -266,7 +339,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * writes and showed empty or mixed batches. */
             {
                 if (rsx_ok && cellGcm_take_flip_pending()) {
-                    rsx_d3d12_backend_present();
+                    rsx_present_frame();
                     last_flip = cellGcm_flip_request_count();
                 }
             }
@@ -285,7 +358,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * The real RSX writes those fences in microseconds. */
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
-                rsx_d3d12_backend_present();
+                rsx_present_frame();
                 last_flip = cellGcm_flip_request_count();
             }
             cellGcm_rsx_process_fifo();
@@ -299,11 +372,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
               static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
-            if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
+            if (rsx_pump_messages() != 0) { rsx_ok = 0; }
             if (getenv("YDKJ_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
-                ULONGLONG t0=GetTickCount64(); rsx_d3d12_backend_present(); ULONGLONG t1=GetTickCount64();
+                ULONGLONG t0=GetTickCount64(); rsx_present_frame(); ULONGLONG t1=GetTickCount64();
                 s_presms += (t1-t0);
                 if (s_win==0) s_win=now;
                 if (now - s_win >= 1000) {
@@ -320,7 +393,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                  * during boot. */
                 unsigned fc = cellGcm_flip_request_count();
                 if (fc != last_flip || fc == 0) {
-                    rsx_d3d12_backend_present();
+                    rsx_present_frame();
                     last_flip = fc;
                 }
             }
