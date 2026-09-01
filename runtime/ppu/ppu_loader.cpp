@@ -1978,6 +1978,40 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             if (n < 20) { fprintf(stderr, "[tty] suspicious len=%u (buf=0x%08X) clamped\n", len, buf); n++; }
             wlen = 0x4000u;
         }
+        /* Collapse a repeating line. A title that logs an error from inside a
+         * retry loop prints it thousands of times a second, and every one of
+         * those is an unbuffered fwrite+fflush on the guest thread -- our
+         * logging then costs far more than whatever the title is retrying.
+         * Virtua Fighter 5 emits "[AMGL]:[ERROR] Command Buffer Overflow!"
+         * 88,000 times in a run and its render loop drops to nothing, most of
+         * that spent in our own fflush. Print the first few, then one line per
+         * 1000 with a count, and say so when the run of repeats ends.
+         *
+         * TTY_NO_DEDUPE=1 restores the raw firehose. */
+        { static char last[128]; static unsigned long long run_len = 0;
+          static int dedupe = -1;
+          if (dedupe < 0) dedupe = getenv("TTY_NO_DEDUPE") ? 0 : 1;
+          if (dedupe && vm_base && wlen > 0 && wlen < sizeof(last)) {
+              char cur[128]; uint32_t cn = wlen;
+              for (uint32_t i = 0; i < cn; i++) cur[i] = (char)vm_read8(buf + i);
+              cur[cn] = 0;
+              if (run_len && strcmp(cur, last) == 0) {
+                  run_len++;
+                  if (run_len > 4 && (run_len % 1000ull) != 0) {
+                      if (pwl) vm_write32(pwl, wlen);
+                      ctx->gpr[3] = 0;
+                      return;
+                  }
+                  fprintf(stderr, "[tty] (x%llu) ", (unsigned long long)run_len);
+              } else {
+                  if (run_len > 4)
+                      fprintf(stderr, "[tty] previous line repeated %llu times%c",
+                              (unsigned long long)run_len, 10);
+                  memcpy(last, cur, cn + 1);
+                  run_len = 1;
+              }
+          } }
+
         FILE* out = stdout;   /* keep all TTY on stdout, clean of [ppu] logs */
         /* TTY_BT=<substring>: dump the call chain whenever the title prints a
          * line containing it. Three hooks in this function and one in
