@@ -521,6 +521,9 @@ void cellGcmSetWaitFlip(void)
 /* NID: 0x51C9D62B */
 void cellGcmResetFlipStatus(void)
 {
+    { static int n = 0;
+      if (getenv("FLIP_DBG") && n++ < 12)
+          fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
 }
 
@@ -534,6 +537,10 @@ u32 cellGcmGetFlipStatus(void)
      * beat) completes pending flips. The old self-completing version made
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
+    { static int n = 0;
+      if (getenv("FLIP_DBG") && n++ < 24)
+          fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
+                  s_flip_status, 10); }
     return s_flip_status;
 }
 
@@ -1504,7 +1511,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     why, start_off, s_fifo_getoff, s_fifo_getoff - start_off, put);
     }
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
+    /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
+     * the walker actually is. A probe, not a fix -- it removes the back-pressure
+     * a title uses to avoid overwriting commands the GPU has not read. It exists
+     * to answer one question for a title that reports its ring full while the
+     * walker says it is drained: is the title reading `get`, or something else?
+     * If the overflow survives this, `get` is not what it consults. */
+    { static int eq = -1;
+      if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
     ReleaseSRWLockExclusive(&s_ref_pub_lock);

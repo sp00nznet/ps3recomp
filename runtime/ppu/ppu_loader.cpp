@@ -1956,6 +1956,33 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             wlen = 0x4000u;
         }
         FILE* out = stdout;   /* keep all TTY on stdout, clean of [ppu] logs */
+        /* TTY_BT=<substring>: dump the call chain whenever the title prints a
+         * line containing it. Three hooks in this function and one in
+         * lv2_register.c already do exactly this for one hardcoded string
+         * each, which only ever helped the title they were written for. A
+         * title's own error message is the cheapest breakpoint there is -- it
+         * fires exactly when the thing went wrong, on the thread it went wrong
+         * on -- so it should be a knob, not an edit.
+         *
+         * The host chain is the useful half: link with /MAP and every RVA maps
+         * straight back to a func_XXXXXXXX, i.e. a guest address. */
+        if (vm_base && wlen < 4096) {
+            static const char* pat = (const char*)1;
+            if (pat == (const char*)1) pat = getenv("TTY_BT");
+            if (pat && *pat) {
+                char bt[512]; uint32_t bn = wlen < 511 ? wlen : 511;
+                for (uint32_t i = 0; i < bn; i++) bt[i] = (char)vm_read8(buf + i);
+                bt[bn] = 0;
+                if (strstr(bt, pat)) {
+                    static int tn = 0;
+                    if (tn++ < 3) {
+                        fprintf(stderr, "%c[TTY_BT] \"%.90s\"%c", 10, bt, 10);
+                        ppu_log_host_chain("tty-bt");
+                    }
+                }
+            }
+        }
+
         /* POOL CORRUPTION TRACE: dump the host->guest call chain the first few
          * times the game's debug allocator reports a bad block / wrong pool /
          * zeroed sentinel, to locate who passed/corrupted the block. */
