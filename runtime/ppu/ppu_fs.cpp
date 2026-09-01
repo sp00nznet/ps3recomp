@@ -148,7 +148,8 @@ static void host_path(char* out, size_t cap, const char* guest)
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
 static FILE* g_files[FS_MAX];
-static uint8_t g_fd_usm[FS_MAX];   /* 1 if this fd is an open .usm movie (read tracker) */
+static uint8_t g_fd_usm[FS_MAX];
+static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
@@ -220,6 +221,7 @@ static void cellFsOpen(ppu_context* ctx)
      * streaming layer opens a file and never reads it (You Don't Know Jack's
      * movies) is diagnosed from the opener: its sibling read path is the one
      * that is not running. */
+    if (fd >= 0 && fd < FS_MAX) { strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd]-1); g_fd_path[fd][sizeof g_fd_path[fd]-1]=0; }
     { char who[64] = "?";
       if (getenv("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
           fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who);
@@ -518,6 +520,18 @@ static void cellFsFstat(ppu_context* ctx)
     fseek(g_files[fd], 0, SEEK_END);
     long sz = ftell(g_files[fd]);
     fseek(g_files[fd], cur, SEEK_SET);
+    /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
+     * has. You Don't Know Jack reads a 100 KB archive whole but only probes
+     * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
+     * by the size it just asked for, capping it makes the title take the read
+     * path. Answers whether the split is size-based -- nothing more. */
+    { const char* cap = getenv("FS_FSTAT_CAP");
+      const char* only = getenv("FS_FSTAT_CAP_PATH");
+      if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
+      if (cap) { long c = strtol(cap, 0, 0);
+          if (c > 0 && sz > c) {
+              fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
+              sz = c; } } }
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
     if (getenv("YDKJ_FSDBG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
     ctx->gpr[3] = CELL_OK;
