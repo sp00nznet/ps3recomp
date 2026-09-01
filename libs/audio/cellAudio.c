@@ -972,6 +972,40 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
     return CELL_OK;
 }
 
+/* cellAudioGetPortBlockTag(portNum, blockNo, tag) -- the monotonically rising
+ * tag of one block in a port's ring. A title uses it to tell whether the block
+ * it is about to fill has already been consumed: it reads the tag, writes the
+ * block, and compares again. Left unimplemented the call returns the
+ * unresolved-NID default and the mixer thread has no way to advance, which is
+ * where Virtua Fighter 5's boot stops once it is past the game-data dialog.
+ *
+ * read_index counts blocks consumed, so it IS the tag counter. Same
+ * normalisation the hardware does: round the counter down to the start of the
+ * current ring pass, and if the requested block has already gone by this pass,
+ * report it on the next one. */
+s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
+{
+    if (!s_audio_initialized)
+        return (s32)CELL_AUDIO_ERROR_NOT_INIT;
+    if (portNum >= CELL_AUDIO_PORT_MAX || !s_ports[portNum].in_use)
+        return (s32)CELL_AUDIO_ERROR_PARAM;
+    if (!tag)
+        return (s32)CELL_AUDIO_ERROR_PARAM;
+
+    u64 nblock = s_ports[portNum].param.nBlock;
+    if (!nblock || blockNo >= nblock)
+        return (s32)CELL_AUDIO_ERROR_PARAM;
+
+    u64 base = s_ports[portNum].read_index;
+    u64 pos  = base % nblock;
+    base -= pos;
+    if (pos > blockNo)
+        base += nblock;
+
+    vm_write64((u32)(uintptr_t)tag, base + blockNo);
+    return CELL_OK;
+}
+
 s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice)
 {
     (void)iPersonalStream;

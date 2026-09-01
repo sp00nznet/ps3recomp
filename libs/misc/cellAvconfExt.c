@@ -125,6 +125,36 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     return CELL_OK;
 }
 
+/* cellAudioOutGetState(audioOut, deviceIndex, state) -- the audio sibling of
+ * cellVideoOutGetState. A title checks it before configuring output; Virtua
+ * Fighter 5 calls it once during boot and it was the last unresolved import in
+ * the whole title. The device is always present and enabled here: there is no
+ * "no audio device" case a recompiled port can be in.
+ *
+ * CellAudioOutState { u8 state; u8 encoder; u8 reserved[2]; u32 downMixer;
+ *                     CellAudioOutSoundMode soundMode; } -- written big-endian
+ * a byte at a time, which needs no struct definition to get right. */
+s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
+{
+    (void)deviceIndex;
+    uint32_t ea = (uint32_t)(uintptr_t)state;
+    printf("[cellAvconfExt] AudioOutGetState(audioOut=%u)\n", audioOut);
+    if (!ea)
+        return CELL_EINVAL;
+
+    vm_write8(ea + 0, 0);                                   /* ENABLED        */
+    vm_write8(ea + 1, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
+    vm_write8(ea + 2, 0);
+    vm_write8(ea + 3, 0);
+    vm_write32(ea + 4, 0);                                  /* no down-mixer  */
+    vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
+    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
+    vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
+    vm_write8(ea + 11, 0);
+    vm_write32(ea + 12, 0);
+    return CELL_OK;
+}
+
 s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control)
 {
     (void)audioOut;

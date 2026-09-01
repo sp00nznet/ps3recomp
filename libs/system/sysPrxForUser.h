@@ -147,6 +147,14 @@ void* sys_heap_malloc(sys_heap_t heap, u32 size);
 s32 sys_heap_free(sys_heap_t heap, void* ptr);
 void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
 
+/* The underscore-prefixed names titles import; forwarders to the above. */
+u32   sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags);
+u32   _sys_heap_create_heap(u32 name, u32 type, u32 blocksize, u32 flags);
+s32   _sys_heap_delete_heap(sys_heap_t heap);
+void* _sys_heap_malloc(sys_heap_t heap, u32 size);
+void* _sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
+s32   _sys_heap_free(sys_heap_t heap, void* ptr);
+
 /* ---------------------------------------------------------------------------
  * PRX utilities
  * -----------------------------------------------------------------------*/

@@ -60,6 +60,9 @@ typedef void (*CellMsgDialogCallback)(s32 buttonType, void* userdata);
  * Functions
  * -----------------------------------------------------------------------*/
 
+s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
+                      CellMsgDialogCallback callback, void* userdata,
+                      void* extParam);
 s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
                         CellMsgDialogCallback callback, void* userdata,
                         void* extParam);

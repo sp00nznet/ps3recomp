@@ -114,6 +114,18 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     return CELL_OK;
 }
 
+/* cellMsgDialogOpen -- the pre-3.40 entry point, identical arguments and
+ * behaviour to Open2 (RPCS3 forwards it the same way). Registering only Open2
+ * meant a title on the older API got the unresolved-NID default and then waited
+ * forever for a callback that could never fire. Virtua Fighter 5 opens one
+ * during boot and stops dead there. */
+s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
+                      CellMsgDialogCallback callback, void* userdata,
+                      void* extParam)
+{
+    return cellMsgDialogOpen2(type, msgString, callback, userdata, extParam);
+}
+
 s32 cellMsgDialogClose(float delayMs)
 {
     printf("[cellMsgDialog] Close(delay=%.1f ms)\n", delayMs);

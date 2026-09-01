@@ -78,6 +78,7 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
 s32 cellAudioOutGetConfiguration(u32 audioOut,
                                   CellAudioOutConfiguration* config,
                                   void* option, u32 optionSize);
+s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state);
 s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control);
 
 /* HDMI/display audio */

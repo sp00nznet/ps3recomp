@@ -784,6 +784,41 @@ u32 sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags)
     return s_hid++;
 }
 
+/* The names titles actually import. Every one of these existed above under a
+ * name without the leading underscore, so gen_hle_nids.py hashed a NID nothing
+ * imports and the whole family fell through to the unresolved-NID default --
+ * create_heap handed back 0, every allocation off it returned 0, and the title
+ * took its out-of-memory path. Virtua Fighter 5's boot ends in exactly that:
+ * _sys_heap_create_heap unresolved, then _sys_heap_memalign unresolved, then
+ * cellMsgDialogOpen and a permanent wait.
+ *
+ * ponytail: forwarders, not a second implementation. The allocator stays the
+ * one bump allocator above. */
+u32 _sys_heap_create_heap(u32 name, u32 type, u32 blocksize, u32 flags)
+{
+    return sys_heap_create_heap_ret(name, type, blocksize, flags);
+}
+
+s32 _sys_heap_delete_heap(sys_heap_t heap)
+{
+    return sys_heap_destroy_heap(heap);
+}
+
+void* _sys_heap_malloc(sys_heap_t heap, u32 size)
+{
+    return sys_heap_malloc(heap, size);
+}
+
+void* _sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
+{
+    return sys_heap_memalign(heap, align, size);
+}
+
+s32 _sys_heap_free(sys_heap_t heap, void* ptr)
+{
+    return sys_heap_free(heap, ptr);
+}
+
 /* ---------------------------------------------------------------------------
  * PRX utilities
  * -----------------------------------------------------------------------*/
