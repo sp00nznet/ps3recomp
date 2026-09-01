@@ -2272,6 +2272,33 @@ extern "C" uint32_t ppu_load_elf(const char* path)
      * further would the title get?" -- before spending a session on WHY it is
      * being clobbered. Default length 4096, one page, which is the granularity
      * the guard reports in. */
+    /* PPU_POKE=<hex ea>:<hex value>[,<ea>:<value>...] -- hold those guest words
+     * at those values. A PROBE, NOT A FIX, and a blunter one than PPU_KEEP_EA:
+     * it asserts a value the guest never wrote. It answers one question that is
+     * otherwise unanswerable without implementing a whole subsystem -- "if this
+     * flag did become what the title is waiting for, would it go anywhere?" --
+     * and the answer decides whether the subsystem is worth building. */
+    { const char* pk = getenv("PPU_POKE");
+      if (pk && *pk && vm_base) {
+          static uint32_t ea[8], val[8]; static int n;
+          const char* c = pk;
+          while (*c && n < 8) {
+              ea[n]  = (uint32_t)strtoul(c, (char**)&c, 16);
+              if (*c == ':') c++;
+              val[n] = (uint32_t)strtoul(c, (char**)&c, 16);
+              fprintf(stderr, "[poke] holding 0x%08X = 0x%X%c", ea[n], val[n], 10);
+              n++;
+              while (*c == ',' || *c == ' ') c++;
+          }
+          struct P { static unsigned long __stdcall go(void*) {
+              for (;;) {
+                  for (int i = 0; i < n; i++)
+                      if (!ppu_vm_size || ea[i] + 4 <= ppu_vm_size) vm_write32(ea[i], val[i]);
+                  Sleep(2);
+              } } };
+          if (n) CloseHandle(CreateThread(0, 0, P::go, 0, 0, 0));
+      } }
+
     { const char* ke = getenv("PPU_KEEP_EA");
       if (ke && *ke && vm_base) {
           uint32_t kea = (uint32_t)strtoul(ke, 0, 16);
