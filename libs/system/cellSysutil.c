@@ -127,8 +127,20 @@ s32 cellSysutilUnregisterCallback(s32 slot)
     return CELL_OK;
 }
 
+/* Whether the title actually pumps sysutil. cellMsgDialog needs to know: it
+ * defers a dialog answer to this pump (which is where hardware delivers it) and
+ * must not defer into a pump that never runs. */
+static int s_pump_seen = 0;
+int cellSysutil_pump_seen(void) { return s_pump_seen; }
+
 s32 cellSysutilCheckCallback(void)
 {
+    { extern void cellMsgDialog_pump(void);
+      if (!s_pump_seen) {
+          s_pump_seen = 1;
+          printf("[cellSysutil] CheckCallback: the title pumps sysutil%c", 10);
+      }
+      cellMsgDialog_pump(); }
     /* Drain the event queue, dispatching each event into guest code via
      * the registered ps3_guest_caller hook. Standard PS3 sysutil callback
      * signature is:

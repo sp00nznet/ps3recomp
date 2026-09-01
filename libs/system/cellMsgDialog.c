@@ -46,6 +46,22 @@ static CellMsgDialogCallback s_callback    = NULL;
 static void*                 s_userdata    = NULL;
 static CellMsgDialogType     s_type        = 0;
 
+/* Answer queued for the next cellSysutilCheckCallback (see Open2). */
+static int                   s_pending        = 0;
+static int32_t               s_pending_result = 0;
+static CellMsgDialogCallback s_pending_cb     = NULL;
+static void*                 s_pending_user   = NULL;
+
+extern int cellSysutil_pump_seen(void);
+
+/* Called from cellSysutilCheckCallback. */
+void cellMsgDialog_pump(void)
+{
+    if (!s_pending) return;
+    s_pending = 0;
+    invoke_dialog_callback(s_pending_cb, s_pending_result, s_pending_user);
+}
+
 /* Progress bar state */
 #define MAX_PROGRESS_BARS 2
 
@@ -112,10 +128,30 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
             printf("[cellMsgDialog] Auto-responding: NONE (no buttons)\n");
         }
 
-        /* Close and invoke callback */
+        /* Deliver the answer the way hardware does: from the title's own
+         * cellSysutilCheckCallback pump, not synchronously from inside Open.
+         * Firing it here runs the guest callback BEFORE Open has returned, so a
+         * title that arms its wait state after the call --
+         *
+         *     state = WAITING;
+         *     cellMsgDialogOpen(..., cb, &state);   // cb sets state = DONE
+         *     state = WAITING;                      // ...overwritten here
+         *
+         * -- loses the answer and waits forever. Queue it instead.
+         *
+         * A title that never pumps sysutil would then never see the answer at
+         * all, so fall back to the old synchronous call until a pump is
+         * actually observed. */
         s_dialog_open = 0;
         if (s_callback) {
-            invoke_dialog_callback(s_callback, result, s_userdata);
+            if (cellSysutil_pump_seen()) {
+                s_pending_result = result;
+                s_pending_cb     = s_callback;
+                s_pending_user   = s_userdata;
+                s_pending        = 1;
+            } else {
+                invoke_dialog_callback(s_callback, result, s_userdata);
+            }
         }
     } else {
         printf("[cellMsgDialog] Progress bar dialog opened (will close on explicit Close/Abort)\n");
