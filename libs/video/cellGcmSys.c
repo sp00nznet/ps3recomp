@@ -698,6 +698,10 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
 #define GCM_RECYCLE_SLACK 0x1000u
+/* How far past the ring's start the walker must have read before the runtime
+ * will recycle on the title's behalf. The guest resumes writing at `begin`, so
+ * this is the amount of already-consumed head room it gets. */
+#define GCM_RECYCLE_MARGIN 0x20000u
 static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
 static u32 s_fifo_getoff  = 0;
 static u32 s_fifo_calloff = 0;
@@ -1564,8 +1568,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
         u32 cur   = ctx ? vm_read32(ctx + 0x8) : 0;
+        /* `get == put` -- a fully drained FIFO -- was too strict. It holds
+         * while a title is only clearing, and stops holding the moment its SPU
+         * work starts producing real command volume: the walker then always has
+         * a backlog, the recycle never fires, and the ring overflows again.
+         * That is exactly where Virtua Fighter 5 stalls once its "SPU Delegate"
+         * group starts feeding the renderer.
+         *
+         * Hardware does not need a drained FIFO either -- only that the bytes
+         * about to be overwritten have already been read. So require the walker
+         * to be a margin PAST `begin` instead: the head of the ring is consumed,
+         * which is the region the guest is about to write. */
+        u32 io_begin_chk = begin ? gcm_ea2io(begin) : 0xFFFFFFFFu;
+        int head_consumed =
+            (io_begin_chk != 0xFFFFFFFFu) &&
+            (s_fifo_getoff == put ||
+             (s_fifo_getoff > io_begin_chk &&
+              s_fifo_getoff - io_begin_chk >= GCM_RECYCLE_MARGIN));
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
-                && s_fifo_getoff == put) {
+                && head_consumed) {
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
