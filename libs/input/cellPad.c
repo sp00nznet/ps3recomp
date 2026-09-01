@@ -629,8 +629,17 @@ skip_inject: ;
       }
       if (s_sc && port_no == 0) {
           double now = (double)(GetTickCount64() - t0) / 1000.0;
+          /* Latch, do not window. A fixed time window is missed whenever the
+           * title stops polling the pad for longer than the window (it does
+           * exactly that on a loading screen), so the press silently never
+           * happens. Fire on the first poll at or after the event time and
+           * hold it for a fixed number of polls, which is what a real press
+           * looks like regardless of poll rate. */
+          static int fired[32], held[32];
           for (int i = 0; i < n_ev; i++) {
-              if (now >= ev[i].t && now < ev[i].t + 0.25) {
+              if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = 40; }
+              if (held[i] > 0) {
+                  held[i]--;
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
                   static int said[32];
