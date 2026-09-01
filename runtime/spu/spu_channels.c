@@ -1430,6 +1430,26 @@ void spu_indirect_branch(spu_context* ctx)
               } }
             fflush(stderr);
         }
+        /* SPU_INTERP_UNLIFTED=1: if real code is present at the target, run it
+         * through the interpreter instead of ending the job. No lift can exist
+         * for a module the title loads at runtime -- You Don't Know Jack's FMOD
+         * mixer relocates a DSP plugin into local store and calls it -- and the
+         * interpreter rejoins the compiled path as soon as it reaches a lifted
+         * address, which is what the plugin's return does. Opt-in so titles
+         * that reach here on a genuinely bad pc keep the loud stop. */
+        { uint32_t p = ctx->pc & SPU_LS_MASK;
+          uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
+                        ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
+          static int s_iu = -1;
+          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
+          if (s_iu && w0) {
+              static int _n = 0;
+              if (_n++ < 8)
+                  fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
+                          "(runtime-loaded code)\n", ctx->image_id, p);
+              spu_interp_run(ctx, p);
+              return;
+          } }
         spu_halt(ctx);
         return;
     }

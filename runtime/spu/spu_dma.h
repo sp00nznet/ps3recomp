@@ -442,6 +442,34 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     { extern int g_cri_video_dma;
       if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
+    /* SPU_DSP_IMAGE_EA -- recover an SPU image load whose source address the
+     * title lost. You Don't Know Jack's FMOD mixer relocates a DSP plugin into
+     * local store and calls it, but the descriptor it builds carries a NULL
+     * source address, so the transfer reads guest memory at 0, the mixer calls
+     * into zeros, its job ends, and the event flag the menu waits on is never
+     * set. The plugin itself is present and known: _sys_spu_image_import parsed
+     * it moments earlier, and its segments are contiguous in the source image
+     * (segment 0 at 0x4D3900 + (0x2C00 - 0x80) lands exactly on segment 1's
+     * 0x4D6480), so a transfer of the image's span belongs at segment 0's
+     * address. Match on the size the import recorded and substitute it.
+     *
+     * This is opt-in: it repairs a pointer the guest should have supplied, so
+     * it must not mask the real defect by default. */
+    if (mfc_is_get(cmd) && !(uint32_t)ea && size) {
+        static int s_di = -1;
+        if (s_di < 0) s_di = getenv("SPU_DSP_IMAGE_EA") ? 1 : 0;
+        extern uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+        if (s_di && g_spu_image_src_ea) {
+            static int _n = 0;
+            if (_n++ < 8)
+                fprintf(stderr, "[dsp-image] img%d GET ea=0 size=%u dest=0x%05X -> 0x%08X "
+                        "(last imported SPU image: ls_start=0x%X span=%u)\n",
+                        spu->image_id, size, lsa, g_spu_image_src_ea,
+                        g_spu_image_ls_start, g_spu_image_span);
+            ea = g_spu_image_src_ea;
+            ea_ptr = vm_base + (uint32_t)ea;   /* the copy reads ea_ptr, not ea */
+        }
+    }
     /* DIAGNOSTIC (LBP_SKIP_NULL_DMA): a GET from a null/near-null EA reads guest
      * memory at ~0 (the ELF header / low mem) = garbage. The FMOD SPU mixer's DSP
      * buffer pointers are 0 in our run; if the real task would SKIP a null DSP

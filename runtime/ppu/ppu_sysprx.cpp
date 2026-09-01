@@ -598,6 +598,13 @@ static void hle_net_sendto(ppu_context* ctx) { ctx->gpr[3] = (uint32_t)ctx->gpr[
  * Self-verifying: no-op unless r4 points to an ELF (so a wrong NID guess is safe).
  * sys_spu_image { u32 type; u32 entry; sys_spu_segment* segs; int nsegs; }
  * sys_spu_segment{ int type; u32 ls_start; int size; u64 src_pa }  (0x18, src@0x10) */
+/* Last SPU image parsed below: where its loadable bytes live, which local
+ * store address they start at, and how far they span. Read by the SPU DMA
+ * path (SPU_DSP_IMAGE_EA in spu_dma.h) to recover a section load whose
+ * source address the title lost between import and use. */
+extern "C" uint32_t g_spu_image_src_ea = 0, g_spu_image_ls_start = 0,
+                    g_spu_image_span = 0;
+
 static void hle_sys_spu_image_import(ppu_context* ctx)
 {
     uint32_t img_ea = (uint32_t)ctx->gpr[3];
@@ -637,14 +644,118 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
     }
     s_seg_bump += (uint32_t)nsegs * 0x18;
     if (s_seg_bump >= 0x0E000000u) s_seg_bump = 0x0D000000u;
+    /* Remember where this image's loadable bytes live, for the SPU-side
+     * recovery in spu_dma.h (SPU_DSP_IMAGE_EA). The segments are contiguous in
+     * the source image, so segment 0's address plus the span from its ls_start
+     * to the end of the last segment describes the whole thing. */
+    if (nsegs > 0) {
+        uint32_t last = segs_ea + (uint32_t)(nsegs - 1) * 0x18;
+        g_spu_image_src_ea   = vm_read32(segs_ea + 0x14);
+        g_spu_image_ls_start = vm_read32(segs_ea + 0x04);
+        g_spu_image_span     = vm_read32(last + 0x04) - g_spu_image_ls_start;
+    }
     vm_write32(img_ea + 0x00, 0);                              /* type = USER */
     vm_write32(img_ea + 0x04, entry);
     vm_write32(img_ea + 0x08, nsegs ? segs_ea : 0);
     vm_write32(img_ea + 0x0C, (uint32_t)nsegs);
     fprintf(stderr, "[HLE] _sys_spu_image_import -> entry=0x%05X nsegs=%d machine=%u (SPU=23)\n",
             entry, nsegs, machine);
+    /* SPU_IMAGE_DIAG=1: r6 is a caller-supplied guest buffer that differs on
+     * every call, which this handler ignores -- it points the segments at the
+     * source image instead. Show the segments written and what the caller's
+     * buffer holds, to establish whether the caller expects it to be filled. */
+    if (getenv("SPU_IMAGE_DIAG")) {
+        for (int i = 0; i < nsegs; i++) {
+            uint32_t s = segs_ea + (uint32_t)i * 0x18;
+            fprintf(stderr, "        seg[%d] type=%u ls=0x%05X size=%u src=0x%08X%08X\n",
+                    i, vm_read32(s + 0x00), vm_read32(s + 0x04), vm_read32(s + 0x08),
+                    vm_read32(s + 0x10), vm_read32(s + 0x14));
+        }
+        uint32_t r6 = (uint32_t)ctx->gpr[6];
+        if (r6 && r6 < 0xD0000000u) {
+            /* Scan a window around the caller's buffer for the DSP descriptor
+             * the SPU later reads: its first word is 0x0052E1E8 and it carries
+             * the image's {entry, size, ls_start, size} at +0x150. Finding it
+             * at a fixed offset says r6 IS that descriptor. */
+            for (int32_t o = -0x400; o <= 0x400; o += 4) {
+                uint32_t a = (uint32_t)((int32_t)r6 + o);
+                if (vm_read32(a) == 0x0052E1E8u)
+                    fprintf(stderr, "        descriptor marker 0x0052E1E8 at r6%+d (0x%08X)\n", o, a);
+                if (vm_read32(a) == 0x00000248u && vm_read32(a + 4) == 0x00002CB0u)
+                    fprintf(stderr, "        image quad {248,2CB0,80,2CB0} at r6%+d (0x%08X) "
+                            "=> descriptor+0x150, descriptor=0x%08X, its +0x140=%08X %08X %08X %08X\n",
+                            o, a, a - 0x150,
+                            vm_read32(a - 0x10), vm_read32(a - 0xC),
+                            vm_read32(a - 8), vm_read32(a - 4));
+            }
+        }
+    }
     fflush(stderr);
     ctx->gpr[3] = 0;
+}
+
+/* ---- sys_spinlock_* (sysPrxForUser) -------------------------------------
+ *
+ * A sys_spinlock_t is one 32-bit word in guest memory and nothing else -- the
+ * real firmware spins on it with lwarx/stwcx. The guest only ever touches that
+ * word through these four calls, so a host test-and-set on the same address is
+ * exactly equivalent and stays correct across the title's own threads.
+ *
+ * Stored big-endian, so a guest that peeks at the word still reads 1.
+ *
+ * ABI: initialize / lock / unlock return void; trylock returns CELL_OK or
+ * EBUSY. Found via Virtua Fighter 5, which locks with trylock in a retry loop
+ * and was the first title to import the family -- the three NIDs were unnamed
+ * in the database until compute_nid() was brute-forced over the sysPrxForUser
+ * export list.
+ */
+#define SPINLOCK_BE1  0x01000000u          /* be32(1) */
+
+static inline volatile long* spin_word(uint32_t ea)
+{
+    return (volatile long*)(vm_base + ea);
+}
+
+/* Test-and-set, not compare-and-swap: writing "locked" over an already-locked
+ * word is idempotent, so a plain atomic exchange is enough -- and _Interlocked-
+ * Exchange is the one RMW the POSIX shim in win32_compat.h already provides. */
+static inline int spin_try(uint32_t ea)
+{
+    return _InterlockedExchange(spin_word(ea), (long)SPINLOCK_BE1) == 0;
+}
+
+static void sys_spinlock_initialize(ppu_context* ctx)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+    if (ea) _InterlockedExchange(spin_word(ea), 0);
+}
+
+static void sys_spinlock_lock(ppu_context* ctx)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+    if (!ea) return;
+    /* ponytail: spin briefly, then hand the core back. On real hardware the
+     * holder runs to completion in a few instructions; here it is a host thread
+     * the OS can deschedule mid-section, so busy-waiting a whole quantum is the
+     * wrong trade. Swap in a futex if a title ever shows real contention here. */
+    for (unsigned n = 0; !spin_try(ea); n++) {
+        if (n < 64) YieldProcessor();
+        else        Sleep(0);
+    }
+}
+
+static void sys_spinlock_trylock(ppu_context* ctx)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+    ctx->gpr[3] = (ea && spin_try(ea))
+                ? 0                                            /* CELL_OK */
+                : (uint64_t)(int64_t)(int32_t)0x8001000Au;     /* EBUSY   */
+}
+
+static void sys_spinlock_unlock(ppu_context* ctx)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+    if (ea) _InterlockedExchange(spin_word(ea), 0);
 }
 
 extern "C" void ppu_sysprx_register(void)
@@ -685,6 +796,12 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_lock"),    "sys_lwmutex_lock",    sys_lwmutex_lock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_unlock"),  "sys_lwmutex_unlock",  sys_lwmutex_unlock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_trylock"), "sys_lwmutex_trylock", sys_lwmutex_trylock);
+
+    /* Spinlocks. One guest word each, no kernel object; see the block above. */
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_initialize"), "sys_spinlock_initialize", sys_spinlock_initialize);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_lock"),       "sys_spinlock_lock",       sys_spinlock_lock);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_trylock"),    "sys_spinlock_trylock",    sys_spinlock_trylock);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_unlock"),     "sys_spinlock_unlock",     sys_spinlock_unlock);
 
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_create"),     "sys_lwcond_create",     sys_lwcond_create);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_destroy"),    "sys_lwcond_destroy",    sys_lwcond_destroy);
