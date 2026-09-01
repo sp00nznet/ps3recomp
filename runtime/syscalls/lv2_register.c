@@ -275,6 +275,7 @@ typedef struct {
     uint32_t args_ea;
     uint32_t args_size;
     uint32_t img_ea;         /* sys_spu_image descriptor EA (for LS segment load) */
+    uint64_t spu_cfg;        /* sys_spu_thread_{set,get}_spu_cfg */
     /* Async fallback execution. host_thread is set when group_start spawned
      * a host thread for this SPU thread's PPU fallback; finish_event is
      * signalled when the handler returns; running indicates the thread is
@@ -1566,6 +1567,41 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
 }
 
 /* Catch-all stub for SPU syscalls we don't model individually yet. */
+/* sys_spu_thread_{set,get}_spu_cfg -- the SPU's signal-notification config
+ * word. Both were stubs, which means set() dropped the value and get() handed
+ * back whatever the stub returns; a title that writes a config and reads it
+ * back to confirm sees a mismatch. Virtua Fighter 5 calls both, once each,
+ * exactly as its "SPU Delegate" group starts.
+ *
+ * There is nothing to configure on our side -- the lifted SPU code does not
+ * consult it -- so this is storage, per thread, which is all the ABI promises
+ * the caller. */
+extern void vm_write64(uint64_t a, uint64_t v);
+
+static int64_t sys_spu_thread_set_spu_cfg(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint64_t val = ctx->gpr[4];
+    for (int i = 0; i < MAX_SPU_THREADS; i++)
+        if (s_spu_threads[i].in_use && s_spu_threads[i].tid == tid) {
+            s_spu_threads[i].spu_cfg = val;
+            return CELL_OK;
+        }
+    return (int64_t)(int32_t)CELL_ESRCH;
+}
+
+static int64_t sys_spu_thread_get_spu_cfg(ppu_context* ctx)
+{
+    uint32_t tid    = (uint32_t)ctx->gpr[3];
+    uint32_t out_ea = (uint32_t)ctx->gpr[4];
+    for (int i = 0; i < MAX_SPU_THREADS; i++)
+        if (s_spu_threads[i].in_use && s_spu_threads[i].tid == tid) {
+            if (out_ea) vm_write64(out_ea, s_spu_threads[i].spu_cfg);
+            return CELL_OK;
+        }
+    return (int64_t)(int32_t)CELL_ESRCH;
+}
+
 static int64_t sys_spu_thread_stub(ppu_context* ctx)
 {
     (void)ctx;
@@ -1641,6 +1677,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_LS,        sys_spu_thread_write_ls_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_READ_LS,         sys_spu_thread_read_ls_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SNR,       sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_SPU_CFG,     sys_spu_thread_set_spu_cfg);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_SPU_CFG,     sys_spu_thread_get_spu_cfg);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_handler);
