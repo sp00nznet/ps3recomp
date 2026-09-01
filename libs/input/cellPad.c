@@ -649,6 +649,40 @@ skip_inject: ;
           }
       } }
 
+    /* PAD_FILE=<path> -- closed-loop input. Each poll, if the file holds a
+     * button mask (same encoding as PAD_SCRIPT), press it for a fixed number
+     * of polls and empty the file. A driver outside the process can then look
+     * at the log or a frame dump, decide which screen the title is on, and
+     * write the next button -- which a fixed time schedule cannot do, because
+     * a menu system with several screens wanders when driven blind.
+     *
+     *   echo 0x0008 > pad.txt    # START
+     *   echo 0x4000 > pad.txt    # CROSS
+     */
+    { static int s_pf = -1; static char pf_path[512];
+      static unsigned held_mask = 0; static int held_n = 0;
+      if (s_pf < 0) { const char* e = getenv("PAD_FILE");
+                      s_pf = (e && *e) ? 1 : 0;
+                      if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
+      if (s_pf && port_no == 0) {
+          if (held_n <= 0) {
+              FILE* f = fopen(pf_path, "rb");
+              if (f) {
+                  char buf[64]; buf[0] = 0;
+                  if (fgets(buf, sizeof buf, f)) {
+                      unsigned m = (unsigned)strtoul(buf, 0, 0);
+                      if (m) { held_mask = m; held_n = 40;
+                               printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
+                  }
+                  fclose(f);
+                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
+              }
+          }
+          if (held_n > 0) { held_n--;
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+      } }
+
     /* Analog sticks */
     /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at
      * fixed positions. Rubber Ducky drives its camera from the sticks and never
