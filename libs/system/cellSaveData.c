@@ -243,6 +243,45 @@ static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName
     return result;
 }
 
+/* Dispatch a List/Fixed selection callback.
+ *
+ * The four List/Fixed entry points used to call the guest OPD as a HOST
+ * function pointer with HOST struct pointers -- `funcList(&cbResult, &listGet,
+ * &listSet)`. That is an immediate access violation the first time a title
+ * actually reaches one, and none did until Virtua Fighter 5 called
+ * cellSaveDataFixedLoad: rip == the guest OPD address, 0x00691F30.
+ *
+ * ponytail: this dispatches through the guest caller with ZEROED guest
+ * structures rather than marshalling the directory list. With no save data on
+ * the VFS the list is empty anyway, which is the honest answer, and a title
+ * sees "nothing to select" and proceeds with defaults. Marshal CellSaveData-
+ * ListGet/ListSet properly when a title needs to pick an existing save; the
+ * layouts are the only missing piece, and dispatch_func_stat next door is the
+ * shape to copy. */
+static s32 dispatch_func_select(uint32_t func_opd, uint32_t dirCount,
+                                uint32_t userdata_ea, const char* who)
+{
+    if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+
+    scratch_reset();
+    uint32_t cb_ea  = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
+    uint32_t get_ea = scratch_alloc(SAVEDATA_STATGET_SIZE);
+    uint32_t set_ea = scratch_alloc(SAVEDATA_STATSET_SIZE);
+    if (!cb_ea || !get_ea || !set_ea) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+
+    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea);
+    vm_write32(get_ea + 0, dirCount);        /* dirNum     */
+    vm_write32(get_ea + 4, 0);               /* dirListNum: nothing marshalled */
+
+    printf("[cellSaveData] dispatching %s OPD=0x%08X (dirNum=%u)%c",
+           who, func_opd, dirCount, 10);
+    g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
+
+    s32 result = marshal_cbresult_read_result(cb_ea);
+    printf("[cellSaveData] %s returned cbResult.result=%d%c", who, result, 10);
+    return result;
+}
+
 /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
 static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList, u32 max)
 {
@@ -716,7 +755,9 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
     CellSaveDataListSet listSet;
     memset(&listSet, 0, sizeof(listSet));
 
-    funcList(&cbResult, &listGet, &listSet);
+    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList,
+                                          listGet.dirListNum,
+                                          (uint32_t)(uintptr_t)userdata, "funcList");
 
     if (cbResult.result < 0) {
         free(dirList);
@@ -781,7 +822,9 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
     CellSaveDataListSet listSet;
     memset(&listSet, 0, sizeof(listSet));
 
-    funcList(&cbResult, &listGet, &listSet);
+    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList,
+                                          listGet.dirListNum,
+                                          (uint32_t)(uintptr_t)userdata, "funcList");
 
     if (cbResult.result < 0) {
         free(dirList);
@@ -845,7 +888,9 @@ s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
     CellSaveDataListSet listSet;
     memset(&listSet, 0, sizeof(listSet));
 
-    funcFixed(&cbResult, &listGet, &listSet);
+    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcFixed,
+                                          listGet.dirListNum,
+                                          (uint32_t)(uintptr_t)userdata, "funcFixed");
 
     if (cbResult.result < 0) {
         free(dirList);
@@ -907,7 +952,9 @@ s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
     CellSaveDataListSet listSet;
     memset(&listSet, 0, sizeof(listSet));
 
-    funcFixed(&cbResult, &listGet, &listSet);
+    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcFixed,
+                                          listGet.dirListNum,
+                                          (uint32_t)(uintptr_t)userdata, "funcFixed");
 
     if (cbResult.result < 0) {
         free(dirList);
@@ -942,10 +989,21 @@ s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
     printf("[cellSaveData] AutoSave2(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
 
-    if (!dirName || !setBuf || !funcStat)
-        return CELL_SAVEDATA_ERROR_PARAM;
-
-    return savedata_execute(dirName, 1, setBuf, funcStat, funcFile, userdata);
+    /* Delegate to the non-_2 entry, which marshals. This used to call
+     * savedata_execute(), which invokes funcStat as a HOST function pointer
+     * with HOST struct addresses -- but funcStat is a guest OPD and the structs
+     * must live in guest memory, so the callback wrote nothing the caller could
+     * read and the first dereference faulted. The Simpsons Arcade Game crashed
+     * exactly here on its first boot, creating its profile right after
+     * AutoLoad2 had correctly reported ERR_NODATA. The two entries take
+     * identical arguments; _2 is just the newer SDK name.
+     *
+     * savedata_execute() is still behind the List* and Fixed* entries and
+     * carries the same defect for each of them. Fixing those needs list/file
+     * marshalling that dispatch_func_stat does not do yet, so they are left
+     * alone until a title actually reaches one. */
+    return cellSaveDataAutoSave(version, dirName, errDialog, setBuf,
+                                funcStat, funcFile, container, userdata);
 }
 
 s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
@@ -1014,6 +1072,55 @@ s32 cellSaveDataDelete2(u32 container)
  * cellSaveDataAutoSave / AutoLoad / Delete instead of the _2 variants
  * RPCS3's flOw build uses. Same semantics, different NID.
  * -----------------------------------------------------------------------*/
+/* The pre-3.00 List/Fixed entry points. Identical to their "2" forms except
+ * that v2 added a trailing `userdata` the callbacks echo back; RPCS3 forwards
+ * v1 with userdata = NULL and so do we. Registering only the "2" forms left a
+ * title on the older API getting the unresolved-NID default, so its save-data
+ * callbacks never fired and whatever it was loading never completed. Virtua
+ * Fighter 5 calls FixedLoad during its boot and stops there.
+ *
+ * Same shape as cellMsgDialogOpen vs Open2 and cellGameDataCheckCreate vs
+ * Create2 -- three of the four v1/v2 pairs in this tree had the same gap. */
+s32 cellSaveDataListSave(u32 version, CellSaveDataSetList* setList,
+                         CellSaveDataSetBuf* setBuf,
+                         CellSaveDataListCallback funcList,
+                         CellSaveDataStatCallback funcStat,
+                         CellSaveDataFileCallback funcFile, u32 container)
+{
+    return cellSaveDataListSave2(version, setList, setBuf, funcList, funcStat,
+                                 funcFile, container, NULL);
+}
+
+s32 cellSaveDataListLoad(u32 version, CellSaveDataSetList* setList,
+                         CellSaveDataSetBuf* setBuf,
+                         CellSaveDataListCallback funcList,
+                         CellSaveDataStatCallback funcStat,
+                         CellSaveDataFileCallback funcFile, u32 container)
+{
+    return cellSaveDataListLoad2(version, setList, setBuf, funcList, funcStat,
+                                 funcFile, container, NULL);
+}
+
+s32 cellSaveDataFixedSave(u32 version, CellSaveDataSetList* setList,
+                          CellSaveDataSetBuf* setBuf,
+                          CellSaveDataFixedCallback funcFixed,
+                          CellSaveDataStatCallback funcStat,
+                          CellSaveDataFileCallback funcFile, u32 container)
+{
+    return cellSaveDataFixedSave2(version, setList, setBuf, funcFixed, funcStat,
+                                  funcFile, container, NULL);
+}
+
+s32 cellSaveDataFixedLoad(u32 version, CellSaveDataSetList* setList,
+                          CellSaveDataSetBuf* setBuf,
+                          CellSaveDataFixedCallback funcFixed,
+                          CellSaveDataStatCallback funcStat,
+                          CellSaveDataFileCallback funcFile, u32 container)
+{
+    return cellSaveDataFixedLoad2(version, setList, setBuf, funcFixed, funcStat,
+                                  funcFile, container, NULL);
+}
+
 s32 cellSaveDataAutoSave(u32 version, const char* dirName,
                           u32 errDialog,
                           CellSaveDataSetBuf* setBuf,

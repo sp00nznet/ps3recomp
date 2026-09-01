@@ -143,6 +143,8 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath);
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size);
 
+s32 cellGameDataCheckCreate(u32 version, const char* dirName, u32 errDialog,
+                            void* funcStat, u32 container);
 s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
                              void* funcStat, u32 container);
 

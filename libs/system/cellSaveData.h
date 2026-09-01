@@ -252,6 +252,24 @@ typedef struct CellSaveDataSetBuf {
  * Functions
  * -----------------------------------------------------------------------*/
 
+/* pre-3.00 entry points; forwarders to the "2" forms with userdata = NULL. */
+s32 cellSaveDataListSave(u32 version, CellSaveDataSetList* setList,
+                         CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
+                         CellSaveDataStatCallback funcStat,
+                         CellSaveDataFileCallback funcFile, u32 container);
+s32 cellSaveDataListLoad(u32 version, CellSaveDataSetList* setList,
+                         CellSaveDataSetBuf* setBuf, CellSaveDataListCallback funcList,
+                         CellSaveDataStatCallback funcStat,
+                         CellSaveDataFileCallback funcFile, u32 container);
+s32 cellSaveDataFixedSave(u32 version, CellSaveDataSetList* setList,
+                          CellSaveDataSetBuf* setBuf, CellSaveDataFixedCallback funcFixed,
+                          CellSaveDataStatCallback funcStat,
+                          CellSaveDataFileCallback funcFile, u32 container);
+s32 cellSaveDataFixedLoad(u32 version, CellSaveDataSetList* setList,
+                          CellSaveDataSetBuf* setBuf, CellSaveDataFixedCallback funcFixed,
+                          CellSaveDataStatCallback funcStat,
+                          CellSaveDataFileCallback funcFile, u32 container);
+
 s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
                            CellSaveDataSetBuf* setBuf,
                            CellSaveDataListCallback funcList,

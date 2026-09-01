@@ -409,6 +409,21 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
     return CELL_OK;
 }
 
+/* cellGameDataCheckCreate -- the pre-3.00 entry point. Same arguments and same
+ * behaviour as Create2 (RPCS3 forwards it the same way); the only difference is
+ * the size of CellGameDataStatGet in older SDKs, and a title that asks for the
+ * smaller one simply ignores the tail of ours.
+ *
+ * Registering only Create2 meant a title on the older API got the unresolved-NID
+ * default, its funcStat callback never fired, and its game-data check never
+ * completed. Virtua Fighter 5 calls this once during its load and stops there. */
+s32 cellGameDataCheckCreate(u32 version, const char* dirName, u32 errDialog,
+                            void* funcStat, u32 container)
+{
+    printf("[cellGame] DataCheckCreate -> Create2%c", 10);
+    return cellGameDataCheckCreate2(version, dirName, errDialog, funcStat, container);
+}
+
 s32 cellGameGetParamInt(s32 id, s32* value)
 {
     printf("[cellGame] GetParamInt(id=%d)\n", id);
