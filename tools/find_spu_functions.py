@@ -117,7 +117,13 @@ def read_symbols(buf, shs):
             continue
         strtab = shs[sh["link"]] if 0 <= sh["link"] < len(shs) else None
         strbuf = buf[strtab["off"]:strtab["off"] + strtab["size"]] if strtab else b""
-        for i in range(sh["size"] // sh["entsize"]):
+        if sh["entsize"] <= 0:
+            continue
+        # An image carved out of a bigger binary (extract_spu_images.py sizes it
+        # by the PT_LOAD / section-table extent) can carry a symtab header whose
+        # data runs past the carved bytes. Truncate to what we actually have.
+        avail = max(0, len(buf) - sh["off"]) // sh["entsize"]
+        for i in range(min(sh["size"] // sh["entsize"], avail)):
             off = sh["off"] + i * sh["entsize"]
             st_name, st_value, st_size, st_info, st_other, st_shndx = \
                 struct.unpack_from(">IIIBBH", buf, off)

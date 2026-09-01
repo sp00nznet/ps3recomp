@@ -676,6 +676,10 @@ unsigned long long ps3_ms_now(void)
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+/* Backlog past which the drain stops honouring one-flip-per-tick and
+ * catches up instead. Sized well above a frame's command list so a
+ * title that keeps up never sees this path. */
+#define GCM_FIFO_CATCHUP_BYTES 0x10000u
 static u32 s_fifo_getoff  = 0;
 static u32 s_fifo_calloff = 0;
 
@@ -1175,6 +1179,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
 
+    u32 start_off = s_fifo_getoff;
     if (getenv("GCM_DRAINDBG")) {
         static int n = 0;
         if (n++ % 60 == 0)
@@ -1183,7 +1188,33 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    vm_read32(s_gcm_context_ea + 0x8));
     }
 
+
+    /* GCM_FIFO_SNAP=N: dump N snapshots of the raw words at both ends of the
+     * ring -- what `get` is about to decode, and what the title just wrote at
+     * `put`. When get and put drift apart, the two windows say immediately
+     * whether get is grinding through NOPs/garbage or the title is writing
+     * somewhere get can never reach. The [FIFOSTEP] trace only ever fired on a
+     * bad branch, which is exactly the case where the drift is silent. */
+    { static int snap = -1;
+      if (snap < 0) { const char* e = getenv("GCM_FIFO_SNAP"); snap = e ? atoi(e) : 0; }
+      if (snap > 0 && put) {
+          snap--;
+          fprintf(stderr, "[SNAP] get=%08X put=%08X\n", s_fifo_getoff, put);
+          for (int k = 0; k < 16; k++) {
+              u32 gio = s_fifo_getoff + (u32)(k * 4), pio = put + (u32)(k * 4);
+              u32 gea = gcm_io2ea(gio), pea = gcm_io2ea(pio);
+              fprintf(stderr, "[SNAP]  get+%-3d io=%08X w=%08X   put+%-3d io=%08X w=%08X\n",
+                      k * 4, gio, gea ? vm_read32(gea) : 0xDEADDEADu,
+                      k * 4, pio, pea ? vm_read32(pea) : 0xDEADDEADu);
+          }
+          fflush(stderr);
+      } }
+
     int budget = 0x100000;                    /* words per tick cap */
+    /* GCM_DRAINDBG also reports WHY each pass stopped. A drain that ends far
+     * short of `put` every tick is the signature of a FIFO that can never
+     * catch up, and the reason is the whole diagnosis. */
+    const char* why = "caught-up";
     while (s_fifo_getoff != put && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
@@ -1204,6 +1235,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             s_fifo_getoff, put);
             }
             s_fifo_getoff = put;
+            why = "no-io-mapping";
             break;
         }
         u32 w = vm_read32(ea);
@@ -1222,7 +1254,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
             cellGcmSetFlipCommand(w & 0xFFu);
-            break;
+            /* ...unless the FIFO is badly backlogged. One flip per drain is
+             * right while `get` is keeping up with `put`; when it is megabytes
+             * behind it is a deadlock, because the title's ring can only be
+             * reclaimed as `get` advances. VF5 submits ~5x faster than one
+             * flip per drain consumes, so its 4 MB ring fills, its own
+             * buffer-full callback can never free space, and AMGL prints
+             * "Command Buffer Overflow" forever. Past the threshold keep
+             * draining -- the intermediate presents are frames we are too far
+             * behind to show anyway. No-op for a title that is keeping up. */
+            if (put < s_fifo_getoff ||
+                put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
+                { why = "flip"; break; }
+            continue;
         }
 
         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
@@ -1230,7 +1274,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync(&s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync(&s_fifo_getoff, put); why = "bad-jump"; break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
                * catches up, and overwrites it when the next segment is
@@ -1245,14 +1289,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
                   if (put != s_fifo_getoff) { gcm_fifo_resync(&s_fifo_getoff, put); }
-                  break;
+                  why = "park"; break;
               }
               s_fifo_getoff = tgt; }
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync(&s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync(&s_fifo_getoff, put); why = "bad-call"; break; }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
@@ -1319,7 +1363,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             if (blk) { sem_blocked = 1; break; }
         }
                 }
-                if (sem_blocked) break;
+                if (sem_blocked) { why = "sema"; break; }
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
@@ -1412,6 +1456,38 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * passes while `put` is somewhere else, there is work the walker will
      * never reach: resynchronise to the write head. Same trade as the
      * unmapped-get path -- commands are lost, the FIFO lives. */
+    /* The stuck-detector above only fires when `get` stops MOVING. A walker
+     * going in circles moves plenty -- it just never arrives. Twisted Metal
+     * and flOw both write one ring and their JUMPs lead to `put`; VF5 does
+     * not. AMGL leaves libgcm's default ring at IO 0 parked on its own JUMP
+     * loop and drives the RSX from a second buffer it mapped at IO 0xA00000,
+     * so the walker circulates the default ring forever, `get` never reaches
+     * `put`, the title's ring is never reclaimed, and AMGL prints "Command
+     * Buffer Overflow" until it runs off the end of its own mapping.
+     *
+     * A drain that burns its ENTIRE word budget without arriving is that
+     * signature: no legitimate frame leaves a million words pending, and a
+     * genuine burst clears within a tick or two. Circling does not, so
+     * require several passes in a row before following the write head.
+     *
+     * ponytail: consecutive-budget-burn is a heuristic, not a proof. The real
+     * fix is knowing which buffer the RSX is bound to -- that needs the
+     * SetQueueHandler / context-switch path modelled, not a walker rule. */
+    { static int burned = 0, passes = -1;
+      if (passes < 0) { const char* e = getenv("GCM_FIFO_CIRCLE_PASSES");
+                        passes = e ? atoi(e) : 4; }
+      if (passes && budget <= 0 && s_fifo_getoff != put) {
+          if (++burned >= passes) {
+              static int n = 0;
+              if (n++ < 8)
+                  fprintf(stderr, "[cellGcmSys] FIFO walker circling (get=0x%08X, "
+                          "put=0x%08X, full budget burned x%d) -- following the "
+                          "write head\n", s_fifo_getoff, put, burned);
+              gcm_fifo_resync(&s_fifo_getoff, put);
+              burned = 0;
+          }
+      } else burned = 0; }
+
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
       if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_resync(&s_fifo_getoff, put); stuck = 0; }
@@ -1421,6 +1497,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
+    if (getenv("GCM_DRAINDBG")) {
+        static int n2 = 0;
+        if (n2++ % 60 == 0)
+            fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
+                    why, start_off, s_fifo_getoff, s_fifo_getoff - start_off, put);
+    }
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
@@ -1533,6 +1615,17 @@ int cellGcmOffsetIsDisplay(u32 offset)
 }
 
 /* NID: 0xEAA52F23 */
+/* How many display buffers the title has actually registered. cellResc needs
+ * it to know how far to rotate its flip target; nothing else about the set is
+ * anyone else's business, so this stays a count rather than exposing the array. */
+u32 cellGcm_display_buffer_count(void)
+{
+    u32 n = 0;
+    for (u32 i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++)
+        if (s_display_buffer_set[i]) n++;
+    return n;
+}
+
 s32 cellGcmSetFlipCommand(u32 bufferId)
 {
     { static int _n=0; if (getenv("FLIP_DBG") && _n++ < 20)

@@ -340,6 +340,13 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("sysPrxForUser", "sys_lwcond_create"),
     ("sysPrxForUser", "sys_lwcond_destroy"),
     ("sysPrxForUser", "sys_lwcond_wait"),
+    # Recovered by brute-forcing compute_nid() over the sysPrxForUser export
+    # list against Virtua Fighter 5's imports (0x8C2BB498 / 0x722A0254 /
+    # 0x5267CB35 were unresolved in every title until then).
+    ("sysPrxForUser", "sys_spinlock_initialize"),
+    ("sysPrxForUser", "sys_spinlock_lock"),
+    ("sysPrxForUser", "sys_spinlock_trylock"),
+    ("sysPrxForUser", "sys_spinlock_unlock"),
     ("sysPrxForUser", "sys_lwcond_signal"),
     ("sysPrxForUser", "sys_lwcond_signal_all"),
     ("sysPrxForUser", "sys_mutex_create"),
