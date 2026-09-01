@@ -180,6 +180,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               char tag[64];
               snprintf(tag, sizeof tag, "hle#%u tid=%u nid=0x%08X", n[t] - 1u, t, nid);
               ppu_dump_guest_stack(ctx, tag);
+              { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
+                ppu_dump_bctrl_ring((uint32_t)ctx->thread_id, tag); }
           }
       } }
 
