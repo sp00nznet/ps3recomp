@@ -2611,6 +2611,24 @@ void cellGcmSetDefaultCommandBuffer(void)
     s_control.put = 0;
     s_control.get = 0;
     s_control.ref = 0;
+
+    /* On hardware this re-points gCellGcmCurrentContext at the default context
+     * cellGcmInit built. Zeroing a host-side struct is not that: a title that
+     * calls it to go back to the big default buffer stays on whatever smaller
+     * segment it had switched to.
+     *
+     * GCM_DEFAULT_CTX_REPOINT=1 does the real thing -- write our context's EA
+     * into the guest variable cellGcmInit's ctx_out pointed at, and rewind that
+     * context. Off by default because a title managing its own segment chain
+     * may hold pointers into the old one; this exists to be measured, not
+     * assumed. */
+    if (getenv("GCM_DEFAULT_CTX_REPOINT") && s_gcm_ctx_out_ea && s_gcm_context_ea) {
+        vm_write32(s_gcm_context_ea + 0x8, vm_read32(s_gcm_context_ea + 0x0));
+        vm_write32(s_gcm_ctx_out_ea, s_gcm_context_ea);
+        printf("[cellGcmSys] SetDefaultCommandBuffer: repointed "
+               "gCellGcmCurrentContext@0x%08X -> 0x%08X\n",
+               s_gcm_ctx_out_ea, s_gcm_context_ea);
+    }
 }
 
 /* Debug dump — no-op in recomp */
