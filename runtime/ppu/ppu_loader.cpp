@@ -405,6 +405,16 @@ extern "C" void ppu_guest_callstack(const char* tag);
 static uint32_t s_guard_pre = 0;
 static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
 {
+    /* Re-entrancy guard. The handler logs with fprintf, and if the guarded page
+     * is one the C runtime or this process touches while logging -- guarding the
+     * GCM control register at 0x20002000 is enough -- the log write faults into
+     * this handler again, forever. It surfaces as a [STACKOVERFLOW] whose
+     * backtrace is a repeating ppu_guard_veh / fprintf cycle, i.e. a diagnostic
+     * reporting itself as the title's bug. Drop the nested fault instead. */
+    static PPU_THREAD_LOCAL int in_veh = 0;
+    if (in_veh) return EXCEPTION_CONTINUE_SEARCH;
+    struct Re { int* f; Re(int* p) : f(p) { *f = 1; } ~Re() { *f = 0; } } _re(&in_veh);
+
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == EXCEPTION_ACCESS_VIOLATION && s_guard_page &&
         ep->ExceptionRecord->NumberParameters >= 2) {
