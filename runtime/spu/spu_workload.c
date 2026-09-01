@@ -672,6 +672,16 @@ static void spu_async_run(spu_async_job* j)
                 ydkj_wake_all_event_flags();
                 fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
             }
+            /* SPU_LS_DUMP=<prefix>: write this job's whole local store when it
+             * ends. A reference dump from real hardware is a full local store,
+             * so the only way to ask "what ELSE is different" -- rather than
+             * checking one guessed word at a time -- is to diff all 256 KB. */
+            { const char* pfx = getenv("SPU_LS_DUMP");
+              if (pfx) { char path[512];
+                  snprintf(path, sizeof path, "%s_img%d.bin", pfx, j->image_id);
+                  FILE* f = fopen(path, "wb");
+                  if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
+                      fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
