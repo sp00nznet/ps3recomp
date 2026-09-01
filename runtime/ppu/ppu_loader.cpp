@@ -1349,13 +1349,24 @@ extern "C" void ppu_dump_bctrl_ring(uint32_t thread_id, const char* tag)
     unsigned t = (unsigned)thread_id & 15;
     uint32_t n = g_bctrl_pos[t] < BCTRL_RING_N ? g_bctrl_pos[t] : BCTRL_RING_N;
     if (!n) return;
-    fprintf(stderr, "[BCTRL:%s] tid=%u last %u indirect targets:", tag, t, n);
+    /* Its own file when BCTRL_RING names one. A 512-entry line on stderr
+     * interleaves with everything else the runtime and the guest are printing
+     * from other threads, and a spliced ring is worse than no ring -- the first
+     * use of this tool produced a diff that had a [surfsz] log line embedded in
+     * the middle of it. */
+    static FILE* out = NULL; static int tried = 0;
+    if (!tried) { tried = 1;
+        const char* e = getenv("BCTRL_RING");
+        if (e && *e && e[1]) out = fopen(e, "w");   /* "1" means stderr */
+    }
+    FILE* f = out ? out : stderr;
+    fprintf(f, "[BCTRL:%s] tid=%u last %u indirect targets:", tag, t, n);
     for (uint32_t i = 0; i < n; i++) {
         uint32_t idx = (g_bctrl_pos[t] - n + i) & (BCTRL_RING_N - 1);
-        fprintf(stderr, " %08X", g_bctrl_ring[t][idx]);
+        fprintf(f, " %08X", g_bctrl_ring[t][idx]);
     }
-    fputc(10, stderr);
-    fflush(stderr);
+    fputc(10, f);
+    fflush(f);
 }
 
 extern "C" void ps3_indirect_call(ppu_context* ctx)
