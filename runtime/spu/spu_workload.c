@@ -445,10 +445,40 @@ static void spu_async_run(spu_async_job* j)
                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
                      * so the cri leaf reads valid data instead of my planted guesses. */
                     uint64_t elf = spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                    /* --- Golden-reference context fields for the CRI task, recovered from a
+                     * WORKING RPCS3 SPU-LS snapshot via caner's rpcs3-guest-memory-dumper fork
+                     * (github.com/canersaka/rpcs3-guest-memory-dumper): YDKJ BLUS30569, SPU0
+                     * "CellSpursKernel0" mid-cri-decode. These are what the cri task's context
+                     * validator (func_00026E80/F18/FC4) reads; our values differed and tripped
+                     * its 0x80410911 error path. CRI-SCOPED (image 22 only) -- overriding these
+                     * in the shared build_context breaks the audio SPURS task. */
+                    LSBE32(0x2840, 0x53505552u); LSBE32(0x2844, 0x53544153u); /* moduleId "SPURSTASK MODULE" */
+                    LSBE32(0x2848, 0x4B204D4Fu); LSBE32(0x284C, 0x44554C45u);
+                    /* TI_LS_PATTERN = full-coverage (all-ones). The prior "golden fix"
+                     * set this to 0 from the decode-time RPCS3 LS dump, but that region
+                     * is post-validation (also zero) so it wasn't authoritative. Runtime
+                     * probe YDKJ_CRI_GATE1TRACE proved 0 makes the validator func_00026E80
+                     * return 0x8041090F (busy-spin poll); all-ones makes it return 0 -- the
+                     * task then passes and reaches the taskset-state getllar (func_00027028).
+                     * Verified by direct r3 read (YDKJ_G1_LSPAT=0xFFFFFFFF -> r3=0). */
+                    LSBE32(0x27A0, 0xFFFFFFFFu); LSBE32(0x27A4, 0xFFFFFFFFu);
+                    LSBE32(0x27A8, 0xFFFFFFFFu); LSBE32(0x27AC, 0xFFFFFFFFu);
+                    LSBE32(0x27D0, 0x1F);                       /* dmaTagId = 0x1F (build_context wrote 0) */
                     /* still plant the cri-specific task descriptor @0x2FB0 that build_context
                      * doesn't cover (cri func_00026DE0 reads it). */
                     LSBE32(0x2FB0, 0xFFFFFFFFu); LSBE32(0x2FB4, 0x400);
                     LSBE32(0x2FB8, 0x2700);      LSBE32(0x2FBC, 0x3000);
+                    /* GATE1 SWEEP (YDKJ_G1_*): the validator func_00026E80 reads the
+                     * TI_CONTEXT(0x2798)/TI_LS_PATTERN(0x27A0) region; YDKJ_CRI_GATE1TRACE
+                     * proved r16=rotqby(LS[0x2798],8)=0 forces its 0x8041090F return. The
+                     * decode-time RPCS3 dump has this region zero (post-validation), so it
+                     * can't be diffed -- sweep candidate values here and read the probe's
+                     * r3. Overrides the plants above so one build tests many values. */
+                    { const char* _e;
+                      if ((_e=getenv("YDKJ_G1_LSPAT"))) { uint32_t v=(uint32_t)strtoul(_e,0,0);
+                          LSBE32(0x27A0,v); LSBE32(0x27A4,v); LSBE32(0x27A8,v); LSBE32(0x27AC,v); }
+                      if ((_e=getenv("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
+                          LSBE32(0x2798,v); LSBE32(0x279C,v); } }
                     fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
                             g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
                 } else {
