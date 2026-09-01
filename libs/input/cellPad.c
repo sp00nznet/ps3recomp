@@ -78,6 +78,8 @@ static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+/* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
+static int s_data_fresh[PAD_MAX_HOST_PORTS];
 
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -110,6 +112,80 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
     if (val > 255) val = 255;
     return (u8)val;
 }
+
+/* Keyboard fallback for port 0.
+ *
+ * The only backend here is XInput, so on a machine with no controller plugged
+ * in a title gets a pad that is reported present and never presses anything --
+ * it can be watched but not played. That is what The Simpsons Arcade Game hit:
+ * it reached its attract loop and no input existed to start a game.
+ *
+ * Only fills in for port 0, only when XInput found nothing there, so a real
+ * controller always wins and nothing changes for a port that has one. Keys are
+ * read only while a window of THIS process is in the foreground, so typing in
+ * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
+ * disable it entirely.
+ *
+ * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
+ * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
+ * so a title that reads the stick instead is playable too. */
+#ifdef _WIN32
+static int pad_host_window_focused(void)
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static void pad_poll_keyboard(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (off) return;
+
+    PadHostState* hs = &s_host_state[0];
+    if (!pad_host_window_focused()) {
+        /* Release everything on focus loss, or a key held while alt-tabbing
+         * would stay down forever. */
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = 128;
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->connected = 1;
+        return;
+    }
+
+    static const struct { int vk; u16 btn; } map[] = {
+        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
+        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
+        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
+        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
+        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
+        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
+        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
+    };
+
+    u16 btns = 0;
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+
+    hs->buttons   = btns;
+    hs->connected = 1;
+    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+    hs->analog_rx = hs->analog_ry = 128;
+    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+
+    { static int said = 0;
+      if (!said && btns) { said = 1;
+          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+          fflush(stdout); } }
+}
+#endif
 
 static void pad_poll_xinput(void)
 {
@@ -317,12 +393,53 @@ static void pad_shutdown_backend(void)
  * Poll dispatcher
  * -----------------------------------------------------------------------*/
 
+/* Re-poll the host at most every PAD_POLL_INTERVAL_MS; serve cached state in
+ * between.
+ *
+ * XInputGetState is a driver call, and on a slot with nothing plugged in it is
+ * an expensive one: measured at 97.6 us for a sweep of the 7 host ports on a
+ * machine with no controller attached. cellPadGetData ran that sweep on EVERY
+ * call, and a guest that polls the pad from a spin loop -- The Simpsons Arcade
+ * Game does, in its input stage -- therefore spends its whole main thread
+ * inside the input driver.
+ *
+ * 4 ms is 250 Hz, well above the 60 Hz a title can actually observe (and above
+ * a real DualShock 3's own report rate), so no game can tell the difference,
+ * including one sampling for button-press edges. */
+#define PAD_POLL_INTERVAL_MS 4
+
+static unsigned long long pad_now_ms(void)
+{
+#ifdef _WIN32
+    return (unsigned long long)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull +
+           (unsigned long long)ts.tv_nsec / 1000000ull;
+#endif
+}
+
 static void pad_poll_backend(void)
 {
+    /* Benign race: two threads may poll in the same tick. That costs one extra
+     * sweep, never a missed or stale-forever read. */
+    static unsigned long long s_last_ms = 0;
+    unsigned long long now = pad_now_ms();
+    if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) return;
+    s_last_ms = now;
+    /* A real pad streams reports at roughly this rate whether or not anything
+     * changed, and libpad buffers them; a fresh sweep is a fresh report for
+     * every port. cellPadGetData hands each one out exactly once. */
+    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
+
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
+#endif
+#ifdef _WIN32
+    if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
 }
 
@@ -483,6 +600,46 @@ skip_inject: ;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
       } }
 
+    /* PAD_SCRIPT="<sec>:<mask>,<sec>:<mask>,..." -- press a NAMED button at a
+     * given wall-clock second, each held ~250 ms. LBP_AUTOPRESS only pulses
+     * CROSS and START, which is enough to clear a "press start" screen but not
+     * to navigate a menu: You Don't Know Jack needs DOWN to move off its name
+     * field before CROSS means anything. Masks are CELL_PAD_CTRL_* packed as
+     * (DIGITAL2 << 8) | DIGITAL1: START 0x0008, UP 0x0010, DOWN 0x0040,
+     * LEFT 0x0080, RIGHT 0x0020, CROSS 0x4000, CIRCLE 0x2000, TRIANGLE 0x1000.
+     * Legit input simulation on the same footing as LBP_AUTOPRESS/PAD_STICK. */
+    { static int s_sc = -1;
+      static struct { double t; unsigned mask; } ev[32]; static int n_ev = 0;
+      static ULONGLONG t0 = 0;
+      if (s_sc < 0) {
+          s_sc = 0;
+          const char* e = getenv("PAD_SCRIPT");
+          if (e && *e) {
+              s_sc = 1; t0 = GetTickCount64();
+              const char* p = e;
+              while (*p && n_ev < 32) {
+                  double t = strtod(p, (char**)&p);
+                  if (*p == ':') p++;
+                  unsigned m = (unsigned)strtoul(p, (char**)&p, 0);
+                  ev[n_ev].t = t; ev[n_ev].mask = m; n_ev++;
+                  while (*p == ',' || *p == ' ') p++;
+              }
+              printf("[cellPad] PAD_SCRIPT: %d event(s)\n", n_ev);
+          }
+      }
+      if (s_sc && port_no == 0) {
+          double now = (double)(GetTickCount64() - t0) / 1000.0;
+          for (int i = 0; i < n_ev; i++) {
+              if (now >= ev[i].t && now < ev[i].t + 0.25) {
+                  data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
+                  data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
+                  static int said[32];
+                  if (!said[i]) { said[i] = 1;
+                      printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
+              }
+          }
+      } }
+
     /* Analog sticks */
     /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at
      * fixed positions. Rubber Ducky drives its camera from the sticks and never
@@ -559,6 +716,38 @@ skip_inject: ;
     }  /* end connected block */
 
 emit:
+    /* A non-zero len means "here is a CHANGE packet" -- the constant is literally
+     * named CELL_PAD_LEN_CHANGE_DEFAULT. Hardware reports len = 0 once the port
+     * has nothing new, and titles DRAIN on that: The Simpsons Arcade Game's
+     * input stage is
+     *
+     *     while (cellPadGetData(port, &d) == CELL_OK && d.len > 0) { ... }
+     *
+     * (func_0013CFA8, loop 0x13D648 -> 0x13D040). Reporting a change on every
+     * call made that loop infinite: the main thread pegged one core inside
+     * libpad and the title never got past its first rendered screen.
+     *
+     * So hand out one packet per host report and report len = 0 for any read
+     * after that until the next one arrives (pad_poll_backend sets the flag when
+     * it actually re-polls, every PAD_POLL_INTERVAL_MS). That is what the
+     * hardware does: a pad streams reports at a fixed rate whether or not
+     * anything changed, and libpad buffers them.
+     *
+     * Reporting only on CHANGE instead is wrong and was tried: a HELD button
+     * produces exactly one packet, so a title that reads button[] only when
+     * len > 0 sees the press for a single frame and then sees nothing. In this
+     * game that came out as jump being the only control that seemed to work and
+     * attack firing once.
+     *
+     * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
+    {
+        static int always = -1;
+        if (always < 0) always = getenv("PAD_ALWAYS_CHANGE") ? 1 : 0;
+        if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
+            if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
+            else                        s_data_fresh[port_no] = 0;
+        }
+    }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
