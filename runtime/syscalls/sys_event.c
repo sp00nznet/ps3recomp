@@ -753,6 +753,7 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
+    fprintf(stderr, "[evt] port_connect(port=%u -> queue=%u)\n", port_id, queue_id);
 
     evt_table_lock();
 
