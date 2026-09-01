@@ -1295,6 +1295,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            /* Count the flip WORDS the title actually writes into the FIFO,
+             * separately from the presents that result. When a title stops
+             * appearing on screen the first question is which side stopped:
+             * this counter still climbing while presents do not is a runtime
+             * problem, both stopping together is the guest's. */
+            { static unsigned long long flips = 0; static int dbg = -1;
+              if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
+              ++flips;
+              if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
+                  fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
+                          flips, 10); }
             cellGcmSetFlipCommand(w & 0xFFu);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
@@ -1749,6 +1760,24 @@ u32 cellGcm_display_buffer_count(void)
 
 s32 cellGcmSetFlipCommand(u32 bufferId)
 {
+    /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
+     * which answers "did it ever flip?" and not "is it still flipping, and how
+     * fast?" -- the question that matters when a title stops appearing on
+     * screen. Virtua Fighter 5 does not use the in-FIFO 0xFEADxxxx flip word at
+     * all (that counter stays at zero for the whole run); it flips through
+     * cellGcmSetFlip, so this is where its frame rate actually is. */
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
+      if (dbg) {
+          extern unsigned long long ps3_ms_now(void);
+          static unsigned long long n = 0, t0 = 0;
+          unsigned long long now = ps3_ms_now();
+          if (!t0) t0 = now;
+          ++n;
+          if (n <= 400ull || (n % 100ull) == 0)
+              fprintf(stderr, "[flip] %llu at %llu ms%c", n, now - t0, 10);
+      } }
+
     { static int _n=0; if (getenv("FLIP_DBG") && _n++ < 20)
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
