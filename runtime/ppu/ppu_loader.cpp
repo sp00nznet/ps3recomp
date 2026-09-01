@@ -2278,6 +2278,36 @@ extern "C" uint32_t ppu_load_elf(const char* path)
      * otherwise unanswerable without implementing a whole subsystem -- "if this
      * flag did become what the title is waiting for, would it go anywhere?" --
      * and the answer decides whether the subsystem is worth building. */
+    /* PPU_POKE8=<hex ea>:<hex byte>[,...] -- the byte-wide form. A flag a title
+     * gates behaviour on is often one byte inside a struct, and a 32-bit poke
+     * would trample its neighbours. */
+    { const char* pk8 = getenv("PPU_POKE8");
+      if (pk8 && *pk8 && vm_base) {
+          static uint32_t ea8[8]; static uint8_t v8[8]; static int n8;
+          const char* c = pk8;
+          while (*c && n8 < 8) {
+              ea8[n8] = (uint32_t)strtoul(c, (char**)&c, 16);
+              if (*c == ':') c++;
+              v8[n8]  = (uint8_t)strtoul(c, (char**)&c, 16);
+              fprintf(stderr, "[poke8] holding 0x%08X = 0x%02X%c", ea8[n8], v8[n8], 10);
+              n8++;
+              while (*c == ',' || *c == ' ') c++;
+          }
+          /* PPU_POKE_AFTER_MS delays the start. Asserting a value from boot
+           * changes what the title does on the way to the moment you care
+           * about -- forcing VF5's render gate on from t=0 left it opening 15
+           * files instead of 134. Wait until the title is where you want it. */
+          struct P8 { static unsigned long __stdcall go(void*) {
+              { const char* d = getenv("PPU_POKE_AFTER_MS");
+                if (d && *d) Sleep((unsigned long)strtoul(d, 0, 0)); }
+              for (;;) {
+                  for (int i = 0; i < n8; i++)
+                      if (!ppu_vm_size || ea8[i] < ppu_vm_size) vm_base[ea8[i]] = v8[i];
+                  Sleep(2);
+              } } };
+          if (n8) CloseHandle(CreateThread(0, 0, P8::go, 0, 0, 0));
+      } }
+
     { const char* pk = getenv("PPU_POKE");
       if (pk && *pk && vm_base) {
           static uint32_t ea[8], val[8]; static int n;
