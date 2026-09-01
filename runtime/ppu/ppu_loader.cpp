@@ -2176,6 +2176,41 @@ extern "C" uint32_t ppu_load_elf(const char* path)
      * load time covers that window; the later arm is a no-op once armed. */
     { const char* ge = getenv("PPU_GUARD_EA");
       if (ge && *ge) ppu_guard_page((uint32_t)strtoul(ge, 0, 16)); }
+
+    /* PPU_KEEP_EA=<hex>[:<len>] -- snapshot that guest range at load time and
+     * restore it continuously. A PROBE, NOT A FIX: it fights the guest for
+     * ownership of memory, and if the guest legitimately writes there it will
+     * corrupt it. It exists to answer one question that is otherwise very
+     * expensive to answer -- "if this region were not being clobbered, how much
+     * further would the title get?" -- before spending a session on WHY it is
+     * being clobbered. Default length 4096, one page, which is the granularity
+     * the guard reports in. */
+    { const char* ke = getenv("PPU_KEEP_EA");
+      if (ke && *ke && vm_base) {
+          uint32_t kea = (uint32_t)strtoul(ke, 0, 16);
+          const char* c = strchr(ke, ':');
+          uint32_t klen = c ? (uint32_t)strtoul(c + 1, 0, 0) : 4096u;
+          if (klen && (!ppu_vm_size || (uint64_t)kea + klen <= ppu_vm_size)) {
+              static uint8_t* keep; static uint32_t keep_ea, keep_len;
+              keep = (uint8_t*)malloc(klen);
+              if (keep) {
+                  memcpy(keep, vm_base + kea, klen);
+                  keep_ea = kea; keep_len = klen;
+                  fprintf(stderr, "[keep] snapshotting 0x%08X..0x%08X and restoring it%c",
+                          kea, kea + klen, 10);
+                  struct R { static unsigned long __stdcall go(void*) {
+                      for (;;) {
+                          if (memcmp(vm_base + keep_ea, keep, keep_len)) {
+                              memcpy(vm_base + keep_ea, keep, keep_len);
+                              static int n = 0;
+                              if (n++ < 8) fprintf(stderr, "[keep] restored 0x%08X%c", keep_ea, 10);
+                          }
+                          Sleep(2);
+                      } } };
+                  CloseHandle(CreateThread(0, 0, R::go, 0, 0, 0));
+              }
+          }
+      } }
     return entry;
 }
 
