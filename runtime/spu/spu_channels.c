@@ -1415,6 +1415,19 @@ void spu_indirect_branch(spu_context* ctx)
             fprintf(stderr, "[spu] img=%d branched into unlifted LS 0x%05X "
                     "(lr=0x%05X) -- ending the job\n",
                     ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+            /* Is there real code at the target, or is the pc garbage? Eight
+             * words at the target and at the return address separate "the lift
+             * missed a function" from "this branch should never have happened". */
+            { uint32_t a[2]; a[0] = ctx->pc & SPU_LS_MASK;
+              a[1] = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+              for (int k = 0; k < 2; k++) {
+                  fprintf(stderr, "      LS[0x%05X]:", a[k]);
+                  for (uint32_t o = 0; o < 32 && a[k] + o + 3 < SPU_LS_SIZE; o += 4)
+                      fprintf(stderr, " %02X%02X%02X%02X",
+                              ctx->ls[a[k]+o], ctx->ls[a[k]+o+1],
+                              ctx->ls[a[k]+o+2], ctx->ls[a[k]+o+3]);
+                  fprintf(stderr, "\n");
+              } }
             fflush(stderr);
         }
         spu_halt(ctx);
