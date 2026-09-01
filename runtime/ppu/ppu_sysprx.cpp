@@ -605,6 +605,28 @@ static void hle_net_sendto(ppu_context* ctx) { ctx->gpr[3] = (uint32_t)ctx->gpr[
 extern "C" uint32_t g_spu_image_src_ea = 0, g_spu_image_ls_start = 0,
                     g_spu_image_span = 0;
 
+/* img_ea -> the EA of the SPU ELF it was parsed from. Small and fixed: a title
+ * has a handful of images, and a repeat import of the same descriptor replaces
+ * its entry. */
+#define SPU_IMG_SRC_MAX 32
+static struct { uint32_t img, src; } s_spu_img_src[SPU_IMG_SRC_MAX];
+
+extern "C" void ps3_spu_image_record(uint32_t img_ea, uint32_t src_ea)
+{
+    if (!img_ea || !src_ea) return;
+    for (int i = 0; i < SPU_IMG_SRC_MAX; i++)
+        if (s_spu_img_src[i].img == img_ea || s_spu_img_src[i].img == 0) {
+            s_spu_img_src[i].img = img_ea; s_spu_img_src[i].src = src_ea; return;
+        }
+}
+
+extern "C" uint32_t ps3_spu_image_source_ea(uint32_t img_ea)
+{
+    for (int i = 0; i < SPU_IMG_SRC_MAX; i++)
+        if (s_spu_img_src[i].img == img_ea) return s_spu_img_src[i].src;
+    return 0;
+}
+
 static void hle_sys_spu_image_import(ppu_context* ctx)
 {
     uint32_t img_ea = (uint32_t)ctx->gpr[3];
@@ -654,6 +676,11 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
         g_spu_image_ls_start = vm_read32(segs_ea + 0x04);
         g_spu_image_span     = vm_read32(last + 0x04) - g_spu_image_ls_start;
     }
+    /* Remember which ELF this descriptor was parsed from. sys_spu_thread_group_
+     * start only gets the DESCRIPTOR, but the workload registry is keyed by a
+     * fingerprint of the ELF's own bytes -- without this the raw SPU path has no
+     * way to ask whether the image it is about to run was lifted. */
+    ps3_spu_image_record(img_ea, src_ea);
     vm_write32(img_ea + 0x00, 0);                              /* type = USER */
     vm_write32(img_ea + 0x04, entry);
     vm_write32(img_ea + 0x08, nsegs ? segs_ea : 0);

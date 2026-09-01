@@ -25,10 +25,12 @@
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
 #include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
+#include "../spu/spu_workload.h"   /* the content-fingerprint registry */
 #include "sys_event.h"
 
 #include <stdio.h>
-#include <string.h>
+#include <string.h>
+
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 
 /* ---------------------------------------------------------------------------
@@ -56,6 +58,40 @@ static int64_t sys_tty_write(ppu_context* ctx)
         /* Write guest string data to host stderr */
         fwrite(vm_base + buf_ea, 1, len, stderr);
         fflush(stderr);
+        /* TTY_BT=<substring>: dump the guest LR back-chain whenever the title
+         * prints a line containing it. The two hooks below do exactly this for
+         * one hardcoded string each, which only ever helped the title they were
+         * written for. A title's own error message is the cheapest breakpoint
+         * there is -- it fires exactly when the thing went wrong, in the thread
+         * it went wrong on -- so make it a knob rather than an edit.
+         *
+         * Virtua Fighter 5: TTY_BT="Command Buffer Overflow" names the AMGL
+         * function whose free-space check is failing. */
+        { static const char* pat = (const char*)1;
+          if (pat == (const char*)1) pat = getenv("TTY_BT");
+          if (pat && *pat && len < 4096) {
+              char tmp[512]; uint32_t n = len < 511 ? len : 511;
+              memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
+              if (strstr(tmp, pat)) {
+                  static int _n = 0;
+                  if (_n++ < 4) {
+                      uint32_t sp = (uint32_t)ctx->gpr[1];
+                      fprintf(stderr, "[TTY_BT] \"%.70s\" tid=%llu cia=0x%08X lr=0x%08X chain:",
+                              tmp, (unsigned long long)ctx->thread_id,
+                              (uint32_t)ctx->cia, (uint32_t)ctx->lr);
+                      for (int i = 0; i < 24 && sp && sp < 0x10000000u; i++) {
+                          uint32_t nsp; memcpy(&nsp, vm_base + sp, 4);
+                          nsp = ((nsp>>24)&0xFF)|((nsp>>8)&0xFF00)|((nsp<<8)&0xFF0000)|((nsp<<24)&0xFF000000);
+                          if (nsp <= sp || nsp >= 0x10000000u) break;
+                          uint32_t lr; memcpy(&lr, vm_base + nsp + 0x10, 4);
+                          lr = ((lr>>24)&0xFF)|((lr>>8)&0xFF00)|((lr<<8)&0xFF0000)|((lr<<24)&0xFF000000);
+                          fprintf(stderr, " %08X", lr); sp = nsp;
+                      }
+                      fprintf(stderr, "\n"); fflush(stderr);
+                  }
+              }
+          } }
+
         /* CRI error back-chain (YDKJ_CRIBT=1): dump the guest LR chain when a CRI
          * null-pointer / criFs error is printed, to locate the failing call. */
         if (getenv("YDKJ_CRIBT") && len < 4096) {
@@ -784,6 +820,33 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (!t->in_use) continue;
         void* user = NULL;
         spu_ppu_fallback_fn fb = spu_lookup_ppu_fallback(t->entry_point, &user);
+        /* No fallback by entry point -- ask the WORKLOAD registry, which is
+         * keyed by the image's content fingerprint and is what
+         * build_spu_workloads.py populates. The two registries have always both
+         * existed; only the SPURS path consulted this one, so a title driving
+         * plain SPU thread groups never ran a line of its lifted SPU code. */
+        if (!fb && t->img_ea && vm_base) {
+            extern uint32_t ps3_spu_image_source_ea(uint32_t img_ea);
+            extern int32_t spu_registry_fallback(uint32_t, uint32_t, uint32_t, void*);
+            uint32_t src = ps3_spu_image_source_ea(t->img_ea);
+            size_t isz = src ? spu_elf_image_size(vm_base + src, 1u << 20) : 0;
+            if (isz) {
+                uint64_t fp = spu_workload_fingerprint(vm_base + src, isz);
+                int iid = 0;
+                if (spu_workload_find_img(fp, &iid)) {
+                    fb = spu_registry_fallback;
+                    user = (void*)(uintptr_t)fp;
+                    fprintf(stderr, "[SPU] thread tid=0x%X image @0x%08X (%u bytes) "
+                            "matched lifted workload fp=0x%016llX image_id=%d\n",
+                            t->tid, src, (unsigned)isz,
+                            (unsigned long long)fp, iid);
+                } else {
+                    fprintf(stderr, "[SPU] thread tid=0x%X image @0x%08X (%u bytes) "
+                            "fp=0x%016llX is NOT in the workload registry\n",
+                            t->tid, src, (unsigned)isz, (unsigned long long)fp);
+                }
+            }
+        }
         if (!fb && getenv("RD_SPU_INTERP") && t->img_ea) {
             /* No lifted fallback: interpret the image instead of instant-
              * completing. Additive + env-gated so it can't destabilize titles
