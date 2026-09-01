@@ -1795,6 +1795,8 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
                   char tag[48];
                   snprintf(tag, sizeof tag, "flip#%llu", m);
                   ppu_dump_guest_stack(g_active_ctx, tag);
+                  { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
+                    ppu_dump_bctrl_ring((uint32_t)g_active_ctx->thread_id, tag); }
               }
           }
       } }

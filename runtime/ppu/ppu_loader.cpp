@@ -1339,9 +1339,41 @@ extern "C" void lbp_breadcrumb_dump(const char* tag)
     for(int i=0;i<64;i++) if(g_bc_cnt[i]) p+=snprintf(ln+p,sizeof(ln)-p," t%d=%08X(%u)",i,g_bc_last[i],g_bc_cnt[i]);
     fprintf(stderr,"%s\n",ln); fflush(stderr);
 }
+/* Per-thread ring of recent indirect-call targets (BCTRL_RING=1). */
+#define BCTRL_RING_N 512
+static uint32_t g_bctrl_ring[16][BCTRL_RING_N];
+static uint32_t g_bctrl_pos[16];
+
+extern "C" void ppu_dump_bctrl_ring(uint32_t thread_id, const char* tag)
+{
+    unsigned t = (unsigned)thread_id & 15;
+    uint32_t n = g_bctrl_pos[t] < BCTRL_RING_N ? g_bctrl_pos[t] : BCTRL_RING_N;
+    if (!n) return;
+    fprintf(stderr, "[BCTRL:%s] tid=%u last %u indirect targets:", tag, t, n);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t idx = (g_bctrl_pos[t] - n + i) & (BCTRL_RING_N - 1);
+        fprintf(stderr, " %08X", g_bctrl_ring[t][idx]);
+    }
+    fputc(10, stderr);
+    fflush(stderr);
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     g_active_ctx = ctx;
+    /* BCTRL_RING=1: keep the last N indirect-call targets per thread, and let
+     * anything that can name a moment dump them. A render path built out of
+     * function pointers and vtables -- a scene graph -- cannot be mapped from
+     * the disassembly, because nothing calls it with a `bl`. Diffing this ring
+     * between the last frame a title drew and the first it did not is the only
+     * way to see which way the dispatch went. */
+    { static int on = -1;
+      if (on < 0) on = getenv("BCTRL_RING") ? 1 : 0;
+      if (on) {
+          unsigned t = (unsigned)ctx->thread_id & 15;
+          g_bctrl_ring[t][g_bctrl_pos[t] & (BCTRL_RING_N - 1)] = (uint32_t)ctx->ctr;
+          g_bctrl_pos[t]++;
+      } }
     { static int bc=-2; if(bc==-2) bc=getenv("LBP_BREADCRUMB")?1:0;
       if(bc){ unsigned t=(unsigned)ctx->thread_id & 63; g_bc_last[t]=(uint32_t)ctx->ctr; g_bc_cnt[t]++; } }
 #ifdef _WIN32
