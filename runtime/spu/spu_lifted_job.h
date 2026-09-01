@@ -136,10 +136,29 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     int taskset_ctx = (_LB(0x27C4) == 0xA70u);
     if (spurs_task_abi) {
         if (r3_override) {
-            ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle      */
-            ctx.gpr[3]._u32[1] = args_ea;          /* eaContext (DMA'd first) */
-            ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA           */
+            /* Pass the game's own CellSpursTaskArgument through UNCHANGED.
+             *
+             * Word 1 used to be overwritten with args_ea, the eaContext this
+             * runtime's HLE task-attribute handler had recorded. That is the
+             * word the task DMAs its 64-byte context from (func_00003ED8 puts
+             * it in MFC_EAL), and the substituted address is a PPU STACK
+             * temporary: by the third task the frame has already been recycled,
+             * so the task DMAs stack junk and decodes garbage.
+             *
+             * The game's own word 1 is the task's persistent control block --
+             * 0x006B4500 / 0x006B4780 / 0x006B4A00 for the three cri decode
+             * tasks. Those are load-bearing: the PPU waits on control+0x100
+             * (0x006B4600 / 0x006B4880 / 0x006B4B00), which is exactly the flag
+             * the task is supposed to set when a work cycle completes. Pointing
+             * the task at a different context is why it never sets it.
+             *
+             * A substituted eaContext remains the fallback below, for a task
+             * whose real argument this runtime never captured. */
+            ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle       */
+            ctx.gpr[3]._u32[1] = r3_override[1];   /* task control block EA    */
+            ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA            */
             ctx.gpr[3]._u32[3] = r3_override[3];
+            if (!ctx.gpr[3]._u32[1]) ctx.gpr[3]._u32[1] = args_ea;
         } else if (image_id == 22) {
             /* cri_mpv leaf (func_00003E68) gate is `rotmai(r3.word0, 112) == 64`
              * = an ARITHMETIC RIGHT-SHIFT BY 16 then ceqi 64, i.e. it wants
