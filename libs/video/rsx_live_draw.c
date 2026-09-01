@@ -1773,6 +1773,12 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
 {
     u8 s[4];
     switch (base_fmt) {
+    /* B8 is one channel. Broadcasting it to alpha as well is arguably more
+     * faithful (the YUV movie combine shader samples each plane's .w), but
+     * DO NOT do it until the USM decode actually fills those planes: while
+     * they are empty it only makes the garbage VISIBLE, putting green noise
+     * behind the title screen and every other movie-backed UI. Tried
+     * 2026-09-01, reverted the same session. See ydkj-live-draw-rebuild. */
     case TEX_FMT_B8: s[0] = 255; s[1] = s[2] = s[3] = p[0]; break;
     case TEX_FMT_A4R4G4B4: {
         const u16 v = (u16)((p[0] << 8) | p[1]);
@@ -2175,6 +2181,25 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
         if (!rgba[n]) { oom = 1; break; }
         const u32 lw = log2_u32(mw), lh = log2_u32(mh);
         const u8* level_src = src + off;
+        /* LD_PLANE_DUMP=1: write the first few big single-channel (B8) planes
+         * straight out as PGM, exactly as the guest laid them down. Settles
+         * "is the video decode producing an image?" without guessing from the
+         * composited frame. ponytail: one-shot debug, costs nothing when off. */
+        { static int pd = -1; static int pdn = 0;
+          if (pd < 0) { const char* e = getenv("LD_PLANE_DUMP"); pd = e ? atoi(e) : 0; }
+          if (pd && (int)g_ld_frames >= pd && m == 0 && base_fmt == TEX_FMT_B8 && mw >= 320 && pdn < 6) {
+              char fn[128];
+              snprintf(fn, sizeof fn, "scratch/plane_%02d_%ux%u_p%u.pgm", pdn, mw, mh, pitch);
+              FILE* pf = fopen(fn, "wb");
+              if (pf) {
+                  fprintf(pf, "P5\n%u %u\n255\n", mw, mh);
+                  for (u32 yy = 0; yy < mh; yy++)
+                      fwrite(level_src + (size_t)yy * pitch, 1, mw, pf);
+                  fclose(pf);
+                  fprintf(stderr, "[plane-dump] %s linear=%d\n", fn, linear);
+              }
+              pdn++;
+          } }
         for (u32 y = 0; y < mh; y++)
             for (u32 x = 0; x < mw; x++) {
                 const u8* pixel = linear
@@ -2292,6 +2317,28 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             entry->last_hash_frame != g_ld_frames) {
             int readable = 0;
             const u64 hash = texture_content_hash(t, &readable);
+            /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
+             * reads are microseconds apart, so they can only disagree if a
+             * guest thread is writing this texture right now -- i.e. we are
+             * decoding a half-written image. Pure observation; it changes
+             * nothing. Counts per source so one torn texture is attributable. */
+            { static int race = -1;
+              if (race < 0) race = getenv("LD_TEX_RACE") ? 1 : 0;
+              if (race && readable) {
+                  int r2 = 0;
+                  const u64 again = texture_content_hash(t, &r2);
+                  static unsigned long long checks = 0, torn = 0;
+                  checks++;
+                  if (r2 && again != hash) torn++;
+                  if ((checks % 256) == 0)
+                      fprintf(stderr,
+                              "[tex-race] src=%u:0x%08X %ux%u  torn %llu/%llu reads"
+                              " (%.1f%%)\n",
+                              t->location, t->offset, t->width, t->height,
+                              (unsigned long long)torn,
+                              (unsigned long long)checks,
+                              100.0 * (double)torn / (double)checks);
+              } }
             entry->last_hash_frame = g_ld_frames;
             if (readable && hash != entry->content_hash) {
                 ID3D12Resource* replacement =
@@ -3690,6 +3737,25 @@ static ID3D12PipelineState* get_pso(
                     rsx_dsp_reg(&g.rsx, 0x08E4 /* M_FP_ACTIVE_PROGRAM */), fp_loc, fp_off,
                     rsx_fp_read_word(fp_uc + 0), rsx_fp_read_word(fp_uc + 4),
                     rsx_fp_read_word(fp_uc + 8), rsx_fp_read_word(fp_uc + 12));
+            /* All-zero here has two very different causes: the offset resolved
+             * into the wrong memory, or nothing ever wrote the buffer. Scan
+             * forward for the first non-zero byte -- a hit a few hundred bytes
+             * on means the region IS populated and the offset is wrong; no hit
+             * across 64 KB means the producer never ran. */
+            {
+                const u8* q = guest_ptr(fp_loc, fp_off, 0x10000);
+                u32 i = 0;
+                if (q) { while (i < 0x10000u && !q[i]) i++; }
+                if (!q)
+                    fprintf(stderr, "[pso-bail]   (64 KB window not mapped)\n");
+                else if (i == 0x10000u)
+                    fprintf(stderr, "[pso-bail]   64 KB from here is entirely "
+                                    "zero -- nothing ever wrote this buffer\n");
+                else
+                    fprintf(stderr, "[pso-bail]   first non-zero byte at "
+                                    "+0x%X -- the region is populated, the "
+                                    "offset is wrong\n", i);
+            }
             fflush(stderr);
         }
         return NULL;
@@ -7595,6 +7661,34 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
+
+    /* LD_FRAME_DUMP=<dir> [+ LD_FRAME_DUMP_EVERY=<n>, default 300]: write the
+     * PRESENTED surface to a .ppm every n flips. The engine could already dump
+     * a surface, but only at shutdown or behind the parity harness -- neither
+     * reachable when a title is simply left running, which is exactly when you
+     * want to see what is on screen. PrintWindow and CopyFromScreen both come
+     * back white for a D3D12 swapchain, so a readback here is the only way to
+     * answer "what is it actually drawing?". */
+    { static int every = -1; static const char* dir; static unsigned n;
+      if (every < 0) { dir = getenv("LD_FRAME_DUMP");
+                       const char* e = getenv("LD_FRAME_DUMP_EVERY");
+                       every = (dir && dir[0]) ? (e ? atoi(e) : 300) : 0;
+                       if (every <= 0 && dir && dir[0]) every = 300; }
+      if (every > 0 && buffer_id < 8 && g.display_buffers[buffer_id].valid &&
+          (n++ % (unsigned)every) == 0) {
+          for (u32 i = 0; i < g.n_surfaces; i++) {
+              if (g.surfaces[i].location != g.display_buffers[buffer_id].location ||
+                  g.surfaces[i].offset   != g.display_buffers[buffer_id].offset) continue;
+              char path[MAX_PATH * 2];
+              snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dir, n - 1u);
+              const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[i]);
+              fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu\n", path,
+                      g.surfaces[i].w, g.surfaces[i].h,
+                      (unsigned long long)(nb == UINT64_MAX ? 0 : nb));
+              fflush(stderr);
+              break;
+          }
+      } }
     /* A flip names a registered display buffer. The current color target may
      * be an offscreen shadow/postprocess surface at that instant; copying it
      * caused a010 to present black despite executing the scene's draws. */
@@ -7625,6 +7719,24 @@ void rsx_live_draw_present(u32 buffer_id)
     g_ld_last_present_target = target;
     const u32 current = current_surface();
     surface_t* presented_surface = &g.surfaces[target];
+    /* LD_PRESENT_DBG=1: is this surface actually finished? A surface whose last
+     * clear is NEWER than its last draw has been wiped and not redrawn -- that
+     * presents as a black frame. Counting them separates "we present the wrong
+     * buffer" from "we present the right buffer too early". */
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("LD_PRESENT_DBG") ? 1 : 0;
+      if (dbg) {
+          static unsigned long long n = 0, blank = 0;
+          n++;
+          if (presented_surface->last_draw_generation <
+              presented_surface->last_clear_generation) blank++;
+          if ((n % 256) == 0)
+              fprintf(stderr,
+                      "[present] %llu/%llu presents showed a surface cleared "
+                      "after its last draw (%.1f%%)\n",
+                      (unsigned long long)blank, (unsigned long long)n,
+                      100.0 * (double)blank / (double)n);
+      } }
 #if !defined(YZ_PERF_CLEAN)
     presented_surface->last_present_copy_generation =
         ++g_ld_present_copy_generation;
