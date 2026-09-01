@@ -455,6 +455,31 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      *
      * This is opt-in: it repairs a pointer the guest should have supplied, so
      * it must not mask the real defect by default. */
+    /* SPU_DUMP_GET=<hexEA>: dump the source bytes the first time an SPU fetches
+     * from that address. Fixed BSS structures have the same address in a
+     * reference run, so this is what a dump from real hardware diffs against. */
+    if (mfc_is_get(cmd) && size && vm_base) {
+        static uint32_t s_dg = 0xFFFFFFFFu;
+        if (s_dg == 0xFFFFFFFFu) { const char* e = getenv("SPU_DUMP_GET");
+                                   s_dg = e ? (uint32_t)strtoul(e, 0, 0) : 0; }
+        if (s_dg && (uint32_t)ea == s_dg) {
+            static int done = 0;
+            if (!done) { done = 1;
+                uint32_t n = size > 128 ? 128 : size;
+                fprintf(stderr, "[get-dump] img%d GET 0x%08X size=%u pc=0x%05X\n",
+                        spu->image_id, (uint32_t)ea, size, (uint32_t)spu->pc & SPU_LS_MASK);
+                for (uint32_t o = 0; o < n; o += 16) {
+                    fprintf(stderr, "  +0x%03X:", o);
+                    for (uint32_t i = 0; i < 16; i += 4) {
+                        const uint8_t* q = vm_base + (uint32_t)ea + o + i;
+                        fprintf(stderr, " %02X%02X%02X%02X", q[0], q[1], q[2], q[3]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+                fflush(stderr);
+            }
+        }
+    }
     /* The DSP descriptor arrives as a 368-byte GET shortly before the section
      * load; remember where it came from so the substitution below can name it.
      * That guest address is what a write-watch needs to find its producer. */
