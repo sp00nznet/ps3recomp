@@ -360,7 +360,28 @@ static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= 1.
  * at the *lower* storage address). Same caveat as the mpy family. */
 static inline u128 spu_xsbh(u128 a) { u128 r; for(int i=0;i<8;i++) r._s16[i] = (int8_t)a._u8[2*i]; return r; }
 static inline u128 spu_xshw(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (int16_t)a._s16[2*i]; return r; }
-static inline u128 spu_xswd(u128 a) { u128 r; for(int i=0;i<2;i++) r._s64[i] = (int32_t)a._s32[2*i]; return r; }
+/* xswd: rt.doubleword[d] = sign_extend_64(ra.word[2d+1]) -- the ODD word of
+ * each doubleword, because that is the low half in big-endian order.
+ *
+ * This read the EVEN words (2d) and wrote the result through _s64, which is a
+ * host little-endian lane: writing it puts the value in _u32[2d] (SPU word 2d,
+ * the HIGH half) and the sign fill in _u32[2d+1]. Both halves were therefore
+ * wrong, and the common case -- a small positive value -- came out as ZERO.
+ *
+ * You Don't Know Jack's FMOD mixer hit exactly that: a compiler-generated
+ * 64-bit multiply helper received `1 * 0` instead of `1 * 16`, so the mixer's
+ * block count was zero and it stopped on its own assert. Unlike its siblings
+ * xsbh/xshw, whose source and destination swaps cancel, nothing cancels here.
+ * Write the two words explicitly. */
+static inline u128 spu_xswd(u128 a) {
+    u128 r;
+    for (int d = 0; d < 2; d++) {
+        int32_t v = (int32_t)a._u32[2*d + 1];
+        r._u32[2*d]     = (uint32_t)(v >> 31);   /* sign fill (high word) */
+        r._u32[2*d + 1] = (uint32_t)v;           /* value      (low word) */
+    }
+    return r;
+}
 
 /* ---- Phase 3: OR across ---- */
 static inline u128 spu_orx(u128 a) {
