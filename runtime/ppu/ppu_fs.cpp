@@ -222,7 +222,13 @@ static void cellFsOpen(ppu_context* ctx)
      * that is not running. */
     { char who[64] = "?";
       if (getenv("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
-          fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who); }
+          fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who);
+          /* FS_STACK=<substr>: every open funnels through one guest wrapper, so
+           * one caller level says nothing about WHICH subsystem wanted the file.
+           * Dump the guest call chain for the opens that matter. */
+          { const char* want = getenv("FS_STACK");
+            if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
+          } }
       else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
     if (getenv("YDKJ_USMBT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
@@ -313,6 +319,8 @@ static void cellFsSdataOpen(ppu_context* ctx)
 static void cellFsClose(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
+    if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+        fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (g_fd_usm[fd] && getenv("YDKJ_USMRD")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
         fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
@@ -451,6 +459,8 @@ static void cellFsLseek(ppu_context* ctx)
     uint32_t wh   = (uint32_t)ctx->gpr[5];
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+        fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
     fseek(g_files[fd], (long)off, worigin);
     long p = ftell(g_files[fd]);
@@ -502,6 +512,8 @@ static void cellFsFstat(ppu_context* ctx)
     int fd      = (int)(uint32_t)ctx->gpr[3];
     uint32_t sb = (uint32_t)ctx->gpr[4];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+        fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
     long cur = ftell(g_files[fd]);
     fseek(g_files[fd], 0, SEEK_END);
     long sz = ftell(g_files[fd]);
