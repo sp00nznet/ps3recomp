@@ -309,6 +309,25 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    /* WAITBT_EVERY=<n>: the same dump, but every nth wait per (tid,queue)
+     * instead of once. The one-shot above names where a thread FIRST parks,
+     * which is a boot-time answer; when a title runs for a while and then stops
+     * doing something, the question is where it is parked at the END, and the
+     * last dump in the log answers that. */
+    { static int every = -1;
+      if (every < 0) { const char* e = getenv("WAITBT_EVERY"); every = e ? atoi(e) : 0; }
+      if (every > 0) {
+          static unsigned n[8][8] = {{0}};
+          unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
+          if ((n[t][qk]++ % (unsigned)every) == 0) {
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              char tag[64];
+              snprintf(tag, sizeof tag, "wait#%u tid=%u q=%u",
+                       n[t][qk] - 1u, t, queue_id);
+              ppu_dump_guest_stack(ctx, tag);
+          }
+      } }
+
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
