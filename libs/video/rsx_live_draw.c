@@ -8066,7 +8066,12 @@ void rsx_live_draw_present(u32 buffer_id)
                   fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
           fps_t0 = now; fps_f0 = g_ld_frames;
       } }
-    if (LD_DIAG_ENABLED("YZ_RSX_DUMP") && g_ld_frames <= 8) {
+    /* YZ_RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
+     * a title whose content starts after the boot clears is invisible otherwise. */
+    static int ld_dump_every = -1;
+    if (ld_dump_every < 0) { const char* e = getenv("YZ_RSX_DUMP_EVERY"); ld_dump_every = e ? atoi(e) : 0; }
+    if (LD_DIAG_ENABLED("YZ_RSX_DUMP") &&
+        (g_ld_frames <= 8 || (ld_dump_every > 0 && (g_ld_frames % (u32)ld_dump_every) == 0))) {
         /* Dump the presented color surface (RENDER_TARGET state -> safe). */
         const u32 cur = current_surface();
         if (cur != LD_INVALID_SURFACE) {
