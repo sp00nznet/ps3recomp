@@ -3642,25 +3642,61 @@ static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
     return vp_instrs != 0;
 }
 
+/* LD_PSO_DBG=1: name the first bail-out of each kind in get_pso(). Every exit
+ * there returns NULL silently and the caller only counts drop{pso=N}, so a
+ * title whose draws ALL die in this function has no way to say which gate
+ * rejected them. One line per distinct reason, so a stuck title prints a
+ * handful of lines rather than one per draw. */
+static void ld_pso_bail(int* said, const char* reason)
+{
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("LD_PSO_DBG") ? 1 : 0;
+    if (!dbg || *said) return;
+    *said = 1;
+    fprintf(stderr, "[pso-bail] %s\n", reason);
+    fflush(stderr);
+}
+#define LD_PSO_BAIL(reason) \
+    do { static int _said_ = 0; ld_pso_bail(&_said_, (reason)); } while (0)
+
 static ID3D12PipelineState* get_pso(
     const rsx_vertex_layout_plan* masked_layout, int packed_payload)
 {
     memset(&g_ld_current_pso, 0, sizeof(g_ld_current_pso));
     const u32 start = rsx_dsp_vp_start(&g.rsx);
-    if (start >= RSX_DSP_VP_INSTR) return NULL;
+    if (start >= RSX_DSP_VP_INSTR) { LD_PSO_BAIL("no vertex program uploaded (vp start out of range)"); return NULL; }
     const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
     const u32 vp_instrs = rsx_vp_program_size_instrs(vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
-    if (!vp_instrs) return NULL;
+    if (!vp_instrs) { LD_PSO_BAIL("vertex program has zero instructions"); return NULL; }
 
     u32 fp_loc = 0;
     const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
     const u8* fp_uc = guest_ptr(fp_loc, fp_off, 16);
-    if (!fp_uc) return NULL;
+    if (!fp_uc) { LD_PSO_BAIL("fragment program address does not resolve to guest memory"); return NULL; }
     const u32 fp_size = rsx_fp_program_size(fp_uc, 0x10000);
-    if (!fp_size) return NULL;
+    if (!fp_size) {
+        /* No END-bit instruction in 64 KB: the bytes at (location, offset) are
+         * not a fragment program. Almost always the LOCATION is wrong, not the
+         * offset -- the same class of bug caner hit in Yakuza with textures --
+         * so report the register the guest actually wrote and the head of what
+         * we read, which is what says local-vs-main. */
+        static int said = 0;
+        if (!said && getenv("LD_PSO_DBG")) {
+            said = 1;
+            fprintf(stderr,
+                    "[pso-bail] fragment program size reads as zero: "
+                    "reg=0x%08X -> loc=%u off=0x%08X, first words "
+                    "%08X %08X %08X %08X\n",
+                    rsx_dsp_reg(&g.rsx, 0x08E4 /* M_FP_ACTIVE_PROGRAM */), fp_loc, fp_off,
+                    rsx_fp_read_word(fp_uc + 0), rsx_fp_read_word(fp_uc + 4),
+                    rsx_fp_read_word(fp_uc + 8), rsx_fp_read_word(fp_uc + 12));
+            fflush(stderr);
+        }
+        return NULL;
+    }
     /* re-resolve with the true size to validate the whole program is mapped */
     fp_uc = guest_ptr(fp_loc, fp_off, fp_size);
-    if (!fp_uc) return NULL;
+    if (!fp_uc) { LD_PSO_BAIL("fragment program is not fully mapped in guest memory"); return NULL; }
 
     /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
      * SHADER_CONTROL word bit 0x40 (same fix as the replay harness — the
@@ -3708,8 +3744,10 @@ static ID3D12PipelineState* get_pso(
     render_state_t rs;
     decode_render_state(&rs);
     if (rsx_fp_collect_constants(
-            fp_uc, fp_size, &g.fp_constants) < 0)
+            fp_uc, fp_size, &g.fp_constants) < 0) {
+        LD_PSO_BAIL("fragment program constant collection failed");
         return NULL;
+    }
     g.fp_alpha_ref = rsx_fp_alpha_ref(
         rs.alpha_ref_raw, rs.alpha_ref_format);
 
@@ -3719,8 +3757,10 @@ static ID3D12PipelineState* get_pso(
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
     else
         key = fnv1a(fp_uc, fp_size, key);
-    if (!key)
+    if (!key) {
+        LD_PSO_BAIL("shader hash collapsed to zero");
         return NULL;
+    }
     const u32 fp_ctrl_key = fp_ctrl & 0x40u;
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
@@ -3788,6 +3828,7 @@ static ID3D12PipelineState* get_pso(
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.pso_full++;
 #endif
+        LD_PSO_BAIL("PSO cache full (MAX_PSOS)");
         return NULL;
     }
 
