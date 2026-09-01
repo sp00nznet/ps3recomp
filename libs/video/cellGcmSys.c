@@ -1585,6 +1585,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
             (s_fifo_getoff == put ||
              (s_fifo_getoff > io_begin_chk &&
               s_fifo_getoff - io_begin_chk >= GCM_RECYCLE_MARGIN));
+        /* Already overrun. gcmReserve writes past `end` when its callback
+         * declines to recycle (AMGL's only prints), and once the guest is out
+         * there the walker follows into memory that is not the ring: `get`
+         * stops advancing, head_consumed can never become true again, and the
+         * title is wedged for good -- which is exactly where Virtua Fighter 5
+         * stops, at the same flip every run however long it is left.
+         *
+         * There is nothing left to protect at that point. Recycling loses
+         * whatever was written past the end; not recycling loses the rest of
+         * the run. */
+        if (begin && end > begin && cur >= end) head_consumed = 1;
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed) {
             u32 io_begin = gcm_ea2io(begin);
