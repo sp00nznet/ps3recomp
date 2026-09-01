@@ -1774,8 +1774,29 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
           unsigned long long now = ps3_ms_now();
           if (!t0) t0 = now;
           ++n;
-          if (n <= 400ull || (n % 100ull) == 0)
+          if (n <= 400ull || (n % 10ull) == 0)
               fprintf(stderr, "[flip] %llu at %llu ms%c", n, now - t0, 10);
+      } }
+
+    /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
+     * around n. When a title renders correctly for a while and then stops
+     * submitting -- no error, no unresolved import, no overflow -- the only
+     * thing separating the last good frame from the first missing one is what
+     * the render path was doing on each. This is the window onto that. */
+    { static long long at = -2;
+      if (at == -2) { const char* e = getenv("GCM_FLIP_BT"); at = e ? atoll(e) : -1; }
+      if (at >= 0) {
+          static unsigned long long m = 0;
+          ++m;
+          if ((long long)m >= at - 5 && (long long)m <= at + 5) {
+              extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              if (g_active_ctx) {
+                  char tag[48];
+                  snprintf(tag, sizeof tag, "flip#%llu", m);
+                  ppu_dump_guest_stack(g_active_ctx, tag);
+              }
+          }
       } }
 
     { static int _n=0; if (getenv("FLIP_DBG") && _n++ < 20)
