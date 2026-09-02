@@ -18,6 +18,7 @@
  * Compiled as C++ to match the lifted output's `extern "C"` / __declspec(thread).
  */
 
+#include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);

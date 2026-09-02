@@ -346,8 +346,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
     }
 
-    /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA's 128B
-     * line (e.g. a SPURS event flag) -- who tries to set it, from where. */
+    /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA`s 128B line.
+     * SPU_ATOM_FULL=1 additionally dumps 32 bytes of the line before and after.
+     *
+     * Built into ONE buffer and written with a single fprintf: several SPU host
+     * threads and the PPU all write stderr, so a dump split across many fprintf
+     * calls comes out shredded and unreadable exactly when it matters. */
     { static int s_ae = -1; static uint32_t s_aea;
       if (s_ae < 0) { const char* e = getenv("SPU_ATOM_EA");
         s_aea = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_ae = s_aea ? 1 : 0;
@@ -358,19 +362,27 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (_n++ < 48) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
-              /* lr (gpr[0]) too: these atomics sit in generic inc/dec helpers, so
-               * pc names the HELPER and only the link register names the caller
-               * that gives the counter its meaning. */
-              fprintf(stderr, "[atom-ea] cmd=0x%X img=%d pc=0x%05X lr=0x%05X ea=0x%08X "
-                      "RAM=%02X%02X%02X%02X %02X%02X%02X%02X",
-                      cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)ea,
-                      r[0],r[1],r[2],r[3], r[4],r[5],r[6],r[7]);
+              static int s_af = -1;
+              if (s_af < 0) s_af = getenv("SPU_ATOM_FULL") ? 1 : 0;
+              char buf[640]; int p = 0;
+              /* lr (gpr[0]) as well as pc: these atomics sit in generic helpers,
+               * so pc names the HELPER and only lr names the real caller. */
+              p += snprintf(buf + p, sizeof buf - p,
+                            "[atom-ea] cmd=0x%X img=%d pc=0x%05X lr=0x%05X ea=0x%08X",
+                            cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                            ctx->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)ea);
+              int nb = s_af ? 64 : 8;   /* 64 covers +0x30 pendingRecv */
+              p += snprintf(buf + p, sizeof buf - p, " RAM=");
+              for (int i = 0; i < nb && p < (int)sizeof buf - 4; i++)
+                  p += snprintf(buf + p, sizeof buf - p, "%02X%s", r[i],
+                                (i % 4 == 3) ? " " : "");
               if (cmd == MFC_PUTLLC_CMD) {
-                  fprintf(stderr, " STORE=%02X%02X%02X%02X %02X%02X%02X%02X",
-                          ls[0],ls[1],ls[2],ls[3], ls[4],ls[5],ls[6],ls[7]);
+                  p += snprintf(buf + p, sizeof buf - p, " STORE=");
+                  for (int i = 0; i < nb && p < (int)sizeof buf - 4; i++)
+                      p += snprintf(buf + p, sizeof buf - p, "%02X%s", ls[i],
+                                    (i % 4 == 3) ? " " : "");
               }
-              fprintf(stderr, "\n"); fflush(stderr);
+              fprintf(stderr, "%s\n", buf); fflush(stderr);
           }
       } }
     /* Bink sync-line atomic trace (armed by the PPU-side producer probe). */
@@ -933,6 +945,37 @@ int spu_overlay_match_sig(const uint8_t hdr[16])
  * syscallAddr (in the cri dispatch) and INTERCEPT a branch to it here to HLE the
  * syscall. num = r3&0xF (0x10 bit = the "2" variant), args in r4. Adopted from the
  * JonathanDC64/ps3recomp fork (aaea4158) which uses this to run SPURS tasks clean. */
+/* Write the event bits a PPU-side Set owed this wait object into guest memory,
+ * at object+0x00 (events) and every object+0x30 slot (pendingRecv).
+ *
+ * Called from the WAIT_SIGNAL handler immediately before control returns to the
+ * guest. Doing it at Set time loses a race: the guest reads object+0x30 the
+ * instant it resumes, and a task that took the latched-wake path was never
+ * parked for the Set to target. Here the guest demonstrably has not read yet.
+ *
+ * ponytail: fills all 16 slots rather than the one the guest picked -- the slot
+ * index is derived from state we do not model, and a wrong slot delivers
+ * nothing. Narrow it if a title ever cares which slot fired. */
+static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
+{
+    (void)ctx;
+    static int s_od = -1;
+    if (s_od < 0) s_od = getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0;
+    if (!s_od || !wobj || !vm_base) return;
+    extern uint16_t spu_ef_bits_take(uint32_t);
+    uint16_t bits = spu_ef_bits_take(wobj);
+    if (!bits) return;
+    uint8_t* m = vm_base + wobj;
+    m[0] = (uint8_t)(bits >> 8); m[1] = (uint8_t)bits;          /* +0x00 events */
+    for (uint32_t s = 0; s < 16; s++) {                          /* +0x30 slots */
+        m[0x30 + 2*s]     = (uint8_t)(bits >> 8);
+        m[0x30 + 2*s + 1] = (uint8_t)bits;
+    }
+    { static int _n = 0; if (_n++ < 8)
+        fprintf(stderr, "[spu] delivered owed bits=0x%04X to object 0x%08X \n",
+                (unsigned)bits, wobj); }
+}
+
 #define YDKJ_TASKSET_PM_SYSCALL_ADDR 0xA70u
 void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
@@ -941,6 +984,18 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
     { static int _n = 0; if (_n++ < 24)
         fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X\n",
                 num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+    /* The task-API argument is passed in LOCAL STORE at 0x2FD0, not in r4: the
+     * caller does shufb(arg,...) -> stqd 0x2FD0 and only then sets r3 = number
+     * (see func_00026DE0 / func_000272AC in image 22). Logging r4 shows caller
+     * leftovers and hides what the task actually asked for. */
+    { static int s_sa = -1; if (s_sa < 0) s_sa = getenv("YDKJ_SYSCALL_ARG") ? 1 : 0;
+      if (s_sa) { static int _n = 0; if (_n++ < 40) {
+        const uint8_t* a = &ctx->ls[0x2FD0];
+        fprintf(stderr, "[spu] syscall num=%u LS[0x2FD0]=%02X%02X%02X%02X %02X%02X%02X%02X"
+                        " %02X%02X%02X%02X %02X%02X%02X%02X img=%d\n",
+                num, a[0],a[1],a[2],a[3], a[4],a[5],a[6],a[7],
+                a[8],a[9],a[10],a[11], a[12],a[13],a[14],a[15], ctx->image_id);
+        fflush(stderr); } } }
     /* NOTE (YDKJ cri_mpv): the cri task's BOOTSTRAP (func_00003040) calls the
      * task-API syscall and EXPECTS IT TO RETURN, then branches to the real task
      * entry (0x3050). Halting on num=0 here kills the task at bootstrap before it
@@ -949,6 +1004,22 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * spin; if that happens, gate a real halt after the task has done work.)
      * For non-cri images keep the fork's EXIT=halt semantics. Env YDKJ_CRI_EXIT_HALT
      * forces the old halt behaviour for comparison. */
+    /* The cri bootstrap calls EXIT once and EXPECTS IT TO RETURN, then branches to
+     * the real task entry -- so image 22 cannot halt on the first one. But a task
+     * that has since done work and calls EXIT again means it: returning there makes
+     * it re-enter and spin (observed: 6x num=0 from link 0x26E18 once the task is
+     * woken). Honour the first call, halt on the rest. Each task runs on its own
+     * host thread, so a thread-local count is per task. */
+    static _Thread_local int s_exit_seen = 0;
+    if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
+        if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
+        { static int _n = 0; if (_n++ < 8)
+            fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
+                    s_exit_seen); }
+        ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+        spu_halt(ctx);
+        return;
+    }
     if (num == 0 && (ctx->image_id != 22 || getenv("YDKJ_CRI_EXIT_HALT"))) {
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
@@ -968,6 +1039,45 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
                        ((uint32_t)ctx->ls[0x27BE] << 8)  |  (uint32_t)ctx->ls[0x27BF];
         uint32_t tid = ((uint32_t)ctx->ls[0x27D4] << 24) | ((uint32_t)ctx->ls[0x27D5] << 16) |
                        ((uint32_t)ctx->ls[0x27D6] << 8)  |  (uint32_t)ctx->ls[0x27D7];
+        /* The guest names its wait OBJECT in the task-API argument at LS 0x2FD0
+         * (low nibble is flags). It reads its received event bits from
+         * object+0x30, so this is both who to wake and where to deliver. */
+        uint32_t wobj = (((uint32_t)ctx->ls[0x2FDC] << 24) |
+                         ((uint32_t)ctx->ls[0x2FDD] << 16) |
+                         ((uint32_t)ctx->ls[0x2FDE] << 8)  |
+                          (uint32_t)ctx->ls[0x2FDF]) & ~0xFu;
+        /* SPURS_EF_SPU_REPLY=1 -- DIAGNOSTIC BISECT, NOT A FIX.
+         *
+         * The guest task is supposed to set its SPU->PPU flag (object+0x100)
+         * when a work cycle completes; it never does, so the PPU blocks on that
+         * flag forever and can never enqueue the next unit of work. That is a
+         * cycle: we cannot see what the PPU would do next without breaking it.
+         *
+         * On RE-ENTRY to WAIT_SIGNAL for the same object the previous cycle has
+         * finished, so set the flag on the task`s behalf and watch where the PPU
+         * goes. This FABRICATES guest state -- the repo`s own history says faked
+         * success is the most expensive kind of bug (see the unresolved-NID note
+         * in ppu_hle.cpp), so it stays opt-in and must never become the default.
+         * If the PPU advances, the answer is what the task must do to earn it. */
+        { static int s_rp = -1;
+          if (s_rp < 0) { const char* e = getenv("SPURS_EF_SPU_REPLY");
+                          s_rp = e ? atoi(e) : 0; }   /* 2 = reply on EVERY entry */
+          if (s_rp && wobj) {
+              static uint32_t seen[8]; static int seen_n = 0;
+              int again = 0;
+              for (int i = 0; i < seen_n; i++) if (seen[i] == wobj) { again = 1; break; }
+              if (s_rp >= 2) again = 1;   /* force: answer "would the PPU move at all?" */
+              if (!again) { if (seen_n < 8) seen[seen_n++] = wobj; }
+              else {
+                  extern void spurs_ef_set_from_spu(uint32_t, uint16_t);
+                  spurs_ef_set_from_spu(wobj + 0x100u, 1);
+                  static int _n = 0;
+                  if (_n++ < 8)
+                      fprintf(stderr, "[spu] SPU-REPLY: set flag 0x%08X for object "
+                                      "0x%08X (cycle complete)\n", wobj + 0x100u, wobj);
+              }
+          } }
+
         if (ts) {
             extern int spu_taskset_wait_signal(uint32_t, uint32_t);
             /* Park = OS-level wait on this SPU's host thread. Under the lockstep
@@ -975,9 +1085,22 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
              * releasing it starves every other lifted SPU (observed: FMOD task 1
              * parks in WAIT_SIGNAL holding the token -> the mixer never runs
              * again -> the PPU audio pump blocks forever on flag 0x94F600). */
+            /* Publish that this task is parked so a PPU-side event-flag Set can
+             * reach it even though it registered no wait slot in the flag. */
+            extern void spu_taskset_parked_add(uint32_t, uint32_t, uint32_t);
+            extern void spu_taskset_parked_del(uint32_t, uint32_t);
+            extern int spu_taskset_consume_wake(uint32_t);
+            if (spu_taskset_consume_wake(ts)) {   /* a Set beat us to the park */
+                spu_ef_deliver_owed(ctx, wobj);
+                ctx->gpr[3]._u32[0] = 0;
+                return;
+            }
             yz_lockstep_block_begin(ctx);
+            spu_taskset_parked_add(ts, tid, wobj);
             spu_taskset_wait_signal(ts, tid);
+            spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);
+            spu_ef_deliver_owed(ctx, wobj);
         }
         ctx->gpr[3]._u32[0] = 0;
         return;

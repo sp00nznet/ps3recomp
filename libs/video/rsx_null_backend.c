@@ -44,6 +44,8 @@ static NullBackendState s_state;
  * Win32 window procedure
  * -----------------------------------------------------------------------*/
 
+static int s_present_suppressed = 0;
+
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -134,6 +136,9 @@ static void null_end_frame(void* ud)
 
 static void null_present(void* ud, u32 buffer_id)
 {
+    /* The live draw engine presents through its own swap chain on this HWND;
+     * leaving the GDI blit running underneath would fight it for the window. */
+    if (s_present_suppressed) return;
     (void)ud;
     (void)buffer_id;
 
@@ -285,6 +290,19 @@ int rsx_null_backend_pump_messages(void)
         DispatchMessageA(&msg);
     }
     return s_state.window_closed ? -1 : 0;
+}
+
+/* Ported from caner (canersaka) Yakuza-Dead-Souls-EX: the live NV4097->D3D12
+ * engine binds its swap chain to this window and then owns presentation, so it
+ * needs the HWND and a way to silence the GDI present underneath it. */
+void* rsx_null_backend_get_hwnd(void)
+{
+    return (void*)s_state.hwnd;
+}
+
+void rsx_null_backend_suppress_present(int on)
+{
+    s_present_suppressed = on;
 }
 
 #else /* !_WIN32 */
@@ -608,6 +626,8 @@ void rsx_null_backend_shutdown(void)
 int rsx_null_backend_pump_messages(void) { return 0; }
 
 void rsx_null_backend_present(void) { nullsw_present(NULL, 0); }
+void* rsx_null_backend_get_hwnd(void) { return 0; }
+void  rsx_null_backend_suppress_present(int on) { (void)on; }
 
 u32 rsx_null_backend_debug_color(void) { return s_soft.clear_argb; }
 

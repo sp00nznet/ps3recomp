@@ -751,6 +751,118 @@ static pthread_mutex_t s_sig_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
 #endif
 
+/* Which (taskset, task) pairs are currently parked in WAIT_SIGNAL.
+ *
+ * A PPU->SPU event-flag Set must be able to reach a task that parked WITHOUT
+ * registering a wait slot in the flag: our Set path only signalled tasks listed
+ * in the flag`s `used` bitmask, so such a task slept forever while the producer`s
+ * memory looked perfectly intact. Same failure class canersaka documented for
+ * SPURS queues in Yakuza Dead Souls ("the HLE previously woke only its host
+ * condvar, which lifted SPU consumer tasks never wait on").
+ *
+ * ponytail: deliberately lock-free and racy. A missed entry costs one 1s poll
+ * timeout in the waiter; a stale entry costs one spurious signal, which is safe
+ * because signals are LATCHED in guest state (CSTS_SIGNALLED) and every wait
+ * loop re-checks its own predicate. Add a lock only if this ever needs to be
+ * authoritative rather than a hint. */
+void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined below */
+
+#define SPU_PARKED_MAX 64
+static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
+static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
+
+void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
+{
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++)
+        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
+}
+
+void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
+{
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++)
+        if (s_parked[i] == key) { s_parked[i] = 0; return; }
+}
+
+/* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
+ *
+ * Writing the bits at Set time loses a race: the guest reads them from
+ * object+0x30 immediately on resuming, and a task that took the latched-wake
+ * path was never parked for the Set to target. So the Set only RECORDS what is
+ * owed, and the WAIT_SIGNAL handler writes it into guest memory just before it
+ * hands control back -- at which point the guest cannot yet have read it. */
+#define SPU_EFBITS_MAX 16
+static volatile uint32_t s_efbits_obj[SPU_EFBITS_MAX];
+static volatile uint32_t s_efbits_val[SPU_EFBITS_MAX];
+
+void spu_ef_bits_post(uint32_t obj, uint16_t bits)
+{
+    if (!obj) return;
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == obj) { s_efbits_val[i] |= bits; return; }
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == 0) { s_efbits_val[i] = bits; s_efbits_obj[i] = obj; return; }
+}
+
+/* Take (and clear) whatever is owed to `obj`. 0 = nothing pending. */
+uint16_t spu_ef_bits_take(uint32_t obj)
+{
+    if (!obj) return 0;
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == obj) {
+            uint16_t v = (uint16_t)s_efbits_val[i];
+            s_efbits_obj[i] = 0; s_efbits_val[i] = 0;
+            return v;
+        }
+    return 0;
+}
+
+/* A direction-2 Set that finds NOBODY parked yet is a lost wakeup: the task
+ * parks a moment later and sleeps through the signal it was meant to get. Latch
+ * one pending wake per taskset; the next task to park consumes it instead of
+ * sleeping. One bit, not a counter -- SPURS signals are latched, not queued, so
+ * two Sets before a park must not buy two passes through the wait. */
+#define SPU_WAKE_LATCH_MAX 16
+static volatile uint32_t s_wake_latch[SPU_WAKE_LATCH_MAX];   /* taskset EA, 0 = free */
+
+void spu_taskset_latch_wake(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return;
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == taskset_ea) return;          /* already latched */
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == 0) { s_wake_latch[i] = taskset_ea; return; }
+}
+
+/* Consume a latched wake for this taskset. Returns 1 if one was pending. */
+int spu_taskset_consume_wake(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return 0;
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == taskset_ea) { s_wake_latch[i] = 0; return 1; }
+    return 0;
+}
+
+/* Signal every task of `taskset_ea` currently parked. Returns how many. */
+/* Wake only the task parked on `wait_obj` (0 = any task of the taskset).
+ * The guest names its wait object in the WAIT_SIGNAL argument, and for YDKJ`s
+ * CRI tasks the flag the PPU sets is exactly wait_obj + 0x80 -- so a Set can
+ * address the one task that was waiting for it instead of every parked task. */
+int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
+{
+    if (!taskset_ea) return 0;
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k || (uint32_t)(k >> 32) != taskset_ea) continue;
+        if (wait_obj && s_parked_obj[i] && s_parked_obj[i] != wait_obj) continue;
+        spu_taskset_signal_task(taskset_ea, (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
 /* Deliver a signal to a task (callable from any PPU/host thread). */
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {

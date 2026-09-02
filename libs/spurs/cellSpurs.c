@@ -272,6 +272,63 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
             spu_taskset_signal_task(taskset_ea, taskId);
         }
     }
+
+    /* SPURS_EF_WAKE_PARKED: a task that parked in WAIT_SIGNAL WITHOUT registering
+     * a wait slot in this flag is unreachable by the loop above, which only
+     * signals slots present in `used`. YDKJ CRI tasks do exactly that, so a
+     * PPU->SPU Set (direction 2) delivered nothing and they slept forever. Same
+     * failure class canersaka documented for SPURS queues in Yakuza Dead Souls:
+     * the HLE woke only its host condvar, which lifted SPU tasks never wait on.
+     * Signalling a task that was not waiting on THIS flag is safe -- signals are
+     * latched in guest state and every wait loop re-checks its own predicate. */
+    /* Record the bits this Set owes the task waiting on (flag - 0x80),
+     * unconditionally. Gating this on EF_DIRECTION made delivery depend on
+     * Initialize having already run, and the CRI flags are Set before that --
+     * so the post silently never happened. An unclaimed post is harmless: it is
+     * only ever consumed by a task that names this exact object in its wait. */
+    if (ea > 0x80u) {
+        uint32_t obj = ea - 0x80u;
+        /* Write NOW *and* record for consume time. The two orderings are both
+         * real and neither alone is enough: if the task has not read yet the
+         * immediate write is what it sees, and if it is parked (or took the
+         * latched-wake path and never parked at all) the WAIT_SIGNAL handler
+         * replays it just before returning. Writing the same bits twice is
+         * idempotent, so covering both costs nothing and removes the race that
+         * made this fire in only 1 of 4 runs. */
+        { static int s_od = -1;
+          if (s_od < 0) s_od = getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0;
+          if (s_od) {
+              vm_write16(obj + EF_EVENTS, bits);
+              for (uint32_t s = 0; s < 16; s++)
+                  vm_write16(obj + EF_PENDING_RECV_EVT + 2u * s, bits);
+          } }
+        { extern void spu_ef_bits_post(uint32_t, uint16_t);
+          spu_ef_bits_post(obj, bits); }
+    }
+    if (!pendingRecv) {
+        static int s_wp = -1;
+        if (s_wp < 0) s_wp = getenv("SPURS_EF_WAKE_PARKED") ? 1 : 0;
+
+        if (s_wp && vm_read8(ea + EF_DIRECTION) == 2) {
+            uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
+            /* The task waiting for THIS flag parked on object (flag - 0x80):
+             * YDKJ CRI obj 0x006B4500/4780/4A00 <-> flag 0x006B4580/4800/4A80.
+             * Fall back to any parked task of the taskset if none matches. */
+            extern int spu_taskset_signal_parked_obj(uint32_t, uint32_t);
+
+            int woke = spu_taskset_signal_parked_obj(taskset_ea, ea - 0x80u);
+            if (!woke) woke = spu_taskset_signal_parked_obj(taskset_ea, 0);
+            if (!woke) {   /* nobody parked yet -- do not lose the wakeup */
+                extern void spu_taskset_latch_wake(uint32_t);
+                spu_taskset_latch_wake(taskset_ea);
+            }
+            static int _n = 0;
+            if (woke && _n++ < 12)
+                fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X woke %d parked "
+                                "task(s) on taskset 0x%08X (no wait slot)\n",
+                        ea, woke, taskset_ea);
+        }
+    }
 }
 
 /* SPU-side entry (Layer 2): a task's flag Set arriving via the taskset
@@ -872,6 +929,29 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
      * whose lsPattern doesn't cover its stack (0x8041090F). */
     attr->lsPattern_ea = (u32)(uintptr_t)lsPattern;
     attr->argument_ea  = (u32)(uintptr_t)argument;
+
+    /* SPURS_TASKATTR_R8: some callers use a SIX-argument form, passing only
+     * r3..r8 -- r9/r10 then hold caller leftovers, not arguments. YDKJ is one:
+     * func_00331DA4 sets r3..r8 and nothing else, so our 8-parameter prototype
+     * reads lsPattern=r9 (a size, 0x0003D400) and argument=r10 (0x2E, the ASCII
+     * terminator its hex-string parser stopped on). r8 is the real 16-byte
+     * CellSpursTaskArgument -- proven by its contents matching the quadword the
+     * SPU task later receives in r3. A zero/garbage argument makes the SPU task
+     * library refuse every blocking wait (0x8041090F), which is exactly how the
+     * CRI tasks end up parked in WAIT_SIGNAL forever.
+     * CONFIRMED by a second, independently lifted title: Jackbox Party Pack
+     * calls the same NID with the same shape -- r3=attr, r4=1, r5=0x00330000,
+     * r6=eaElf, r7=sp+0x180, r8=sp+0x170 (two adjacent 16-byte blocks), and
+     * r9/r10 never written. Two unrelated callers agreeing settles it, so this
+     * is now the default; SPURS_TASKATTR_LEGACY=1 restores the old 8-arg read. */
+    { static int s_r8 = -1;
+      if (s_r8 < 0) s_r8 = getenv("SPURS_TASKATTR_LEGACY") ? 0 : 1;
+      if (s_r8) {
+          attr->argument_ea  = (u32)sizeContext;   /* r8 */
+          attr->lsPattern_ea = 0;                  /* r9 was a leftover */
+          printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
+                 attr->argument_ea, (u32)(uintptr_t)argument);
+      } }
     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
            (u32)eaElf, (u32)eaContext, sizeContext,
            attr->lsPattern_ea, attr->argument_ea);

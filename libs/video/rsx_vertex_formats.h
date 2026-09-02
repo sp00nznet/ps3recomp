@@ -46,6 +46,20 @@ static inline u32 rsx_vertex_attrib_size(u32 type, u32 num_components)
     return rsx_vertex_type_size(type) * num_components;
 }
 
+/* Resolve one attribute's element under
+ * NV4097_SET_FREQUENCY_DIVIDER_OPERATION. Frequency 0/1 is ordinary vertex
+ * fetch, a set operation bit is modulo (instanced template), and a clear bit
+ * is division (one per-instance datum shared by `frequency` vertices). */
+static inline u32 rsx_vertex_element_index(u32 vertex_id, u32 base_index,
+                                           u32 frequency, u32 modulo)
+{
+    if (frequency <= 1)
+        return (vertex_id + base_index) & 0x000FFFFFu;
+    if (modulo)
+        return vertex_id % frequency;
+    return vertex_id / frequency;
+}
+
 /* DXGI format values for D3D12 input layout */
 #define DXGI_FORMAT_R32_FLOAT           41
 #define DXGI_FORMAT_R32G32_FLOAT        16

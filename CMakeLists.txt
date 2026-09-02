@@ -39,6 +39,7 @@ file(GLOB_RECURSE HLE_SOURCES
     "libs/font/*.c"
     "libs/misc/*.c"
     "libs/hardware/*.c"
+    "runtime/diag/*.c"      # yz_frontier_trace, used by the live draw engine
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
