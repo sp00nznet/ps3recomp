@@ -214,9 +214,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * SPU_DMA_LAX=1 restores the old permissive behaviour. */
     { static int s_lax = -1; if (s_lax < 0) s_lax = getenv("SPU_DMA_LAX") ? 1 : 0;
       if (!s_lax) {
+          /* A PUT into the null page is the same class of accident: lv2 reserves
+           * the low 64 KB and no title DMAs there on purpose, so an EA that
+           * small means the descriptor field holding the real destination came
+           * through as zero. GT5P's second audio job spills its whole local
+           * store (0x0000/0x4000/0x8000, 34 KB) to EA 0 on every pass --
+           * 363,577 of 364,600 PUTs in a 40 s boot. Performing them writes
+           * nothing useful and buries the real destinations in the histogram.
+           * GETs from low EAs stay allowed: they only read garbage, and
+           * LBP_SKIP_NULL_DMA already exists to test zeroing them instead. */
           int malformed = (size == 0) || (size > 0x4000)
                        || (size >= 16 && (size & 15))
-                       || (((lsa ^ (uint32_t)ea) & 15) != 0);
+                       || (((lsa ^ (uint32_t)ea) & 15) != 0)
+                       || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
           if (malformed) {
               static int _n = 0;
               if (_n++ < 8)
