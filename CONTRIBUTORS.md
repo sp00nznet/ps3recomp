@@ -135,6 +135,18 @@ guest-ABI and lv2 batch:
 - Plus the **`sync_stress` lv2 target wired into the build**, so the semaphore
   behaviour above stays executable outside a generated title (#88).
 
+*The live RSX draw engine (**v0.10.0** "Three Platforms")* — a second, independent
+draw engine beside the one [@sagemono](https://github.com/sagemono) built, brought
+upstream from the [Yakuza: Dead Souls EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX)
+port (#113). It executes the guest's NV4097 command stream **as it arrives**
+rather than replaying a recorded frame. `rsx_live_draw.c`, `rsx_dispatch.*`,
+`rsx_vertex_compact.*`, `rsx_restart_cuts.h` and the vertex/fragment-program
+decompiler updates are his work; it is opt-in behind `RSX_LIVE_DRAW`, so the
+existing backend path is untouched when it is off. A second title driving the
+same engine then needed the FIFO subchannel treated as a binding slot rather
+than an engine selector, HDR (`F_W16Z16Y16X16`) colour surfaces, and
+fragment-output NaN guards — all on top of his engine, not in place of it.
+
 ### Jonathan Del Corpo — [@JonathanDC64](https://github.com/JonathanDC64)
 Correctness and robustness fixes distilled from a **Demon's Souls** port that
 stress-tested the toolkit against a ~106k-function title. The title-agnostic wins

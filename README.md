@@ -64,6 +64,41 @@ a runner with no display and no GPU. It is not a renderer — no depth, no
 blending, no textures — so Linux is still one real backend, plus the same PPU
 boot scaffold macOS needs, away from running a title.
 
+### What each platform needs next
+
+Both non-Windows platforms are blocked on the *same* two things, in this order.
+
+**1. The PPU boot scaffold, on POSIX.** This is the shared blocker and the only
+one that gates "runs a recompiled game" on both. `ppu_loader.cpp`,
+`boot_main.cpp` and the HLE dispatch are compiled *per game* rather than into
+the library, and were Win32-only — thread creation, `VirtualAlloc`, SEH, stack
+walking. v0.10.0 took it to zero errors on POSIX and put it under CI so it
+cannot rot again, and ported the guest-pointer trap, thread-locals and host
+backtraces. What is left is running it: load a lifted image on POSIX and reach
+the guest's first instruction, then `main`. Until that works, neither platform
+can run a title no matter how good its renderer is.
+
+**2. One real backend each.** The RSX abstraction landed in v0.10.0 (#101, #102,
+#103) — texture conversion, the `TEXTURE_CONTROL1` crossbar, texture layout and
+a neutral draw record all live outside the D3D12 file now, so a backend no
+longer has to reimplement them to draw anything.
+
+- **macOS** has the furthest to go that is *interesting* rather than
+  mechanical: [@slushiimusic](https://github.com/slushiimusic)'s Metal backend
+  (#96) does clear, flip, guest vertex fetch, a pipeline-state cache and blend
+  translation. Reaching D3D12 parity means the guest's own fragment programs
+  through the decompiler, then textures. `ps3recomp_host` already drives
+  cellGcm → RSX → Metal with no lifted game, so each step is testable before a
+  title exists to run.
+- **Linux** has no renderer at all — the headless backend is a CPU triangle
+  filler for CI, deliberately. Vulkan is the obvious target, and it starts from
+  the same neutral draw record Metal reads.
+
+**Deliberately not claimed:** the table above says "no" for running a game on
+macOS and Linux, and it will keep saying "no" until a title actually boots to
+gameplay on one of them. Building the runtime, passing the suites and rendering
+through `ps3recomp_host` are all real, and none of them is that.
+
 ## The Challenge
 
 The PS3's Cell processor is a beast unlike anything else:
@@ -379,6 +414,77 @@ ps3recomp is built by a growing community. See **[CONTRIBUTORS.md](CONTRIBUTORS.
 for who did what — thank you, everyone.
 
 ## Changelog
+
+### v0.10.0 — *"Three Platforms"* (September 2026)
+
+*Windows, macOS and Linux all build the runtime and pass the suites. A second*
+*draw engine lands beside the first — [@canersaka](https://github.com/canersaka)'s,*
+*brought across from his Yakuza port — the RSX backend finally gets a real*
+*abstraction instead of one D3D12 file, and* You Don't Know Jack *reaches*
+*gameplay.*
+
+**A second draw engine**
+
+- **The live NV4097 → D3D12 draw engine** — executes the guest's command stream
+  as it arrives rather than replaying a recorded frame. Brought across from the
+  [Yakuza: Dead Souls EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX)
+  port: `rsx_live_draw.c`, `rsx_dispatch.*`, `rsx_vertex_compact.*`,
+  `rsx_restart_cuts.h` and the VP/FP decompiler updates are
+  *[@canersaka](https://github.com/canersaka)*'s work (#113). Opt-in behind
+  `RSX_LIVE_DRAW`, so the existing backend path is unchanged when it is off.
+  This sits *beside* [@sagemono](https://github.com/sagemono)'s draw engine from
+  v0.7.0 — two independent renderers, not a replacement.
+- What a second title needed on top: the **FIFO subchannel is a binding slot,
+  not an engine selector** (a title binding NV4097 on subchannel 1 had every
+  `SET_SHADER_PROGRAM` dropped, so every draw ran one constant-black fragment
+  program); **HDR colour surfaces** (`F_W16Z16Y16X16` targets were created as
+  `R8G8B8A8_UNORM`, clamping every value above 1.0 on write); and fragment-output
+  NaN guards.
+
+**Three platforms**
+
+- **Linux bring-up** (#100) — CI, a headless RSX backend, and the PPU boot
+  scaffold taken to zero errors on POSIX. The headless path is a host-memory
+  framebuffer with a CPU triangle filler: enough to prove the guest's command
+  stream produced the pixels it asked for on a runner with no display and no
+  GPU. It is not a renderer, and the README says so.
+- **The RSX backend gets an abstraction.** Texture pixel conversion (#101), the
+  `TEXTURE_CONTROL1` crossbar decode (#102), texture layout, and one primitive
+  truth table with a draw record that is not a D3D structure (#103) all lifted
+  out of the D3D12 backend — so Metal and the headless backend read the same
+  neutral values instead of reimplementing them.
+- **CI samples a real guest texture with no GPU anywhere** (#106), and the
+  frame clock starts on POSIX (#105).
+- Portable plumbing throughout: one thread-local spelling reachable from the
+  boot scaffold, host backtrace diagnostics on POSIX, Win32 types and
+  interlocked ops on POSIX, and an in-tree Win32 `dirent.h`.
+
+**Runtime correctness**
+
+- **`CellSyncMutex` is a ticket lock, not a 0/1 flag** (#118) — the guest word
+  is big-endian `m_freed`/`m_order` and free means `m_freed == m_order`. We
+  stored it host-endian and CAS'd it from zero, so a mutex the SPU left free at
+  `1/1` read as `0x01000100` and `TryLock` spun forever — 160 million times, in
+  the title that found it.
+- **`sys_mmapper_allocate_memory`** implemented (#112), **`cellSpurs`
+  `CreateJobChain` + `KickJobChain`** actually start the chain (#98),
+  **`cellDiscGameGetBootDiscInfo` takes one argument, not three** (#109),
+  **`sys_event` yields before refusing a receive on an invalid queue** (#110),
+  and **SPU MFC PUTs into the null page are rejected** (#107).
+- **The guest bounds check is inlined** (#116), and a port can **choose the
+  HLE-visible GCM window base** (#104).
+
+**Diagnostics**
+
+- **`LBP_WV`** watches PPU stores by value rather than by address (#108), the
+  write watch **says when it stops printing** and lets the cap be raised (#111),
+  the guard **prints the writer's live arguments** on every watched-line hit
+  (#99), plus `PS3_HLE_ARGS`, `PS3_WAIT_OBJ` and a settable SPU atomic-trace cap.
+
+**Ports**
+
+- ***You Don't Know Jack* reaches gameplay** — boots, renders its Scaleform UI,
+  navigates menus, loads an episode and puts answerable questions on screen.
 
 ### v0.9.1 — *"Downloads"* (August 2026)
 
