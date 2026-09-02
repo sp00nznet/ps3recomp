@@ -28,58 +28,109 @@
  * Mutex
  * =====================================================================*/
 
+/* CellSyncMutex is a TICKET lock, not a 0/1 flag, and it lives in guest memory
+ * that SPU code manipulates directly. Its 32-bit word is big-endian:
+ *
+ *     u16 m_freed;   // high half: tickets released
+ *     u16 m_order;   // low  half: next ticket to hand out
+ *
+ * free  <=> m_freed == m_order.  Treating the word as a host-endian flag and
+ * CAS-ing it from 0 means a mutex the SPU left at m_freed==m_order==1 reads as
+ * 0x01000100 -- never zero -- and TryLock spins forever. Swap to interpret. */
+static inline uint32_t sync_bswap32(uint32_t v)
+{
+    return (v >> 24) | ((v >> 8) & 0x0000FF00u) | ((v << 8) & 0x00FF0000u) | (v << 24);
+}
+
+/* ponytail: the sibling primitives below (barrier / rwlock / queue) still
+ * assume host-endian words. Same treatment when a title actually exercises
+ * them; not fixed blind here. */
+
+static int sync_trace(void){ static int v=-1; if(v<0){const char*e=getenv("SYNC_TRACE"); v=e?1:0;} return v; }
+#ifdef _WIN32
+#define SYNC_TID() ((unsigned long)GetCurrentThreadId())
+#else
+#define SYNC_TID() ((unsigned long)0)
+#endif
+
 s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
 {
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    atomic_store(&mutex->lock, 0);
+    atomic_store(&mutex->lock, 0);   /* m_freed = m_order = 0 -> free */
     return CELL_OK;
 }
 
 s32 cellSyncMutexLock(CellSyncMutex* mutex)
 {
+    unsigned int _ea = (unsigned int)(uintptr_t)mutex;
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    unsigned int expected;
-    int spins = 0;
-
+    /* Take a ticket. */
+    uint32_t raw, g;
+    uint16_t ticket;
     for (;;) {
-        expected = 0;
-        if (atomic_compare_exchange_weak(&mutex->lock, &expected, 1))
+        raw = atomic_load(&mutex->lock);
+        g   = sync_bswap32(raw);
+        ticket = (uint16_t)g;                       /* m_order */
+        uint32_t ng = (g & 0xFFFF0000u) | (uint16_t)(ticket + 1);
+        if (atomic_compare_exchange_weak(&mutex->lock, &raw, sync_bswap32(ng)))
+            break;
+    }
+    /* Wait until it is served. */
+    int spins = 0;
+    for (;;) {
+        g = sync_bswap32(atomic_load(&mutex->lock));
+        if ((uint16_t)(g >> 16) == ticket) {
+            if (sync_trace()) fprintf(stderr, "[SYNC] LOCK    ea=0x%08X tid=%lu ticket=%u\n",
+                                      _ea, SYNC_TID(), ticket);
             return CELL_OK;
-
-        if (++spins > 1000) {
-            SYNC_YIELD();
-            spins = 0;
         }
+        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
     }
 }
 
 s32 cellSyncMutexTryLock(CellSyncMutex* mutex)
 {
+    unsigned int _ea = (unsigned int)(uintptr_t)mutex;
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    unsigned int expected = 0;
-    if (atomic_compare_exchange_strong(&mutex->lock, &expected, 1))
-        return CELL_OK;
+    uint32_t raw = atomic_load(&mutex->lock);
+    uint32_t g   = sync_bswap32(raw);
+    uint16_t freed = (uint16_t)(g >> 16), order = (uint16_t)g;
 
-    return CELL_SYNC_ERROR_BUSY;
+    if (freed != order)                             /* someone holds it */
+        return CELL_SYNC_ERROR_BUSY;
+
+    uint32_t ng = ((uint32_t)freed << 16) | (uint16_t)(order + 1);
+    if (atomic_compare_exchange_strong(&mutex->lock, &raw, sync_bswap32(ng))) {
+        if (sync_trace()) fprintf(stderr, "[SYNC] TRYLOCK ea=0x%08X tid=%lu OK\n", _ea, SYNC_TID());
+        return CELL_OK;
+    }
+    return CELL_SYNC_ERROR_BUSY;                    /* lost the race */
 }
 
 s32 cellSyncMutexUnlock(CellSyncMutex* mutex)
 {
+    unsigned int _ea = (unsigned int)(uintptr_t)mutex;
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    atomic_store(&mutex->lock, 0);
-    return CELL_OK;
+    if (sync_trace()) fprintf(stderr, "[SYNC] UNLOCK  ea=0x%08X tid=%lu\n", _ea, SYNC_TID());
+    for (;;) {                                      /* m_freed++ */
+        uint32_t raw = atomic_load(&mutex->lock);
+        uint32_t g   = sync_bswap32(raw);
+        uint32_t ng  = ((uint32_t)(uint16_t)((g >> 16) + 1) << 16) | (uint16_t)g;
+        if (atomic_compare_exchange_weak(&mutex->lock, &raw, sync_bswap32(ng)))
+            return CELL_OK;
+    }
 }
 
 /* =========================================================================
