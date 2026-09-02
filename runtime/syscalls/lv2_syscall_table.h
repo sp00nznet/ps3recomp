@@ -289,11 +289,18 @@ static inline void lv2_syscall_dispatch(lv2_syscall_table* tbl, ppu_context* ctx
     ctx->gpr[3] = (uint64_t)handler(ctx);
 }
 
-/* Convenience wrapper using the global table */
-static inline void lv2_syscall(ppu_context* ctx)
-{
-    lv2_syscall_dispatch(&g_lv2_syscalls, ctx);
-}
+/* No lv2_syscall() wrapper here on purpose. The real one lives in the PPU
+ * boot harness (ppu_loader.cpp) and does considerably more than dispatch:
+ * it arms the page guard, tracks which lv2 call each guest thread is
+ * inside, handles the boot-critical calls inline and stamps the profiler.
+ * A convenience wrapper used to sit here, static inline, calling
+ * lv2_syscall_dispatch directly -- nothing called it, but any translation
+ * unit including both this header and the lifter-generated one bound the
+ * name to the stripped-down version instead of the real one, and the two
+ * declarations (extern there, static here) are contradictory besides.
+ * GCC rejects the combination outright; Clang accepted it. Call
+ * lv2_syscall_dispatch(&g_lv2_syscalls, ctx) if that is genuinely what
+ * you want. */
 
 /* ---------------------------------------------------------------------------
  * Argument extraction macros for syscall handlers

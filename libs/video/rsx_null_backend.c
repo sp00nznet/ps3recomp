@@ -327,6 +327,7 @@ void rsx_null_backend_suppress_present(int on)
  * -----------------------------------------------------------------------*/
 
 #include "rsx_vertex_fetch.h"
+#include "rsx_texture_layout.h"
 #include <stdlib.h>
 
 typedef struct {
@@ -336,6 +337,13 @@ typedef struct {
     u32  last_present;      /* centre pixel of the last presented frame */
     int  presented;
     const rsx_state* state; /* live state, for the draw path       */
+
+    /* One decoded texture unit. The point is not to be a sampler but to
+     * prove the shared RSX texture path end to end -- layout, deswizzle,
+     * channel order -- on a platform with no GPU at all. */
+    u8*  tex;               /* decoded RGBA rows, tex_pitch * tex_h  */
+    u32  tex_w, tex_h, tex_pitch;
+    int  tex_ready;
 } NullSoftState;
 
 static NullSoftState s_soft;
@@ -379,10 +387,79 @@ static u32 colour_of(const float c[4])
             (u32)(b * 255.0f + 0.5f);
 }
 
+/* Decode the bound guest texture once, through the same rsx_texture_layout /
+ * rsx_texture_decode the D3D12 backend uses. Only unit 0 is kept: this exists
+ * to check that path produces the right pixels, not to be a texture cache. */
+static void nullsw_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
+{
+    (void)ud;
+    if (unit != 0 || !t) return;
+
+    /* CONTROL0 bit 31 is the unit enable. A disabled unit unbinds. */
+    if (!(t->control0 & 0x80000000u) || !t->offset) { s_soft.tex_ready = 0; return; }
+
+    u32 w = (t->image_rect >> 16) & 0xFFFFu;
+    u32 h =  t->image_rect        & 0xFFFFu;
+    if (!w || !h || w > 4096u || h > 4096u) { s_soft.tex_ready = 0; return; }
+
+    /* Bit 31 of the offset selects MAIN vs LOCAL, same as a vertex array. */
+    u32 ea = (t->offset & 0x80000000u)
+                 ? cellGcmResolveLocated(0, t->offset & 0x7FFFFFFFu)
+                 : cellGcmResolveLocated(1, t->offset & 0x7FFFFFFFu);
+    if (!vm_base) { s_soft.tex_ready = 0; return; }
+
+    rsx_tex_layout tl;
+    rsx_texture_layout(t->format, w, h, &tl);
+    if (tl.compressed) { s_soft.tex_ready = 0; return; }   /* no BC decode here */
+
+    u32 pitch = w * 4u;
+    u8* buf = (u8*)realloc(s_soft.tex, (size_t)pitch * h);
+    if (!buf) { s_soft.tex_ready = 0; return; }
+    s_soft.tex = buf;
+
+    if (tl.fmt == RSX_TEXFMT_R8G8B8A8) {
+        rsx_texture_decode(buf, pitch, vm_base + ea, w, h, &tl,
+                           rsx_texture_argb_is_rgba());
+    } else {
+        /* Narrower formats decode to their own width; splay them to RGBA so
+         * sampling below has one layout to read. */
+        u32 srcp = tl.row_bytes;
+        u8* tmp = (u8*)malloc((size_t)srcp * h);
+        if (!tmp) { s_soft.tex_ready = 0; return; }
+        rsx_texture_decode(tmp, srcp, vm_base + ea, w, h, &tl, 0);
+        for (u32 y = 0; y < h; y++)
+            for (u32 x = 0; x < w; x++) {
+                const u8* sp = tmp + (size_t)y * srcp + (size_t)x * tl.bytes_per_texel;
+                u8* dp = buf + (size_t)y * pitch + (size_t)x * 4u;
+                dp[0] = sp[0];
+                dp[1] = tl.bytes_per_texel > 1 ? sp[1] : sp[0];
+                dp[2] = tl.bytes_per_texel > 2 ? sp[2] : sp[0];
+                dp[3] = 255;
+            }
+        free(tmp);
+    }
+
+    s_soft.tex_w = w; s_soft.tex_h = h; s_soft.tex_pitch = pitch;
+    s_soft.tex_ready = 1;
+}
+
+/* Nearest-neighbour point sample, wrapping. No filtering, no mip levels, no
+ * addressing modes: the guest UVs in the harness land inside [0,1). */
+static u32 sample_tex(float u, float v)
+{
+    if (!s_soft.tex_ready) return 0xFF00FFu;         /* magenta = not bound */
+    long sx = (long)(u * (float)s_soft.tex_w);
+    long sy = (long)(v * (float)s_soft.tex_h);
+    sx %= (long)s_soft.tex_w; if (sx < 0) sx += (long)s_soft.tex_w;
+    sy %= (long)s_soft.tex_h; if (sy < 0) sy += (long)s_soft.tex_h;
+    const u8* px = s_soft.tex + (size_t)sy * s_soft.tex_pitch + (size_t)sx * 4u;
+    return ((u32)px[0] << 16) | ((u32)px[1] << 8) | (u32)px[2];
+}
+
 /* Bounding-box scan with the three edge functions; fills when a pixel centre
  * is on the same side of all three edges, so winding does not matter. */
 static void fill_triangle(const float a[4], const float b[4], const float c[4],
-                          u32 rgb)
+                          u32 rgb, const float uv[3][4], int textured)
 {
     float ax, ay, bx, by, cx, cy;
     ndc_to_px(a, &ax, &ay); ndc_to_px(b, &bx, &by); ndc_to_px(c, &cx, &cy);
@@ -414,7 +491,20 @@ static void fill_triangle(const float a[4], const float b[4], const float c[4],
             int neg = (w0 < 0) || (w1 < 0) || (w2 < 0);
             int pos = (w0 > 0) || (w1 > 0) || (w2 > 0);
             if (neg && pos) continue;               /* outside */
-            s_soft.fb[(u32)y * s_soft.width + (u32)x] = rgb;
+
+            u32 out = rgb;
+            if (textured) {
+                /* Barycentric weights fall out of the same edge functions, so
+                 * interpolating costs nothing extra. Screen-space rather than
+                 * perspective-correct: the harness draws in the z=0 plane,
+                 * where the two agree. */
+                float inv = 1.0f / area;
+                float la = w1 * inv, lb = w2 * inv, lc = w0 * inv;
+                float u = la * uv[0][0] + lb * uv[1][0] + lc * uv[2][0];
+                float v = la * uv[0][1] + lb * uv[1][1] + lc * uv[2][1];
+                out = sample_tex(u, v);
+            }
+            s_soft.fb[(u32)y * s_soft.width + (u32)x] = out;
         }
     }
 }
@@ -429,13 +519,21 @@ static void draw_prim(u32 prim, u32 first, u32 count)
 
     /* Position is attribute 0 and diffuse colour attribute 3 -- the same slots
      * the D3D12 and Metal fallback paths assume. */
+    /* Texture coordinates are attribute 8 (texcoord0), the slot the D3D12 and
+     * Metal fetch paths also read. A draw is textured when a texture is bound
+     * AND that attribute is actually supplied. */
+    const int textured = s_soft.tex_ready && st->vertex_attribs[8].enabled;
+
     #define TRI(i0, i1, i2) do {                                        \
-        float p0[4], p1[4], p2[4], col[4];                              \
+        float p0[4], p1[4], p2[4], col[4], uv[3][4];                    \
         rsx_fetch_attrib(st, 0, (i0), p0);                              \
         rsx_fetch_attrib(st, 0, (i1), p1);                              \
         rsx_fetch_attrib(st, 0, (i2), p2);                              \
         rsx_fetch_attrib(st, 3, (i0), col);                             \
-        fill_triangle(p0, p1, p2, colour_of(col));                      \
+        rsx_fetch_attrib(st, 8, (i0), uv[0]);                           \
+        rsx_fetch_attrib(st, 8, (i1), uv[1]);                           \
+        rsx_fetch_attrib(st, 8, (i2), uv[2]);                           \
+        fill_triangle(p0, p1, p2, colour_of(col), uv, textured);        \
     } while (0)
 
     switch (prim) {
@@ -497,6 +595,7 @@ static rsx_backend s_nullsw_backend = {
     .set_render_target = nullsw_set_render_target,
     .set_vertex_attribs= nullsw_set_vertex_attribs,
     .clear             = nullsw_clear,
+    .bind_texture      = nullsw_bind_texture,
     .draw_arrays       = nullsw_draw_arrays,
     .draw_indexed      = nullsw_draw_indexed,
     .present           = nullsw_present,
@@ -518,8 +617,9 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
 void rsx_null_backend_shutdown(void)
 {
     rsx_set_backend(NULL);
-    free(s_soft.fb);
-    s_soft.fb = NULL;
+    free(s_soft.fb);   s_soft.fb  = NULL;
+    free(s_soft.tex);  s_soft.tex = NULL;
+    s_soft.tex_ready = 0;
 }
 
 /* Headless has no event queue and no window to close. */

@@ -8,6 +8,7 @@
 #include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -335,28 +336,48 @@ s32 cellSysCacheClear(void)
  * Disc game check
  * -----------------------------------------------------------------------*/
 
-s32 cellDiscGameGetBootDiscInfo(u32* type, char* titleId, u32 titleIdSize)
+/* cellDiscGameGetBootDiscInfo(CellDiscGameSystemFileParam* getParam)
+ *
+ * ONE argument, not three. This was declared (u32* type, char* titleId, u32
+ * size), so the adapter handed it whatever r4 and r5 happened to hold at the
+ * call -- and it wrote a title-id string through r4. In GT5P r4 still holds an
+ * unrelated global the guest loaded for the cellDiscGameRegisterDiscChangeCallback
+ * call two instructions earlier, so every boot stamped a string into 0x01025510.
+ *
+ * The real shape is a single out-struct the caller pre-zeroes (this title zeroes
+ * 0x20 bytes of it) whose first field is titleId[CELL_DISCGAME_SYSP_TITLEID_SIZE].
+ * The return code is what carries disc-vs-HDD: CELL_OK means booted from disc,
+ * CELL_DISCGAME_ERROR_NOT_DISCBOOT (0x8002BD02) means not -- GT5P branches on
+ * exactly those two values and ignores everything else.
+ */
+s32 cellDiscGameGetBootDiscInfo(void* getParam)
 {
-    printf("[cellSysutil] DiscGameGetBootDiscInfo()\n");
+    uint32_t ea = (uint32_t)(uintptr_t)getParam;
+    printf("[cellSysutil] DiscGameGetBootDiscInfo(param=0x%08X)\n", ea);
 
-    /* Both out-params are GUEST addresses (generic adapter passes raw EAs). */
-    uint32_t type_ea  = (uint32_t)(uintptr_t)type;
-    uint32_t title_ea = (uint32_t)(uintptr_t)titleId;
-
-    if (type_ea)
-        vm_write32(type_ea, CELL_DISCGAME_TYPE_HDD); /* pretend HDD game */
-
-    if (title_ea && titleIdSize > 0) {
-        /* Use the real title id (from PARAM.SFO at boot) instead of a placeholder. */
+    if (ea) {
         extern const char* cellGame_get_title_id(void);
         const char* tid = cellGame_get_title_id();
         if (!tid || !tid[0]) tid = "GAME00000";
         size_t n = strlen(tid);
-        if (n > titleIdSize - 1) n = titleIdSize - 1;
-        memcpy(vm_base + title_ea, tid, n);
-        vm_base[title_ea + n] = '\0';
+        if (n > CELL_DISCGAME_SYSP_TITLEID_SIZE - 1)
+            n = CELL_DISCGAME_SYSP_TITLEID_SIZE - 1;
+        memcpy(vm_base + ea, tid, n);
+        vm_base[ea + n] = '\0';
     }
 
+    /* PS3_DISCGAME_BOOT=0 reports NOT_DISCBOOT instead, for a title that is
+     * genuinely installed to HDD. Disc is the default because that is the tree
+     * cellFs actually serves. */
+    { static int s_disc = -1;
+      if (s_disc < 0) { const char* e = getenv("PS3_DISCGAME_BOOT");
+                        s_disc = e ? atoi(e) : 1; }
+      if (!s_disc) {
+          printf("[cellSysutil]   -> NOT_DISCBOOT\n");
+          return (s32)CELL_DISCGAME_ERROR_NOT_DISCBOOT;
+      } }
+    printf("[cellSysutil]   -> disc boot, titleId='%s'\n",
+           (const char*)(vm_base + ea));
     return CELL_OK;
 }
 

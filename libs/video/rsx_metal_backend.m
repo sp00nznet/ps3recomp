@@ -25,6 +25,7 @@
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
+#include "rsx_primitives.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -228,21 +229,18 @@ static void fetch_vertex(const rsx_state* st, u32 vi, MtlVertex* out)
  * fetched. Everything else maps directly.
  * --------------------------------------------------------------------------*/
 
-static int prim_needs_expansion(u32 prim)
+/* Which primitives need CPU expansion, and what they end up drawn as, both
+ * come from rsx_primitives.h now -- this file used to answer the first
+ * question with its own list, which disagreed with the one in that header
+ * about LINE_LOOP and POLYGON. Only the Metal enum mapping stays here. */
+static MTLPrimitiveType topo_to_metal(rsx_topology t)
 {
-    return prim == RSX_PRIMITIVE_QUADS      || prim == RSX_PRIMITIVE_QUAD_STRIP ||
-           prim == RSX_PRIMITIVE_TRIANGLE_FAN || prim == RSX_PRIMITIVE_POLYGON;
-}
-
-static MTLPrimitiveType prim_to_metal(u32 prim)
-{
-    switch (prim) {
-    case RSX_PRIMITIVE_POINTS:         return MTLPrimitiveTypePoint;
-    case RSX_PRIMITIVE_LINES:          return MTLPrimitiveTypeLine;
-    case RSX_PRIMITIVE_LINE_LOOP:      /* approximated as a strip */
-    case RSX_PRIMITIVE_LINE_STRIP:     return MTLPrimitiveTypeLineStrip;
-    case RSX_PRIMITIVE_TRIANGLE_STRIP: return MTLPrimitiveTypeTriangleStrip;
-    default:                           return MTLPrimitiveTypeTriangle;
+    switch (t) {
+    case RSX_TOPOLOGY_POINTS:         return MTLPrimitiveTypePoint;
+    case RSX_TOPOLOGY_LINES:          return MTLPrimitiveTypeLine;
+    case RSX_TOPOLOGY_LINE_STRIP:     return MTLPrimitiveTypeLineStrip;
+    case RSX_TOPOLOGY_TRIANGLE_STRIP: return MTLPrimitiveTypeTriangleStrip;
+    default:                          return MTLPrimitiveTypeTriangle;
     }
 }
 
@@ -314,8 +312,8 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->base  = first_vert;
     d->count = wrote;
     /* Expanded primitives always come out as a triangle list. */
-    d->topology = prim_needs_expansion(prim) ? MTLPrimitiveTypeTriangle
-                                             : prim_to_metal(prim);
+    d->topology = rsx_primitive_needs_expansion(prim) ? MTLPrimitiveTypeTriangle
+                                             : topo_to_metal(rsx_primitive_topology(prim));
     d->blend_enable   = st->blend_enable;
     d->blend_sfactor  = st->blend_sfactor;
     d->blend_dfactor  = st->blend_dfactor;

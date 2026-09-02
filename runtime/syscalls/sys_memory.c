@@ -389,6 +389,75 @@ int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * sys_mmapper_allocate_memory (lv2 341)
+ *
+ * r3 = pointer to receive the allocated address (u32*)
+ * r4 = size
+ *
+ * The ABI here was read off the caller rather than a header. GT5P's PDI device
+ * worker calls this the moment it starts -- func_00941808 loads r3 with a
+ * pointer and r4 with 0x300000, issues the syscall, retries on any non-zero
+ * result, and on success immediately does `lwz r29, 0(r29)`, reading back
+ * through the pointer it passed in r3.
+ *
+ * Answering CELL_OK without writing anything is the worst of both worlds: the
+ * worker believes it has three megabytes, reads a null buffer back, and exits
+ * on the spot -- which leaves the packed-filesystem device with no worker at
+ * all and stalls asset loading. Answering an error is worse still, because the
+ * caller retries forever.
+ *
+ * The flat VM has no distinction between reserving and mapping, so this hands
+ * back committed guest memory directly and sys_mmapper_allocate_memory_from_
+ * container below accepts it as already mapped.
+ * -----------------------------------------------------------------------*/
+int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
+{
+    uint32_t addr_out = LV2_ARG_PTR(ctx, 0);
+    uint32_t size     = LV2_ARG_U32(ctx, 1);
+
+    if (size == 0)
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
+
+    bump_lock();
+    if (g_sys_mem_bump_ptr == 0)
+        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
+    g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, VM_PAGE_SIZE);
+    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+        bump_unlock();
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+    uint32_t addr = g_sys_mem_bump_ptr;
+    g_sys_mem_bump_ptr += size;
+    bump_unlock();
+
+    vm_commit(addr, size);
+
+    if (addr_out != 0)
+        write_be32(addr_out, addr);
+
+    { static int n = 0; if (n++ < 4)
+        fprintf(stderr, "[sys_memory] mmapper_allocate_memory size=0x%X -> 0x%08X\n",
+                size, addr); }
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_mmapper_allocate_memory_from_container (lv2 342)
+ *
+ * The same allocation charged to a container. GT5P calls it straight after 341
+ * with the address 341 handed back, so with a flat VM there is nothing further
+ * to do -- the memory is already committed and addressable.
+ * -----------------------------------------------------------------------*/
+int64_t sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
+{
+    (void)ctx;
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * sys_mmapper_map_shared_memory
  *
  * r3 = address (where to map)
@@ -441,4 +510,6 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MMAPPER_FREE_ADDRESS,        sys_mmapper_free_address);
     lv2_syscall_register(tbl, SYS_MMAPPER_ALLOCATE_SHARED_MEMORY, sys_mmapper_allocate_shared_memory);
     lv2_syscall_register(tbl, SYS_MMAPPER_MAP_SHARED_MEMORY,  sys_mmapper_map_shared_memory);
+    lv2_syscall_register(tbl, 341, sys_mmapper_allocate_memory);
+    lv2_syscall_register(tbl, 342, sys_mmapper_allocate_memory_from_container);
 }

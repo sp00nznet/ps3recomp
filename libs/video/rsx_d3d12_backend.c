@@ -72,7 +72,7 @@
 typedef struct {
     u32 vb_byte_offset; /* offset into vb_mapped where this draw's verts live */
     u32 vertex_count;
-    u32 topology;       /* D3D_PRIMITIVE_TOPOLOGY_* */
+    u32 topology;       /* rsx_topology (NOT a D3D value; see topo_to_d3d) */
     int textured;       /* 1 = sample the bound font/atlas texture (dbgfont) */
     int is_vp;          /* 1 = real VP path: vb_byte_offset indexes vp_vb (float4) */
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
@@ -2384,36 +2384,17 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
  * Returns the slot index (SRV at heap 1+slot) or -1. Must run while the
  * command list is open, before the draw passes. */
 /* NV4097 TEXTURE_CONTROL1 component remap -> D3D12 Shader4ComponentMapping.
- * Low byte = crossbar: bits[1:0] select the SOURCE (0=A,1=R,2=G,3=B) for
- * output A, [3:2] for R, [5:4] for G, [7:6] for B. Next byte = per-output op:
- * 0 = force ZERO, 1 = force ONE, 2 = use crossbar (identity word = 0xAAE4).
- * Our uploaded resource holds guest R,G,B,A at comps 0,1,2,3. */
+ * The crossbar decode itself is RSX semantics and lives in
+ * rsx_texture_layout.c; all that is left here is packing the four selectors
+ * into D3D12's word. Its force-zero/force-one encodings are 4 and 5, which is
+ * what RSX_REMAP_ZERO/ONE already are, so the selectors pass straight through.
+ *
+ * out[] arrives in the crossbar's field order A,R,G,B; D3D12 wants
+ * destR | destG<<3 | destB<<6 | destA<<9 | valid<<12. */
 static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
 {
-    /* Crossbar field order LSB->MSB is A,R,G,B -- the order the header
-     * describes, and the one that makes RSX's documented identity word 0xAAE4
-     * actually decode to an identity mapping. The body used to run the fields
-     * backwards (B,G,R,A), which made 0xAAE4 a channel rotation and 0xAA1B the
-     * "identity"; lanes_dxt was then bent to {2,1,0,3} to cancel the reversal
-     * on DXT, so DXT looked right while every A8R8G8B8 texture sampled a
-     * permuted vector. Rubber Ducky sets 0xAAE4 on its lightmaps and 0xAA93 on
-     * its bump maps: the wall's normal map came back as (R,A,A), which is what
-     * drove the green channel to an extreme and gave the scene its magenta and
-     * green casts.
-     *
-     * Source codes index the presented vector {A,R,G,B}; our uploaded resource
-     * holds guest R,G,B,A at comps 0,1,2,3, and BC decodes to RGBA the same
-     * way, so both use {3,0,1,2}.
-     * Ops byte (same field order): 0 = force ZERO, 1 = force ONE, 2 = remap. */
-    static const u8 lanes_argb[4] = {3, 0, 1, 2};
-    static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
-    const u8* src2res = (basef == 0x8B) ? lanes_g8b8 : lanes_argb;
-    if (!(c1 & 0xFFFF)) c1 = 0xAAE4;               /* unset -> identity */
-    u32 out[4];                                    /* outputs in field order A,R,G,B */
-    for (int i = 0; i < 4; i++) {
-        u32 s = (c1 >> (i * 2)) & 3, op = (c1 >> (8 + i * 2)) & 3;
-        out[i] = (op == 0) ? 4u : (op == 1) ? 5u : (u32)src2res[s];
-    }
+    u8 out[4];
+    rsx_texture_component_remap(c1, basef, out);
     /* TEX_REMAP_ID=<n>: override the derived crossbar with a fixed mapping, to
      * test channel order directly. The resource holds the guest's A8R8G8B8
      * bytes straight through, so its components are (R=A, G=R, B=G, A=B) and
@@ -3756,6 +3737,22 @@ static void guest_fb_present(u32 fi)
 }
 
 
+/* rsx_topology -> D3D_PRIMITIVE_TOPOLOGY. Spelled out rather than relying on
+ * the two enums happening to agree: the draw record carries the neutral value
+ * so a second backend can read it, and this is the one place it becomes a D3D
+ * one. */
+static D3D12_PRIMITIVE_TOPOLOGY topo_to_d3d(u32 t)
+{
+    switch (t) {
+    case RSX_TOPOLOGY_POINTS:         return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+    case RSX_TOPOLOGY_LINES:          return D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+    case RSX_TOPOLOGY_LINE_STRIP:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+    case RSX_TOPOLOGY_TRIANGLE_STRIP: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+    case RSX_TOPOLOGY_TRIANGLES:      return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    default:                          return D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    }
+}
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
@@ -4351,11 +4348,11 @@ static void render_frame(void)
             ID3D12PipelineState* target_pso = s_d3d.pipeline_state; /* default triangle */
             if (dr->textured && s_d3d.tex_ready && s_d3d.pipeline_state_tex) {
                 target_pso = s_d3d.pipeline_state_tex;
-            } else if (dr->topology == D3D_TOPOLOGY_POINTLIST) {
+            } else if (dr->topology == RSX_TOPOLOGY_POINTS) {
                 target_pso = s_d3d.pipeline_state_points
                              ? s_d3d.pipeline_state_points : s_d3d.pipeline_state;
-            } else if (dr->topology == D3D_TOPOLOGY_LINELIST ||
-                       dr->topology == D3D_TOPOLOGY_LINESTRIP) {
+            } else if (dr->topology == RSX_TOPOLOGY_LINES ||
+                       dr->topology == RSX_TOPOLOGY_LINE_STRIP) {
                 target_pso = s_d3d.pipeline_state_lines
                              ? s_d3d.pipeline_state_lines : s_d3d.pipeline_state;
             }
@@ -4364,7 +4361,7 @@ static void render_frame(void)
                 last_pso = target_pso;
             }
             if (dr->topology != last_topo) {
-                s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, dr->topology);
+                s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, topo_to_d3d(dr->topology));
                 last_topo = dr->topology;
             }
             u32 start_vert = dr->vb_byte_offset / VERTEX_STRIDE;
@@ -4399,7 +4396,7 @@ static void render_frame(void)
         if (any && vpso) {
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
             s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, vpso);
-            s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_TOPOLOGY_TRIANGLELIST);
+            s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                 s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb));
             ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
@@ -6003,7 +6000,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * (exact position + texcoord): upload raw float4 attrib0 into vp_vb and
      * mark the draw is_vp; render_frame compiles the VP and draws it. Fall
      * back to the frac-approximation textured path if VP resources are absent. */
-    if (primitive == 8 /* CELL_GCM_PRIMITIVE_QUADS */) {
+    if (primitive == RSX_PRIMITIVE_QUADS) {
         /* Prefer the real vertex-program path whenever VP resources exist --
          * NOT only when a texture is bound. Requiring tex_bound routed vkcube's
          * UNtextured cube to the fixed-function fallback, which never applies the
@@ -6016,7 +6013,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
                 dr->vb_byte_offset = rec;
                 dr->vertex_count   = emitted;
-                dr->topology       = D3D_TOPOLOGY_TRIANGLELIST;
+                dr->topology       = RSX_TOPOLOGY_TRIANGLES;
                 dr->textured       = s_d3d.tex_bound;
                 dr->is_vp          = 1;
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
@@ -6081,7 +6078,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         if (s_d3d.draw_count < MAX_DRAWS) {
             s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
             s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
-            s_d3d.draws[s_d3d.draw_count].topology       = D3D_TOPOLOGY_TRIANGLELIST;
+            s_d3d.draws[s_d3d.draw_count].topology       = RSX_TOPOLOGY_TRIANGLES;
             s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
             s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
             s_d3d.draws[s_d3d.draw_count].is_clear       = 0;
@@ -6102,14 +6099,14 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * zero pixels (it also uploads to vp_vb, leaving the fixed-function vb empty).
      * Geometry already in clip space with no VP -- flOw's injected scene -- must
      * go down the fixed-function passthrough below instead. */
-    if ((primitive == 5 /* TRIANGLES */ || primitive == 6 /* TRIANGLE_STRIP */
-         || primitive == 7 /* TRIANGLE_FAN */) &&
+    if ((primitive == RSX_PRIMITIVE_TRIANGLES || primitive == RSX_PRIMITIVE_TRIANGLE_STRIP
+         || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
         s_d3d.vp_vb_mapped && s_d3d.vp_root_sig &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
         u32 rec = s_d3d.vp_vb_offset;
-        u32 emitted = (primitive == 5)
+        u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
             ? upload_tris_vp(s_d3d.current_rsx_state, first, count)
-            : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == 7);
+            : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == RSX_PRIMITIVE_TRIANGLE_FAN);
         /* RSX splits one primitive stream across several DRAW_ARRAYS entries
          * inside a single BEGIN/END (each carries at most 256 vertices), and the
          * hardware concatenates them before assembling primitives. Recording a
@@ -6124,8 +6121,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
             u32 fpnow = s_d3d.current_rsx_state
                         ? s_d3d.current_rsx_state->shader_program : 0;
-            if (pv->is_vp && pv->topology == D3D_TOPOLOGY_TRIANGLELIST &&
-                pv->fp_addr == fpnow && primitive == 5 &&
+            if (pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
+                pv->fp_addr == fpnow && primitive == RSX_PRIMITIVE_TRIANGLES &&
                 pv->begin_epoch == (s_d3d.current_rsx_state
                                     ? s_d3d.current_rsx_state->begin_epoch : 0) &&
                 pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
@@ -6138,7 +6135,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
             dr->vb_byte_offset = rec;
             dr->vertex_count   = emitted;
-            dr->topology       = D3D_TOPOLOGY_TRIANGLELIST;
+            dr->topology       = RSX_TOPOLOGY_TRIANGLES;
             dr->textured       = s_d3d.tex_bound;
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
@@ -6189,15 +6186,15 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
             s_d3d.draw_count++;
             /* Anchor for merging the next DRAW_ARRAYS batch of this stream. */
-            s_d3d.merge_prev_draw  = (primitive == 5);
+            s_d3d.merge_prev_draw  = (primitive == RSX_PRIMITIVE_TRIANGLES);
             s_d3d.merge_first_end  = first + count;
         }
         return;
     }
     s_d3d.merge_prev_draw = 0;   /* any other primitive breaks the stream */
 
-    u32 topo = rsx_to_d3d12_topology(primitive);
-    if (topo == D3D_TOPOLOGY_UNDEFINED) {
+    u32 topo = (u32)rsx_primitive_topology(primitive);
+    if (topo == RSX_TOPOLOGY_UNSUPPORTED) {
         /* Other primitives still needing index-buffer conversion
          * (line loops, triangle fans) — skip rather than draw wrong. */
         static int s_skipped_nontri = 0;
@@ -6250,10 +6247,10 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
      * list. Other primitives are skipped rather than drawn wrong. */
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
-    if (primitive == 8)      emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
-    else if (primitive == 5) emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
-    else if (primitive == 6) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
-    else if (primitive == 7) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1);
+    if (primitive == RSX_PRIMITIVE_QUADS)             emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLES)    emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN)   emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1);
     else {
         static int _skip = 0;
         if (_skip++ < 3)
@@ -6264,11 +6261,11 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
      * fluid arrives as ~3000 DRAW_INDEX_ARRAY batches of 256, and 256 is not a
      * multiple of 3, so every batch after the first assembled out of phase. */
     if (emitted && s_d3d.merge_prev_draw && s_d3d.draw_count > 0 &&
-        s_d3d.merge_first_end == first && primitive == 5) {
+        s_d3d.merge_first_end == first && primitive == RSX_PRIMITIVE_TRIANGLES) {
         D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
         u32 fpnow = s_d3d.current_rsx_state
                     ? s_d3d.current_rsx_state->shader_program : 0;
-        if (pv->is_vp && pv->topology == D3D_TOPOLOGY_TRIANGLELIST &&
+        if (pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
             pv->fp_addr == fpnow &&
             pv->begin_epoch == (s_d3d.current_rsx_state
                                 ? s_d3d.current_rsx_state->begin_epoch : 0) &&
@@ -6282,7 +6279,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
         dr->vb_byte_offset = rec;
         dr->vertex_count   = emitted;
-        dr->topology       = D3D_TOPOLOGY_TRIANGLELIST;
+        dr->topology       = RSX_TOPOLOGY_TRIANGLES;
         dr->textured       = s_d3d.tex_bound;
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
@@ -6332,7 +6329,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         s_d3d.draw_count++;
         /* Anchor for merging the next batch of this indexed stream. */
-        s_d3d.merge_prev_draw = (primitive == 5);
+        s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES);
         s_d3d.merge_first_end = first + count;
     }
 }

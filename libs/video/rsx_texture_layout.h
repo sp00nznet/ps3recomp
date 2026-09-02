@@ -88,6 +88,42 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
                         const u8* src, u32 w, u32 h,
                         const rsx_tex_layout* tl, int argb_as_rgba);
 
+/* --- component remap (NV4097 TEXTURE_CONTROL1 crossbar) ------------------
+ *
+ * Each of the texture's four outputs is either a channel of the sampled
+ * resource or a forced constant. These are the selector values
+ * rsx_texture_component_remap() writes.
+ *
+ * 0..3 index the UPLOADED RESOURCE's components, which rsx_texture_decode()
+ * always lays out as R,G,B,A -- BC1/2/3 decode to RGBA the same way, so both
+ * paths agree. (D3D12 happens to encode force-zero and force-one as 4 and 5
+ * too, so its backend can pass these through; that is a convenience, not the
+ * reason for the values.) */
+#define RSX_REMAP_ZERO 4u   /* force 0.0 */
+#define RSX_REMAP_ONE  5u   /* force 1.0 */
+
+/* Decode TEXTURE_CONTROL1's crossbar for `rsx_fmt`.
+ *
+ * `out` receives the selector for each output IN THE CROSSBAR'S OWN FIELD
+ * ORDER: out[0] = A, out[1] = R, out[2] = G, out[3] = B. A backend reorders
+ * them into whatever its API wants.
+ *
+ * Layout of control1: the low byte is the crossbar, two bits per output,
+ * selecting the source from the presented vector {A,R,G,B}; the next byte is
+ * the per-output operation, 0 = force zero, 1 = force one, 2 = use the
+ * crossbar. A control word of 0 means "unset" and is treated as the hardware
+ * identity, 0xAAE4.
+ *
+ * The field order is load-bearing and has been got wrong before. Running the
+ * fields backwards (B,G,R,A) makes 0xAAE4 -- the documented identity -- decode
+ * to a channel rotation, and makes 0xAA1B look like the identity instead. That
+ * bug was then papered over by bending the DXT lane table to cancel it, so DXT
+ * sampled correctly while every A8R8G8B8 texture came back permuted: Rubber
+ * Ducky's bump maps returned (R,A,A) and drove the scene's magenta and green
+ * casts. test_texture_layout.c asserts 0xAAE4 is the identity and 0xAA1B is
+ * not, which is precisely that regression. */
+void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4]);
+
 /* TEX_RGBA: treat A8R8G8B8 source bytes as already R,G,B,A and copy them
  * straight through.
  *

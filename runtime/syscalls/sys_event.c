@@ -309,12 +309,32 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
+    /* A guest that receives on a queue id it never initialised gets ESRCH
+     * straight back and, if it does not check, spins on it. That is the
+     * guest's bug, but returning instantly makes it ours: GT5P's Job Manager
+     * handler hit this and issued 2,323,673 receives in a 45-second boot,
+     * pinning a core and starving the very threads that would have made
+     * progress. Yield before answering -- it costs a mis-behaving caller
+     * nothing it was entitled to, and stops one bad loop deciding how much
+     * CPU every other thread gets. */
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) {
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active)
+    if (!q->active) {
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
     /* SPURS bring-up: when a PPU thread is about to block forever for SPU
      * completion (libsre created the taskset correctly but never started its SPU
@@ -550,14 +570,24 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     }
     /* Diagnostic: prove the blocked receiver was WOKEN and is returning an event
      * (vs. staying blocked forever). Distinguishes a wake bug from game logic. */
-    if (queue_id == 1) {
+    /* Was hardcoded to queue 1, which makes every other queue look silent: the
+     * [WAIT] line prints on entry, so a queue with thousands of receives and no
+     * deliveries is indistinguishable from one that is delivering fine.
+     * PS3_EVT_RECV=<queue id> follows a different one; PS3_EVT_RECV=all follows
+     * every queue. Default stays queue 1 so existing logs read the same. */
+    {
+        static int _sel = -2;
+        if (_sel == -2) { const char* e = getenv("PS3_EVT_RECV");
+                          _sel = !e ? 1 : (strcmp(e, "all") == 0 ? -1 : atoi(e)); }
+    if (_sel == -1 || (int)queue_id == _sel) {
         static int _r = 0;
-        if (_r++ < 12)
-            fprintf(stderr, "[evt] q=1 receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
+        if (_r++ < 64)
+            fprintf(stderr, "[evt] q=%u receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
+                    queue_id,
                     (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
                     (unsigned long long)evt.data1, (unsigned long long)evt.data2,
                     (unsigned long long)evt.data3, q->count);
-    }
+    } }
 
     return CELL_OK;
 }
@@ -716,6 +746,8 @@ int64_t sys_event_port_create(ppu_context* ctx)
     p->connected_queue = 0;
 
     uint32_t port_id = (uint32_t)(slot + 1);
+    fprintf(stderr, "[evt] port_create -> id=%u type=%d name=0x%llX\n",
+            port_id, (int)port_type, (unsigned long long)name);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, port_id);
     }
@@ -774,6 +806,12 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
 
     p->connected_queue = (int32_t)queue_id;
     evt_table_unlock();
+    /* Port->queue wiring was invisible: create and connect logged nothing, so a
+     * queue nobody is wired to reads exactly like one that is. GT5P's PDI queue
+     * takes 1,901 receives and delivers zero events; knowing whether any port
+     * points at it is the difference between "no sender ran" and "no sender
+     * exists". */
+    fprintf(stderr, "[evt] port_connect_local(port=%u -> q=%u)\n", port_id, queue_id);
     return CELL_OK;
 }
 

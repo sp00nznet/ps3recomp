@@ -66,6 +66,10 @@ uint8_t* vm_base = NULL;
 
 #define CLEAR_ARGB  0xFF101830u          /* what we expect to come out again  */
 #define VTX_OFFSET  0x00010000u          /* RSX offset of our vertex buffer   */
+#define TEX_OFFSET  0x00020000u          /* RSX offset of our test texture    */
+#define TEX_W       4u
+#define TEX_H       4u
+#define TEX_ARGB    0xFF20C040u          /* what a textured pixel must read   */
 
 /* Functions the RSX side exports but does not declare in a public header. */
 extern void cellGcm_rsx_process_fifo(void);
@@ -131,6 +135,47 @@ static void upload_triangle(void)
             guest_f32(IO_ADDR + VTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
 }
 
+/* A 4x4 texture, every texel the same colour, written as the guest would:
+ * A8R8G8B8 means the bytes land A,R,G,B in that order on a big-endian PPU.
+ *
+ * Uniform on purpose: this asserts the pixel VALUE survives the whole path --
+ * bind, layout, decode, channel reorder, sample -- and a single centre-pixel
+ * readback is what the harness can observe.
+ *
+ * It therefore does NOT detect swizzling, and cannot: reordering identical
+ * texels changes nothing. Nor can a non-uniform texture fix that here. The
+ * centre lands somewhere in the four texels around (2,2) of a 4x4, and Morton
+ * order maps those to offsets {3,6,9,12} against linear's {5,6,9,10} -- the
+ * two agree at 6 and 9, so a centre sample can land on a texel where swizzled
+ * and linear read the same byte. Swizzling is covered instead by
+ * libs/video/tests/test_texture_layout.c, which asserts Morton addressing is a
+ * bijection and that a swizzled read differs from a linear one over the same
+ * bytes. Verified: breaking the swizzle decision fails those and not this. */
+static void upload_texture(void)
+{
+    for (uint32_t i = 0; i < TEX_W * TEX_H; i++)
+        guest_w32(IO_ADDR + TEX_OFFSET + i * 4u, TEX_ARGB);
+}
+
+/* The textured draw uses its own vertex block: two triangles covering the
+ * screen, with texcoord0 (attribute 8) alongside position and colour.
+ * Layout per vertex: float4 pos, float4 colour, float4 uv -- stride 48. */
+#define TVTX_OFFSET (VTX_OFFSET + 0x1000u)
+static void upload_textured_quad(void)
+{
+    static const float v[6][12] = {
+        { -1,-1,0,1,  0,1,0,1,  0,0,0,0 },
+        {  1,-1,0,1,  0,1,0,1,  1,0,0,0 },
+        {  1, 1,0,1,  0,1,0,1,  1,1,0,0 },
+        { -1,-1,0,1,  0,1,0,1,  0,0,0,0 },
+        {  1, 1,0,1,  0,1,0,1,  1,1,0,0 },
+        { -1, 1,0,1,  0,1,0,1,  0,1,0,0 },
+    };
+    for (int i = 0; i < 6; i++)
+        for (int k = 0; k < 12; k++)
+            guest_f32(IO_ADDR + TVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[i][k]);
+}
+
 /* type[3:0]=2 (float32), size[7:4], stride[15:8] */
 #define VFMT(size, stride) (2u | ((u32)(size) << 4) | ((u32)(stride) << 8))
 
@@ -153,6 +198,32 @@ static void emit_triangle_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
 }
 
+/* Bind the test texture on unit 0 and draw the quad. The vertex colour is
+ * deliberately GREEN while the texture is a different colour, so a pass that
+ * ignored the texture would still produce a plausible-looking frame -- and
+ * the assertion would catch it. */
+static void emit_textured_draw(void)
+{
+    /* NV4097_SET_TEXTURE_* are 0x20 apart per unit; unit 0 is the base. */
+    emit(NV4097_SET_TEXTURE_OFFSET     + 0, VTX_MAIN(TEX_OFFSET));
+    /* format: A8R8G8B8 (0x85) | LN (0x20) -- linear, not swizzled. */
+    emit(NV4097_SET_TEXTURE_FORMAT     + 0, 0x85u | 0x20u);
+    emit(NV4097_SET_TEXTURE_CONTROL0   + 0, 0x80000000u);   /* unit enable */
+    emit(NV4097_SET_TEXTURE_CONTROL1   + 0, 0xAAE4u);       /* identity crossbar */
+    emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (TEX_W << 16) | TEX_H);
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(TVTX_OFFSET +  0));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 48));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(TVTX_OFFSET + 16));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 48));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 8 * 4, VTX_MAIN(TVTX_OFFSET + 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 8 * 4, VFMT(4, 48));
+
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES       */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((6u - 1u) << 24));   /* first=0 count=6 */
+    emit(NV4097_SET_BEGIN_END, 0u);
+}
+
 /* Append this frame's commands to the ring and advance `put`, exactly as a
  * title does. The RSX's `get` pointer lives inside cellGcmSys and chases `put`;
  * it is never rewound, so each frame must occupy fresh ring space rather than
@@ -161,7 +232,8 @@ static void submit_frame(int with_draw)
 {
     emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
     emit(NV4097_CLEAR_SURFACE,         0xF0u);
-    if (with_draw) emit_triangle_draw();
+    if (with_draw == 2)      emit_textured_draw();
+    else if (with_draw == 1) emit_triangle_draw();
 
     guest_w32(CTRL_ADDR + 0, g_fifo_len);   /* put */
     cellGcm_rsx_process_fifo();
@@ -175,6 +247,11 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--frames=", 9) == 0) frames = atoi(argv[i] + 9);
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;
+        /* --tex: bind a texture and sample it, which exercises the shared
+         * rsx_texture_layout/decode path end to end rather than in a unit
+         * test. The vertex colour differs from the texture colour, so a
+         * backend that ignored the texture fails the assertion below. */
+        else if (strcmp(argv[i], "--tex") == 0)    do_draw = 2;
     }
 
     vm_base = (uint8_t*)calloc(1, VM_SIZE);
@@ -195,7 +272,8 @@ int main(int argc, char** argv)
     cellGcmSetDisplayBuffer(0, 0, 1280 * 4, 1280, 720);
 
     guest_w32(CTRL_ADDR + 4, 0);            /* get: start of ring */
-    if (do_draw) upload_triangle();
+    if (do_draw == 1) upload_triangle();
+    if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -224,8 +302,13 @@ int main(int argc, char** argv)
          * RSX ARGB -> Metal BGRA8Unorm keeps R, G and B in the same bytes. */
         /* Without a draw the centre pixel is the clear colour; with the test
          * triangle it is the triangle's red, which proves the vertex fetch,
-         * primitive path, pipeline state and draw all worked. */
-        u32 want = do_draw ? 0xFFFF0000u : CLEAR_ARGB;
+         * primitive path, pipeline state and draw all worked. With --tex it is
+         * the TEXTURE's colour, not the quad's green -- so it also proves the
+         * texture reached the sampler through layout, decode and the crossbar.
+         */
+        u32 want = (do_draw == 2) ? TEX_ARGB
+                 : (do_draw == 1) ? 0xFFFF0000u
+                                  : CLEAR_ARGB;
         printf("[host] presented pixel: 0x%08X (expected 0x%08X) %s\n",
                back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
         if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
