@@ -18,6 +18,7 @@
  * needs the lifter to split output into multiple TUs (88 MB single-file
  * otherwise).
  */
+#include <stdarg.h>
 #include "ppu_recomp.h"
 /* PPU_THREAD_LOCAL only -- NOT ppu_context.h, which would redefine the struct
  * a generated ppu_recomp.h already declares. Ports generated before the
@@ -367,9 +368,13 @@ extern "C" const char* g_last_hle_name;
  * for threads parked in a DLL (OS waits / FMOD) print the module name so they
  * are not mistaken for guest spins. Called twice so the caller can diff which
  * guest thread is genuinely parked (same RIP) vs. still progressing. */
+/* Defined with the debug console below; writes to stderr and, when the
+ * console is servicing a command, also to its response file. */
+static void dbg_printf(const char* fmt, ...);
+
 static void dump_threads(const char* label, HMODULE self)
 {
-    fprintf(stderr, "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
+    dbg_printf( "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
             label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -388,14 +393,14 @@ static void dump_threads(const char* label, HMODULE self)
                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    (LPCSTR)ctx.Rip, &m);
                 if (m == self) {
-                    fprintf(stderr, "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
+                    dbg_printf( "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
                             (unsigned long)te.th32ThreadID,
                             (unsigned long long)((char*)ctx.Rip - (char*)self));
                 } else {
                     char path[MAX_PATH] = "?";
                     if (m) GetModuleFileNameA(m, path, sizeof path);
                     const char* base = strrchr(path, '\\');
-                    fprintf(stderr, "[WATCHDOG]   tid %5lu in %s\n",
+                    dbg_printf( "[WATCHDOG]   tid %5lu in %s\n",
                             (unsigned long)te.th32ThreadID, base ? base + 1 : path);
                 }
                 /* Scan the suspended thread's stack for boot-module return
@@ -455,7 +460,7 @@ static void dump_threads(const char* label, HMODULE self)
                              * wrong frame is worse than no frame. */
                             if (bestHost == maxHost ||
                                 (uintptr_t)v - bestHost > 0x4000u) bestGuest = 0;
-                            fprintf(stderr, bestGuest
+                            dbg_printf( bestGuest
                                     ? "[WATCHDOG]       tid %5lu ret rva=0x%llX  func_%08X+0x%llX\n"
                                     : "[WATCHDOG]       tid %5lu ret rva=0x%llX\n",
                                     (unsigned long)te.th32ThreadID,
@@ -472,6 +477,155 @@ static void dump_threads(const char* label, HMODULE self)
     }
     if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
     fflush(stderr);
+}
+
+/* ── Debug console ───────────────────────────────────────────────────────────
+ * PS3_DEBUG=<path> opens a file-based command channel, so a title that is
+ * already running can be asked what it is doing without a rebuild.
+ *
+ * Write one command into <path>; the console executes it, appends the answer
+ * to <path>.out, and truncates <path> ready for the next one.
+ *
+ *     echo threads    > dbg.txt     # symbolised stack of every guest thread
+ *     echo "mem 10200 64" > dbg.txt # hexdump of guest memory
+ *     echo stat       > dbg.txt     # flips, HLE breadcrumb, uptime
+ *
+ * A file and not a socket on purpose: no listening port inside a game
+ * process, nothing for a firewall to prompt about, and it drives from a shell
+ * script exactly the way PAD_FILE already does.
+ *
+ * Read-only by design apart from poke32. Changing a diagnostic knob while the
+ * title runs is NOT possible here: the large majority are read once at first
+ * use and cached in a function-local static (see docs/DIAGNOSTICS.md), so they
+ * are launch-time settings. `knobs` reports which ones this run was started
+ * with, which is the useful half of that.
+ */
+static FILE* s_dbg_out = NULL;
+
+static void dbg_printf(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (s_dbg_out) { va_list c; va_copy(c, ap); vfprintf(s_dbg_out, fmt, c); va_end(c); }
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+static void dbg_mem(uint32_t ea, uint32_t len)
+{
+    if (!vm_base) { dbg_printf("  vm_base not live yet%c", 10); return; }
+    if (len == 0 || len > 4096) len = 64;
+    for (uint32_t off = 0; off < len; off += 16) {
+        char asc[17];
+        dbg_printf("  0x%08X ", ea + off);
+        for (uint32_t i = 0; i < 16; i++) {
+            if (off + i < len) {
+                uint8_t b = vm_base[(size_t)(ea + off + i)];
+                dbg_printf("%02X ", b);
+                asc[i] = (b >= 32 && b < 127) ? (char)b : '.';
+            } else { dbg_printf("   "); asc[i] = ' '; }
+        }
+        asc[16] = 0;
+        dbg_printf(" |%s|%c", asc, 10);
+    }
+}
+
+static void dbg_knobs(const char* prefix)
+{
+    /* Which diagnostics this run was actually started with. */
+    LPCH env = GetEnvironmentStringsA();
+    if (!env) return;
+    int n = 0;
+    for (LPCH p = env; *p; p += strlen(p) + 1) {
+        const char* eq = strchr(p, '=');
+        if (!eq || eq == p) continue;
+        /* Only the runtime's own namespaces, not the whole shell environment. */
+        static const char* known[] = {
+            "PS3_", "SPU_", "SPURS_", "GCM_", "RSX_", "LD_", "YZ_", "YDKJ_",
+            "LBP_", "FLOW_", "RD_", "TEX_", "FP_", "VP_", "PPU_", "PS1_",
+            "CELLMARK_", "RTT_", "PAD_", "FS_", "WATCHDOG_", "SYNC_", NULL };
+        int match = 0;
+        for (int k = 0; known[k]; k++)
+            if (strncmp(p, known[k], strlen(known[k])) == 0) { match = 1; break; }
+        if (!match) continue;
+        if (prefix && *prefix && strncmp(p, prefix, strlen(prefix)) != 0) continue;
+        dbg_printf("  %s%c", p, 10);
+        n++;
+    }
+    FreeEnvironmentStringsA(env);
+    dbg_printf("  (%d set; docs/DIAGNOSTICS.md lists all of them)%c", n, 10);
+}
+
+static DWORD WINAPI debug_console(LPVOID param)
+{
+    const char* path = (const char*)param;
+    char outpath[1024];
+    snprintf(outpath, sizeof outpath, "%s.out", path);
+
+    HMODULE self = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&debug_console, &self);
+    const DWORD t0 = GetTickCount();
+    fprintf(stderr, "[dbg] console on '%s' -- write a command, read '%s'%c",
+            path, outpath, 10);
+
+    for (;;) {
+        Sleep(100);
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        char cmd[512] = {0};
+        if (!fgets(cmd, sizeof cmd, f)) { fclose(f); continue; }
+        fclose(f);
+        char* nl = strpbrk(cmd, "\r\n"); if (nl) *nl = 0;
+        if (!cmd[0]) continue;
+        FILE* t = fopen(path, "wb"); if (t) fclose(t);   /* consume it */
+
+        s_dbg_out = fopen(outpath, "ab");
+        dbg_printf("%c[dbg] > %s%c", 10, cmd, 10);
+
+        char verb[64] = {0};
+        unsigned a = 0, b = 0;
+        sscanf(cmd, "%63s", verb);
+
+        if (!strcmp(verb, "help")) {
+            dbg_printf("  threads          stacks of every guest thread, symbolised%c", 10);
+            dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
+            dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
+            dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
+            dbg_printf("  poke32 <hex> <v> write a guest u32%c", 10);
+            dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
+        } else if (!strcmp(verb, "threads")) {
+            dump_threads("console", self);
+        } else if (!strcmp(verb, "hle")) {
+            dbg_printf("  last HLE = 0x%08X (%s)%c", g_last_hle_nid,
+                       g_last_hle_name ? g_last_hle_name : "", 10);
+        } else if (!strcmp(verb, "stat")) {
+            dbg_printf("  uptime   %.1f s%c", (GetTickCount() - t0) / 1000.0, 10);
+            dbg_printf("  flips    %u%c", cellGcm_flip_request_count(), 10);
+            dbg_printf("  last HLE 0x%08X (%s)%c", g_last_hle_nid,
+                       g_last_hle_name ? g_last_hle_name : "", 10);
+            dbg_printf("  vm_base  %s%c", vm_base ? "live" : "not mapped", 10);
+        } else if (!strcmp(verb, "mem") && sscanf(cmd, "%*s %x %u", &a, &b) >= 1) {
+            dbg_mem(a, b);
+        } else if (!strcmp(verb, "poke32") && sscanf(cmd, "%*s %x %x", &a, &b) == 2) {
+            if (vm_base) {
+                uint32_t be = ((b & 0xFF) << 24) | ((b & 0xFF00) << 8) |
+                              ((b >> 8) & 0xFF00) | ((b >> 24) & 0xFF);
+                memcpy(vm_base + a, &be, 4);
+                dbg_printf("  [0x%08X] = 0x%08X%c", a, b, 10);
+            } else dbg_printf("  vm_base not live yet%c", 10);
+        } else if (!strcmp(verb, "knobs")) {
+            char pfx[64] = {0};
+            sscanf(cmd, "%*s %63s", pfx);
+            dbg_knobs(pfx);
+        } else {
+            dbg_printf("  ? '%s' -- try 'help'%c", verb, 10);
+        }
+
+        if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+    }
+    return 0;
 }
 
 static DWORD WINAPI hang_watchdog(LPVOID)
@@ -617,7 +771,12 @@ int main(int argc, char** argv)
     if (getenv("PS3_GUEST_PROF"))
         CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
 #ifdef _WIN32
-    CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);   /* tlhelp32-based */
+    CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
+    /* PS3_DEBUG=<file>: ask a running title what it is doing. */
+    { static char dbgpath[1024];
+      const char* dp = getenv("PS3_DEBUG");
+      if (dp && *dp) { snprintf(dbgpath, sizeof dbgpath, "%s", dp);
+                       CreateThread(NULL, 0, debug_console, dbgpath, 0, NULL); } }   /* tlhelp32-based */
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
