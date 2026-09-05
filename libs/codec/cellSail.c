@@ -27,6 +27,34 @@ typedef struct {
 
 static SailPlayer s_players[CELL_SAIL_PLAYER_MAX];
 
+/* Players registered by cellSailPlayerInitialize2, keyed by the guest struct EA
+ * the title passed as `pSelf`. Declared here because the adapter setters below
+ * need it -- they take that same pointer, not an index into s_players[]. */
+static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; int state; }
+    s_sail_players[CELL_SAIL_PLAYER_MAX];
+
+/* A CellSailPlayer is a GUEST POINTER, not a small integer handle.
+ *
+ * Every player entry point below used to validate its first argument as an
+ * index (`handle >= CELL_SAIL_PLAYER_MAX`) into the handle-keyed s_players[]
+ * table, which rejects every real call: a guest pointer is always larger than
+ * the table. cellSailPlayerInitialize2 has always registered the player by its
+ * `pSelf` EA, so the two halves of this file disagreed about what a handle is.
+ *
+ * That is not a harmless error return. Tokyo Jungle sets its sound adapter
+ * during audio init; on failure it abandons the path, closes a resource it
+ * never opened ("sgxResClose unknown ID (0)"), terminates its SGX sound system
+ * and then blocks forever joining an audio thread that will not exit.
+ *
+ * One lookup, used by all of them, so the disagreement cannot come back. */
+static int sail_player_slot(u32 self_ea)
+{
+    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
+        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
+            return i;
+    return -1;
+}
+
 /* Lifecycle */
 
 s32 cellSailInit(void)
@@ -77,10 +105,11 @@ s32 cellSailPlayerCreate(const CellSailPlayerAttribute* attr,
 s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
 {
     printf("[cellSail] PlayerDestroy(%u)\n", handle);
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    s_players[handle].in_use = 0;
-    s_players[handle].state = CELL_SAIL_PLAYER_STATE_CLOSED;
+    s_sail_players[_sp].in_use = 0;
+    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_CLOSED;
     return CELL_OK;
 }
 
@@ -88,9 +117,10 @@ s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
 {
     (void)userParam;
     printf("[cellSail] PlayerBoot(%u)\n", handle);
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    s_players[handle].state = CELL_SAIL_PLAYER_STATE_RUNNING;
+    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
     return CELL_OK;
 }
 
@@ -98,7 +128,8 @@ s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path)
 {
     printf("[cellSail] PlayerOpenStream(%u, \"%s\") - stub\n", handle,
            path ? path : "null");
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     /* Stub: don't actually open anything */
     return CELL_OK;
@@ -106,7 +137,8 @@ s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path)
 
 s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
 {
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     return CELL_OK;
 }
@@ -114,43 +146,48 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
 s32 cellSailPlayerStart(CellSailPlayerHandle handle)
 {
     printf("[cellSail] PlayerStart(%u)\n", handle);
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    s_players[handle].state = CELL_SAIL_PLAYER_STATE_RUNNING;
+    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
     /* Immediately signal finished since we don't play anything */
-    s_players[handle].state = CELL_SAIL_PLAYER_STATE_FINISHED;
+    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     return CELL_OK;
 }
 
 s32 cellSailPlayerStop(CellSailPlayerHandle handle)
 {
     printf("[cellSail] PlayerStop(%u)\n", handle);
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    s_players[handle].state = CELL_SAIL_PLAYER_STATE_FINISHED;
+    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     return CELL_OK;
 }
 
 s32 cellSailPlayerPause(CellSailPlayerHandle handle)
 {
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    s_players[handle].state = CELL_SAIL_PLAYER_STATE_PAUSE;
+    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_PAUSE;
     return CELL_OK;
 }
 
 s32 cellSailPlayerGetState(CellSailPlayerHandle handle, s32* state)
 {
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     if (!state) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    vm_write32((u32)(uintptr_t)state, (u32)s_players[handle].state);
+    vm_write32((u32)(uintptr_t)state, (u32)s_sail_players[_sp].state);
     return CELL_OK;
 }
 
 s32 cellSailPlayerGetStreamNum(CellSailPlayerHandle handle, u32* streamNum)
 {
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     if (!streamNum) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     vm_write32((u32)(uintptr_t)streamNum, 0);   /* no streams in stub */
@@ -161,48 +198,76 @@ s32 cellSailPlayerGetStreamInfo(CellSailPlayerHandle handle, u32 streamIndex,
                                   CellSailStreamInfo* info)
 {
     (void)streamIndex;
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     if (!info) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     return (s32)CELL_SAIL_ERROR_NOT_FOUND;
 }
 
+/* r3 is a CellSailPlayer* -- a GUEST POINTER, the same `pSelf` that
+ * cellSailPlayerInitialize2 registered -- not a small integer handle. Validating
+ * it as an index (`handle >= CELL_SAIL_PLAYER_MAX`) rejects every real call,
+ * because a guest pointer is always larger than the table size.
+ *
+ * That is not a harmless error return: Tokyo Jungle sets its sound adapter
+ * during audio init, and on failure abandons the whole path -- it closes a
+ * resource it never opened ("sgxResClose unknown ID (0)"), terminates its SGX
+ * sound system, and then blocks forever joining an audio thread that is not
+ * going to exit. Look the player up the way Initialize2 stored it. */
 s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
     (void)index; (void)adapter;
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    return CELL_OK;
+    u32 self_ea = (u32)handle;
+    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
+        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
+            return CELL_OK;
+    return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
 }
 
+/* r3 is a CellSailPlayer* -- a GUEST POINTER, the same `pSelf` that
+ * cellSailPlayerInitialize2 registered -- not a small integer handle. Validating
+ * it as an index (`handle >= CELL_SAIL_PLAYER_MAX`) rejects every real call,
+ * because a guest pointer is always larger than the table size.
+ *
+ * That is not a harmless error return: Tokyo Jungle sets its sound adapter
+ * during audio init, and on failure abandons the whole path -- it closes a
+ * resource it never opened ("sgxResClose unknown ID (0)"), terminates its SGX
+ * sound system, and then blocks forever joining an audio thread that is not
+ * going to exit. Look the player up the way Initialize2 stored it. */
 s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
     (void)index; (void)adapter;
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    return CELL_OK;
+    u32 self_ea = (u32)handle;
+    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
+        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
+            return CELL_OK;
+    return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
 }
 
 s32 cellSailPlayerCancel(CellSailPlayerHandle handle)
 {
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    s_players[handle].state = CELL_SAIL_PLAYER_STATE_FINISHED;
+    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     return CELL_OK;
 }
 
 s32 cellSailPlayerIsPaused(CellSailPlayerHandle handle)
 {
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return 0;
-    return (s_players[handle].state == CELL_SAIL_PLAYER_STATE_PAUSE) ? 1 : 0;
+    return (s_sail_players[_sp].state == CELL_SAIL_PLAYER_STATE_PAUSE) ? 1 : 0;
 }
 
 s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode, void* command)
 {
     (void)command;
     printf("[cellSail] SetRepeatMode(%u, %d)\n", handle, repeatMode);
-    if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     /* Real ABI returns the (now-set) repeat mode in r3, not an error code. */
     return repeatMode;
@@ -337,8 +402,6 @@ s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLe
 #define SAIL_PLAYER_CLEAR   0x200u   /* well clear of the caller's next object */
 #define SAIL_ADAPTER_CLEAR  0x100u
 
-static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; }
-    s_sail_players[CELL_SAIL_PLAYER_MAX];
 
 static void sail_zero_guest(u32 ea, u32 n)
 {
