@@ -454,7 +454,7 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
 }
 
-static void spurs_cancel_attached_queues(void);  /* defined with the queue table */
+static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
 
 s32 cellSpursFinalize(CellSpurs* spurs)
 {
@@ -472,7 +472,7 @@ s32 cellSpursFinalize(CellSpurs* spurs)
      *
      * Done BEFORE the instance lookup: that lookup fails here, and a failed
      * handle is no reason to strand a thread. */
-    spurs_cancel_attached_queues();
+    spurs_cancel_attached_queues((u32)(uintptr_t)spurs);
 
     struct SpursInst* si = spurs_inst_find((u32)(uintptr_t)spurs);
     if (!si)
@@ -600,15 +600,33 @@ extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
 extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
 
 static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
+/* WHICH SPURS instance attached each queue. A title with more than one instance
+ * -- Tokyo Jungle boots one for its data install and keeps a second for audio --
+ * finalises them separately, and cancelling every queue on any Finalize kills
+ * the surviving instance's queues too. That reads to the title as "the SPU
+ * stopped answering": its sound engine's receives fail with ECANCELED and it
+ * tears itself down. Cancel only the queues the instance being finalised owns. */
+static u32 s_spurs_event_queue_owner[MAX_SPURS_QUEUES];
 static int s_spurs_event_queue_n = 0;
 
 /* Release anyone blocked on the completion queues SPURS attached; see
  * cellSpursFinalize. */
-static void spurs_cancel_attached_queues(void)
+static void spurs_cancel_attached_queues(u32 spurs_ea)
 {
-    for (int i = 0; i < s_spurs_event_queue_n; i++)
-        sys_event_queue_cancel_by_id(s_spurs_event_queue[i]);
-    s_spurs_event_queue_n = 0;
+    int keep = 0;
+    for (int i = 0; i < s_spurs_event_queue_n; i++) {
+        /* owner 0 means "attached before we tracked owners" -- cancel those on
+         * any finalize, which is the old behaviour and the safe default. */
+        u32 owner = s_spurs_event_queue_owner[i];
+        if (spurs_ea == 0 || owner == 0 || owner == spurs_ea) {
+            sys_event_queue_cancel_by_id(s_spurs_event_queue[i]);
+        } else {
+            s_spurs_event_queue[keep]       = s_spurs_event_queue[i];
+            s_spurs_event_queue_owner[keep] = owner;
+            keep++;
+        }
+    }
+    s_spurs_event_queue_n = keep;
 }
 
 s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
@@ -627,7 +645,8 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
         int dup = 0;
         for (int i = 0; i < s_spurs_event_queue_n; i++)
             if (s_spurs_event_queue[i] == queue) dup = 1;
-        if (!dup) s_spurs_event_queue[s_spurs_event_queue_n++] = queue;
+        if (!dup) { s_spurs_event_queue_owner[s_spurs_event_queue_n] = (u32)(uintptr_t)spurs;
+                    s_spurs_event_queue[s_spurs_event_queue_n++] = queue; }
     }
 
     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
@@ -2433,6 +2452,33 @@ static s32 jc_start(u64 jc_ea, const char* who)
 s32 cellSpursRunJobChain(u64 jc_ea)
 {
     return jc_start(jc_ea, "RunJobChain");
+}
+
+/* cellSpursShutdownJobChain(CellSpursJobChain*) -- the other half of the pair.
+ *
+ * A title that starts a chain with Run/Kick ends it with Shutdown, then blocks
+ * in Join until the chain has actually stopped. Leaving Shutdown unimplemented
+ * is not harmless: the import logs UNIMPLEMENTED and returns whatever was in
+ * r3, so the caller reads a garbage result for "did the shutdown take?" and a
+ * title that checks it can decide the subsystem failed and tear itself down.
+ *
+ * Clearing `running` is what makes the pair honest: the host walker stops
+ * grabbing new work, and the Join that follows has something true to observe.
+ * Found in Tokyo Jungle, whose sound engine shuts its chain down during init
+ * and then reports "failed to recv data from SPU" when the handshake does not
+ * complete. */
+s32 cellSpursShutdownJobChain(u64 jc_ea)
+{
+    static int _n = 0;
+    if (_n++ < 8) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (s_jobchains[i].jc_ea == (u32)jc_ea) {
+            s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
+            return CELL_OK;
+        }
+    }
+    /* Not one of ours: still CELL_OK -- the chain is, trivially, not running. */
+    return CELL_OK;
 }
 
 /* cellSpursJoinJobChain(const CellSpursJobChain*) -- one argument, as above. */
