@@ -928,7 +928,18 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         static int _wn=0; if (_wn++ < 400) {
         char* mb=(char*)GetModuleHandleA(NULL); void* bt[28]; unsigned short fr=RtlCaptureStackBackTrace(0,28,bt,0);
         char ln[1000]; int p=snprintf(ln,sizeof ln,"[WWATCH] write32 0x%08X = 0x%08X bt:",ea,v);
-        for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
+        /* Resolve each frame to the LIFTED GUEST FUNCTION, the way the write64
+         * path already does. Raw module RVAs name nothing without a linker map,
+         * so a write32 watch could say a value was stored but never by whom --
+         * which is the only thing the watch is for. Consecutive frames inside
+         * one guest function collapse to a single entry. */
+        uint32_t prev=0;
+        for(int i=0;i<fr;i++){
+            uint32_t gfn = ppu_prof_resolve_host(bt[i]);
+            if (gfn && gfn != prev) { p+=snprintf(ln+p,sizeof(ln)-p," func_%08X",gfn); prev=gfn; }
+            else if (!gfn)          { p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb)); }
+            if (p > (int)sizeof(ln)-24) break;
+        }
         fprintf(stderr,"%s\n",ln); }
 #else
         fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p\n", ea, v, __builtin_return_address(0));
