@@ -180,6 +180,15 @@ int64_t sys_cond_wait(ppu_context* ctx)
               for (int k = 0; k < 16; k++) fprintf(stderr, " %02X", o[k]);
               fputc(10, stderr);
           } } }
+    /* PS3_COND_PEEK=<hex ea>: print a guest u32 alongside each wait. A condvar
+     * wait is only ever "waiting for a predicate", and the predicate is a word
+     * in guest memory -- printing it at the moment of the wait says whether the
+     * waiter is right to wait, without inferring it from a write watch. */
+    { extern uint32_t vm_read32(uint64_t);
+      static long pk = -1;
+      if (pk < 0) { const char* e = getenv("PS3_COND_PEEK"); pk = e ? (long)strtoul(e,0,16) : 0; }
+      if (pk > 0) fprintf(stderr, "[PEEK] [0x%08lX]=%u (0x%08X)  at cond_wait(cond=%u)\n",
+                          (unsigned long)pk, vm_read32((uint32_t)pk), vm_read32((uint32_t)pk), cond_id); }
     fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
             (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
     /* YDKJ_THREADGATE: creating thread is blocking -> let gated workers run. */
