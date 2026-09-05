@@ -1020,7 +1020,7 @@ void vm_write64(uint64_t a, uint64_t v) {
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
         void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(NULL);
-        fprintf(stderr,"[WWATCH] write64 0x%08X = 0x%016llX  ra_rva=0x%llX\n", ea, (unsigned long long)v, (unsigned long long)((char*)ra-mb)); } } }
+        fprintf(stderr,"[WWATCH] write64 0x%08X = 0x%016llX  ra_rva=0x%llX guest-fn=0x%08X\n", ea, (unsigned long long)v, (unsigned long long)((char*)ra-mb), ppu_prof_resolve_host(ra)); } } }
     /* FLOW_WVAL (64-bit): catch a 64-bit store whose HIGH or LOW 32-bit half equals
      * the watched value — the blind spot for the vm_write32-only FLOW_WVAL hook. */
     { static int64_t wv=-2; if(wv==-2){const char*e=getenv("FLOW_WVAL"); wv=e?(int64_t)strtoul(e,0,16):-1;}
