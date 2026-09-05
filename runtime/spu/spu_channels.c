@@ -406,7 +406,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         yz_lockstep_tick(ctx);
         resv_lock();
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
-        memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);  /* snapshot for compare */
+        /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
+         * single atomic 128-byte read, so the reserved data and the reservation
+         * come from the same instant. Reading guest memory twice lets a PPU store
+         * land between them, leaving the SPU a STALE line and a FRESH snapshot --
+         * and then both halves of the wait fail: the SPU compares its stale copy,
+         * sees produced == consumed and sleeps on MFC_LLR_LOST_EVENT, while the
+         * reservation poll compares memory against a snapshot that already holds
+         * the new value, finds no difference, and never raises the event. Nobody
+         * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
+         * stale, which is exactly what makes the lost-reservation event fire. */
+        memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
         resv_unlock();
         return 1;
