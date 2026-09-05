@@ -452,6 +452,36 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
     return CELL_OK;
 }
 
+/* cellSailGraphicsAdapterInitialize(pSelf, pCallbacks, pArg)
+ *
+ * The video-side twin of cellSailSoundAdapterInitialize, and it was missing --
+ * so the import returned whatever was in r3 and the guest read an adapter it
+ * believed was initialised. Same treatment as the sound adapter: zero the guest
+ * struct so every pointer the title reads back is NULL (which callers check)
+ * rather than a stale address that faults or is silently followed. */
+s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
+{
+    (void)pArg;
+    printf("[cellSail] GraphicsAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
+           pSelf, pCallbacks);
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
+    return CELL_OK;
+}
+
+/* cellSailGraphicsAdapterSetPreferredFormat(pSelf, pFormat)
+ *
+ * Records nothing: we do not decode video, so there is no format to honour.
+ * It must still answer CELL_OK for a valid adapter, because a title that reads
+ * an error here concludes its graphics adapter is unusable. */
+s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
+{
+    printf("[cellSail] GraphicsAdapterSetPreferredFormat(self=0x%08X fmt=0x%08X)\n",
+           pSelf, pFormat);
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return CELL_OK;
+}
+
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs)
 {
