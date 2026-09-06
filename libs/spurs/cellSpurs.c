@@ -2329,20 +2329,7 @@ static void jc_signal_done(u32 jc_ea)
      * data2 + 1 reaches the chain's job count, so a mailbox value there ends
      * the wait early. */
     enum { SGX_Q_IN_BUSES = 0x105, SGX_Q_OUT_BUSES = 0x106 };
-    /* SPURS_ANSWER_QUERIES=1. Off by default, and that is a deliberate
-     * trade rather than doubt about the emulation: forwarding the answer is
-     * correct -- the count check errors when count < requested, and the SPU's
-     * answer of 1 satisfies a request for bus 1 where our 0 does not -- but the
-     * title then advances into a load that reads a ~23 MB file into a global
-     * buffer pointer at [[TOC-0xB60]] which nothing in the lifted image ever
-     * sets. The fread destination advances through the copy, so it walks from
-     * address 0 up over the title's own OPD table and TOC. Until that NULL
-     * buffer is understood, the default keeps the clean, reproducible failure
-     * instead of a corrupted one. See tokyojungle/docs/WHERE_IT_STOPS.md. */
-    static int s_answer = -1;
-    if (s_answer < 0) s_answer = getenv("SPURS_ANSWER_QUERIES") ? 1 : 0;
-    const int answers_a_count = s_answer &&
-                                (g_spurs_job_cmd == SGX_Q_IN_BUSES ||
+    const int answers_a_count = (g_spurs_job_cmd == SGX_Q_IN_BUSES ||
                                  g_spurs_job_cmd == SGX_Q_OUT_BUSES);
     if (g_spurs_job_mbox_valid) {
         d2 = g_spurs_job_mbox;
