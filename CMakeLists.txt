@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # 2026 while the project shipped 0.6.x through 0.8.0, so every build printed
 # "ps3recomp runtime v0.3.0" and was believed. v0.9.0 is the first TAGGED one.
 project(ps3recomp_runtime
-    VERSION 0.9.1
+    VERSION 0.11.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )

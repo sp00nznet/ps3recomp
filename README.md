@@ -39,7 +39,12 @@ The PlayStation 3 has over **3,000 titles** and some of the most beloved games e
 
 ## Platform support
 
-Verified by CI on every push unless noted.
+Every row is exercised by CI on every push. **Windows is green; Linux and macOS
+currently fail one check** — the PPU boot scaffold ratchet, which guards the
+unfinished POSIX port from sliding backwards and has been failing since before
+v0.11.0 ([#139](https://github.com/sp00nznet/ps3recomp/issues/139)). The rows
+below describe what those jobs actually do when they run, not what a green tick
+would imply.
 
 | | Windows | macOS (arm64) | Linux |
 |---|---|---|---|
@@ -189,7 +194,7 @@ ps3recomp/
     ├── ARCHITECTURE.md        # Cell processor and recomp pipeline deep-dive
     ├── GETTING_STARTED.md     # How to recompile your first PS3 game
     ├── MODULE_STATUS.md       # Implementation status of all HLE modules
-    ├── MODULES_REFERENCE.md   # Detailed per-module documentation (all 77+)
+    ├── MODULES_REFERENCE.md   # Detailed per-module documentation
     ├── RUNTIME.md             # Runtime reference: VM, PPU/SPU contexts, types
     ├── SYSCALLS.md            # All LV2 kernel syscall implementations
     ├── NID_SYSTEM.md          # PS3 NID linking system explained
@@ -260,7 +265,7 @@ tests (`runtime/spu/tests/`: sum, shufb, DMA, brsl-return).
 
 ## Module Status
 
-We're building HLE implementations based on RPCS3's module system. **97 modules complete, 1 partial (media decode), 283 files, ~74,000 lines of code.**
+We're building HLE implementations based on RPCS3's module system. **97 modules complete, 1 partial (media decode)** — 219 files and ~76,000 lines under `libs/`.
 
 | Category | Modules | Status |
 |----------|---------|--------|
@@ -309,7 +314,7 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[Runtime Reference](docs/RUNTIME.md)** | Virtual memory manager, PPU/SPU execution contexts, type system, endianness, syscall dispatch, DMA engine |
 | **[Syscall Reference](docs/SYSCALLS.md)** | All LV2 kernel syscalls: threading, sync, events, timers, memory, filesystem |
 | **[NID System](docs/NID_SYSTEM.md)** | How PS3 function linking works, NID computation, module registration framework |
-| **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for all 93+ HLE modules — what they do and how they're implemented |
+| **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for every HLE module — what they do and how they're implemented |
 | **[Module Status](docs/MODULE_STATUS.md)** | Quick-reference status table for all modules |
 | **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, D3D12 and Metal backends, shader strategy |
 | **[Tools Reference](docs/TOOLS.md)** | Every recompiler pipeline tool documented: ELF parser, disassembler, lifter, NID database |
@@ -420,6 +425,87 @@ ps3recomp is built by a growing community. See **[CONTRIBUTORS.md](CONTRIBUTORS.
 for who did what — thank you, everyone.
 
 ## Changelog
+
+### v0.11.0 — *"Correctness Pass"* (September 2026)
+
+*Fourteen open pull requests land at once. Most of them are correctness fixes*
+*found by driving real titles into real walls:* Tokyo Jungle *reaches its main*
+*menu, and the bugs it exposed — a mutex that never ran its initialiser, a FIFO*
+*resync that ate fences, two guest pointers dereferenced as host pointers — were*
+*never title-specific.*
+
+**Execution correctness**
+
+- **`sys_ppu_thread_once` was unimplemented** and returned success *without
+  running the initialiser* (#136). Anything waiting on state that a once-routine
+  was supposed to publish waited forever. This was the keystone bug behind
+  Tokyo Jungle's boot.
+- **SPU `xswd` read the wrong words and stored the halves backwards** (#127) —
+  small positive values became zero. **`GETLLAR` must snapshot the reservation
+  from local store**, not re-read memory (#126).
+- **VMX correctness batch folded back** from the port branches (#125):
+  `vmsumshs`, `vsumsws`, `vmulesh` and five byte-order bugs.
+
+**Guest pointers are not host pointers**
+
+Two crashes, same root cause, both reachable from ordinary gameplay:
+
+- **`cellSaveData` called the title's `funcStat` and `funcFile` as host function
+  pointers.** They are guest OPDs, so this jumped into guest memory as code —
+  every autosave died on it. Both now marshal through guest memory the way
+  `cellSaveDataAutoLoad2` already did.
+- **`cellSail` printed its `uri` and `path` arguments as host strings**, killing
+  the process the moment a title opened a movie. Both are copied out of guest
+  memory now, and the descriptor's long-unused `uri[512]` field is finally
+  filled.
+
+**Graphics and SPURS**
+
+- **A FIFO resync must not swallow fences** (#137). Jumping `get` to `put` keeps
+  the ring alive, but a `SET_REFERENCE` in the skipped range means the
+  `cellGcmFinish` waiting on it never wakes. Losing draws costs a frame; losing
+  a fence deadlocks the title. The skipped range is now swept first, and each
+  resync site is named in the log.
+- **SPURS carries the SPU's answer to a job query** in the completion event
+  (#135), and **cancels only the finalised instance's queues**, plus a real
+  `ShutdownJobChain` (#129).
+- **`cellSail`**: a player handle is a guest pointer, not an index (#130), and
+  async call completion is reported to the title's event handler (#133).
+
+**Diagnostics and tooling**
+
+- **A call graph over the lifted output** (#131), so reachability is a query
+  rather than a grep.
+- **Watched stores name the guest function** that made them (#132, #134), and
+  condvar probes tell a lost signal from an unsatisfied predicate (#128).
+
+**Documentation, honestly**
+
+- Removed three documents that were surveys of a private game library, one of
+  which described obtaining DRM-stripped EBOOTs. The harness no longer defaults
+  to a personal path (#138).
+- **The starter template could not link.** It declared a `ps3::memory` /
+  `ps3::thread` / `ps3::modules` API that does not exist, and since the porting
+  guide tells you to copy that template, the documented path could only ever
+  produce undefined references (#114, #89). Rewritten against the real runtime
+  API, and its CMake now compiles the per-game PPU scaffold and sets `/bigobj`.
+- **The renderer is documented at last** — which backend each platform gets,
+  that there is no CMake switch for it, and that `RSX_LIVE_DRAW` is *not*
+  required to get a picture.
+- `SPU_FALLBACK.md` claimed ps3recomp cannot execute SPU code, which stopped
+  being true some time ago.
+
+**CI**
+
+- `cellSync.c` called `getenv` with no `<stdlib.h>` — invisible on Windows,
+  fatal on POSIX, and one reason every Linux job had been red.
+- The SPU helper suite had a broken `xswd` case that built asymmetric vectors
+  with a helper documented as only safe for symmetric ones. **Windows CI was
+  never running that suite at all**; it does now.
+
+> **Known issue:** the PPU scaffold ratchet still fails on Linux and macOS
+> (`ppu_loader.cpp`, 0 → 110 on gcc). It predates this release and is tracked in
+> #139. Windows CI is green.
 
 ### v0.10.0 — *"Three Platforms"* (September 2026)
 
