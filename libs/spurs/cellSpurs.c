@@ -2288,8 +2288,13 @@ static int jg_wait(u32 ea)
  * this queue, and would only notify again after the event arrives -- so
  * signalling at walker exit deadlocks both sides. Signal when the WORK
  * completes: at END, and on reaching a guard with jobs run this lap. */
-extern uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr, g_spurs_job_cmd;
-extern int g_spurs_job_mbox_valid;
+#ifdef _WIN32
+#  define SPURS_JOB_TLS __declspec(thread)
+#else
+#  define SPURS_JOB_TLS __thread
+#endif
+extern SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr, g_spurs_job_cmd;
+extern SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 
 /* SPURS_EVENT_D3=<n>: probe. The value a job query returns to the PPU is read
  * from the completion event's data3 field (the guest stores r7 at sp+0xB8 and

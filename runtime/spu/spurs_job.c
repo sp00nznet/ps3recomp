@@ -128,11 +128,22 @@ const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
 }
 
 /* Last outbound mailbox posted by a finished job (see below). */
-uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
+/* THREAD-LOCAL. A job's answer is read back by the completion event that
+ * follows it, and jc_execute signals immediately after each job -- but the walk
+ * runs on whichever guest thread drives the chain, and more than one can be in
+ * flight. As plain globals these were clobbered between a job finishing and its
+ * own completion being pushed, so a query could be answered with an unrelated
+ * job's mailbox. Per-thread keeps each job paired with its own answer. */
+#ifdef _WIN32
+#  define SPURS_JOB_TLS __declspec(thread)
+#else
+#  define SPURS_JOB_TLS __thread
+#endif
+SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
 /* The command this job ran, read from its own command block. Only a query
  * expects an answer back through the completion event. */
-uint32_t g_spurs_job_cmd;
-int g_spurs_job_mbox_valid;
+SPURS_JOB_TLS uint32_t g_spurs_job_cmd;
+SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
