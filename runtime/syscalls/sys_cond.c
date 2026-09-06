@@ -115,6 +115,16 @@ int64_t sys_cond_create(ppu_context* ctx)
         if ((uint32_t)(slot + 1) <= SYS_COND_MAX) g_cond_id_addr[slot + 1] = id_out_addr;
     }
 
+    /* PS3_SYNCLOG: which guest object each cond id belongs to, and who made it.
+     * A deadlock report names a cond by id; without this there is no way back
+     * from "nothing signals cond 3" to the subsystem that owns cond 3. */
+    if (getenv("PS3_SYNCLOG") || getenv("YDKJ_SYNCLOG")) {
+        char nm[9]; memcpy(nm, c->name, 8); nm[8] = 0;
+        fprintf(stderr, "[SYNC] cond_create id=%u name='%s' mutex=%u id_at=0x%08X lr=0x%08X\n",
+                cond_id, nm, mutex_id, id_out_addr, (uint32_t)ctx->lr);
+        fflush(stderr);
+    }
+
     cond_table_unlock();
     return CELL_OK;
 }
@@ -213,6 +223,18 @@ int64_t sys_cond_wait(ppu_context* ctx)
     m->lock_count = 0;
 
 #ifdef _WIN32
+    /* PS3_COND_SPURIOUS_MS=<n>: turn an infinite wait into an n-ms one.
+     *
+     * A spurious wakeup is legal for a condition variable -- correct guest code
+     * re-tests its predicate on wake -- so this cannot invent progress that the
+     * title would not otherwise make. It is an A/B PROBE: if a run advances only
+     * with this set, the missing thing is a SIGNAL, and the predicate was already
+     * satisfiable. If it does not advance, the predicate itself is never true and
+     * the producer is what to chase. Not a fix, and it does not belong in a run
+     * you are measuring. */
+    { static long sp = -1;
+      if (sp < 0) { const char* e = getenv("PS3_COND_SPURIOUS_MS"); sp = e ? atol(e) : 0; }
+      if (sp > 0 && timeout_us == 0) timeout_us = (uint64_t)sp * 1000ull; }
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;
     /* FLOW_CONDKICK (SPU-bring-up diagnostic): cond=7 is waited on but never
