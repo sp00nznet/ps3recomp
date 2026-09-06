@@ -90,6 +90,17 @@ jobs:
         run: python tools/check_ppu_scaffold.py
 
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
+      # Linux and macOS have run these since they were written; Windows never
+      # did. That gap let a broken xswd case sit red on both POSIX runners
+      # while Windows reported green, which is exactly the wrong way round for
+      # the platform most contributors build on.
+      - name: Run self-contained SPU helper tests
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_spu_helpers.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
       - name: Run self-contained RSX tests

@@ -25,6 +25,16 @@ static u128 make128(uint64_t hi, uint64_t lo) {
     u128 r; r._u64[0] = hi; r._u64[1] = lo; return r;
 }
 
+/* Construct from four SPU words: w0 is SPU word 0 (most significant).
+ * Use this rather than make128 whenever the lanes differ, because make128
+ * writes _u64[] and the union is host-native -- on a little-endian host
+ * _u64[0]'s low half is _u32[0], i.e. SPU word 0, so the word order comes out
+ * reversed within each dword. */
+static u128 make128_words(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) {
+    u128 r; r._u32[0] = w0; r._u32[1] = w1; r._u32[2] = w2; r._u32[3] = w3;
+    return r;
+}
+
 /* Construct from 16 explicit bytes — endianness-neutral (writes _u8[i]=b[i]).
  * Use this for any test that cares about specific byte layout (shufb, cwd,
  * fsmbi, byte permutations). make128 above interprets values according to
@@ -368,8 +378,14 @@ static void test_sign_extend(void) {
     EXPECT_EQ(spu_xshw(spu_il(0x0000FFFE)), spu_il((int32_t)0xFFFFFFFE));
 
     TEST("xswd: sign-extend low word of each dword to 64-bit");
-    u128 in_xswd = make128(0x00000000FFFFFFFFULL, 0x000000007FFFFFFFULL);
-    u128 expected_xswd = make128(0xFFFFFFFFFFFFFFFFULL, 0x000000007FFFFFFFULL);
+    /* dword 0: low word 0xFFFFFFFF -> sign-extends to all ones.
+     * dword 1: low word 0x7FFFFFFF -> stays positive, high word cleared.
+     * Built by word lane: make128 would reverse the words within each dword
+     * (see make128_words), which is why this case read as all zeros. */
+    u128 in_xswd       = make128_words(0x00000000u, 0xFFFFFFFFu,
+                                       0x00000000u, 0x7FFFFFFFu);
+    u128 expected_xswd = make128_words(0xFFFFFFFFu, 0xFFFFFFFFu,
+                                       0x00000000u, 0x7FFFFFFFu);
     EXPECT_EQ(spu_xswd(in_xswd), expected_xswd);
 }
 
