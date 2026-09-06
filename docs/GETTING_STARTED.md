@@ -127,19 +127,43 @@ cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp
 cmake --build build
 ```
 
-On MSVC, use `/bigobj` for large generated source files (the template CMakeLists.txt handles this).
+Lifted output produces very large translation units. On MSVC (and `clang-cl`)
+add `/bigobj` to the target that compiles them, or the object files overflow
+their section limit:
+
+```cmake
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+endif()
+```
+
+`lbp/CMakeLists.txt` in this repository does exactly that and is the working
+reference; the starter template does not set it for you.
 
 ### Step 7: Run
 
+The game executable takes the path to the decrypted ELF as its first argument
+-- it is loaded into the guest address space at startup, not baked into the
+binary:
+
 ```bash
-./build/my_game
+./build/my_game path/to/EBOOT.elf
+```
+
+Most ports also need to know where the title's files live, so that guest mount
+points such as `/dev_hdd0` resolve to a real directory. The in-tree ports derive
+that from the ELF path and accept `PS3_VFS_ROOT` as an override:
+
+```bash
+PS3_VFS_ROOT=/path/to/game-files ./build/my_game path/to/EBOOT.elf
 ```
 
 You'll see:
 - `[init]` messages as the runtime initializes (VM, syscalls, HLE modules)
 - `[HLE]` messages as PS3 API functions are called
 - `[LV2]` messages for unimplemented system calls
-- A window opens (null or D3D12 backend) for RSX graphics output
+- A window opens for RSX output -- Direct3D 12 on Windows, Metal on macOS. See
+  [Graphics backends](BUILDING.md#graphics-backends) for what each platform gets.
 
 **Expected first-run behavior:** CRT startup executes, the game calls `cellSysmoduleLoadModule` to load libraries, then begins initialization. Missing HLE functions show as `[HLE] UNIMPLEMENTED` — add bridges in your game's `hle_modules.cpp`.
 
