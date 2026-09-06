@@ -21,6 +21,7 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
+#include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 
 /* Resolve the GUEST function on the host stack (closest lifted entry below
