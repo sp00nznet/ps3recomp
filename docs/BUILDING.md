@@ -267,9 +267,19 @@ cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-`clang-cl` is what the in-tree ports are built with; add
-`-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl` (with LLVM's `bin`
-on `PATH`) once the MSVC environment is loaded.
+**Both toolchains work.** As of this writing the runtime library builds clean
+with either, verified by building `master` both ways (128/128 targets, warnings
+only):
+
+| Toolchain | Configure |
+|-----------|-----------|
+| MSVC (`cl`) | `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release` |
+| Clang (`clang-cl`) | add `-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl`, with LLVM's `bin` on `PATH` |
+
+`clang-cl` is what the in-tree ports are built with, so it is the better-trodden
+path for a game target. Older guidance said plain MSVC could not compile the
+runtime because of `__builtin_bswap*` and `__attribute__((weak))`; those are
+guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 
 **Link Libraries (auto-linked by CMake):**
 - `ws2_32` — Winsock2 for networking (sys_net, cellHttp, cellNet)
