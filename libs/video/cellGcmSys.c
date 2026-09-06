@@ -681,6 +681,7 @@ unsigned long long ps3_ms_now(void)
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static u32 s_fifo_getoff  = 0;
+static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
 static u32 s_fifo_calloff = 0;
 
 /* ---------------------------------------------------------------------------
@@ -1027,11 +1028,39 @@ static u32 s_tr_i = 0;
  * the unmapped-get path already makes: the commands between here and put
  * are lost, but the next frame is written from a clean boundary and the
  * FIFO lives. */
-static void gcm_fifo_resync(u32* getoff, u32 put)
+static void gcm_ref_push_at(u32 v, u32 getoff);
+
+/* A resync jumps `get` straight to `put`, which is what keeps the FIFO alive
+ * when the walker cannot make progress -- but everything in between is
+ * dropped, and if a SET_REFERENCE is in there the cellGcmFinish waiting on it
+ * never wakes. Tokyo Jungle lost exactly one that way: two fences in the ring
+ * (arg 0 at io 0x09A0, arg 1 at io 0x19E8), the walker parked before the
+ * second, and the resync to put=0x19F0 stepped straight over it -- ref stayed
+ * 0 while the title spun for ref==1 forever.
+ *
+ * Dropping DRAWS on a resync is survivable: a frame is lost. Dropping a FENCE
+ * is not, it deadlocks the title. Sweep the skipped range first. */
+static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
     static int n = 0;
     if (n++ < 8)
-        fprintf(stderr, "[cellGcmSys] FIFO resync 0x%08X -> put 0x%08X\n", *getoff, put);
+        fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
+                why, *getoff, put);
+    u32 from = (*getoff <= put) ? *getoff : s_last_ring_off;
+    if (from < put) {
+        unsigned rescued = 0;
+        for (u32 io = from; io + 8 <= put; io += 4) {
+            u32 ea = gcm_io2ea(io); if (!ea) continue;
+            u32 w = vm_read32(ea);
+            if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
+            u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
+            gcm_ref_push_at(vm_read32(dea), io);
+            rescued++;
+        }
+        if (rescued) { static int m = 0; if (m++ < 8)
+            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
+                    " 0x%08X..0x%08X\n", rescued, from, put); }
+    }
     *getoff = put;
 }
 
@@ -1187,6 +1216,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    vm_read32(s_gcm_context_ea + 0x8));
     }
 
+    /* GCM_SCANREF=1 (one-shot): list every NV406E_SET_REFERENCE actually
+     * present in 0..put. "The title waits for a fence we never published" has
+     * two very different causes -- we missed the command, or it was never
+     * submitted -- and only a direct scan of the ring separates them. */
+    { static int scanned = 0;
+      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+        unsigned found = 0;
+        for (u32 io = 0; io + 8 <= put; io += 4) {
+            u32 ea = gcm_io2ea(io); if (!ea) continue;
+            u32 w = vm_read32(ea);
+            if ((w & 0x1FFCu) == 0x0050u && (w >> 29) == 0) {
+                u32 dea = gcm_io2ea(io + 4);
+                fprintf(stderr, "[SCANREF] io=%08X w=%08X count=%u arg=%08X\n",
+                        io, w, (w >> 18) & 0x7FFu, dea ? vm_read32(dea) : 0xDEADu);
+                found++;
+            }
+        }
+        fprintf(stderr, "[SCANREF] %u SET_REFERENCE in 0..%08X\n", found, put);
+      } }
     int budget = 0x100000;                    /* words per tick cap */
     while (s_fifo_getoff != put && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
@@ -1211,6 +1259,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
+        /* Only remember offsets BELOW put -- those are positions in the
+         * ring the title is writing. A park in another region is where the
+         * walker gave up, not how far it got through the ring. */
+        if (s_fifo_getoff < put) s_last_ring_off = s_fifo_getoff + 4;
         s_tr_off[s_tr_i % GCM_TRACE_N] = s_fifo_getoff;
         s_tr_w[s_tr_i % GCM_TRACE_N] = w;
         s_tr_i++;
@@ -1234,7 +1286,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync(&s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
                * catches up, and overwrites it when the next segment is
@@ -1248,7 +1300,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * park standing -- it only patches a park when it reuses that
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_resync(&s_fifo_getoff, put); }
+                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
+                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
                   break;
               }
               s_fifo_getoff = tgt; }
@@ -1256,7 +1309,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync(&s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
@@ -1418,7 +1471,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * unmapped-get path -- commands are lost, the FIFO lives. */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
       if (s_fifo_getoff == last && s_fifo_getoff != put) {
-          if (++stuck >= 8) { gcm_fifo_resync(&s_fifo_getoff, put); stuck = 0; }
+          if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
+                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
 
     /* Publish progress: get chases put; ref advances at most ONE queued fence
