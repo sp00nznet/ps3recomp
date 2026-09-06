@@ -360,7 +360,27 @@ static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= 1.
  * at the *lower* storage address). Same caveat as the mpy family. */
 static inline u128 spu_xsbh(u128 a) { u128 r; for(int i=0;i<8;i++) r._s16[i] = (int8_t)a._u8[2*i]; return r; }
 static inline u128 spu_xshw(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (int16_t)a._s16[2*i]; return r; }
-static inline u128 spu_xswd(u128 a) { u128 r; for(int i=0;i<2;i++) r._s64[i] = (int32_t)a._s32[2*i]; return r; }
+/* xswd: sign-extend each SPU word 1 and 3 into a doubleword.
+ *
+ * SPU word 0 is _u32[0], so the SOURCE words are the ODD indices, and the
+ * result must be written as two u32 halves -- writing through _s64 puts the
+ * halves the wrong way round, because _s64 is host-little-endian while the
+ * quadword lanes are big-endian. The old form did both wrongly at once
+ * (reading the EVEN words and storing via _s64), which cancelled only for
+ * values whose two halves happen to be equal -- so small positive values came
+ * out as ZERO and everything derived from them silently collapsed.
+ *
+ * xsbh/xshw look like this too but are correct: their source and destination
+ * swaps cancel. Nothing cancels here, because words are not reversed. */
+static inline u128 spu_xswd(u128 a) {
+    u128 r;
+    for (int d = 0; d < 2; d++) {
+        int32_t v = (int32_t)a._u32[2*d + 1];
+        r._u32[2*d]     = (uint32_t)(v >> 31);   /* sign fill (high word) */
+        r._u32[2*d + 1] = (uint32_t)v;           /* value      (low word) */
+    }
+    return r;
+}
 
 /* ---- Phase 3: OR across ---- */
 static inline u128 spu_orx(u128 a) {
