@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
 #include <stdio.h>
 #include <stdarg.h>
@@ -422,6 +423,46 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
     }
     slot_unlock();
     return CELL_EAGAIN;
+}
+
+/* sys_ppu_thread_once(once_ctrl, init)
+ *
+ * Runs `init` exactly once, the pthread_once of the lv2 user library. It was
+ * not implemented at all, so it fell through to the unresolved-NID handler,
+ * which returns CELL_OK -- success, without ever running the initialiser. Every
+ * subsystem that brings itself up this way was therefore left uninitialised
+ * while its caller was told the init had happened, and the failure only shows
+ * up later as a state error from the first call that needs it.
+ *
+ * Tokyo Jungle reaches its SPURS bring-up through one of these; with the
+ * initialiser skipped, the very next check returns CELL_ESTAT and the whole
+ * bring-up -- including the allocation of the buffer its loader reads into --
+ * is abandoned.
+ *
+ * `once_ctrl` is a guest word, zero before the first call (SYS_PPU_THREAD_ONCE_
+ * INIT). `init` is a function DESCRIPTOR, so it goes through the guest caller.
+ * ponytail: reuses the slot lock rather than a per-control one -- the call is
+ * rare and only ever contended at start-up. */
+
+s32 sys_ppu_thread_once(u32 once_ctrl_ea, u32 init_opd)
+{
+    if (!once_ctrl_ea)
+        return (s32)CELL_EINVAL;
+
+    slot_lock();
+    const int first = (vm_read32(once_ctrl_ea) == 0);
+    if (first)
+        vm_write32(once_ctrl_ea, 1);
+    slot_unlock();
+
+    if (first && init_opd && g_ps3_guest_caller) {
+        static int n = 0;
+        if (n++ < 8)
+            printf("[sysPrxForUser] sys_ppu_thread_once: running init 0x%08X"
+                   " (ctrl 0x%08X)\n", init_opd, once_ctrl_ea);
+        g_ps3_guest_caller(init_opd, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+    return CELL_OK;
 }
 
 s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
