@@ -8,7 +8,7 @@ hardens the toolkit (and tells us which NID stubs to ship next).
 
 Two input sources, because PS3 content reaches us at two very different stages:
 
-  * --psn-root DIR   The PSN library of *.rar archives (default Z:\\Roms\\PS3\\PSN).
+  * --archive-root DIR  A directory of packaged titles (*.rar). No default --
                      PSN packages are NPDRM-encrypted and frequently multi-GB, so
                      we do NOT decrypt them wholesale. Instead we catalog every
                      title cheaply from its filename (which encodes the title-id
@@ -34,7 +34,7 @@ the batch. Per-title results land in <out>/results/<id>.json. `report`
 aggregates them into REPORT.md.
 
 Usage:
-  python ps3_recomp_harness.py catalog --psn-root "Z:\\Roms\\PS3\\PSN" [--probe 10]
+  python ps3_recomp_harness.py catalog --archive-root <dir> [--probe 10]
   python ps3_recomp_harness.py analyze --elf-root D:\\recomp\\ps3games --max-tier 4
   python ps3_recomp_harness.py analyze --elf-root D:\\recomp\\ps3games\\scout --max-tier 5
   python ps3_recomp_harness.py report
@@ -65,7 +65,8 @@ IDA_ANALYZE = TOOLS_DIR / "ida_analyze.py"
 # rather than editing this file -- the defaults are deliberately generic so
 # the harness carries no one developer's directory layout.
 DEFAULTS = {
-    "psn_root":   os.environ.get("PS3RECOMP_PSN_ROOT", ""),
+    "psn_root":   os.environ.get("PS3RECOMP_ARCHIVE_ROOT",
+                              os.environ.get("PS3RECOMP_PSN_ROOT", "")),
     "out":        os.environ.get("PS3RECOMP_OUT", str(TOOLS_DIR.parent / "_harness")),
     "sevenzip":   os.environ.get("PS3RECOMP_7ZIP", "7z"),
     "ps3sce":     os.environ.get("PS3RECOMP_PS3SCE", "ps3sce"),
@@ -798,8 +799,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    pc = sub.add_parser("catalog", help="catalog the PSN library by filename (+optional probe)")
-    pc.add_argument("--psn-root", dest="psn_root")
+    pc = sub.add_parser("catalog", help="catalog a directory of packaged titles by filename (+optional probe)")
+    pc.add_argument("--archive-root", dest="psn_root",
+                    help="directory of packaged titles to catalog")
+    # Kept so existing scripts keep working; --archive-root is the documented name.
+    pc.add_argument("--psn-root", dest="psn_root", help=argparse.SUPPRESS)
     pc.add_argument("--probe", type=int, default=0, help="extract+read PKG header for N smallest titles")
     pc.add_argument("--out")
     pc.add_argument("--sevenzip")
