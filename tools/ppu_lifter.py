@@ -2403,9 +2403,26 @@ class PPULifter:
                 if mn == iname:
                     vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
                     cmp = ">" if prefix == "vmax" else "<"
-                    return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
-                            f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
-                            f"for(int i=0;i<{cnt};i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+                    w = 16 // cnt
+                    if w == 1:
+                        # single byte per lane: no byte order to get wrong
+                        return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
+                                f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
+                                f"for(int i=0;i<{cnt};i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+                    # Multi-byte lanes are stored BIG-ENDIAN in vr[]. Reading
+                    # them through a host {ty}* byte-reverses every lane, so the
+                    # comparison picks the wrong operand -- the same defect the
+                    # vadduwm comment above describes. Compose each lane from its
+                    # bytes, compare, write the winner back big-endian.
+                    return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                            f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t o[16]; "
+                            f"for(int i=0;i<{cnt};i++){{ uint32_t ux=0,uy=0; "
+                            f"for(int k=0;k<{w};k++){{ ux=(ux<<8)|a[i*{w}+k]; "
+                            f"uy=(uy<<8)|b[i*{w}+k]; }} "
+                            f"{ty} x=({ty})ux, y=({ty})uy; "
+                            f"{ty} r=(x{cmp}y)?x:y; "
+                            f"for(int k=0;k<{w};k++) o[i*{w}+k]=(uint8_t)((({ty})r)>>(8*({w}-1-k))); }} "
+                            f"memcpy(&ctx->vr[{vd}], o, 16); }}")
 
         # Float min/max
         if mn == "vmaxfp" or mn == "vminfp":
@@ -2620,15 +2637,26 @@ class PPULifter:
                     f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<16;i++){{uint8_t s=b[i]&7u; d[i]=(a[i]<<s)|(a[i]>>(8u-s));}} }}")
         if mn == "vrlw":
+            # BE lanes (same defect as vsraw had). A rotate of a byte-reversed
+            # word is wrong in both the value and the amount.
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{uint32_t s=b[i]&31u; d[i]=(a[i]<<s)|(a[i]>>(32u-s));}} }}")
+            return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); "
+                    f"ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++){{ uint32_t s=b[i]&31u; "
+                    f"d[i]=s?((a[i]<<s)|(a[i]>>(32u-s))):a[i]; }} "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
         if mn == "vsraw":
+            # BE lanes, exactly like vslw/vsrw above. This read vr[] through an
+            # int32_t* with no byte swap, so every lane was byte-reversed before
+            # the shift -- and an arithmetic shift of a byte-reversed value is
+            # not even close. ps1_netemu's MDEC colour conversion is built from
+            # vsraw + vminsw + vmaxsw, which is why its output was saturated
+            # primaries (pure red/green/white) instead of decoded video.
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int32_t* a=(int32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]>>(b[i]&31u); }}")
+            return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); "
+                    f"ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=(uint32_t)((int32_t)a[i]>>(b[i]&31u)); "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
 
         # (vmaxsw handled above by the generic vmax/vmin loop)
 
@@ -2645,12 +2673,76 @@ class PPULifter:
                     f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
                     f"d[0]=(uint32_t)a[0]*(uint32_t)b[0]; d[1]=(uint32_t)a[2]*(uint32_t)b[2]; "
                     f"d[2]=(uint32_t)a[4]*(uint32_t)b[4]; d[3]=(uint32_t)a[6]*(uint32_t)b[6]; }}")
-        if mn == "vmulosh":
+        # vmsumshs / vsumsws -- the two instructions an IDCT is actually built
+        # from, and both were emitted as "/* TODO */" no-ops. 32 sites, ALL of
+        # them inside ps1_netemu's MDEC decode function (func_000E90B4), so the
+        # inverse DCT never ran at all.
+        #
+        # vr[] holds big-endian bytes: halfword lane i is bytes [2i,2i+1],
+        # word lane j is bytes [4j..4j+3].
+        #
+        # vmsumshs vD,vA,vB,vC: for each word j, add vC[j] to the two products
+        # of the signed halfword pair in that word, saturating to signed 32.
+        if mn == "vmsumshs":
+            vd, va, vb, vc = (int(ops[0][1:]), int(ops[1][1:]),
+                              int(ops[2][1:]), int(ops[3][1:]))
+            return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; "
+                    f"const uint8_t* c=(const uint8_t*)&ctx->vr[{vc}]; uint8_t o[16]; "
+                    f"for(int j=0;j<4;j++){{ "
+                    f"int64_t acc=(int64_t)(int32_t)(((uint32_t)c[j*4]<<24)|"
+                    f"((uint32_t)c[j*4+1]<<16)|((uint32_t)c[j*4+2]<<8)|c[j*4+3]); "
+                    f"for(int h=0;h<2;h++){{ int l=j*2+h; "
+                    f"int16_t x=(int16_t)((a[l*2]<<8)|a[l*2+1]); "
+                    f"int16_t y=(int16_t)((b[l*2]<<8)|b[l*2+1]); "
+                    f"acc+=(int64_t)x*(int64_t)y; }} "
+                    f"if(acc>2147483647LL) acc=2147483647LL; "
+                    f"if(acc<-2147483648LL) acc=-2147483648LL; "
+                    f"uint32_t r=(uint32_t)(int32_t)acc; "
+                    f"for(int k=0;k<4;k++) o[j*4+k]=(uint8_t)(r>>(8*(3-k))); }} "
+                    f"memcpy(&ctx->vr[{vd}], o, 16); }}")
+
+        # vsumsws vD,vA,vB: sum the four signed words of vA plus word 3 of vB,
+        # saturate to signed 32, place in word 3 of vD; words 0..2 are zero.
+        if mn == "vsumsws":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"d[0]=(int32_t)a[1]*(int32_t)b[1]; d[1]=(int32_t)a[3]*(int32_t)b[3]; "
-                    f"d[2]=(int32_t)a[5]*(int32_t)b[5]; d[3]=(int32_t)a[7]*(int32_t)b[7]; }}")
+            return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t o[16]; "
+                    f"memset(o,0,16); int64_t acc=0; "
+                    f"for(int j=0;j<4;j++){{ acc+=(int64_t)(int32_t)(((uint32_t)a[j*4]<<24)|"
+                    f"((uint32_t)a[j*4+1]<<16)|((uint32_t)a[j*4+2]<<8)|a[j*4+3]); }} "
+                    f"acc+=(int64_t)(int32_t)(((uint32_t)b[12]<<24)|((uint32_t)b[13]<<16)|"
+                    f"((uint32_t)b[14]<<8)|b[15]); "
+                    f"if(acc>2147483647LL) acc=2147483647LL; "
+                    f"if(acc<-2147483648LL) acc=-2147483648LL; "
+                    f"uint32_t r=(uint32_t)(int32_t)acc; "
+                    f"for(int k=0;k<4;k++) o[12+k]=(uint8_t)(r>>(8*(3-k))); "
+                    f"memcpy(&ctx->vr[{vd}], o, 16); }}")
+
+        # vmulesh / vmulosh -- multiply the EVEN / ODD signed halfword lanes to
+        # four 32-bit products.
+        #
+        # vmulesh had NO lowering at all and was emitted as "/* TODO */" -- a
+        # no-op -- and vmulosh read vr[] through int16_t*/int32_t* with no byte
+        # swap, so its lanes were byte-reversed. ps1_netemu's MDEC colour
+        # conversion (func_000E90B4) uses three of each, so half its multiplies
+        # never ran and the other half multiplied byte-reversed values: the
+        # decoder emitted saturated primaries instead of video, which is why the
+        # PS1 intro movie had no picture.
+        #
+        # vr[] holds big-endian bytes: halfword lane i is bytes [2i,2i+1] and
+        # result word j is bytes [4j..4j+3]. Compose and store explicitly.
+        if mn in ("vmulesh", "vmulosh"):
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            off = 0 if mn == "vmulesh" else 1
+            return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t o[16]; "
+                    f"for(int j=0;j<4;j++){{ int l=2*j+{off}; "
+                    f"int16_t x=(int16_t)((a[l*2]<<8)|a[l*2+1]); "
+                    f"int16_t y=(int16_t)((b[l*2]<<8)|b[l*2+1]); "
+                    f"uint32_t r=(uint32_t)((int32_t)x*(int32_t)y); "
+                    f"for(int k=0;k<4;k++) o[j*4+k]=(uint8_t)(r>>(8*(3-k))); }} "
+                    f"memcpy(&ctx->vr[{vd}], o, 16); }}")
 
         # Average unsigned byte
         if mn == "vavgub":
