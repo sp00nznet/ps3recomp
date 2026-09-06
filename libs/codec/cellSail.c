@@ -146,8 +146,22 @@ s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
 
 s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path)
 {
+    /* path is a GUEST address; printing it as a host char* faulted here the
+     * same way it did in CreateDescriptor. Copy it out of guest memory. */
+    char path_host[512];
+    path_host[0] = '\0';
+    if (path) {
+        u32 ea = (u32)(uintptr_t)path;
+        size_t n = 0;
+        while (n < sizeof(path_host) - 1) {
+            char c = (char)vm_read8(ea + (u32)n);
+            if (!c) break;
+            path_host[n++] = c;
+        }
+        path_host[n] = '\0';
+    }
     printf("[cellSail] PlayerOpenStream(%u, \"%s\") - stub\n", handle,
-           path ? path : "null");
+           path ? path_host : "null");
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
@@ -318,8 +332,27 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
                                      CellSailDescriptorHandle* desc)
 {
     (void)mediaInfo;
+
+    /* uri is a GUEST address. Printing it as a host char* faulted the moment
+     * the title opened a movie -- the log line stopped mid-token at
+     * 'uri="' and the process died with 0xC0000005. Copy it out of guest
+     * memory first. The descriptor has always had a uri[512] field; nothing
+     * ever filled it, so the URI was discarded even when it did not crash. */
+    char uri_host[512];
+    uri_host[0] = '\0';
+    if (uri) {
+        u32 ea = (u32)(uintptr_t)uri;
+        size_t n = 0;
+        while (n < sizeof(uri_host) - 1) {
+            char c = (char)vm_read8(ea + (u32)n);
+            if (!c) break;
+            uri_host[n++] = c;
+        }
+        uri_host[n] = '\0';
+    }
+
     printf("[cellSail] CreateDescriptor(player=%u, type=%d, uri=\"%s\")\n", handle,
-           streamType, uri ? uri : "null");
+           streamType, uri ? uri_host : "null");
     if (!desc) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
 
     for (int i = 0; i < MAX_DESCRIPTORS; i++) {
@@ -328,6 +361,7 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
             s_descs[i].in_use = 1;
             s_descs[i].streamType = streamType;
             s_descs[i].player = handle;
+            snprintf(s_descs[i].uri, sizeof(s_descs[i].uri), "%s", uri_host);
             vm_write32((u32)(uintptr_t)desc, (u32)i);   /* guest out-param */
             return CELL_OK;
         }
