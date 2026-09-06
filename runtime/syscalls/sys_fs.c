@@ -241,6 +241,7 @@ int64_t sys_fs_open(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    { extern char* getenv(const char*); static int _fl=-1; if(_fl<0){ const char* e=getenv("TJ_FSLOG"); _fl=(e&&*e&&*e!='0')?1:0; } if(_fl) fprintf(stderr, "[FSOPEN] %s%c", ps3_path?ps3_path:"<null>", 10); }
 
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);

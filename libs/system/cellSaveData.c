@@ -191,6 +191,51 @@ static s32 marshal_cbresult_read_result(uint32_t addr)
 #define SAVEDATA_STATSET_SIZE   16u    /* setParam ptr + reCreateMode + indicator ptr */
 #define SAVEDATA_CBRESULT_SIZE  20u    /* s32 + u32 + s32 + char* + void* */
 
+/* CellSaveDataFileGet is 0x44 (excSize + reserved[64]); CellSaveDataFileSet is
+ * 0x30 (fileOperation, reserved, fileType, secureFileId[16], fileName ptr,
+ * fileOffset, fileSize, fileBufSize, fileBuf ptr). */
+#define SAVEDATA_FILEGET_SIZE   0x44u
+#define SAVEDATA_FILESET_SIZE   0x30u
+
+/* Dispatch the game's funcFile the same way funcStat is dispatched.
+ *
+ * It used to be called as a HOST function pointer with HOST stack addresses:
+ *
+ *     funcFile(&cbResult, &fileGet, &fileSet);
+ *
+ * funcFile is a GUEST OPD, so that jumped straight into guest memory as if it
+ * were host code -- "ACCESS VIOLATION: execute at host 0x34C250" the moment
+ * Tokyo Jungle autosaved. Marshal the three structs into guest memory and go
+ * through g_ps3_guest_caller, exactly as dispatch_func_stat does.
+ *
+ * ponytail: the callback's fileSet is not read back yet, so the game's chosen
+ * file is not written -- the callback runs and the title advances instead of
+ * crashing. Read fileName/fileBuf/fileSize out of set_ea and feed
+ * process_file_op when a title actually needs its save contents. */
+static s32 dispatch_func_file(uint32_t func_opd, uint32_t userdata_ea)
+{
+    if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+
+    scratch_reset();
+    uint32_t cb_ea  = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
+    uint32_t get_ea = scratch_alloc(SAVEDATA_FILEGET_SIZE);
+    uint32_t set_ea = scratch_alloc(SAVEDATA_FILESET_SIZE);
+    if (!cb_ea || !get_ea || !set_ea) {
+        printf("[cellSaveData] funcFile scratch alloc failed\n");
+        return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+    }
+
+    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea);
+
+    printf("[cellSaveData] dispatching funcFile OPD=0x%08X (cb=0x%X get=0x%X set=0x%X)\n",
+           func_opd, cb_ea, get_ea, set_ea);
+    g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
+
+    s32 result = marshal_cbresult_read_result(cb_ea);
+    printf("[cellSaveData] funcFile returned cbResult.result=%d\n", result);
+    return result;
+}
+
 static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
                                   s32 sizeKB, u32 fileNum)
 {
@@ -557,7 +602,12 @@ static s32 savedata_execute(const char* dirName, int is_save,
        the stat callback will see isNewData=1 and can handle it */
 
     /* Prepare stat get */
-    u32 file_list_max = setBuf ? setBuf->fileListMax : 64;
+    /* setBuf is a GUEST address, not a host pointer. Dereferencing it faulted
+     * the moment the title autosaved: cellSaveDataAutoSave2 -> savedata_execute
+     * read setBuf->fileListMax off a guest stack address and took an access
+     * violation (0xD00DCF84 = r1+0x90). Read it out of guest memory, the way
+     * the dirListMax read below already does. fileListMax is at +4. */
+    u32 file_list_max = setBuf ? vm_read32((u32)(uintptr_t)setBuf + 4) : 64;
     CellSaveDataFileStat* fileList = NULL;
     u32 fileNum = 0;
 
@@ -610,7 +660,12 @@ static s32 savedata_execute(const char* dirName, int is_save,
     CellSaveDataStatSet statSet;
     memset(&statSet, 0, sizeof(statSet));
 
-    funcStat(&cbResult, &statGet, &statSet);
+    /* Same guest-OPD-as-host-pointer bug as funcFile below: this jumped into
+     * guest memory as host code -- ACCESS VIOLATION: execute at host 0x34C250
+     * -- the moment Tokyo Jungle autosaved. Route it through the marshalling
+     * dispatcher, which builds StatGet/StatSet in guest memory. */
+    cbResult.result = dispatch_func_stat((uint32_t)(uintptr_t)funcStat, is_new,
+                                         dirName, (uint32_t)(uintptr_t)userdata);
 
     if (cbResult.result < 0) {
         printf("[cellSaveData] stat callback returned error %d\n", cbResult.result);
@@ -637,7 +692,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
 
             cbResult.result = CELL_SAVEDATA_CBRESULT_OK_NEXT;
 
-            funcFile(&cbResult, &fileGet, &fileSet);
+            cbResult.result = dispatch_func_file((uint32_t)(uintptr_t)funcFile, (uint32_t)(uintptr_t)userdata);
 
             if (cbResult.result == CELL_SAVEDATA_CBRESULT_OK_LAST ||
                 cbResult.result < 0) {

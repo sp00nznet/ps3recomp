@@ -407,6 +407,7 @@ static void ensure_parent_dirs(const char* path)
 s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 size)
 {
     printf("[cellFs] Open(path='%s', flags=0x%X)\n", gpath(path) ? gpath(path) : "<null>", flags);
+    { extern char* getenv(const char*); static int _bt=-1; if(_bt<0){ const char* e=getenv("TJ_FSBT"); _bt=(e&&*e&&*e!='0')?1:0; } if(_bt){ extern unsigned int ppu_prof_resolve_host(void*); void* fr[24]; unsigned short n=RtlCaptureStackBackTrace(0,24,fr,0); char ln[600]; int p=snprintf(ln,sizeof ln,"[FSBT]"); unsigned int prev=0; for(unsigned short i=0;i<n;i++){ unsigned int g=ppu_prof_resolve_host(fr[i]); if(g&&g!=prev){ prev=g; p+=snprintf(ln+p,sizeof(ln)-p," %08X",g); } } fprintf(stderr,"%s%c",ln,10); } }
 
     if (!path || !fd)
         return CELL_EFAULT;
