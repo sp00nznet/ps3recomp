@@ -13,6 +13,7 @@
  * guest register values); translate to host before dereferencing. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 #include <stdio.h>
+#include <stdlib.h>   /* getenv -- sync_trace(); pulled in transitively by windows.h, absent on POSIX */
 #include <string.h>
 
 /* Yield hint for spin-wait loops */
