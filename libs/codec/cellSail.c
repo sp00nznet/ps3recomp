@@ -7,6 +7,7 @@
  * initial recompilation testing.
  */
 
+#include "ps3emu/guest_call.h"
 #include "cellSail.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_read32 / vm_write32 */
 #include <stdio.h>
@@ -113,6 +114,24 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
     return CELL_OK;
 }
 
+/* CellSailEvent is {be32 major; be32 minor} -- one 64-bit register, major in
+ * the high half. Async player calls report completion as major=2
+ * (CALL_COMPLETED) with minor = the CellSailPlayerCall id that finished; a
+ * title that drives SAIL asynchronously blocks until its handler sees that.
+ * We run every call synchronously, so notify right after each one. */
+#define SAIL_EV_CALL_COMPLETED 2
+enum { SAIL_CALL_BOOT = 1, SAIL_CALL_OPEN_STREAM = 2, SAIL_CALL_CLOSE_STREAM = 3,
+       SAIL_CALL_START = 10, SAIL_CALL_STOP = 11 };
+
+static void sail_notify(int slot, u32 major, u32 minor, u64 arg0)
+{
+    if (slot < 0 || !g_ps3_guest_caller) return;
+    const u32 cb = s_sail_players[slot].callback_ea;
+    if (!cb) return;
+    g_ps3_guest_caller(cb, s_sail_players[slot].arg_ea,
+                       ((u64)major << 32) | minor, arg0, 0, 0, 0, 0, 0);
+}
+
 s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
 {
     (void)userParam;
@@ -121,6 +140,7 @@ s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
+    sail_notify(_sp, SAIL_EV_CALL_COMPLETED, SAIL_CALL_BOOT, 0);
     return CELL_OK;
 }
 
@@ -132,6 +152,7 @@ s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     /* Stub: don't actually open anything */
+    sail_notify(_sp, SAIL_EV_CALL_COMPLETED, SAIL_CALL_OPEN_STREAM, 0);
     return CELL_OK;
 }
 
@@ -140,6 +161,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_notify(_sp, SAIL_EV_CALL_COMPLETED, SAIL_CALL_CLOSE_STREAM, 0);
     return CELL_OK;
 }
 
@@ -152,6 +174,7 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
     /* Immediately signal finished since we don't play anything */
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
+    sail_notify(_sp, SAIL_EV_CALL_COMPLETED, SAIL_CALL_START, 0);
     return CELL_OK;
 }
 
@@ -162,6 +185,7 @@ s32 cellSailPlayerStop(CellSailPlayerHandle handle)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
+    sail_notify(_sp, SAIL_EV_CALL_COMPLETED, SAIL_CALL_STOP, 0);
     return CELL_OK;
 }
 

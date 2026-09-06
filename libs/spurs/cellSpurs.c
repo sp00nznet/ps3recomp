@@ -2288,17 +2288,24 @@ static int jg_wait(u32 ea)
  * this queue, and would only notify again after the event arrives -- so
  * signalling at walker exit deadlocks both sides. Signal when the WORK
  * completes: at END, and on reaching a guard with jobs run this lap. */
-extern uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
-extern int g_spurs_job_mbox_valid;
+#ifdef _WIN32
+#  define SPURS_JOB_TLS __declspec(thread)
+#else
+#  define SPURS_JOB_TLS __thread
+#endif
+extern SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr, g_spurs_job_cmd;
+extern SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 
 /* SPURS_EVENT_D3=<n>: probe. The value a job query returns to the PPU is read
  * from the completion event's data3 field (the guest stores r7 at sp+0xB8 and
  * reads the count back from sp+0xBC). This lets that be confirmed by observing
  * the returned count change, without having to guess the real value first. */
+static int d3_probe_valid = 0;
 static u64 spurs_event_data3_probe(void)
 {
     static int v = -1;
-    if (v < 0) { const char* e = getenv("SPURS_EVENT_D3"); v = e ? atoi(e) : 0; }
+    if (v < 0) { const char* e = getenv("SPURS_EVENT_D3");
+                 d3_probe_valid = e ? 1 : 0; v = e ? atoi(e) : 0; }
     return (u64)(unsigned)v;
 }
 
@@ -2309,15 +2316,37 @@ static void jc_signal_done(u32 jc_ea)
      * synthetic payload means the caller reads back zero for whatever it
      * asked. Keep the chain EA in data1 for anything that used it. */
     u64 d2 = 0, d3 = 0;
+    (void)spurs_event_data3_probe();   /* prime d3_probe_valid */
+    /* A PPU-side query submits a job and reads the reply out of the completion
+     * event's data3 (the guest stores r7 at sp+0xB8 and reads the value back
+     * from sp+0xBC, the low half). Tokyo Jungle asks each DSP module for its
+     * input and output bus count this way -- commands 0x105 and 0x106 -- and
+     * the SPU answers both in its outbound mailbox. We computed that mailbox
+     * and then dropped it, pushing 0, so every module registered with a bus
+     * count of 0 and the bus setup rejected the first bus it was asked for
+     * ("sgxbus.c: out of range bus"): the check errors when count < requested,
+     * and 0 < 1.
+     *
+     * Only the two count queries are forwarded. Neighbouring commands
+     * (0x102/0x103/0x104) reply with LS ADDRESSES rather than counts, and
+     * func_00201D38 stores each reply into module+0x1C/+0x20/+0x24. data2
+     * stays 0 because the audio consumer uses it as a JOB INDEX: it waits until
+     * data2 + 1 reaches the chain's job count, so a mailbox value there ends
+     * the wait early. */
+    enum { SGX_Q_IN_BUSES = 0x105, SGX_Q_OUT_BUSES = 0x106 };
+    const int answers_a_count = (g_spurs_job_cmd == SGX_Q_IN_BUSES ||
+                                 g_spurs_job_cmd == SGX_Q_OUT_BUSES);
     if (g_spurs_job_mbox_valid) {
         d2 = g_spurs_job_mbox;
-        d3 = g_spurs_job_mbox_intr;
+        d3 = g_spurs_job_mbox_intr; (void)d3;
         g_spurs_job_mbox_valid = 0;
     }
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
                                             SPURS_EVENT_PORT, jc_ea, 0,
-                                            spurs_event_data3_probe());
+                                            d3_probe_valid
+                                                ? spurs_event_data3_probe()
+                                                : (answers_a_count ? d2 : 0));
         static int n = 0;
         if (n++ < 8)
             printf("[cellSpurs] chain 0x%08X work done -> event queue %u (rc=%d)\n",
