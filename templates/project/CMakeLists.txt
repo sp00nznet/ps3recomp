@@ -58,18 +58,29 @@ endif()
 # ---------------------------------------------------------------------------
 # Recompiled game executable
 # ---------------------------------------------------------------------------
+# The PPU boot scaffold is NOT part of libps3recomp_runtime: those sources
+# #include the lifter-generated ppu_recomp.h, so they are compiled per game,
+# here, against your generated header. See docs/BUILDING.md.
+file(GLOB PS3RECOMP_PPU_SOURCES "${PS3RECOMP_DIR}/runtime/ppu/*.cpp")
+list(FILTER PS3RECOMP_PPU_SOURCES EXCLUDE REGEX "/tests/")
+
+# Your lifted output. ppu_lifter.py writes these; post_lift.py renames them to
+# .cpp and patches the header include.
+file(GLOB GENERATED_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/*.cpp")
+
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
-
-    # Add your recompiled .c / .cpp files here:
-    # recompiled/func_00000100.c
-    # recompiled/func_00000200.c
+    ${PS3RECOMP_PPU_SOURCES}
+    ${GENERATED_SOURCES}
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     "${PS3RECOMP_DIR}/include"
+    "${PS3RECOMP_DIR}/runtime"
+    "${PS3RECOMP_DIR}/libs/video"
     "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp"   # ppu_recomp.h lands here
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -93,6 +104,7 @@ elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
         /W3 /wd4100 /wd4244 /wd4267
         /Zc:__cplusplus         # report correct __cplusplus value
+        /bigobj                 # lifted translation units exceed the section limit
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE
         _CRT_SECURE_NO_WARNINGS

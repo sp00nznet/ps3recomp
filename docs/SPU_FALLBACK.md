@@ -1,9 +1,20 @@
 # SPU PPU Fallback API
 
-ps3recomp does not execute SPU code (no SPU ISA JIT, no SPU local-store
-model). For most games this is fine — many SPU jobs produce side effects
-that nothing actually depends on, or the PPU code is happy when the
-group reports "all threads exited cleanly".
+> **This document predates the SPU lifter.** ps3recomp *does* execute SPU code
+> now: `tools/spu_lifter.py` lifts SPU images to C, and `runtime/spu/` provides
+> the local store, channels, DMA and per-image dispatch. See
+> [SPU_LIFTER.md](SPU_LIFTER.md) for the current path, which is what new ports
+> should use.
+>
+> The fallback API below is still present and still supported
+> (`runtime/syscalls/spu_fallback.c`). It remains the right tool when you want a
+> PPU-side implementation of a job instead of running the SPU code — a
+> hand-written replacement for a decompressor or mixer, or a bring-up shim
+> before an image is lifted.
+
+Historically ps3recomp did not execute SPU code at all. For many games that was
+fine — plenty of SPU jobs produce side effects that nothing actually depends on,
+or the PPU code is happy when the group reports "all threads exited cleanly".
 
 Some games need real SPU output: PhyreEngine asset decompressors, audio
 mixers, particle simulations, physics. Stubbing those silently leaves

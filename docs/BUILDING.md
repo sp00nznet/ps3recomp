@@ -9,12 +9,13 @@ Complete guide to building the ps3recomp runtime library and game projects.
 1. [Prerequisites](#prerequisites)
 2. [Building the Runtime Library](#building-the-runtime-library)
 3. [Build Options](#build-options)
-4. [Platform-Specific Notes](#platform-specific-notes)
-5. [Compiler Support](#compiler-support)
-6. [CMake Build System Details](#cmake-build-system-details)
-7. [Linking Against the Runtime](#linking-against-the-runtime)
-8. [Building a Game Project](#building-a-game-project)
-9. [Troubleshooting](#troubleshooting)
+4. [Graphics Backends](#graphics-backends)
+5. [Platform-Specific Notes](#platform-specific-notes)
+6. [Compiler Support](#compiler-support)
+7. [CMake Build System Details](#cmake-build-system-details)
+8. [Linking Against the Runtime](#linking-against-the-runtime)
+9. [Building a Game Project](#building-a-game-project)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -197,9 +198,88 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 ---
 
+## Graphics Backends
+
+**There is no CMake option for the renderer.** Everything under `libs/video/` is
+compiled into `ps3recomp_runtime`, and the backend is selected by host platform:
+
+| Host | Backend | Source | Status |
+|------|---------|--------|--------|
+| Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
+| macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
+| Linux | null / headless software | `libs/video/` null path | No hardware backend yet. The guest command stream is executed and validated, but nothing is presented to a window. |
+
+So on Windows a plain `cmake --build` already gives you the working renderer --
+there is nothing to switch on. If you are bringing up a port and want frames on
+screen, build on Windows.
+
+### Exercising the backend without a game
+
+On POSIX hosts the build also produces `ps3recomp_host`, which drives the
+`cellGcm` -> RSX -> backend bridge with no lifted game at all. It is how a
+backend gets brought up and regression-tested before any title exists:
+
+```bash
+cmake --build build --target ps3recomp_host
+./build/ps3recomp_host
+```
+
+### `RSX_LIVE_DRAW` is not required
+
+`RSX_LIVE_DRAW=1` (alias `YZ_RSX_DRAW`) selects an **alternative** draw engine
+contributed from a downstream fork, not the normal renderer. It is **off by
+default** and the D3D12 backend is used instead. You do not need to set it to
+get a picture, and setting it changes which draw path executes -- so leave it
+unset unless you are specifically working on that engine.
+
+### The RSX code that is *not* in the library
+
+`runtime/ppu/` and `runtime/host/` are deliberately excluded from
+`ps3recomp_runtime` (see the `list(FILTER ...)` in the root `CMakeLists.txt`).
+They `#include` the lifter-generated `ppu_recomp.h`, which only exists once you
+have lifted a specific title, so they are compiled **into your game target**
+rather than into the shared library. `lbp/CMakeLists.txt` shows the arrangement.
+
+---
+
 ## Platform-Specific Notes
 
 ### Windows
+
+**Configure from a developer environment.** CMake finds the compiler through
+the environment, so a plain shell will fail at `project()` with either
+"no CMAKE_C_COMPILER could be found" or, if you point it at `clang-cl`,
+"the C compiler is not able to compile a simple test program" -- `clang-cl`
+needs the MSVC headers and libraries that `vcvars` exports. Either
+
+```bat
+:: from a "x64 Native Tools Command Prompt for VS 2022", or after
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+or use the Visual Studio generator, which locates the toolchain itself:
+
+```bat
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+```
+
+**Both toolchains work.** As of this writing the runtime library builds clean
+with either, verified by building `master` both ways (128/128 targets, warnings
+only):
+
+| Toolchain | Configure |
+|-----------|-----------|
+| MSVC (`cl`) | `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release` |
+| Clang (`clang-cl`) | add `-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl`, with LLVM's `bin` on `PATH` |
+
+`clang-cl` is what the in-tree ports are built with, so it is the better-trodden
+path for a game target. Older guidance said plain MSVC could not compile the
+runtime because of `__builtin_bswap*` and `__attribute__((weak))`; those are
+guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 
 **Link Libraries (auto-linked by CMake):**
 - `ws2_32` — Winsock2 for networking (sys_net, cellHttp, cellNet)
