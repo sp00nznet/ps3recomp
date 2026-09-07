@@ -73,6 +73,70 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
     s_event_tail = next;
 }
 
+/* Dialog and other one-shot completions carry their own OPD, rather than a
+ * registered sysutil slot. Detach one batch before invoking guest code so a
+ * callback may safely enqueue another completion for the next poll. */
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_completion_lock = SRWLOCK_INIT;
+#define COMPLETION_LOCK() AcquireSRWLockExclusive(&s_completion_lock)
+#define COMPLETION_UNLOCK() ReleaseSRWLockExclusive(&s_completion_lock)
+#define COMPLETION_TLS __declspec(thread)
+#else
+#include <pthread.h>
+static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
+#define COMPLETION_LOCK() pthread_mutex_lock(&s_completion_lock)
+#define COMPLETION_UNLOCK() pthread_mutex_unlock(&s_completion_lock)
+#define COMPLETION_TLS _Thread_local
+#endif
+
+typedef struct GuestCompletion {
+    struct GuestCompletion* next;
+    u32 opd;
+    u64 args[8];
+} GuestCompletion;
+static GuestCompletion* s_completion_head;
+static GuestCompletion* s_completion_tail;
+
+s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
+{
+    if (!opd) return CELL_OK;
+    GuestCompletion* item = malloc(sizeof(*item));
+    if (!item) return (s32)CELL_ENOMEM;
+    item->next = NULL; item->opd = opd; memcpy(item->args, args, sizeof(item->args));
+    COMPLETION_LOCK();
+    if (s_completion_tail) s_completion_tail->next = item;
+    else s_completion_head = item;
+    s_completion_tail = item;
+    COMPLETION_UNLOCK();
+    return CELL_OK;
+}
+
+s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
+{
+    const u64 args[8] = {arg0, arg1, 0, 0, 0, 0, 0, 0};
+    return cellSysutilQueueGuestCallbackArgs(opd, args);
+}
+
+static void drain_guest_completions(void)
+{
+    static COMPLETION_TLS int draining;
+    if (draining || !g_ps3_guest_caller) return;
+    draining = 1;
+    COMPLETION_LOCK();
+    GuestCompletion* item = s_completion_head;
+    s_completion_head = s_completion_tail = NULL;
+    COMPLETION_UNLOCK();
+    while (item) {
+        GuestCompletion* next = item->next;
+        g_ps3_guest_caller(item->opd, item->args[0], item->args[1], item->args[2],
+            item->args[3], item->args[4], item->args[5], item->args[6], item->args[7]);
+        free(item);
+        item = next;
+    }
+    draining = 0;
+}
+
 static s32 s_bgm_enabled = 1;
 static s32 s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
 static char s_cache_path[CELL_SYSCACHE_PATH_MAX];
@@ -136,12 +200,13 @@ int cellSysutil_pump_seen(void) { return s_pump_seen; }
 
 s32 cellSysutilCheckCallback(void)
 {
-    { extern void cellMsgDialog_pump(void);
+    drain_guest_completions();
+    {
       if (!s_pump_seen) {
           s_pump_seen = 1;
           printf("[cellSysutil] CheckCallback: the title pumps sysutil%c", 10);
       }
-      cellMsgDialog_pump(); }
+    }
     /* Drain the event queue, dispatching each event into guest code via
      * the registered ps3_guest_caller hook. Standard PS3 sysutil callback
      * signature is:
@@ -170,14 +235,20 @@ s32 cellSysutilCheckCallback(void)
     return CELL_OK;
 }
 
-s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
+/* value_ea is a GUEST address, and it is spelt as one. It used to be declared
+ * s32* and immediately cast back to a guest EA, with a comment explaining that
+ * dereferencing it as a host pointer faults -- true, and no help to a caller
+ * who reads the declaration instead of the body. A host that translated the
+ * argument first, which is what a pointer parameter asks for, handed this the
+ * address of a host stack local; the cast truncated it to 32 bits and
+ * vm_write32 stored four bytes at whatever guest address that spelt. It varies
+ * with stack layout, so it lands somewhere different every run and nowhere
+ * near the guest's variable, and nothing on the way says a word.
+ *
+ * A u32 cannot be passed a host pointer by accident. */
+s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 {
-    /* `value` is a GUEST address (the recompiled title passes its own VM
-     * pointer); dereferencing it as a host pointer faults. Compute locally
-     * and store big-endian via vm_write32 (this crashed minecraft's boot at
-     * its very first GetSystemParamInt(LANG) call). */
-    uint32_t out_ea = (uint32_t)(uintptr_t)value;
-    if (!out_ea)
+    if (!value_ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 
     s32 v = 0;
@@ -205,36 +276,36 @@ s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
         break;
     }
 
-    vm_write32(out_ea, (uint32_t)v);
+    vm_write32(value_ea, (uint32_t)v);
     return CELL_OK;
 }
 
-s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize)
+/* buf_ea is a GUEST address, for the same reason and with the same history as
+ * the Int form above: the body always treated it as one, and only the
+ * declaration said otherwise. */
+s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize)
 {
-    if (!buf || bufsize == 0)
+    if (!buf_ea || bufsize == 0)
         return CELL_SYSUTIL_ERROR_VALUE;
 
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME: {
-        /* `buf` is a GUEST address — serialize byte-wise via vm_write8. */
         const char* s = "ps3recomp_user";
-        uint32_t ea = (uint32_t)(uintptr_t)buf;
         u32 i;
-        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(ea + i, (uint8_t)s[i]);
-        vm_write8(ea + i, 0);
+        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(buf_ea + i, (uint8_t)s[i]);
+        vm_write8(buf_ea + i, 0);
         break;
     }
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USERNAME: {
         const char* s = "User";
-        uint32_t ea = (uint32_t)(uintptr_t)buf;
         u32 i;
-        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(ea + i, (uint8_t)s[i]);
-        vm_write8(ea + i, 0);
+        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(buf_ea + i, (uint8_t)s[i]);
+        vm_write8(buf_ea + i, 0);
         break;
     }
     default:
         printf("[cellSysutil] GetSystemParamString: unknown id 0x%04X\n", id);
-        vm_write8((uint32_t)(uintptr_t)buf, 0);
+        vm_write8(buf_ea, 0);
         break;
     }
 

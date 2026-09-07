@@ -1,11 +1,12 @@
 /*
  * ps3recomp - cellMsgDialog HLE implementation
  *
- * Prints dialog messages to stdout and immediately invokes callbacks.
+ * Prints dialog messages to stdout and queues callbacks for sysutil polling.
  * No actual UI is rendered.
  */
 
 #include "cellMsgDialog.h"
+#include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,15 +27,13 @@ static const char* guest_str(const void* p)
     return (ea && vm_base) ? (const char*)(vm_base + ea) : "<null>";
 }
 
-/* The callback is a guest OPD; dispatch it the way every other guest callback
- * in the runtime is dispatched. */
-static void invoke_dialog_callback(CellMsgDialogCallback cb, int32_t result,
-                                   void* userdata)
+/* Do not run a completion before Open2 returns: games establish their
+ * dialog wait state after opening, then consume the result on a sysutil poll. */
+static s32 queue_dialog_callback(CellMsgDialogCallback cb, int32_t result,
+                                 void* userdata)
 {
-    uint32_t opd = (uint32_t)(uintptr_t)cb;
-    if (!opd || !g_ps3_guest_caller) return;
-    g_ps3_guest_caller(opd, (uint64_t)(int64_t)result,
-                       (uint64_t)(uintptr_t)userdata, 0, 0, 0, 0, 0, 0);
+    return cellSysutilQueueGuestCallback((u32)(uintptr_t)cb,
+        (u64)(int64_t)result, (u64)(uintptr_t)userdata);
 }
 
 /* ---------------------------------------------------------------------------
@@ -45,22 +44,6 @@ static int                   s_dialog_open = 0;
 static CellMsgDialogCallback s_callback    = NULL;
 static void*                 s_userdata    = NULL;
 static CellMsgDialogType     s_type        = 0;
-
-/* Answer queued for the next cellSysutilCheckCallback (see Open2). */
-static int                   s_pending        = 0;
-static int32_t               s_pending_result = 0;
-static CellMsgDialogCallback s_pending_cb     = NULL;
-static void*                 s_pending_user   = NULL;
-
-extern int cellSysutil_pump_seen(void);
-
-/* Called from cellSysutilCheckCallback. */
-void cellMsgDialog_pump(void)
-{
-    if (!s_pending) return;
-    s_pending = 0;
-    invoke_dialog_callback(s_pending_cb, s_pending_result, s_pending_user);
-}
 
 /* Progress bar state */
 #define MAX_PROGRESS_BARS 2
@@ -101,11 +84,11 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     }
 
     /* Determine button type and auto-respond */
-    u32 button_type = type & 0x000000F0;
+    u32 button_type = type & 0x00000030;
     int has_progress = (type & 0x0000F000) != 0;
 
     if (!has_progress) {
-        /* Auto-respond immediately for non-progress dialogs */
+        /* Queue the headless auto-response for non-progress dialogs */
         s32 result = CELL_MSGDIALOG_BUTTON_OK;
 
         if (button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO) {
@@ -128,30 +111,12 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
             printf("[cellMsgDialog] Auto-responding: NONE (no buttons)\n");
         }
 
-        /* Deliver the answer the way hardware does: from the title's own
-         * cellSysutilCheckCallback pump, not synchronously from inside Open.
-         * Firing it here runs the guest callback BEFORE Open has returned, so a
-         * title that arms its wait state after the call --
-         *
-         *     state = WAITING;
-         *     cellMsgDialogOpen(..., cb, &state);   // cb sets state = DONE
-         *     state = WAITING;                      // ...overwritten here
-         *
-         * -- loses the answer and waits forever. Queue it instead.
-         *
-         * A title that never pumps sysutil would then never see the answer at
-         * all, so fall back to the old synchronous call until a pump is
-         * actually observed. */
+        /* Close and queue the callback; never enter guest code here. */
         s_dialog_open = 0;
         if (s_callback) {
-            if (cellSysutil_pump_seen()) {
-                s_pending_result = result;
-                s_pending_cb     = s_callback;
-                s_pending_user   = s_userdata;
-                s_pending        = 1;
-            } else {
-                invoke_dialog_callback(s_callback, result, s_userdata);
-            }
+            CellMsgDialogCallback cb = s_callback;
+            s_callback = NULL;
+            return queue_dialog_callback(cb, result, s_userdata);
         }
     } else {
         printf("[cellMsgDialog] Progress bar dialog opened (will close on explicit Close/Abort)\n");
@@ -183,8 +148,9 @@ s32 cellMsgDialogClose(float delayMs)
     s_dialog_open = 0;
 
     if (s_callback) {
-        invoke_dialog_callback(s_callback, CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
+        CellMsgDialogCallback cb = s_callback;
         s_callback = NULL;
+        return queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
     }
 
     return CELL_OK;
@@ -201,8 +167,9 @@ s32 cellMsgDialogAbort(void)
     s_dialog_open = 0;
 
     if (s_callback) {
-        invoke_dialog_callback(s_callback, CELL_MSGDIALOG_BUTTON_ESCAPE, s_userdata);
+        CellMsgDialogCallback cb = s_callback;
         s_callback = NULL;
+        return queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_ESCAPE, s_userdata);
     }
 
     return CELL_OK;

@@ -104,6 +104,11 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
 s32 cellSysutilUnregisterCallback(s32 slot);
 s32 cellSysutilCheckCallback(void);
 
+/* Internal HLE completion queue, delivered by the guest's next callback poll. */
+s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
+/* Copy eight guest register arguments into the deferred completion queue. */
+s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
+
 /* Host-side helper: queue a sysutil event to be delivered to the game's
  * registered callback at the next cellSysutilCheckCallback poll. status
  * is one of the CELL_SYSUTIL_* event codes (REQUEST_EXITGAME,
@@ -113,8 +118,11 @@ s32 cellSysutilCheckCallback(void);
  * games use slot 0. */
 void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 
-s32 cellSysutilGetSystemParamInt(s32 id, s32* value);
-s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize);
+/* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
+ * the title's own memory through vm_write*. Spelt u32 so a caller cannot
+ * translate the argument first and hand over a host address. */
+s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea);
+s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize);
 
 /* ---------------------------------------------------------------------------
  * BGM playback control
