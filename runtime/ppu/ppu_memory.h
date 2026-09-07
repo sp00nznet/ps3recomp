@@ -121,9 +121,35 @@ extern "C" {
 #endif
 extern int  g_resv_store_active;
 void        ppu_resv_break_store(uint64_t ea);
+
+/* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c). A PPU store to
+ * a 128-byte line an SPU has reserved with GETLLAR has to serialize through the
+ * SPU lock-line lock -- otherwise it can land inside a PUTLLC's compare and be
+ * written straight back over -- and has to raise SPU_EVENT_LR, which is how an
+ * SPURS idle service parked in `rdch SPU_RdEventStat` learns work was posted.
+ * Declared here rather than pulling spu_coherency.h into every HLE module.
+ *
+ * spu_coh_is_reserved is a load of a global that stays zero until an SPU
+ * reserves its first line, so the ordinary store pays one predictable branch. */
+int         spu_coh_is_reserved(uint32_t addr);
+void        spu_lockline_lock(void);
+void        spu_lockline_unlock(void);
+void        spu_coh_notify_write(uint32_t addr);
 #ifdef __cplusplus
 }
 #endif
+
+#define VM_WRITE_COH(addr, src, n)                                            \
+    do {                                                                      \
+        if (spu_coh_is_reserved((uint32_t)(addr))) {                          \
+            spu_lockline_lock();                                              \
+            memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
+            spu_coh_notify_write((uint32_t)(addr));                           \
+            spu_lockline_unlock();                                            \
+        } else {                                                              \
+            memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
+        }                                                                     \
+    } while (0)
 
 /* ---------------------------------------------------------------------------
  * Write-watch hook for the INLINE writers.
@@ -151,21 +177,21 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width);
 static inline void vm_write8(uint32_t addr, uint8_t val)
 {
     PS3_WW_CHECK(addr, val, 1);
-    *vm_ptr8(addr) = val;
+    VM_WRITE_COH(addr, &val, 1);
 }
 
 static inline void vm_write16(uint32_t addr, uint16_t val)
 {
     PS3_WW_CHECK(addr, val, 2);
     uint16_t raw = ps3_bswap16(val);
-    memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    VM_WRITE_COH(addr, &raw, sizeof(raw));
 }
 
 static inline void vm_write32(uint32_t addr, uint32_t val)
 {
     PS3_WW_CHECK(addr, val, 4);
     uint32_t raw = ps3_bswap32(val);
-    memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    VM_WRITE_COH(addr, &raw, sizeof(raw));
     if (g_resv_store_active > 0) ppu_resv_break_store(addr);
 }
 
@@ -173,7 +199,7 @@ static inline void vm_write64(uint32_t addr, uint64_t val)
 {
     PS3_WW_CHECK(addr, val, 8);
     uint64_t raw = ps3_bswap64(val);
-    memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    VM_WRITE_COH(addr, &raw, sizeof(raw));
     if (g_resv_store_active > 0) ppu_resv_break_store(addr);
 }
 
@@ -199,14 +225,55 @@ static inline void vm_memcpy_from(void* host_dst, uint32_t guest_src, size_t len
     memcpy(host_dst, vm_ptr8(guest_src), len);
 }
 
+/* A block store is a store to every 128-byte line it touches, so it breaks
+ * an SPU reservation on any of them the same way vm_write32 does on one:
+ * under the lock-line lock, with the lost-reservation event raised per line.
+ * Only the lines that are reserved are notified, and a block that touches
+ * none takes the plain path. */
+static inline int vm_block_reserved(uint32_t guest_dst, size_t len)
+{
+    if (len == 0) return 0;
+    uint32_t first = guest_dst & ~127u;
+    uint32_t last  = (uint32_t)(guest_dst + (len - 1)) & ~127u;
+    for (uint32_t line = first; ; line += 128u) {
+        if (spu_coh_is_reserved(line)) return 1;
+        if (line == last) break;
+    }
+    return 0;
+}
+
+static inline void vm_block_notify(uint32_t guest_dst, size_t len)
+{
+    uint32_t first = guest_dst & ~127u;
+    uint32_t last  = (uint32_t)(guest_dst + (len - 1)) & ~127u;
+    for (uint32_t line = first; ; line += 128u) {
+        if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
+        if (line == last) break;
+    }
+}
+
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
-    memcpy(vm_ptr8(guest_dst), host_src, len);
+    if (vm_block_reserved(guest_dst, len)) {
+        spu_lockline_lock();
+        memcpy(vm_ptr8(guest_dst), host_src, len);
+        vm_block_notify(guest_dst, len);
+        spu_lockline_unlock();
+    } else {
+        memcpy(vm_ptr8(guest_dst), host_src, len);
+    }
 }
 
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 {
-    memset(vm_ptr8(guest_dst), val, len);
+    if (vm_block_reserved(guest_dst, len)) {
+        spu_lockline_lock();
+        memset(vm_ptr8(guest_dst), val, len);
+        vm_block_notify(guest_dst, len);
+        spu_lockline_unlock();
+    } else {
+        memset(vm_ptr8(guest_dst), val, len);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -247,9 +314,23 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
     uint32_t desired  = ps3_bswap32(val);
     _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
 
-    int ok = atomic_compare_exchange_strong_explicit(
-        atom, &expected, desired,
-        memory_order_acq_rel, memory_order_acquire);
+    /* On a line an SPU has reserved, commit under the lock-line lock and notify
+     * -- the same serialization the coherent stores above use, so a PPU commit
+     * can never land inside an SPU PUTLLC's compare/commit window (nor the
+     * reverse), and the reserving SPU gets its lost-reservation event. */
+    int ok;
+    if (spu_coh_is_reserved(addr)) {
+        spu_lockline_lock();
+        ok = atomic_compare_exchange_strong_explicit(
+            atom, &expected, desired,
+            memory_order_acq_rel, memory_order_acquire);
+        if (ok) spu_coh_notify_write(addr);
+        spu_lockline_unlock();
+    } else {
+        ok = atomic_compare_exchange_strong_explicit(
+            atom, &expected, desired,
+            memory_order_acq_rel, memory_order_acquire);
+    }
 
     ctx->reserve_valid = 0;
 
@@ -286,9 +367,19 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
     uint64_t desired  = ps3_bswap64(val);
     _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
 
-    int ok = atomic_compare_exchange_strong_explicit(
-        atom, &expected, desired,
-        memory_order_acq_rel, memory_order_acquire);
+    int ok;
+    if (spu_coh_is_reserved(addr)) {
+        spu_lockline_lock();
+        ok = atomic_compare_exchange_strong_explicit(
+            atom, &expected, desired,
+            memory_order_acq_rel, memory_order_acquire);
+        if (ok) spu_coh_notify_write(addr);
+        spu_lockline_unlock();
+    } else {
+        ok = atomic_compare_exchange_strong_explicit(
+            atom, &expected, desired,
+            memory_order_acq_rel, memory_order_acquire);
+    }
 
     ctx->reserve_valid = 0;
 

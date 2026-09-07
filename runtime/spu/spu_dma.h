@@ -604,8 +604,59 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               }
           } }
     } else if (mfc_is_put(cmd)) {
-        /* PUT: local store -> main memory */
-        memcpy(ea_ptr, ls_ptr, size);
+        /* PUT: local store -> main memory.
+         *
+         * A plain PUT is a store by another processor as far as every SPU
+         * holding a reservation on the lines it covers is concerned: on
+         * hardware those reservations are lost and their SPUs take
+         * SPU_EVENT_LR. Unannounced, a peer's pending PUTLLC compares its
+         * snapshot against a line this copy has already replaced and commits
+         * over it, and a peer parked on RdEventStat sleeps through the write.
+         *
+         * So when the span touches a reserved line the copy and the notify run
+         * as ONE critical section under the lock-line lock -- the same contract
+         * the PPU store path and the PUTLLC commit keep, and the only way the
+         * copy cannot land inside a peer's compare-and-commit window. Spans
+         * that touch no reserved line keep the lock-free copy: bulk asset PUTs
+         * are large and hot, and the scan is a bitmap bit per 128 bytes against
+         * a global that stays zero until an SPU reserves its first line.
+         *
+         * The unreserved path re-checks afterwards because a line can be
+         * reserved between the scan and the end of the copy. That peer's
+         * snapshot may be torn, so it gets its event and loses its reservation
+         * rather than committing against a line it never saw whole. */
+        {
+            extern int  spu_coh_is_reserved(uint32_t);
+            extern void spu_coh_notify_write(uint32_t);
+            extern void spu_lockline_lock(void);
+            extern void spu_lockline_unlock(void);
+            uint32_t a0 = (uint32_t)ea & ~127u;
+            uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+            int span_reserved = 0;
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+                if (a == a1) break;
+            }
+            if (span_reserved) {
+                spu_lockline_lock();
+                memcpy(ea_ptr, ls_ptr, size);
+                for (uint32_t a = a0; ; a += 128u) {
+                    if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
+                    if (a == a1) break;
+                }
+                spu_lockline_unlock();
+            } else {
+                memcpy(ea_ptr, ls_ptr, size);
+                for (uint32_t a = a0; ; a += 128u) {
+                    if (spu_coh_is_reserved(a)) {
+                        spu_lockline_lock();
+                        spu_coh_notify_write(a);
+                        spu_lockline_unlock();
+                    }
+                    if (a == a1) break;
+                }
+            }
+        }
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;
@@ -675,9 +726,13 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
         uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
 
         if (xfer_size) {
-            int rc = mfc_do_transfer(spu, dest_lsa, ea, xfer_size, base_cmd);
+            /* Each list element occupies whole LS quadwords, even for
+             * 1/2/4/8-byte transfers. The EA supplies its byte offset within
+             * the first quadword. Keep the rounded cursor for stall/resume. */
+            uint32_t transfer_lsa = (dest_lsa & ~15u) | (eal & 15u);
+            int rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
             if (rc != 0) return rc;
-            dest_lsa += xfer_size;
+            dest_lsa = (dest_lsa & ~15u) + ((xfer_size + 15u) & ~15u);
         }
 
         if (stall_notify) {

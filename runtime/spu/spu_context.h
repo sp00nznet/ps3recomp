@@ -266,6 +266,21 @@ typedef struct spu_context {
      * path recognizes a registered overlay's source EA and records which
      * overlay is now resident; dispatch retries a missed lookup against it. */
     int resident_ovl;
+    /* Independently streamed code buffers can coexist with the policy overlay.
+     * Each mapping records which translated image owns that local-store span. */
+    struct {
+        uint32_t lsa, size, source_ea;
+        int image_id;
+    } resident_code[4];
+
+    /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
+     * for co-resident tasks. A taskset may hold several tasks that all lift at the
+     * SAME LS base (the shared task-code region at LS 0x3000+), so an LS address
+     * alone cannot say which one owns it. Outside the region it is cleared;
+     * on entry/resume it is resolved from the resident policy's TaskInfo ELF
+     * registration, or the legacy entry map if no ELF metadata is available.
+     * This also handles returns to internal PCs after scheduler calls. */
+    int      resident_task;
 
     /* --- SPU_DRAIN trampoline execution model (faithful-adopt, canersaka) ---
      * host_depth counts live lifted call frames (matched brsl/bisl). SPU_RET
@@ -644,6 +659,8 @@ int  spu_tailret_enabled(void);
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*);
 
+/* Drain a translated call up to its explicit architectural return PC. */
+void spu_drain_call(spu_context* ctx, uint32_t return_pc);
 /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
  *
  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from

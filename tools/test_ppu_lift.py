@@ -41,7 +41,8 @@ ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, TOOLS)
 
 import ppu_disasm                    # noqa: E402
-from ppu_lifter import PPULifter, LiftedFunction   # noqa: E402
+from ppu_lifter import (PPULifter, LiftedFunction,          # noqa: E402
+                        FENCE_PREAMBLE, HEADER_PREAMBLE)
 
 MASK64 = (1 << 64) - 1
 MASK32 = (1 << 32) - 1
@@ -87,6 +88,12 @@ def fp_x_form(xo, bt, rc=0):   # opcd-63 X-form FPSCR bit ops (mtfsb0/mtfsb1/mtf
 def spr_form(xo, rt, spr_num):   # mfspr/mtspr; the 10-bit spr field is two 5-bit halves swapped
     spr_raw = ((spr_num & 0x1F) << 5) | ((spr_num >> 5) & 0x1F)
     return (31 << 26) | (rt << 21) | (spr_raw << 11) | (xo << 1)
+
+def sync_form(lfield):   # sync/lwsync/ptesync differ only by the 2-bit L field (bits 9..10)
+    return (31 << 26) | ((lfield & 3) << 21) | (598 << 1)
+
+EIEIO_WORD = (31 << 26) | (854 << 1)
+ISYNC_WORD = (19 << 26) | (150 << 1)
 
 # ---------------------------------------------------------------------------
 # PowerISA reference semantics (independent of the lifter). 64-bit registers;
@@ -557,6 +564,27 @@ def build_cases():
          in_mem={0x7020: struct.pack(">Q", pi_bits)},
          exp_fpr=[(10, pi_bits)])
 
+    # --- Memory barriers -------------------------------------------------
+    # What a barrier is FOR cannot be tested here: this driver is one thread,
+    # and a fence's whole effect is on what a second one observes. What can be
+    # tested, and is what regressed the day these were no-ops, is the rest of
+    # it: that the barrier reaches the compiler as a real fence (checked as
+    # text by check_barrier_lowering below and asserted again against the
+    # generated driver in emit_c), that the fence COMPILES in the same
+    # translation unit as the lifted code on every host toolchain, that it
+    # runs, and that it changes no architected state on the way past. The last
+    # is the trap a hand-written fence macro falls into -- one that clobbers a
+    # scratch register, or that a compiler turns into a call with its own
+    # side effects, would corrupt the guest for the sake of ordering it.
+    for nm, word in (("sync", sync_form(0)), ("lwsync", sync_form(1)),
+                     ("ptesync", sync_form(2)), ("eieio", EIEIO_WORD),
+                     ("isync", ISYNC_WORD)):
+        case(f"{nm} leaves gprs, ca and cr alone", word,
+             {3: 0x0123456789ABCDEF, 4: MASK64, 5: 0},
+             [(3, 0x0123456789ABCDEF, MASK64), (4, MASK64, MASK64),
+              (5, 0, MASK64)],
+             in_ca=1, exp_ca=1, exp_cr=(0, 28))
+
 build_cases()
 
 def build_vcases():
@@ -695,6 +723,62 @@ def check_decode_and_lift():
     return fails[0] == 0
 
 # ---------------------------------------------------------------------------
+# Memory barriers: the decode and the fence each one lowers to.
+#
+# The CASES driver runs a barrier and checks it disturbs nothing, which is
+# necessary and nowhere near sufficient -- a barrier lowered back to a no-op
+# passes every one of those checks. What says the ordering is really there is
+# the text: WHICH fence each mnemonic emits, and that the three XO-598 forms
+# are told apart before the lifter ever sees them. sync and lwsync are one bit
+# apart in the encoding and a whole barrier apart in what they cost.
+# ---------------------------------------------------------------------------
+
+BARRIERS = [
+    # word,            mnemonic,  the fence it must lower to
+    (sync_form(0),     "sync",    "PPU_FENCE(seq_cst)"),
+    (sync_form(1),     "lwsync",  "PPU_FENCE(acq_rel)"),
+    (sync_form(2),     "ptesync", "PPU_FENCE(seq_cst)"),
+    (EIEIO_WORD,       "eieio",   "PPU_FENCE(release)"),
+    (ISYNC_WORD,       "isync",   "PPU_FENCE(acquire)"),
+]
+
+def check_barrier_lowering():
+    lifter = PPULifter()
+    dummy = LiftedFunction(name="conf", start_addr=0, end_addr=0x10000)
+    fails = 0
+
+    for word, want_mn, want_fence in BARRIERS:
+        insn = ppu_disasm.decode(word, 0x30000)
+        if insn.mnemonic != want_mn:
+            print(f"FAIL barrier {want_mn}: word {word:#010x} decoded as "
+                  f"{insn.mnemonic!r}")
+            fails += 1
+            continue
+        code = lifter._translate(insn, dummy)
+        if want_fence not in code:
+            print(f"FAIL barrier {want_mn}: lifted to {code!r}, want "
+                  f"{want_fence!r} -- a barrier that lowers to nothing is the "
+                  f"bug this checks for")
+            fails += 1
+            continue
+        print(f"[barriers] ok {want_mn}: {insn.mnemonic} -> {code}")
+
+    # The macro itself has to reach the lifted code, and it has to carry both
+    # spellings: the split output is C++, --single-file output and the smoke
+    # title are C.
+    wanted = ("define PPU_FENCE(o)", "std::atomic_thread_fence",
+              "atomic_thread_fence(memory_order_##o)", "<atomic>",
+              "<stdatomic.h>")
+    for want in wanted:
+        if want not in HEADER_PREAMBLE:
+            print(f"FAIL barrier preamble: header preamble is missing {want!r}")
+            fails += 1
+
+    n = len(BARRIERS) + len(wanted)
+    print(f"[barriers] {n - fails} checks passed, {fails} FAILED")
+    return fails == 0
+
+# ---------------------------------------------------------------------------
 # C driver generation
 # ---------------------------------------------------------------------------
 
@@ -702,9 +786,15 @@ def emit_c(path):
     lifter = PPULifter()
     dummy = LiftedFunction(name="conf", start_addr=0, end_addr=0x10000)
     pre = lifter._preamble_lines()
-    # replace the generated-header include with the real (small) context header
+    # Replace the generated-header include with the real (small) context
+    # header. PPU_FENCE goes in behind it, taken from the lifter rather than
+    # written out again: this driver is the one consumer of lifted statements
+    # that does NOT include a generated ppu_recomp.h, so it would otherwise be
+    # the one place where the fence could be spelt differently from the code
+    # under test, which is the same as not testing it.
     pre[0] = pre[0].replace('#include "ppu_recomp.h"',
-                            '#include "ppu_context.h"\n#include <stdint.h>')
+                            '#include "ppu_context.h"\n#include <stdint.h>\n'
+                            + FENCE_PREAMBLE)
     out = ["/* Auto-generated by tools/test_ppu_lift.py -- conformance driver. */"]
     out.append("#define _CRT_SECURE_NO_WARNINGS")
     out.extend(pre)
@@ -916,11 +1006,28 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
     return g_fail ? 1 : 0;
 }
 """)
+    text = "\n".join(out)
     with open(path, "w") as f:
-        f.write("\n".join(out))
+        f.write(text)
     n_total = len(CASES) + len(VCASES)
     print(f"wrote {path}: {n_total - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
+
+    # A case whose lifted code starts with a comment is dropped above with a
+    # note on stdout, which is how a barrier that went back to being a no-op
+    # would leave this suite green: nothing would fail, there would just be
+    # five fewer cases and a line nobody reads. So say out loud how many
+    # fences reached the driver, and make it an error if any is missing.
+    n_fences = text.count("PPU_FENCE(seq_cst)") + text.count("PPU_FENCE(acq_rel)") \
+             + text.count("PPU_FENCE(release)") + text.count("PPU_FENCE(acquire)")
+    want_fences = len(BARRIERS)
+    print(f"  memory barriers lowered to fences in the driver: {n_fences}")
+    if n_fences < want_fences:
+        print(f"FAIL barriers: {n_fences} fences in the generated driver, "
+              f"want {want_fences} -- a barrier lifted back to a no-op is "
+              f"dropped from this file without failing anything")
+        return False
+    return True
 
 # ---------------------------------------------------------------------------
 
@@ -930,14 +1037,15 @@ def main():
     args = ap.parse_args()
 
     decode_ok = check_decode_and_lift()
+    decode_ok = check_barrier_lowering() and decode_ok
 
     os.makedirs(os.path.join(ROOT, "scratch"), exist_ok=True)
     cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
     epath = os.path.join(ROOT, "scratch", "ppu_conformance.exe"
                          if os.name == "nt" else "ppu_conformance")
-    emit_c(cpath)
+    decode_ok = emit_c(cpath) and decode_ok
     if args.emit:
-        return
+        sys.exit(0 if decode_ok else 1)
 
     log = os.path.join(ROOT, "scratch", "ppu_conformance.log")
 

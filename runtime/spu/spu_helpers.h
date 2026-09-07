@@ -117,8 +117,24 @@ static inline u128 spu_mpy(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._s3
 static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
 /* sfx: extended subtract rb-ra-1+carry; carry-in = low bit of old rt (RT is 3rd src). */
 static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
-/* fi: floating interpolate (reciprocal refine after frest) — Newton-step approximation. */
-static inline u128 spu_fi(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ float y=b._f32[i]; r._f32[i]=y*(2.0f-a._f32[i]*y); } return r; }
+/* FI decodes the base and step fields produced by the hardware estimate
+ * instructions; its second operand is not an ordinary reciprocal float. */
+static inline u128 spu_fi(u128 a, u128 b) {
+    u128 r;
+    for (int i = 0; i < 4; i++) {
+        uint32_t rb = b._u32[i];
+        uint32_t ra = a._u32[i];
+        uint32_t exp = (rb >> 23) & 0xFFu;
+        uint32_t base_bits = rb & 0xFFFFFC00u;
+        float base; memcpy(&base, &base_bits, sizeof base);
+        uint32_t step_frac = rb & 0x3FFu;
+        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
+        if (base < 0.0f) step = -step;
+        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
+        r._f32[i] = base - step * y;
+    }
+    return r;
+}
 static inline u128 spu_mpyu(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[i*2]*(uint32_t)b._u16[i*2]; return r; }
 static inline u128 spu_mpyi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int16_t)imm; return r; }
 
@@ -215,20 +231,20 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
 static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
 static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
 
-/* Float<->int conversions with scale (RI8). rpcs3/HW scale-table semantics:
- * scale[x] = 2^(x-155); cflts/cfltu use x=173-i8, csflt/cuflt use x=155-i8. */
-static inline u128 spu_cflts(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8)-155.0f);
+/* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
+ * The canonical immediates 173 and 155 are identity conversions. */
+static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
-static inline u128 spu_cfltu(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8)-155.0f);
+static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
-static inline u128 spu_csflt(u128 a, int i8){ u128 r; float f=exp2f((float)(155-i8)-155.0f);
-    for(int i=0;i<4;i++) r._f32[i]=(float)a._s32[i]*f; return r; }
-static inline u128 spu_cuflt(u128 a, int i8){ u128 r; float f=exp2f((float)(155-i8)-155.0f);
-    for(int i=0;i<4;i++) r._f32[i]=(float)a._u32[i]*f; return r; }
+static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
+static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
 static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]+c._f32[i]; return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]-c._f32[i]; return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=c._f32[i]-a._f32[i]*b._f32[i]; return r; }
+static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
+static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
 static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
 
@@ -254,10 +270,9 @@ static inline u128 spu_dfnma(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<2;i
 /* double compares -> per-lane 64-bit mask (RPCS3 stubs these; sane impl here). */
 static inline u128 spu_dfceq(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 static inline u128 spu_dfcmeq(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-/* fesd: extend single (word slots 1,3) -> double (dwords 0,1). frds: round
- * double -> single in slots 1,3 and zero slots 0,2 (RPCS3 FESD/FRDS). */
-static inline u128 spu_fesd(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) spu__dset(&r,i,(double)a._f32[i*2+1]); return r; }
-static inline u128 spu_frds(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) r._f32[i*2+1]=(float)spu__dget(a,i); return r; }
+/* Singles occupy preferred words 0 and 2 when converting doubleword lanes. */
+static inline u128 spu_fesd(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) spu__dset(&r,i,(double)a._f32[i*2]); return r; }
+static inline u128 spu_frds(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) r._f32[i*2]=(float)spu__dget(a,i); return r; }
 /* mpyhhu: high-16 x high-16 of each word, unsigned, full 32-bit product. */
 static inline u128 spu_mpyhhu(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
 /* cgx: extended carry-generate, carry-in = low bit of old rt (RPCS3 CGX). */
@@ -350,10 +365,67 @@ static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int3
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
 static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
 static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
-static inline u128 spu_frsqest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= a._f32[i]>0.0f ? 1.0f/sqrtf(a._f32[i]) : 0.0f; return r; }
+static const uint32_t spu_frest_fraction_lut[32] = {
+    0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
+    0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,
+    0x2AA9BE, 0x2A85AC, 0x23D59A, 0x23BD8E, 0x1D8576, 0x1D8576, 0x17AD5A, 0x17AD5A,
+    0x124543, 0x124543, 0x0D392D, 0x0D392D, 0x08851A, 0x08851A, 0x041D07, 0x041D07
+};
+
+static const uint32_t spu_frsqest_fraction_lut[64] = {
+    0x350160, 0x34E954, 0x2F993D, 0x2F993D, 0x2AA523, 0x2AA523, 0x26190D, 0x26190D,
+    0x21E4F9, 0x21E4F9, 0x1E00E9, 0x1E00E9, 0x1A5CD9, 0x1A5CD9, 0x16F8CB, 0x16F8CB,
+    0x13CCC0, 0x13CCC0, 0x10CCB3, 0x10CCB3, 0x0E00AA, 0x0E00AA, 0x0B58A1, 0x0B58A1,
+    0x08D498, 0x08D498, 0x067491, 0x067491, 0x043089, 0x043089, 0x020C83, 0x020C83,
+    0x7FFDF4, 0x7FD1DE, 0x7859C8, 0x783DBA, 0x71559C, 0x71559C, 0x6AE57C, 0x6AE57C,
+    0x64F561, 0x64F561, 0x5F7149, 0x5F7149, 0x5A4D33, 0x5A4D33, 0x55811F, 0x55811F,
+    0x51050F, 0x51050F, 0x4CC8FE, 0x4CC8FE, 0x48D0F0, 0x48D0F0, 0x4510E4, 0x4510E4,
+    0x4180D7, 0x4180D7, 0x3E24CC, 0x3E24CC, 0x3AF4C3, 0x3AF4C3, 0x37E8BA, 0x37E8BA
+};
+
+static inline u128 spu_frsqest(u128 a) {
+    u128 r;
+    for (int i = 0; i < 4; i++) {
+        uint32_t bits = a._u32[i];
+        uint32_t exp  = (bits >> 23) & 0xFFu;
+        uint32_t frac_idx = (bits >> 18) & 0x3Fu;
+        uint32_t rexp = (exp == 0u) ? 0xFFu : (190u - (exp + 1u) / 2u);
+        uint32_t fraction = spu_frsqest_fraction_lut[frac_idx];
+        uint32_t out = (rexp << 23) | (fraction & 0x7FFFFFu);
+        memcpy(&r._f32[i], &out, sizeof out);
+    }
+    return r;
+}
 /* frest: reciprocal estimate (refined by the following spu_fi Newton step).
  * Full-precision 1/x is exact after fi and >= HW-estimate accuracy. */
-static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= 1.0f/a._f32[i]; return r; }
+static inline u128 spu_frest(u128 a) {
+    u128 r;
+    for (int i = 0; i < 4; i++) {
+        uint32_t bits = a._u32[i];
+        uint32_t sign = bits & 0x80000000u;
+        uint32_t exp  = (bits >> 23) & 0xFFu;
+        uint32_t frac_idx = (bits >> 18) & 0x1Fu;
+        uint32_t out;
+        if (exp == 0u) {
+            /* zero or denormal operand: ISA p.215 "1/0 is defined to give the
+             * maximum SPU single-precision extended-range fp number", sign of
+             * the (zero) input preserved. Same bucket for true denormals
+             * (their biased exponent field is also 0). */
+            out = sign | 0x7FFFFFFFu;
+        } else {
+            /* result biased exponent = 253 - input biased exponent (253 =
+             * 2*127-1, i.e. reciprocal negates the unbiased exponent),
+             * clamped to 0 on underflow (ISA p.215 "Big: if |x|>=2^126,
+             * 1/x underflows to zero"). Verified bit-exact against RPCS3's
+             * raw 256-entry spu_frest_exponent_lut for all 256 inputs. */
+            uint32_t rexp = (exp >= 253u) ? 0u : (253u - exp);
+            uint32_t fraction = spu_frest_fraction_lut[frac_idx];
+            out = sign | (rexp << 23) | (fraction & 0x7FFFFFu);
+        }
+        memcpy(&r._f32[i], &out, sizeof out);
+    }
+    return r;
+}
 
 /* ---- Phase 3: sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word

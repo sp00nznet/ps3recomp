@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <assert.h>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -106,9 +107,26 @@ extern uint32_t ppu_vm_size;
  * Initialization / Shutdown
  * -----------------------------------------------------------------------*/
 
+static inline void vm_shutdown(void);
+
 /*
  * Reserve the host address range and commit the main memory region.
  * Returns CELL_OK on success, CELL_ENOMEM on failure.
+ *
+ * The base is 4 GB aligned, and that is a guarantee rather than a hope.
+ * Translation runs one way as `host = vm_base + guest`, but a great deal of
+ * the HLE runs the other way: a bridge handed a host pointer recovers the
+ * guest address by truncating the pointer to 32 bits. GUEST_EA in
+ * libs/guest_struct.h is that, and the GUEST_PTR macros accept either kind of
+ * value on the same reasoning. The identity holds only while the low 32 bits
+ * of vm_base are zero.
+ *
+ * It used to hold by luck, because both kernels tend to place a 4 GB
+ * reservation on a 4 GB boundary. Nothing promises that, and the failure when
+ * it stops is not a crash: the truncated pointer is a plausible-looking guest
+ * address that moves with every run, so a write lands somewhere in the guest
+ * arena and the guest's own variable keeps whatever was in it. The cost of
+ * removing the question is one over-reservation that is trimmed back.
  */
 static inline int32_t vm_init(void)
 {
@@ -118,9 +136,24 @@ static inline int32_t vm_init(void)
     /*
      * Reserve a contiguous 4 GB region.  We only commit pages as needed.
      * MEM_RESERVE just reserves address space without backing pages.
+     *
+     * Windows cannot release part of a reservation, so the equivalent of the
+     * POSIX trim below is to over-reserve, note where the aligned base falls,
+     * release the lot and re-reserve exactly there. Another allocation could
+     * take that address in between, hence the retries; on a 64-bit address
+     * space losing a race for an 8 GB hole repeatedly is not a real risk, but
+     * failing outright beats carrying on unaligned.
      */
-    vm_base = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)VM_TOTAL_SIZE,
-                                      MEM_RESERVE, PAGE_NOACCESS);
+    for (int attempt = 0; attempt < 8 && !vm_base; attempt++) {
+        uint8_t* probe = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)(VM_TOTAL_SIZE * 2),
+                                                MEM_RESERVE, PAGE_NOACCESS);
+        if (!probe) break;
+        uint8_t* aligned = (uint8_t*)(((uintptr_t)probe + (uintptr_t)VM_TOTAL_SIZE - 1u)
+                                      & ~((uintptr_t)VM_TOTAL_SIZE - 1u));
+        VirtualFree(probe, 0, MEM_RELEASE);
+        vm_base = (uint8_t*)VirtualAlloc(aligned, (SIZE_T)VM_TOTAL_SIZE,
+                                         MEM_RESERVE, PAGE_NOACCESS);
+    }
     if (!vm_base) return CELL_ENOMEM;
 
     /* Commit main memory region (256 MB, read/write) */
@@ -140,13 +173,25 @@ static inline int32_t vm_init(void)
     }
 
 #else /* POSIX */
-    vm_base = (uint8_t*)mmap(NULL, (size_t)VM_TOTAL_SIZE,
-                              PROT_NONE,
-                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                              -1, 0);
-    if (vm_base == MAP_FAILED) {
-        vm_base = NULL;
-        return CELL_ENOMEM;
+    /* Over-map and trim: ask for twice the space, keep the 4 GB aligned window
+     * inside it, and give the head and tail back. mmap can hand back part of a
+     * mapping, so this needs no retry and cannot race. */
+    {
+        size_t want = (size_t)VM_TOTAL_SIZE;
+        uint8_t* raw = (uint8_t*)mmap(NULL, want * 2, PROT_NONE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                      -1, 0);
+        if (raw == MAP_FAILED) {
+            vm_base = NULL;
+            return CELL_ENOMEM;
+        }
+        uint8_t* aligned = (uint8_t*)(((uintptr_t)raw + (uintptr_t)want - 1u)
+                                      & ~((uintptr_t)want - 1u));
+        if (aligned > raw)
+            munmap(raw, (size_t)(aligned - raw));
+        if (raw + want * 2 > aligned + want)
+            munmap(aligned + want, (size_t)((raw + want * 2) - (aligned + want)));
+        vm_base = aligned;
     }
 
     /* Make main memory readable/writable */
@@ -165,6 +210,16 @@ static inline int32_t vm_init(void)
         return CELL_ENOMEM;
     }
 #endif
+
+    /* The invariant every host-pointer-to-guest-address truncation rests on.
+     * The reservations above hold it by construction; this is here so that a
+     * change to either of them announces itself now, instead of as a stray
+     * four-byte write to a moving address somewhere else entirely. */
+    assert(((uintptr_t)vm_base & ((uintptr_t)VM_TOTAL_SIZE - 1u)) == 0);
+    if (((uintptr_t)vm_base & ((uintptr_t)VM_TOTAL_SIZE - 1u)) != 0) {
+        vm_shutdown();
+        return CELL_ENOMEM;
+    }
 
     /* Zero main memory */
     memset(vm_base + VM_MAIN_MEM_BASE, 0, VM_MAIN_MEM_SIZE);

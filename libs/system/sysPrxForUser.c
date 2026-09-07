@@ -155,8 +155,21 @@ static u32 s_next_heap_id = 1;
  * Process management
  * -----------------------------------------------------------------------*/
 
+/* The status the guest asked to exit with, published before the host exit()
+ * runs. exit() gives its argument to _exit and to nothing else -- an atexit
+ * handler cannot read it -- so without this the only place a guest's chosen
+ * status is visible is the process's own exit code. That forces a harness to
+ * exit with the guest's status rather than with its own verdict about the run,
+ * and makes "the guest asked for 0" indistinguishable from "the harness fell
+ * through and returned 0". Written before any of the diagnostic detours below,
+ * so a parked or held exit still records what was asked for. */
+int g_sys_process_exit_called = 0;
+s32 g_sys_process_exit_code   = 0;
+
 void sys_process_exit(s32 exitcode)
 {
+    g_sys_process_exit_code   = exitcode;
+    g_sys_process_exit_called = 1;
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);
 #ifdef _WIN32
     /* The RSX present thread runs at ~60Hz; a title that finishes in a few ms
@@ -267,6 +280,30 @@ s32 _sys_printf(const char* fmt, ...)
     va_end(ap);
     printf("[PS3] %s", buf);
     return ret;
+}
+
+/* The abort half of the Cell SDK's internal assertion macro. Every one of its
+ * 80 call sites in libsre is the same two-instruction pair: _sys_printf with
+ * the "PS3 SDK INTERNAL ASSERTION FAILURE" format, then this with a short
+ * message -- "Aborted.", or "The SPURS is aborted." when SPURS is the one
+ * giving up. One argument, a guest pointer to that message.
+ *
+ * It is not noreturn. The compiler emits an ordinary return sequence after
+ * each call, because on retail hardware with no debugger attached the trap is
+ * taken, ignored, and the caller unwinds itself -- which is why a title whose
+ * SPURS has aborted goes on to walk its own call chain, print it, and exit the
+ * thread rather than stopping here.
+ *
+ * So printing the message and returning is the faithful behaviour, not a stub
+ * standing in for something better. What it changes is that the abort is
+ * legible: without it the call is an unresolved NID answering CELL_ENOSYS in a
+ * trace, three lines after the assertion text that explains it, with nothing
+ * connecting the two. */
+s32 _sys_trap_process(const char* msg)
+{
+    const char* m = (const char*)yz_g2h(msg);
+    printf("[PS3] %s", m ? m : "(trap)\n");
+    return CELL_OK;
 }
 
 s32 _sys_sprintf(char* buf, const char* fmt, ...)
@@ -988,9 +1025,32 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
     printf("[sysPrxForUser] sys_prx_get_module_id_by_name('%s')\n",
            hname ? hname : "(null)");
 
-    if (!hid) return CELL_EFAULT;
-    *hid = 0; /* fake module ID */
-    return CELL_OK;
+    /* A null id is not an error. The caller that only wants to know whether a
+     * module is present passes one -- libsre's tuner probe does exactly that,
+     * with r5 = 0 -- and answering CELL_EFAULT tells it the question was
+     * malformed rather than that the module is absent. Report the lookup
+     * result either way and write the id only if there is somewhere to put it.
+     *
+     * No module is loaded by name here, so the honest answer is that the name
+     * is not known: CELL_PRX_ERROR_UNKNOWN_MODULE. This used to write a module
+     * id of 0 and report CELL_OK, which is worse than it looks -- a caller asks
+     * this question precisely to find out whether some optional module is
+     * present, and success hands it an id that indexes nothing.
+     *
+     * libsre is the caller that shows the cost. _cellSpursIsLaunchedFromTuner
+     * asks whether the SPURS profiler is loaded; told yes, it asserts on the
+     * id, reports the title as launched from the tuner, and runs tuner and
+     * trace setup that then fails with CELL_SPURS_CORE_ERROR_STAT -- and the
+     * SPURS task workload never attaches, so a title waiting on its first
+     * workload waits forever. The failure is four layers from the lie and says
+     * nothing about it; runtime/ppu/ppu_hle.cpp has carried an env-gated
+     * override returning exactly this code, with a comment spelling out that
+     * chain, since long before the reason was traced back to here.
+     *
+     * A runtime that grows real load-by-name has a module table to answer
+     * from, and this becomes a lookup miss rather than a constant. */
+    if (hid) *hid = 0;
+    return (s32)0x8001112E;   /* CELL_PRX_ERROR_UNKNOWN_MODULE */
 }
 
 /* ---------------------------------------------------------------------------

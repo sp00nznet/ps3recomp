@@ -852,7 +852,7 @@ class SPULifter:
                 # + image save/restore (adopt-on-serve cannot leak upward).
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
                         f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"SPU_DRAIN(ctx); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -910,7 +910,7 @@ class SPULifter:
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"{{ int32_t _si = (int32_t)ctx->image_id; "
                     f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
-                    f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
+                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):

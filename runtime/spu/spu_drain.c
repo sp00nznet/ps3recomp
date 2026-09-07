@@ -39,7 +39,8 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    (void)fn;
+    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
      * resident job manager, and with the job loaded at 0 that lands on its own
      * entry. Planting a return address in r0 catches the jobs that get there
@@ -342,4 +343,30 @@ int spu_tailret_enabled(void)
     static int s_on = -1;
     if (s_on < 0) { const char* e = getenv("SPU_TAILRET"); s_on = (e && e[0] == 0x31) ? 1 : 0; }
     return s_on;
+}
+
+/* A return may use any register, not only r0. Running that branch target
+ * inside this drain executes the caller's continuation twice (once here,
+ * once when its real host frame resumes), including its stack adjustment. */
+void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+{
+    spu_depth_guard(ctx);
+    while (g_spu_trampoline_fn) {
+        if (g_spu_trampoline_fn == spu_indirect_branch &&
+            (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
+            g_spu_trampoline_fn = 0;
+            return;
+        }
+        void (*fn)(spu_context*) = g_spu_trampoline_fn;
+        g_spu_trampoline_fn = 0;
+        yz_lockstep_tick(ctx);
+        spu_task_launch_check(ctx, (void*)fn);
+        if (ctx->int_enable && (ctx->event_status & ctx->event_mask))
+            fn = spu_take_interrupt(ctx, fn);
+        fn(ctx);
+    }
+    if ((ctx->pc & SPU_LS_MASK) != (return_pc & SPU_LS_MASK)) {
+        extern void spu_restart_dispatch(spu_context*);
+        spu_restart_dispatch(ctx);
+    }
 }

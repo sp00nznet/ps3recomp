@@ -35,6 +35,16 @@ extern "C" {
 #define SYS_PROCESS_GET_NUMBER_OF_OBJECT 12
 #define SYS_PROCESS_GET_ID              13
 #define SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS 14
+#define SYS_PROCESS_GET_SDK_VERSION     25
+
+/* The SDK version sys_process_get_sdk_version reports. It is a variable and
+ * not a constant because the real number comes out of the title: the loader
+ * reads sys_process_param_t.sdk_version from the ELF's PROC_PARAM segment and
+ * assigns it here before running any guest code. The default is what a title
+ * with no such segment gets. libsre picks feature sets off this, so leaving it
+ * unset is not neutral. */
+extern uint32_t g_ps3_sdk_version;
+
 
 #define SYS_PPU_THREAD_CREATE           41
 #define SYS_PPU_THREAD_EXIT             42

@@ -643,8 +643,20 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             return result
 
         # --- Sync / cache / misc ---
+        # XO 598 is three different barriers, told apart by the 2-bit L field
+        # (bits 9..10): 0 is the heavyweight sync, 1 lwsync, 2 ptesync. Naming
+        # all three "sync" cost nothing while the lifter treated them as
+        # no-ops, but it does now that they lower to host fences: every
+        # lightweight barrier a game emits would take a full one, and the
+        # lifter's lwsync arm would be unreachable. objdump spells them apart
+        # too, so this also keeps the disassembly audit honest.
+        if xo_full == 598:
+            result.mnemonic = {1: "lwsync", 2: "ptesync"}.get(bits(insn, 9, 10),
+                                                              "sync")
+            return result
+
         misc_x = {
-            598: "sync", 854: "eieio", 278: "dcbt", 246: "dcbtst",
+            854: "eieio", 278: "dcbt", 246: "dcbtst",
             86: "dcbf", 54: "dcbst", 982: "icbi", 758: "dcba",
             1014: "dcbz",
         }
