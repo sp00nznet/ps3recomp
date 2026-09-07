@@ -21,9 +21,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdio.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "../platform/win32_compat.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,25 +31,21 @@ extern uint8_t* vm_base;
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
- * SPU / lv2-heap / stack pages are committed). A garbage EA — e.g. one the SPURS
- * kernel computes from an incomplete context during bring-up — must be treated
- * as a failed DMA, NOT crash the host emulator with an access violation. On
- * Windows we query the page state; the whole [ea, ea+size) range must be
- * committed and accessible. Returns 1 if the range is safe to memcpy. */
+ * SPU / lv2-heap / stack pages are committed). A garbage EA must be treated
+ * as a failed DMA, NOT crash the host emulator with an access violation.
+ * Queries the page state and demand-commits on first touch; the whole
+ * [ea, ea+size) range must be committed and accessible.
+ * Returns 1 if the range is safe to memcpy. */
 static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
 {
-    /* The flat VM reserves the FULL 32-bit guest space and demand-commits
-     * pages on first touch (ppu_loader's vectored handler), so every 32-bit
-     * EA is safe host memory by construction -- a garbage EA reads zeros /
-     * commits an empty page, exactly like vm_read32. The old implementation
-     * additionally VirtualQuery'd the range on EVERY MFC transfer: VTune
-     * measured that at 94 CPU-seconds in a 50 s movie run -- 60x the entire
-     * lifted-SPU execution cost, and the real reason the Bink intro decoded
-     * at 1-2 FPS. Bounds-check only. */
+    /* The VM reserves the full 32-bit guest space but only commits specific
+     * regions (main mem, stack, RSX). A DMA to an uncommitted page must
+     * commit it on demand rather than crash. A bitmap caches the per-64K-page
+     * committed state so the steady-state cost is two bit tests; only a first
+     * touch per page pays the VirtualQuery syscall. */
     uint32_t e = (uint32_t)ea;
     if (size == 0) return 0;
     if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
-#ifdef _WIN32
     if (!vm_base) return 0;
     /* Committed-page bitmap as a self-healing CACHE of VirtualQuery. The
      * demand-commit fault handler seeds it, but regions the host commits
@@ -69,15 +63,6 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
           if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
           if (mbi.State != MEM_COMMIT) {
-              /* COMMIT it, do not refuse it. The PPU demand-commits guest
-               * pages on first touch; the SPU had no equivalent and simply
-               * dropped the transfer, so the two processors disagreed about
-               * which memory exists. An SPU-written output buffer is the case
-               * that breaks -- the SPU is the FIRST writer, so the page has
-               * never faulted, and the job's results vanish. Worse, a job that
-               * then polls for its own output spins forever: four of Tokyo
-               * Jungle's twelve images wedged this way, each burning 4096
-               * skipped transfers per run before the runaway guard stopped it. */
               if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
           } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
               return 0;
@@ -85,7 +70,6 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
       }
     }
-#endif
     return 1;
 }
 

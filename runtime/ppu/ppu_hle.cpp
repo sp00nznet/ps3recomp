@@ -106,6 +106,19 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd,
                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
 /* Weak: builds that don't link cellGcmSys.c (test harnesses) get a null and skip. */
 extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
+/* The SPURS SPU kernel spawn hook, whose real definition is per-port
+ * (flow_spurs_kernel.c). This used to be a weak extern DECLARATION written at
+ * block scope inside ps3_hle_call, guarded by a test of its own address -- so
+ * it read exactly like an optional hook and was not one. A weak attribute on a
+ * block-scope declaration does not make the symbol weak, and a weak reference
+ * with no definition anywhere is an undefined symbol on Mach-O regardless. Any
+ * build without that per-port file failed to link, which is every build except
+ * one, and it went unnoticed because nothing else had ever linked this
+ * scaffold. A weak DEFINITION is the shape that works, and it is the one
+ * ppu_hle_register_all at the bottom of this file already uses: the port's
+ * strong definition overrides it, and everyone else gets the no-op. */
+extern "C" void flow_spurs_kernel_spawn_postinit(void) __attribute__((weak));
+extern "C" void flow_spurs_kernel_spawn_postinit(void) {}
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 
 /* An unresolved NID is a firmware import we never registered. Returning
@@ -581,11 +594,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             /* cellSpursInitialize (0xACFC8DBC) just returned -> the CellSpurs
              * instance is now populated; spawn the lifted SPURS SPU kernel against
              * it (flОw libsre never calls group_start; spawning during init reads
-             * an empty context and recurses to a stack overflow). Weak so a build
-             * without flow_spurs_kernel.c still links. */
+             * an empty context and recurses to a stack overflow). Defined weak
+             * at the top of this file, so a build without flow_spurs_kernel.c
+             * links and this call is a no-op. */
             if (nid == 0xACFC8DBCu) {
-                extern void flow_spurs_kernel_spawn_postinit(void) __attribute__((weak));
-                if (getenv("FLOW_SPURSKERNEL") && flow_spurs_kernel_spawn_postinit)
+                if (getenv("FLOW_SPURSKERNEL"))
                     flow_spurs_kernel_spawn_postinit();
             }
             return;

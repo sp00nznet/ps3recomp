@@ -9,6 +9,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "rsx_draw_engine.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -1569,6 +1570,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   if (live < 0) live = rsx_live_draw_enabled();
                   if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
 
+                /* And into the platform-neutral register-file draw engine,
+                 * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
+                 * It wants the raw method with its subchannel bits for the
+                 * same reason the live engine does, and masks them itself. */
+                { static int eng = -1;
+                  if (eng < 0) eng = rsx_draw_engine_enabled();
+                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
                  * backend's draw callbacks can be compared in one measurement. */
@@ -1833,6 +1842,8 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
      * always in RSX local memory (location 0). */
     if (rsx_live_draw_enabled())
         rsx_live_draw_set_display_buffer(bufferId, 0, offset, pitch, width, height);
+    if (rsx_draw_engine_enabled())
+        rsx_draw_engine_set_display_buffer(bufferId, 0, offset, pitch, width, height);
 
     return CELL_OK;
 }

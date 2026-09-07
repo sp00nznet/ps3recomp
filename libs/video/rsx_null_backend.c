@@ -320,10 +320,14 @@ void rsx_null_backend_suppress_present(int on)
  * without this ps3recomp_host cannot be built or run there at all and the
  * whole cellGcm -> RSX -> backend bridge goes unexercised on the platform.
  *
- * ponytail: flat-shaded triangles from the first vertex's colour, no depth
- * buffer, no blending, no textures, no clipping beyond the framebuffer
- * bounds, and the viewport is the whole target. It is a correctness probe,
- * not a renderer. Anything more belongs in a real backend.
+ * ponytail: flat-shaded triangles from the first vertex's colour, no blending,
+ * no stencil, no clipping beyond the framebuffer bounds, and the viewport is
+ * the whole target. It is a correctness probe, not a renderer. Anything more
+ * belongs in a real backend.
+ *
+ * It does keep a depth buffer, because draw ORDER is one of the things the
+ * probe has to be able to answer: without one it draws in submission order and
+ * cannot tell a working depth test from a missing one.
  * -----------------------------------------------------------------------*/
 
 #include "rsx_vertex_fetch.h"
@@ -332,6 +336,7 @@ void rsx_null_backend_suppress_present(int on)
 
 typedef struct {
     u32* fb;                /* width * height, 0x00RRGGBB          */
+    float* depth;           /* width * height, window z in [0,1]   */
     u32  width, height;
     u32  clear_argb;        /* last NV4097_SET_COLOR_CLEAR_VALUE   */
     u32  last_present;      /* centre pixel of the last presented frame */
@@ -350,8 +355,13 @@ static NullSoftState s_soft;
 
 static void nullsw_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 {
-    (void)ud; (void)depth; (void)stencil;
+    (void)ud; (void)stencil;                      /* no stencil buffer here */
     s_soft.clear_argb = color;
+    /* CLEAR_SURFACE bits: 0x01 depth, 0x02 stencil, 0xF0 the four colour
+     * channels. rsx_commands.c decoded `depth` out of ZSTENCIL_CLEAR_VALUE's
+     * top 24 bits, so it is already the [0,1] value to store. */
+    if (s_soft.depth && (flags & 0x01u))
+        for (u32 i = 0; i < s_soft.width * s_soft.height; i++) s_soft.depth[i] = depth;
     if (!s_soft.fb || !(flags & 0xF0u)) return;   /* colour bits only */
     u32 rgb = color & 0x00FFFFFFu;
     for (u32 i = 0; i < s_soft.width * s_soft.height; i++) s_soft.fb[i] = rgb;
@@ -367,14 +377,34 @@ static void nullsw_set_vertex_attribs(void* ud, const rsx_state* state)
     (void)ud; s_soft.state = state;
 }
 
-/* NDC -> framebuffer pixels. The guest's clip-space position is divided by w
- * (1.0 for the identity-transform case) and mapped over the whole target;
- * see the ponytail note above about the viewport. */
-static void ndc_to_px(const float p[4], float* sx, float* sy)
+/* NDC -> framebuffer pixels, plus the window z the depth test compares. The
+ * guest's clip-space position is divided by w (1.0 for the identity-transform
+ * case) and mapped over the whole target; see the ponytail note above about
+ * the viewport. z/w is already the [0,1] depth on this hardware, as it is in
+ * D3D and Metal, so it needs no remapping. */
+static void ndc_to_px(const float p[4], float* sx, float* sy, float* sz)
 {
     float w = (p[3] != 0.0f) ? p[3] : 1.0f;
     *sx = ( p[0] / w * 0.5f + 0.5f) * (float)s_soft.width;
     *sy = (-p[1] / w * 0.5f + 0.5f) * (float)s_soft.height;
+    *sz = p[2] / w;
+}
+
+/* The NV4097 depth function is the GL enum, 0x200 NEVER .. 0x207 ALWAYS.
+ * Anything unrecognised passes, as it does in the D3D12 backend's gcm_cmp --
+ * including the 1 rsx_state_init seeds the register with. */
+static int depth_passes(u32 func, float src, float dst)
+{
+    switch (func) {
+    case 0x0200: return 0;              /* NEVER    */
+    case 0x0201: return src <  dst;     /* LESS     */
+    case 0x0202: return src == dst;     /* EQUAL    */
+    case 0x0203: return src <= dst;     /* LEQUAL   */
+    case 0x0204: return src >  dst;     /* GREATER  */
+    case 0x0205: return src != dst;     /* NOTEQUAL */
+    case 0x0206: return src >= dst;     /* GEQUAL   */
+    default:     return 1;              /* ALWAYS   */
+    }
 }
 
 static u32 colour_of(const float c[4])
@@ -402,14 +432,18 @@ static void nullsw_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
     u32 h =  t->image_rect        & 0xFFFFu;
     if (!w || !h || w > 4096u || h > 4096u) { s_soft.tex_ready = 0; return; }
 
-    /* Bit 31 of the offset selects MAIN vs LOCAL, same as a vertex array. */
-    u32 ea = (t->offset & 0x80000000u)
-                 ? cellGcmResolveLocated(0, t->offset & 0x7FFFFFFFu)
-                 : cellGcmResolveLocated(1, t->offset & 0x7FFFFFFFu);
-    if (!vm_base) { s_soft.tex_ready = 0; return; }
+    /* SET_TEXTURE_FORMAT as a title writes it: bits [1:0] are the location
+     * (1 = local, 2 = main), [15:8] the format byte with its LN/UN flags.
+     * The offset is a plain RSX offset. This used to read the format byte
+     * from the low bits and a location flag from bit 31 of the offset --
+     * a convention only this backend and the host harness shared; the
+     * D3D12 backend, which has met real titles, decodes the register. */
+    u32 ea = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
+    if (!vm_base || ea == 0xFFFFFFFFu) { s_soft.tex_ready = 0; return; }
+    const u32 fmt = (t->format >> 8) & 0xFFu;
 
     rsx_tex_layout tl;
-    rsx_texture_layout(t->format, w, h, &tl);
+    rsx_texture_layout(fmt, w, h, &tl);
     if (tl.compressed) { s_soft.tex_ready = 0; return; }   /* no BC decode here */
 
     u32 pitch = w * 4u;
@@ -461,11 +495,22 @@ static u32 sample_tex(float u, float v)
 static void fill_triangle(const float a[4], const float b[4], const float c[4],
                           u32 rgb, const float uv[3][4], int textured)
 {
-    float ax, ay, bx, by, cx, cy;
-    ndc_to_px(a, &ax, &ay); ndc_to_px(b, &bx, &by); ndc_to_px(c, &cx, &cy);
+    float ax, ay, az, bx, by, bz, cx, cy, cz;
+    ndc_to_px(a, &ax, &ay, &az);
+    ndc_to_px(b, &bx, &by, &bz);
+    ndc_to_px(c, &cx, &cy, &cz);
 
     float area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
     if (area == 0.0f) return;                       /* degenerate */
+    const float inv = 1.0f / area;                  /* barycentric scale */
+
+    /* Depth writes need the test enabled, exactly as on the hardware: with
+     * SET_DEPTH_TEST_ENABLE off the RSX writes no depth whatever the mask
+     * says, and both real backends express that the same way. */
+    const rsx_state* dst = s_soft.state;
+    const int ztest  = s_soft.depth && dst && dst->depth_test_enable;
+    const int zwrite = ztest && dst->depth_mask;
+    const u32 zfunc  = dst ? dst->depth_func : 0u;
 
     /* Bounding box. Plain casts truncate toward zero rather than flooring,
      * which only differs for negative coordinates -- and those clamp to 0 on
@@ -492,14 +537,21 @@ static void fill_triangle(const float a[4], const float b[4], const float c[4],
             int pos = (w0 > 0) || (w1 > 0) || (w2 > 0);
             if (neg && pos) continue;               /* outside */
 
+            /* Barycentric weights fall out of the same edge functions, so
+             * interpolating costs nothing extra. Screen-space rather than
+             * perspective-correct: the probe's geometry is drawn in a plane,
+             * where the two agree. */
+            float la = w1 * inv, lb = w2 * inv, lc = w0 * inv;
+
+            if (ztest) {
+                float z = la * az + lb * bz + lc * cz;
+                float* zp = &s_soft.depth[(u32)y * s_soft.width + (u32)x];
+                if (!depth_passes(zfunc, z, *zp)) continue;
+                if (zwrite) *zp = z;
+            }
+
             u32 out = rgb;
             if (textured) {
-                /* Barycentric weights fall out of the same edge functions, so
-                 * interpolating costs nothing extra. Screen-space rather than
-                 * perspective-correct: the harness draws in the z=0 plane,
-                 * where the two agree. */
-                float inv = 1.0f / area;
-                float la = w1 * inv, lb = w2 * inv, lc = w0 * inv;
                 float u = la * uv[0][0] + lb * uv[1][0] + lc * uv[2][0];
                 float v = la * uv[0][1] + lb * uv[1][1] + lc * uv[2][1];
                 out = sample_tex(u, v);
@@ -608,6 +660,12 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     s_soft.height = height ? height : 720;
     s_soft.fb = (u32*)calloc((size_t)s_soft.width * s_soft.height, sizeof(u32));
     if (!s_soft.fb) return -1;
+    /* The far plane, not calloc's zero: zero is the NEAR plane, so a guest
+     * that enables the depth test before its first depth clear would draw
+     * nothing at all under LESS. */
+    s_soft.depth = (float*)malloc((size_t)s_soft.width * s_soft.height * sizeof(float));
+    if (!s_soft.depth) { free(s_soft.fb); s_soft.fb = NULL; return -1; }
+    for (u32 i = 0; i < s_soft.width * s_soft.height; i++) s_soft.depth[i] = 1.0f;
     rsx_set_backend(&s_nullsw_backend);
     printf("[RSX null] headless software backend %ux%u (%s)\n",
            s_soft.width, s_soft.height, title ? title : "");
@@ -617,8 +675,9 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
 void rsx_null_backend_shutdown(void)
 {
     rsx_set_backend(NULL);
-    free(s_soft.fb);   s_soft.fb  = NULL;
-    free(s_soft.tex);  s_soft.tex = NULL;
+    free(s_soft.fb);    s_soft.fb    = NULL;
+    free(s_soft.depth); s_soft.depth = NULL;
+    free(s_soft.tex);   s_soft.tex   = NULL;
     s_soft.tex_ready = 0;
 }
 
@@ -637,5 +696,7 @@ u32 rsx_null_backend_readback_center(void)
      * non-zero alpha the way a real drawable readback would. */
     return s_soft.presented ? (0xFF000000u | s_soft.last_present) : 0u;
 }
+
+u32 rsx_null_backend_guest_draws(void) { return 0; }
 
 #endif /* _WIN32 */

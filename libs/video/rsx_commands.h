@@ -41,6 +41,25 @@ extern "C" {
  * nouveau. The original table here was shuffled: only COLOR_AOFFSET was
  * right, so SET_SURFACE_COLOR_TARGET (MRT selection) was never decoded and
  * clip dims read the format register). */
+/* Which context DMA a colour surface's offset is an offset INTO: handle
+ * 0xFEED0000 is RSX local memory and 0xFEED0001 is IO-mapped main memory.
+ * RSX offsets are two overlapping number spaces, so this is what tells a
+ * surface at offset X from a texture at offset X in the other one. Decoded
+ * by rsx_dispatch (rsx_dsp_surface.color_location); rsx_state has no field
+ * for it and rsx_process_method ignores it. */
+#define NV4097_SET_CONTEXT_DMA_COLOR_A         0x00000194
+/* ...and the same for colour target B, which sits BELOW A in the register
+ * file rather than after it (C and D are at 0x1B4 and 0x1B8). An MRT set
+ * whose members disagree about which memory they live in is one the draw
+ * engine cannot match a texture unit against, since it keys surfaces by
+ * (location, offset). */
+#define NV4097_SET_CONTEXT_DMA_COLOR_B         0x0000018C
+/* ...and the same question for the depth buffer, which a texture unit coming
+ * back to sample it has to agree with. */
+#define NV4097_SET_CONTEXT_DMA_ZETA            0x00000198
+#define CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER 0xFEED0000
+#define CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER  0xFEED0001
+
 #define NV4097_SET_SURFACE_CLIP_HORIZONTAL     0x00000200
 #define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000204
 #define NV4097_SET_SURFACE_FORMAT              0x00000208
@@ -100,6 +119,24 @@ extern "C" {
 #define NV4097_SET_TEXTURE_FILTER               0x00001A14
 #define NV4097_SET_TEXTURE_IMAGE_RECT           0x00001A18
 #define NV4097_SET_TEXTURE_BORDER_COLOR         0x00001A1C
+/* CONTROL3 sits in its own block, 4 bytes per unit rather than 0x20, because
+ * it was added to the register file after the per-unit blocks were laid out.
+ * Its low 20 bits are the row pitch of a linear texture and the rest is the
+ * depth of a 3D one. */
+#define NV4097_SET_TEXTURE_CONTROL3             0x00001840
+
+/* Vertex textures: four units of eight words at 0x0900 + unit*0x20. The block
+ * is laid out like a fragment unit's with one substitution -- CONTROL3 sits
+ * where CONTROL1 does, so a vertex unit has a row pitch and no component
+ * crossbar. A transform program's TXL instruction samples these. */
+#define NV4097_SET_VERTEX_TEXTURE_OFFSET        0x00000900
+#define NV4097_SET_VERTEX_TEXTURE_FORMAT        0x00000904
+#define NV4097_SET_VERTEX_TEXTURE_ADDRESS       0x00000908
+#define NV4097_SET_VERTEX_TEXTURE_CONTROL0      0x0000090C
+#define NV4097_SET_VERTEX_TEXTURE_CONTROL3      0x00000910
+#define NV4097_SET_VERTEX_TEXTURE_FILTER        0x00000914
+#define NV4097_SET_VERTEX_TEXTURE_IMAGE_RECT    0x00000918
+#define NV4097_SET_VERTEX_TEXTURE_BORDER_COLOR  0x0000091C
 
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
@@ -172,6 +209,7 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 
 #define RSX_MAX_TEXTURES          16
+#define RSX_MAX_VERTEX_TEXTURES    4
 #define RSX_MAX_VERTEX_ATTRIBS    16
 #define RSX_MAX_RENDER_TARGETS     4
 
@@ -184,6 +222,7 @@ typedef struct rsx_texture_state {
     u32 filter;
     u32 image_rect;
     u32 border_color;
+    u32 control3;    /* row pitch [19:0], depth [31:20] -- a separate block */
     int dirty;
 } rsx_texture_state;
 
@@ -252,6 +291,12 @@ typedef struct rsx_state {
 
     /* Textures */
     rsx_texture_state textures[RSX_MAX_TEXTURES];
+    /* Vertex textures reuse rsx_texture_state deliberately: a vertex unit's
+     * registers are a fragment unit's with CONTROL3 in CONTROL1's slot, so
+     * decoding one into the same struct with control1 left at zero -- which
+     * reads as the identity crossbar -- lets a backend resolve, upload and
+     * cache both kinds through one path. */
+    rsx_texture_state vertex_textures[RSX_MAX_VERTEX_TEXTURES];
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];

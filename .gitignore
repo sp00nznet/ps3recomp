@@ -1,7 +1,6 @@
 # Build directories
 build/
-build-gate/
-build-merge/
+build-*/
 cmake-build-*/
 out/
 

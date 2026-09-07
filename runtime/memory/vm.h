@@ -83,7 +83,28 @@ extern uint32_t ppu_hle_inject_base;
 #endif
 #define VM_HLE_INJECT_BASE  ppu_hle_inject_base
 
-#define VM_PAGE_SIZE        0x00001000u      /* 4 KB page size */
+#define VM_PAGE_SIZE        0x00001000u      /* 4 KB: the GUEST page size */
+
+/* The HOST page size, which is what mprotect/VirtualProtect actually work in.
+ * Windows and x86-64 Linux use 4 KB, so it used to be safe to assume the two
+ * were the same number; Apple Silicon uses 16 KB, where an mprotect on a
+ * 4 KB-aligned address fails with EINVAL and a 4 KB guard "page" is really a
+ * 16 KB one that eats the bottom of the stack beside it. Everything that
+ * changes protection goes through this, so guest-visible layout stays 4 KB
+ * granular while the host operations are aligned to what the host needs. */
+static inline uint32_t vm_host_page_size(void)
+{
+#ifdef _WIN32
+    return VM_PAGE_SIZE;
+#else
+    static uint32_t s_page = 0;
+    if (!s_page) {
+        long v = sysconf(_SC_PAGESIZE);
+        s_page = (v > 0) ? (uint32_t)v : VM_PAGE_SIZE;
+    }
+    return s_page;
+#endif
+}
 
 /* Align a value up to `align` (must be power of 2) */
 #define VM_ALIGN_UP(val, align) (((val) + (align) - 1) & ~((align) - 1))
@@ -95,6 +116,17 @@ extern uint32_t ppu_hle_inject_base;
  *   host_ptr = vm_base + guest_addr
  * -----------------------------------------------------------------------*/
 extern uint8_t* vm_base;
+
+#ifndef _WIN32
+/* mprotect over the host pages covering [addr, addr+size). */
+static inline int vm__mprotect_pages(uint32_t addr, uint32_t size, int prot)
+{
+    uint64_t pg = vm_host_page_size();
+    uint64_t a0 = (uint64_t)addr & ~(pg - 1u);
+    uint64_t a1 = ((uint64_t)addr + size + pg - 1u) & ~(pg - 1u);
+    return mprotect(vm_base + a0, (size_t)(a1 - a0), prot);
+}
+#endif
 
 /* Guest address-space size; set non-zero once the host has mapped guest memory
  * (ppu_loader.cpp). Under native-VA mapping vm_base is deliberately 0 (guest
@@ -198,7 +230,7 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
     if (!VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE))
         return CELL_ENOMEM;
 #else
-    if (mprotect(vm_base + addr, size, PROT_READ | PROT_WRITE) != 0)
+    if (vm__mprotect_pages(addr, size, PROT_READ | PROT_WRITE) != 0)
         return CELL_ENOMEM;
 #endif
 
@@ -227,7 +259,7 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
     if (write) prot |= PROT_WRITE;
     if (exec)  prot |= PROT_EXEC;
 
-    if (mprotect(vm_base + addr, size, prot) != 0)
+    if (vm__mprotect_pages(addr, size, prot) != 0)
         return CELL_EFAULT;
 #endif
 
@@ -258,10 +290,15 @@ static inline void vm_stack_alloc_init(vm_stack_alloc* sa)
  */
 static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size)
 {
-    stack_size = VM_ALIGN_UP(stack_size, VM_PAGE_SIZE);
+    /* Host page granularity throughout: the guard must be exactly one host
+     * page, and the stack above it must start on a host page boundary, or a
+     * 16 KB host would either refuse the mprotect or protect part of the
+     * stack itself. On a 4 KB host this is the layout it always was. */
+    uint32_t pg = vm_host_page_size();
+    stack_size = VM_ALIGN_UP(stack_size, pg);
 
     /* Add a guard page */
-    uint32_t total = stack_size + VM_PAGE_SIZE;
+    uint32_t total = stack_size + pg;
 
     if (sa->next_addr + total > sa->region_end)
         return 0; /* out of stack space */
@@ -270,9 +307,9 @@ static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size
     sa->next_addr += total;
 
     /* Guard page at the bottom (no access) */
-    vm_protect(base, VM_PAGE_SIZE, 0, 0, 0);
+    vm_protect(base, pg, 0, 0, 0);
 
-    return base + VM_PAGE_SIZE; /* skip the guard page */
+    return base + pg; /* skip the guard page */
 }
 
 /* ---------------------------------------------------------------------------

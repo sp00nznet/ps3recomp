@@ -39,7 +39,13 @@ static uint64_t ls_now_ns(void)
 #else
 #  include <pthread.h>
 #  include <time.h>
-#  define LS_RELAX() ((void)0)
+#  if defined(__x86_64__) || defined(__i386__)
+#    define LS_RELAX() __builtin_ia32_pause()
+#  elif defined(__aarch64__)
+#    define LS_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#  else
+#    define LS_RELAX() ((void)0)
+#  endif
 static pthread_mutex_t s_ls_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_ls_cv   = PTHREAD_COND_INITIALIZER;
 #  define LS_LOCK()       pthread_mutex_lock(&s_ls_lock)

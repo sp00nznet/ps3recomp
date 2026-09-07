@@ -3,8 +3,7 @@
  * optional title/runtime integration hooks. The stress suite tests the
  * primitives directly, without linking a generated title.
  */
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "../../runtime/platform/win32_compat.h"   /* QueryPerformanceCounter on every host */
 
 #include <stdint.h>
 
@@ -49,3 +48,10 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
     (void)work_ea;
     return 0;
 }
+
+/* The SPU-side event handoff sys_event_port_send writes when a port is bound
+ * to an SPU thread. Defined by runtime/spu/spu_interp.c, which this suite
+ * does not link; nothing here binds a port to an SPU, so the values are
+ * never read back. */
+uint32_t g_spu_pending_evt[3];
+int      g_spu_pending_evt_valid;

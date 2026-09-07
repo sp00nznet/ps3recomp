@@ -24,8 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # glslang and spirv-cross turn the decompilers' HLSL into MSL for the
+      # Metal backend's guest-shader path; without them CMake builds the
+      # fixed-function backend only.
       - name: Install dependencies
-        run: brew install ninja sdl2
+        run: brew install ninja sdl2 glslang spirv-cross
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
@@ -64,10 +67,82 @@ jobs:
                 -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
           /tmp/test_spu_helpers
 
+      # An SPU parked on a GETLLAR reservation has to be told when the PPU
+      # writes that line. Nothing else in the tree fails when that notify is
+      # missing -- the SPU just never wakes -- so it gets its own check.
+      - name: Run the PPU/SPU lock-line coherence tests
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu \
+                -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
+          /tmp/test_spu_coherency
+
+      # The other writer: an SPU. Five SPURS kernels share one management line,
+      # so a commit that does not break its peers' reservations lets two of them
+      # win the same compare-and-swap, and the queue is quietly wrong afterwards.
+      - name: Run the SPU-to-SPU lock-line coherence tests
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_lockline_peer \
+            runtime/spu/tests/test_spu_lockline_peer.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c -lpthread -lm
+          /tmp/test_spu_lockline_peer
+
+      # A thread group starting its threads on their image's LIFTED code. This
+      # is the path a real title needs and the one that used to be missing: the
+      # group's threads completed instantly with status 0, the group reported a
+      # clean exit, and the program the guest asked to run had simply not run.
+      # Nothing else in the tree fails when that happens, so it gets its own
+      # check. The real lv2 SPU-thread layer and the real SPU dispatcher are
+      # compiled in, and the two threads have to run concurrently on host
+      # threads of their own, with the image in their local stores, the entry
+      # point and image the registry says, and each thread's own arguments.
+      - name: Run the lifted SPU thread-group start test
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_lifted_start \
+            runtime/spu/tests/test_spu_lifted_start.c \
+            runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
+            runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
+            runtime/spu/spu_workload.c runtime/spu/spurs_policy.c \
+            runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
+            runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
+            runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
+            runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spu_lifted_start
+
+      # The per-context MFC engine table, which the group above writes from
+      # every one of its threads at once. Two threads claiming the same slot
+      # share one engine's queue and tag mask, so one SPU's tag wait is
+      # satisfied by the other's transfer and nothing says so; slots that are
+      # never given back put every context past the eighth on one shared
+      # engine. Eight contexts claim on the same instant, thirty-two times
+      # over, and the check is that the same eight engines come back around,
+      # each one clean and holding only its own owner's state.
+      - name: Run the SPU MFC engine slot test
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_mfc_slots \
+            runtime/spu/tests/test_spu_mfc_slots.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c -lpthread -lm
+          /tmp/test_spu_mfc_slots
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge
-      # is intact, not merely that it compiled.
+      # is intact, not merely that it compiled. No environment set, so this is
+      # the DEFAULT path -- rsx_dispatch's register file into rsx_draw_engine.c
+      # and the record-oriented backend under it.
       - name: Run the POSIX host (headless Metal end-to-end)
         run: |
           # Clear + flip: asserts the guest clear colour reaches the drawable.
@@ -77,6 +152,122 @@ jobs:
           # and the draw path, not just the clear.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+          # Two triangles drawn near-first: the centre pixel is red only if the
+          # depth test rejected the later far one.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth
+          # Guest programs: a vertex program and a fragment program loaded
+          # through the FIFO, decompiled, translated to MSL, compiled and
+          # bound. The fragment program swaps the triangle's red and blue,
+          # and the host asks the backend how many draws ran guest code, so
+          # a fall-back to the built-in shader cannot pass. The forced
+          # built-in run proves the check has teeth: it must fail.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader --frames=60
+          # A guest texture sampled by a guest fragment program: layout,
+          # decode, upload, the CONTROL1 crossbar as a swizzle, and the
+          # sampler registers. The quad is green and the texture is not.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex
+          # A texture with TWO mip levels, each a different colour, sampled
+          # through a quad small enough that the LOD reaches level 1. A
+          # backend that uploads level 0 and stops presents level 0's colour
+          # and fails, so this cannot pass without the whole mip chain.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip
+          # Render-to-texture: a red triangle drawn into a colour surface of
+          # the guest's own, then sampled by a full-screen quad through the
+          # guest programs. The guest bytes behind that surface are green, so
+          # a backend that uploads them instead of binding the surface it
+          # rendered into presents green and fails.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt --frames=60
+          # A polygon and a quad strip, the two primitives with no host
+          # equivalent that are not simply a list of quads. The pentagon is
+          # green and the quad strip red over it, and the centre pixel belongs
+          # to the strip's SECOND quad, so a renderer that drops quad strips
+          # or expands only the first quad presents green and fails.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --quads
+          # Depth-as-texture: a flat triangle written into a zeta of the
+          # guest's own with the depth test on, then that zeta sampled as a
+          # DEPTH24_D8 texture by a guest fragment program in a second pass.
+          # The centre pixel is the depth itself, 0.25 as a byte; a zeta
+          # nothing wrote, and the guest bytes behind its address, both read
+          # 1.0 and present saturated red. This one runs on the draw engine
+          # only: the vtable path tracks no zeta as a texture and uploads
+          # those bytes instead, which is exactly the failure above.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex --frames=60
+          # Multiple render targets: an MRT1 set at two offscreen offsets,
+          # both members written by ONE draw whose fragment program exports
+          # r0 and r2 -- a deferred renderer's G-buffer pass. The display
+          # quad then samples one of them, and a centre pixel can only speak
+          # for one, so --mrt asserts target B (blue, the export that had
+          # nowhere to go until the decompiler grew a second SV_TARGET) and
+          # --mrt-a asserts target A (red, that growing it disturbed
+          # nothing). Every way of getting it wrong has its own colour: the
+          # set's clear colour for a target attached and cleared but never
+          # fed, and the surfaces' green guest bytes for a renderer that
+          # uploads those instead of binding what the pass wrote.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt-a
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt --frames=60
+          # A guest program pair that will not translate has no fallback in
+          # the draw engine, so forcing the built-in shader leaves --shader
+          # with nothing to draw: it must still fail, or the check is not
+          # checking. On the vtable path it falls back and draws the wrong
+          # colour instead, which fails the same assertion.
+          if PS3RECOMP_METAL_FIXED_FUNCTION=1 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader; then
+            echo "--shader passed with the built-in shader forced; the check is not checking"
+            exit 1
+          fi
+          # No graphics: create a guest PPU thread through the lv2 path and
+          # check the host stack it got. A recompiled call chain nests on the
+          # host stack one frame per guest call, and Darwin's default thread
+          # stack is 512 KB, which nothing tells you until a title dies.
+          ./build/ps3recomp_host --threads
+          # The SDL2 audio and pad backends, which the Windows build never
+          # reaches (it takes WASAPI and XInput). The dummy audio driver and
+          # no controller are the runner's situation and must both be fine.
+          SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad
+
+      # ...and the same modes again through the older vtable path, the one
+      # driven by rsx_state rather than by the register file. Both have to
+      # pass every mode for as long as both exist, and the pixel assertions
+      # are what say the two agree; this is also the check that the way back
+      # still works.
+      - name: Run the POSIX host (vtable path)
+        env:
+          PS3RECOMP_METAL_HEADLESS: "1"
+          PS3RECOMP_RSX_ENGINE: vtable
+        run: |
+          ./build/ps3recomp_host
+          ./build/ps3recomp_host --draw
+          ./build/ps3recomp_host --draw --frames=60
+          ./build/ps3recomp_host --depth
+          ./build/ps3recomp_host --shader
+          ./build/ps3recomp_host --shader --frames=60
+          ./build/ps3recomp_host --tex
+          ./build/ps3recomp_host --mip
+          ./build/ps3recomp_host --rtt
+          ./build/ps3recomp_host --rtt --frames=60
+          ./build/ps3recomp_host --quads
+          ./build/ps3recomp_host --mrt
+          ./build/ps3recomp_host --mrt-a
+          ./build/ps3recomp_host --mrt --frames=60
+          if PS3RECOMP_METAL_FIXED_FUNCTION=1 ./build/ps3recomp_host --shader; then
+            echo "--shader passed with the built-in shader forced; the check is not checking"
+            exit 1
+          fi
+          # And the PPU boot path, whose three frames reach the backend from
+          # guest code rather than from the harness.
+          ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
+
+      # Guest vertex and fragment programs through the decompilers, glslang
+      # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
+      # and attribute slots the Metal backend binds to. The binary missing
+      # means the shader tools were not found, which must fail, not skip.
+      - name: Run the guest shader translation test
+        run: |
+          test -x build/test_shader_msl
+          ./build/test_shader_msl
 
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
@@ -84,6 +275,46 @@ jobs:
       # output is what to record with --update.
       - name: Check the PPU boot scaffold (ratchet)
         run: python tools/check_ppu_scaffold.py
+
+      # ...and this one RUNS it. The ratchet above only compiles the scaffold;
+      # the smoke title is a synthetic lifted program that drives the loader,
+      # the NID bridge, the lv2 syscalls, a guest thread, the frame clock and
+      # the Metal backend from guest code, and checks all of it. Exit 0 means
+      # every marker appeared in order, the guest thread ran on its own host
+      # thread, three frames reached the backend and the guest's chosen exit
+      # status came back through sys_process_exit. The binary missing means
+      # CMake skipped the target, which must fail rather than pass quietly.
+      - name: Run the PPU boot smoke title (headless Metal)
+        run: |
+          test -x build/ps3recomp_boot_smoke
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
+
+      # templates/project is what "start a port" means -- docs/GETTING_STARTED.md
+      # says to copy it -- and until now nothing built it on any platform. This
+      # is the same smoke title again, booted through the TEMPLATE's runner and
+      # the template's own CMakeLists: the toolkit from PS3RECOMP_DIR, the lift
+      # from RECOMP_DIR, exactly the two directories a real port passes. Exit 0
+      # is the smoke title's own verdict, so a template that builds but boots
+      # nothing cannot pass.
+      - name: Build and run the game template (headless Metal)
+        run: |
+          # pipefail, or tee below would swallow the runner's exit status --
+          # which IS the smoke title's verdict.
+          set -eo pipefail
+          test -f build/smoke/lift/ppu_recomp.h
+          cmake -S templates/project -B build-template -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DPS3RECOMP_DIR="$PWD" \
+            -DRECOMP_DIR="$PWD/build/smoke/lift"
+          cmake --build build-template
+          PS3RECOMP_METAL_HEADLESS=1 \
+            ./build-template/MyGameRecomp build/smoke/smoke.elf 2>&1 | tee template.log
+          # The runner's own banner, so a pass cannot come from some other
+          # binary, and the marker-order verdict spelt out rather than inferred
+          # from the exit status alone.
+          grep -q "=== ps3recomp game runner ===" template.log
+          grep -q "\[smoke\] OK: all 11 markers, in order" template.log
+          grep -q "\[smoke\] PASS" template.log
 
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # arithmetic with no host API in it, so it runs everywhere, and it is the
@@ -94,3 +325,54 @@ jobs:
           /tmp/test_texture_layout
           clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
           /tmp/test_rsx_primitives
+          # The fragment-program decoder on its own: the word swap, source
+          # swizzles and types, the dest mask, inline constants, which
+          # register file the colour export comes from, and how many
+          # SV_TARGETs a program that writes more than one export gets.
+          clang -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_fp_decompiler
+          # The register-file draw engine's platform-neutral halves against a
+          # stub backend -- surface keying and reallocation, render-target
+          # aliasing on a texture bind, the texture cache's revalidation and
+          # eviction, the pipeline key's stability under constant changes, and
+          # restart cuts bounding topology expansion. Runs on Linux too.
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_rsx_draw_engine
+
+      # The Win32 shim the runtime runs through on macOS: interlocked widths
+      # and return conventions, SRW/CS/condition variables, events, semaphores,
+      # joinable threads, WaitOnAddress, timers, VirtualAlloc -- on arm64,
+      # where the memory model is weak and 16 KB pages are real.
+      - name: Run the Win32 compatibility layer tests
+        run: |
+          clang -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread
+          /tmp/test_win32_compat
+
+      # Which signal an inaccessible guest window faults with, and whether one
+      # can be reserved at all. This is the host that makes the question real:
+      # a PROT_NONE page here raises SIGBUS, not SIGSEGV, so the untranslated-
+      # guest-pointer trap in runtime/ppu/ppu_loader.cpp has to take both.
+      - name: Run the guest-pointer trap signal test
+        run: |
+          clang -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
+          /tmp/test_guest_ptr_trap
+
+      # The lv2 sync-primitive stress suite on host threads. Windows-only until
+      # the shim grew joinable handles and multi-object waits; on Apple Silicon
+      # it is the arm64 memory-model regression net for the primitives a game
+      # hammers hardest.
+      - name: Build and run sync_stress
+        run: |
+          cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build-sync-stress
+          ctest --test-dir build-sync-stress --output-on-failure
+
+      # cellFiber's cooperative switching on ucontext. Apple deprecated those
+      # routines in 10.6 and gates the shape of ucontext_t itself on
+      # _XOPEN_SOURCE, so this is the evidence that the path works on arm64
+      # rather than an assumption that it does.
+      - name: Build and run fiber_switch
+        run: |
+          cmake -S tests/fiber_switch -B build-fiber -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build-fiber
+          ./build-fiber/fiber_switch

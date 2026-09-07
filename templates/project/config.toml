@@ -71,8 +71,13 @@ max_spu_threads = 6
 use_host_threads = true
 
 [graphics]
-# Graphics backend: "vulkan", "d3d12", "opengl", "null"
-backend = "vulkan"
+# Graphics backend. main.cpp picks this at BUILD time from the host it is
+# compiled on -- D3D12 on Windows, Metal on Apple, the null backend's headless
+# software path anywhere else -- because that is where the backends exist.
+# Change the selection in main.cpp, not here.
+#
+# Recognised names: "d3d12", "metal", "null"
+backend = "auto"
 
 # Window resolution (0 = match the game's native resolution)
 width = 0
@@ -85,8 +90,12 @@ vsync = "on"
 scale_factor = 1
 
 [audio]
-# Audio backend: "wasapi", "pulseaudio", "coreaudio", "sdl", "null"
-backend = "sdl"
+# Audio backend, likewise chosen at build time: WASAPI on Windows, SDL2
+# everywhere else (see libs/audio/cellAudio.c). Set SDL_AUDIODRIVER=dummy to
+# run with no sound device at all.
+#
+# Recognised names: "wasapi", "sdl", "null"
+backend = "auto"
 
 # Sample rate (PS3 native is 48000)
 sample_rate = 48000

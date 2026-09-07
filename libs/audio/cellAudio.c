@@ -140,6 +140,12 @@ static AudioNotifySlot s_notify_queues[CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES];
 /* Mixing thread */
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
+#ifndef _WIN32
+/* Is s_mix_thread a thread that exists and has not been joined? The Win32
+ * branch asks that of the HANDLE itself, which it nulls after closing;
+ * pthread_t has no such value, so carry the flag. */
+static int           s_mix_thread_live = 0;
+#endif
 static mutex_t       s_audio_mutex;
 
 /* Output mix buffer (stereo, one block worth) */
@@ -575,6 +581,7 @@ static int audio_start_mix_thread(void)
         s_mix_thread_running = 0;
         return -1;
     }
+    s_mix_thread_live = 1;
 #endif
     return 0;
 }
@@ -589,7 +596,16 @@ static void audio_stop_mix_thread(void)
         s_mix_thread = NULL;
     }
 #else
-    pthread_join(s_mix_thread, NULL);
+    /* Same guard. Init leaves s_audio_initialized set even when the mixing
+     * thread failed to start ("continuing silently" -- a title without audio
+     * still runs), so Quit reaches here with s_mix_thread never assigned.
+     * pthread_t has no null value to test, and joining an unset one, or
+     * joining the same one twice, is undefined rather than an error the way
+     * WaitForSingleObject on a null HANDLE is. */
+    if (s_mix_thread_live) {
+        pthread_join(s_mix_thread, NULL);
+        s_mix_thread_live = 0;
+    }
 #endif
 }
 

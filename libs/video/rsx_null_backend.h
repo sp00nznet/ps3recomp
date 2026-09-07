@@ -52,13 +52,18 @@ u32 rsx_null_backend_debug_color(void);
 /* Centre pixel of the last presented frame as 0xFFRRGGBB, or 0 if nothing has
  * been presented yet. */
 u32 rsx_null_backend_readback_center(void);
-#endif
 
-#ifdef __cplusplus
-}
+/* Draws of the last presented frame that ran the guest's own programs:
+ * always 0 here, this backend has no shader path. Mirrors the Metal hook so
+ * the host harness can name one entry point per backend. */
+u32 rsx_null_backend_guest_draws(void);
 #endif
 
 /* The live draw engine binds to this window and takes over presentation. */
 void* rsx_null_backend_get_hwnd(void);
 void  rsx_null_backend_suppress_present(int on);
+
+#ifdef __cplusplus
+}
+#endif
 #endif

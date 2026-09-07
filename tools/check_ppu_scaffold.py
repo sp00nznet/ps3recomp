@@ -51,12 +51,19 @@ BASELINE = os.path.join(ROOT, "tools", "ppu_scaffold_baseline.json")
 # per-game SPU recomp header too. It does not -- ppu_recomp.h is the only
 # generated header it wants, and the stub covers that. Leaving it out meant
 # the file the frame clock lives in was the one file nothing checked.
+#
+# templates/project/main.cpp is here for the same reason: it is a runner built
+# against the same generated header, and it is the file a port starts from. CI
+# builds and RUNS it on macOS and Linux; Windows cannot (the boot smoke target
+# that generates a lift is UNIX-only there), so this is what keeps the Windows
+# half of the template honest.
 SOURCES = [
     "runtime/ppu/ppu_loader.cpp",
     "runtime/ppu/ppu_hle.cpp",
     "runtime/ppu/ppu_fs.cpp",
     "runtime/ppu/ppu_sysprx.cpp",
     "runtime/ppu/tests/boot_main.cpp",
+    "templates/project/main.cpp",
 ]
 
 INCLUDE_DIRS = [
@@ -65,6 +72,7 @@ INCLUDE_DIRS = [
     "runtime/spu",
     "runtime/memory",
     "runtime/syscalls",
+    "runtime/platform",   # win32_compat.h, which the template takes by name
     "libs/video",
 ]
 

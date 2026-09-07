@@ -15,6 +15,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <errno.h>
 #endif
 
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
@@ -649,6 +650,11 @@ static void spu_async_run(spu_async_job* j)
                 for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
 #ifdef _WIN32
                     Sleep(3);
+#else
+                    /* The pause is the point: it is the window in which the
+                     * PPU marks work ready. Without it the 400 attempts are
+                     * spent before the producer runs at all. */
+                    { struct timespec _d = { 0, 3 * 1000 * 1000 }; nanosleep(&_d, NULL); }
 #endif
                     memset(ls, 0, SPU_LS_SIZE);
                     uint32_t e2 = 0;
@@ -1098,8 +1104,23 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!th) { free(j); return 0; }
     CloseHandle(th);   /* detached */
 #else
+    /* Same 256 MB reservation, for the same reason: pthread stacks are
+     * mmap'd and committed on touch, so this reserves address space rather
+     * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
+     * the guard page above. */
     pthread_t th;
-    if (pthread_create(&th, NULL, spu_async_thread, j) != 0) { free(j); return 0; }
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    int prc = EINVAL;
+    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
+        prc = pthread_create(&th, &attr, spu_async_thread, j);
+    pthread_attr_destroy(&attr);
+    /* A host that will not reserve that much still gets the thread, on the
+     * default stack: a shallow SPU job runs there, and a deep one dying
+     * beats never dispatching at all. */
+    if (prc != 0)
+        prc = pthread_create(&th, NULL, spu_async_thread, j);
+    if (prc != 0) { free(j); return 0; }
     pthread_detach(th);
 #endif
     return 1;

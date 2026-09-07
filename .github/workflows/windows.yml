@@ -103,6 +103,18 @@ jobs:
 
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
+      # sync_stress has always been the Windows-native suite; now that its
+      # source also builds on POSIX through the shim, this is what proves the
+      # shared source still means the same thing here.
+      - name: Build and run sync_stress
+        run: |
+          cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build build-sync-stress
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ctest --test-dir build-sync-stress --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Run self-contained RSX tests
         # NOT shell: bash. Git Bash rewrites a leading-slash argument into a
         # Windows path, so /nologo arrived at the linker as an .obj under the

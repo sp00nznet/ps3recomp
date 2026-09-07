@@ -89,6 +89,8 @@
 #define M_VP_UPLOAD_FROM_ID     0x1E9C
 #define M_VP_UPLOAD_CONST_ID    0x1EFC
 #define M_VP_UPLOAD_CONST       0x1F00
+#define M_GCM_FLIP_HEAD_0       0xE920
+#define M_GCM_FLIP_HEAD_1       0xE924
 #define M_GCM_DRIVER_FLIP       0xE944
 /* Primitive restart: a sentinel index value that breaks a TRIANGLE_STRIP/
  * FAN mid-draw with no connecting triangle (RPCS3 oracle: gcm_enums.h
@@ -172,6 +174,8 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     mark_class(rsx, M_CLEAR_BUFFERS,     1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VP_UPLOAD_INST,   32, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VP_UPLOAD_CONST,  32, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_GCM_FLIP_HEAD_0,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_GCM_FLIP_HEAD_1,   1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_GCM_DRIVER_FLIP,   1, RSX_DSP_CLASS_EXEC);
 
     /* State the getters decode */
@@ -306,6 +310,8 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                                        arg & 0xFFFFFF, (arg >> 24) + 1);
         break;
 
+    case M_GCM_FLIP_HEAD_0:
+    case M_GCM_FLIP_HEAD_1:
     case M_GCM_DRIVER_FLIP:
         if (rsx->sink.flip)
             rsx->sink.flip(rsx->sink.user, rsx, arg);

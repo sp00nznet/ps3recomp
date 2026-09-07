@@ -1,22 +1,25 @@
 /*
- * ps3recomp - integrated PPU boot harness (first-boot attempt).
+ * ps3recomp - integrated PPU boot harness.
  *
- * Links the whole PPU runtime half into one executable and starts executing
- * the recompiled game's entry point:
+ * Links the whole PPU runtime half into one executable and starts executing a
+ * recompiled program's entry point:
  *
  *   lifted code (ppu_recomp.c) + loader (ppu_loader.cpp) + HLE bridge
  *   (ppu_hle.cpp + generated NID table) + HLE libs (cellGcmSys, rsx_commands)
  *
- * It loads the real EBOOT image, registers the lifted functions and the HLE
- * NID handlers, then dispatches the entry. Execution runs real Uncharted boot
- * code until it reaches a function outside the lifted subset (logged by the
- * unlifted stub), an unimplemented firmware import (logged by ps3_hle_call),
- * or an lv2 syscall (logged by lv2_syscall) -- telling us exactly what to
- * implement next.
+ * It loads the PPU ELF named on the command line, registers the lifted
+ * functions and the HLE NID handlers, starts the frame clock, then dispatches
+ * the entry OPD. Execution runs real guest code until it reaches a function
+ * outside the lifted subset (logged by the unlifted stub), an unimplemented
+ * firmware import (logged by ps3_hle_call), or an lv2 syscall (logged by
+ * lv2_syscall) -- telling us exactly what to implement next.
  *
- * This proves the integration builds + runs; a full-image build additionally
- * needs the lifter to split output into multiple TUs (88 MB single-file
- * otherwise).
+ * Nothing here is title-specific: the ELF path, the VFS root derived from it
+ * and the window title all come from the command line or the environment. Two
+ * things drive it today -- a game port, which supplies its own lifted
+ * ppu_recomp.c and its own HLE overrides, and the smoke title in
+ * tests/smoke/, which is the same harness with a synthetic program in it and
+ * is what proves this path runs at all on POSIX.
  */
 #include <stdarg.h>
 #include "ppu_recomp.h"
@@ -49,6 +52,12 @@ void     ppu_sysprx_register(void);
 void     ppu_fs_register(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
+/* The status a guest handed to sys_process_exit, published by
+ * libs/system/sysPrxForUser.c before it calls the host exit(). A title that
+ * exits that way never returns through ppu_run, so this is only read on the
+ * path where the guest fell out of its entry function instead. */
+extern int     g_sys_process_exit_called;
+extern int32_t g_sys_process_exit_code;
 void     cellGame_init_from_paramsfo(const char* sfo_path);  /* libs/system/cellGame.c */
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
  * guest RAM and register their exports. Weak default is a no-op; a title that
@@ -283,6 +292,21 @@ static void rsx_present_frame(void)
 static int rsx_pump_messages(void)
 { return s_rsx_live ? rsx_null_backend_pump_messages() : rsx_backend_pump(); }
 
+/* Frames handed to the backend at a guest FLIP boundary -- one per frame the
+ * guest actually finished, which is the number a port means by "is anything
+ * reaching the screen". The presents the ticker makes before the guest's first
+ * flip (so a fresh window is not left white through a long boot) are
+ * deliberately not counted: they carry no guest frame. */
+static volatile LONG g_frames_presented = 0;
+extern "C" unsigned ppu_boot_frames_presented(void) { return (unsigned)g_frames_presented; }
+static void present_guest_frame(void)
+{
+    rsx_present_frame();
+    /* The ticker increments, a guest thread reads: interlocked rather than a
+     * volatile ++, which is neither atomic nor a fence on arm64. */
+    InterlockedIncrement(&g_frames_presented);
+}
+
 /* ---- Guest-PC sampling profiler (PS3_GUEST_PROF=1) -----------------------
  * Samples every guest thread's ctx.cia every ~5ms and dumps the top sites
  * every 5s. cia is refreshed at every syscall, and guest spin loops issue a
@@ -389,7 +413,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * writes and showed empty or mixed batches. */
             {
                 if (rsx_ok && cellGcm_take_flip_pending()) {
-                    rsx_present_frame();
+                    present_guest_frame();
                     last_flip = cellGcm_flip_request_count();
                 }
             }
@@ -408,7 +432,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * The real RSX writes those fences in microseconds. */
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
-                rsx_present_frame();
+                present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
             cellGcm_rsx_process_fifo();
@@ -443,8 +467,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                  * during boot. */
                 unsigned fc = cellGcm_flip_request_count();
                 if (fc != last_flip || fc == 0) {
-                    rsx_present_frame();
+                    if (fc) present_guest_frame(); else rsx_present_frame();
                     last_flip = fc;
+                } else if (fc == 0) {
+                    rsx_backend_present();
                 }
             }
         }
@@ -809,7 +835,7 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) { printf("usage: %s <EBOOT.elf>\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <PPU ELF>\n", argv[0]); return 2; }
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
@@ -928,12 +954,20 @@ int main(int argc, char** argv)
 #endif
 
     ps3_ms("boot:entry");
-    { extern void ps3_sampler_start(void); ps3_sampler_start(); }   /* PS3_SAMPLE=<ms> */
+#ifdef _WIN32
+    { extern void ps3_sampler_start(void); ps3_sampler_start(); } /* PS3_SAMPLE=<ms> */
+#endif
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
 #endif
     int rc = ppu_run(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
-    return 0;
+    /* A guest that called sys_process_exit never reaches this line: that path
+     * ends in the host exit(). Getting here means the entry function returned
+     * instead, so hand back the status the guest published if it published one
+     * -- returning a hardcoded 0 reported success for a run that never got
+     * anywhere, which is exactly the kind of green a boot harness must not
+     * produce. */
+    return g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0;
 }

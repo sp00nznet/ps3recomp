@@ -3,7 +3,7 @@
  *
  * Extended sync primitives using host OS primitives.
  * Windows: SRWLOCK, CONDITION_VARIABLE
- * Unix: pthread_mutex, pthread_cond, sem_t
+ * Unix: pthread_mutex, pthread_cond, ps3_sem_t (runtime/platform/posix_sem.h)
  */
 
 #include "cellSync2.h"
@@ -17,7 +17,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
-#include <semaphore.h>
+#include "../../runtime/platform/posix_sem.h"   /* sem_init is ENOSYS on Darwin */
 #include <errno.h>
 #include <time.h>
 #endif
@@ -55,7 +55,7 @@ typedef struct Sync2SemInternal {
 #ifdef _WIN32
     HANDLE sem;
 #else
-    sem_t sem;
+    ps3_sem_t sem;
 #endif
 } Sync2SemInternal;
 
@@ -331,7 +331,7 @@ s32 cellSync2SemaphoreInit(CellSync2Semaphore* sem, s32 initialValue,
     s->sem = CreateSemaphoreW(NULL, initialValue, s->maxValue, NULL);
     if (!s->sem) return CELL_SYNC2_ERROR_STAT;
 #else
-    if (sem_init(&s->sem, 0, (unsigned)initialValue) != 0)
+    if (ps3_sem_init(&s->sem, (unsigned)initialValue) != 0)
         return CELL_SYNC2_ERROR_STAT;
 #endif
 
@@ -353,7 +353,7 @@ s32 cellSync2SemaphoreAcquire(CellSync2Semaphore* sem, u32 count,
         if (rc != WAIT_OBJECT_0) return CELL_SYNC2_ERROR_STAT;
 #else
         if (timeoutUsec == 0) {
-            sem_wait(&s->sem);
+            ps3_sem_wait(&s->sem);
         } else {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -363,7 +363,7 @@ s32 cellSync2SemaphoreAcquire(CellSync2Semaphore* sem, u32 count,
                 ts.tv_sec++;
                 ts.tv_nsec -= 1000000000L;
             }
-            if (sem_timedwait(&s->sem, &ts) != 0) {
+            if (ps3_sem_timedwait(&s->sem, &ts) != 0) {
                 if (errno == ETIMEDOUT) return CELL_SYNC2_ERROR_TIMEDOUT;
                 return CELL_SYNC2_ERROR_STAT;
             }
@@ -386,7 +386,7 @@ s32 cellSync2SemaphoreTryAcquire(CellSync2Semaphore* sem, u32 count)
         if (rc == WAIT_TIMEOUT) return CELL_SYNC2_ERROR_BUSY;
         if (rc != WAIT_OBJECT_0) return CELL_SYNC2_ERROR_STAT;
 #else
-        if (sem_trywait(&s->sem) != 0) {
+        if (ps3_sem_trywait(&s->sem) != 0) {
             if (errno == EAGAIN) return CELL_SYNC2_ERROR_BUSY;
             return CELL_SYNC2_ERROR_STAT;
         }
@@ -406,7 +406,7 @@ s32 cellSync2SemaphoreRelease(CellSync2Semaphore* sem, u32 count)
 #ifdef _WIN32
         ReleaseSemaphore(s->sem, 1, NULL);
 #else
-        sem_post(&s->sem);
+        ps3_sem_post(&s->sem);
 #endif
     }
 
@@ -425,7 +425,7 @@ s32 cellSync2SemaphoreGetValue(const CellSync2Semaphore* sem, s32* value)
     vm_write32((u32)(uintptr_t)value, (u32)s->value); /* approximate */
 #else
     int v;
-    sem_getvalue(&s->sem, &v);
+    ps3_sem_getvalue(&s->sem, &v);
     vm_write32((u32)(uintptr_t)value, (u32)v);
 #endif
 

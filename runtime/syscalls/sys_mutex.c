@@ -181,8 +181,6 @@ int64_t sys_mutex_lock(ppu_context* ctx)
 {
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] mutex_lock(mutex=%u timeout=%llu)\n", mutex_id,(unsigned long long)timeout_us); }
-
     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -273,10 +271,15 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
 #ifdef _WIN32
         EnterCriticalSection(&m->cs);
 #else
-        /* pthreads: the default mutex is non-recursive; an owner re-lock
-         * would deadlock. The pthread path needs a PTHREAD_MUTEX_RECURSIVE
-         * mutex for guest-recursive locks; pre-existing gap, not introduced
-         * by this fix. */
+        /* Same reasoning, and it applies here: create() gives a recursive
+         * guest mutex a PTHREAD_MUTEX_RECURSIVE host mutex, so the owner
+         * re-locking it bumps the host recursion count and never blocks.
+         * The comment this replaces claimed the host mutex was the default
+         * non-recursive kind and skipped the lock, which left one host
+         * acquisition behind two guest ones: the first guest unlock then
+         * dropped the host mutex entirely and another thread could enter
+         * while the guest still believed it held the mutex. */
+        pthread_mutex_lock(&m->mtx);
 #endif
         m->lock_count++;
         return CELL_OK;

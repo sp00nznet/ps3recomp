@@ -11,6 +11,22 @@
  * -----------------------------------------------------------------------*/
 sys_rwlock_info g_sys_rwlocks[SYS_RWLOCK_MAX];
 
+#ifndef _WIN32
+/* The write lock's owner, or 0. Only the owner ever writes it, and only
+ * while it holds the lock, so a reader either sees its own id or somebody
+ * else's -- never a stale "it is me". Acquire/release pair it with the
+ * pthread lock itself so the id is published with the acquisition. */
+static uint64_t rwlock_writer(const sys_rwlock_info* r)
+{
+    return __atomic_load_n(&r->writer_tid, __ATOMIC_ACQUIRE);
+}
+
+static void rwlock_set_writer(sys_rwlock_info* r, uint64_t tid)
+{
+    __atomic_store_n(&r->writer_tid, tid, __ATOMIC_RELEASE);
+}
+#endif
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -61,6 +77,7 @@ int64_t sys_rwlock_create(ppu_context* ctx)
     r->writer  = 0;
 #else
     pthread_rwlock_init(&r->rwl, NULL);
+    r->writer_tid = 0;
 #endif
 
     uint32_t rwlock_id = (uint32_t)(slot + 1);
@@ -179,7 +196,15 @@ int64_t sys_rwlock_wlock(ppu_context* ctx)
     InterlockedExchange(&r->writer, 1);
     r->writer_tid = ctx->thread_id;
 #else
+    /* pthread_rwlock_wrlock by the thread that already holds the lock is
+     * undefined behaviour. Darwin's libpthread does not block or report it,
+     * it returns 0, which is worse: the guest is told it took a second lock
+     * level that no unlock will ever match. Answer EDEADLK before touching
+     * the lock, as the Win32 branch does. */
+    if (rwlock_writer(r) == ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EDEADLK;
     pthread_rwlock_wrlock(&r->rwl);
+    rwlock_set_writer(r, ctx->thread_id);
 #endif
 
     return CELL_OK;
@@ -204,9 +229,12 @@ int64_t sys_rwlock_trywlock(ppu_context* ctx)
     InterlockedExchange(&r->writer, 1);
     r->writer_tid = ctx->thread_id;
 #else
+    if (rwlock_writer(r) == ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EDEADLK;
     int rc = pthread_rwlock_trywrlock(&r->rwl);
     if (rc != 0)
         return (int64_t)(int32_t)CELL_EBUSY;
+    rwlock_set_writer(r, ctx->thread_id);
 #endif
 
     return CELL_OK;
@@ -232,6 +260,13 @@ int64_t sys_rwlock_wunlock(ppu_context* ctx)
     InterlockedExchange(&r->writer, 0);
     ReleaseSRWLockExclusive(&r->srw);
 #else
+    /* Same guard: pthread_rwlock_unlock does not distinguish a read unlock
+     * from a write one, so without the owner check a stray wunlock releases
+     * whatever the calling thread happens to hold, or somebody else's write
+     * lock entirely. */
+    if (rwlock_writer(r) != ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EPERM;
+    rwlock_set_writer(r, 0);
     pthread_rwlock_unlock(&r->rwl);
 #endif
 

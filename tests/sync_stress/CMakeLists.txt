@@ -3,13 +3,22 @@
 # Deterministic lv2 sync-primitive stress suite.
 # Standalone project: its OWN build dir, never yakuza\build.
 #
-# Build (chain in ONE command -- Launch-VsDevShell is blocked in this harness;
-# shell state does not persist between tool calls):
+# Build on Windows (chain in ONE command -- Launch-VsDevShell is blocked in
+# this harness; shell state does not persist between tool calls):
 #
 #   cmd /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul && cmake -S tests\sync_stress -B tests\sync_stress\build -G Ninja && ninja -C tests\sync_stress\build"
 #
+# Build on Linux / macOS:
+#
+#   cmake -S tests/sync_stress -B tests/sync_stress/build -G Ninja && ninja -C tests/sync_stress/build
+#
 # Run:
-#   .\tests\sync_stress\build\sync_stress.exe [seed]
+#   .\tests\sync_stress\build\sync_stress.exe [seed]     (Windows)
+#   ./tests/sync_stress/build/sync_stress [seed]          (POSIX)
+#
+# The harness is written against Win32 threads, events and interlocked ops.
+# Off Windows those come from runtime/platform/win32_compat.h, so the same
+# source runs on every host -- and doubles as a stress test of that shim.
 #
 cmake_minimum_required(VERSION 3.20)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -48,7 +57,13 @@ add_executable(sync_stress
     "${RUNTIME_SYNC_DIR}/sys_cond.c"
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
     "${RUNTIME_SYNC_DIR}/sys_event.c"
+    "${RUNTIME_SYNC_DIR}/sys_rwlock.c"
 )
+if(NOT WIN32)
+    # The Win32 handle, wait and thread API the harness drives.
+    target_sources(sync_stress PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+endif()
 
 target_include_directories(sync_stress PRIVATE
     "${RUNTIME_SYNC_DIR}"
@@ -64,7 +79,8 @@ if(MSVC)
     target_compile_definitions(sync_stress PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(sync_stress PRIVATE -Wall -Wextra -Wno-unused-parameter)
-    target_link_libraries(sync_stress PRIVATE pthread)
+    find_package(Threads REQUIRED)
+    target_link_libraries(sync_stress PRIVATE Threads::Threads)
 endif()
 
 add_test(NAME sync_stress COMMAND sync_stress)
@@ -72,3 +88,22 @@ set_tests_properties(sync_stress PROPERTIES
     LABELS "stress;runtime;sync"
     TIMEOUT 120
 )
+
+# Focused regressions: ownership, full recursive release, and host spurious wakes.
+add_executable(test_cond_semantics
+    test_cond_semantics.c test_shims.c
+    "${RUNTIME_SYNC_DIR}/sys_mutex.c"
+    "${RUNTIME_SYNC_DIR}/sys_cond.c")
+target_include_directories(test_cond_semantics PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
+if(WIN32)
+    target_compile_definitions(test_cond_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_sources(test_cond_semantics PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    target_link_libraries(test_cond_semantics PRIVATE Threads::Threads)
+endif()
+foreach(mode owner recursive spurious)
+    add_test(NAME cond_${mode} COMMAND test_cond_semantics ${mode})
+    set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
+endforeach()

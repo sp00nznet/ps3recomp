@@ -399,9 +399,7 @@ static struct SpursInst* spurs_inst_find(u32 ea)
     return NULL;
 }
 
-#ifdef _WIN32
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
-#endif
 
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
 {
@@ -424,12 +422,10 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
 
-#ifdef _WIN32
     if (!si->kernel_live) {
         si->kernel_live = 1;
         CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     }
-#endif
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
     return CELL_OK;
@@ -1408,8 +1404,14 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
-#ifdef _WIN32
-/* One virtual SPU running a workload's policy module. The WWS job manager
+/* Thread creation, waiting and Sleep come from runtime/platform/win32_compat.h
+ * off Windows (included at the top of this file), which is what lets the three
+ * thread bodies below stand as written on every host. SetThreadStackGuarantee
+ * has no POSIX counterpart -- it reserves stack for the stack-overflow
+ * exception handler, and there is no such handler here -- so it stays behind
+ * an _WIN32 guard where it is used.
+ *
+ * One virtual SPU running a workload's policy module. The WWS job manager
  * runs concurrently across N SPUs (RPCS3: jobmanagerCellSpursKernel0..N): each
  * claims jobs from the shared queue and advances its own lane of the sync
  * barrier. Running the SPUs SEQUENTIALLY deadlocks -- SPU 0 completes its job,
@@ -1423,7 +1425,9 @@ struct spurs_pm_worker_arg {
 };
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
+#ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#endif
     struct spurs_pm_worker_arg* a = (struct spurs_pm_worker_arg*)p;
     spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
                           a->arg, a->wid, a->ea, a->spu_num);
@@ -1432,7 +1436,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
+#ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+#endif
     struct SpursInst* si = (struct SpursInst*)p;
     static volatile long s_pm_off = -1;
     if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;
@@ -1633,7 +1639,6 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         }
     }
 }
-#endif
 
 s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
                              u32 value)
@@ -2459,7 +2464,6 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
            jc_ea, jobs);
 }
 
-#ifdef _WIN32
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
@@ -2478,7 +2482,6 @@ static DWORD WINAPI jc_thread(LPVOID p)
     jc_signal_done(s_jobchains[slot].jc_ea);
     return 0;
 }
-#endif
 
 /* cellSpursRunJobChain -- start job chain execution (async, like the real one). */
 /* cellSpursRunJobChain(const CellSpursJobChain* jobChain) -- ONE argument.
@@ -2507,14 +2510,12 @@ static s32 jc_start(u64 jc_ea, const char* who)
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
-#ifdef _WIN32
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
             else s_jobchains[i].running = 0;
         }
-#endif
         return CELL_OK;
     }
     printf("[cellSpurs] %s(jc=0x%08X) -- UNKNOWN chain (no Create seen)\n", who, (u32)jc_ea);

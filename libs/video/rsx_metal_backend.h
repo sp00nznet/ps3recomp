@@ -48,6 +48,12 @@ u32  rsx_metal_backend_debug_color(void);
  * drawable, whose contents belong to the compositor once presented. */
 u32  rsx_metal_backend_readback_center(void);
 
+/* How many draws of the last presented frame ran the guest's own vertex and
+ * fragment programs rather than the built-in shader. A host mode that loads
+ * programs asserts this is non-zero, because the built-in path would draw
+ * the same test triangle and a pixel check alone could not tell them apart. */
+u32  rsx_metal_backend_guest_draws(void);
+
 #ifdef __cplusplus
 }
 #endif

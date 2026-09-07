@@ -28,11 +28,28 @@ static int g_fail = 0;
                          g_fail++; } } while (0)
 
 /* NV4097 texture format bytes. 0x20 is the LN (linear) flag. */
+#define FMT_B8       0x81u
+#define FMT_A1R5G5B5 0x82u
+#define FMT_A4R4G4B4 0x83u
+#define FMT_R5G6B5   0x84u
 #define FMT_A8R8G8B8 0x85u
-#define FMT_G8B8     0x8Bu
 #define FMT_DXT1     0x86u
 #define FMT_DXT23    0x87u
 #define FMT_DXT45    0x88u
+#define FMT_G8B8     0x8Bu
+#define FMT_HILO8    0x8Cu
+#define FMT_HILO_S8  0x8Du
+#define FMT_DEPTH24  0x90u
+#define FMT_DEPTH16  0x92u
+#define FMT_X16      0x94u
+#define FMT_Y16X16   0x95u
+#define FMT_R5G5B5A1 0x97u
+#define FMT_W16F     0x9Au
+#define FMT_W32F     0x9Bu
+#define FMT_X32F     0x9Cu
+#define FMT_D1R5G5B5 0x9Du
+#define FMT_D8R8G8B8 0x9Eu
+#define FMT_Y16X16F  0x9Fu
 #define FMT_LN       0x20u
 
 static void test_argb(void)
@@ -117,12 +134,262 @@ static void test_unknown_format_degrades(void)
 {
     rsx_tex_layout L;
     /* Anything unrecognised falls back to one byte per texel rather than
-     * guessing wider and reading past the end of guest memory. */
-    rsx_texture_layout(0x81u, 64, 64, &L);
+     * guessing wider and reading past the end of guest memory. B8 lands there
+     * too, and means it. */
+    rsx_texture_layout(0x8Fu /* R6G5B5, not classified */, 64, 64, &L);
     CHECK_EQ(L.fmt, RSX_TEXFMT_R8);
     CHECK_EQ(L.bytes_per_texel, 1);
     CHECK(!L.compressed);
     CHECK_EQ(L.face_bytes, 64u * 64u);
+
+    rsx_texture_layout(FMT_B8, 64, 64, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R8);
+    CHECK_EQ(L.bytes_per_texel, 1);
+    CHECK_EQ(L.dst_bytes_per_texel, 1);
+    CHECK_EQ(L.face_bytes, 64u * 64u);
+}
+
+/* --- the formats added for the Metal backend ---------------------------- */
+
+/* Source and destination row sizes are tracked separately because a packed
+ * 16-bit texel is two bytes in guest memory and four after the decode. */
+static void test_packed16_rows(void)
+{
+    rsx_tex_layout L;
+    const u32 packed[] = { FMT_A1R5G5B5, FMT_A4R4G4B4, FMT_R5G6B5,
+                           FMT_R5G5B5A1, FMT_D1R5G5B5 };
+    for (unsigned i = 0; i < sizeof packed / sizeof packed[0]; i++) {
+        rsx_texture_layout(packed[i] | FMT_LN, 64, 32, &L);
+        CHECK_EQ(L.fmt, RSX_TEXFMT_R8G8B8A8);
+        CHECK_EQ(L.bytes_per_texel, 2);
+        CHECK_EQ(L.dst_bytes_per_texel, 4);
+        CHECK_EQ(L.row_bytes, 64u * 2u);
+        CHECK_EQ(L.dst_row_bytes, 64u * 4u);
+        CHECK_EQ(L.rows, 32);
+        CHECK_EQ(L.face_bytes, 64u * 32u * 2u);   /* the SOURCE span */
+        CHECK(!L.compressed);
+    }
+}
+
+/* Each packed format's field order, decoded from one texel. The half-word is
+ * big-endian, so the high bits of the first byte are the format's leading
+ * field. */
+static void decode_one(u32 fmt, const u8* src, u8 out[4])
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(fmt | FMT_LN, 1, 1, &L);
+    rsx_texture_decode(out, 4, src, 1, 1, &L, 0);
+}
+
+static void test_packed16_texels(void)
+{
+    u8 d[4];
+
+    /* A1R5G5B5 0xFC1F = 1 11111 00000 11111: opaque magenta. */
+    { const u8 s[2] = { 0xFC, 0x1F };
+      decode_one(FMT_A1R5G5B5, s, d);
+      CHECK_EQ(d[0], 255); CHECK_EQ(d[1], 0); CHECK_EQ(d[2], 255); CHECK_EQ(d[3], 255); }
+    /* The top bit is the alpha, and clearing it must clear the alpha only. */
+    { const u8 s[2] = { 0x7C, 0x1F };
+      decode_one(FMT_A1R5G5B5, s, d);
+      CHECK_EQ(d[0], 255); CHECK_EQ(d[2], 255); CHECK_EQ(d[3], 0); }
+    /* D1R5G5B5 is the same bits with no alpha channel: the top bit is a
+     * don't-care and the texel is opaque either way. */
+    { const u8 s[2] = { 0x7C, 0x1F };
+      decode_one(FMT_D1R5G5B5, s, d);
+      CHECK_EQ(d[0], 255); CHECK_EQ(d[2], 255); CHECK_EQ(d[3], 255); }
+
+    /* A4R4G4B4 0x8F00 = A 8, R F, G 0, B 0. */
+    { const u8 s[2] = { 0x8F, 0x00 };
+      decode_one(FMT_A4R4G4B4, s, d);
+      CHECK_EQ(d[0], 0xFF); CHECK_EQ(d[1], 0); CHECK_EQ(d[2], 0);
+      CHECK_EQ(d[3], 0x88); }
+
+    /* R5G6B5 0x07E0 = R 0, G 63, B 0: pure green, opaque. */
+    { const u8 s[2] = { 0x07, 0xE0 };
+      decode_one(FMT_R5G6B5, s, d);
+      CHECK_EQ(d[0], 0); CHECK_EQ(d[1], 255); CHECK_EQ(d[2], 0);
+      CHECK_EQ(d[3], 255); }
+
+    /* R5G5B5A1 0xF801 = R 31, G 0, B 0, A 1. Alpha is the LOW bit here, which
+     * is the whole difference from A1R5G5B5: reading it as A1R5G5B5 would
+     * give a transparent blue-ish texel instead of an opaque red one. */
+    { const u8 s[2] = { 0xF8, 0x01 };
+      decode_one(FMT_R5G5B5A1, s, d);
+      CHECK_EQ(d[0], 255); CHECK_EQ(d[1], 0); CHECK_EQ(d[2], 0);
+      CHECK_EQ(d[3], 255); }
+}
+
+/* D8R8G8B8 is A8R8G8B8 with no alpha channel: the byte is still there, and
+ * whatever it holds must not modulate a draw. */
+static void test_x8r8g8b8(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(FMT_D8R8G8B8 | FMT_LN, 8, 8, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R8G8B8A8);
+    CHECK_EQ(L.bytes_per_texel, 4);
+    CHECK_EQ(L.dst_bytes_per_texel, 4);
+    CHECK_EQ(L.row_bytes, 32);
+    CHECK_EQ(L.dst_row_bytes, 32);
+
+    const u8 s[4] = { 0x00, 0x12, 0x34, 0x56 };   /* X, R, G, B */
+    u8 d[4];
+    decode_one(FMT_D8R8G8B8, s, d);
+    CHECK_EQ(d[0], 0x12); CHECK_EQ(d[1], 0x34); CHECK_EQ(d[2], 0x56);
+    CHECK_EQ(d[3], 255);
+}
+
+/* Depth sampled as colour: one red channel each. */
+static void test_depth(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(FMT_DEPTH16 | FMT_LN, 16, 4, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R16);
+    CHECK_EQ(L.bytes_per_texel, 2);
+    CHECK_EQ(L.row_bytes, 32);
+    CHECK_EQ(L.dst_row_bytes, 32);
+
+    /* Big-endian 0x1234 becomes a little-endian 16-bit unorm. */
+    { const u8 s[2] = { 0x12, 0x34 };
+      u8 d[2]; rsx_texture_layout(FMT_DEPTH16 | FMT_LN, 1, 1, &L);
+      rsx_texture_decode(d, 2, s, 1, 1, &L, 0);
+      CHECK_EQ(d[0], 0x34); CHECK_EQ(d[1], 0x12); }
+
+    /* DEPTH24_D8 has no host 24-bit format, so its integer depth is
+     * normalised into a float; the low byte is stencil and is dropped. */
+    rsx_texture_layout(FMT_DEPTH24 | FMT_LN, 16, 4, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R32F);
+    CHECK_EQ(L.bytes_per_texel, 4);
+    CHECK_EQ(L.dst_row_bytes, 64);
+    { const u8 s[4] = { 0xFF, 0xFF, 0xFF, 0x7B };   /* depth all ones */
+      float f = 0.0f;
+      rsx_texture_layout(FMT_DEPTH24 | FMT_LN, 1, 1, &L);
+      rsx_texture_decode(&f, 4, s, 1, 1, &L, 0);
+      CHECK(f == 1.0f); }
+    { const u8 s[4] = { 0x00, 0x00, 0x00, 0xFF };   /* depth zero, stencil set */
+      float f = 1.0f;
+      rsx_texture_decode(&f, 4, s, 1, 1, &L, 0);
+      CHECK(f == 0.0f); }
+}
+
+/* X16 / Y16_X16 keep their bits; only the guest's big-endian component order
+ * changes. */
+static void test_x16_y16x16(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(FMT_X16 | FMT_LN, 32, 8, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R16);
+    CHECK_EQ(L.row_bytes, 64);
+    CHECK_EQ(L.dst_row_bytes, 64);
+
+    rsx_texture_layout(FMT_Y16X16 | FMT_LN, 32, 8, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R16G16);
+    CHECK_EQ(L.bytes_per_texel, 4);
+    CHECK_EQ(L.row_bytes, 128);
+    CHECK_EQ(L.dst_row_bytes, 128);
+
+    /* X first in memory, then Y: each half-word byte-swapped in place, and
+     * the two NOT exchanged with each other. */
+    { const u8 s[4] = { 0x11, 0x22, 0x33, 0x44 };
+      u8 d[4];
+      rsx_texture_layout(FMT_Y16X16 | FMT_LN, 1, 1, &L);
+      rsx_texture_decode(d, 4, s, 1, 1, &L, 0);
+      CHECK_EQ(d[0], 0x22); CHECK_EQ(d[1], 0x11);
+      CHECK_EQ(d[2], 0x44); CHECK_EQ(d[3], 0x33); }
+}
+
+/* The float render-target formats reach the host bit for bit, byte-swapped. */
+static void test_float_formats(void)
+{
+    rsx_tex_layout L;
+
+    rsx_texture_layout(FMT_Y16X16F | FMT_LN, 64, 64, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R16G16F);
+    CHECK_EQ(L.bytes_per_texel, 4);
+    CHECK_EQ(L.row_bytes, 64u * 4u);
+    CHECK_EQ(L.dst_row_bytes, 64u * 4u);
+
+    rsx_texture_layout(FMT_W16F | FMT_LN, 64, 64, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R16G16B16A16F);
+    CHECK_EQ(L.bytes_per_texel, 8);
+    CHECK_EQ(L.row_bytes, 64u * 8u);
+
+    rsx_texture_layout(FMT_X32F | FMT_LN, 64, 64, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R32F);
+    CHECK_EQ(L.bytes_per_texel, 4);
+
+    rsx_texture_layout(FMT_W32F | FMT_LN, 64, 64, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R32G32B32A32F);
+    CHECK_EQ(L.bytes_per_texel, 16);
+    CHECK_EQ(L.row_bytes, 64u * 16u);
+
+    /* Half-float 1.0 is 0x3C00, stored high byte first. */
+    { const u8 s[8] = { 0x3C,0x00, 0x00,0x00, 0xBC,0x00, 0x3C,0x00 };
+      u8 d[8];
+      rsx_texture_layout(FMT_W16F | FMT_LN, 1, 1, &L);
+      rsx_texture_decode(d, 8, s, 1, 1, &L, 0);
+      CHECK_EQ(d[0], 0x00); CHECK_EQ(d[1], 0x3C);   /* X = 1.0  */
+      CHECK_EQ(d[4], 0x00); CHECK_EQ(d[5], 0xBC);   /* Z = -1.0 */ }
+
+    /* float 1.0 is 0x3F800000. */
+    { const u8 s[4] = { 0x3F, 0x80, 0x00, 0x00 };
+      float f = 0.0f;
+      rsx_texture_layout(FMT_X32F | FMT_LN, 1, 1, &L);
+      rsx_texture_decode(&f, 4, s, 1, 1, &L, 0);
+      CHECK(f == 1.0f); }
+}
+
+/* HILO is a two-channel 8-bit normal-map pair, laid out like G8B8. */
+static void test_hilo(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout(FMT_HILO8 | FMT_LN, 128, 128, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R8G8);
+    CHECK_EQ(L.bytes_per_texel, 2);
+    CHECK_EQ(L.row_bytes, 256);
+    CHECK_EQ(L.dst_row_bytes, 256);
+
+    rsx_texture_layout(FMT_HILO_S8 | FMT_LN, 128, 128, &L);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R8G8);
+    CHECK_EQ(L.dst_row_bytes, 256);
+
+    const u8 s[2] = { 0x40, 0xC0 };
+    u8 d[2];
+    rsx_texture_layout(FMT_HILO8 | FMT_LN, 1, 1, &L);
+    rsx_texture_decode(d, 2, s, 1, 1, &L, 0);
+    CHECK_EQ(d[0], 0x40); CHECK_EQ(d[1], 0xC0);
+}
+
+/* SET_TEXTURE_CONTROL3's pitch spaces out a LINEAR image's rows. It cannot
+ * describe a swizzled one, and a pitch narrower than a texel row is not a
+ * pitch at all. */
+static void test_control3_pitch(void)
+{
+    rsx_tex_layout L;
+    rsx_texture_layout_pitched(FMT_A8R8G8B8 | FMT_LN, 16, 4, 128, &L);
+    CHECK_EQ(L.row_bytes, 128);
+    CHECK_EQ(L.dst_row_bytes, 64);
+    CHECK_EQ(L.face_bytes, 128u * 4u);
+
+    /* Swizzled: no pitch. */
+    rsx_texture_layout_pitched(FMT_A8R8G8B8, 16, 4, 128, &L);
+    CHECK(L.swizzled);
+    CHECK_EQ(L.row_bytes, 64);
+
+    /* Too narrow to hold a row: ignored. */
+    rsx_texture_layout_pitched(FMT_A8R8G8B8 | FMT_LN, 16, 4, 32, &L);
+    CHECK_EQ(L.row_bytes, 64);
+
+    /* And the decode steps the source by the pitch, not by the row. */
+    u8 src[2 * 128];
+    memset(src, 0, sizeof src);
+    src[0] = 0xAA; src[1] = 0xBB; src[2] = 0xCC; src[3] = 0xDD;   /* row 0 */
+    src[128] = 0x11; src[129] = 0x22; src[130] = 0x33; src[131] = 0x44;
+    rsx_texture_layout_pitched(FMT_A8R8G8B8 | FMT_LN, 1, 2, 128, &L);
+    u8 dst[2 * 4];
+    rsx_texture_decode(dst, 4, src, 1, 2, &L, 0);
+    CHECK_EQ(dst[0], 0xBB); CHECK_EQ(dst[3], 0xAA);
+    CHECK_EQ(dst[4], 0x22); CHECK_EQ(dst[7], 0x11);
 }
 
 static void test_swizzle_offset(void)
@@ -418,6 +685,14 @@ int main(void)
     test_g8b8();
     test_compressed();
     test_unknown_format_degrades();
+    test_packed16_rows();
+    test_packed16_texels();
+    test_x8r8g8b8();
+    test_depth();
+    test_x16_y16x16();
+    test_float_formats();
+    test_hilo();
+    test_control3_pitch();
     test_swizzle_offset();
     test_log2_ceil();
     test_decode_argb_linear();

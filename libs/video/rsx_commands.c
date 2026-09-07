@@ -235,6 +235,51 @@ static int process_texture_method(rsx_state* state, u32 method, u32 data)
     return 0;
 }
 
+/* Vertex texture unit block: 0x0900 + unit*0x20, eight words. Same order as a
+ * fragment unit's except at +0x10, which is CONTROL3 (the row pitch) rather
+ * than CONTROL1 (the component crossbar) -- a vertex unit has no crossbar. */
+static int process_vertex_texture_method(rsx_state* state, u32 method, u32 data)
+{
+    u32 base = method - NV4097_SET_VERTEX_TEXTURE_OFFSET;
+    u32 unit = base / 0x20;
+    u32 reg  = base % 0x20;
+
+    if (unit >= RSX_MAX_VERTEX_TEXTURES)
+        return -1;
+
+    rsx_texture_state* tex = &state->vertex_textures[unit];
+
+    switch (reg) {
+    case 0x00: tex->offset       = data; break;
+    case 0x04: tex->format       = data; break;
+    case 0x08: tex->address      = data; break;
+    case 0x0C: tex->control0     = data; break;
+    case 0x10: tex->control3     = data; break;   /* CONTROL1's slot */
+    case 0x14: tex->filter       = data; break;
+    case 0x18: tex->image_rect   = data; break;
+    case 0x1C: tex->border_color = data; break;
+    default:
+        return -1;
+    }
+
+    tex->dirty = 1;
+    state->texture_dirty = 1;
+    return 0;
+}
+
+/* SET_TEXTURE_CONTROL3: 0x1840 + unit*4, one word per unit rather than a slot
+ * in the 0x20-byte unit block. */
+static int process_texture_control3(rsx_state* state, u32 method, u32 data)
+{
+    u32 unit = (method - NV4097_SET_TEXTURE_CONTROL3) / 4;
+    if (unit >= RSX_MAX_TEXTURES)
+        return -1;
+    state->textures[unit].control3 = data;
+    state->textures[unit].dirty = 1;
+    state->texture_dirty = 1;
+    return 0;
+}
+
 /* ---------------------------------------------------------------------------
  * Vertex attribute method processing
  *
@@ -330,6 +375,16 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     /* Texture methods: 0x1A00..0x1A00 + 16*0x20 - 1 */
     if (method >= 0x1A00 && method < 0x1A00 + RSX_MAX_TEXTURES * 0x20)
         return process_texture_method(state, method, data);
+
+    /* Texture CONTROL3: 0x1840..0x187C */
+    if (method >= NV4097_SET_TEXTURE_CONTROL3 &&
+        method < NV4097_SET_TEXTURE_CONTROL3 + RSX_MAX_TEXTURES * 4)
+        return process_texture_control3(state, method, data);
+
+    /* Vertex texture units: 0x0900..0x097C */
+    if (method >= NV4097_SET_VERTEX_TEXTURE_OFFSET &&
+        method < NV4097_SET_VERTEX_TEXTURE_OFFSET + RSX_MAX_VERTEX_TEXTURES * 0x20)
+        return process_vertex_texture_method(state, method, data);
 
     /* Vertex attribute FORMAT: 0x1740..0x177C */
     if (method >= 0x1740 && method < 0x1740 + RSX_MAX_VERTEX_ATTRIBS * 4)

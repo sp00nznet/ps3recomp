@@ -2469,11 +2469,20 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     /* Compressed rows are counted in blocks, so keep bpp at 1 for the byte
      * arithmetic the diagnostics below do. */
     u32 bpp = tl.compressed ? 1u : tl.bytes_per_texel;
+    /* The DECODED image's format, which is not always the guest's: the packed
+     * 16-bit colour formats arrive here unpacked to RGBA8, and DEPTH24_D8 as a
+     * float. rsx_texture_layout.h says which class each format byte lands in. */
     DXGI_FORMAT dxfmt = (tl.fmt == RSX_TEXFMT_R8G8B8A8) ? DXGI_FORMAT_R8G8B8A8_UNORM
                       : (tl.fmt == RSX_TEXFMT_R8G8)     ? DXGI_FORMAT_R8G8_UNORM
                       : (tl.fmt == RSX_TEXFMT_BC1)      ? DXGI_FORMAT_BC1_UNORM
                       : (tl.fmt == RSX_TEXFMT_BC2)      ? DXGI_FORMAT_BC2_UNORM
                       : (tl.fmt == RSX_TEXFMT_BC3)      ? DXGI_FORMAT_BC3_UNORM
+                      : (tl.fmt == RSX_TEXFMT_R16)      ? DXGI_FORMAT_R16_UNORM
+                      : (tl.fmt == RSX_TEXFMT_R16G16)   ? DXGI_FORMAT_R16G16_UNORM
+                      : (tl.fmt == RSX_TEXFMT_R16G16F)  ? DXGI_FORMAT_R16G16_FLOAT
+                      : (tl.fmt == RSX_TEXFMT_R16G16B16A16F) ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                      : (tl.fmt == RSX_TEXFMT_R32F)     ? DXGI_FORMAT_R32_FLOAT
+                      : (tl.fmt == RSX_TEXFMT_R32G32B32A32F) ? DXGI_FORMAT_R32G32B32A32_FLOAT
                       : DXGI_FORMAT_R8_UNORM;
     /* DXT data is stored as linear 4x4 block rows (compressed formats are
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
@@ -2605,7 +2614,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                   start_delta, w * h * bpp, 10); } } }
     if (slot < 0) slot = freeslot;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
-    u32 pitch = ((dxt ? blkrow : w * bpp) + 255) & ~255u;
+    /* The upload buffer's rows hold the DECODED image, so they are sized from
+     * dst_row_bytes -- w * bpp is the source row, which is narrower for any
+     * format rsx_texture_decode unpacks. */
+    u32 pitch = (tl.dst_row_bytes + 255) & ~255u;
     int fresh = 0;
 
     /* Also recreate when the CUBE-ness changes: a slot holding a 2D texture of

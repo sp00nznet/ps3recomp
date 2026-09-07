@@ -38,6 +38,13 @@ typedef struct sys_rwlock_info {
     uint64_t       writer_tid;   /* owning thread of the write lock (EDEADLK/EPERM) */
 #else
     pthread_rwlock_t rwl;
+    /* Same exclusive-ownership tracking as the Win32 branch. One field is
+     * enough here: writer_tid is nonzero exactly while a thread holds the
+     * write lock, so it answers both "is there a writer" and "is it me".
+     * Read and written with the __atomic builtins rather than _Atomic
+     * because this header is reachable from C++ through extern "C", the same
+     * reason win32_compat.h gives for its own choice. */
+    uint64_t         writer_tid;
 #endif
 
 } sys_rwlock_info;

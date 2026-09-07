@@ -21,6 +21,7 @@
 #else
   #include <unistd.h>
   #include <dirent.h>
+  #include <time.h>     /* nanosleep: the delay in the open-retry loop */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -371,6 +372,13 @@ int64_t sys_fs_open(ppu_context* ctx)
         for (int _r = 0; !fp && _r < 3000; _r++) {
 #ifdef _WIN32
             Sleep(1);
+#else
+            /* The delay is the retry. 3000 iterations is meant to be about
+             * three seconds of waiting for a transient share lock or handle
+             * pressure to clear; without it the loop spends microseconds
+             * calling fopen 3000 times on a condition that has not changed,
+             * and the recovery this exists for never happens. */
+            { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
 #endif
             fp = fopen(host_path, mode);
         }

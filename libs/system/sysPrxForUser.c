@@ -22,6 +22,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sched.h>
+#include <errno.h>   /* ETIMEDOUT: its value differs per host, so never inline it */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -703,7 +704,11 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
         }
         int rc = pthread_cond_timedwait(&s_lwcond[cslot].cv,
                                          &s_lwmutex[mslot].mtx, &ts);
-        if (rc == 110 /* ETIMEDOUT */)
+        /* ETIMEDOUT, not the 110 that was written here: 110 is Linux's value
+         * and Darwin's is 60, so on macOS a real timeout fell through and the
+         * guest was told CELL_OK -- that its condition had been signalled. A
+         * lwcond poll loop then proceeds on state nobody produced. */
+        if (rc == ETIMEDOUT)
             return CELL_ETIMEDOUT;
     }
 #endif
