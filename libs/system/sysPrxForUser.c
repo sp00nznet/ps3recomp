@@ -380,26 +380,18 @@ extern u8* vm_base;  /* for guest-address diagnostics in the boot log */
  * translation, so the order no longer decides whether it crashes. */
 #define YZ_XLAT(p, T) ((p) = (p) ? (T)(void*)(vm_base + (u32)(uintptr_t)(p)) : (T)0)
 
-s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
+/* Allocation is shared by explicit creation and the guest's static
+ * initializer path. The caller holds s_slot_lock across the guest slot write. */
+static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex,
+                                  const sys_lwmutex_attribute_t* attr)
 {
-    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
-    YZ_XLAT(attr, const sys_lwmutex_attribute_t*);
-    printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
-           attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
-    { extern char* getenv(const char*); static int _lt=-1; if(_lt<0)_lt=getenv("FLOW_LWMTRACE")?1:0;
-      if(_lt){ extern unsigned int ppu_active_lr(void); printf("[LWMTRACE] create guest=0x%08X caller_lr=0x%08X\n", YZ_GUEST_ADDR(lwmutex), ppu_active_lr()); } }
-
-    if (!lwmutex)
-        return CELL_EFAULT;
-
-    slot_lock();
     u32 idx = s_lwmutex_next;
     for (u32 i = 0; i < MAX_LWMUTEX; i++) {
         u32 slot = (idx + i) % MAX_LWMUTEX;
         if (!s_lwmutex[slot].in_use) {
             LwMutexSlot* m = &s_lwmutex[slot];
             m->in_use = 1;
-            m->recursive = (attr && (attr->recursive & SYS_SYNC_RECURSIVE)) ? 1 : 0;
+            m->recursive = (attr && (ps3_bswap32(attr->recursive) & SYS_SYNC_RECURSIVE)) ? 1 : 0;
             if (attr)
                 memcpy(m->name, attr->name, 8);
 
@@ -417,11 +409,9 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
             memset(lwmutex, 0, sizeof(*lwmutex));
             lwmutex->sleep_queue = slot + 1; /* 1-based ID */
             s_lwmutex_next = (slot + 1) % MAX_LWMUTEX;
-            slot_unlock();
             return CELL_OK;
         }
     }
-    slot_unlock();
     return CELL_EAGAIN;
 }
 
@@ -465,11 +455,41 @@ s32 sys_ppu_thread_once(u32 once_ctrl_ea, u32 init_opd)
     return CELL_OK;
 }
 
+s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
+{
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
+    YZ_XLAT(attr, const sys_lwmutex_attribute_t*);
+    if (!lwmutex) return CELL_EFAULT;
+    slot_lock();
+    s32 rc = lwmutex_register_locked(lwmutex, attr);
+    slot_unlock();
+    return rc;
+}
+
+/* Match the existing game runtime's static-initializer support. Such a
+ * mutex has flags in attribute but has never called the create import.
+ * Serialize the first use so competing threads share one host mutex. */
+static s32 lwmutex_ensure_registered(sys_lwmutex_t_hle* lwmutex)
+{
+    slot_lock();
+    s32 rc = CELL_OK;
+    if (!lwmutex->sleep_queue) {
+        sys_lwmutex_attribute_t attr = {0};
+        attr.recursive = lwmutex->attribute;
+        rc = lwmutex_register_locked(lwmutex, &attr);
+    }
+    slot_unlock();
+    return rc;
+}
+
 s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 {
     (void)timeout;
     YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     if (!lwmutex) return CELL_EFAULT;
+
+    s32 rc = lwmutex_ensure_registered(lwmutex);
+    if (rc != CELL_OK) return rc;
 
     u32 slot = lwmutex->sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
@@ -510,6 +530,9 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
 {
     YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     if (!lwmutex) return CELL_EFAULT;
+
+    s32 rc = lwmutex_ensure_registered(lwmutex);
+    if (rc != CELL_OK) return rc;
 
     u32 slot = lwmutex->sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)

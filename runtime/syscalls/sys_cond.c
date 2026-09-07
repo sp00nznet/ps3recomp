@@ -1,407 +1,237 @@
-/*
- * ps3recomp - Condition variable syscalls (implementation)
+/* ps3recomp - Kernel condition variables.
+ *
+ * The kernel commits a waiter before releasing its guest mutex. A host CV
+ * alone does not retain a signal delivered between syscall entry and parking.
+ * Keep explicit wait records under a separate lock; signals never need the
+ * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
  */
-
 #include "sys_cond.h"
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
-/* RtlCaptureStackBackTrace + GetModuleHandleA come from <windows.h> (pulled in
- * by sys_cond.h for CRITICAL_SECTION) -- do not redeclare them. */
+#include <stdio.h>
 
-/* ---------------------------------------------------------------------------
- * Globals
- * -----------------------------------------------------------------------*/
+struct sys_cond_waiter {
+    struct sys_cond_waiter* next;
+    int signalled;
+};
+
 sys_cond_info g_sys_conds[SYS_COND_MAX];
-
-#ifdef _WIN32
-static CRITICAL_SECTION s_cond_table_lock;
-static int              s_cond_table_lock_init = 0;
-#else
-static pthread_mutex_t  s_cond_table_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
-
-static void cond_table_lock(void)
-{
-#ifdef _WIN32
-    if (!s_cond_table_lock_init) {
-        InitializeCriticalSection(&s_cond_table_lock);
-        s_cond_table_lock_init = 1;
-    }
-    EnterCriticalSection(&s_cond_table_lock);
-#else
-    pthread_mutex_lock(&s_cond_table_lock);
-#endif
-}
-
-static void cond_table_unlock(void)
-{
-#ifdef _WIN32
-    LeaveCriticalSection(&s_cond_table_lock);
-#else
-    pthread_mutex_unlock(&s_cond_table_lock);
-#endif
-}
-
-static void write_be32(uint32_t addr, uint32_t val)
-{
-    uint32_t* p = (uint32_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-    val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
-          ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
-#endif
-    *p = val;
-}
-
-/* ---------------------------------------------------------------------------
- * sys_cond_create
- *
- * r3 = pointer to receive cond ID (u32*)
- * r4 = mutex_id to associate with
- * r5 = pointer to attribute struct
- * -----------------------------------------------------------------------*/
-/* Guest address the cond id was written to, per id. A guest sync object
- * usually embeds {flag, mutex, cond, count}, so the cond id lives at a known
- * offset inside it and this recovers the object address -- enough to watch the
- * counter a waiter is blocked on. */
 uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
+
+#ifdef _WIN32
+static SRWLOCK s_table_lock = SRWLOCK_INIT;
+static void table_lock(void) { AcquireSRWLockExclusive(&s_table_lock); }
+static void table_unlock(void) { ReleaseSRWLockExclusive(&s_table_lock); }
+static void cond_lock(sys_cond_info* c) { EnterCriticalSection(&c->signal_lock); }
+static void cond_unlock(sys_cond_info* c) { LeaveCriticalSection(&c->signal_lock); }
+static void cond_wake(sys_cond_info* c) { WakeAllConditionVariable(&c->cv); }
+static void guest_lock(sys_mutex_info* m) { EnterCriticalSection(&m->cs); }
+static void guest_unlock(sys_mutex_info* m) { LeaveCriticalSection(&m->cs); }
+#else
+static pthread_mutex_t s_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static void table_lock(void) { pthread_mutex_lock(&s_table_lock); }
+static void table_unlock(void) { pthread_mutex_unlock(&s_table_lock); }
+static void cond_lock(sys_cond_info* c) { pthread_mutex_lock(&c->signal_lock); }
+static void cond_unlock(sys_cond_info* c) { pthread_mutex_unlock(&c->signal_lock); }
+static void cond_wake(sys_cond_info* c) { pthread_cond_broadcast(&c->cv); }
+static void guest_lock(sys_mutex_info* m) { pthread_mutex_lock(&m->mtx); }
+static void guest_unlock(sys_mutex_info* m) { pthread_mutex_unlock(&m->mtx); }
+#endif
+
+/* Lock ordering is table -> condition. No caller holds the condition lock
+ * while acquiring a guest mutex. Native locks survive slot recycling. */
+static sys_cond_info* acquire_cond(uint32_t id)
+{
+    if (!id || id > SYS_COND_MAX) return NULL;
+    table_lock();
+    sys_cond_info* c = &g_sys_conds[id - 1];
+    if (!c->active) { table_unlock(); return NULL; }
+    cond_lock(c);
+    table_unlock();
+    return c;
+}
 
 int64_t sys_cond_create(ppu_context* ctx)
 {
-    uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
-    uint32_t mutex_id    = LV2_ARG_U32(ctx, 1);
-    uint32_t attr_addr   = LV2_ARG_PTR(ctx, 2);
-
-    /* Validate the associated mutex */
-    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX) {
-        if(getenv("YDKJ_SYNCLOG")) fprintf(stderr,"[SYNC] sys_cond_create FAIL: mutex_id=%u out of range -> ESRCH (cond var not created -> worker will spin on null)\n",mutex_id);
-        return (int64_t)(int32_t)CELL_ESRCH; }
-    if (!g_sys_mutexes[mutex_id - 1].active) {
-        if(getenv("YDKJ_SYNCLOG")) fprintf(stderr,"[SYNC] sys_cond_create FAIL: mutex_id=%u INACTIVE -> ESRCH (cond var not created -> worker spins on null)\n",mutex_id);
-        return (int64_t)(int32_t)CELL_ESRCH; }
-
-    cond_table_lock();
-
-    int slot = -1;
-    for (int i = 0; i < SYS_COND_MAX; i++) {
-        if (!g_sys_conds[i].active) { slot = i; break; }
-    }
-    if (slot < 0) {
-        cond_table_unlock();
-        return (int64_t)(int32_t)CELL_EAGAIN;
-    }
-
-    sys_cond_info* c = &g_sys_conds[slot];
-    memset(c, 0, sizeof(*c));
-    c->active   = 1;
-    c->mutex_id = mutex_id;
-
-    /* Read name from attribute if provided */
-    if (attr_addr != 0) {
-        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
-        /* name is typically at offset 8 in the cond attr struct */
-        memcpy(c->name, attr_raw + 8, 8);
-    }
-
+    uint32_t out = LV2_ARG_PTR(ctx, 0);
+    uint32_t mid = LV2_ARG_U32(ctx, 1);
+    uint32_t attr = LV2_ARG_PTR(ctx, 2);
+    if (!mid || mid > SYS_MUTEX_MAX || !g_sys_mutexes[mid - 1].active)
+        return (int32_t)CELL_ESRCH;
+    table_lock();
+    for (unsigned i = 0; i < SYS_COND_MAX; ++i) {
+        sys_cond_info* c = &g_sys_conds[i];
+        if (c->active) continue;
+        if (!c->initialized) {
 #ifdef _WIN32
-    InitializeConditionVariable(&c->cv);
+            InitializeCriticalSection(&c->signal_lock);
+            InitializeConditionVariable(&c->cv);
 #else
-    pthread_cond_init(&c->cv, NULL);
+            int rc = pthread_mutex_init(&c->signal_lock, NULL);
+            if (rc) { table_unlock(); return (int32_t)CELL_EAGAIN; }
+            rc = pthread_cond_init(&c->cv, NULL);
+            if (rc) {
+                pthread_mutex_destroy(&c->signal_lock);
+                table_unlock(); return (int32_t)CELL_EAGAIN;
+            }
 #endif
-
-    uint32_t cond_id = (uint32_t)(slot + 1);
-    if (id_out_addr != 0) {
-        write_be32(id_out_addr, cond_id);
-        if ((uint32_t)(slot + 1) <= SYS_COND_MAX) g_cond_id_addr[slot + 1] = id_out_addr;
-    }
-
-    /* PS3_SYNCLOG: which guest object each cond id belongs to, and who made it.
-     * A deadlock report names a cond by id; without this there is no way back
-     * from "nothing signals cond 3" to the subsystem that owns cond 3. */
-    if (getenv("PS3_SYNCLOG") || getenv("YDKJ_SYNCLOG")) {
-        char nm[9]; memcpy(nm, c->name, 8); nm[8] = 0;
-        fprintf(stderr, "[SYNC] cond_create id=%u name='%s' mutex=%u id_at=0x%08X lr=0x%08X\n",
-                cond_id, nm, mutex_id, id_out_addr, (uint32_t)ctx->lr);
-        fflush(stderr);
-    }
-
-    cond_table_unlock();
-    return CELL_OK;
-}
-
-/* ---------------------------------------------------------------------------
- * sys_cond_destroy
- *
- * r3 = cond_id
- * -----------------------------------------------------------------------*/
-int64_t sys_cond_destroy(ppu_context* ctx)
-{
-    uint32_t cond_id = LV2_ARG_U32(ctx, 0);
-
-    if (cond_id == 0 || cond_id > SYS_COND_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    cond_table_lock();
-
-    sys_cond_info* c = &g_sys_conds[cond_id - 1];
-    if (!c->active) {
-        cond_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-#ifndef _WIN32
-    pthread_cond_destroy(&c->cv);
-#endif
-    /* Windows CONDITION_VARIABLE doesn't need destruction */
-
-    c->active = 0;
-    cond_table_unlock();
-    return CELL_OK;
-}
-
-/* ---------------------------------------------------------------------------
- * sys_cond_wait
- *
- * r3 = cond_id
- * r4 = timeout_usec (0 = infinite)
- * -----------------------------------------------------------------------*/
-int64_t sys_cond_wait(ppu_context* ctx)
-{
-    uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
-    uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
-    { static int s_ow = -1; if (s_ow < 0) s_ow = getenv("PS3_COND_OBJ") ? 1 : 0;
-      if (s_ow && cond_id <= SYS_COND_MAX && g_cond_id_addr[cond_id]) {
-          uint32_t obj = g_cond_id_addr[cond_id] - 8;   /* {flag,mutex,cond,count} */
-          extern uint8_t* vm_base;
-          static int _n = 0;
-          if (_n++ < 12 && vm_base) {
-              const uint8_t* o = vm_base + obj;
-              fprintf(stderr, "[cond-obj] cond=%u obj=0x%08X:", cond_id, obj);
-              for (int k = 0; k < 16; k++) fprintf(stderr, " %02X", o[k]);
-              fputc(10, stderr);
-          } } }
-    /* PS3_COND_PEEK=<hex ea>: print a guest u32 alongside each wait. A condvar
-     * wait is only ever "waiting for a predicate", and the predicate is a word
-     * in guest memory -- printing it at the moment of the wait says whether the
-     * waiter is right to wait, without inferring it from a write watch. */
-    { extern uint32_t vm_read32(uint64_t);
-      static long pk = -1;
-      if (pk < 0) { const char* e = getenv("PS3_COND_PEEK"); pk = e ? (long)strtoul(e,0,16) : 0; }
-      if (pk > 0) fprintf(stderr, "[PEEK] [0x%08lX]=%u (0x%08X)  at cond_wait(cond=%u)\n",
-                          (unsigned long)pk, vm_read32((uint32_t)pk), vm_read32((uint32_t)pk), cond_id); }
-    fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
-            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
-    /* YDKJ_THREADGATE: creating thread is blocking -> let gated workers run. */
-    { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
-#ifdef _WIN32
-    if (cond_id == 7) {
-        static int _n = 0;
-        if (_n++ < 1) {
-            void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
-            char* mb = (char*)GetModuleHandleA(0);
-            char line[640]; int p = snprintf(line, sizeof line, "[cond7-bt] fr=%u rva:", (unsigned)fr);
-            for (int i = 0; i < fr; i++)
-                p += snprintf(line+p, sizeof(line)-p, " %llX", (unsigned long long)((char*)bt[i]-mb));
-            fprintf(stderr, "%s\n", line); fflush(stderr);
+            c->initialized = 1;
         }
-    }
-#endif
-
-    if (cond_id == 0 || cond_id > SYS_COND_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_cond_info* c = &g_sys_conds[cond_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    uint32_t mutex_id = c->mutex_id;
-    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
-    if (!m->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    /* The caller must hold the associated mutex. We need to release it
-     * atomically with the wait and re-acquire it on wake. */
-
-    /* Save and clear ownership info */
-    uint64_t saved_owner = m->owner_tid;
-    int saved_count = m->lock_count;
-    m->owner_tid = 0;
-    m->lock_count = 0;
-
-#ifdef _WIN32
-    /* PS3_COND_SPURIOUS_MS=<n>: turn an infinite wait into an n-ms one.
-     *
-     * A spurious wakeup is legal for a condition variable -- correct guest code
-     * re-tests its predicate on wake -- so this cannot invent progress that the
-     * title would not otherwise make. It is an A/B PROBE: if a run advances only
-     * with this set, the missing thing is a SIGNAL, and the predicate was already
-     * satisfiable. If it does not advance, the predicate itself is never true and
-     * the producer is what to chase. Not a fix, and it does not belong in a run
-     * you are measuring. */
-    { static long sp = -1;
-      if (sp < 0) { const char* e = getenv("PS3_COND_SPURIOUS_MS"); sp = e ? atol(e) : 0; }
-      if (sp > 0 && timeout_us == 0) timeout_us = (uint64_t)sp * 1000ull; }
-    DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
-    if (ms == 0 && timeout_us > 0) ms = 1;
-    /* FLOW_CONDKICK (SPU-bring-up diagnostic): cond=7 is waited on but never
-     * signaled (its signaler is blocked on the dead SPU pipeline). Cap infinite
-     * waits and return CELL_OK so the engine can advance past spurious waits. */
-    static int s_kick = -1; if (s_kick < 0) s_kick = getenv("FLOW_CONDKICK") ? 1 : 0;
-    if (s_kick && ms == INFINITE) ms = 1500;
-
-    BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
-
-    /* Restore ownership */
-    m->owner_tid = saved_owner;
-    m->lock_count = saved_count;
-
-    if (!ok && GetLastError() == ERROR_TIMEOUT) {
-        if (s_kick) return CELL_OK;   /* pretend signaled so the guest re-checks/proceeds */
-        return (int64_t)(int32_t)CELL_ETIMEDOUT;
-    }
-#else
-    if (timeout_us == 0) {
-        pthread_cond_wait(&c->cv, &m->mtx);
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
+        c->mutex_id = mid;
+        c->waiters = NULL;
+        memset(c->name, 0, sizeof(c->name));
+        if (attr) memcpy(c->name, (uint8_t*)vm_to_host(attr) + 8, 8);
+        c->active = 1;
+        g_cond_id_addr[i + 1] = out;
+        if (out) {
+            uint8_t* p = vm_to_host(out);
+            uint32_t id = i + 1;
+            p[0] = (uint8_t)(id >> 24); p[1] = (uint8_t)(id >> 16);
+            p[2] = (uint8_t)(id >> 8); p[3] = (uint8_t)id;
         }
-        int rc = pthread_cond_timedwait(&c->cv, &m->mtx, &ts);
-
-        /* Restore ownership */
-        m->owner_tid = saved_owner;
-        m->lock_count = saved_count;
-
-        if (rc == ETIMEDOUT) {
-            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+        if (getenv("PS3_SYNCLOG") || getenv("YDKJ_SYNCLOG")) {
+            char name[9]; memcpy(name, c->name, 8); name[8] = 0;
+            fprintf(stderr, "[SYNC] cond_create id=%u name='%s' mutex=%u id_at=0x%08X lr=0x%08X\n",
+                    i + 1, name, mid, out, (uint32_t)ctx->lr);
         }
+        table_unlock();
         return CELL_OK;
     }
-
-    /* Restore ownership */
-    m->owner_tid = saved_owner;
-    m->lock_count = saved_count;
-#endif
-
-    return CELL_OK;
+    table_unlock();
+    return (int32_t)CELL_EAGAIN;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_cond_signal
- *
- * r3 = cond_id
- * -----------------------------------------------------------------------*/
-int64_t sys_cond_signal(ppu_context* ctx)
+int64_t sys_cond_destroy(ppu_context* ctx)
 {
-    uint32_t cond_id = LV2_ARG_U32(ctx, 0);
-    { static int n=0; if(n++<80) fprintf(stderr,"[SIGNAL] cond_signal(cond=%u) tid=%llu lr=0x%08X\n", cond_id,
-            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr); }
-
-    if (cond_id == 0 || cond_id > SYS_COND_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_cond_info* c = &g_sys_conds[cond_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-#ifdef _WIN32
-    WakeConditionVariable(&c->cv);
-#else
-    pthread_cond_signal(&c->cv);
-#endif
-
-    return CELL_OK;
+    uint32_t id = LV2_ARG_U32(ctx, 0);
+    if (!id || id > SYS_COND_MAX) return (int32_t)CELL_ESRCH;
+    table_lock();
+    sys_cond_info* c = &g_sys_conds[id - 1];
+    if (!c->active) { table_unlock(); return (int32_t)CELL_ESRCH; }
+    cond_lock(c);
+    int32_t result = CELL_OK;
+    if (c->waiters) result = (int32_t)CELL_EBUSY;
+    else { c->active = 0; g_cond_id_addr[id] = 0; }
+    cond_unlock(c);
+    table_unlock();
+    return result;
 }
 
-/* ---------------------------------------------------------------------------
- * sys_cond_signal_all
- *
- * r3 = cond_id
- * -----------------------------------------------------------------------*/
-int64_t sys_cond_signal_all(ppu_context* ctx)
+int64_t sys_cond_wait(ppu_context* ctx)
 {
-    uint32_t cond_id = LV2_ARG_U32(ctx, 0);
-    { static int n=0; if(n++<40) fprintf(stderr,"[SIGNAL] cond_signal_all(cond=%u)\n", cond_id); }
-
-    if (cond_id == 0 || cond_id > SYS_COND_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_cond_info* c = &g_sys_conds[cond_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
+    uint64_t timeout = LV2_ARG_U64(ctx, 1);
+    /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
+    const char* peek = getenv("PS3_COND_PEEK");
+    if (peek) {
+        uint32_t ea = (uint32_t)strtoul(peek, NULL, 16);
+        if (ea) {
+            const uint8_t* p = vm_to_host(ea);
+            uint32_t value = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                             ((uint32_t)p[2] << 8) | p[3];
+            fprintf(stderr, "[PEEK] [0x%08X]=%u (0x%08X) at cond_wait(cond=%u)\n",
+                    ea, value, value, LV2_ARG_U32(ctx, 0));
+        }
+    }
 #ifdef _WIN32
-    WakeAllConditionVariable(&c->cv);
-#else
-    pthread_cond_broadcast(&c->cv);
+    const char* spurious = getenv("PS3_COND_SPURIOUS_MS");
+    long probe_ms = spurious ? atol(spurious) : 0;
+    if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
 #endif
+    if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
+    sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
+    if (!c) return (int32_t)CELL_ESRCH;
+    sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
+    if (!m->active) { cond_unlock(c); return (int32_t)CELL_ESRCH; }
+    if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
+        cond_unlock(c); return (int32_t)CELL_EPERM;
+    }
+    struct sys_cond_waiter waiter = {NULL, 0};
+    struct sys_cond_waiter** tail = &c->waiters;
+    while (*tail) tail = &(*tail)->next;
+    *tail = &waiter;
+    int depth = m->lock_count;
+    m->owner_tid = 0;
+    m->lock_count = 0;
+    for (int i = 0; i < depth; ++i) guest_unlock(m);
 
-    return CELL_OK;
+    int32_t result = CELL_OK;
+#ifdef _WIN32
+    ULONGLONG start = GetTickCount64();
+    uint64_t duration = (timeout + 999) / 1000;
+    while (!waiter.signalled) {
+        DWORD ms = INFINITE;
+        if (timeout) {
+            uint64_t elapsed = GetTickCount64() - start;
+            if (elapsed >= duration) { result = (int32_t)CELL_ETIMEDOUT; break; }
+            uint64_t remaining = duration - elapsed;
+            ms = remaining >= INFINITE ? INFINITE - 1 : (DWORD)remaining;
+        }
+        BOOL ok = SleepConditionVariableCS(&c->cv, &c->signal_lock, ms);
+        if (!ok && GetLastError() != ERROR_TIMEOUT && !waiter.signalled) {
+            result = (int32_t)CELL_EFAULT; break;
+        }
+    }
+#else
+    struct timespec deadline;
+    if (timeout) {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += (time_t)(timeout / 1000000);
+        deadline.tv_nsec += (long)((timeout % 1000000) * 1000);
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++; deadline.tv_nsec -= 1000000000L;
+        }
+    }
+    while (!waiter.signalled) {
+        int rc = timeout ? pthread_cond_timedwait(&c->cv, &c->signal_lock, &deadline)
+                         : pthread_cond_wait(&c->cv, &c->signal_lock);
+        if (rc && !waiter.signalled) {
+            result = (int32_t)(rc == ETIMEDOUT ? CELL_ETIMEDOUT : CELL_EFAULT);
+            break;
+        }
+    }
+#endif
+    struct sys_cond_waiter** link = &c->waiters;
+    while (*link != &waiter) link = &(*link)->next;
+    *link = waiter.next;
+    cond_unlock(c);
+    for (int i = 0; i < depth; ++i) guest_lock(m);
+    m->owner_tid = ctx->thread_id;
+    m->lock_count = depth;
+    return result;
 }
 
-/* ---------------------------------------------------------------------------
- * Registration
- * -----------------------------------------------------------------------*/
-/* sys_cond_signal_to(cond_id, ppu_thread_id) -- wake ONE NAMED waiter.
- *
- * This was the only member of the condvar family left unregistered, so it hit
- * the generic "lv2_syscall 110 (stub)" path and returned success without waking
- * anyone. A missing WAIT primitive fails loudly; a missing WAKE primitive just
- * deadlocks whoever was waiting, which is far harder to spot.
- *
- * ponytail: wakes ALL waiters, not the named one -- sys_cond_info holds a bare
- * condition variable with no waiter list, so targeting a thread would mean
- * per-waiter bookkeeping in wait/signal. Waking all can never FAIL to wake the
- * intended thread; the cost is a spurious return for any other waiter. Add a
- * {thread_id -> event} waiter list here if a title is ever seen mishandling
- * that spurious wake. */
-int64_t sys_cond_signal_to(ppu_context* ctx)
+static int64_t signal_cond(uint32_t id, int all)
 {
-    uint32_t cond_id   = LV2_ARG_U32(ctx, 0);
-    uint32_t thread_id = LV2_ARG_U32(ctx, 1);
-    { static int n=0; if(n++<80) fprintf(stderr,
-        "[SIGNAL] cond_signal_to(cond=%u target_tid=%u) tid=%llu lr=0x%08X\n",
-        cond_id, thread_id, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr); }
-
-    if (cond_id == 0 || cond_id > SYS_COND_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_cond_info* c = &g_sys_conds[cond_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-#ifdef _WIN32
-    WakeAllConditionVariable(&c->cv);
-#else
-    pthread_cond_broadcast(&c->cv);
-#endif
-
+    sys_cond_info* c = acquire_cond(id);
+    if (!c) return (int32_t)CELL_ESRCH;
+    int selected = 0;
+    for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) {
+        if (w->signalled) continue;
+        w->signalled = 1;
+        selected = 1;
+        if (!all) break;
+    }
+    /* Broadcast the host CV: only selected records return to the guest.
+     * Waking an arbitrary host waiter could leave the selected one asleep. */
+    if (selected) cond_wake(c);
+    cond_unlock(c);
     return CELL_OK;
 }
+
+int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
+int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+
+/* Preserve upstream's current broadcast fallback for signal_to. */
+int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
 
 void sys_cond_init(lv2_syscall_table* tbl)
 {
-    memset(g_sys_conds, 0, sizeof(g_sys_conds));
-
-#ifdef _WIN32
-    if (!s_cond_table_lock_init) {
-        InitializeCriticalSection(&s_cond_table_lock);
-        s_cond_table_lock_init = 1;
-    }
-#endif
-
-    lv2_syscall_register(tbl, SYS_COND_CREATE,     sys_cond_create);
-    lv2_syscall_register(tbl, SYS_COND_DESTROY,     sys_cond_destroy);
-    lv2_syscall_register(tbl, SYS_COND_WAIT,        sys_cond_wait);
-    lv2_syscall_register(tbl, SYS_COND_SIGNAL,      sys_cond_signal);
-    lv2_syscall_register(tbl, SYS_COND_SIGNAL_ALL,  sys_cond_signal_all);
-    lv2_syscall_register(tbl, SYS_COND_SIGNAL_TO,   sys_cond_signal_to);
+    /* Static storage starts empty. Registration must not memset live locks. */
+    lv2_syscall_register(tbl, SYS_COND_CREATE, sys_cond_create);
+    lv2_syscall_register(tbl, SYS_COND_DESTROY, sys_cond_destroy);
+    lv2_syscall_register(tbl, SYS_COND_WAIT, sys_cond_wait);
+    lv2_syscall_register(tbl, SYS_COND_SIGNAL, sys_cond_signal);
+    lv2_syscall_register(tbl, SYS_COND_SIGNAL_ALL, sys_cond_signal_all);
+    lv2_syscall_register(tbl, SYS_COND_SIGNAL_TO, sys_cond_signal_to);
 }

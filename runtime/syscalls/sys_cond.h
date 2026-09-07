@@ -31,11 +31,15 @@ typedef struct sys_cond_info {
     int      active;
     uint32_t mutex_id;   /* associated mutex */
     char     name[8];
+    int      initialized;
+    struct sys_cond_waiter* waiters;
 
 #ifdef _WIN32
     CONDITION_VARIABLE cv;
+    CRITICAL_SECTION signal_lock;
 #else
     pthread_cond_t     cv;
+    pthread_mutex_t    signal_lock;
 #endif
 
 } sys_cond_info;
