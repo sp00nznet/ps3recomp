@@ -322,6 +322,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
+      }
+      if (method == 0x1D74) {
+        extern void vm_write32(uint32_t a, uint32_t v);
+        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+        return 0;
       } }
     if ((method >= 0x200 && method <= 0x23C) ||
         (method >= 0x280 && method <= 0x28C))
@@ -745,7 +750,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
-    /* Unrecognized method — log in debug builds */
+    /* GCM_FLIP_HEAD (0xE920/0xE924): immediate display flip from the FIFO.
+     * The draw engine handles the actual present; suppress the unknown log. */
+    if (method == 0xE920 || method == 0xE924) return 0;
+
+    /* Unrecognized method -- log in debug builds */
 #ifndef NDEBUG
     static int s_unknown_count = 0;
     if (s_unknown_count < 50) {

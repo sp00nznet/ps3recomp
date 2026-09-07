@@ -364,7 +364,8 @@ s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size,
 void* cellGcmGetNotifyDataAddress(u32 index);
 
 /* Timestamp location query */
-u32 cellGcmGetTimeStampLocation(u32 index, u32* location);
+/* location is CELL_GCM_LOCATION_LOCAL/_MAIN, as in the Report variants. */
+u64 cellGcmGetTimeStampLocation(u32 index, u32 location);
 
 /* Default FIFO size configuration */
 s32 cellGcmSetDefaultFifoSize(u32 size);
@@ -426,6 +427,8 @@ void cellGcmSetVBlankFrequency(u32 freq);
 
 /* User command */
 void cellGcmSetUserCommand(u32 cmd);
+/* Host FIFO consumer: defer the retired command to ppu_gcm_pump. */
+void cellGcmQueueUserCommand(u32 cmd);
 
 /* Invalidate tile */
 s32 cellGcmSetInvalidateTile(u8 index);

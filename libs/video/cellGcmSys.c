@@ -14,6 +14,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+#include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -152,6 +153,19 @@ static int s_io_mapping_count = 0;
 /* Callback handlers — these are GUEST OPD addresses passed by the
  * recompiled game, not host function pointers. Stored as uint32_t and
  * invoked through g_ps3_guest_caller (see ps3emu/guest_call.h). */
+
+/* Handler mask exported for the RSX event delivery path. Bit layout matches
+ * the RPCS3 SYS_RSX_EVENT enum (vblank=0x02, flip=0x04, user_cmd=0x80).
+ * The runner's vblank tick reads this to decide which events to send to
+ * the libgcm interrupt thread. Updated by Set*Handler below.
+ *
+ * If g_gcm_driver_info_ea is non-zero, the mask is also written to
+ * driver_info + 0x12C0 so the game's own libgcm interrupt path can read it
+ * directly from guest memory. The runner sets g_gcm_driver_info_ea during
+ * RSX context allocation. */
+uint32_t g_gcm_handler_mask = 0;
+uint32_t g_gcm_driver_info_ea = 0;
+
 static u32 s_flip_handler_opd     = 0;
 
 /* GCM_FLIPCB_ONTICK=1: fire the guest flip handler only when the flip
@@ -182,6 +196,17 @@ static void ydkj_restore_handler_opd(u32 opd, u32 code) {
         static int _n=0; if(_n++<6) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
     }
 }
+static void gcm_update_handler_mask(void)
+{
+    uint32_t m = 0;
+    if (s_vblank_handler_opd) m |= 0x02;
+    if (s_flip_handler_opd)   m |= 0x04;
+    if (s_user_handler_opd)   m |= 0x80;
+    g_gcm_handler_mask = m;
+    if (g_gcm_driver_info_ea)
+        vm_write32(g_gcm_driver_info_ea + 0x12C0, m);
+}
+
 /* Legacy host-typed slots kept around for any caller still treating
  * these as host pointers. New code should use the _opd slots. */
 static CellGcmFlipHandler    s_flip_handler    = NULL;
@@ -210,7 +235,22 @@ static u32 s_second_v_frequency = 0;
 static u32 s_vblank_frequency   = 0;
 
 /* User command */
-static u32 s_user_command = 0;
+#ifdef _WIN32
+static volatile LONG s_user_command = 0;
+#define GCM_USER_STORE(cmd) InterlockedExchange(&s_user_command, (LONG)(cmd))
+/* Pair the pending marker with its cause so a later producer cannot
+ * overwrite a cause already claimed by the callback pump. */
+static volatile LONG64 s_user_pending = 0;
+#define GCM_USER_PENDING_STORE(value) InterlockedExchange64(&s_user_pending, (LONG64)(value))
+#define GCM_USER_PENDING_TAKE() ((u64)InterlockedExchange64(&s_user_pending, 0))
+#else
+#include <stdatomic.h>
+static atomic_uint s_user_command = 0;
+#define GCM_USER_STORE(cmd) atomic_store(&s_user_command, (cmd))
+static _Atomic(u64) s_user_pending = 0;
+#define GCM_USER_PENDING_STORE(value) atomic_store(&s_user_pending, (value))
+#define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
+#endif
 
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
@@ -401,7 +441,8 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_queue_handler = NULL;
     s_second_v_frequency = 0;
     s_vblank_frequency = 0;
-    s_user_command = 0;
+    GCM_USER_STORE(0);
+    GCM_USER_PENDING_STORE(0);
 
     /* Set up the initial IO mapping for the command buffer region */
     if (ioAddress != 0 && ioSize > 0) {
@@ -565,26 +606,28 @@ u32 cellGcmGetFlipStatus(void)
 #include "ps3emu/guest_call.h"
 
 /* ---------------------------------------------------------------------------
- * Serialized vblank/flip handler delivery.
+ * Serialized vblank/flip/user handler delivery.
  *
- * The vblank ticker runs on its own host thread. Invoking the guest vblank/flip
- * handlers directly from it executes GUEST CODE concurrently with the main guest
- * thread -- a data race on guest memory that made the demo nondeterministic (Cg
- * shader loader aborting run-to-run). Instead the ticker only marks a tick
- * PENDING (no guest code), and the handlers run on the MAIN guest thread, at HLE
- * call boundaries (ppu_gcm_pump from ps3_hle_call). Guest handler execution is
- * therefore serialized with the main thread -- no race.
+ * Tick producers publish pending work. The runner pumps it at HLE boundaries
+ * or on a dedicated callback thread. The pump serializes guest handlers with
+ * one another; it does not stop unrelated guest execution on other threads.
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
 #include <windows.h>
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
+static volatile LONG s_gcm_pumping = 0;
+#define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
+#define GCM_PUMP_LEAVE()     InterlockedExchange(&s_gcm_pumping, 0)
 #else
 #include <stdatomic.h>
 static atomic_int s_gcm_pending = 0;
 #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
+static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
+#define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
+#define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
@@ -614,24 +657,16 @@ void cellGcm_request_tick(void)
     GCM_PENDING_SET(3);
 }
 
-/* Run the pending vblank/flip handlers on the CURRENT (main guest) thread.
- * Called from ps3_hle_call at each HLE boundary. Re-entrancy-guarded, and skipped
- * while already inside a guest callback (shared scratch stack). */
+/* Deliver pending handlers on the calling host thread. Serialize the entire
+ * claim-and-deliver sequence across threads: an HLE boundary and a host ticker
+ * may both pump, and newer causes must not overtake already claimed callbacks.
+ * A nonblocking guard also prevents nested callbacks from reentering. Leave
+ * pending notifications untouched when another pump is active. */
 void ppu_gcm_pump(void)
 {
-    /* (faithful-adopt-caner fold: dropped the ydkj ppu_in_guest_callback() guard
-     * -- sagemono's runtime has no guest-call-depth counter; the local `in`
-     * re-entrancy guard below still holds. Re-add depth tracking if a nested-
-     * callback flip regression appears in flow.) */
-#ifdef _WIN32
-    static __declspec(thread) int in = 0;
-#else
-    static __thread int in = 0;
-#endif
-    if (in) return;
+    if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
-    if (!p) return;
-    in = 1;
+    u64 user = GCM_USER_PENDING_TAKE();
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
@@ -644,7 +679,12 @@ void ppu_gcm_pump(void)
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
     }
-    in = 0;
+    if (user) {
+        u32 cmd = (u32)user;
+        if (s_user_handler_opd && g_ps3_guest_caller)
+            g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+    }
+    GCM_PUMP_LEAVE();
 }
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
@@ -1262,6 +1302,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * own command ring, so everything after the jump (including the reference
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    /* The words behind `put` were stored by another thread (the title, or the
+     * recycle below) before it stored `put`. On x86 the hardware keeps loads
+     * in order; on arm64 it does not, so without an acquire here the ring
+     * word can be fetched before `put` was and come back stale -- the walker
+     * then runs off the end of the previous frame's bytes until it meets a
+     * word that is not a command, and parks there forever. */
+    atomic_thread_fence(memory_order_acquire);
 
     /* GCM_CTXDBG=1: which context the title is actually driving. Ours is written
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
@@ -1585,7 +1632,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                  n_be, n_va, n_ia), fflush(stdout);
                   } }
 
-                if (subch == 0 || (subch == 1 && !s1_2d)) {
+                /* Driver methods (0xE9xx, 0xEBxx) occupy bits 2-15 of the
+                 * FIFO word; the standard 11-bit extraction (w & 0x1FFC)
+                 * truncates them.  Reconstruct the full address the same way
+                 * the draw-engine call above does. */
+                { const u32 mfull = (subch << 13) | m;
+                if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                    cellGcmQueueUserCommand(vm_read32(dea));
+                } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                    cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
@@ -1593,6 +1649,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
+                }
             }
             s_fifo_getoff += 4 + count * 4;
             continue;
@@ -1788,6 +1845,11 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     u32 io_begin = gcm_ea2io(begin);
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+        /* The jump has to be in guest memory before `put` moves behind the
+         * walker's `get`. Program order is not enough on arm64: the walker
+         * may observe the new `put`, find `get` != `put`, and read the old
+         * word at `current` before the jump lands there. */
+        atomic_thread_fence(memory_order_release);
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
     }
 
@@ -2010,6 +2072,7 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
     s_flip_handler_opd = (u32)(size_t)handler;
     s_flip_handler = handler;
     { u32 c = s_flip_handler_opd ? vm_read32(s_flip_handler_opd) : 0; if (c) s_flip_handler_code = c; }
+    gcm_update_handler_mask();
 }
 
 /* NID: 0xA547ADDE */
@@ -2019,6 +2082,7 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
     s_vblank_handler_opd = (u32)(size_t)handler;
     s_vblank_handler = handler;
     { u32 c = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd) : 0; if (c) s_vblank_handler_code = c; }
+    gcm_update_handler_mask();
 }
 
 /* NID: 0xF9BFCDA3 */
@@ -2035,6 +2099,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     printf("[cellGcmSys] SetUserHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_user_handler_opd = (u32)(size_t)handler;
     s_user_handler = handler;
+    gcm_update_handler_mask();
 }
 
 /* NID: 0x21AC3697 */
@@ -2522,17 +2587,28 @@ void* cellGcmGetNotifyDataAddress(u32 index)
 }
 
 /* Timestamp location — returns CELL_GCM_LOCATION_LOCAL or MAIN */
-u32 cellGcmGetTimeStampLocation(u32 index, u32* location)
+/* The Location suffix names an ARGUMENT, not an out-parameter: it is the
+ * caller saying which memory the report lives in, CELL_GCM_LOCATION_LOCAL or
+ * _MAIN, exactly as cellGcmGetReportDataLocation and
+ * cellGcmGetReportDataAddressLocation take it three hundred lines below. This
+ * one alone was declared u32* and treated the value as a guest address to
+ * write the location INTO, which inverts the parameter and loses the return.
+ *
+ * A title passing CELL_GCM_LOCATION_MAIN therefore had a 1 taken for an
+ * effective address, and vm_write32 stored four bytes at guest address 1.
+ * Yakuza: Dead Souls does that during display setup and dies there.
+ *
+ * It returns the timestamp, like cellGcmGetTimeStamp, whose body this is with
+ * a location the report table does not distinguish. */
+u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
 {
-    /* `location` is a GUEST address (see cellGcmGetConfiguration): the HLE
-     * ABI adapter passes pointer parameters through as guest values, so
-     * dereferencing one writes to whatever host address shares that number
-     * -- an access violation. Tokyo Jungle calls this during display setup,
-     * which is how it turned up. */
-    uint32_t loc_ea = (uint32_t)(uintptr_t)location;
-    (void)index;
-    if (loc_ea) vm_write32(loc_ea, CELL_GCM_LOCATION_LOCAL);
-    return 0;
+    (void)location;
+
+    if (index >= CELL_GCM_MAX_REPORT_COUNT)
+        return 0;
+
+    s_report_data[index].timestamp = get_timestamp_ns();
+    return s_report_data[index].timestamp;
 }
 
 /* SetTileInfo — alternative to SetTile with same parameters */
@@ -2618,7 +2694,8 @@ void cellGcmTerminate(void)
     s_vblank_count = 0;
     s_io_map_reserved = 0;
     s_default_fifo_mode = 0;
-    s_user_command = 0;
+    GCM_USER_STORE(0);
+    GCM_USER_PENDING_STORE(0);
 
     memset(s_display_buffers, 0, sizeof(s_display_buffers));
     memset(s_display_buffer_set, 0, sizeof(s_display_buffer_set));
@@ -2818,7 +2895,16 @@ void cellGcmSetVBlankFrequency(u32 freq)
 /* Store user command value */
 void cellGcmSetUserCommand(u32 cmd)
 {
-    s_user_command = cmd;
+    GCM_USER_STORE(cmd);
+}
+
+/* Called when a FIFO consumer retires a user-interrupt method. Publishing
+ * the cause and pending marker is atomic; guest code runs later in the pump.
+ * Like the driver cause register, multiple pending commands coalesce. */
+void cellGcmQueueUserCommand(u32 cmd)
+{
+    GCM_USER_STORE(cmd);
+    GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
 }
 
 /* Invalidate a tile region (unbind + clear) */
