@@ -97,6 +97,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 #else
   #include <pthread.h>
   #include <unistd.h>
+  #include <time.h>
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
   #define mutex_init(m)    pthread_mutex_init(m, NULL)
@@ -136,6 +137,9 @@ typedef struct {
     u64  key;
 } AudioNotifySlot;
 static AudioNotifySlot s_notify_queues[CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES];
+
+/* Timestamp anchor for cellAudioGetPortTimestamp (microseconds, set at init) */
+static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
 static volatile int  s_mix_thread_running = 0;
@@ -460,16 +464,12 @@ static void audio_mix_one_block(void)
          * cleared block is an observable consumption signal for producers. */
         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
 
-        /* Advance read index and publish it to the guest-visible counter so the
-         * game can tell how far playback has consumed. The counter is a 64-bit
-         * big-endian value: LBP's audio watchdog reads it with `ld` and compares
-         * the LOW word (`ld r0,0(r11)` / `cmpw r9,r0` at 0x484144), so the live
-         * bits are bytes [4..7]. A 32-bit store here only ever wrote bytes
-         * [0..3] -- the half the game never looks at -- so it saw a frozen index
-         * and tripped "LIBAUDIO DROPOUT - POSITION NO LONGER INCREMENTING". */
+        /* Keep the monotonic counter for tags/timestamps, but publish the
+         * ring slot to the guest. SurMixer multiplies this value by the block
+         * size directly; an unbounded counter walks beyond the audio buffer. */
         port->read_index++;
         if (port->read_idx_addr)
-            vm_write64((u32)port->read_idx_addr, port->read_index);
+            vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -621,6 +621,16 @@ s32 cellAudioInit(void)
         /* Don't fail -- games should still run without audio */
     }
 
+
+#ifdef _WIN32
+    { LARGE_INTEGER f, c;
+      QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+      s_audio_start_us = (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
+          (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart; }
+#else
+    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+      s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }
+#endif
     if (audio_start_mix_thread() < 0) {
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }
@@ -708,23 +718,16 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
 
-    /* Audio buffers live in GUEST memory, but the base must be a window NOTHING
-     * else claims. It used to be 0x01000000, commented "free window" -- it is not:
-     * that is where ports put their HLE OPD arena (Tokyo Jungle's HLE_OPD_BASE is
-     * exactly 0x01000000), and the memset below wiped 128 KB of it. Every import
-     * whose OPD lived there began dispatching to a NULL address the moment the
-     * game opened an audio port -- and a null bctr returns with r3 untouched, so
-     * the guest reads its own first argument back as a status code. That is why
-     * Tokyo Jungle reported "failed to set notify queue (23A0)": 0x23A0 was the
-     * key it had just passed in, echoed back by a call that never happened. */
-#define CELL_AUDIO_GUEST_BASE 0x60000000u   /* clear of HLE, heaps, RSX and libsre */
-    static u32 s_audio_guest = CELL_AUDIO_GUEST_BASE;
-    u32 guest_buf  = s_audio_guest;
-    s_audio_guest += (port->buf_size + 0xFFFFFu) & ~0xFFFFFu;
-    u32 guest_ridx = s_audio_guest;
-    s_audio_guest += 0x100000u;
-    /* Not part of the pre-committed main-memory map: commit before touching. */
-    vm_commit(guest_buf, (guest_ridx + 0x100000u) - guest_buf);
+    /* Keep audio outside sys_memory (0x40000000..0x50000000), the HLE heap
+     * (0x50000000..0x58000000), and sys_vm (0x60000000..0x70000000).
+     * Reserve two 1-MB pages per port so reopening reuses its own storage. */
+    u32 guest_buf = 0x58000000u + (u32)found * 0x200000u;
+    u32 guest_ridx = guest_buf + 0x100000u;
+    if (vm_commit(guest_buf, 0x200000u) != CELL_OK) {
+        port->in_use = 0;
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_AUDIOSYSTEM;
+    }
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
     memset(port->buffer, 0, port->buf_size);
@@ -756,7 +759,7 @@ s32 cellAudioPortClose(u32 portNum)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
     }
 
-    /* buffer points INTO the guest vm_base arena (bump-allocated in PortOpen),
+    /* buffer points INTO the guest vm_base arena (reserved per port in PortOpen),
      * not a host malloc -- do NOT free() it (that corrupts the host heap).
      * The guest window is reclaimed wholesale when vm_base is released. */
     s_ports[portNum].buffer = NULL;
@@ -805,6 +808,56 @@ s32 cellAudioPortStop(u32 portNum)
     s_ports[portNum].running = 0;
     mutex_unlock(&s_audio_mutex);
 
+    return CELL_OK;
+}
+
+s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
+{
+    uint32_t tag_ea = (uint32_t)(uintptr_t)tag;
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+    if (!s_ports[portNum].in_use)
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    if (!tag_ea)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    mutex_lock(&s_audio_mutex);
+    AudioPortSlot* port = &s_ports[portNum];
+    u64 nblk = port->param.nBlock ? port->param.nBlock : 1;
+    if (blockNo >= nblk) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PARAM;
+    }
+    u64 t = port->read_index + blockNo - (port->read_index % nblk);
+    if (blockNo < port->read_index % nblk) t += nblk;
+    mutex_unlock(&s_audio_mutex);
+
+    vm_write64(tag_ea, t);
+    return CELL_OK;
+}
+
+s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
+{
+    uint32_t stamp_ea = (uint32_t)(uintptr_t)stamp;
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+    if (!s_ports[portNum].in_use)
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    if (!stamp_ea)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    mutex_lock(&s_audio_mutex);
+    u64 global_counter = s_ports[portNum].read_index;
+    mutex_unlock(&s_audio_mutex);
+    if (tag > global_counter)
+        return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
+
+    u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
+    vm_write64(stamp_ea, t);
     return CELL_OK;
 }
 
@@ -969,40 +1022,6 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
         vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_READY);
     }
 
-    return CELL_OK;
-}
-
-/* cellAudioGetPortBlockTag(portNum, blockNo, tag) -- the monotonically rising
- * tag of one block in a port's ring. A title uses it to tell whether the block
- * it is about to fill has already been consumed: it reads the tag, writes the
- * block, and compares again. Left unimplemented the call returns the
- * unresolved-NID default and the mixer thread has no way to advance, which is
- * where Virtua Fighter 5's boot stops once it is past the game-data dialog.
- *
- * read_index counts blocks consumed, so it IS the tag counter. Same
- * normalisation the hardware does: round the counter down to the start of the
- * current ring pass, and if the requested block has already gone by this pass,
- * report it on the next one. */
-s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
-{
-    if (!s_audio_initialized)
-        return (s32)CELL_AUDIO_ERROR_NOT_INIT;
-    if (portNum >= CELL_AUDIO_PORT_MAX || !s_ports[portNum].in_use)
-        return (s32)CELL_AUDIO_ERROR_PARAM;
-    if (!tag)
-        return (s32)CELL_AUDIO_ERROR_PARAM;
-
-    u64 nblock = s_ports[portNum].param.nBlock;
-    if (!nblock || blockNo >= nblock)
-        return (s32)CELL_AUDIO_ERROR_PARAM;
-
-    u64 base = s_ports[portNum].read_index;
-    u64 pos  = base % nblock;
-    base -= pos;
-    if (pos > blockNo)
-        base += nblock;
-
-    vm_write64((u32)(uintptr_t)tag, base + blockNo);
     return CELL_OK;
 }
 
