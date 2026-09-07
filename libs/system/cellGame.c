@@ -11,6 +11,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
+#include <errno.h>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -22,6 +24,7 @@
 #else
 #  include <unistd.h>
 #  include <sys/types.h>
+#  include <sys/statvfs.h>
 #  define HOST_MKDIR(p) mkdir(p, 0755)
 #  define HOST_STAT     stat
 #  define HOST_STAT_T   struct stat
@@ -83,6 +86,61 @@ static int dir_exists(const char* path)
 #else
     return S_ISDIR(st.st_mode);
 #endif
+}
+
+/* Content may not exist on first boot. Query its nearest existing ancestor
+ * so installation checks use the destination volume, without creating data. */
+static s32 content_free_kb(void)
+{
+    char path[CELL_GAME_PATH_MAX];
+    snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
+    for (;;) {
+#ifdef _WIN32
+        ULARGE_INTEGER available;
+        if (GetDiskFreeSpaceExA(path, &available, NULL, NULL)) {
+            u64 kb = available.QuadPart / 1024;
+            return kb > INT32_MAX ? INT32_MAX : (s32)kb;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_PATH_NOT_FOUND && error != ERROR_FILE_NOT_FOUND) break;
+#else
+        struct statvfs info;
+        if (statvfs(path, &info) == 0) {
+            u64 block = info.f_frsize ? info.f_frsize : info.f_bsize;
+            u64 count = info.f_bavail;
+            if (!block) return 0;
+            if (count > ((u64)INT32_MAX * 1024) / block) return INT32_MAX;
+            return (s32)((count * block) / 1024);
+        }
+        if (errno != ENOENT && errno != ENOTDIR) break;
+#endif
+        size_t len = strlen(path);
+#ifdef _WIN32
+        if (len == 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\')) break;
+#endif
+        while (len > 1 && (path[len - 1] == '/' || path[len - 1] == '\\'))
+            path[--len] = 0;
+        char* slash = strrchr(path, '/');
+#ifdef _WIN32
+        char* backslash = strrchr(path, '\\');
+        if (backslash && (!slash || backslash > slash)) slash = backslash;
+        if (slash == path + 2 && path[1] == ':') {
+            if (!slash[1]) break;
+            slash[1] = 0;
+            continue;
+        }
+#endif
+        if (!slash) {
+            if (strcmp(path, ".") == 0) break;
+            strcpy(path, ".");
+        } else if (slash == path) {
+            if (!slash[1]) break;
+            slash[1] = 0;
+        } else {
+            *slash = 0;
+        }
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -245,7 +303,7 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     if (attr_ea) vm_write32(attr_ea, 0);
 
     if (size_ea) {
-        vm_write32(size_ea + 0, 1024 * 1024);                 /* hddFreeSizeKB = 1 GB */
+        vm_write32(size_ea + 0, (u32)content_free_kb());
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
         vm_write32(size_ea + 8, 0);                           /* sysSizeKB */
     }
@@ -332,7 +390,7 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
 
     uint32_t size_ea = (uint32_t)(uintptr_t)size;
     if (size_ea) {
-        vm_write32(size_ea + 0, 1024 * 1024);
+        vm_write32(size_ea + 0, (u32)content_free_kb());
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
         vm_write32(size_ea + 8, 0);
     }
@@ -397,8 +455,8 @@ static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
     memset(vm_base + cb, 0, (set + 0x20) - cb);
 
     /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
-    vm_write32(get + 0x000, 40u * 1024u * 1024u - 256u);  /* hddFreeSizeKB (~40 GB) */
-    vm_write32(get + 0x004, is_new_data);                  /* isNewData */
+    vm_write32(get + 0x000, (u32)content_free_kb());
+    vm_write32(get + 0x004, is_new_data);                            /* isNewData = 0 (data exists) */
     snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
     snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
     vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
@@ -576,19 +634,18 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
     ensure_dirs(usrdir);
 
+    /* Host paths are only for host filesystem access. Guest code feeds these
+     * results back to cellFs, which resolves PS3 virtual paths through VFS. */
     uint32_t cip_ea = (uint32_t)(uintptr_t)tmp_contentInfoPath;
     uint32_t usr_ea = (uint32_t)(uintptr_t)tmp_usrdirPath;
+    char guest_path[CELL_GAME_PATH_MAX];
     if (cip_ea) {
-        size_t len = strlen(path);
-        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
-        memcpy(vm_base + cip_ea, path, len);
-        vm_base[cip_ea + len] = '\0';
+        snprintf(guest_path, sizeof(guest_path), "/dev_hdd0/game/%s", create_dir);
+        memcpy(vm_base + cip_ea, guest_path, strlen(guest_path) + 1);
     }
     if (usr_ea) {
-        size_t len = strlen(usrdir);
-        if (len > CELL_GAME_PATH_MAX - 1) len = CELL_GAME_PATH_MAX - 1;
-        memcpy(vm_base + usr_ea, usrdir, len);
-        vm_base[usr_ea + len] = '\0';
+        snprintf(guest_path, sizeof(guest_path), "/dev_hdd0/game/%s/USRDIR", create_dir);
+        memcpy(vm_base + usr_ea, guest_path, strlen(guest_path) + 1);
     }
 
     return CELL_OK;
