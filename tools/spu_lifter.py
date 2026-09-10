@@ -900,6 +900,11 @@ class SPULifter:
                     or addr in self.link_return:
                 # SPU_RET: host return while a matched brsl frame is live
                 # (host_depth>0); at 0 the frame was destroyed -> dispatch to r0.
+                # A return through a NON-r0 link (compute_link_returns) must
+                # publish THAT register as the return PC: SPU_RET publishes r0,
+                # and spu_drain_call restarts dispatch when pc != return_pc.
+                if tgt_reg != "0":
+                    return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
@@ -944,6 +949,8 @@ class SPULifter:
             # land on an unregistered mid-function PC.
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
+                if tgt_reg != "0":
+                    return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
             return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")

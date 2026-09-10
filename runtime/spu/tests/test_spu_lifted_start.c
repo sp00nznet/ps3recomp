@@ -716,6 +716,45 @@ static void test_short_dma_lists(void)
           "short GET list leaves quadword padding untouched");
 }
 
+/* A lifted return through a NON-r0 link register. Sony's SPU compiler links
+ * leaf/helper calls through r4/r5/r6/r8/r78 and returns with `bi $rN`; the
+ * lifter lowers that to SPU_RET_REG(ctx, N). SPU_RET publishes r0 instead,
+ * which is not where the guest is going, and spu_drain_call -- which stops a
+ * translated call at its explicit return PC -- then sees pc != return_pc and
+ * restarts dispatch from r0's stale value. Observed on LittleBigPlanet's
+ * wwsjob policy module: every `brsl $r4, helper` ... `bi $r4` tore the
+ * module out of its host frames two DMAs into its first run. */
+static void callee_returns_via_r7(spu_context* ctx) { SPU_RET_REG(ctx, 7); }
+static void callee_returns_via_r0(spu_context* ctx) { SPU_RET(ctx); }
+static void test_nonzero_link_return(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate non-r0 return context"); return; }
+    spu_begin_image(90); spu_begin_image(0);
+    ctx->image_id = 90; ctx->host_depth = 1;
+    ctx->gpr[7]._u32[0] = 0x900;  /* the link the caller planted with brsl $r7 */
+    ctx->gpr[0]._u32[0] = 0x888;  /* r0 holds an unrelated nested-call link */
+    ctx->pc = 0x400;
+    g_spu_trampoline_fn = 0;
+    callee_returns_via_r7(ctx);
+    spu_drain_call(ctx, 0x900);
+    check(ctx->pc == 0x900, "SPU_RET_REG publishes the link register it returns through");
+    check(!g_spu_trampoline_fn, "non-r0 link return leaves no pending continuation");
+    check(ctx->status != SPU_STATUS_STOPPED_BY_HALT,
+          "spu_drain_call accepts the non-r0 return at its return address");
+
+    /* Negative control: the old lowering. r0 is not the return register, so
+     * the drain's return-address check cannot match and it restarts dispatch. */
+    ctx->host_depth = 1; ctx->status = 0; ctx->pc = 0x400;
+    g_spu_trampoline_fn = 0;
+    callee_returns_via_r0(ctx);
+    spu_drain_call(ctx, 0x900);
+    check(ctx->pc == 0x888, "SPU_RET publishes r0 (the defect the macro fixes)");
+    check(ctx->status == SPU_STATUS_STOPPED_BY_HALT,
+          "spu_drain_call restarts dispatch when a return publishes the wrong register");
+    free(ctx);
+}
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -730,6 +769,7 @@ int main(void)
     test_guest_stack_reset();
     test_taskset_resume_stack();
     test_alternate_link_return();
+    test_nonzero_link_return();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
