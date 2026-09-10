@@ -1529,8 +1529,9 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
     uint32_t raw = ctx->gpr[3]._u32[0];
     uint32_t num = raw & 0x0F;
     { static int _n = 0; if (_n++ < 24)
-        fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X\n",
-                num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+        fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X wobj\n2FDC=0x%02X%02X%02X%02X\n",
+                num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                ctx->ls[0x2FDC], ctx->ls[0x2FDD], ctx->ls[0x2FDE], ctx->ls[0x2FDF]); }
     /* The task-API argument is passed in LOCAL STORE at 0x2FD0, not in r4: the
      * caller does shufb(arg,...) -> stqd 0x2FD0 and only then sets r3 = number
      * (see func_00026DE0 / func_000272AC in image 22). Logging r4 shows caller
@@ -1867,7 +1868,16 @@ void spu_indirect_branch(spu_context* ctx)
     if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
         uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
                     | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
-        if (ctx->image_id == 22 || (ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR)) {
+        /* A task dispatched standalone (no policy module in this local store)
+         * runs on the SpursTasksetContext spu_workload.c plants, whose
+         * syscallAddr is this address; nothing is lifted at 0xA70 for it, so
+         * the only alternative to the HLE is the synthesised-stop exit below
+         * -- which is how LBP's audio tasks (images 6/7) ended on their first
+         * syscall and left the loading thread waiting on their event flag. */
+        int standalone = !ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR &&
+                         !spu_lookup(YDKJ_TASKSET_PM_SYSCALL_ADDR, ctx->image_id);
+        if (ctx->image_id == 22 || standalone ||
+            (ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR)) {
             spu_spurs_taskset_syscall(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
