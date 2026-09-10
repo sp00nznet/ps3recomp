@@ -1156,7 +1156,13 @@ def main() -> None:
                 else:
                     newb.append((s, e))
             if not split and not any(s == a for s, _ in bset):
-                newb.append((a, base + len(data)))
+                # A seed in a gap between bounds (or past the last one) runs to
+                # the next function start, not the image end: otherwise a
+                # 2-instruction stub swallows every function after it and any
+                # rodata tail (hundreds of `.word` unsupported).
+                nxt = min([s for s, _ in bset if s > a] + [base + len(data)])
+                newb.append((a, nxt))
+
             bset = sorted(set(newb))
         # Dedup by start: if an extra addr lands inside two overlapping auto-
         # detected bounds, splitting both yields two bounds with the same start

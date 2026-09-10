@@ -54,6 +54,71 @@ EXTRA_FUNCS = [a.strip() for a in
                os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",") if a.strip()]
 
 
+def manual_link_targets(raw, base=BASE):
+    """Return targets built into the link register by hand:
+        ila  $r0, off
+        a    $r0, $r0, $r126        (r126 = module load base, from the entry's
+        br   fn                      ila/brsl/sf base probe)
+    Every job module's entry does this once (`ila $r0, entry+0xAC ... br body`):
+    the body returns with `bi $r0` to base+off, an address no branch names, so
+    the lift has no entry there. Without it the return unwinds to the manager's
+    drain (drain-mismatch return_pc=0x3258 pc=0x4AEC), the restart re-enters the
+    entry function from its start, the prologue runs twice and the job leaves
+    on a garbage r0 (`exit: synthesised stop at LS 0xE81C`). Seeding base+off
+    is exact: the offset is an immediate."""
+    out = []
+    for off in range(0x30, len(raw) - 20, 4):
+        w = struct.unpack_from(">I", raw, off)[0]
+        if (w >> 25) & 0x7F != 0x21 or (w & 0x7F) != 0:          # ila $r0, i18
+            continue
+        imm = (w >> 7) & 0x3FFFF
+        for k in range(1, 5):
+            w2 = struct.unpack_from(">I", raw, off + 4 * k)[0]
+            if (w2 >> 21) & 0x7FF == 0x0C0 and (w2 & 0x7F) == 0 and ((w2 >> 7) & 0x7F) == 0:
+                if imm % 4 == 0 and 0x30 <= imm < len(raw):        # a $r0, $r0, $rX
+                    out.append(base + imm)
+                break
+    return sorted(set(out))
+
+
+
+def switch_table_targets(raw, base=BASE):
+    """Return the targets of position-independent switch tables.  The
+    compiler emits, for `switch`:
+        ila  $rT, tbl_off ; a $rT, $rT, $r126      ($rT = LS address of table)
+        ... lqx/rotqby entry ... a $r2, $entry, $rT ; bi $r2
+        tbl: .word target0 - tbl, target1 - tbl, ...  (right after the bi)
+    Entries are relative to the table itself and the table follows the `bi`,
+    so no absolute address of any case ever appears in the code: the lift
+    only ever reached the cases by luck (`bi $r2` computed at run time,
+    BRANCH-TO-0 unresolved pc=0x7A08 in jobmod ef33c6c99dc7). A table is
+    accepted only when some `ila` in the module names its offset."""
+    ilas = set()
+    for off in range(0x30, len(raw) - 4, 4):
+        w = struct.unpack_from(">I", raw, off)[0]
+        if (w >> 25) & 0x7F == 0x21:                          # ila $rX, i18
+            ilas.add((w >> 7) & 0x3FFFF)
+    out = []
+    for off in range(0x30, len(raw) - 16, 4):
+        w = struct.unpack_from(">I", raw, off)[0]
+        if (w >> 21) & 0x7FF != 0x1A8 or (w & 0x7F) != 0:     # bi $rA (rt field 0)
+            continue
+        tbl = off + 4
+        if tbl not in ilas:
+            continue
+        targets = []
+        while tbl + 4 * len(targets) + 4 <= len(raw):
+            e = struct.unpack_from(">I", raw, tbl + 4 * len(targets))[0]
+            t = (tbl + e) & 0xFFFFFFFF
+            if t % 4 or not (0x30 <= t < len(raw)):
+                break
+            targets.append(base + t)
+        if len(targets) >= 2:
+            out += targets
+    return sorted(set(out))
+
+
+
 def main():
     if EXTRA_FUNCS:
         print(f"  extra function entries: {', '.join(EXTRA_FUNCS)}")
@@ -83,6 +148,19 @@ def main():
             cmd += ["--code-end", hex(CODE_END[name])]
         # Only offer addresses that fall inside THIS module's image.
         inside = [a for a in EXTRA_FUNCS if BASE <= int(a, 0) < BASE + len(raw)]
+        # The module's first function starts right after the 0x30-byte header
+        # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
+        # reached by a branch and found anyway, but in two modules it is a bare
+        # `bi $r0` stub reached only through a function pointer the job builds at
+        # run time (base + 0x30, relocated via the entry's ila/brsl base probe), so
+        # nothing in the code references it and the lift had no entry there: the
+        # job's indirect call fell off the lifted set and came back with a
+        # corrupted stack (drain-mismatch return_pc=0x50C8 pc=0xA800, jobmod
+        # ef33c6c99dc7). Seeding it is exact, not a heuristic: every module's
+        # first instruction is at +0x30.
+        inside.append(hex(BASE + 0x30))
+        inside += [hex(a) for a in manual_link_targets(raw)]
+        inside += [hex(a) for a in switch_table_targets(raw)]
         if inside:
             cmd += ["--extra-funcs", ",".join(inside)]
         r = subprocess.run(cmd, capture_output=True, text=True)
