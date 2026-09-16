@@ -2123,6 +2123,23 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
               "       ^ no HLE handlers are registered, so this is almost certainly\n"
               "         a firmware import rather than guest code. Run\n"
               "         tools/gen_hle_nids.py and build its output into the port.\n");
+      }
+      /* The other half of the same mistake, and it survives a correct NID
+       * table: a lift done without --hle-stubs keeps every import trampoline as
+       * literal code, so `bl <stub>` runs `li r12,0; oris r12,r12,hi;
+       * lwz r12,lo(r12)` against an import table no host loader ever patched,
+       * and branches to the word it read -- the next trampoline's own first
+       * instruction, 0x39800000 (`li r12,0`). An instruction word as a call
+       * target is the signature, and registered handlers do not make it go away. */
+      else if (!said && (uint32_t)ctx->ctr == 0x39800000u) {
+          said = 1;
+          fprintf(stderr,
+              "       ^ 0x39800000 is the instruction `li r12,0`, not an address: this call\n"
+              "         went through a firmware import trampoline that was lifted literally.\n"
+              "         Re-lift with --hle-stubs so import stubs dispatch to HLE:\n"
+              "           python tools/ppu_loader.py EBOOT.elf -o out/\n"
+              "           python tools/ppu_lifter.py EBOOT.elf --functions out/EBOOT.functions.json \\\n"
+              "                  --hle-stubs out/EBOOT.imports.json -o src/recomp/\n");
       } }
     static int dumped = 0;
     if (dumped < 3) {

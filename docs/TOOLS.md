@@ -7,53 +7,96 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 ## Table of Contents
 
 1. [Pipeline Overview](#pipeline-overview)
-2. [elf_parser.py — ELF/SELF/PRX Analysis](#elf_parserpy)
-3. [ppu_disasm.py — PowerPC Disassembler](#ppu_disasmpy)
-4. [ppu_lifter.py — PPU → C Code Generator](#ppu_lifterpy)
-5. [spu_disasm.py — SPU Disassembler](#spu_disasmpy)
-6. [find_functions.py — Function Boundary Detection](#find_functionspy)
-7. [nid_database.py — NID Resolver](#nid_databasepy)
-8. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
-9. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
-10. [Dependencies](#dependencies)
+2. [ppu_loader.py — image, OPD functions, imports](#ppu_loaderpy)
+3. [elf_parser.py — ELF/SELF/PRX Analysis](#elf_parserpy)
+4. [ppu_disasm.py — PowerPC Disassembler](#ppu_disasmpy)
+5. [ppu_lifter.py — PPU → C Code Generator](#ppu_lifterpy)
+6. [spu_disasm.py — SPU Disassembler](#spu_disasmpy)
+7. [find_functions.py — Function Boundary Detection](#find_functionspy)
+8. [nid_database.py — NID Resolver](#nid_databasepy)
+9. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
+10. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
+11. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
+12. [Dependencies](#dependencies)
 
 ---
 
 ## Pipeline Overview
 
-The recompiler pipeline transforms a PS3 executable into native C source code in five stages:
+The recompiler pipeline transforms a PS3 executable into native C++ source in four stages:
 
 ```
-  EBOOT.BIN (encrypted SELF)
+  EBOOT.BIN (SELF)  --unfself.py / RPCS3 dump-->  EBOOT.ELF
        │
        ▼
-  ┌────────────────┐
-  │ elf_parser.py   │ ← Stage 1: Parse and analyze
-  └──────┬─────────┘
-         │  ELF structure, imports, exports, segments
+  ┌──────────────────┐
+  │ ppu_loader.py    │ ← Stage 1: image, OPD function table, TOC, imports
+  └──────┬───────────┘
+         │  EBOOT.functions.json, EBOOT.imports.json, .image.json, .loader.json
          ▼
-  ┌────────────────┐
-  │ ppu_disasm.py   │ ← Stage 2: Disassemble
-  └──────┬─────────┘
-         │  Assembly listing with control flow info
+  ┌──────────────────┐
+  │ ppu_lifter.py    │ ← Stage 2: lift to C++ (--functions, --hle-stubs)
+  └──────┬───────────┘
+         │  ppu_recomp_NNN.cpp + ppu_recomp.h
          ▼
-  ┌────────────────┐
-  │ ppu_lifter.py   │ ← Stage 3: Lift to C
-  └──────┬─────────┘
-         │  C source files with function pointer table
+  ┌──────────────────┐
+  │ gen_hle_nids.py  │ ← Stage 3: NID → HLE handler table for this runtime
+  └──────┬───────────┘
+         │  ppu_hle_nids.cpp
          ▼
-  ┌────────────────┐
-  │ CMake + Compiler│ ← Stage 4: Compile
-  │ + ps3recomp_runtime
-  └──────┬─────────┘
-         │  Native executable
+  ┌──────────────────┐
+  │ CMake + compiler │ ← Stage 4: compile against ps3recomp_runtime
+  └──────┬───────────┘
          ▼
        🎮 Run!
 ```
 
+`ppu_disasm.py`, `find_functions.py`, `elf_parser.py` and `prx_analyzer.py` are
+analysis tools around that spine, not steps in it: you reach for them when the
+loader's output does not explain what a title is doing.
+
 Each stage can be run independently, allowing incremental development and debugging.
 
 ---
+
+## ppu_loader.py
+
+Stage 1. Turns a decrypted PPU ELF (ET_EXEC EBOOT or ET_DYN PRX) into the data
+the lifter and the runtime need, all from the binary's own tables rather than
+from heuristics.
+
+### What It Does
+
+1. **Segment manifest** — which PT_LOAD segments go where, including zero-filled
+   BSS (`memsz > filesz`)
+2. **OPD function table** — PS3 function pointers are addresses of 8-byte
+   `{code, toc}` descriptors, so the `.opd` section is an authoritative list of
+   every address-taken function, and of the module TOC (`r2`)
+3. **Entry point** — `e_entry` is itself an OPD address; resolved to (code, TOC)
+4. **Firmware imports** — walks `sys_proc_prx_param` (an ET_EXEC EBOOT has no
+   dynamic section, so `prx_analyzer` finds nothing there) for every `.lib.stub`
+   trampoline address and its NID
+
+### Usage
+
+```bash
+python tools/ppu_loader.py game/EBOOT.ELF -o out/
+```
+
+### Output Files
+
+| File | Contents |
+|------|----------|
+| `<name>.functions.json` | `[{start,end,toc,opd}]` — feeds `ppu_lifter --functions` |
+| `<name>.imports.json` | `[{library,nid,stub}]` — feeds `ppu_lifter --hle-stubs` |
+| `<name>.image.json` | `[{vaddr,filesz,memsz,flags,file_offset}]` |
+| `<name>.loader.json` | entry OPD → (code, TOC), module TOC, OPD extent, counts |
+
+It also prints a summary — entry, TOC, OPD extent, function count, imports per
+library — which is the first check on whether the input is what you think.
+
+---
+
 
 ## elf_parser.py
 
@@ -73,20 +116,19 @@ Each stage can be run independently, allowing incremental development and debugg
 ### Usage
 
 ```bash
-# Basic analysis — dump ELF structure and imports
-python tools/elf_parser.py path/to/EBOOT.ELF --info
+# Header, entry point, architecture (JSON on stdout — redirect it)
+python tools/elf_parser.py path/to/EBOOT.ELF
 
-# Full analysis with output to directory
-python tools/elf_parser.py path/to/EBOOT.ELF --output analysis/
-
-# Decrypt SELF to ELF first
-python tools/elf_parser.py path/to/EBOOT.BIN --decrypt --output analysis/
-
-# Extract specific segments
-python tools/elf_parser.py path/to/EBOOT.ELF --extract-segments --output segments/
+# One report at a time, or everything
+python tools/elf_parser.py path/to/EBOOT.ELF --imports  > analysis/imports.json
+python tools/elf_parser.py path/to/EBOOT.ELF --exports  > analysis/exports.json
+python tools/elf_parser.py path/to/EBOOT.ELF --all      > analysis/elf_info.json
 ```
 
-### Output Files
+### Report Sections
+
+Everything goes to **stdout** as one JSON document; the names below are the
+conventional files to redirect each report into.
 
 | File | Contents |
 |------|----------|
@@ -307,23 +349,23 @@ The lifter handles several control flow patterns:
 ### Usage
 
 ```bash
-# Lift disassembly to C
-python tools/ppu_lifter.py disasm/ --output recomp/
+# Lift an ELF, with the loader's function table and import list
+python tools/ppu_lifter.py game/EBOOT.ELF \
+    --functions out/EBOOT.functions.json \
+    --hle-stubs out/EBOOT.imports.json \
+    --output src/recomp/
 
-# Lift with specific function table
-python tools/ppu_lifter.py disasm/ --func-table funcs.json --output recomp/
-
-# Generate single-file output
-python tools/ppu_lifter.py disasm/ --single-file --output recomp/all_functions.c
+# One translation unit instead of chunks (small titles and tests only)
+python tools/ppu_lifter.py game/EBOOT.ELF --functions out/EBOOT.functions.json \
+    --single-file --output src/recomp/
 ```
 
 ### Output Files
 
 | File | Contents |
 |------|----------|
-| `functions_NNNN.c` | Recompiled C functions (batched, ~100 per file) |
-| `func_table.cpp` | `g_recompiled_funcs[]` — maps guest address → host function pointer |
-| `data_segments.c` | Initialized data sections (`.data`, `.rodata`) as C arrays |
+| `ppu_recomp_NNN.cpp` | Recompiled functions, batched across translation units |
+| `ppu_recomp.h` | Declarations, VM access helpers, and `ppu_recomp_register()` |
 
 ---
 
@@ -584,6 +626,42 @@ DECLARE_PS3_MODULE(cellFs, "cellFs")
 ```
 
 ---
+
+## gen_imports.py / gen_hle_nids.py
+
+The two halves of firmware imports. Omit either and the port builds, starts, and
+dies on its first firmware call with `[ppu] unresolved indirect call ->
+0x39800000` — which is not an address but the instruction `li r12,0`, the first
+word of an import trampoline.
+
+**`gen_imports.py`** writes the same import list `ppu_loader.py` already emits,
+with NIDs resolved to names where `nid_database` knows them. Use it when you
+want to read the list; the lifter is happy with either file.
+
+```bash
+python tools/gen_imports.py game/EBOOT.ELF -o out/imports_named.json
+# 1 libraries, 12 imports, 12 named (100%) -> out/imports_named.json
+```
+
+Feeding that list to `ppu_lifter.py --hle-stubs` makes each import stub its own
+function whose body is `ps3_hle_call(<nid>, ctx)`, instead of the trampoline's
+literal instructions.
+
+**`gen_hle_nids.py`** generates the other side: the table that maps those NIDs
+to this runtime's HLE implementations.
+
+```bash
+python tools/gen_hle_nids.py --all --out src/gen/ppu_hle_nids.cpp   # every module
+python tools/gen_hle_nids.py sysPrxForUser --out src/gen/ppu_hle_nids.cpp
+```
+
+It defines `ppu_hle_register_all()`, which `ppu_hle_init()` calls at startup.
+`runtime/ppu/ppu_hle.cpp` carries a **weak** empty version, so a port that never
+compiles this file still links — regenerate it after every toolkit update, since
+the table names handlers from the revision it was generated against.
+
+---
+
 
 ## Dependencies
 

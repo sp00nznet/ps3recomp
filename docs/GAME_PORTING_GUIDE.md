@@ -175,8 +175,25 @@ Review the output for unresolved NIDs. For each one:
 
 ### Function Detection
 
+Stage 1 of the pipeline. `ppu_loader.py` reads the `.opd` table — the PS3's own
+list of function descriptors — and writes the function boundaries, the firmware
+import table, the segment manifest and the entry/TOC pair in one pass:
+
 ```bash
-python tools/find_functions.py game/EBOOT.ELF --output analysis/functions.json
+python tools/ppu_loader.py game/EBOOT.ELF -o analysis/
+#   analysis/EBOOT.functions.json   [{start,end,toc,opd}]
+#   analysis/EBOOT.imports.json     [{library,nid,stub}]   <- Phase 5 needs this
+#   analysis/EBOOT.image.json       PT_LOAD manifest
+#   analysis/EBOOT.loader.json      entry OPD -> (code, toc), module TOC
+```
+
+`find_functions.py` is the heuristic scanner — prologue, leaf and branch-target
+detection — for what the OPD does not cover. `--seed-json` merges in the
+loader's list rather than starting over:
+
+```bash
+python tools/find_functions.py game/EBOOT.ELF \
+    --seed-json analysis/EBOOT.functions.json --output analysis/functions.json
 ```
 
 Review the function list:
@@ -208,16 +225,29 @@ SPU ELF segments are embedded within the main PPU ELF. Each one needs separate a
 
 ### PPU Code Lifting
 
+The lifter takes the **ELF**, not the disassembly listing:
+
 ```bash
-python tools/ppu_lifter.py disasm/ \
-    --nid-db tools/nid_db.json \
+python tools/ppu_lifter.py game/EBOOT.ELF \
+    --functions analysis/EBOOT.functions.json \
+    --hle-stubs analysis/EBOOT.imports.json \
     --output recomp/
 ```
 
 This generates:
-- `functions_NNNN.c` — batches of recompiled C functions
-- `func_table.cpp` — maps guest address → host function pointer
-- `data_segments.c` — initialized data as C arrays
+- `ppu_recomp_NNN.cpp` — batches of recompiled functions (C++, no post-step)
+- `ppu_recomp.h` — declarations, helpers and `ppu_recomp_register()`
+
+**`--hle-stubs` is what makes firmware imports callable.** Each import stub
+address listed in `EBOOT.imports.json` is emitted as its own function whose body
+is `ps3_hle_call(<nid>, ctx)`. Leave it out and the lifter translates the import
+trampolines literally — `li r12,0; oris r12,r12,hi; lwz r12,lo(r12); ... bctr` —
+against an import table nothing ever patched, and the first import call the game
+makes lands on a raw instruction word:
+
+```
+[ppu] unresolved indirect call -> 0x39800000
+```
 
 ### SPU Code Lifting (if applicable)
 
@@ -250,6 +280,10 @@ first symptom is an indirect call to something that is not an address:
 `0x39800000` is the PowerPC instruction `li r12,0`, the first word of an import
 stub. The runtime prints a warning at startup when it finds no handlers
 registered, which names this directly.
+
+The *same* message means the other half of Phase 5 is missing when the handler
+table is present: a lift run without `--hle-stubs` never reaches the table at
+all. Check both before chasing it as a lifter bug.
 
 Regenerate it whenever you update ps3recomp: the table is generated from the
 toolkit's registered modules, so one built against a different revision can
