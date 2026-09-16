@@ -14,14 +14,17 @@ Work through [docs/GETTING_STARTED.md](../../docs/GETTING_STARTED.md) first. The
 short version:
 
 ```bash
-# 1. lift the title (writes src/recomp/*.c and ppu_recomp.h)
+# 1. load the title (function table, imports, TOC, segment manifest)
+python /path/to/ps3recomp/tools/ppu_loader.py game/EBOOT.ELF -o out/
+
+# 2. lift it (writes src/recomp/ppu_recomp*.cpp and ppu_recomp.h)
 python /path/to/ps3recomp/tools/ppu_lifter.py game/EBOOT.ELF \
-    --functions functions.json --output src/recomp/
+    --functions out/EBOOT.functions.json \
+    --hle-stubs out/EBOOT.imports.json \
+    --output src/recomp/
 
-# 2. rename to .cpp, patch the header, apply the fallthrough fix
-python /path/to/ps3recomp/tools/post_lift.py --recomp-dir src/recomp/
-
-# 3. now configure and build
+# 3. now configure and build -- CMakeLists generates the NID -> HLE handler
+#    table itself unless src/recomp/ppu_hle_nids.cpp already exists
 cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp
 cmake --build build
 ```

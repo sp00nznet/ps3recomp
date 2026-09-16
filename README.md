@@ -338,16 +338,18 @@ cd ps3recomp
 # Install Python tools
 pip install -r requirements.txt
 
-# Analyze a decrypted PS3 ELF (writes JSON to stdout -- redirect it)
-mkdir -p analysis
-python tools/elf_parser.py /path/to/EBOOT.ELF --all > analysis/elf_info.json
+# Stage 1: image, OPD function table, TOC and firmware imports
+python tools/ppu_loader.py /path/to/EBOOT.ELF -o out/
 
-# Find functions, then disassemble (ppu_disasm also writes to stdout)
-python tools/find_functions.py /path/to/EBOOT.ELF --output analysis/functions.json
-python tools/ppu_disasm.py /path/to/EBOOT.ELF --functions > disasm.txt
+# Stage 2: lift to C++. --hle-stubs turns each firmware import stub into
+# ps3_hle_call(nid); leave it out and the first import call crashes the port.
+python tools/ppu_lifter.py /path/to/EBOOT.ELF \
+    --functions out/EBOOT.functions.json \
+    --hle-stubs out/EBOOT.imports.json \
+    --output src/recomp/
 
-# Lift to C
-python tools/ppu_lifter.py disasm/ --output recomp/
+# Stage 3: the NID -> HLE handler table for this runtime
+python tools/gen_hle_nids.py --all --out src/gen/ppu_hle_nids.cpp
 
 # Build with the runtime
 cd templates/project
