@@ -169,6 +169,13 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * an earlier run would be restored over this job's arguments. */
     { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
     ctx->steps = 0;   /* fresh run: step 0 is the entry */
+    /* The host stack is empty here by definition, so no lifted caller frame
+     * is live. A persistent context (a SPURS policy module re-entered every
+     * scheduling quantum) otherwise carries the depth its last quantum
+     * halted at: two frames per quantum for an idle job manager, and the
+     * recursion guard halted the SPU at 2000 after a few minutes of idling. */
+    ctx->host_depth = 0;
+    ctx->irq_frame = 0;
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
     /* Lockstep gate (env SPU_LOCKSTEP, default off): join the round-robin

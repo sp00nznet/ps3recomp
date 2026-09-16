@@ -324,6 +324,17 @@ typedef struct spu_context {
      * branch instruction AT LS 0 (pm_wwsjob's entry writes `bra 0xA2C` there).
      * The handler returns via iret (pc <- srr0). */
     uint32_t int_enable;
+    /* The host frame that took the pending interrupt (spu_drain_call's loop),
+     * innermost first. The WWS handler leaves through a routine it assembles
+     * at the top of local store, from wherever its state machine happens to
+     * be -- several lifted calls deep -- so the iret rarely returns to the
+     * frame that entered the handler. When the iret's register restore fires
+     * deeper than the taking frame, execution unwinds to that frame and goes
+     * on at srr0 from there; the handler's host frames hold nothing the guest
+     * still needs. Without it the interrupted code resumed INSIDE the
+     * handler's frames and its return address then missed every drain on the
+     * way up (drain-mismatch return_pc=0xA90 pc=0x2D28, once per job). */
+    void*    irq_frame;
 
     /* Parked DMA-list commands (stall-and-notify), keyed PER TAG GROUP. A
      * GETL/PUTL that transfers a list element with the stall-and-notify bit
