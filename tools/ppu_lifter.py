@@ -3455,8 +3455,21 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # loaded TOC-relative via `lwz base, disp(r2)`. (Hardcoding p[2] as the
         # base silently skipped every dispatcher with the operands swapped.)
         r_val = p[0]
-        disp = None; r_base = None; base_is_ld = False
-        disp2 = None; disp2_is_ld = False
+        # Every operand whose nearest definition resolves to a base load is kept
+        # in `_bases`, and the decode below keeps the one whose table validates
+        # the most case targets -- the same score the multi-TOC loop uses. Taking
+        # the FIRST operand that resolved was only safe when the `add` reordering
+        # below had already put the real base first, and that needs an `add`,
+        # i.e. an OFFSET table. An ABSOLUTE table has none: the candidates stay
+        # in raw lwzx order, and when the index operand is also r2-loaded (a
+        # TOC-addressed global) it resolved first, its slot was read as the
+        # table, nothing validated, and the dispatcher was dropped without a
+        # word -- the bctr lifted to an unresolved indirect call (#115, pinned by
+        # tools/test_ppu_jumptables.py). Ties keep the earlier candidate, so the
+        # `add` preference still decides whenever the scores cannot, and a
+        # dispatcher only changes when the old pick validated strictly fewer
+        # targets.
+        _bases = []         # [(r_base, disp, base_is_ld, disp2, disp2_is_ld)]
         # Prefer the lwzx operand that the `add ..., base` feeding mtctr combines
         # with the loaded offset. Both operands are often TOC-loaded, so "first
         # candidate with a TOC-load definition" can pick an unrelated index reg
@@ -3485,6 +3498,8 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 continue
             break
         for cand in _cands:
+            disp = None; r_base = None; base_is_ld = False
+            disp2 = None; disp2_is_ld = False
             # Walk backward to the NEAREST instruction that defines `cand`, and
             # accept it as the table base only if that definition is a TOC load
             # (`lwz`/`ld cand, disp(r2)`). Stopping at the first definition is
@@ -3557,133 +3572,134 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                         _scan = all_insns[_lo:i]
                 break                           # first definition of cand wins/loses
             if disp is not None:
-                break
-        _dbg(all_insns[i].addr, f"disp={disp} disp2={disp2} r_base={r_base} base_is_ld={base_is_ld} toc={toc}")
-        if disp is None or not toc:
+                _bases.append((r_base, disp, base_is_ld, disp2, disp2_is_ld))
+        _dbg(all_insns[i].addr, f"bases={_bases} toc={toc}")
+        if not _bases or not toc:
             continue
         toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
-        # offset table iff an `add rC, *, r_base` combines the loaded value + base
-        is_offset = any(
-            w.mnemonic == 'add' and
-            [x.strip() for x in w.operands.split(',')][0] == rC and
-            r_base in [x.strip() for x in w.operands.split(',')][1:]
-            for w in win)
-        # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`. Match the
-        # compare on the RAW INDEX register: the lwzx index (rIdx*4) is usually a
-        # shift of the raw index (`rldic/clrlsldi rShift, rIdx, ...`), and the raw
-        # index is what the switch bounds-checks. Blindly taking the nearest
-        # cmpwi grabbed an unrelated `cmpwi r9,0` in a sibling basic block (the
-        # 30-insn address window spans both arms of a branch), where r9 is only
-        # reused as the shifted index LATER -> count=0 -> a single case decoded ->
-        # LBP sub_422A40's 0x2A-case "GMTb" dispatcher fell through to an
-        # unresolved indirect call (0x422CA0) and stalled the loader.
-        _idx_reg = p[1] if r_base == p[2] else p[2]
-        _raw_idx = _idx_reg
-        for w in reversed(win):
-            a = [x.strip() for x in w.operands.split(',')]
-            if a and a[0] == _idx_reg:
-                if (w.mnemonic in ('rldic', 'rldicl', 'rldicr', 'rlwinm',
-                                   'clrlsldi', 'sldi', 'slwi', 'clrldi')
-                        and len(a) >= 2):
-                    _raw_idx = a[1]
-                break                           # first (nearest) def of idx wins
-        # Take the LARGEST immediate compared against the raw index: the switch
-        # bounds-check (`cmplwi rIdx, COUNT`) uses the max index, while any
-        # per-case `cmpwi rIdx, k` in the window tests a specific smaller case
-        # value. Picking the nearest compare grabbed `cmpwi r7,1` (a case test)
-        # -> count=1 -> only the default case decoded. Over-counting is safe: the
-        # per-entry text-range validation below stops at the first bogus offset.
-        count = None
-        for w in reversed(win):
-            if w.mnemonic in ('cmplwi', 'cmpwi'):
-                a = [x.strip() for x in w.operands.split(',')]
-                _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
-                if _cmp_reg == _raw_idx:
-                    try:
-                        _c = int(a[-1], 0)
-                    except ValueError:
-                        continue
-                    if count is None or _c > count:
-                        count = _c
-        if count is None or count < 0 or count > 4096:
-            count = 256
-        # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
-        # counting: the backward window spans sibling basic blocks, so it can
-        # latch a per-case test (`cmpwi rIdx, k`) instead of the real bounds
-        # check and silently truncate the table. A truncated table drops real
-        # cases, and the runtime `bctr` then lands on an unlifted mid-function
-        # address -> "unresolved indirect call" -> the caller runs on garbage.
-        # (LBP func_0038F380: a 31-entry offset table decoded as 19 because a
-        # stray `cmpwi 18` won; case 22 = 0x0038F754 fell through to the global
-        # dispatcher -- which only knows function ENTRIES, not mid-function
-        # labels -- and the boot died in a storm of vcalls through a job
-        # descriptor's name string.) The per-entry validation below already
-        # finds the true end, so scan generously and let it terminate.
-        scan = min(max(count + 1, 256), 4096)
-
-        # Multi-TOC executables (e.g. LBP: two TOCs, ~3.6k/2.2k functions each)
-        # load the table base relative to WHICHEVER r2 their function runs
-        # with. We don't track per-function TOCs here, so try each candidate
-        # and keep the one whose table decodes to the most in-text case
-        # targets (a wrong TOC reads unrelated data and validates 0 targets).
         best = []
-        for cand in toc_candidates:
-            if not cand:
-                continue
-            def _read_ptr(_ea, _is_ld):
-                # ELFv1 TOC entries are 64-bit; a table address always fits the
-                # low word, so a non-zero high word means we read the wrong slot.
-                _ea &= 0xFFFFFFFF
-                if not _is_ld:
-                    return read_u32(_ea)
-                if read_u32(_ea):
-                    return None
-                return read_u32((_ea + 4) & 0xFFFFFFFF)
-            table_base = _read_ptr(cand + disp, base_is_ld)
-            if table_base is not None and disp2 is not None:
-                table_base = _read_ptr(table_base + disp2, disp2_is_ld)
-            _dbg(all_insns[i].addr, f"cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
-            if table_base is None:
-                continue
-            targets = []
-            for k in range(scan):
-                ea = (table_base + k * 4) & 0xFFFFFFFF
-                # Structural end-of-table: a jump table never overlaps the code
-                # it dispatches to, so once the cursor reaches the lowest case
-                # target that lies AHEAD of the table, the table has ended. (The
-                # gcc/SN pattern puts the table immediately before its cases:
-                # LBP func_0038F380's table is 0x38F4F0..0x38F56C and case[0] IS
-                # 0x38F56C.) Forward targets only -- a table whose cases branch
-                # backwards would otherwise bound at k=0.
-                fwd = [t for t in targets if t > table_base]
-                if fwd and ea >= min(fwd):
-                    _dbg(all_insns[i].addr, f"  stop at k={k}: cursor 0x{ea:X} reached first case 0x{min(fwd):X}")
-                    break
-                v = read_u32(ea)
-                if v is None:
-                    break
-                if is_offset:
-                    off = v - (1 << 32) if (v & 0x80000000) else v
-                    t = (table_base + off) & 0xFFFFFFFF
-                else:
-                    t = v
-                if k < 3:
-                    _dbg(all_insns[i].addr, f"  entry[{k}] raw=0x{v:X} -> target=0x{t:X} valid={text_lo <= t < text_hi and t % 4 == 0}")
-                if text_lo <= t < text_hi and t % 4 == 0:
-                    targets.append(t)
-                elif targets or k >= 4:
-                    # First hole AFTER real entries ends the table. LEADING holes
-                    # do not: a dense opcode table has null slots for the codes it
-                    # never dispatches, and ps1_netemu's 128-entry R3000 table
-                    # starts with exactly one (index 0 is unused, entries 1..127
-                    # are the handlers). Breaking on it decoded 0 targets and
-                    # dropped the whole dispatcher. Bounded at 4 so a table_base
-                    # that is simply wrong still fails fast instead of scanning
-                    # into unrelated data.
-                    break
-            _dbg(all_insns[i].addr, f"decoded {len(targets)} targets")
-            if len(targets) > len(best):
-                best = targets
+        for r_base, disp, base_is_ld, disp2, disp2_is_ld in _bases:
+            # offset table iff an `add rC, *, r_base` combines the loaded value + base
+            is_offset = any(
+                w.mnemonic == 'add' and
+                [x.strip() for x in w.operands.split(',')][0] == rC and
+                r_base in [x.strip() for x in w.operands.split(',')][1:]
+                for w in win)
+            # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`. Match the
+            # compare on the RAW INDEX register: the lwzx index (rIdx*4) is usually a
+            # shift of the raw index (`rldic/clrlsldi rShift, rIdx, ...`), and the raw
+            # index is what the switch bounds-checks. Blindly taking the nearest
+            # cmpwi grabbed an unrelated `cmpwi r9,0` in a sibling basic block (the
+            # 30-insn address window spans both arms of a branch), where r9 is only
+            # reused as the shifted index LATER -> count=0 -> a single case decoded ->
+            # LBP sub_422A40's 0x2A-case "GMTb" dispatcher fell through to an
+            # unresolved indirect call (0x422CA0) and stalled the loader.
+            _idx_reg = p[1] if r_base == p[2] else p[2]
+            _raw_idx = _idx_reg
+            for w in reversed(win):
+                a = [x.strip() for x in w.operands.split(',')]
+                if a and a[0] == _idx_reg:
+                    if (w.mnemonic in ('rldic', 'rldicl', 'rldicr', 'rlwinm',
+                                       'clrlsldi', 'sldi', 'slwi', 'clrldi')
+                            and len(a) >= 2):
+                        _raw_idx = a[1]
+                    break                           # first (nearest) def of idx wins
+            # Take the LARGEST immediate compared against the raw index: the switch
+            # bounds-check (`cmplwi rIdx, COUNT`) uses the max index, while any
+            # per-case `cmpwi rIdx, k` in the window tests a specific smaller case
+            # value. Picking the nearest compare grabbed `cmpwi r7,1` (a case test)
+            # -> count=1 -> only the default case decoded. Over-counting is safe: the
+            # per-entry text-range validation below stops at the first bogus offset.
+            count = None
+            for w in reversed(win):
+                if w.mnemonic in ('cmplwi', 'cmpwi'):
+                    a = [x.strip() for x in w.operands.split(',')]
+                    _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
+                    if _cmp_reg == _raw_idx:
+                        try:
+                            _c = int(a[-1], 0)
+                        except ValueError:
+                            continue
+                        if count is None or _c > count:
+                            count = _c
+            if count is None or count < 0 or count > 4096:
+                count = 256
+            # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
+            # counting: the backward window spans sibling basic blocks, so it can
+            # latch a per-case test (`cmpwi rIdx, k`) instead of the real bounds
+            # check and silently truncate the table. A truncated table drops real
+            # cases, and the runtime `bctr` then lands on an unlifted mid-function
+            # address -> "unresolved indirect call" -> the caller runs on garbage.
+            # (LBP func_0038F380: a 31-entry offset table decoded as 19 because a
+            # stray `cmpwi 18` won; case 22 = 0x0038F754 fell through to the global
+            # dispatcher -- which only knows function ENTRIES, not mid-function
+            # labels -- and the boot died in a storm of vcalls through a job
+            # descriptor's name string.) The per-entry validation below already
+            # finds the true end, so scan generously and let it terminate.
+            scan = min(max(count + 1, 256), 4096)
+
+            # Multi-TOC executables (e.g. LBP: two TOCs, ~3.6k/2.2k functions each)
+            # load the table base relative to WHICHEVER r2 their function runs
+            # with. We don't track per-function TOCs here, so try each candidate
+            # and keep the one whose table decodes to the most in-text case
+            # targets (a wrong TOC reads unrelated data and validates 0 targets).
+            for cand in toc_candidates:
+                if not cand:
+                    continue
+                def _read_ptr(_ea, _is_ld):
+                    # ELFv1 TOC entries are 64-bit; a table address always fits the
+                    # low word, so a non-zero high word means we read the wrong slot.
+                    _ea &= 0xFFFFFFFF
+                    if not _is_ld:
+                        return read_u32(_ea)
+                    if read_u32(_ea):
+                        return None
+                    return read_u32((_ea + 4) & 0xFFFFFFFF)
+                table_base = _read_ptr(cand + disp, base_is_ld)
+                if table_base is not None and disp2 is not None:
+                    table_base = _read_ptr(table_base + disp2, disp2_is_ld)
+                _dbg(all_insns[i].addr, f"r_base={r_base} cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
+                if table_base is None:
+                    continue
+                targets = []
+                for k in range(scan):
+                    ea = (table_base + k * 4) & 0xFFFFFFFF
+                    # Structural end-of-table: a jump table never overlaps the code
+                    # it dispatches to, so once the cursor reaches the lowest case
+                    # target that lies AHEAD of the table, the table has ended. (The
+                    # gcc/SN pattern puts the table immediately before its cases:
+                    # LBP func_0038F380's table is 0x38F4F0..0x38F56C and case[0] IS
+                    # 0x38F56C.) Forward targets only -- a table whose cases branch
+                    # backwards would otherwise bound at k=0.
+                    fwd = [t for t in targets if t > table_base]
+                    if fwd and ea >= min(fwd):
+                        _dbg(all_insns[i].addr, f"  stop at k={k}: cursor 0x{ea:X} reached first case 0x{min(fwd):X}")
+                        break
+                    v = read_u32(ea)
+                    if v is None:
+                        break
+                    if is_offset:
+                        off = v - (1 << 32) if (v & 0x80000000) else v
+                        t = (table_base + off) & 0xFFFFFFFF
+                    else:
+                        t = v
+                    if k < 3:
+                        _dbg(all_insns[i].addr, f"  entry[{k}] raw=0x{v:X} -> target=0x{t:X} valid={text_lo <= t < text_hi and t % 4 == 0}")
+                    if text_lo <= t < text_hi and t % 4 == 0:
+                        targets.append(t)
+                    elif targets or k >= 4:
+                        # First hole AFTER real entries ends the table. LEADING holes
+                        # do not: a dense opcode table has null slots for the codes it
+                        # never dispatches, and ps1_netemu's 128-entry R3000 table
+                        # starts with exactly one (index 0 is unused, entries 1..127
+                        # are the handlers). Breaking on it decoded 0 targets and
+                        # dropped the whole dispatcher. Bounded at 4 so a table_base
+                        # that is simply wrong still fails fast instead of scanning
+                        # into unrelated data.
+                        break
+                _dbg(all_insns[i].addr, f"decoded {len(targets)} targets")
+                if len(targets) > len(best):
+                    best = targets
         if best:
             tables[all_insns[i].addr] = sorted(set(best))
     return tables
