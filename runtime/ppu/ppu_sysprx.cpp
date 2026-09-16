@@ -657,7 +657,12 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
         uint32_t p_msz = vm_read32(src_ea + ph + 0x14);
         uint32_t seg = segs_ea + (uint32_t)nsegs * 0x18;       /* COPY */
         vm_write32(seg + 0x00, 1); vm_write32(seg + 0x04, p_va);
-        vm_write32(seg + 0x08, p_fsz); vm_write32(seg + 0x10, 0);
+        vm_write32(seg + 0x08, p_fsz);
+        /* src is the u64 at +0x10; its low word, which every 32-bit reader
+         * takes, is +0x14 -- but LBP's FMOD mixer reads the u32 at +0x10 as
+         * the DMA source (it DMA'd its DSP overlay from EA 0 and jumped into
+         * zeroed LS), so write both, as the lv2 syscall path already does. */
+        vm_write32(seg + 0x10, src_ea + p_off);
         vm_write32(seg + 0x14, src_ea + p_off); nsegs++;
         if (p_msz > p_fsz && nsegs < 32) {                     /* BSS tail -> FILL 0 */
             seg = segs_ea + (uint32_t)nsegs * 0x18;
