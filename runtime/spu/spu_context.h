@@ -751,6 +751,14 @@ static inline void spu_pchist_tick(const spu_context* ctx)
         return;                                                \
     } while (0)
 
+/* Host return through a NON-r0 link register. Sony's SPU compiler links
+ * leaf/helper calls through r4/r5/r6/r8/r78 (`brsl $r4, helper` ...
+ * `bi $r4`); SPU_RET would publish r0 as the return PC, which is not where
+ * the guest is going, and spu_drain_call's return-address check can then
+ * never match -- it restarts dispatch from r0's stale value instead. Same
+ * host-frame return as SPU_RET, publishing the register actually branched. */
+#define SPU_RET_REG(ctx, n) do {                                       (ctx)->pc = (ctx)->gpr[n]._u32[0];                             if ((ctx)->host_depth == 0)                                        g_spu_trampoline_fn = spu_indirect_branch;                 return;                                                    } while (0)
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
