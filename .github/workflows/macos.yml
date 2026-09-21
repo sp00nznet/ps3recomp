@@ -61,6 +61,18 @@ jobs:
             python "$t"
           done
 
+      # libs/system/tests/ existed and NOTHING ran it -- two suites checked in,
+      # both documenting a macOS clang line in their own header comment, neither
+      # wired to any job. They need -Wl,-dead_strip (macOS ld) to drop the
+      # unreferenced runtime symbols they do not stub, which is why they belong
+      # here and not on the Linux or Windows jobs.
+      - name: Run self-contained sysutil tests
+        run: |
+          clang -std=gnu17 -I include                 libs/system/tests/test_dialog_callbacks.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_dialog_callbacks
+          /tmp/test_dialog_callbacks
+          clang -std=gnu17 -I include                 libs/system/tests/test_savedata_fixed.c                 -Wl,-dead_strip -o /tmp/test_savedata_fixed
+          /tmp/test_savedata_fixed
+
       - name: Run self-contained SPU helper tests
         run: |
           clang -std=gnu17 -I include -I runtime/spu \
