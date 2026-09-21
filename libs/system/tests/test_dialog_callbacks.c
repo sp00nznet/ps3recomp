@@ -51,6 +51,24 @@ int main(void)
     g_ps3_guest_caller = callback;
     cellSysutilCheckCallback(); assert(calls == 3 && last_result == CELL_MSGDIALOG_BUTTON_NONE);
     cellSysutilCheckCallback(); assert(calls == 3);
+
+    /* The headless yes/no auto-answer must not answer YES to a prompt that
+     * offers to ABORT something: Virtua Fighter 5 asks "Are you sure you want
+     * to cancel checking the game data?" and "Do you want to cancel the load
+     * operation?" during boot, and a blanket YES cancelled its own game-data
+     * check and then its own load. The "Install data" YESNO above still
+     * answers YES, which is the other half of the contract. */
+    memcpy(vm_base + 0x300, "Do you want to cancel the load operation?", 42);
+    assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL |
+                              CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO,
+                              (void*)0x300, (void*)0x100, (void*)0x1234, NULL) == CELL_OK);
+    cellSysutilCheckCallback();
+    assert(calls == 4 && last_result == CELL_MSGDIALOG_BUTTON_NO);
+
+    /* MSGDIALOG_ANSWER overrides the heuristic in both directions -- but the
+     * decision is cached on first use, so it cannot be re-read here; the knob
+     * is exercised by setting it before the run. */
+
     free(vm_base);
     puts("Deferred dialog and button-mask checks passed");
 }

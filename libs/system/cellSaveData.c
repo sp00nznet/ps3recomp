@@ -967,16 +967,31 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
 /* Fixed callbacks have CellSaveDataFixedSet, not CellSaveDataListSet.
  * Marshal the PS3 layouts (32-bit pointers, big endian) and enter the guest
  * through its OPD bridge. Layout reference: RPCS3 cellSaveData.h. */
+/* savedata_fixed's early returns were all silent, so a title whose save-data
+ * load never completes produced exactly one log line ("FixedLoad2") and no hint
+ * which of a dozen validation branches rejected it. Virtua Fighter 5 sits in
+ * cellSaveDataFixedLoad2 and repeatedly offers to cancel the load; naming the
+ * branch is the difference between that and a day of bisecting. Diagnostic
+ * only -- the value returned is unchanged. */
+static void savedata_reject_log(const char* fn, const char* why, int rc)
+{
+    printf("[cellSaveData] %s: %s (rc=0x%08X)\n", fn, why, (unsigned)rc);
+}
+#define SAVEDATA_REJECT(rc, why) \
+    do { savedata_reject_log(__func__, (why), (rc)); return (rc); } while (0)
+
 static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
                          CellSaveDataSetBuf* setBuf, CellSaveDataFixedCallback funcFixed,
                          CellSaveDataStatCallback funcStat, CellSaveDataFileCallback funcFile,
                          void* userdata)
 {
     if (!setList || !setBuf || !funcFixed)
-        return CELL_SAVEDATA_ERROR_PARAM;
-    if (!g_ps3_guest_caller) return CELL_SAVEDATA_ERROR_INTERNAL;
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "setList/setBuf/funcFixed is NULL");
+    if (!g_ps3_guest_caller)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_INTERNAL, "no guest caller installed");
     u32 dir_max = vm_read32((u32)(uintptr_t)setBuf);
-    if (dir_max > CELL_SAVEDATA_DIRLIST_MAX) return CELL_SAVEDATA_ERROR_PARAM;
+    if (dir_max > CELL_SAVEDATA_DIRLIST_MAX)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "dirListMax over CELL_SAVEDATA_DIRLIST_MAX");
     CellSaveDataDirList* dirs = dir_max ? calloc(dir_max, sizeof(*dirs)) : NULL;
     if (dir_max && !dirs) return CELL_SAVEDATA_ERROR_INTERNAL;
     u32 prefix = vm_read32((u32)(uintptr_t)setList + 8);
@@ -998,18 +1013,37 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
     s32 result = marshal_cbresult_read_result(cb);
     if (result == CELL_SAVEDATA_CBRESULT_OK_LAST ||
         result == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM) return CELL_OK;
-    if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT) return CELL_SAVEDATA_ERROR_CBRESULT;
-    if (!funcStat) return CELL_SAVEDATA_ERROR_PARAM;
+    if (result != CELL_SAVEDATA_CBRESULT_OK_NEXT) {
+        /* Name the value: the title chose this, so it says WHY it refused --
+         * ERR_NODATA on a load means the dirList we handed it was empty or
+         * held nothing it recognised, which is a different bug from a broken
+         * save or a marshalling mistake. */
+        const char* w = "funcFixed returned an unknown cbresult";
+        switch (result) {
+        case CELL_SAVEDATA_CBRESULT_ERR_NOSPACE: w = "funcFixed: ERR_NOSPACE"; break;
+        case CELL_SAVEDATA_CBRESULT_ERR_FAILURE: w = "funcFixed: ERR_FAILURE"; break;
+        case CELL_SAVEDATA_CBRESULT_ERR_BROKEN:  w = "funcFixed: ERR_BROKEN";  break;
+        case CELL_SAVEDATA_CBRESULT_ERR_NODATA:  w = "funcFixed: ERR_NODATA -- it found nothing it wanted in our dirList"; break;
+        case CELL_SAVEDATA_CBRESULT_ERR_INVALID: w = "funcFixed: ERR_INVALID"; break;
+        }
+        printf("[cellSaveData] savedata_fixed: cbresult=%d listed=%u\n", result, listed);
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_CBRESULT, w);
+    }
+    if (!funcStat)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcStat is NULL");
     u32 selected = vm_read32(set);
-    if (!selected || vm_read32(set + 8) > 1) return CELL_SAVEDATA_ERROR_PARAM;
+    if (!selected || vm_read32(set + 8) > 1)
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcFixed set no dirName, or an out-of-range option");
     const char* name = (const char*)vm_base + selected;
     size_t len = strnlen(name, CELL_SAVEDATA_DIRNAME_SIZE);
     if (!len || len == CELL_SAVEDATA_DIRNAME_SIZE || strchr(name, '/') ||
         strchr(name, '\\') || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-        return CELL_SAVEDATA_ERROR_PARAM;
+        SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcFixed set an unusable dirName");
     /* The selected string may be inside callback scratch, reused by funcStat. */
     char directory[CELL_SAVEDATA_DIRNAME_SIZE];
     memcpy(directory, name, len + 1);
+    printf("[cellSaveData] %s: proceeding with dir='%s' (%u listed)\n",
+           __func__, directory, listed);
     return savedata_execute(directory, is_save, setBuf, funcStat, funcFile,
                             (void*)(uintptr_t)vm_read32(cb + 16));
 }

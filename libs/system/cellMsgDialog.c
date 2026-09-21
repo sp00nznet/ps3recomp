@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>   /* tolower: the yes/no auto-answer heuristic */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 
 /* Pointer parameters here are GUEST addresses, and the dialog callback is a
@@ -59,6 +60,25 @@ static ProgressBarState s_progress[MAX_PROGRESS_BARS];
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* Does this yes/no prompt offer to ABORT something the title is doing?
+ * Case-insensitive substring match on the words a title uses for it. Only
+ * consulted when MSGDIALOG_ANSWER is unset; the call site explains why the
+ * dialog's own type field cannot answer this. */
+static int msg_offers_to_abort(const char* msg)
+{
+    static const char* const words[] = { "cancel", "quit", "abort", NULL };
+    if (!msg) return 0;
+    for (int w = 0; words[w]; w++) {
+        const size_t n = strlen(words[w]);
+        for (const char* p = msg; *p; p++) {
+            size_t i = 0;
+            while (i < n && p[i] && (char)tolower((unsigned char)p[i]) == words[w][i]) i++;
+            if (i == n) return 1;
+        }
+    }
+    return 0;
+}
+
 s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
                         CellMsgDialogCallback callback, void* userdata,
                         void* extParam)
@@ -98,11 +118,41 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
              * answered yes sends the title down an install/cache path a port may
              * have nothing behind, where no just plays from disc. A knob costs
              * less than a rebuild to try the other branch. */
-            static int no_ = -1;
-            if (no_ < 0) { const char* e = getenv("MSGDIALOG_ANSWER");
-                           no_ = (e && (e[0] == 'n' || e[0] == 'N')) ? 1 : 0; }
+            /* Unset, the answer is no longer a blanket YES, because a
+             * blanket YES is actively destructive on one class of prompt. A
+             * headless run cannot ask anybody, so it answers whichever button
+             * lets the title CONTINUE -- and for a prompt that offers to abort
+             * something, that button is NO:
+             *
+             *   "Do you want to use game data?"               -> YES
+             *   "Are you sure you want to cancel checking the
+             *    game data?"                                  -> NO
+             *   "Do you want to cancel the load operation?"   -> NO
+             *
+             * Virtua Fighter 5 asks the last two during its boot. Answered YES
+             * it cancelled its own game-data check and then its own load, which
+             * from the outside looks exactly like a port that cannot get past
+             * its loading screen.
+             *
+             * The dialog TYPE cannot decide this: both of VF5's prompts arrive
+             * as 0x11 (SE_NORMAL | BUTTON_TYPE_YESNO) with the default cursor
+             * on YES, because on hardware the cursor only says where the
+             * highlight starts and a person reads the sentence. The text is the
+             * only signal left, which makes this a heuristic and not a rule --
+             * it keys on English words, and a localised build falls through to
+             * YES. MSGDIALOG_ANSWER=yes|no overrides it either way. */
+            static int forced = -1;   /* 0 = force YES, 1 = force NO, 2 = auto */
+            if (forced < 0) {
+                const char* e = getenv("MSGDIALOG_ANSWER");
+                if      (e && (e[0] == 'n' || e[0] == 'N')) forced = 1;
+                else if (e && (e[0] == 'y' || e[0] == 'Y')) forced = 0;
+                else                                        forced = 2;
+            }
+            int auto_no = (forced == 2) ? msg_offers_to_abort(guest_str(msgString)) : 0;
+            int no_ = (forced == 2) ? auto_no : forced;
             result = no_ ? CELL_MSGDIALOG_BUTTON_NO : CELL_MSGDIALOG_BUTTON_YES;
-            printf("[cellMsgDialog] Auto-responding: %s\n", no_ ? "NO" : "YES");
+            printf("[cellMsgDialog] Auto-responding: %s%s\n", no_ ? "NO" : "YES",
+                   auto_no ? " (prompt offers to abort)" : "");
         } else if (button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK) {
             result = CELL_MSGDIALOG_BUTTON_OK;
             printf("[cellMsgDialog] Auto-responding: OK\n");
