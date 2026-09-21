@@ -242,6 +242,19 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     g_last_hle_nid = nid;
+    /* Stamp the NAME here too, not only where a handler is found below.
+     *
+     * These are read as a pair -- the watchdog prints "last HLE call = <nid>
+     * (<name>)" -- but they were written at different points: the nid on every
+     * dispatch, the name only when a handler resolved. So an UNIMPLEMENTED nid
+     * advanced the number and left the previous implemented call's name behind,
+     * and the pair printed as one confident fact.
+     *
+     * Guitar Hero III wedges on sys_spinlock_unlock (0x5267CB35) and the
+     * watchdog reported it as "cellPadInit" -- which for a game that needs a
+     * guitar controller is an extremely convincing wrong answer. Placeholder
+     * now, overwritten with the real name once the handler is known. */
+    g_last_hle_name = "(unimplemented)";
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
@@ -608,7 +621,23 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     for (uint32_t i = 0; i < g_ctx_count; i++)
         if (g_ctx[i].nid == nid) {
             ps3_msf("hle:%s", g_ctx[i].name);
-            g_ctx[i].fn(ctx); return;
+            /* Record the name here too. This loop dispatches every
+             * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser
+             * and CRT surface: spinlocks, lwmutex, thread and fs ops -- and it
+             * returned without touching g_last_hle_name or the in-flight slot.
+             * So for a title wedged anywhere in that surface the watchdog named
+             * whichever TABLE handler ran last instead, with total confidence.
+             *
+             * Guitar Hero III wedges in sys_spinlock_unlock and was reported as
+             * "cellPadInit", which for a game that needs a guitar controller is
+             * a very convincing wrong answer to chase. */
+            g_last_hle_name = g_ctx[i].name;
+            { unsigned t = (unsigned)ctx->thread_id;
+              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
+            g_ctx[i].fn(ctx);
+            { unsigned t = (unsigned)ctx->thread_id;
+              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
+            return;
         }
 
     ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
