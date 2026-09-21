@@ -2213,8 +2213,23 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     /* Auto-map unmapped main memory. On real hardware PSL1GHT pre-maps its
      * whole RSX heap in gcmInitBody, so its libraries never call MapMainMemory
      * before handing an EA to the RSX (Tiny3D's command ring lives in an
-     * sys_mmapper region). Mirror that by mapping the 1MB page on first use. */
-    if (address < 0x40000000u) {
+     * sys_mmapper region). Mirror that by mapping the 1MB page on first use.
+     *
+     * The bound used to be a flat `< 0x40000000`, which is not a description of
+     * anything -- RSX local memory is already handled at the top of this
+     * function against its real base, and the raw-SPU window at 0x30000000 sits
+     * *below* the old bound, so it was not keeping that out either. What it did
+     * do was exclude titles whose RSX-visible heap lives high: Virtua Fighter 5
+     * maps 0x4A900000..0x4B400000 and then hands us 0x4B400040, which fell past
+     * 0x40000000, skipped the auto-map, and failed -- 976 times a boot, leaving
+     * the title with no offsets to draw with (20 draws in five minutes).
+     *
+     * So the test is now what it always meant: anything below RSX local memory
+     * is main memory. Local is checked first and returns above, so reaching
+     * here with an address under localAddress means an unmapped main-memory
+     * page, which is exactly the case this fallback exists for. */
+    u32 auto_map_limit = s_config.localAddress ? s_config.localAddress : 0x40000000u;
+    if (address < auto_map_limit) {
         u32 ea_page = address & ~0xFFFFFu;
         u32 io      = gcm_io_alloc(0x100000u);
         populate_offset_table(ea_page, io, 0x100000u);
@@ -2300,22 +2315,29 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
 /* NID: 0x5A41C10F */
 s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
 {
-    /* Both EA and IO must be 1MB aligned */
-    if ((ea & 0xFFFFF) != 0 || (io & 0xFFFFF) != 0)
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
-
-    if (size == 0 || (size & 0xFFFFF) != 0)
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
-
+    /* Logged before validation, and every failure path named -- same reason as
+     * cellGcmMapMainMemory above. Two of these returned silently AFTER the log
+     * line as well, so even a call that got that far could vanish. */
     printf("[cellGcmSys] MapEaIoAddress(ea=0x%08X, io=0x%08X, size=0x%X)\n", ea, io, size);
 
-    /* Check for overlap with existing mappings */
-    if (find_mapping_by_ea(ea) != NULL)
+    if ((ea & 0xFFFFF) != 0 || (io & 0xFFFFF) != 0) {
+        printf("[cellGcmSys] MapEaIoAddress REFUSED: ea 0x%08X / io 0x%08X not 1MB aligned\n", ea, io);
+        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+    }
+    if (size == 0 || (size & 0xFFFFF) != 0) {
+        printf("[cellGcmSys] MapEaIoAddress REFUSED: size 0x%X is not a non-zero multiple of 1MB\n", size);
+        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+    }
+    if (find_mapping_by_ea(ea) != NULL) {
+        printf("[cellGcmSys] MapEaIoAddress REFUSED: ea 0x%08X is already mapped\n", ea);
         return CELL_GCM_ERROR_ADDRESS_OVERWRAP;
+    }
 
     IoMapping* mapping = find_free_mapping();
-    if (!mapping)
+    if (!mapping) {
+        printf("[cellGcmSys] MapEaIoAddress REFUSED: no free IO mapping slots\n");
         return CELL_GCM_ERROR_FAILURE;
+    }
 
     mapping->ea     = ea;
     mapping->io     = io;
