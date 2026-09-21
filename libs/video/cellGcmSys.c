@@ -1232,6 +1232,21 @@ void* cellGcm_fifo_kick_event(void)
     return (void*)s_gcm_kick_ev;
 }
 
+/* The present thread's idle wait. It used to be a flat Sleep(4), which meant
+ * the kick above was created, signalled -- and waited on by nobody, so a
+ * starved guest still paid the full tick. Waiting here instead costs nothing
+ * when no one kicks (the timeout is the old sleep) and drains immediately when
+ * someone does. */
+void cellGcm_fifo_kick_wait(unsigned ms)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
+    HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    if (ev) WaitForSingleObject(ev, ms);
+    else    Sleep(ms);
+}
+
+
 /* Serializes fence publication between the present ticker and every guest
  * thread poll-reading the ref register (REFPOLL default-on made this path
  * multi-threaded; the SPSC queue head raced and publication order broke --

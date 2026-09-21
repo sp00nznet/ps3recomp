@@ -219,6 +219,7 @@ extern "C" int  rsx_null_backend_pump_messages(void);
 #  define rsx_backend_pump    rsx_null_backend_pump_messages
 #endif
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+extern "C" void cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
 extern "C" unsigned cellGcm_flip_request_count(void);
 extern "C" unsigned cellGcmGetCurrentDisplayBufferId(void);
 extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
@@ -400,7 +401,12 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * and catch up in a bounded burst so present latency never slows the game. */
     ULONGLONG next_tick = GetTickCount64();
     for (;;) {
-        Sleep(4);
+        /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
+         * fence queue, and had no waiter -- so a guest starved for `get` or a
+         * fence still paid the whole tick. Waiting on it keeps the same 4 ms
+         * ceiling when nothing kicks, and drains on demand when something
+         * does. */
+        cellGcm_fifo_kick_wait(4);
         ULONGLONG now = GetTickCount64();
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
