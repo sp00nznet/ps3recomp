@@ -1120,6 +1120,15 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
 #endif
+    /* PPU_FORCE_READ_ADDR also applies at byte width. The u32 path has had this
+     * for a while; a title's own feature flags are usually BYTES, so the u32
+     * hook could not reach the thing you most want to pin. Virtua Fighter 5's
+     * render gate is one byte at 0x104D320A -- a constructor clears it and
+     * nothing sets it back, and holding it lets the title flip again. */
+    { static int64_t _fa8=-2; static uint32_t _fv8=0;
+      if(_fa8==-2){ const char* e=getenv("PPU_FORCE_READ_ADDR"); _fa8=e?(int64_t)strtoul(e,0,16):-1;
+                    const char* ev=getenv("PPU_FORCE_READ_VAL"); _fv8=ev?(uint32_t)strtoul(ev,0,16):0; }
+      if (_fa8>=0 && (uint32_t)a==(uint32_t)_fa8) return (uint8_t)_fv8; }
     /* PPU_RWATCH=<hex>[,len]: log the first reads of a guest address range, with
      * the guest function that read it.
      *
