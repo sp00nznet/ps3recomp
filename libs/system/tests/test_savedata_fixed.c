@@ -67,7 +67,6 @@ int main(void)
         assert(fwrite(psf_magic, 1, sizeof psf_magic, f) == sizeof psf_magic);
         fclose(f);
     }
-    }
     vm_base = calloc(1, 0x200000); assert(vm_base);
     assert(cellSaveData_set_scratch_region(0x100000, 0x20000) == CELL_OK);
     assert(cellSaveData_set_scratch_region(0x100001, 0x20000) == CELL_SAVEDATA_ERROR_PARAM);
