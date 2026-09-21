@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extract WWS SPU job code modules (C0DEC0DE) from LBP's SDATA archives.
+Extract WWS SPU job code modules (C0DEC0DE) from a title's SDATA archives.
 
 Pipeline:
   1. SDATA-decrypt patch.sdat / data.sdat (same algorithm as the runtime's
@@ -12,9 +12,12 @@ Pipeline:
      inflated stream is exactly one module, so the inflated length IS the
      module's initialised (code+rodata) image; bss extends past it in LS.
 
-Output: lbp_spu/jobmods/jobmod_<sha1[:12]>_e<entryOffset>.bin
+Output: <outdir>/jobmod_<sha1[:12]>_e<entryOffset>.bin
+
+Usage:
+  python tools/extract_jobmods.py --usrdir <dev_hdd0>/game/<TITLEID>/USRDIR                                   --out   <port>/spu/jobmods
 """
-import glob, hashlib, os, struct, sys, zlib
+import argparse, glob, hashlib, os, struct, sys, zlib
 from Crypto.Cipher import AES
 
 SDAT_KEY   = bytes([0x0D,0x65,0x5E,0xF8,0xE6,0x74,0xA9,0x8A,0xB8,0x50,0x5C,0xFA,0x7D,0x01,0x29,0x33])
@@ -110,14 +113,25 @@ def find_modules(plain: bytes):
     return mods
 
 def main():
-    hdd0 = os.environ.get("PS3_HDD0_ROOT", "C:/Users/sewshee/Desktop/rpcs3/dev_hdd0")
-    usrdir = os.path.join(hdd0, "game/BCUS98148/USRDIR")
-    outdir = os.path.join(os.path.dirname(__file__), "..", "lbp_spu", "jobmods")
-    outdir = os.path.abspath(outdir)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--usrdir", default=os.environ.get("PS3_USRDIR"),
+                    help="The title's USRDIR (holds patch.sdat / data.sdat). "
+                         "Defaults to $PS3_USRDIR.")
+    ap.add_argument("--out", required=True,
+                    help="Directory to write the extracted modules into.")
+    ap.add_argument("--sdat", action="append", default=None, metavar="NAME",
+                    help="Archive filename to scan, repeatable "
+                         "(default: patch.sdat and data.sdat).")
+    args = ap.parse_args()
+    if not args.usrdir:
+        ap.error("--usrdir is required (or set PS3_USRDIR)")
+    usrdir = args.usrdir
+    outdir = os.path.abspath(args.out)
     os.makedirs(outdir, exist_ok=True)
 
     seen = {}   # sha1 -> module bytes
-    for name in ("patch.sdat", "data.sdat"):
+    for name in (args.sdat or ["patch.sdat", "data.sdat"]):
         path = os.path.join(usrdir, name)
         if not os.path.exists(path):
             print(f"  MISSING {path}", file=sys.stderr); continue

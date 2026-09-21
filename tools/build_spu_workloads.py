@@ -23,11 +23,11 @@ fingerprint computed here is byte-identical to runtime/spu/spu_workload.c's
 spu_workload_fingerprint() over spu_elf_image_size() bytes, so registrations and
 the images the title passes to cellSpurs line up.
 
-Example (LittleBigPlanet, 23 images):
+Example:
   python tools/build_spu_workloads.py \
-      --images lbp_spu --lifted lbp_spu/lifted \
-      --out lbp/gen/spu_workloads.c \
-      --register-fn lbp_spu_register_all --constructor --title lbp
+      --images <port>/spu/images --lifted <port>/spu \
+      --out <port>/spu/spu_workloads.c \
+      --register-fn port_spu_register_all --constructor --title <port>
 """
 import argparse, glob, os, re, subprocess, sys
 

@@ -383,6 +383,14 @@ Gave the project its first CI and its second platform, in **v0.9.0**.
   documented command against its tool's real argument parser turned up four more
   in the guide and two in the README. Fixed.
 
+### tomspilman — [@tomspilman](https://github.com/tomspilman)
+- **Found `spu_lifter.py --header-name` silently ignored** (#181) — the flag set
+  the output filename but the emitted `#include` stayed hardcoded to
+  `spu_recomp.h`, so any image lifted under a custom header name produced a
+  source file that could not compile. Every in-tree caller happens to pass the
+  default, which is exactly why it survived: a flag that only breaks for the
+  second person to use it.
+
 ### Filedownloader-tech — [@Filedownloader-tech](https://github.com/Filedownloader-tech)
 - **Build failure report with a full log** (#89) — the kind of report that can
   actually be acted on.

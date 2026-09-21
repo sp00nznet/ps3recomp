@@ -1530,7 +1530,6 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
                 (unsigned)bits, wobj); }
 }
 
-#define YDKJ_TASKSET_PM_SYSCALL_ADDR 0xA70u
 void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
@@ -1872,7 +1871,7 @@ void spu_indirect_branch(spu_context* ctx)
      * evidence that this is an HLE context. LLE tasks must enter Sony's policy
      * to yield/select workloads instead of parking an entire SPU host thread.
      * Image 22 is the legacy standalone HLE CRI task runner. */
-    if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
+    if (ctx->pc == SPURS_TASKSET_PM_SYSCALL_LS) {
         uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
                     | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
         /* A task dispatched standalone (no policy module in this local store)
@@ -1881,12 +1880,12 @@ void spu_indirect_branch(spu_context* ctx)
          * the only alternative to the HLE is the synthesised-stop exit below
          * -- which is how LBP's audio tasks (images 6/7) ended on their first
          * syscall and left the loading thread waiting on their event flag. */
-        int lifted = spu_lookup(YDKJ_TASKSET_PM_SYSCALL_ADDR, ctx->image_id) ||
-            (ctx->resident_task && spu_lookup(YDKJ_TASKSET_PM_SYSCALL_ADDR, ctx->resident_task)) ||
-            (ctx->resident_ovl  && spu_lookup(YDKJ_TASKSET_PM_SYSCALL_ADDR, ctx->resident_ovl));
-        int standalone = !ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR && !lifted;
+        int lifted = spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->image_id) ||
+            (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
+            (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
+        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted;
         if (ctx->image_id == 22 || standalone ||
-            (ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR)) {
+            (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS)) {
             spu_spurs_taskset_syscall(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
@@ -1898,7 +1897,7 @@ void spu_indirect_branch(spu_context* ctx)
      * the taskset from garbage -> waiting!=0 -> wrong resume path -> savedContextLr=0.
      * Inject r4 = taskset EA (0x0F000000) at the policy entry dispatch (this is the
      * exact point before the entry reads r4, after the kernel's arg setup). */
-    if (ctx->image_id == 23 && !getenv("YDKJ_NO_CRI_R4")) {
+    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && !getenv("YDKJ_NO_CRI_R4")) {
         static int s_r4 = -1; if (s_r4 < 0) s_r4 = getenv("YDKJ_CRI_CHAIN") ? 1 : 0;
         if (s_r4) {
             /* Force ctxt->taskset @LS 0x27B8 = the REAL game taskset EA on every

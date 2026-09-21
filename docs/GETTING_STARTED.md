@@ -218,7 +218,7 @@ if(MSVC)
 endif()
 ```
 
-`lbp/CMakeLists.txt` in this repository does exactly that and is the working
+`templates/project/CMakeLists.txt` in this repository does exactly that and is the working
 reference; the starter template does not set it for you.
 
 ### Step 7: Run

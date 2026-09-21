@@ -238,7 +238,7 @@ unset unless you are specifically working on that engine.
 `ps3recomp_runtime` (see the `list(FILTER ...)` in the root `CMakeLists.txt`).
 They `#include` the lifter-generated `ppu_recomp.h`, which only exists once you
 have lifted a specific title, so they are compiled **into your game target**
-rather than into the shared library. `lbp/CMakeLists.txt` shows the arrangement.
+rather than into the shared library. `templates/project/CMakeLists.txt` shows the arrangement.
 
 ---
 

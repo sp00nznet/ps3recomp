@@ -21,17 +21,15 @@ typedef void (*spu_dispatch_fn)(spu_context*);
 spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
 void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
 
-#define TASKSET_PM_SYSCALL_ADDR 0xA70u   /* mirrors YDKJ_TASKSET_PM_SYSCALL_ADDR */
-
 void spu_indirect_branch_mt(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK;
-    /* LBP_SPU_PCWATCH: attribute silent SPU spins (a task that stops logging
+    /* PS3_SPU_PCWATCH: attribute silent SPU spins (a task that stops logging
      * but never returns). Each SPU job runs on its own host thread, so a
      * thread-local counter + small PC ring is race-free; a trace line prints
      * every ~4M dispatches -- a healthy task finishes long before tripping. */
     { static int s_watch = -1;
-      if (s_watch < 0) s_watch = getenv("LBP_SPU_PCWATCH") ? 1 : 0;
+      if (s_watch < 0) s_watch = getenv("PS3_SPU_PCWATCH") ? 1 : 0;
       if (s_watch) {
           static _Thread_local unsigned long long n;
           static _Thread_local uint32_t ring[8];
@@ -54,8 +52,8 @@ void spu_indirect_branch_mt(spu_context* ctx)
     int special = (ctx->policy_mode &&
                    (pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
                     pc == SPURS_PM_SELECT_WORKLOAD_LS))
-                  || pc == TASKSET_PM_SYSCALL_ADDR
-                  || ctx->image_id == 23;
+                  || pc == SPURS_TASKSET_PM_SYSCALL_LS
+                  || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID;
     if (!special) {
         /* Resident overlay first (mirrors the full resolver): streamed plugin
          * code owns its LS range; base-image entries at the same address are

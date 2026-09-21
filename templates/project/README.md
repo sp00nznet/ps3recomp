@@ -36,7 +36,7 @@ the new files are picked up.
 
 | File | Purpose |
 |------|---------|
-| `main.cpp` | Boots the runtime and runs the ELF entry point. Reduced from `lbp/main.cpp`, which is the fully worked reference. |
+| `main.cpp` | Boots the runtime and runs the ELF entry point. |
 | `stubs.cpp` | Where you add HLE bridges for functions the runtime does not implement yet. |
 | `CMakeLists.txt` | Links `ps3recomp_runtime`, compiles the per-game PPU scaffold from `runtime/ppu/`, and sets `/bigobj` for the large generated translation units. |
 | `config.toml` | Lifter/porting settings for the title. |

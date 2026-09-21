@@ -96,7 +96,7 @@ extern "C" {
  * unavailable -- its dispatch is a plain call, so guest loops that iterate
  * through a computed jump leak a resolver frame per iteration. Title builds
  * that compile their lifted sources with clang should provide the thin
- * musttail fast path spu_indirect_branch_mt (see lbp/spu_dispatch_mt.c) and
+ * musttail fast path spu_indirect_branch_mt (runtime/spu/spu_dispatch_mt.c) and
  * define SPU_USE_DISPATCH_MT for the lifted TUs; dispatch sites below go
  * through SPU_IB_DISPATCH so the choice is a compile-time switch. */
 void spu_indirect_branch(spu_context* ctx);

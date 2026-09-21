@@ -14,21 +14,25 @@ For each module:
      last function is never disassembled (no .word data-as-code).
   3. unique --symbol-prefix per module so all 89 link together.
 
-Output: lbp_spu/lifted/<modname>/spu_recomp.{c,h}
-Also writes lbp_spu/lifted/jobmods_manifest.json: [{name, prefix, base, entry,
-sig(hex16), size, funcs, unsupported}].
+Output: <outdir>/<modname>/spu_recomp.{c,h}
+Also writes <outdir>/jobmods_manifest.json: [{name, prefix, base, entry,
+sig(hex16), size, funcs, unsupported}], and a registration TU (--register).
+
+Usage:
+  python tools/lift_jobmods.py --jobmods <port>/spu/jobmods                                --out     <port>/spu                                --register <port>/spu/jobmods_register.c
 """
-import glob, hashlib, json, os, struct, subprocess, sys
+import argparse, glob, hashlib, json, os, struct, subprocess, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wrap_spu_elf import wrap
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-JOBMODS= os.path.join(ROOT, "lbp_spu", "jobmods")
-OUTDIR = os.path.join(ROOT, "lbp_spu", "lifted")
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
 BASE   = 0x4000
 
-# Per-module code/data boundary. A few images embed a large rodata/const tail
+# Per-module code/data boundary, keyed by the module's content hash -- so this
+# table is title-agnostic by construction: any title shipping a byte-identical
+# module gets the same fixup, and a module not listed here is simply not fixed
+# up. A few images embed a large rodata/const tail
 # inside the executable segment; its bytes decode as in-range branches that
 # seed spurious "functions", disassembling the data as code (garbage + `.word`
 # for undecodable words). The boundary was found by disassembly: after the
@@ -120,9 +124,27 @@ def switch_table_targets(raw, base=BASE):
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--jobmods", required=True,
+                    help="Directory of extracted jobmod_*.bin (extract_jobmods.py --out).")
+    ap.add_argument("--out", required=True,
+                    help="Directory to lift into: <out>/<modname>/spu_recomp.{c,h}.")
+    ap.add_argument("--register", default=None, metavar="FILE",
+                    help="Write the registration TU here (default: <out>/jobmods_register.c).")
+    ap.add_argument("--symbol-prefix", default="port", metavar="NAME",
+                    help="C symbol prefix for the registration functions, so two "
+                         "ports linked in one tree cannot collide (default: port).")
+    args = ap.parse_args()
+    JOBMODS = args.jobmods
+    OUTDIR  = args.out
+    register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
+
     if EXTRA_FUNCS:
         print(f"  extra function entries: {', '.join(EXTRA_FUNCS)}")
     mods = sorted(glob.glob(os.path.join(JOBMODS, "*.bin")))
+    if not mods:
+        sys.exit(f"no jobmod_*.bin in {JOBMODS} -- run extract_jobmods.py first")
     os.makedirs(OUTDIR, exist_ok=True)
     manifest = []
     tmp_elf = os.path.join(OUTDIR, "_tmp.elf")
@@ -187,7 +209,7 @@ def main():
         os.remove(tmp_elf)
     with open(os.path.join(OUTDIR, "jobmods_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    emit_register(manifest)
+    emit_register(manifest, register_c, args.symbol_prefix)
     tot_unsup = sum(m["unsupported"] for m in manifest)
     print(f"\nLifted {len(manifest)} module(s), {tot_unsup} total unsupported instruction(s)")
     print(f"Manifest: {os.path.join(OUTDIR, 'jobmods_manifest.json')}")
@@ -195,10 +217,9 @@ def main():
 # Image ids for the job-code overlays. Well clear of the fingerprint-dispatched
 # images (1..25), the FMOD overlays (60..65) and the taskset policy (100).
 JOBMOD_IMAGE_BASE = 200
-REGISTER_C = os.path.join(ROOT, "lbp", "gen", "jobmods_register.c")
 
-def emit_register(manifest):
-    """Generate lbp/gen/jobmods_register.c: register every job module's lifted
+def emit_register(manifest, REGISTER_C, sym_prefix):
+    """Generate the registration TU: register every job module's lifted
     functions under a distinct image id, plus its 16-byte content signature so
     spu_overlay_note_get flips resident_ovl when the module DMAs into the job
     code buffer (LS 0x4000). Dispatched exactly like the FMOD codec overlays."""
@@ -218,7 +239,7 @@ def emit_register(manifest):
     for m in manifest:
         L.append(f"extern void {m['prefix']}spu_recomp_register(void);")
     L.append("")
-    L.append("void lbp_jobmods_register_all(void)")
+    L.append(f"void {sym_prefix}_jobmods_register_all(void)")
     L.append("{")
     for i, m in enumerate(manifest):
         img = JOBMOD_IMAGE_BASE + i
@@ -230,9 +251,9 @@ def emit_register(manifest):
     L.append("    spu_begin_image(0);")
     L.append("}")
     L.append("")
-    L.append("__attribute__((constructor)) static void lbp_jobmods_register_ctor(void)")
+    L.append(f"__attribute__((constructor)) static void {sym_prefix}_jobmods_register_ctor(void)")
     L.append("{")
-    L.append("    lbp_jobmods_register_all();")
+    L.append(f"    {sym_prefix}_jobmods_register_all();")
     L.append("}")
     L.append("")
     os.makedirs(os.path.dirname(REGISTER_C), exist_ok=True)

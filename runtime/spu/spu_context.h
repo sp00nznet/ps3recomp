@@ -367,6 +367,20 @@ typedef struct spu_context {
 #define SPURS_PM_EXIT_TO_KERNEL_LS   0x9C0u
 #define SPURS_PM_SELECT_WORKLOAD_LS  0x9D0u
 
+/* The taskset policy module's syscall trampoline. Both the full resolver
+ * (spu_channels.c) and the musttail fast path (spu_dispatch_mt.c) must treat a
+ * branch here as special, so the address lives here rather than being #defined
+ * twice -- it was, and the second copy carried a "mirrors the other one"
+ * comment, which is a drift bug waiting for someone to change one of them. */
+#define SPURS_TASKSET_PM_SYSCALL_LS  0xA70u
+
+/* Image whose dispatch must always reach the full resolver: the CRI audio
+ * image needs the resolver's r4 fixup, which the fast path cannot do without
+ * becoming the resolver. Named here for the same reason as the address above.
+ * ponytail: still a per-title magic id -- the durable fix is residency-aware
+ * dispatch (issue #59), which subsumes this. */
+#define SPU_RESOLVER_ONLY_IMAGE_ID   23
+
 /* ---------------------------------------------------------------------------
  * Initialization
  * -----------------------------------------------------------------------*/
