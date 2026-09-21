@@ -200,6 +200,10 @@ int cellSysutil_pump_seen(void) { return s_pump_seen; }
 
 s32 cellSysutilCheckCallback(void)
 {
+    /* Give a no-button dialog the title has left open past its grace period
+     * its dismissal. Done before the drain so the callback it queues is
+     * delivered on this same poll. */
+    { extern void cellMsgDialog_tick(void); cellMsgDialog_tick(); }
     drain_guest_completions();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll

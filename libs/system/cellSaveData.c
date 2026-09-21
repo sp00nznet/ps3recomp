@@ -103,6 +103,26 @@ static int dir_exists(const char* path)
 #endif
 }
 
+/* Does this directory hold an actual save, as opposed to merely existing?
+ *
+ * Firmware writes a PARAM.SFO into every savedata directory, so its presence is
+ * what separates a real save from an empty or half-made one. dir_exists() alone
+ * is not that test, and the difference is not academic: an empty
+ * BLUS30020-SYSTEM directory made Virtua Fighter 5's stat callback come back
+ * CELL_SAVEDATA_CBRESULT_ERR_BROKEN (-3), because we had told it isNewData=0 --
+ * "your save is there" -- and then handed it a directory with nothing in it.
+ * Reporting isNewData=1 for that case is both true and the answer that lets a
+ * title create the save it was looking for. */
+static int dir_has_save(const char* path)
+{
+    if (!dir_exists(path)) return 0;
+    char sfo[1024];
+    snprintf(sfo, sizeof(sfo), "%s/PARAM.SFO", path);
+    HOST_STAT_T st;
+    return HOST_STAT(sfo, &st) == 0;
+}
+
+
 /* ---------------------------------------------------------------------------
  * Guest-callback marshalling
  *
@@ -703,7 +723,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
 
-    int is_new = !dir_exists(save_path);
+    int is_new = !dir_has_save(save_path);
 
     printf("[cellSaveData] %s dir='%s' (new=%d)\n",
            is_save ? "SAVE" : "LOAD", dirName, is_new);
@@ -1026,7 +1046,9 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
         case CELL_SAVEDATA_CBRESULT_ERR_NODATA:  w = "funcFixed: ERR_NODATA -- it found nothing it wanted in our dirList"; break;
         case CELL_SAVEDATA_CBRESULT_ERR_INVALID: w = "funcFixed: ERR_INVALID"; break;
         }
-        printf("[cellSaveData] savedata_fixed: cbresult=%d listed=%u\n", result, listed);
+        printf("[cellSaveData] savedata_fixed: cbresult=%d listed=%u/%u prefix='%s' root='%s'\n",
+               result, listed, count,
+               prefix ? (const char*)(vm_base + prefix) : "", s_save_root);
         SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_CBRESULT, w);
     }
     if (!funcStat)
@@ -1135,7 +1157,7 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
      * isNewData=1 so its title state machine can advance. */
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
-    int is_new = !dir_exists(save_path);
+    int is_new = !dir_has_save(save_path);
 
     uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
     /* userdata arrives as a GUEST address in a pointer type (same convention as
@@ -1251,7 +1273,7 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
      * the correct, honest first step and matches the load path's behaviour.) */
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
-    int is_new = !dir_exists(save_path);
+    int is_new = !dir_has_save(save_path);
 
     uint32_t func_opd     = (uint32_t)(uintptr_t)funcStat;
     uint32_t userdata_ea  = (uint32_t)(uintptr_t)userdata;
@@ -1282,7 +1304,7 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
 
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
-    int is_new = !dir_exists(save_path);
+    int is_new = !dir_has_save(save_path);
 
     uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
     /* userdata arrives as a GUEST address in a pointer type (same convention as
