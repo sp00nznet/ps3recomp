@@ -2253,18 +2253,28 @@ static u32 gcm_io_alloc(u32 size)
 /* NID: 0x2A6FBA9C */
 s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
 {
-    if (!offset)
-        return CELL_GCM_ERROR_INVALID_VALUE;
-
-    /* Size must be 1MB aligned */
-    if (size == 0 || (size & 0xFFFFF) != 0)
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
-
-    /* EA must be 1MB aligned */
-    if ((ea & 0xFFFFF) != 0)
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
-
+    /* Log the REQUEST before validating it. Every rejection below used to
+     * happen before the only printf in this function, so a title whose
+     * mapping we refused looked -- in the log -- like a title that never asked.
+     * Virtua Fighter 5 then fails cellGcmAddressToOffset ~976 times a boot for
+     * addresses immediately past the region it did get, draws 20 times instead
+     * of thousands, and never flips; the refusal that would explain it was
+     * invisible. Same lesson as the savedata early returns. */
     printf("[cellGcmSys] MapMainMemory(ea=0x%08X, size=0x%X)\n", ea, size);
+
+    if (!offset) {
+        printf("[cellGcmSys] MapMainMemory REFUSED: offset out-param is NULL\n");
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    }
+    /* Size and EA must both be 1MB aligned. */
+    if (size == 0 || (size & 0xFFFFF) != 0) {
+        printf("[cellGcmSys] MapMainMemory REFUSED: size 0x%X is not a non-zero multiple of 1MB\n", size);
+        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+    }
+    if ((ea & 0xFFFFF) != 0) {
+        printf("[cellGcmSys] MapMainMemory REFUSED: ea 0x%08X is not 1MB aligned\n", ea);
+        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+    }
 
     /* Allocate a fresh IO region past the Init command-buffer window. */
     u32 io_offset = gcm_io_alloc(size);
