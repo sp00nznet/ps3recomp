@@ -52,22 +52,32 @@ int main(void)
     cellSysutilCheckCallback(); assert(calls == 3 && last_result == CELL_MSGDIALOG_BUTTON_NONE);
     cellSysutilCheckCallback(); assert(calls == 3);
 
-    /* The headless yes/no auto-answer must not answer YES to a prompt that
-     * offers to ABORT something: Virtua Fighter 5 asks "Are you sure you want
-     * to cancel checking the game data?" and "Do you want to cancel the load
-     * operation?" during boot, and a blanket YES cancelled its own game-data
-     * check and then its own load. The "Install data" YESNO above still
-     * answers YES, which is the other half of the contract. */
+    /* The yes/no auto-answer. DEFAULT is a blanket YES, including for a prompt
+     * that offers to abort something -- see cellMsgDialog.c for why the
+     * semantically better answer is opt-in (`MSGDIALOG_ANSWER=auto`): Virtua
+     * Fighter 5 boots further on the blanket YES, and correctness about the
+     * button is worth less than the title booting. Assert the default, so that
+     * if it is ever flipped it is flipped deliberately. */
     memcpy(vm_base + 0x300, "Do you want to cancel the load operation?", 42);
     assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL |
                               CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO,
                               (void*)0x300, (void*)0x100, (void*)0x1234, NULL) == CELL_OK);
     cellSysutilCheckCallback();
-    assert(calls == 4 && last_result == CELL_MSGDIALOG_BUTTON_NO);
+    assert(calls == 4 && last_result == CELL_MSGDIALOG_BUTTON_YES);
 
-    /* MSGDIALOG_ANSWER overrides the heuristic in both directions -- but the
-     * decision is cached on first use, so it cannot be re-read here; the knob
-     * is exercised by setting it before the run. */
+    /* The heuristic =auto would use, tested directly: the decision is cached on
+     * first use so the env cannot be flipped mid-run, but the predicate is the
+     * whole of the logic and it is right here in this translation unit. */
+    assert(msg_offers_to_abort("Are you sure you want to cancel checking the game data?"));
+    assert(msg_offers_to_abort("Do you want to cancel the load operation?"));
+    assert(msg_offers_to_abort("CANCEL?"));
+    assert(msg_offers_to_abort("Quit the game?"));
+    assert(msg_offers_to_abort("Abort installation?"));
+    assert(!msg_offers_to_abort("Do you want to use game data? The HDD access indicator will flash"));
+    assert(!msg_offers_to_abort("Save complete."));
+    assert(!msg_offers_to_abort(""));
+    assert(!msg_offers_to_abort(NULL));
+
 
     free(vm_base);
     puts("Deferred dialog and button-mask checks passed");

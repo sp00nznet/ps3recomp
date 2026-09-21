@@ -54,6 +54,20 @@ int main(void)
     char path[256];
     snprintf(path, sizeof(path), "%s/TEST00001", root); assert(mkdir(path, 0700) == 0);
     snprintf(path, sizeof(path), "%s/TEST00002", root); assert(mkdir(path, 0700) == 0);
+
+    /* A savedata directory is only a SAVE once it has a PARAM.SFO -- firmware
+     * writes one into every save, and cellSaveData now uses its presence to
+     * decide isNewData (an empty directory is a half-made one, not a save).
+     * Give the fixtures theirs, or the "existing directory" assertion in
+     * guest_callback is checking a directory that now reports isNewData=1. */
+    static const unsigned char psf_magic[4] = { 0, 'P', 'S', 'F' };
+    for (int n = 1; n <= 2; n++) {
+        snprintf(path, sizeof(path), "%s/TEST0000%d/PARAM.SFO", root, n);
+        FILE* f = fopen(path, "wb"); assert(f);
+        assert(fwrite(psf_magic, 1, sizeof psf_magic, f) == sizeof psf_magic);
+        fclose(f);
+    }
+    }
     vm_base = calloc(1, 0x200000); assert(vm_base);
     assert(cellSaveData_set_scratch_region(0x100000, 0x20000) == CELL_OK);
     assert(cellSaveData_set_scratch_region(0x100001, 0x20000) == CELL_SAVEDATA_ERROR_PARAM);
@@ -99,6 +113,8 @@ int main(void)
     assert(ctx.gpr[3] == CELL_OK && fixed_calls == 7 && stat_calls == 2);
     assert(cellSaveDataListAutoLoad(0, 3, (void*)0x100, (void*)0x200,
            (void*)0x800, (void*)0x900, NULL, 0, (void*)0xCAFE) == CELL_SAVEDATA_ERROR_PARAM);
+    snprintf(path, sizeof(path), "%s/TEST00001/PARAM.SFO", root); remove(path);
+    snprintf(path, sizeof(path), "%s/TEST00002/PARAM.SFO", root); remove(path);
     snprintf(path, sizeof(path), "%s/TEST00001", root); assert(rmdir(path) == 0);
     snprintf(path, sizeof(path), "%s/TEST00002", root); assert(rmdir(path) == 0);
     assert(rmdir(root) == 0); free(vm_base);
