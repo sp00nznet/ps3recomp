@@ -1365,7 +1365,14 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
      * with the writing guest function -- to find who fills (or fails to fill)
      * a struct field (e.g. FMOD's overlay descriptor source at 0x94F680). */
     { static uint32_t s_ww = 0xFFFFFFFFu;
-      if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("PPU_WWATCH"); s_ww = e ? (uint32_t)strtoul(e,0,0) : 0;
+      if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("PPU_WWATCH");
+                                 /* base 16, not 0: the variable is documented as <hexEA>
+                                  * and everyone writes it bare. Under base 0 "10708A14"
+                                  * parses as DECIMAL and stops at the 'A', arming the
+                                  * watch on a different address entirely -- which then
+                                  * reports "nothing writes this" for an address that is
+                                  * written constantly. A 0x prefix still works. */
+                                 s_ww = e ? (uint32_t)strtoul(e,0,16) : 0;
                                  ww_arm_inline_window(s_ww); }
       /* PPU_WWATCH_LEN=<bytes>: widen the watched span. 0x20 is fine for a single
        * field but useless for "who fills this struct" -- the SPURS instance is
