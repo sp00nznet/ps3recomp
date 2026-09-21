@@ -2881,7 +2881,21 @@ void cellGcmSetDefaultCommandBuffer(void)
      * into the guest variable cellGcmInit's ctx_out pointed at, and rewind that
      * context. Off by default because a title managing its own segment chain
      * may hold pointers into the old one; this exists to be measured, not
-     * assumed. */
+     * assumed.
+     *
+     * Measured once now, on Virtua Fighter 5, which is the case this was
+     * written for. VF5's AMGL keeps its own command buffers (it repoints
+     * gCellGcmCurrentContext at a 512 KB segment of its own inside the 4 MB it
+     * maps) and calls this entry to recover when one fills. Getting a host-side
+     * struct zeroed instead leaves it on the exhausted segment, so it allocates
+     * another, fills that, and asks again:
+     *
+     *     [AMGL]:[ERROR] Command Buffer Overflow!   x91, 636 calls to here
+     *
+     * With the repoint: **0 overflows**, and the command packets reaching the
+     * draw engine go from 12,756 to 15,097 over the same five minutes. Still
+     * one title's evidence, so still opt-in -- but it is no longer unmeasured,
+     * and a port whose title manages its own segments should try it. */
     if (getenv("GCM_DEFAULT_CTX_REPOINT") && s_gcm_ctx_out_ea && s_gcm_context_ea) {
         vm_write32(s_gcm_context_ea + 0x8, vm_read32(s_gcm_context_ea + 0x0));
         vm_write32(s_gcm_ctx_out_ea, s_gcm_context_ea);
