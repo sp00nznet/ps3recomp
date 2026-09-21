@@ -2228,11 +2228,42 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
      * is main memory. Local is checked first and returns above, so reaching
      * here with an address under localAddress means an unmapped main-memory
      * page, which is exactly the case this fallback exists for. */
+    /* NULL is not a buffer. Auto-mapping it costs an IO page and, worse, hands
+     * the title a real-looking offset for guest address 0 -- so an EA the title
+     * computed as NULL (a failed allocation, an out-param it never filled)
+     * silently becomes a valid RSX offset instead of an error it could notice.
+     * The Orange Box's chooser asks for exactly this, and the page it burned was
+     * the one the following cellGcmMapMainMemory would otherwise have taken. */
+    if (address < 0x100000u) {
+        printf("[cellGcmSys] AddressToOffset REFUSED: ea 0x%08X is not a mappable "
+               "address (page 0)\n", address);
+        vm_write32(off_ea, 0);
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    }
+
     u32 auto_map_limit = s_config.localAddress ? s_config.localAddress : 0x40000000u;
     if (address < auto_map_limit) {
         u32 ea_page = address & ~0xFFFFFu;
         u32 io      = gcm_io_alloc(0x100000u);
         populate_offset_table(ea_page, io, 0x100000u);
+        /* Record it in the mapping list too, not just the offset table.
+         *
+         * These are two different structures answering two different questions,
+         * and only the offset table was being filled in. The FIFO walker
+         * resolves io -> ea through the MAPPING LIST (find_io_mapping_by_io),
+         * so an auto-mapped range was invisible to it: a JUMP into one reported
+         * "no IO mapping", the walker resynced straight to put, and every fence
+         * in the skipped range was lost -- which strands a title spinning on
+         * ctrl->ref with no way to see why. Both paths have to agree about what
+         * is mapped. */
+        IoMapping* m = find_free_mapping();
+        if (m) {
+            m->ea = ea_page; m->io = io; m->size = 0x100000u; m->active = 1;
+            s_io_mapping_count++;
+        } else {
+            printf("[cellGcmSys] WARNING: auto-map has no free IO mapping slot; "
+                   "the FIFO will not be able to walk io 0x%08X\n", io);
+        }
         printf("[cellGcmSys] AddressToOffset: auto-mapped ea 0x%08X -> io 0x%08X\n",
                ea_page, io);
         vm_write32(off_ea, io | (address & 0xFFFFFu));
