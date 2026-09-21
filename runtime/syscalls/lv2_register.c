@@ -26,6 +26,15 @@
 extern void sys_rsx_init(lv2_syscall_table* tbl);   /* libs/video/sys_rsx.c */
 extern void sys_raw_spu_init(lv2_syscall_table* tbl);   /* runtime/spu/spu_raw.c */
 extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
+
+/* Guest scratch for an SPU ELF staged by sys_spu_image_open, which reads the
+ * file in and then re-enters the import path with it. Shares the 16 MB region
+ * below the TLS block (0x0E000000) with the segment tables built by
+ * sys_spu_image_import: those grow up from 0x0D000000, these from the halfway
+ * mark, so the two only meet after ~350k segment records. */
+#define SPU_IMAGE_STAGE_BASE 0x0D800000u
+#define SPU_IMAGE_STAGE_END  0x0E000000u
+#define SPU_IMAGE_STAGE_MAX  0x00100000u   /* 1 MB: an SPU image is <=256 KB + headers */
 #include "ps3emu/spu_fallback.h"
 #include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
 #include "../spu/spu_lifted_thread.h" /* run a thread's own image, lifted */
@@ -2061,35 +2070,82 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
         return 0;
     }
 
-    /* ELF32 header is 52 bytes. We need:
-     *   +16  e_type    (2 bytes)   2 = ET_EXEC
-     *   +18  e_machine (2 bytes)   23 = EM_SPU
-     *   +24  e_entry   (4 bytes)
+    /* Read the WHOLE image into guest memory and hand it to the import path.
+     *
+     * This used to read 52 bytes, report e_entry and stop, on the reasoning that
+     * lifted SPU code does not execute out of local store so the segments need
+     * not be materialised. Two things actually do depend on them:
+     *
+     *   - the raw-SPU layer resolves an image to its lifted entry by
+     *     FINGERPRINTING THE ELF BYTES, and only _sys_spu_image_import ever did
+     *     that. A title loading raw SPU images by path never reached the
+     *     registry, so a correctly registered image was never found and the SPU
+     *     never started -- while the PPU span forever on SPU_Mbox_Stat waiting
+     *     for a message from it.
+     *   - lifted SPU code still READS local store for its own constants and
+     *     data. An image whose descriptor carries zero segments comes up in
+     *     4096 zeroed lines and halts at LS 0, which looks exactly like a
+     *     lifting bug and is not one.
+     *
+     * An image named by path is an image imported from memory once the file has
+     * been read in: same ELF, same segment table, same fingerprint. So stage the
+     * bytes and call sys_spu_image_import_handler rather than re-deriving any of
+     * it here -- re-deriving is how the two paths drifted apart to begin with.
      */
-    uint8_t hdr[52];
-    size_t got = fread(hdr, 1, sizeof(hdr), f);
+    long fsz = (fseek(f, 0, SEEK_END) == 0) ? ftell(f) : -1;
+    if (fsz <= 0 || fsz > (long)SPU_IMAGE_STAGE_MAX || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' — implausible size %ld\n",
+                img_ea, ps3_path, fsz);
+        fflush(stderr);
+        ctx->gpr[3] = 0;
+        return 0;
+    }
+
+    /* Guest scratch for the staged ELF. It shares the 16 MB region below the TLS
+     * block with the segment tables, which grow up from 0x0D000000; images grow
+     * up from the halfway mark. Reaching the 8 MB that would let them meet needs
+     * ~350k segment records, which no title comes close to. */
+    static uint32_t s_spu_img_bump = SPU_IMAGE_STAGE_BASE;
+    if (s_spu_img_bump + (uint32_t)fsz > SPU_IMAGE_STAGE_END)
+        s_spu_img_bump = SPU_IMAGE_STAGE_BASE;                 /* wrap */
+    uint32_t staged_ea = s_spu_img_bump;
+
+    /* Read into a host buffer and copy, rather than fread-ing straight into the
+     * guest map: a short read then cannot leave half an image staged for the
+     * import path to parse as a whole one. */
+    uint8_t* buf = (uint8_t*)malloc((size_t)fsz);
+    size_t got = buf ? fread(buf, 1, (size_t)fsz, f) : 0;
     fclose(f);
-
-    uint32_t entry = 0;
-    int valid_elf = 0;
-    if (got >= 52 && hdr[0] == 0x7F && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
-        valid_elf = 1;
-        /* Big-endian on PS3 */
-        entry = ((uint32_t)hdr[24] << 24) |
-                ((uint32_t)hdr[25] << 16) |
-                ((uint32_t)hdr[26] <<  8) |
-                ((uint32_t)hdr[27]);
+    if (got != (size_t)fsz) {
+        fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' — short read "
+                        "(%zu of %ld)\n", img_ea, ps3_path, got, fsz);
+        fflush(stderr);
+        free(buf);
+        ctx->gpr[3] = 0;
+        return 0;
     }
+    memcpy(vm_base + staged_ea, buf, (size_t)fsz);
+    free(buf);
+    s_spu_img_bump += ((uint32_t)fsz + 0x7F) & ~0x7Fu;          /* keep it aligned */
 
-    if (img_ea && vm_base) {
-        vm_write_be32(img_ea + 4, entry);
-    }
-
-    fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' entry=0x%08X%s\n",
-            img_ea, ps3_path, entry, valid_elf ? "" : " (header invalid — entry left 0)");
+    fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' staged %ld bytes at "
+                    "0x%08X\n", img_ea, ps3_path, fsz, staged_ea);
     fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+
+    /* Re-enter as an import of the staged bytes. gpr[4] is the source operand in
+     * both calls -- a path here, a guest EA there -- so this is the same syscall
+     * with the file resolved. */
+    uint64_t saved_r4 = ctx->gpr[4], saved_r5 = ctx->gpr[5];
+    ctx->gpr[4] = staged_ea;
+    ctx->gpr[5] = 1;                                            /* DIRECT */
+    int64_t rc = sys_spu_image_import_handler(ctx);
+    ctx->gpr[4] = saved_r4;
+    ctx->gpr[5] = saved_r5;
+
+    /* sys_spu_image_open reports success/failure the same way, so let the
+     * import result stand rather than overwriting it with a soft 0. */
+    return rc;
 }
 
 /* ---------------------------------------------------------------------------
