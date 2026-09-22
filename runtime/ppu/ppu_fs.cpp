@@ -475,6 +475,52 @@ static void cellFsWrite(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
+/* cellFsFGetBlockSize(int fd, u64* sector_size, u64* block_size)
+ * cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
+ *
+ * Titles ask the filesystem what granularity it wants and then size and ALIGN
+ * their reads to the answer. Left unregistered, the call fell through to the
+ * unresolved-NID path: the out-params were never written, so the title read
+ * whatever was already in them.
+ *
+ * The Orange Box's chooser does exactly this. With no answer it re-seeks to
+ * offset 0 and re-reads the same 64 KB of APP_CHOOSER.GRP forever -- 241,997
+ * reads and 15.86 GB of I/O against a 4 MB file in one run -- because the
+ * offset arithmetic it derives from the block size collapses to zero.
+ *
+ * Both out-params are u64 and big-endian, so they go through vm_write64.
+ * PS3_FS_BLOCK_SIZE overrides the value for a title that wants a different
+ * granularity. */
+static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t blk_ptr)
+{
+    static uint64_t bs = 0;
+    if (!bs) {
+        const char* e = getenv("PS3_FS_BLOCK_SIZE");
+        bs = (e && *e) ? (uint64_t)strtoull(e, nullptr, 0) : 4096ull;
+        if (!bs) bs = 4096ull;
+    }
+    if (sec_ptr) vm_write64(sec_ptr, bs);
+    if (blk_ptr) vm_write64(blk_ptr, bs);
+    ctx->gpr[3] = CELL_OK;
+}
+
+static void cellFsFGetBlockSize(ppu_context* ctx)
+{
+    int fd = (int)(uint32_t)ctx->gpr[3];
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
+        return;
+    }
+    fs_report_block_size(ctx, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
+}
+
+static void cellFsGetBlockSize(ppu_context* ctx)
+{
+    /* Path variant: the answer does not depend on the file, only the device,
+     * and every mount we serve is backed by the same host filesystem. */
+    fs_report_block_size(ctx, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
+}
+
 static void cellFsLseek(ppu_context* ctx)
 {
     int fd        = (int)(uint32_t)ctx->gpr[3];
@@ -736,6 +782,8 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFstat"),    "cellFsFstat",    cellFsFstat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpendir"),  "cellFsOpendir",  cellFsOpendir);
