@@ -454,6 +454,16 @@ static uint32_t samp_lookup(uintptr_t rip)
      * describes one function. Kept in preference to RtlLookupFunctionEntry
      * because the lifted TU carries no .pdata (the startup self-check says so),
      * which makes the exact path blind to guest code entirely. */
+    /* CAVEAT -- identical code folding. The linker merges functions with
+     * identical bodies, and a lifted tree has thousands of `{ return; }`
+     * stubs, so many guest addresses share ONE host address. The map then
+     * holds several entries at that address and this search picks whichever
+     * the sort left first: the name is then one arbitrary member of the fold,
+     * not the function that ran. Guitar Hero III profiled as 9% in
+     * func_009927A4, which is `{ return; }` -- a hot empty stub is the
+     * signature of this, not a finding. A folded attribution says "some
+     * trivial function", nothing more; only a name with a real body is
+     * evidence. */
     uintptr_t next = (k + 1 < s_samp_n) ? s_samp_map[k + 1].h : s_samp_map[k].h + 0x20000;
     if (rip >= next) return 0;
     return s_samp_map[k].spu ? (0x80000000u | s_samp_map[k].g) : s_samp_map[k].g;
