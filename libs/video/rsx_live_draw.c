@@ -6439,6 +6439,23 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             }
         }
         if (sampled >= 0) {
+            /* LD_ALIAS_DBG also reports the HIT. A texture that aliases a render
+             * surface when it should not is exactly as interesting as one that
+             * fails to alias when it should, and only the miss was visible --
+             * so a title whose every bind resolves to a surface (binds[real=0
+             * surf=N] in the frame stats) had no way to show WHY. Guitar Hero
+             * III does that: every bind lands on a surface and not one real
+             * texture is ever created, so the screen stays black. */
+            if (getenv("LD_ALIAS_DBG")) {
+                static u32 n_hit = 0;
+                if (n_hit++ < 24)
+                    fprintf(stderr, "[alias-hit] tex %u:0x%08X fmt=0x%02X %ux%u "
+                            "-> surface[%d] %u:0x%08X %ux%u" "\n",
+                            t.location, t.offset, t.format, t.width, t.height,
+                            sampled, g.surfaces[sampled].location,
+                            g.surfaces[sampled].offset,
+                            g.surfaces[sampled].w, g.surfaces[sampled].h);
+            }
             slots[u] = SRV_SURFACE_BASE + sampled;
             g_ld_bind_surf++;
             int seen = 0;
