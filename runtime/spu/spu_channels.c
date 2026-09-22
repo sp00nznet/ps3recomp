@@ -88,6 +88,13 @@ int (*g_spu_user_event_hook)(spu_context*, uint32_t) = NULL;
 void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
                             int is_intr, uint32_t value) = 0;
 
+/* Every MFC PUT an SPU completes, if anyone is listening. Installed by the GCM
+ * layer (libs/video/cellGcmSys.c), which needs it to find the RSX pushbuffer:
+ * a title whose SPUs build the command stream never tells libgcm where that
+ * stream is, so the only evidence is the DMA that writes it. NULL until
+ * installed, so a title with no SPU-built FIFO pays nothing. */
+void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+
 void spu_halt(spu_context* ctx)
 {
     /* Register/context dump at halt-asserts: the WWS job's parameter guard

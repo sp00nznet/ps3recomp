@@ -144,9 +144,21 @@ static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p
 /* ---------------------------------------------------------------------------
  * Channel state
  * -----------------------------------------------------------------------*/
+/* Channel capacity. Most SPU channels are genuinely one deep, but the PPU->SPU
+ * inbound mailbox is FOUR on hardware, and a title that sends a multi-word
+ * message writes the words back to back after checking the free-slot count. A
+ * one-deep channel drops all but one of them, and the SPU then blocks forever
+ * on a message it half received -- silently, because nothing is wrong with
+ * either side. The Orange Box's CB.SPU takes a two-word work descriptor this
+ * way. (The rcv_evt[4] queue below is the same problem, solved once ad hoc for
+ * sys_spu_thread_receive_event's four-word reply.) */
+#define SPU_CHANNEL_CAP 4
+
 typedef struct spu_channel {
-    uint32_t value;
-    uint32_t count;   /* number of valid entries (0 or 1 for most channels) */
+    uint32_t value;   /* head: the value the next read returns */
+    uint32_t count;   /* number of valid entries, 0..SPU_CHANNEL_CAP */
+    uint32_t q[SPU_CHANNEL_CAP];
+    uint32_t head;
 } spu_channel;
 
 /* ---------------------------------------------------------------------------
@@ -611,16 +623,30 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
 /* ---------------------------------------------------------------------------
  * Channel read/write helpers
  * -----------------------------------------------------------------------*/
+/* `value` stays the head, and `count` the number of entries, so the many places
+ * that read those two fields directly keep working unchanged. */
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
-    ch->value = val;
-    ch->count = 1;
+    if (ch->count >= SPU_CHANNEL_CAP) {
+        /* Full. Hardware would not have accepted the write -- the sender is
+         * supposed to check the free-slot count first -- so drop the OLDEST,
+         * which keeps the most recent message intact rather than the stalest. */
+        ch->head = (ch->head + 1u) % SPU_CHANNEL_CAP;
+        ch->count--;
+    }
+    ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = val;
+    ch->count++;
+    ch->value = ch->q[ch->head];
 }
 
 static inline uint32_t spu_channel_read(spu_channel* ch)
 {
     uint32_t val = ch->value;
-    ch->count = 0;
+    if (ch->count) {
+        ch->head = (ch->head + 1u) % SPU_CHANNEL_CAP;
+        ch->count--;
+        if (ch->count) ch->value = ch->q[ch->head];
+    }
     return val;
 }
 

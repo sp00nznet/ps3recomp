@@ -60,13 +60,16 @@ extern void ps3_hle_register_ctx(uint32_t nid, const char* name,
  * [23:16] out-interrupt count.
  *
  * Hardware's PPU->SPU mailbox is four deep and the guest checks the free-slot
- * field before every write. spu_channel models a single entry, so advertise one
- * slot rather than four -- claiming four would invite the PPU to write three
- * words the channel then silently drops. */
+ * field before every write. This used to advertise ONE, because spu_channel
+ * held one value -- claiming four would have invited the PPU to write three
+ * words the channel then dropped. spu_channel now holds SPU_CHANNEL_CAP, so
+ * report the real depth: a title sending a multi-word work descriptor (The
+ * Orange Box sends CB.SPU two words) otherwise has all but one silently
+ * discarded, and the SPU blocks forever on a message it half received. */
 /* Defined in spu_intr.inc, included below; used by the mailbox hook above it. */
 static void ps3_intr_raise(uint32_t tag);
 
-#define SPU_RAW_IN_MBOX_DEPTH  SPU_MBOX_DEPTH
+#define SPU_RAW_IN_MBOX_DEPTH  SPU_CHANNEL_CAP
 #define MBOX_STATUS(out_n, in_free, intr_n) \
     (((uint32_t)(out_n) & 0xFF) | (((uint32_t)(in_free) & 0xFF) << 8) | \
      (((uint32_t)(intr_n) & 0xFF) << 16))
@@ -131,7 +134,7 @@ static void publish(raw_spu* s)
     be32_store(s->base + SPU_RAW_STATUS, c->status);
     be32_store(s->base + SPU_RAW_MBOX_STATUS,
                MBOX_STATUS(c->ch_out_mbox.count,
-                           SPU_MBOX_DEPTH - c->ch_in_mbox.count,
+                           SPU_RAW_IN_MBOX_DEPTH - c->ch_in_mbox.count,
                            c->ch_out_intr_mbox.count));
     if (c->ch_out_mbox.count)
         be32_store(s->base + SPU_RAW_OUT_MBOX, c->ch_out_mbox.value);

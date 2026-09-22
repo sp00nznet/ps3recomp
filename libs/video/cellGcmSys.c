@@ -461,6 +461,16 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, 0);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, 0);
 
+    /* Watch SPU DMA for pushbuffers. A title that builds its command stream on
+     * an SPU never tells libgcm where that stream is, so the write is the only
+     * evidence of it -- see gcm_note_spu_put. Costs one NULL check per SPU DMA
+     * for titles that do not. */
+    { extern void (*g_spu_put_hook)(u32 ea, u32 size);
+      void gcm_note_spu_put(u32 ea, u32 size);       /* defined with the walker */
+      void gcm_forget_spu_blocks(void);
+      gcm_forget_spu_blocks();
+      g_spu_put_hook = gcm_note_spu_put; }
+
     s_gcm_initialized = 1;
     return CELL_OK;
 }
@@ -1102,6 +1112,83 @@ static u32 s_tr_i = 0;
  * FIFO lives. */
 static void gcm_ref_push_at(u32 v, u32 getoff);
 
+/* ---- SPU-built pushbuffers ------------------------------------------------
+ * Some titles do not build the RSX command stream on the PPU at all. The
+ * Orange Box is one: its libgcm context points at a 64 KB buffer in the
+ * binary's own .bss that is never mapped into IO space, because that buffer is
+ * where the PPU records draw commands for an SPU to consume. CB.SPU reads it
+ * and DMAs the real pushbuffer into mapped main memory, then `put` is set past
+ * the end of what it wrote.
+ *
+ * So libgcm is never told where the stream is, and the walker -- which starts
+ * at IO 0 and has no JUMP to follow, because the SPU side did the binding --
+ * scans tens of megabytes of unrelated memory, NOPs through the zeros (a zero
+ * word is a valid NOP) and dies on the first vertex float it meets.
+ *
+ * The DMA is the only evidence there is, so record it. Each PUT that lands in
+ * a mapped IO range is a candidate pushbuffer; the one that ends just short of
+ * `put` is the block the RSX is actually being pointed at. */
+#define GCM_SPU_BLK_N 16
+static struct { u32 io_start, io_end; } s_spu_blk[GCM_SPU_BLK_N];
+static int s_spu_blk_w = 0;
+
+/* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
+static u32 gcm_ea2io_range(u32 ea, u32* room)
+{
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+        IoMapping* m = &s_io_mappings[i];
+        if (!m->active || !m->size) continue;
+        if (ea >= m->ea && ea < m->ea + m->size) {
+            if (room) *room = m->ea + m->size - ea;
+            return m->io + (ea - m->ea);
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+void gcm_forget_spu_blocks(void)
+{
+    memset(s_spu_blk, 0, sizeof s_spu_blk);
+    s_spu_blk_w = 0;
+}
+
+void gcm_note_spu_put(u32 ea, u32 size)
+{
+    if (!size || size > 0x40000u) return;
+    u32 room = 0;
+    u32 io = gcm_ea2io_range(ea, &room);
+    if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
+
+    /* Coalesce with the previous block when an SPU emits one buffer in several
+     * transfers -- otherwise only the last fragment is remembered and the
+     * walker still starts in the middle of the stream. */
+    int prev = (s_spu_blk_w + GCM_SPU_BLK_N - 1) % GCM_SPU_BLK_N;
+    if (s_spu_blk[prev].io_end == io) { s_spu_blk[prev].io_end = io + size; return; }
+
+    s_spu_blk[s_spu_blk_w].io_start = io;
+    s_spu_blk[s_spu_blk_w].io_end   = io + size;
+    s_spu_blk_w = (s_spu_blk_w + 1) % GCM_SPU_BLK_N;
+}
+
+/* The recorded block the RSX is being pointed at, or 0xFFFFFFFF.
+ *
+ * `put` sits at or just past the end of the block the title wants executed --
+ * the gap is whatever libgcm appended after the SPU's data, a fence and its
+ * argument in this title's case. Require the block to END within a small window
+ * before `put` and to START before it, so an older double-buffered block (the
+ * SPU alternates between two) is not chosen over the current one. */
+static u32 gcm_spu_block_for_put(u32 put)
+{
+    u32 best = 0xFFFFFFFFu, best_end = 0;
+    for (int i = 0; i < GCM_SPU_BLK_N; i++) {
+        u32 s = s_spu_blk[i].io_start, e = s_spu_blk[i].io_end;
+        if (!e || s >= put || e > put) continue;
+        if (put - e > 0x40u) continue;              /* too far back to be current */
+        if (e >= best_end) { best_end = e; best = s; }
+    }
+    return best;
+}
+
 /* A resync jumps `get` straight to `put`, which is what keeps the FIFO alive
  * when the walker cannot make progress -- but everything in between is
  * dropped, and if a SET_REFERENCE is in there the cellGcmFinish waiting on it
@@ -1118,10 +1205,25 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
     if (n++ < 8)
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
                 why, *getoff, put);
-    u32 from = (*getoff <= put) ? *getoff : s_last_ring_off;
-    if (from < put) {
+    /* If an SPU DMA'd a pushbuffer that ends just short of `put`, that is the
+     * stream the RSX is being pointed at -- land at its START and walk it,
+     * instead of landing on `put` and skipping it. Resyncing to `put` keeps the
+     * FIFO alive but drops every command in between, and SET_BEGIN_END is one
+     * of them: the draws still arrive, with no primitive type, and are dropped
+     * by the backend as prim=0. */
+    u32 land = gcm_spu_block_for_put(put);
+    if (land == 0xFFFFFFFFu) land = put;
+    else { static int b = 0; if (b++ < 8)
+        fprintf(stderr, "[cellGcmSys] resync landing on SPU pushbuffer "
+                "0x%08X (put 0x%08X) instead of skipping to put\n", land, put); }
+
+    /* Sweep only the range still being skipped; the walker will consume the
+     * fences inside the block itself, and pushing them here too would publish
+     * every one twice. */
+    u32 from = (*getoff <= land) ? *getoff : s_last_ring_off;
+    if (from < land) {
         unsigned rescued = 0;
-        for (u32 io = from; io + 8 <= put; io += 4) {
+        for (u32 io = from; io + 8 <= land; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
             u32 w = vm_read32(ea);
             if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
@@ -1131,9 +1233,9 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
         }
         if (rescued) { static int m = 0; if (m++ < 8)
             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
-                    " 0x%08X..0x%08X\n", rescued, from, put); }
+                    " 0x%08X..0x%08X\n", rescued, from, land); }
     }
-    *getoff = put;
+    *getoff = land;
 }
 
 static void gcm_fifo_dump_around(u32 getoff)

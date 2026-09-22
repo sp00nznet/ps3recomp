@@ -641,6 +641,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         }
+        /* Tell whoever is listening where this PUT landed.
+         *
+         * A title whose SPUs build the RSX command stream never tells libgcm
+         * where that stream is -- it hands the RSX a `put` offset and nothing
+         * else -- so the DMA that writes it is the only evidence of which
+         * buffer the RSX is actually bound to. The GCM layer installs this to
+         * find the pushbuffer; NULL for every title that does not. */
+        { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;
