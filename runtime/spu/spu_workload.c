@@ -1036,6 +1036,27 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
     if (!fn) {
+        /* SPU_DUMP_MISS also applies here. The sync path has written the
+         * unrecognised image out for a while and the async path did not, so a
+         * workload policy module -- which is always dispatched async, being a
+         * persistent worker -- could only ever report a fingerprint you had no
+         * way to resolve. These blobs are not ELFs in the EBOOT, so this dump
+         * is the only place their bytes exist. */
+        { const char* _dir = getenv("SPU_DUMP_MISS");
+          if (_dir && *_dir) {
+              static uint64_t _seen[64]; static unsigned _nseen = 0;
+              unsigned _k = 0;
+              for (; _k < _nseen; _k++) if (_seen[_k] == fp) break;
+              if (_k == _nseen && _nseen < 64) {
+                  char _path[512];
+                  _seen[_nseen++] = fp;
+                  snprintf(_path, sizeof(_path), "%s/spujob_%016llX_%u.bin",
+                           _dir, (unsigned long long)fp, image_size);
+                  FILE* _f = fopen(_path, "wb");
+                  if (_f) { fwrite(image, 1, image_size, _f); fclose(_f);
+                      fprintf(stderr, "[spu_workload] wrote %s\n", _path); }
+              }
+          } }
         fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
                 (unsigned long long)fp, image_size);
         return 0;

@@ -54,6 +54,7 @@ typedef struct {
     u32         minContention;
     u32         maxContention;
     u32         readyCount;
+    int         started;       /* its SPU program has been dispatched        */
 } SpursWorkload;
 
 typedef struct {
@@ -1690,7 +1691,40 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
 s32 cellSpursWakeUp(CellSpurs* spurs)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    /* In a full implementation, wake the worker threads */
+
+    /* Start the SPU program of every runnable workload on this instance.
+     *
+     * cellSpursAddWorkload only REGISTERS the policy module -- it publishes the
+     * workload into the BE instance and returns. WakeUp is what the guest
+     * expects to actually put it on an SPU, and this was a stub returning
+     * CELL_OK, so a title whose work is a WORKLOAD (rather than a taskset task,
+     * which cellSpursCreateTask does dispatch) never ran any SPU code at all.
+     *
+     * Guitar Hero III is one: its job library does AddWorkload(pm, 6720 bytes)
+     * -> SetExceptionEventHandler -> ReadyCountStore(8) -> WakeUp, and the
+     * decompression jobs it then queues are picked up by that program. With
+     * WakeUp inert the jobs were submitted, counted, and never executed or
+     * retired -- the PPU blocked forever on a counter nothing could decrement,
+     * while the only SPU images running were the two taskset tasks.
+     *
+     * Dispatch is async for the same reason CreateTask uses it: a workload
+     * policy module is a persistent worker, and running it inline would block
+     * this PPU thread forever. Guarded by `started` so a second WakeUp (they
+     * are common -- the guest calls it whenever it adds work) does not spawn
+     * another copy. */
+    const uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+        SpursWorkload* w = &s_workloads[i];
+        if (!w->in_use || w->started || w->spurs_ea != spurs_ea) continue;
+        if (!w->pm || !w->sizePm) continue;
+        const uint8_t* host = GUEST_PTR(w->pm, const uint8_t*);
+        if (!host) continue;
+        w->started = 1;
+        fprintf(stderr, "[cellSpurs] WakeUp: starting workload %u pm=0x%08X size=%u\n",
+                i, (uint32_t)(uintptr_t)w->pm, w->sizePm);
+        fflush(stderr);
+        spu_workload_dispatch_async(host, w->sizePm, (uint32_t)w->data);
+    }
     return CELL_OK;
 }
 
