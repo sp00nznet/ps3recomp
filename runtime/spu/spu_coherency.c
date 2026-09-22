@@ -95,6 +95,23 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
           fflush(stderr); } }
 }
 
+/* Drop a context from the reserving set.
+ *
+ * There was no way to do this, and the contexts that most need it are
+ * TRANSIENT: spu_run_lifted_job_abi runs each job on a STACK-LOCAL
+ * spu_context, which registered itself here on its first reservation and then
+ * returned. The entry outlived the object, so spu_coh_notify_write walked a
+ * dangling pointer -- reading resv_valid, writing event_status and calling
+ * spu_ch_wake on reclaimed stack. Undefined behaviour, and observable: Guitar
+ * Hero III showed THREE live-looking contexts for one dispatch, stealing each
+ * other`s reservations, with every PUTLLC failing "no reservation". */
+void spu_coh_unregister(spu_context* ctx)
+{
+    if (!ctx) return;
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+        if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; return; }
+}
+
 int spu_coh_is_reserved(uint32_t addr)
 {
     if (!s_coh_armed) return 0;

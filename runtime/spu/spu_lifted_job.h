@@ -14,7 +14,8 @@
 #define SPU_LIFTED_JOB_H
 
 #include "spu_context.h"
-#include "spu_interp.h"        /* spu_interp_run — un-lifted SPU images */
+#include "spu_interp.h"
+#include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,6 +94,10 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
             g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
     }
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
+    /* `ctx` is about to go out of scope: take it out of the reserving set
+     * first, or the coherency walk dereferences this stack frame after it is
+     * gone. See spu_coh_unregister. */
+    spu_coh_unregister(&ctx);
     return (int32_t)ctx.stop_code;
 }
 
