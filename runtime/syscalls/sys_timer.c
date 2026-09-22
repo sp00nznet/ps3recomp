@@ -111,6 +111,53 @@ int64_t sys_timer_usleep(ppu_context* ctx)
       static int n=0; if (n++ < 60)
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
+    /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
+     *
+     * A title that is "hung" is usually not blocked on anything -- every thread
+     * is spinning on sys_timer_usleep waiting for a flag, and [BLOCKSUM] only
+     * says "syscall 141, 12s". This histograms the callers over a window and
+     * prints the top ones, so the answer is a guest address rather than a
+     * count. Keyed on ctx->lr: a host-stack backtrace through lifted code has
+     * no unwind tables and invents chains (see the Guitar Hero III writeup),
+     * and lr is the only guest chain that survives.
+     *
+     * Deliberately unlocked: the counts are a diagnostic, and a lost increment
+     * under a race cannot change which site is at the top of a 30k-per-second
+     * poll. */
+    { static long s_pt = -1;
+      if (s_pt < 0) { const char* e = getenv("PS3_POLLTOP");
+                      s_pt = e ? (long)strtoul(e, 0, 10) : 0;
+                      if (s_pt < 0) s_pt = 0; }
+      if (s_pt > 0) {
+        enum { PT_MAX = 128 };
+        static uint32_t pt_lr[PT_MAX]; static uint32_t pt_n[PT_MAX];
+        static uint64_t pt_us[PT_MAX]; static int pt_used = 0;
+        static unsigned long long pt_win = 0;
+        uint32_t lr = (uint32_t)ctx->lr;
+        int i = 0;
+        for (; i < pt_used; i++) if (pt_lr[i] == lr) break;
+        if (i == pt_used && pt_used < PT_MAX) { pt_lr[pt_used] = lr; pt_used++; }
+        if (i < PT_MAX) { pt_n[i]++; pt_us[i] += usec; }
+        { extern unsigned long long ps3_qpc_us(void);
+          unsigned long long now = ps3_qpc_us();
+          if (!pt_win) pt_win = now;
+          else if (now - pt_win >= (unsigned long long)s_pt * 1000000ull) {
+            fprintf(stderr, "--- usleep poll sites (last %lds) ---\n", s_pt);
+            for (int k = 0; k < 8; k++) {
+              int best = -1;
+              for (int j = 0; j < pt_used; j++)
+                if (pt_n[j] && (best < 0 || pt_n[j] > pt_n[best])) best = j;
+              if (best < 0) break;
+              fprintf(stderr, "  %8u calls  %6llums slept  lr=0x%08X\n",
+                      pt_n[best], (unsigned long long)(pt_us[best] / 1000),
+                      pt_lr[best]);
+              pt_n[best] = 0;
+            }
+            fflush(stderr);
+            for (int j = 0; j < pt_used; j++) { pt_n[j] = 0; pt_us[j] = 0; }
+            pt_win = now;
+          } } } }
+
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
      * address, dump the registers and the object they point at. A poll loop
      * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
