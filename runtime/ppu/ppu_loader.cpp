@@ -1938,6 +1938,37 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
           memcpy(&t,vm_base+vt+4,4); toc=__builtin_bswap32(t);
           fprintf(stderr,"      ARG[0x%08X] vtbl=0x%08X -> method code=0x%08X toc=0x%08X (worker body?)\n", o, vt, code, toc); }
       } }
+    /* The real frame chain FIRST, then the scan.
+     *
+     * The scan below reports any stack word that looks like a return address,
+     * so it reports dead slots from frames that already returned -- it named
+     * the wrong caller twice in one Guitar Hero III session, and both times
+     * the wrong answer looked entirely plausible and cost a run to disprove.
+     *
+     * PS3 is 64-bit ELFv1: a prologue stores the caller's sp at the new sp
+     * (the back chain) and the caller saves lr at back_chain + 0x10. Walking
+     * that gives the ACTUAL callers in order. Keep the scan afterwards -- a
+     * thread parked in a hand-written or HLE frame may have no back chain, and
+     * the scan still finds something there. */
+    { char bc[900]; int bp = snprintf(bc, sizeof bc, "[GSTACK:%s] chain:", tag ? tag : "?");
+      uint32_t f = sp;
+      for (int d = 0; d < 24 && bp < 820; d++) {
+          if (vm_oob(f, 8)) break;
+          uint32_t t; memcpy(&t, vm_base + f + 4, 4);   /* low half of the 64-bit back chain */
+          uint32_t prev = __builtin_bswap32(t);
+          if (prev <= f || vm_oob(prev + 0x14, 4)) break;   /* stacks grow down */
+          memcpy(&t, vm_base + prev + 0x14, 4);         /* low half of the saved lr */
+          uint32_t ra = __builtin_bswap32(t);
+          if (ra >= 0x10000 && ra < 0x600000) {
+              uint32_t bg = 0;
+              for (uint64_t k = 0; k < function_table_count; k++) {
+                  uint32_t aa = function_table[k].addr; if (aa <= ra && aa > bg) bg = aa; }
+              if (bg) bp += snprintf(bc+bp, sizeof(bc)-bp, " func_%08X+0x%X", bg, ra - bg);
+              else    bp += snprintf(bc+bp, sizeof(bc)-bp, " 0x%08X", ra);
+          }
+          f = prev;
+      }
+      fprintf(stderr, "%s\n", bc); }
     char gs[1200]; int gp = snprintf(gs, sizeof gs, "[GSTACK:%s] sp=0x%08X:", tag ? tag : "?", sp);
     uint32_t last = 0;
     for (int i = 0; i < 700 && gp < 1100; i++) {
