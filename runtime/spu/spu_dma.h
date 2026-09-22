@@ -1189,10 +1189,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         /* SPU_DMATRACE=<img> traces one image; SPU_DMATRACE_ALL keeps the old
          * hardcoded pair. Seeing a job's FIRST transfers is how you tell a bad
          * parameter block from a bad address computed later. */
+        /* SPU_DMATRACE takes an IMAGE ID, and that is a trap worth defusing:
+         * "=1" reads like "on" and actually selects image 1, so tracing a
+         * title whose work runs on image 4 prints NOTHING and reads as "this
+         * SPU issues no DMA at all". That produced a confidently wrong writeup
+         * for Guitar Hero III, whose task is in fact busy. Accept "all", and
+         * announce once what was armed so silence is never ambiguous. */
         static int64_t only=-2;
-        if (only==-2){ const char* e=getenv("SPU_DMATRACE"); only = e ? strtol(e,0,0) : -1; }
+        if (only==-2){ const char* e=getenv("SPU_DMATRACE");
+            only = !e ? -1 : ((strcmp(e,"all")==0 || strcmp(e,"ALL")==0) ? -3
+                                                                        : strtol(e,0,0));
+            if (e) fprintf(stderr, "[DMA] SPU_DMATRACE armed for %s\n",
+                           only==-3 ? "ALL images" : "one image id "
+                                                     "(a bare number is an IMAGE ID, not on/off)");
+        }
         if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
-            (only >= 0 && spu->image_id == only)) {
+            only==-3 || (only >= 0 && spu->image_id == only)) {
             static int _n=0; if (_n++ < 160)
                 fprintf(stderr, "[DMA] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
                         spu->image_id, cmd, lsa, (unsigned long long)ea, size, tag);

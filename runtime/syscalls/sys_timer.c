@@ -176,17 +176,31 @@ int64_t sys_timer_usleep(ppu_context* ctx)
       if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
         static int _n = 0;
         if (_n++ < 8) {
-          uint32_t o = (uint32_t)ctx->gpr[29];
-          fprintf(stderr, "[wait-obj] lr=0x%08X r3=%llu r9=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X",
-                  (uint32_t)ctx->lr, (unsigned long long)usec, (uint32_t)ctx->gpr[9],
-                  o, (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31]);
-          /* guest memory is big-endian: assemble the words explicitly. */
-          if (o && vm_base) {
-            const uint8_t* p = vm_base + o;
-            uint32_t w0 = (uint32_t)(((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(uint32_t)(p)[3]);
-            p = vm_base + o + 0x24;
-            uint32_t w24 = (uint32_t)(((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(uint32_t)(p)[3]);
-            fprintf(stderr, "  [r29+0x00]=0x%08X [r29+0x24]=0x%08X", w0, w24);
+          /* Dump the words at EVERY plausible object register, not just r29.
+           * Which register holds the object is per-title -- r29 was right for
+           * the title this was written for and is a spin COUNTER in Guitar
+           * Hero III, where the object is in r30/r31. Printing one guess makes
+           * the tool silently report the wrong memory as "the thing it waits
+           * on", which is worse than printing nothing. */
+          fprintf(stderr, "[wait-obj] lr=0x%08X sleep=%lluus", (uint32_t)ctx->lr,
+                  (unsigned long long)usec);
+          static const int regs[] = { 28, 29, 30, 31, 3 };
+          for (unsigned ri = 0; ri < sizeof regs / sizeof regs[0]; ri++) {
+            const int r = regs[ri];
+            const uint32_t o = (uint32_t)ctx->gpr[r];
+            fprintf(stderr, "  r%d=0x%08X", r, o);
+            /* Only deref something that looks like a guest pointer: a small
+             * integer is a count, and dumping "memory at 4" is noise. */
+            if (vm_base && o >= 0x10000u) {
+              fprintf(stderr, "[");
+              for (int w = 0; w < 4; w++) {
+                const uint8_t* q = vm_base + o + (unsigned)w * 4u;
+                uint32_t v = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) |
+                             ((uint32_t)q[2] << 8)  | (uint32_t)q[3];
+                fprintf(stderr, "%s%08X", w ? " " : "", v);
+              }
+              fprintf(stderr, "]");
+            }
           }
           fprintf(stderr, "\n"); fflush(stderr);
         } } }
