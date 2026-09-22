@@ -776,7 +776,14 @@ extern "C" void ppu_resv_register(ppu_context* c)
  * thread's context here for the reservation set. So the answer was sitting in
  * an array nobody read. Best-effort and unlocked -- a torn read of one word
  * costs a wrong digit in a diagnostic, and the alternative is taking a lock on
- * the reservation path to print a log line. */
+ * the reservation path to print a log line.
+ *
+ * CAVEAT: an unchanged lr does NOT mean the thread has made no calls. A
+ * lifted INDIRECT call (ps3_indirect_call, bctrl through a vtable) does not
+ * write lr, so a thread looping on one sits at the same lr indefinitely
+ * while calling out every pass. Reading a pinned lr as "no calls since
+ * entry" narrowed a search to the wrong loop once already. lr names the
+ * last DIRECT call site and nothing more. */
 extern "C" void ppu_report_guest_lrs(void)
 {
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
