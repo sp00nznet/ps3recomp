@@ -817,16 +817,26 @@ s32 cellPadGetInfo(CellPadInfo2* info)
 
     pad_poll_backend();
 
+    /* Present a virtual pad on port 0 when nothing physical is attached, the
+     * same as cellPadGetInfo2 does.
+     *
+     * The two entry points disagreed: GetInfo2 carried the fallback and GetInfo
+     * did not, so which one a title imports decided whether it believed a
+     * controller existed. The Orange Box's chooser imports GetInfo (v1) and
+     * never GetInfo2, so it saw zero pads, opened "SIXAXIS wireless controller
+     * not detected", took the auto-OK, and opened it again -- forever, before
+     * it ever finished booting. Both entry points describe the same hardware
+     * and have to answer the same way. */
     u32 connected = 0;
     for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++)
-        if (s_host_state[i].connected) connected++;
+        if (s_host_state[i].connected || i == 0) connected++;
 
     vm_write32(gaddr + 0x00, s_max_connect);
     vm_write32(gaddr + 0x04, connected);
     vm_write32(gaddr + 0x08, 0);                       /* system_info */
     for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++) {
         int on = (i < s_max_connect && i < PAD_MAX_HOST_PORTS &&
-                  s_host_state[i].connected);
+                  (s_host_state[i].connected || i == 0));
         vm_write16(gaddr + 0x0C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
         vm_write16(gaddr + 0x1A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
         vm_write8(gaddr + 0x28 + i, on ? CELL_PAD_STATUS_CONNECTED : 0);
@@ -951,6 +961,39 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     s_port_setting[port_no] = port_setting;
+    return CELL_OK;
+}
+
+/* cellPadInfoPressMode (NID 0x0E2DFAAD) / cellPadSetPressMode (NID 0xF83F8182)
+ *
+ * Press mode makes the digital buttons report an analog 0..255 pressure in the
+ * extended part of CellPadData. A DS3 supports it, and the virtual pad reported
+ * by cellPadGetInfo/GetInfo2 already advertises CELL_PAD_CAPABILITY_PRESS_MODE,
+ * so these have to agree with that claim rather than fall through to the
+ * unresolved-NID path.
+ *
+ * Info returns 1 when the port supports press mode; Set toggles it, recorded in
+ * the same s_port_setting word cellPadSetPortSetting uses so a title that reads
+ * the setting back sees what it asked for. */
+s32 cellPadInfoPressMode(u32 port_no)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    return 1;                                  /* supported */
+}
+
+s32 cellPadSetPressMode(u32 port_no, u32 mode)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (mode)
+        s_port_setting[port_no] |= CELL_PAD_SETTING_PRESS_ON;
+    else
+        s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_PRESS_ON;
     return CELL_OK;
 }
 
