@@ -1096,8 +1096,18 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
             spu_halt(ctx);
         }
         return (uint32_t)ctx->rcv_evt_n + ctx->ch_in_mbox.count;           /* readable */
-    case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
-    case SPU_WrOutIntrMbox:  return SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count;
+    /* Free slots, CLAMPED. The queue behind each channel is SPU_CHANNEL_CAP
+     * deep -- deeper than the hardware depth reported here -- so `count` can
+     * exceed the depth and a bare subtraction underflows, telling the SPU it
+     * has four billion free slots. That silently converts a bounded mailbox
+     * into an unbounded one for any title that polls before writing, which is
+     * every SPU-heavy one. */
+    case SPU_WrOutMbox:
+        return ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH
+             ? 0u : (uint32_t)(SPU_MBOX_DEPTH - ctx->ch_out_mbox.count);
+    case SPU_WrOutIntrMbox:
+        return ctx->ch_out_intr_mbox.count >= SPU_INTR_MBOX_DEPTH
+             ? 0u : (uint32_t)(SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count);
     case SPU_RdSigNotify1:   return ctx->ch_sig_notify[0].count;
     case SPU_RdSigNotify2:   return ctx->ch_sig_notify[1].count;
     case MFC_Cmd:            return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
