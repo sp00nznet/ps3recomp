@@ -769,6 +769,41 @@ static void sys_spinlock_initialize(ppu_context* ctx)
     if (ea) _InterlockedExchange(spin_word(ea), 0);
 }
 
+/* Who currently holds each locked word, so a spin that never ends can name the
+ * holder instead of just burning a core in silence.
+ *
+ * A spinlock has no timeout and no failure return, so a lock that is never
+ * released is invisible: the thread sits in Sleep(0) at 100% of a core, a
+ * sampling profiler attributes every sample to ntdll, and NOTHING says which
+ * address or which holder. Guitar Hero III deadlocks exactly this way during
+ * its heap bring-up and presented as "all threads idle in ntdll" while pinning
+ * a core -- two facts that only make sense together once the lock is named.
+ *
+ * Small fixed table, linear scan: contention here is rare by construction (a
+ * guest spinlock section is a few instructions), and a miss just means the
+ * report says "unknown" rather than being wrong. */
+#define SPIN_OWNER_MAX 64
+static struct { uint32_t ea; unsigned long tid; } s_spin_owner[SPIN_OWNER_MAX];
+
+static void spin_note_acquire(uint32_t ea)
+{
+    for (int i = 0; i < SPIN_OWNER_MAX; i++)
+        if (s_spin_owner[i].ea == 0 || s_spin_owner[i].ea == ea) {
+            s_spin_owner[i].ea = ea; s_spin_owner[i].tid = GetCurrentThreadId(); return;
+        }
+}
+static void spin_note_release(uint32_t ea)
+{
+    for (int i = 0; i < SPIN_OWNER_MAX; i++)
+        if (s_spin_owner[i].ea == ea) { s_spin_owner[i].ea = 0; s_spin_owner[i].tid = 0; return; }
+}
+static unsigned long spin_owner_of(uint32_t ea)
+{
+    for (int i = 0; i < SPIN_OWNER_MAX; i++)
+        if (s_spin_owner[i].ea == ea) return s_spin_owner[i].tid;
+    return 0;
+}
+
 static void sys_spinlock_lock(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[3];
@@ -780,13 +815,30 @@ static void sys_spinlock_lock(ppu_context* ctx)
     for (unsigned n = 0; !spin_try(ea); n++) {
         if (n < 64) YieldProcessor();
         else        Sleep(0);
+        /* Report once per stuck lock, well past any legitimate section. */
+        if (n == 200000) {
+            unsigned long owner = spin_owner_of(ea);
+            unsigned long me    = GetCurrentThreadId();
+            static int reported = 0;
+            if (reported++ < 8)
+                fprintf(stderr,
+                        "[spinlock] STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
+                        "held by tid %lu, this is tid %lu%s\n",
+                        ea, (uint32_t)ctx->lr, owner, me,
+                        (owner && owner == me)
+                          ? "  <== SELF-DEADLOCK: this thread already holds it"
+                          : (owner ? "" : "  (holder unknown -- released without us seeing it?)"));
+        }
     }
+    spin_note_acquire(ea);
 }
 
 static void sys_spinlock_trylock(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[3];
-    ctx->gpr[3] = (ea && spin_try(ea))
+    int got = (ea && spin_try(ea));
+    if (got) spin_note_acquire(ea);
+    ctx->gpr[3] = got
                 ? 0                                            /* CELL_OK */
                 : (uint64_t)(int64_t)(int32_t)0x8001000Au;     /* EBUSY   */
 }
@@ -794,7 +846,9 @@ static void sys_spinlock_trylock(ppu_context* ctx)
 static void sys_spinlock_unlock(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[3];
-    if (ea) _InterlockedExchange(spin_word(ea), 0);
+    if (!ea) return;
+    spin_note_release(ea);
+    _InterlockedExchange(spin_word(ea), 0);
 }
 
 extern "C" void ppu_sysprx_register(void)

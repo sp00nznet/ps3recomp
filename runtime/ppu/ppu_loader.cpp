@@ -1116,7 +1116,42 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
         fprintf(stderr, "[rwatch] n=%lu read%d 0x%08X guest-fn=0x%08X\n",
                 rn, width, a, ppu_prof_resolve_host(ra));
 }
+/* Report a guest read through a NULL-ish pointer.
+ *
+ * On a PS3 the first 64 KB is unmapped: dereferencing NULL takes a data-storage
+ * exception and the title dies immediately, holding the pointer that did it.
+ * Our VM is flat and demand-committed, so address 0 reads back as ZERO and the
+ * bug becomes invisible -- which is strictly worse than crashing, because the
+ * guest then computes with the zero.
+ *
+ * Guitar Hero III is the case that earned this. An iterator does
+ *
+ *     end = obj + obj->size;  cur = obj + 0x1C;
+ *     while (end != cur) cur = step(cur);
+ *
+ * with obj == NULL. `obj->size` read as 0, so end was 0 and cur started at
+ * 0x1C, and an equality-terminated loop that can never be equal ran 48 MILLION
+ * iterations, climbing through 2.8 GB of address space and pinning a core --
+ * presenting as "the title boots and then hangs" with nothing pointing at the
+ * NULL. Capped so a title that does this in a hot path cannot flood the log.
+ *
+ * Off with PS3_NULL_READ=0 for a title that dereferences low addresses on
+ * purpose (a few use page 0 as a scratch constant pool). */
+static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("PS3_NULL_READ"); s_on = (e && *e == '0') ? 0 : 1; }
+    if (!s_on) return;
+    static long s_n = 0;
+    if (s_n++ >= 16) return;
+    fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
+            width * 8, a, a, ppu_prof_resolve_host(ra),
+            s_n == 16 ? "  [further NULL reads not reported]" : "");
+    fflush(stderr);
+}
+
 uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
+    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
 #endif
@@ -1156,6 +1191,7 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
      * cannot be served out of memory. Everything else in the window the SPU
      * thread keeps current, so it falls through to the plain load. */
@@ -1267,7 +1303,8 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
       } }
       else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap32(v); }
-uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
+uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8);
+    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 8, __builtin_return_address(0)); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
 #endif
