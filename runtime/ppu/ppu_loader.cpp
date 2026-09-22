@@ -756,6 +756,15 @@ static void resv_check_reg(ppu_context* self)
  * other thread's reservation on that word so their stwcx retries. */
 /* PPU_RESV_OFF=1 -> plain value-CAS (v0 baseline, for A/B diagnosis). */
 static inline int resv_off() { static int v = -1; if (v < 0) v = getenv("PPU_RESV_OFF") ? 1 : 0; return v; }
+/* A successful stwcx./stdcx. is a STORE, and the write watch could not see
+ * one: PPU_WWATCH hooks vm_write*, and a lifted stwcx. goes straight to a
+ * host compare-exchange on guest memory. So any field maintained with
+ * atomics -- every refcount and every job counter -- read as "nothing ever
+ * writes this", which is the most confident kind of wrong answer a probe
+ * can give. Report the commit through the same path as an ordinary store. */
+extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
+extern "C" uint32_t g_ww_lo, g_ww_hi;
+
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
     uint32_t exp_raw = __builtin_bswap32(expected);
@@ -782,6 +791,11 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     }
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
+    /* Gate on the armed window before the call: this sits on EVERY successful
+     * stwcx., which locks use, so the disabled cost has to be two compares and
+     * no call at all. */
+    if (ok && g_ww_lo && (uint32_t)ea >= g_ww_lo && (uint32_t)ea < g_ww_hi)
+        ppu_ww_note_atomic((uint32_t)ea, val, 4, __builtin_return_address(0));
     return ok;
 }
 extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
@@ -805,6 +819,14 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     }
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
     resv_unlock(L);
+    if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
+        /* Report as two words: the watch window is word-granular, and a
+         * doubleword CAS on a counter pair is exactly the case worth seeing. */
+        ppu_ww_note_atomic((uint32_t)ea,     (uint32_t)(val >> 32), 4,
+                           __builtin_return_address(0));
+        ppu_ww_note_atomic((uint32_t)ea + 4, (uint32_t)val, 4,
+                           __builtin_return_address(0));
+    }
     return ok;
 }
 
@@ -1471,6 +1493,12 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
             fprintf(stderr, "[sync-write] +0x%02X <- 0x%X (w%d) guest-fn=0x%08X\n",
                     a - b, v, width, ppu_prof_resolve_host(ra));
     }
+}
+
+/* See the note on the forward declaration above ppu_stwcx32. */
+extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
+{
+    barrier_watch_hit(ea, val, width, ra);
 }
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return;
 #ifdef _WIN32
