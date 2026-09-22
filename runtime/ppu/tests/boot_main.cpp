@@ -506,10 +506,30 @@ extern "C" const char* g_last_hle_name;
  * console is servicing a command, also to its response file. */
 static void dbg_printf(const char* fmt, ...);
 
+extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
+
 static void dump_threads(const char* label, HMODULE self)
 {
     dbg_printf( "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
             label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+
+    /* Which HLE each guest thread is INSIDE right now.
+     *
+     * ppu_hle.cpp has maintained this array for a while and nothing ever read
+     * it. It is the only way to see a thread parked in an HLE wait:
+     * sys_lwmutex_lock and sys_lwcond_wait are sysPrxForUser handlers, not lv2
+     * syscalls, so PS3_SCBLOCK_PROF cannot see them block, the usleep
+     * histogram cannot see them (they do not usleep), and the sampler just
+     * reports ntdll. A thread stuck and invisible to all three is exactly the
+     * case this answers. */
+    { int any = 0;
+      for (unsigned t = 0; t < 64u; t++) {
+          const char* n = g_hle_inflight[t];
+          if (!n) continue;
+          if (!any) { dbg_printf("[WATCHDOG] guest threads inside an HLE:\n"); any = 1; }
+          dbg_printf("[WATCHDOG]   guest-tid %-3u in %s\n", t, n);
+      }
+      if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
