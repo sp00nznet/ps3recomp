@@ -521,6 +521,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * stale, which is exactly what makes the lost-reservation event fire. */
         memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
+        ctx->dbg_getllar++;
         spu_lockline_unlock();
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
@@ -601,10 +602,38 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * successful PUTLLC, it does not report it lost. Already under the
              * lock-line lock, which is what spu_coh_notify_write expects. */
             ctx->resv_valid = 0;
+            { static int s_w = -1;
+              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+              if (s_w) { static unsigned long long n;
+                  if ((++n % 100000) == 1)
+                      fprintf(stderr, "[putllc-ok] %llu: img=%d ctx=%p ea=0x%08X\n",
+                              n, ctx->image_id, (void*)ctx, ea); } }
             spu_coh_notify_write(ea);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
+            /* SPU_PUTLLC_WHY=1: which of the three conditions failed.
+             * A PUTLLC retry loop that never succeeds is a livelock, and
+             * "failed" alone cannot distinguish a lost reservation from a line
+             * another agent is rewriting -- opposite causes, opposite fixes. */
+            { static int s_w = -1;
+              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+              if (s_w) {
+                  static unsigned long long n_noresv, n_ea, n_line;
+                  if (!ctx->resv_valid)            n_noresv++;
+                  else if (ctx->resv_ea != ea)     n_ea++;
+                  else                             n_line++;
+                  static unsigned long long total;
+                  if ((++total % 500000) == 0) {
+                      fprintf(stderr, "[putllc-why] %llu fails: no-reservation=%llu"
+                                      " ea-mismatch=%llu line-changed=%llu"
+                                      " (last ea=0x%08X img=%d resv_ea=0x%08X"
+                                      " getllar=%llu)\n",
+                              total, n_noresv, n_ea, n_line, ea, ctx->image_id,
+                              ctx->resv_ea, (unsigned long long)ctx->dbg_getllar);
+                      fflush(stderr);
+                  }
+              } }
         }
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;

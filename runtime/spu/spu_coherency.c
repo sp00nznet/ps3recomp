@@ -10,6 +10,7 @@
  * on every PPU store.
  */
 
+#include <stdlib.h>
 #include "spu_coherency.h"
 
 #include <stdint.h>
@@ -101,6 +102,31 @@ int spu_coh_is_reserved(uint32_t addr)
     return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
 }
 
+/* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
+ * reservation away for its own MFC write -- the MFC is part of the same SPE.
+ * Our notify had no way to say "everyone but me", so an SPU that reserved a
+ * line and then DMA'd a buffer overlapping it killed its own reservation and
+ * its next PUTLLC could never succeed. Guitar Hero III's job policy module
+ * livelocks exactly there: 16 million atomic ops on one line, every PUTLLC
+ * failing for "no reservation", 600k of them self-inflicted.
+ *
+ * The PUTLLC path already guards this case by dropping its own reservation
+ * before notifying; this gives the DMA path the same ability. */
+void spu_coh_notify_write_except(uint32_t ea, const void* self)
+{
+    uint32_t line = ea & ~127u;
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        spu_context* c = s_coh_ctxs[i];
+        if (!c || (const void*)c == self) continue;
+        if (c->resv_valid && (c->resv_ea & ~127u) == line) {
+            c->event_status |= SPU_EVENT_LR;
+            c->resv_valid = 0;
+            g_spu_lr_raise++;
+            spu_ch_wake(c);
+        }
+    }
+}
+
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
@@ -110,6 +136,15 @@ void spu_coh_notify_write(uint32_t ea)
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
             c->event_status |= SPU_EVENT_LR;
             c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
+            /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
+             * always fails for "no reservation" is useless without knowing who
+             * took it away -- a peer SPU, or the PPU committing to the line. */
+            { static int s_w = -1;
+              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+              if (s_w) { static unsigned long long n;
+                  if ((++n % 200000) == 1)
+                      fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
+                              n, line, c->image_id, (void*)c); } }
             g_spu_lr_raise++;
             /* The event_status store has to be visible before the wake. The
              * waiter re-polls its predicate on a timeout as well, so a

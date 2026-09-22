@@ -62,6 +62,9 @@ int spu_coh_is_reserved(uint32_t addr);
  * Expects the lock-line lock held, so that the store this is reporting and the
  * reservation state it clears are seen by an SPU's PUTLLC as one transaction. */
 void spu_coh_notify_write(uint32_t ea);
+/* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
+ * write does not cost it its reservation on hardware. */
+void spu_coh_notify_write_except(uint32_t ea, const void* self);
 
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */

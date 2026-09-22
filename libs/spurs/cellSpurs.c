@@ -1723,6 +1723,10 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
         fprintf(stderr, "[cellSpurs] WakeUp: starting workload %u pm=0x%08X size=%u\n",
                 i, (uint32_t)(uintptr_t)w->pm, w->sizePm);
         fflush(stderr);
+        /* One instance. readyCount is how many SPUs the workload MAY run on,
+         * and running 2 or 4 changes nothing for the title this was written
+         * against -- measured, not assumed -- so the conservative reading
+         * stands until a title needs otherwise. */
         spu_workload_dispatch_async(host, w->sizePm, (uint32_t)w->data);
     }
     return CELL_OK;

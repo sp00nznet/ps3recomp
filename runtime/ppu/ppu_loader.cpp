@@ -864,6 +864,16 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
      * cannot land inside an SPU PUTLLC's compare/commit window (nor the
      * reverse), and the reserving SPU gets its lost-reservation event. */
     int coh = spu_coh_is_reserved((uint32_t)ea);
+    /* SPU_PUTLLC_WHY=1: count PPU commits that land on a line an SPU has
+     * reserved. If an SPU's PUTLLC never succeeds for "no reservation", the
+     * PPU hammering the same 128-byte line is one of only two agents that can
+     * be taking it. */
+    if (coh) { static int s_w = -1;
+        if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+        if (s_w) { static unsigned long long n;
+            if ((++n % 100000) == 1)
+                fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
+                        n, (uint32_t)ea & ~127u); } }
     if (coh) spu_lockline_lock();
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;

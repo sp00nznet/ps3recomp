@@ -612,6 +612,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         {
             extern int  spu_coh_is_reserved(uint32_t);
             extern void spu_coh_notify_write(uint32_t);
+            extern void spu_coh_notify_write_except(uint32_t, const void*);
             extern void spu_lockline_lock(void);
             extern void spu_lockline_unlock(void);
             uint32_t a0 = (uint32_t)ea & ~127u;
@@ -625,7 +626,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 spu_lockline_lock();
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
+                    if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock();
@@ -634,7 +635,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
                         spu_lockline_lock();
-                        spu_coh_notify_write(a);
+                        spu_coh_notify_write_except(a, spu);
                         spu_lockline_unlock();
                     }
                     if (a == a1) break;
