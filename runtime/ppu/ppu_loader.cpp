@@ -793,6 +793,13 @@ extern "C" void ppu_report_guest_lrs(void)
         fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
                 (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+        /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
+         * targets. lr cannot see those (bctrl does not write it), so for a
+         * thread looping on a vtable call the ring is the only record of where
+         * it has actually been -- and the two together distinguish "grinding
+         * through varied work" from "retrying one target". */
+        { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
+          if (getenv("BCTRL_RING")) ppu_dump_bctrl_ring((uint32_t)c->thread_id, "watchdog"); }
     }
     fflush(stderr);
 }
@@ -2114,6 +2121,50 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * unwound to the initial frame (or a not-yet-populated function pointer).
      * Don't treat it as an unresolved call -- just return to the caller. */
     if (addr == 0) {
+        /* Say so. A bctrl to 0 is nearly always a function-pointer table slot
+         * that was never populated, and returning quietly turns it into an
+         * infinite loop when the caller retries -- which is what it does. This
+         * had no report of any kind, so the failure presented as "a thread is
+         * busy in guest code" with nothing to grep for; Guitar Hero III spends
+         * its whole boot doing it. Same standing as [null-read]: on by default
+         * because a null call is always a bug, capped so it cannot flood, and
+         * PS3_NULL_CALL=0 turns it off.
+         *
+         * lr is the last DIRECT call site, not this one (bctrl does not write
+         * lr), so it names the neighbourhood rather than the instruction --
+         * still the fastest way to the right function. */
+        { static int s_nc = -1;
+          if (s_nc < 0) { const char* e = getenv("PS3_NULL_CALL");
+                          s_nc = (e && *e == '0') ? 0 : 1; }
+          /* Cap PER THREAD. A global cap lets one noisy thread exhaust it and
+           * silently hide every other thread's null calls -- the same trap the
+           * BRANCH-TO-0 log already fixed per image. Guitar Hero III's FMOD
+           * stream thread burned all 8 slots and hid the MAIN thread's, which
+           * is the one that matters. */
+          if (s_nc) { enum { NC_T = 64, NC_PER = 4 };
+              static long s_nt[NC_T];
+              unsigned ti = (unsigned)ctx->thread_id < NC_T
+                            ? (unsigned)ctx->thread_id : 0;
+              long s_n = s_nt[ti];
+              s_nt[ti] = s_n + 1;
+              if (s_n < NC_PER)
+                  /* r12 is NOT reliable here: a vtable bctrl loads ctr from
+                   * the OPD directly and never writes r12, so it prints stale
+                   * garbage. Dump the scratch registers the call sequence
+                   * actually used -- for a C++ virtual call r11/r9/r10 still
+                   * hold object/vtable/OPD, which is enough to see WHICH link
+                   * of the chain read as zero. */
+                  fprintf(stderr, "[null-call] guest called a NULL function pointer"
+                                  " (near lr=0x%08X, tid=%u)"
+                                  " r3=%08X r9=%08X r10=%08X r11=%08X r12=%08X\n",
+                          (uint32_t)ctx->lr, (unsigned)ctx->thread_id,
+                          (uint32_t)ctx->gpr[3],  (uint32_t)ctx->gpr[9],
+                          (uint32_t)ctx->gpr[10], (uint32_t)ctx->gpr[11],
+                          (uint32_t)ctx->gpr[12]);
+              else if (s_n == NC_PER)
+                  fprintf(stderr, "[null-call] tid=%u: further null calls not shown\n",
+                          (unsigned)ctx->thread_id);
+              if (s_n <= NC_PER) fflush(stderr); } }
         /* PPU_OPD_RECOVER=1: ctr==0 while r12 still points at a VALID OPD means
          * the lifted thunk failed to load the code word -- not that the function
          * pointer is genuinely null. We already read opd[0] for the diagnostic
