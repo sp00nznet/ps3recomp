@@ -85,6 +85,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         if (!ctx) return -1;
         s_pm_ctx[wid][spu_num] = ctx;
         first = 1;
+        /* SPU_CTX_LOG=1: policy-module contexts are PERSISTENT and there is one
+         * per (workload, spu_num) -- a workload with readyCount 8 legitimately
+         * runs on several simulated SPUs, which then contend its lock lines
+         * exactly as real SPUs would. Counting only the job contexts in
+         * spu_lifted_job.h reports "two contexts" for a run that has five, and
+         * makes correct multi-SPU execution look like duplicated state. */
+        { static int s_cl = -1;
+          if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+          if (s_cl) fprintf(stderr, "[spu-ctx] new POLICY context %p wid=%u spu_num=%u\n",
+                            (void*)ctx, wid, spu_num); }
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
     } else if (s_fresh || s_pm_data[wid][spu_num] != wkl_data) {
