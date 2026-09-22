@@ -59,17 +59,20 @@ extern void ps3_hle_register_ctx(uint32_t nid, const char* name,
 /* SPU_MBox_Status field layout: [7:0] out count, [15:8] in free slots,
  * [23:16] out-interrupt count.
  *
- * Hardware's PPU->SPU mailbox is four deep and the guest checks the free-slot
- * field before every write. This used to advertise ONE, because spu_channel
- * held one value -- claiming four would have invited the PPU to write three
- * words the channel then dropped. spu_channel now holds SPU_CHANNEL_CAP, so
- * report the real depth: a title sending a multi-word work descriptor (The
- * Orange Box sends CB.SPU two words) otherwise has all but one silently
- * discarded, and the SPU blocks forever on a message it half received. */
+ * Hardware's PPU->SPU mailbox is four deep and the guest polls the free-slot
+ * field before every write. This once advertised ONE, because spu_channel held
+ * a single value. It now advertises the hardware four, while the queue behind
+ * it buffers far more (SPU_CHANNEL_CAP) -- because an MMIO store cannot be
+ * refused, so anything that does not fit is lost rather than stalled. */
 /* Defined in spu_intr.inc, included below; used by the mailbox hook above it. */
 static void ps3_intr_raise(uint32_t tag);
 
-#define SPU_RAW_IN_MBOX_DEPTH  SPU_CHANNEL_CAP
+#define SPU_RAW_IN_MBOX_DEPTH  SPU_IN_MBOX_HW_DEPTH
+/* Advertise the HARDWARE free-slot count, not the buffer's. The queue is
+ * deliberately deeper than hardware (see SPU_CHANNEL_CAP) because an MMIO store
+ * cannot be refused, so `count` can exceed the hardware depth; clamp rather
+ * than underflow the subtraction into a huge "free" value. */
+#define SPU_IN_MBOX_FREE(n)     ((uint32_t)((n) >= SPU_RAW_IN_MBOX_DEPTH ? 0u : SPU_RAW_IN_MBOX_DEPTH - (n)))
 #define MBOX_STATUS(out_n, in_free, intr_n) \
     (((uint32_t)(out_n) & 0xFF) | (((uint32_t)(in_free) & 0xFF) << 8) | \
      (((uint32_t)(intr_n) & 0xFF) << 16))
@@ -134,7 +137,7 @@ static void publish(raw_spu* s)
     be32_store(s->base + SPU_RAW_STATUS, c->status);
     be32_store(s->base + SPU_RAW_MBOX_STATUS,
                MBOX_STATUS(c->ch_out_mbox.count,
-                           SPU_RAW_IN_MBOX_DEPTH - c->ch_in_mbox.count,
+                           SPU_IN_MBOX_FREE(c->ch_in_mbox.count),
                            c->ch_out_intr_mbox.count));
     if (c->ch_out_mbox.count)
         be32_store(s->base + SPU_RAW_OUT_MBOX, c->ch_out_mbox.value);
@@ -431,7 +434,7 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
      * second word, and both sides would wait on each other forever. */
     if (off == SPU_RAW_MBOX_STATUS) {
         *out = MBOX_STATUS(s->ctx->ch_out_mbox.count,
-                           SPU_RAW_IN_MBOX_DEPTH - s->ctx->ch_in_mbox.count,
+                           SPU_IN_MBOX_FREE(s->ctx->ch_in_mbox.count),
                            s->ctx->ch_out_intr_mbox.count);
         return 1;
     }

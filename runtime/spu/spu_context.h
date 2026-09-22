@@ -155,7 +155,25 @@ static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p
  * the SPU drains, exactly as on hardware. (The rcv_evt[4] queue below is the
  * same problem, solved once ad hoc for sys_spu_thread_receive_event's
  * four-word reply.) */
-#define SPU_CHANNEL_CAP 4
+/* Capacity is NOT the hardware depth, deliberately.
+ *
+ * Hardware is four deep and back-pressures the writer: the PPU polls the
+ * free-slot count and its store stalls until there is room. We cannot model
+ * that half -- an MMIO store into the problem-state window is a plain memory
+ * write on the host, already committed by the time the handler runs, so there
+ * is no way to refuse it. Anything that does not fit is simply lost.
+ *
+ * Losing one word of a multi-word descriptor desynchronises the reader
+ * permanently: it takes the words it did get, then waits for a word that has
+ * already been and gone. The Orange Box sends CB.SPU bursts of two words and
+ * of five -- one more than hardware depth -- and its worker reads a long
+ * sequence across several call sites, so a single lost word strands it.
+ *
+ * So buffer generously and let the free-slot count keep advertising the
+ * hardware depth (SPU_IN_MBOX_HW_DEPTH): a guest that polls sees the numbers it
+ * expects, and a guest that does not poll still cannot lose data. */
+#define SPU_CHANNEL_CAP      64
+#define SPU_IN_MBOX_HW_DEPTH 4
 
 typedef struct spu_channel {
     uint32_t value;   /* head: the value the next read returns */
