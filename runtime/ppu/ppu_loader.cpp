@@ -1912,9 +1912,14 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     if (!ctx || !vm_base) return;
     uint32_t sp = (uint32_t)ctx->gpr[1];
     /* also show cia/lr and a few key regs (r3/r31 = likely 'this'/object) + raw stack */
-    fprintf(stderr, "[GSTACK:%s] sp=0x%08X cia=0x%08X lr=0x%08X r3=0x%08X r31=0x%08X r30=0x%08X\n",
+    /* r13 too: it is the thread pointer, so it says WHICH TLS block this
+     * thread is on -- the difference between "nothing writes this per-thread
+     * slot" and "you were watching another thread's copy of it". */
+    fprintf(stderr, "[GSTACK:%s] sp=0x%08X cia=0x%08X lr=0x%08X r3=0x%08X"
+                    " r31=0x%08X r30=0x%08X r13=0x%08X tid=%u\n",
             tag?tag:"?", sp, (uint32_t)ctx->cia, (uint32_t)ctx->lr,
-            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[31], (uint32_t)ctx->gpr[30]);
+            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[31], (uint32_t)ctx->gpr[30],
+            (uint32_t)ctx->gpr[13], (unsigned)ctx->thread_id);
     if (!vm_oob(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
         for (int i=0;i<24 && !vm_oob(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
         fprintf(stderr,"%s\n",rw); }
