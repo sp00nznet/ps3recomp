@@ -1207,12 +1207,20 @@ static inline int vm_oob(uint32_t a, uint32_t n)
  * out to scribble higher. */
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
+static uint32_t g_null_sweep_last = 0;
+static unsigned g_null_sweep_tid = 0;
 static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
 {
     static int en = -1;
     if (en < 0) { const char* e = getenv("PS3_NULL_WRITE");
                   en = (e && *e == (char)48) ? 0 : 1; }   /* PS3_NULL_WRITE=0 */
     if (!en) return 0;                                    /* let it land */
+    { static int sweep = -1;
+      if (sweep < 0) { const char* e = getenv("PS3_NULL_SWEEP"); sweep = e ? 1 : 0; }
+      if (sweep) { g_null_sweep_hi = 1; g_null_sweep_last = a;
+                   g_null_sweep_tid = g_active_ctx
+                                    ? (unsigned)g_active_ctx->thread_id : 0u; } }
     { static long n = 0;
       enum { NW_MAX = 8 };
       long i = n++;
@@ -1236,10 +1244,56 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
     return 1;
 }
 
+/* PS3_NULL_SWEEP=1: contain a runaway sweep that started from a null pointer.
+ *
+ * Dropping the page-0 stores alone does not save the image. memset(NULL, 0, n)
+ * with a large n walks UP out of the null page and keeps going -- Guitar Hero
+ * III clears 82 MB that way, straight through its own .data, .opd and TOC.
+ *
+ * On real hardware that never happens: the FIRST store takes a data-storage
+ * exception and the memset does not continue. So dropping the tail as well is
+ * closer to the machine than letting it land, not further from it.
+ *
+ * ponytail: a monotonic-run heuristic, not dataflow. Once a null-page store is
+ * seen, keep dropping while addresses climb within 0x1000 of the last dropped
+ * one, and stop the moment the pattern breaks. That is enough for a memset or
+ * memcpy and nothing else. It is OFF by default because a false positive drops
+ * a real store; turn it on to test whether the sweep is what is killing a
+ * title. If it becomes load-bearing, replace it with a faulting store. */
+
+
+static int vm_null_sweep(uint32_t a)
+{
+    /* Only the sweeping thread's stores count. The flag is global so the hot
+     * path stays one compare, but every other thread keeps storing while a
+     * memset runs -- and treating those as "the pattern broke" ended the sweep
+     * on its very first store, containing nothing. */
+    if (!g_active_ctx || (unsigned)g_active_ctx->thread_id != g_null_sweep_tid)
+        return 0;   /* another thread, or a host-side store: not our business */
+    /* A WINDOW around the last dropped address, not a monotonic run: a memset
+     * stores descending within each 64-byte block and ascends block to block,
+     * so "strictly increasing" breaks on the second store and contains nothing. */
+    uint32_t d = a > g_null_sweep_last ? a - g_null_sweep_last
+                                       : g_null_sweep_last - a;
+    if (d <= 0x1000u) {
+        if (a > g_null_sweep_last) g_null_sweep_last = a;
+        return 1;                       /* still the same sweep: drop */
+    }
+    g_null_sweep_hi = 0;                /* pattern broken: it is over */
+    { static int said = 0;
+      if (!said) { said = 1;
+          fprintf(stderr, "[null-write] sweep contained, ended at 0x%08X\n",
+                  g_null_sweep_last); fflush(stderr); } }
+    return 0;
+}
+
 /* Hot path: one predictable compare, cold half out of line. */
 static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
 {
-    if (__builtin_expect(a >= 0x1000u, 1)) return 0;
+    if (__builtin_expect(a >= 0x1000u, 1)) {
+        if (__builtin_expect(g_null_sweep_hi == 0, 1)) return 0;
+        return vm_null_sweep(a);
+    }
     return vm_null_store_report(a, v, width, ra);
 }
 
