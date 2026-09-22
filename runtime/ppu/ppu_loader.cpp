@@ -1336,6 +1336,11 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
     if (++rn <= 24 || (rn % 4096) == 0)
         fprintf(stderr, "[rwatch] n=%lu read%d 0x%08X guest-fn=0x%08X\n",
                 rn, width, a, ppu_prof_resolve_host(ra));
+    /* ...and the guest call chain on the first hit, as PPU_WWATCH does. The
+     * sampled guest-fn is a HOST return address that identical code folding
+     * makes ambiguous, and it names the reading function but never who called
+     * it -- which is the question whenever a field reads as garbage. */
+    if (rn == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "rw");
 }
 /* Report a guest read through a NULL-ish pointer.
  *
@@ -1922,6 +1927,20 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
             (uint32_t)ctx->gpr[28], (uint32_t)ctx->gpr[29],
             (uint32_t)ctx->gpr[31], (uint32_t)ctx->gpr[30],
             (uint32_t)ctx->gpr[13], (unsigned)ctx->thread_id);
+    /* The whole GPR file, four rows of eight.
+     * The summary line above picks the registers that are usually interesting,
+     * and picking them one at a time is how this grew r13, then r4/r5, then
+     * r28/r29 across a single debugging session -- each time after a run was
+     * spent discovering the needed register was not printed. The file is 32
+     * words; print it and stop guessing. This only runs when a dump fires. */
+    { char gr[400]; 
+      for (int row = 0; row < 4; row++) {
+          int gp2 = snprintf(gr, sizeof gr, "      r%-2d:", row * 8);
+          for (int c = 0; c < 8; c++)
+              gp2 += snprintf(gr + gp2, sizeof(gr) - gp2, " %08X",
+                              (uint32_t)ctx->gpr[row * 8 + c]);
+          fprintf(stderr, "%s\n", gr);
+      } }
     if (!vm_oob(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
         for (int i=0;i<24 && !vm_oob(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
         fprintf(stderr,"%s\n",rw); }
