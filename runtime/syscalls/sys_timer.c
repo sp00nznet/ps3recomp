@@ -132,11 +132,19 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         enum { PT_MAX = 128 };
         static uint32_t pt_lr[PT_MAX]; static uint32_t pt_n[PT_MAX];
         static uint64_t pt_us[PT_MAX]; static int pt_used = 0;
+        static uint32_t pt_tid[PT_MAX];
         static unsigned long long pt_win = 0;
         uint32_t lr = (uint32_t)ctx->lr;
         int i = 0;
         for (; i < pt_used; i++) if (pt_lr[i] == lr) break;
-        if (i == pt_used && pt_used < PT_MAX) { pt_lr[pt_used] = lr; pt_used++; }
+        if (i == pt_used && pt_used < PT_MAX) {
+            pt_lr[pt_used] = lr;
+            /* The thread matters as much as the site: "who is waiting" is the
+             * half that says whether a poll is the engine idling or the main
+             * thread stuck. */
+            pt_tid[pt_used] = (uint32_t)ctx->thread_id;
+            pt_used++;
+        }
         if (i < PT_MAX) { pt_n[i]++; pt_us[i] += usec; }
         { extern unsigned long long ps3_qpc_us(void);
           unsigned long long now = ps3_qpc_us();
@@ -148,9 +156,9 @@ int64_t sys_timer_usleep(ppu_context* ctx)
               for (int j = 0; j < pt_used; j++)
                 if (pt_n[j] && (best < 0 || pt_n[j] > pt_n[best])) best = j;
               if (best < 0) break;
-              fprintf(stderr, "  %8u calls  %6llums slept  lr=0x%08X\n",
+              fprintf(stderr, "  %8u calls  %6llums slept  tid=%-3u lr=0x%08X\n",
                       pt_n[best], (unsigned long long)(pt_us[best] / 1000),
-                      pt_lr[best]);
+                      pt_tid[best], pt_lr[best]);
               pt_n[best] = 0;
             }
             fflush(stderr);
