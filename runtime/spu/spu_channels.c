@@ -1850,12 +1850,27 @@ static int spu_smc_microstep(spu_context* ctx)
          * corroboration gets for a decode bug. */
         if (op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) { pc += 4; continue; } /* hbr/hbra/hbrr */
 
+        /* Hand off to the real interpreter rather than giving up.
+         *
+         * This microstepper knows a dozen opcodes -- enough for the
+         * runtime-generated stubs it was written for -- and spu_interp.c is a
+         * full, selftested SPU interpreter that was already sitting here
+         * unused on this path. Bailing on the first ordinary instruction is
+         * strictly worse than running it.
+         *
+         * It matters for overlay code: a SPURS job policy module DMAs its job
+         * bodies into local store and branches to them, so there is no lifted
+         * body to find and the fallback IS the execution path. Guitar Hero
+         * III`s job kernel dies here on an `ilh` at LS 0x6638 -- a perfectly
+         * ordinary instruction the interpreter handles -- and with it the
+         * decompression job it was running never completes. */
         { static int _n = 0;
           if (_n++ < 8)
-              fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X UNKNOWN word 0x%08X "
-                      "(steps=%d from 0x%05X)\n", ctx->image_id, pc, w, steps,
-                      ctx->pc & SPU_LS_MASK); }
-        return 0;
+              fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
+                      " microstep set -- handing to the interpreter (steps=%d)\n",
+                      ctx->image_id, pc, w, steps); }
+        ctx->pc = pc;
+        return spu_interp_run(ctx, pc) ? 1 : 0;
     }
     { static int _n = 0; if (_n++ < 4)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
