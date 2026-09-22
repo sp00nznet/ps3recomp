@@ -2600,6 +2600,11 @@ class PPULifter:
             return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
                     f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
+        if mn == "vrfip":  # round to FP integer toward +inf (ceil); vrfip is vD,vB
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=ceilf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
+
         # Float/int convert (operand form "vD, vB, UIMM" — UIMM is a bare int)
         if mn == "vcfsx" or mn == "vcfux":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
@@ -2891,6 +2896,37 @@ class PPULifter:
                     f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
                     f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} }}")
+
+        # Pack unsigned halfword -> unsigned byte, saturating (vpkuhus).
+        # The saturating packs are the back half of a colour-conversion kernel:
+        # widen, do arithmetic at higher precision, then narrow with clamping so
+        # an overflow shows as white rather than wrapping to black. Emitting
+        # them as a TODO comment left the narrow step out entirely, so the
+        # destination register kept whatever it held.
+        if mn == "vpkuhus":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
+                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<8;i++){{uint32_t v=a[i]; d[i]=(uint8_t)(v>255u?255u:v);}} "
+                    f"for(int i=0;i<8;i++){{uint32_t v=b[i]; d[8+i]=(uint8_t)(v>255u?255u:v);}} }}")
+
+        # Pack unsigned word -> unsigned halfword, saturating (vpkuwus)
+        if mn == "vpkuwus":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
+                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++){{uint32_t v=a[i]; d[i]=(uint16_t)(v>65535u?65535u:v);}} "
+                    f"for(int i=0;i<4;i++){{uint32_t v=b[i]; d[4+i]=(uint16_t)(v>65535u?65535u:v);}} }}")
+
+        # Pack unsigned word -> unsigned halfword, modulo (vpkuwum): keep the
+        # low half of each word, no clamping. Same narrowing step as vpkuwus
+        # where the caller already knows the values fit.
+        if mn == "vpkuwum":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
+                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"for(int i=0;i<4;i++) d[i]=(uint16_t)(a[i]&0xFFFFu); "
+                    f"for(int i=0;i<4;i++) d[4+i]=(uint16_t)(b[i]&0xFFFFu); }}")
 
         # vmsummbm (VA-form, 4 operands)
         if mn == "vmsummbm":
