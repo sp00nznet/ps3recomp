@@ -1387,9 +1387,20 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
     if (s_lo < 0) return;
     if (a < (uint32_t)s_lo || a >= (uint32_t)s_lo + s_len) return;
     static unsigned long rn;
-    if (++rn <= 24 || (rn % 4096) == 0)
-        fprintf(stderr, "[rwatch] n=%lu read%d 0x%08X guest-fn=0x%08X\n",
-                rn, width, a, ppu_prof_resolve_host(ra));
+    if (++rn <= 24 || (rn % 4096) == 0) {
+        /* ...and the VALUE. PPU_WWATCH has always printed what was written;
+         * the read side printed only the address, so answering "what did it
+         * actually get" meant a second run with a write watch, or a guess --
+         * and a read watch is usually armed precisely because a field reads
+         * wrong. */
+        uint32_t v = 0;
+        if (!vm_oob(a, (uint32_t)width)) {
+            uint32_t t = 0; memcpy(&t, vm_base + a, (size_t)width);
+            v = __builtin_bswap32(t) >> ((4 - width) * 8);
+        }
+        fprintf(stderr, "[rwatch] n=%lu read%d 0x%08X = 0x%X guest-fn=0x%08X\n",
+                rn, width, a, v, ppu_prof_resolve_host(ra));
+    }
     /* ...and the guest call chain on the first hit, as PPU_WWATCH does. The
      * sampled guest-fn is a HOST return address that identical code folding
      * makes ambiguous, and it names the reading function but never who called
