@@ -337,6 +337,38 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
 
     case SPU_RAW_IN_MBOX:
         if (s->ctx) {
+            /* SPU_MBOX_CHAIN=<n>: the guest call chain behind each of the first
+             * n inbound mailbox writes, per SPU.
+             *
+             * A title that dispatches SPU work by mailbox and then STOPS has
+             * its answer above the dispatcher, not in it -- the dispatcher is a
+             * one-shot and its caller is what gave up. The back-chain LR slots
+             * are 0 under the fragment model, so scan the stack for words in
+             * the lifted code range, the same idiom [LWM-CONVOY] uses. Compare
+             * the chain of the last write against an earlier one: the frame
+             * that is present early and missing late is the one that stopped
+             * asking. */
+            { static int cap = -1; static int seen[SPU_RAW_COUNT];
+              if (cap < 0) { const char* e = getenv("SPU_MBOX_CHAIN");
+                             cap = e ? atoi(e) : 0; }
+              uint32_t si = (uint32_t)(s - s_spu);
+              if (cap && si < SPU_RAW_COUNT && seen[si] < cap && g_active_ctx) {
+                  seen[si]++;
+                  uint32_t sp = (uint32_t)g_active_ctx->gpr[1];
+                  char b[1200];
+                  int p = snprintf(b, sizeof b,
+                                   "[mbox-chain] spu%u #%d val=0x%08X lr=0x%08X sp=0x%08X:",
+                                   si, seen[si], val, (uint32_t)g_active_ctx->lr, sp);
+                  uint32_t prev = 0; int found = 0;
+                  for (uint32_t a = sp; a < sp + 0x2000 && found < 32; a += 4) {
+                      uint32_t v = be32_load(a);
+                      if (v >= 0x00010000u && v < 0x00900000u && v != prev) {
+                          p += snprintf(b + p, sizeof(b) - p, " %08X", v);
+                          prev = v; found++;
+                      }
+                  }
+                  fprintf(stderr, "%s\n", b); fflush(stderr);
+              } }
             spu_channel_write(&s->ctx->ch_in_mbox, val);
             spu_ch_wake(s->ctx);
             publish(s);

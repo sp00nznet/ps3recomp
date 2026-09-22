@@ -149,9 +149,12 @@ static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p
  * message writes the words back to back after checking the free-slot count. A
  * one-deep channel drops all but one of them, and the SPU then blocks forever
  * on a message it half received -- silently, because nothing is wrong with
- * either side. The Orange Box's CB.SPU takes a two-word work descriptor this
- * way. (The rcv_evt[4] queue below is the same problem, solved once ad hoc for
- * sys_spu_thread_receive_event's four-word reply.) */
+ * either side. The Orange Box sends CB.SPU descriptors of two words from one
+ * call site and FIVE from another -- one more than the mailbox is deep, so a
+ * whole message never fits at once and the sender has to poll free slots while
+ * the SPU drains, exactly as on hardware. (The rcv_evt[4] queue below is the
+ * same problem, solved once ad hoc for sys_spu_thread_receive_event's
+ * four-word reply.) */
 #define SPU_CHANNEL_CAP 4
 
 typedef struct spu_channel {
@@ -628,11 +631,17 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
     if (ch->count >= SPU_CHANNEL_CAP) {
-        /* Full. Hardware would not have accepted the write -- the sender is
-         * supposed to check the free-slot count first -- so drop the OLDEST,
-         * which keeps the most recent message intact rather than the stalest. */
-        ch->head = (ch->head + 1u) % SPU_CHANNEL_CAP;
-        ch->count--;
+        /* Full. Hardware does not accept the write at all -- the sender polls
+         * the free-slot count first -- so the NEW word is what is lost.
+         *
+         * Dropping the oldest instead silently REORDERS the queue, which is
+         * worse than losing a word: a reader taking a fixed-length message off
+         * the mailbox then gets a prefix of one message spliced to the tail of
+         * the next, and every field after the splice is garbage that still
+         * looks plausible. The Orange Box sends CB.SPU a five-word descriptor
+         * from five consecutive call sites -- one more than the mailbox is
+         * deep -- so it meets this on every send. */
+        return;
     }
     ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = val;
     ch->count++;
