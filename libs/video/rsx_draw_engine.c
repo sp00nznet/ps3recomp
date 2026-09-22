@@ -182,6 +182,11 @@ static struct {
     rsx_vertex_layout_plan layout;
     rsx_vertex_fetch_plan fetch_plan;
     int fetch_ok;
+
+    /* INLINE_ARRAY stream for this group, when the vertices came down the
+     * FIFO rather than from a vertex array. */
+    const u8* inl;
+    u32 inl_bytes;
 } dc;
 
 /* ---- guest memory -------------------------------------------------------- */
@@ -1099,6 +1104,8 @@ static void dc_reset(void)
     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
     dc.refs_remapped = 0;
     dc.fetch_ok = 1;
+    dc.inl = NULL;
+    dc.inl_bytes = 0;
 }
 
 static int dc_push_ref(u32 vertex_id, u32 base_index)
@@ -1203,6 +1210,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
@@ -1233,6 +1241,24 @@ static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 c
     if (dc.n_arr >= ENG_MAX_BATCHES) return;
     dc.arr[dc.n_arr].first = first;
     dc.arr[dc.n_arr].count = count;
+    dc.n_arr++;
+}
+
+/* INLINE_ARRAY delivers one finished stream rather than a (first, count)
+ * range; queue it as an ordinary consecutive batch and let the fetch plan
+ * read the vertices out of it (rsx_vertex_fetch_plan_set_inline). */
+static void sink_inline_array(void* user, const rsx_dispatch* r,
+                              const u8* data, u32 bytes)
+{
+    (void)user;
+    const u32 stride = rsx_vertex_inline_layout(r, NULL);
+    if (!stride || bytes < stride) return;
+    dc.inl = data;
+    dc.inl_bytes = bytes;
+    dc.n_packets++;
+    if (dc.n_arr >= ENG_MAX_BATCHES) return;
+    dc.arr[dc.n_arr].first = 0;
+    dc.arr[dc.n_arr].count = bytes / stride;
     dc.n_arr++;
 }
 
@@ -1646,6 +1672,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.end              = sink_end;
     sink.draw_arrays      = sink_draw_arrays;
     sink.draw_index_array = sink_draw_index;
+    sink.inline_array     = sink_inline_array;
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;

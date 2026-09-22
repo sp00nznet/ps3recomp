@@ -28,6 +28,7 @@
  *   0x1740+i*4 VTXFMT[i] type[0:3] size[4:7] stride[8:15] frequency[16:31]
  *   0x1808 VERTEX_BEGIN_END  arg = primitive, 0 = end
  *   0x1814 VB_VERTEX_BATCH   first[0:23] (count-1)[24:31]
+ *   0x1818 INLINE_ARRAY     vertex data pushed through the FIFO itself
  *   0x181C IDXBUF_OFFSET     0x1820 IDXBUF_FORMAT location[0:3] type[4:11]
  *   0x1824 VB_INDEX_BATCH    first[0:23] (count-1)[24:31]
  *   0x1D8C CLEAR_DEPTH_VALUE  0x1D90 CLEAR_COLOR_VALUE (A8R8G8B8)
@@ -73,6 +74,7 @@
 #define M_VTXFMT                0x1740
 #define M_VERTEX_BEGIN_END      0x1808
 #define M_VB_VERTEX_BATCH       0x1814
+#define M_INLINE_ARRAY          0x1818
 #define M_IDXBUF_OFFSET         0x181C
 #define M_IDXBUF_FORMAT         0x1820
 #define M_VB_INDEX_BATCH        0x1824
@@ -170,6 +172,7 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_INLINE_ARRAY,      1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_INDEX_BATCH,    1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_CLEAR_BUFFERS,     1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VP_UPLOAD_INST,   32, RSX_DSP_CLASS_EXEC);
@@ -289,12 +292,48 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         if (arg) {
             rsx->in_begin_end = 1;
             rsx->current_primitive = arg;
+            rsx->inline_len = 0;
             if (rsx->sink.begin)
                 rsx->sink.begin(rsx->sink.user, rsx, arg);
         } else {
             rsx->in_begin_end = 0;
+            /* Hand an inline stream over BEFORE end: the sink reads end as
+             * "draw what you have", so a batch delivered after it would be
+             * drawn one primitive late, or not at all. */
+            if (rsx->inline_len && rsx->sink.inline_array)
+                rsx->sink.inline_array(rsx->sink.user, rsx,
+                                       rsx->inline_data, rsx->inline_len);
+            rsx->inline_len = 0;
             if (rsx->sink.end)
                 rsx->sink.end(rsx->sink.user, rsx);
+        }
+        break;
+
+    /* INLINE_ARRAY: the vertex stream travels IN the pushbuffer rather than
+     * being fetched from a vertex array, so there is no (first, count) --
+     * every word between BEGIN_END(prim) and BEGIN_END(0) is vertex data.
+     * The layout is still the ordinary VTXFMT declaration: enabled
+     * attributes packed in ascending index order, one vertex every stride
+     * bytes. Store the words back in guest byte order so the consumer
+     * decodes them with the same big-endian readers a vertex array uses;
+     * the dispatcher never interprets them.
+     *
+     * A title that builds geometry this way (Guitar Hero III draws its
+     * entire 2D layer as inline QUADS) previously issued draws that arrived
+     * carrying no vertices at all: the backend saw BEGIN/END with nothing
+     * between them and counted an empty group. */
+    case M_INLINE_ARRAY:
+        if (rsx->inline_len + 4u <= RSX_DSP_INLINE_MAX_BYTES) {
+            rsx->inline_data[rsx->inline_len + 0] = (u8)(arg >> 24);
+            rsx->inline_data[rsx->inline_len + 1] = (u8)(arg >> 16);
+            rsx->inline_data[rsx->inline_len + 2] = (u8)(arg >> 8);
+            rsx->inline_data[rsx->inline_len + 3] = (u8)arg;
+            rsx->inline_len += 4;
+        } else if (rsx->inline_len) {
+            /* Truncating leaves a torn final vertex; drop the whole stream
+             * and count it instead of drawing something half-read. */
+            rsx->inline_len = 0;
+            rsx->inline_dropped++;
         }
         break;
 

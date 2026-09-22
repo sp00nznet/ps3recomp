@@ -80,6 +80,7 @@ typedef struct {
     u32 pipeline_rt_count;
     u32 bound_surface, bound_depth, bound_pipeline;
     u32 draw_vertices, draw_indices, draw_stride;
+    float draw_first_vertex[4];   /* ATTR0 of the first vertex handed over */
     rsx_topology draw_topology;
     u32 scissor[4];
     u32 stencil_ref;
@@ -206,8 +207,11 @@ static void stub_draw(void* u, rsx_topology topology, const void* verts,
                       u32 count, u32 stride, const u32* indices,
                       u32 index_count)
 {
-    (void)u; (void)verts; (void)indices;
+    (void)u; (void)indices;
     stub.n_draw++;
+    memset(stub.draw_first_vertex, 0, sizeof stub.draw_first_vertex);
+    if (verts && stride >= sizeof stub.draw_first_vertex)
+        memcpy(stub.draw_first_vertex, verts, sizeof stub.draw_first_vertex);
     stub.draw_topology = topology;
     stub.draw_vertices = count;
     stub.draw_stride = stride;
@@ -292,6 +296,7 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_VTXFMT              0x1740
 #define M_BEGIN_END           0x1808
 #define M_DRAW_ARRAYS         0x1814
+#define M_INLINE_ARRAY        0x1818
 #define M_TEX_UNIT            0x1A00   /* + unit * 0x20 */
 #define M_STENCIL_FUNC_REF    0x0334
 #define M_CLEAR_BUFFERS       0x1D94
@@ -916,6 +921,48 @@ static void test_custom_guest_mapping(void)
     engine_down();
 }
 
+/* NV4097_INLINE_ARRAY: the vertices arrive IN the pushbuffer.
+ *
+ * Nothing consumed method 0x1818 at all, so a title that builds geometry this
+ * way (Guitar Hero III draws its whole 2D layer as inline QUADS) issued draws
+ * that reached the backend with no vertices and were counted as empty groups.
+ * The regression this guards is silent by construction -- the draw is simply
+ * absent -- so the check is both that a draw happens AND that its vertices
+ * came from the stream rather than from the still-bound vertex array. */
+static u32 f32_bits(float f) { u32 u; memcpy(&u, &f, 4); return u; }
+
+static void test_inline_array(void)
+{
+    engine_up();
+    /* ATTR0 alone: float4, stride 16. The array at VTX_OFFSET holds 1.0f in
+     * every component (see main), so reading the array instead of the stream
+     * is a distinguishable wrong answer. */
+    m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
+
+    const int before = stub.n_draw;
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    for (u32 v = 0; v < 3; v++) {
+        m(M_INLINE_ARRAY, f32_bits(10.0f + (float)v));  /* x: 10, 11, 12 */
+        m(M_INLINE_ARRAY, f32_bits(20.0f));
+        m(M_INLINE_ARRAY, f32_bits(30.0f));
+        m(M_INLINE_ARRAY, f32_bits(1.0f));
+    }
+    m(M_BEGIN_END, 0u);
+
+    CHECK(stub.n_draw == before + 1, "inline array issues a draw");
+    CHECK(stub.draw_vertices == 3, "inline array draws 3 vertices (got %u)",
+          stub.draw_vertices);
+    CHECK(stub.draw_topology == RSX_TOPOLOGY_TRIANGLES,
+          "inline array keeps the primitive type");
+    CHECK(stub.draw_first_vertex[0] == 10.0f &&
+          stub.draw_first_vertex[1] == 20.0f &&
+          stub.draw_first_vertex[2] == 30.0f,
+          "inline vertices come from the stream, not the vertex array "
+          "(got %g,%g,%g)", stub.draw_first_vertex[0],
+          stub.draw_first_vertex[1], stub.draw_first_vertex[2]);
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -939,6 +986,7 @@ int main(void)
     test_readback();
     test_custom_guest_mapping();
     test_queued_flip_buffer();
+    test_inline_array();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

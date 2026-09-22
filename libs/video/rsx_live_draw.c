@@ -2039,6 +2039,32 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
         *readable = 0;
         return 0;
     }
+    /* LD_TEXSRC_DBG=1: is the guest data there AT ALL?
+     *
+     * "Draws execute, forced green fills the screen, the sampled texture is
+     * black" keeps arriving as the same question, and the decoded-RGBA dump
+     * cannot answer it: that dump lives on the uncompressed path, so a DXT
+     * texture -- which is most of a real game's atlas -- never reaches it.
+     * Counting non-zero SOURCE bytes covers every format and separates "the
+     * upload never happened" from "decode ate it". */
+    { static int ts = -1; static int tsn = 0;
+      if (ts < 0) ts = getenv("LD_TEXSRC_DBG") ? 1 : 0;
+      if (ts && tsn < 16) {
+          u32 nz = 0;
+          for (u32 q = 0; q < span; q++) if (src[q]) nz++;
+          char head[80]; int hn = 0;
+          for (u32 q = 0; q < 16 && q < span; q++)
+              hn += snprintf(head + hn, sizeof head - hn, "%02X", src[q]);
+          fprintf(stderr, "[tex-src] loc=%u off=0x%08X %ux%u fmt=0x%02X mips=%u"
+                          " remap=0x%08X filter=0x%08X head=%s"
+                          " span=%u nonzero=%u\n",
+                  t->location, t->offset, t->width, t->height,
+                  t->format & 0xFF, t->mipmaps, t->remap, t->filter, head,
+                  span, nz);
+          fflush(stderr);
+          tsn++;
+      } }
+
     /* One hash per cached texture per presented frame.  Word-at-a-time FNV is
      * deliberately cheap; this is a mutation detector, not a content ID. */
     u64 hash = 1469598103934665603ull;
@@ -2258,7 +2284,10 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
          * would produce exactly this. */
         { static int td = -1; static int tdn = 0;
           if (td < 0) td = getenv("LD_TEXRGBA_DUMP") ? 1 : 0;
-          if (td && m == 0 && tdn < 6 && mw >= 512 && mh >= 256) {
+          /* No size floor: the floor was picked for one title's full-screen
+           * textures and silently skipped every UI atlas, which is the size
+           * a 2D layer is made of. The dump is opt-in; dump what was asked. */
+          if (td && m == 0 && tdn < 12 && mw && mh) {
               u64 nb = 0;
               for (u32 q = 0; q < mw * mh; q++) {
                   const u8* px = rgba[n] + (size_t)q * 4;
@@ -4204,6 +4233,14 @@ typedef struct { float a[16][4]; } vtx_t;
 typedef struct { u32 first, count; } batch_t;
 
 typedef struct {
+    /* INLINE_ARRAY source for this primitive, or NULL. The stream is the
+     * vertices themselves, in guest byte order, so the fetch path reads it
+     * with the same big-endian decoders it uses for a vertex array -- only
+     * the base pointer differs. inl_off[i] is attribute i's byte offset
+     * within one inline vertex; the attributes are packed in ascending
+     * index order, which is what makes the offsets derivable at all (an
+     * inline stream carries no per-array offset registers). */
+    const u8* inl; u32 inl_bytes, inl_stride; u32 inl_off[16];
     batch_t arr[256]; u32 n_arr;
     batch_t idx[256]; u32 n_idx;
     u32     n_packets;
@@ -4234,6 +4271,7 @@ static void dc_reset(void)
     dc.n_packets = 0;
     dc.n_cuts = 0;
     dc.fetch_ok = 1;
+    dc.inl = NULL; dc.inl_bytes = dc.inl_stride = 0;
 }
 static void push_vert(const vtx_t* v)
 {
@@ -4347,8 +4385,17 @@ static int fetch_attr(u32 i, u32 base, u32 vertex_id, u32 base_index,
     const u32 source_element = rsx_vertex_element_index(
         vertex_id, base_index, a.frequency,
         (divider_mask >> i) & 1u);
-    const u8* p = guest_ptr(
-        a.location, base + a.offset + source_element * stride, elem_size);
+    const u8* p;
+    if (dc.inl) {
+        /* Inline vertices ignore the array offset and the data base: the
+         * stream IS the array, packed at the declared stride. */
+        const u64 at = (u64)source_element * dc.inl_stride + dc.inl_off[i];
+        if (at + elem_size > dc.inl_bytes) return 0;
+        p = dc.inl + at;
+    } else {
+        p = guest_ptr(
+            a.location, base + a.offset + source_element * stride, elem_size);
+    }
     if (!p) return 0;
     for (u32 c = 0; c < a.size && c < 4; c++) {
         switch (a.type) {
@@ -4525,6 +4572,7 @@ static void fetch_batches_hoisted(
     rsx_vertex_fetch_plan_init(
         &dc.fetch_plan, &g.rsx, layout,
         (rsx_vertex_guest_ptr_fn)g.guest_ptr, g.guest_user);
+    rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
     for (u32 slot = 0; slot < layout->count; slot++) {
         const u32 attr = layout->attrs[slot];
@@ -5431,6 +5479,32 @@ static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 coun
     dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++;
     g_ld_stats.packets_queued++;
 }
+/* INLINE_ARRAY arrives as one finished stream instead of a (first, count)
+ * range, so plan the layout here -- offsets and stride come from the VTXFMT
+ * declaration -- and queue it as an ordinary consecutive batch. Everything
+ * downstream (topology, textures, PSO, upload) is then identical to a draw
+ * out of a vertex array, because by then it IS one. */
+static void sink_inline_array(void* u, const rsx_dispatch* r,
+                              const u8* data, u32 bytes)
+{
+    (void)u; (void)r;
+    g_ld_stats.packets_seen++;
+    if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {
+        g_ld_stats.packets_movie++;
+        return;
+    }
+
+    const u32 stride = rsx_vertex_inline_layout(&g.rsx, dc.inl_off);
+    if (!stride || bytes < stride) { g_ld_stats.packets_queue_full++; return; }
+
+    dc.inl = data; dc.inl_bytes = bytes; dc.inl_stride = stride;
+    dc.n_packets++;
+    if (dc.n_arr >= 256) { g_ld_stats.packets_queue_full++; return; }
+    dc.arr[dc.n_arr].first = 0; dc.arr[dc.n_arr].count = bytes / stride;
+    dc.n_arr++;
+    g_ld_stats.packets_queued++;
+}
+
 static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)u; (void)r; g_ld_stats.packets_seen++;
@@ -7324,6 +7398,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     sink.begin = sink_begin;
     sink.end = sink_end;
     sink.draw_arrays = sink_draw_arrays;
+    sink.inline_array = sink_inline_array;
     sink.draw_index_array = sink_draw_index;
     sink.flip = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);

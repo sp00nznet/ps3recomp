@@ -63,12 +63,39 @@ typedef struct rsx_vertex_fetch_plan {
     u32 divider_mask;
     rsx_vertex_guest_ptr_fn guest_ptr;
     void* guest_user;
+    /* INLINE_ARRAY source: when set, the vertices came down the FIFO and the
+     * array offsets/locations mean nothing -- every attribute is read out of
+     * this stream instead. See rsx_vertex_inline_layout. */
+    const u8* inline_data;
+    u32 inline_bytes;
+    u32 inline_off[RSX_DSP_NUM_VERTEX_ATTR]; /* byte offset within a vertex */
+    u32 inline_stride;                       /* decoded once, at _init      */
 } rsx_vertex_fetch_plan;
 
 /* Deterministic ascending-register layout; each selected register remains a
  * float4 and retains its original ATTR semantic index. */
 void rsx_vertex_layout_plan_init(
     rsx_vertex_layout_plan* plan, u32 input_mask);
+
+/* Byte offset of each attribute within one INLINE_ARRAY vertex, and the
+ * vertex size as the return value.
+ *
+ * An inline stream carries no per-array offset registers -- the only thing
+ * that says where an attribute sits is the VTXFMT declaration, and the
+ * hardware rule is that the ENABLED attributes pack in ascending register
+ * order. The declared stride wins over the packed size when the two differ
+ * (a format may pad); the packed size is the fallback when no enabled array
+ * declares a stride. Shared so the hoisted, legacy and reference fetch paths
+ * cannot drift on it. */
+u32 rsx_vertex_inline_layout(
+    const rsx_dispatch* rsx, u32 offsets[RSX_DSP_NUM_VERTEX_ATTR]);
+
+/* Point a plan at an INLINE_ARRAY stream instead of guest memory. Call
+ * between _init and _prepare; a NULL `data` leaves the plan reading guest
+ * memory, so an ordinary draw can call it unconditionally and pay nothing. */
+void rsx_vertex_fetch_plan_set_inline(
+    rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
+    const u8* data, u32 bytes);
 
 /* Decode all 16 descriptors/defaults once for a draw. */
 void rsx_vertex_fetch_plan_init(

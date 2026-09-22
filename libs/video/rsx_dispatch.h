@@ -78,6 +78,13 @@ extern "C" {
 #define RSX_DSP_CLASS_STATE     1   /* decoded by a getter the pipeline uses */
 #define RSX_DSP_CLASS_EXEC      2   /* triggers an execution callback        */
 
+/* Cap on one INLINE_ARRAY stream. A stream is bounded by a single
+ * BEGIN_END pair, and titles use inline arrays for small immediate-mode
+ * batches (UI quads, debug geometry); 64 KB is several hundred vertices of
+ * a fat format. Overruns are counted, not silently truncated -- half a
+ * vertex stream is worse than no draw. */
+#define RSX_DSP_INLINE_MAX_BYTES 65536
+
 typedef struct rsx_dispatch rsx_dispatch;
 
 /* Execution sink: what the dispatcher calls when a method DOES something.
@@ -92,6 +99,13 @@ typedef struct rsx_dispatch_sink {
     void (*draw_arrays)(void* user, const rsx_dispatch* rsx, u32 first, u32 count);
     /* DRAW_INDEX_ARRAY batch: consecutive indices [first, first+count) */
     void (*draw_index_array)(void* user, const rsx_dispatch* rsx, u32 first, u32 count);
+    /* INLINE_ARRAY batch: the vertices were pushed through the FIFO itself
+     * rather than fetched from memory, so they arrive here instead of as a
+     * (first, count) range. `data` is the raw stream in guest byte order and
+     * `bytes` its length; the layout is the ordinary VTXFMT declaration --
+     * see the note on M_INLINE_ARRAY in rsx_dispatch.c. Delivered at END. */
+    void (*inline_array)(void* user, const rsx_dispatch* rsx,
+                         const u8* data, u32 bytes);
     void (*flip)(void* user, const rsx_dispatch* rsx, u32 arg);
 } rsx_dispatch_sink;
 
@@ -105,9 +119,23 @@ struct rsx_dispatch {
     int in_begin_end;                 /* between BEGIN_END(prim) and (0)    */
     u32 current_primitive;
 
+    u32 inline_len;                   /* bytes accumulated this primitive   */
+    u32 inline_dropped;               /* streams lost to the cap            */
+
     /* coverage accounting */
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
     u8  klass[RSX_DSP_NUM_REGS];      /* RSX_DSP_CLASS_*                    */
+
+    /* INLINE_ARRAY accumulation, reset at every BEGIN_END(prim). A fixed
+     * buffer rather than a grown allocation because rsx_dispatch_init
+     * memsets the whole struct, which would drop a pointer on the floor.
+     *
+     * LAST on purpose. Sitting it next to current_primitive pushed seen[]
+     * and klass[] 64 KB away from the register file, and those three are
+     * touched together on EVERY method write: The Simpsons Game, which
+     * emits no inline arrays at all, still lost an order of magnitude of
+     * poll rate in the regression gate purely from the added stride. */
+    u8  inline_data[RSX_DSP_INLINE_MAX_BYTES];
 };
 
 /* ---- lifecycle -------------------------------------------------------- */

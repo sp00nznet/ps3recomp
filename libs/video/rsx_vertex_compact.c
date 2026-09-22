@@ -142,6 +142,39 @@ void rsx_vertex_fetch_plan_init(
     }
 }
 
+u32 rsx_vertex_inline_layout(
+    const rsx_dispatch* rsx, u32 offsets[RSX_DSP_NUM_VERTEX_ATTR])
+{
+    u32 packed = 0, declared = 0;
+    for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; attr++) {
+        rsx_dsp_vertex_attr desc;
+        rsx_dsp_get_vertex_attr(rsx, attr, &desc);
+        if (offsets)
+            offsets[attr] = packed;
+        if (!desc.type || !desc.size)
+            continue;
+        packed += rsx_vertex_attrib_size(desc.type, desc.size);
+        if (desc.stride > declared)
+            declared = desc.stride;
+    }
+    return declared ? declared : packed;
+}
+
+void rsx_vertex_fetch_plan_set_inline(
+    rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
+    const u8* data, u32 bytes)
+{
+    if (!plan)
+        return;
+    plan->inline_data = NULL;
+    plan->inline_bytes = 0;
+    if (!data || !bytes || !rsx)
+        return;
+    plan->inline_stride = rsx_vertex_inline_layout(rsx, plan->inline_off);
+    plan->inline_data = data;
+    plan->inline_bytes = bytes;
+}
+
 void rsx_vertex_fetch_plan_prepare(
     rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count)
 {
@@ -153,8 +186,31 @@ void rsx_vertex_fetch_plan_prepare(
         fetch->stable_base = NULL;
         fetch->stable_first = 0;
         fetch->stable_last = 0;
-        if (!refs || !count || !plan->guest_ptr ||
+        if (!refs || !count ||
             !fetch->desc.type || !fetch->desc.size || !fetch->elem_size)
+            continue;
+
+        /* INLINE_ARRAY: the stream is already one contiguous, correctly
+         * strided array per attribute, which is exactly what stable_base
+         * describes -- so it needs no resolver and no bounds fallback, only
+         * the right base. */
+        if (plan->inline_data) {
+            const u32 stride =
+                plan->inline_stride ? plan->inline_stride : fetch->stride;
+            const u32 off = plan->inline_off[attr];
+            if (!stride || off + fetch->elem_size > stride)
+                continue;
+            const u32 verts = plan->inline_bytes / stride;
+            if (!verts)
+                continue;
+            fetch->stride = stride;
+            fetch->stable_base = plan->inline_data + off;
+            fetch->stable_first = 0;
+            fetch->stable_last = verts - 1;
+            continue;
+        }
+
+        if (!plan->guest_ptr)
             continue;
 
         u32 first = UINT_MAX;
@@ -210,6 +266,13 @@ int rsx_vertex_fetch_one(
             element >= fetch->stable_first && element <= fetch->stable_last) {
             source = fetch->stable_base +
                 (u64)(element - fetch->stable_first) * fetch->stride;
+        } else if (plan->inline_data) {
+            /* An inline draw has no vertex array to fall back to: the array
+             * offsets still hold whatever the last ordinary draw bound, and
+             * reading them would feed this draw another mesh's vertices.
+             * An attribute the stream does not supply gets its default,
+             * which is what the hardware feeds. */
+            source = NULL;
         } else if (plan->guest_ptr) {
             const u32 offset =
                 plan->base_offset + fetch->desc.offset +
