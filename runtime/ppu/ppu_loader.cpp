@@ -1183,6 +1183,66 @@ static inline int vm_oob(uint32_t a, uint32_t n)
     return vm_oob_report(a, n);
 }
 
+/* A guest STORE into the first page. PS3 userspace starts at 0x10000, so a
+ * store below it is a write through a null (or near-null) pointer and would
+ * fault on real hardware before it landed.
+ *
+ * Here the whole 32-bit guest space is backed, so address 0 is ordinary
+ * writable memory and such a store lands silently. That is not a harmless
+ * difference: Guitar Hero III calls memset() on a null buffer with a large
+ * length, and the sweep runs up from page 0 -- invisible while it crosses the
+ * unused copy of the code image, then straight through .data/.opd/.toc at
+ * 0x009D0000. It zeroes the TOC itself, so afterwards every TOC-relative
+ * global reads as 0: allocator pools go null, vtable dispatch calls address 0,
+ * and the guest reads NULL ten million times. Every one of those looks like a
+ * separate bug, and none of them is where the damage happened.
+ *
+ * So drop the store -- hardware never lets it land -- and say so once per
+ * writing function. [null-read] is the read-side twin; this is the store side,
+ * and it is the more important of the two because a read returns a wrong value
+ * while a write destroys state that was correct.
+ *
+ * ponytail: first page only, not the whole 0..0x10000 userspace hole. A null
+ * pointer plus a struct offset is what this is for; widen it if a title turns
+ * out to scribble higher. */
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("PS3_NULL_WRITE");
+                  en = (e && *e == (char)48) ? 0 : 1; }   /* PS3_NULL_WRITE=0 */
+    if (!en) return 0;                                    /* let it land */
+    { static long n = 0;
+      enum { NW_MAX = 8 };
+      long i = n++;
+      if (i < NW_MAX)
+          fprintf(stderr, "[null-write] guest wrote%d 0x%X to 0x%08X (NULL+0x%X)"
+                          " by guest-fn=0x%08X -- DROPPED\n",
+                  width * 8, v, a, a, ppu_prof_resolve_host(ra));
+      else if (i == NW_MAX)
+          fprintf(stderr, "[null-write] further stores into the null page are"
+                          " dropped without a word\n");
+      /* and the guest call chain on the first one: the sampled guest-fn is a
+       * memset/memcpy nine times out of ten, which says nothing about WHICH
+       * buffer was null. The chain names the allocation that failed. */
+      /* ...once per distinct writer, not once overall. The first null store of
+       * a boot is usually a harmless CRT one, and a single global "first" spends
+       * the dump on it and shows nothing for the runaway memset that follows. */
+      { static uint32_t last_fn = 0; uint32_t fn = ppu_prof_resolve_host(ra);
+        if (i < NW_MAX && fn != last_fn && g_active_ctx) {
+            last_fn = fn; ppu_dump_guest_stack(g_active_ctx, "nw"); } }
+      if (i <= NW_MAX) fflush(stderr); }
+    return 1;
+}
+
+/* Hot path: one predictable compare, cold half out of line. */
+static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
+{
+    if (__builtin_expect(a >= 0x1000u, 1)) return 0;
+    return vm_null_store_report(a, v, width, ra);
+}
+
 /* ---------------------------------------------------------------------------
  * Big-endian guest memory accessors (PPU is big-endian; vm_base holds the
  * guest image in its native byte order).
@@ -1610,11 +1670,19 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                           _cap = e ? atol(e) : 64; }
           long _i = ++_n;
           if (_cap == 0 || _i <= _cap) {
-              fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
-                      a, v, width, ppu_prof_resolve_host(ra));
+              /* guest lr and tid as well as the host-sampled function. The
+               * sampler resolves a HOST return address, and identical code
+               * folding makes that ambiguous -- GH3's runaway memset reported
+               * as three different guest functions. ctx->lr is written by the
+               * lifter at every direct call site, so it names the real caller. */
+              extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+              fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X"
+                              " lr=0x%08X tid=%u\n",
+                      a, v, width, ppu_prof_resolve_host(ra),
+                      g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u,
+                      g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u);
               /* On the first write to the watched word, dump the guest caller
                * chain so the origin of a null field can be walked up-stack. */
-              extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
               extern void ppu_dump_guest_stack(ppu_context*, const char*);
               if (_i == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "ww");
           } else if (_i == _cap + 1) {
@@ -1639,7 +1707,7 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
 {
     barrier_watch_hit(ea, val, width, ra);
 }
-void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return;
+void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
     { if(g_pt_val==-2){const char*e=getenv("PT"); g_pt_val=e?(int64_t)strtoul(e,0,16):-1;}
@@ -1649,9 +1717,9 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
     VM_WRITE_COH(a, &v, 1); }
-void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
+void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
-void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4)) return;
+void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */
@@ -1671,7 +1739,7 @@ void vm_write64(uint64_t a, uint64_t v) {
      * 8-byte store still shows up when only its low or high word is watched. */
     barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
-    if (vm_oob((uint32_t)a,8)) return;
+    if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
 }
 
