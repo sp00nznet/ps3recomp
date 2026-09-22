@@ -1912,6 +1912,27 @@ extern "C" void ppu_recomp_register(void)
 /* Reusable guest-stack dumper: scan the guest stack for saved return addresses
  * (words landing inside a lifted function) and resolve them via function_table.
  * Callable from other TUs (e.g. sys_event.c) to identify a blocked thread's chain. */
+/* Upper bound of guest code, from the function table rather than a constant.
+ *
+ * Both stack walkers filtered candidate return addresses with a hardcoded
+ * `< 0x600000`. That is fine for a small title and silently wrong for a big
+ * one: Guitar Hero III's text runs to 0x009CD550, so every frame between
+ * 0x600000 and there was DROPPED -- which is most of its engine. Four separate
+ * walks returned the IDENTICAL chain no matter which frame they started from,
+ * because everything in between was filtered out, and that chain looked
+ * plausible enough to base three wrong conclusions on. */
+static uint32_t ppu_code_hi(void)
+{
+    static uint32_t hi = 0;
+    if (!hi) {
+        uint32_t m = 0;
+        for (uint64_t k = 0; k < function_table_count; k++)
+            if (function_table[k].addr > m) m = function_table[k].addr;
+        hi = m ? m + 0x10000u : 0x600000u;   /* + a margin for the last body */
+    }
+    return hi;
+}
+
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
 {
     if (!ctx || !vm_base) return;
@@ -1980,7 +2001,7 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
           if (prev <= f || vm_oob(prev + 0x14, 4)) break;   /* stacks grow down */
           memcpy(&t, vm_base + prev + 0x14, 4);         /* low half of the saved lr */
           uint32_t ra = __builtin_bswap32(t);
-          if (ra >= 0x10000 && ra < 0x600000) {
+          if (ra >= 0x10000 && ra < ppu_code_hi()) {
               uint32_t bg = 0;
               for (uint64_t k = 0; k < function_table_count; k++) {
                   uint32_t aa = function_table[k].addr; if (aa <= ra && aa > bg) bg = aa; }
@@ -1995,7 +2016,7 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     for (int i = 0; i < 700 && gp < 1100; i++) {
         uint32_t a = sp + i*4; if (vm_oob(a,4)) break;
         uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
-        if (w < 0x10000 || w >= 0x600000) continue;
+        if (w < 0x10000 || w >= ppu_code_hi()) continue;
         uint32_t bg = 0;
         for (uint64_t k = 0; k < function_table_count; k++) { uint32_t aa = function_table[k].addr; if (aa <= w && aa > bg) bg = aa; }
         if (bg && (w - bg) > 0 && (w - bg) < 0x4000 && w != last) {
@@ -2610,7 +2631,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                 uint32_t last = 0;
                 for (int i = 0; i < 700 && gp < 1300; i++) {
                     uint32_t w = g32(sp + i*4);
-                    if (w < 0x10000 || w >= 0x600000) continue;
+                    if (w < 0x10000 || w >= ppu_code_hi()) continue;
                     uint32_t bg = 0;
                     for (uint64_t k = 0; k < function_table_count; k++) {
                         uint32_t a = function_table[k].addr;
