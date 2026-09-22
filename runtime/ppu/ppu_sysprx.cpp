@@ -349,109 +349,33 @@ static void sys_lwcond_create(ppu_context* ctx)
     vm_write32(lwcond + 0x08, ++s_lwcond_id);
     ctx->gpr[3] = 0;
 }
-/* One host event per lwcond id, same open-addressed idiom as lwm_sem above.
- * Auto-reset: a signal releases exactly one waiter, which is sys_lwcond_signal's
- * contract. */
-#ifdef _WIN32
-#define LWC_HASH 4096u
-static struct LwcSlot { volatile long id; HANDLE ev; } g_lwc[LWC_HASH];
-static HANDLE lwc_event(uint32_t id)
-{
-    if (!id) return nullptr;
-    uint32_t h = (id * 2654435761u) & (LWC_HASH - 1);
-    for (uint32_t i = 0; i < LWC_HASH; i++) {
-        uint32_t idx = (h + i) & (LWC_HASH - 1);
-        long cur = g_lwc[idx].id;
-        if ((uint32_t)cur == id) return g_lwc[idx].ev;
-        if (cur == 0 && InterlockedCompareExchange(&g_lwc[idx].id, (long)id, 0) == 0) {
-            g_lwc[idx].ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-            return g_lwc[idx].ev;
-        }
-        if ((uint32_t)g_lwc[idx].id == id) return g_lwc[idx].ev;
-    }
-    return nullptr;
-}
-#endif
-
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-
-/* Wake ONE waiter. This was a no-op that returned success and woke nobody, on
- * the reasoning that the paths reaching it used lwconds for one-shot init
- * handshakes. A title that uses them as real condition variables -- The Orange
- * Box's flip loop at guest 0x00038AE8 does -- then waits on something no one
- * can ever signal. */
-static void sys_lwcond_signal(ppu_context* ctx)
-{
-#ifdef _WIN32
-    uint32_t lwcond = (uint32_t)ctx->gpr[3];
-    HANDLE ev = lwcond ? lwc_event(vm_read32(lwcond + 0x08)) : nullptr;
-    if (ev) SetEvent(ev);
-#endif
-    ctx->gpr[3] = 0;
-}
-static void sys_lwcond_signal_all(ppu_context* ctx)
-{
-#ifdef _WIN32
-    uint32_t lwcond = (uint32_t)ctx->gpr[3];
-    HANDLE ev = lwcond ? lwc_event(vm_read32(lwcond + 0x08)) : nullptr;
-    /* Auto-reset releases one per set; broadcast by setting enough times to
-     * clear any plausible waiter set. Extra sets are harmless -- an event with
-     * no waiter simply stays signalled for the next wait. */
-    if (ev) for (int i = 0; i < 8; i++) SetEvent(ev);
-#endif
-    ctx->gpr[3] = 0;
-}
-static void sys_lwcond_signal_to(ppu_context* ctx)  { sys_lwcond_signal(ctx); }
+static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
 /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
  * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
  * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
  * common single (non-recursive) hold. */
-/* sys_lwcond_wait(lwcond, timeout_usec) -- release the paired lwmutex, block
- * until signalled or the timeout expires, then reacquire it.
- *
- * The timeout was previously ignored outright: the old body slept 1 ms and
- * always returned CELL_OK, i.e. "you were signalled". A guest that passes a
- * deadline and retries on CELL_ETIMEDOUT cannot work against that -- it is told
- * every time that the condition fired. The Orange Box's flip loop does exactly
- * this, checking r3 against 0x8001000B and looping on it.
- *
- * An infinite wait (timeout 0) is deliberately NOT made infinite here: it waits
- * a bounded slice and reports success, which is what the old body effectively
- * did. Honouring it literally would turn "signal is a no-op" bugs elsewhere
- * into hard hangs, and this change should not be able to make anything worse
- * than it already is. Explicit timeouts, which is what a title checking
- * ETIMEDOUT is relying on, are honoured exactly. */
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-    uint64_t timeout = (uint64_t)ctx->gpr[4];        /* microseconds, 0 = forever */
     uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
-    int timed_out = 0;
 #ifdef _WIN32
-    HANDLE s  = lwm_sem(lwmutex);
-    HANDLE ev = lwc_event(vm_read32(lwcond + 0x08));
+    HANDLE s = lwm_sem(lwmutex);
     if (s) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
         ReleaseSemaphore(s, 1, NULL);
-
-        DWORD ms;
-        if (timeout == 0) ms = 1;                    /* bounded, as before */
-        else {
-            uint64_t t = (timeout + 999ull) / 1000ull;
-            ms = (DWORD)(t > 60000ull ? 60000ull : (t ? t : 1ull));
-        }
-        DWORD w = ev ? WaitForSingleObject(ev, ms) : (Sleep(ms), WAIT_TIMEOUT);
-        if (timeout != 0 && w == WAIT_TIMEOUT) timed_out = 1;
-
+        Sleep(1);
         WaitForSingleObject(s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
 #endif
-    ctx->gpr[3] = timed_out ? (uint64_t)(int64_t)(int32_t)CELL_ETIMEDOUT : 0;
+    ctx->gpr[3] = 0;
 }
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
