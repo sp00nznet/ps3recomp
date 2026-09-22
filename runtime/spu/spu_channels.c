@@ -606,8 +606,20 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
               if (s_w) { static unsigned long long n;
                   if ((++n % 100000) == 1)
-                      fprintf(stderr, "[putllc-ok] %llu: img=%d ctx=%p ea=0x%08X\n",
-                              n, ctx->image_id, (void*)ctx, ea); } }
+                      /* ...and the first four words of the line being written.
+                       * A succeeding PUTLLC that repeats millions of times is a
+                       * livelock, and the only useful question is what the SPU
+                       * keeps seeing there -- the count alone cannot answer it. */
+                      { uint32_t w[8] = {0,0,0,0,0,0,0,0};
+                        for (int _i = 0; _i < 8; _i++) {
+                            uint32_t t = 0;
+                            memcpy(&t, (const unsigned char*)ctx->ls + ((lsa + _i*4) & SPU_LS_MASK), 4);
+                            w[_i] = __builtin_bswap32(t);
+                        }
+                        fprintf(stderr, "[putllc-ok] %llu: img=%d ctx=%p ea=0x%08X"
+                                        " line=%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                                n, ctx->image_id, (void*)ctx, ea,
+                                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
             spu_coh_notify_write(ea);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
