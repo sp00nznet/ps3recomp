@@ -625,8 +625,51 @@ static DWORD WINAPI samp_thread(LPVOID p)
     return 0;
 }
 
+/* PPU_POKE_ADDR=<hexEA> PPU_POKE_VAL=<hex> [PPU_POKE_MS=<ms>]: WRITE a guest
+ * word periodically.
+ *
+ * DIAGNOSTIC THAT FABRICATES GUEST STATE -- opt-in, never a default, same
+ * standing as SPURS_EF_SPU_REPLY. It exists because PPU_FORCE_READ_ADDR
+ * cannot answer "what happens once this counter reaches 0": forcing the READ
+ * also fakes the lwarx that loads a store-conditional's expected value, so the
+ * CAS compares against a value memory does not hold and retries forever. That
+ * is a livelock the force itself created -- measured at 1.4M failed
+ * store-conditionals on one address in Guitar Hero III, all of them mine.
+ *
+ * Writing the word leaves memory self-consistent: lwarx, the CAS and the
+ * polling reader all see the same thing, so the guest behaves as it would if
+ * whatever should have cleared the counter had done so. */
+extern "C" void ppu_resv_break(uint64_t ea);
+static DWORD WINAPI poke_thread(LPVOID p)
+{
+    const uint32_t ea  = (uint32_t)(uintptr_t)p;
+    uint32_t val = 0; unsigned ms = 10;
+    { const char* e = getenv("PPU_POKE_VAL"); if (e) val = (uint32_t)strtoul(e, 0, 16);
+      const char* m = getenv("PPU_POKE_MS");  if (m) { ms = (unsigned)atoi(m); if (!ms) ms = 1; } }
+    const uint32_t be = __builtin_bswap32(val);
+    fprintf(stderr, "[poke] writing 0x%08X to guest 0x%08X every %ums (FABRICATED state)\n",
+            val, ea, ms);
+    fflush(stderr);
+    for (;;) {
+        if (vm_base) {
+            __atomic_store_n((uint32_t*)(vm_base + ea), be, __ATOMIC_SEQ_CST);
+            ppu_resv_break(ea);   /* a real writer would break reservations too */
+        }
+        Sleep(ms);
+    }
+}
+static void ppu_poke_start(void)
+{
+    const char* e = getenv("PPU_POKE_ADDR");
+    if (!e) return;
+    uint32_t ea = (uint32_t)strtoul(e, 0, 16);
+    if (!ea) return;
+    CreateThread(NULL, 0, poke_thread, (LPVOID)(uintptr_t)ea, 0, NULL);
+}
+
 void ps3_sampler_start(void)
 {
+    ppu_poke_start();                     /* independent of PS3_SAMPLE */
     const char* e = getenv("PS3_SAMPLE");
     if (!e) return;
     unsigned ms = (unsigned)atoi(e); if (!ms) ms = 5;
@@ -718,6 +761,35 @@ extern "C" void ppu_resv_register(ppu_context* c)
     long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
     if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
 }
+/* Where every guest thread is, as a GUEST address.
+ *
+ * This is the probe the tree was missing. A thread stuck in lifted code is
+ * invisible to everything else: PS3_SCBLOCK_PROF only times lv2 syscalls, the
+ * usleep histogram only sees threads that sleep, g_hle_inflight only sees HLE
+ * handlers, and the sampler resolves a host RIP -- which the lifted TU has no
+ * .pdata for, and which identical code folding makes ambiguous anyway (a hot
+ * `{ return; }` stub is the tell). Guitar Hero III's main thread went dark to
+ * all four at once.
+ *
+ * ctx->lr needs none of that machinery: the lifter writes it before every call,
+ * it is already a guest address, and sys_ppu_thread_create registers every
+ * thread's context here for the reservation set. So the answer was sitting in
+ * an array nobody read. Best-effort and unlocked -- a torn read of one word
+ * costs a wrong digit in a diagnostic, and the alternative is taking a lock on
+ * the reservation path to print a log line. */
+extern "C" void ppu_report_guest_lrs(void)
+{
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (!c) continue;
+        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
+                (unsigned)c->thread_id, (uint32_t)c->lr,
+                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+    }
+    fflush(stderr);
+}
+
 /* Break every reservation on ea's word (real-PPC granule semantics on a store).
  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
  * recheck reads reserve_addr under its slot lock and the value-CAS backstops the
@@ -801,6 +873,39 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     }
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
+    /* PPU_CAS_FAIL=1: histogram the EAs whose store-conditional keeps FAILING.
+     *
+     * A lwarx/stwcx. retry loop that never succeeds is a livelock, and it is
+     * invisible to every other probe: the thread issues no syscall, sleeps
+     * nowhere, enters no HLE, and its lr stays pinned at whatever call brought
+     * it in. "Which address" is the whole question, and nothing could answer
+     * it -- so count failures per address and name the top ones. */
+    { static int s_cf = -1;
+      if (s_cf < 0) s_cf = getenv("PPU_CAS_FAIL") ? 1 : 0;
+      if (s_cf && !ok) {
+          enum { CF_N = 64 };
+          static uint32_t cf_ea[CF_N]; static uint32_t cf_n[CF_N];
+          static int cf_used = 0; static long cf_total = 0;
+          uint32_t a32 = (uint32_t)ea;
+          int i = 0;
+          for (; i < cf_used; i++) if (cf_ea[i] == a32) break;
+          if (i == cf_used && cf_used < CF_N) { cf_ea[cf_used] = a32; cf_used++; }
+          if (i < CF_N) cf_n[i]++;
+          if ((++cf_total % 200000) == 0) {
+              fprintf(stderr, "[cas-fail] %ld failed store-conditionals; top EAs:\n",
+                      cf_total);
+              for (int k = 0; k < 5; k++) {
+                  int best = -1;
+                  for (int j = 0; j < cf_used; j++)
+                      if (cf_n[j] && (best < 0 || cf_n[j] > cf_n[best])) best = j;
+                  if (best < 0) break;
+                  fprintf(stderr, "[cas-fail]   0x%08X  x%u\n", cf_ea[best], cf_n[best]);
+                  cf_n[best] = 0;
+              }
+              fflush(stderr);
+              for (int j = 0; j < cf_used; j++) cf_n[j] = 0;
+          }
+      } }
     /* Gate on the armed window before the call: this sits on EVERY successful
      * stwcx., which locks use, so the disabled cost has to be two compares and
      * no call at all. */

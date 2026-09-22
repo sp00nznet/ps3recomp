@@ -507,6 +507,7 @@ extern "C" const char* g_last_hle_name;
 static void dbg_printf(const char* fmt, ...);
 
 extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
+extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
 
 static void dump_threads(const char* label, HMODULE self)
 {
@@ -530,6 +531,8 @@ static void dump_threads(const char* label, HMODULE self)
           dbg_printf("[WATCHDOG]   guest-tid %-3u in %s\n", t, n);
       }
       if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
+    dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
+    ppu_report_guest_lrs();
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
