@@ -2397,6 +2397,9 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                           (uint32_t)ctx->gpr[3],  (uint32_t)ctx->gpr[9],
                           (uint32_t)ctx->gpr[10], (uint32_t)ctx->gpr[11],
                           (uint32_t)ctx->gpr[12]);
+              /* ...and who made it, once per thread: lr only names the last
+               * direct call, which is usually the lwmutex around the real one. */
+              if (s_n == 0) ppu_dump_guest_stack(ctx, "nc");
               else if (s_n == NC_PER)
                   fprintf(stderr, "[null-call] tid=%u: further null calls not shown\n",
                           (unsigned)ctx->thread_id);

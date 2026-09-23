@@ -664,6 +664,16 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                           (r[10]<<8)|r[11],(r[12]<<8)|r[13],(r[14]<<8)|r[15]);
               }
           } }
+        /* SPU_ATOM_EA: the [atom-ea] line above prints every ATTEMPT, before
+         * the compare. Say which of them committed, or a retried failure reads
+         * as a lost update. */
+        { static int s_v = -1; static uint32_t s_vl;
+          if (s_v < 0) { const char* e = getenv("SPU_ATOM_EA");
+                         s_vl = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_v = s_vl ? 1 : 0; }
+          if (s_v && (ea & ~127u) == s_vl)
+              fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
+                      ctx->atomic_stat ? "FAIL" : "OK",
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
         return 1;
@@ -1494,9 +1504,40 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
 /* Called from the MFC GET path after the copy: ls points at the JUST-COPIED
  * bytes. EA match first (exact, cheap), then content signature for sizeable
  * chunks (overlay bodies are >= 0x500 bytes). */
+/* SPU_DUMP_OVL=<dir>[,<lsa>]: write out every distinct code body streamed into
+ * LS <lsa> (default 0x5000, the job code buffer), so job bodies the title
+ * keeps in its own data can be lifted. A body larger than one DMA arrives as
+ * consecutive GETs (contiguous EA and LS); those are appended to the same
+ * file. One file per source EA: ovl_<ea>.bin. */
+static void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint8_t* ls, uint32_t size)
+{
+    static int s_on = -1; static char s_dir[400]; static uint32_t s_lsa = 0x5000;
+    if (s_on < 0) { const char* e = getenv("SPU_DUMP_OVL"); s_on = e && *e;
+        if (s_on) { snprintf(s_dir, sizeof s_dir, "%s", e);
+                    char* c = strchr(s_dir, ','); if (c) { *c = 0; s_lsa = (uint32_t)strtoul(c + 1, 0, 0); } } }
+    if (!s_on) return;
+    static uint32_t s_seen[256]; static unsigned s_n;
+    static __declspec(thread) uint32_t t_src, t_next_ea, t_next_lsa;
+    FILE* f = NULL; char path[512];
+    if (lsa == s_lsa && size >= 256) {
+        for (unsigned i = 0; i < s_n; i++) if (s_seen[i] == ea) { t_src = 0; return; }
+        if (s_n < 256) s_seen[s_n++] = ea;
+        t_src = ea;
+        snprintf(path, sizeof path, "%s/ovl_%08X.bin", s_dir, ea);
+        f = fopen(path, "wb");
+        fprintf(stderr, "[spu-ovl-dump] img=%d body ea=0x%08X size=%u -> %s\n", ctx->image_id, ea, size, path);
+    } else if (t_src && ea == t_next_ea && lsa == t_next_lsa) {
+        snprintf(path, sizeof path, "%s/ovl_%08X.bin", s_dir, t_src);
+        f = fopen(path, "ab");
+    } else { t_src = 0; return; }
+    if (f) { fwrite(ls, 1, size, f); fclose(f); }
+    t_next_ea = ea + size; t_next_lsa = lsa + size;
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+    spu_ovl_dump(ctx, ea, lsa, ls, size);
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
@@ -1594,7 +1635,11 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
     uint32_t num = raw & 0x0F;
-    { static int _n = 0; if (_n++ < 24)
+    /* SPU_SYSCALL_IMG=<n>: every syscall of image n, uncapped (the 24-line
+     * budget is spent by FMOD's WAIT_SIGNAL loop long before a later task). */
+    static int s_si = -2;
+    if (s_si == -2) { const char* e = getenv("SPU_SYSCALL_IMG"); s_si = e ? atoi(e) : -1; }
+    { static int _n = 0; if (_n++ < 24 || ctx->image_id == s_si)
         fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X wobj@2FDC=0x%02X%02X%02X%02X\n",
                 num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                 ctx->ls[0x2FDC], ctx->ls[0x2FDD], ctx->ls[0x2FDE], ctx->ls[0x2FDF]); }

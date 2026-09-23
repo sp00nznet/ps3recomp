@@ -626,10 +626,24 @@ static void spurs_cancel_attached_queues(u32 spurs_ea)
     s_spurs_event_queue_n = keep;
 }
 
+/* SPU user-event port -> lv2 queue, for SPU code running under SPURS.
+ *
+ * A SPURS task signals the PPU with send_event(port, ...) exactly as a raw SPU
+ * thread does, but there is no lv2 SPU thread group to hold the port binding,
+ * so the lv2 delivery path had nowhere to look and dropped the event -- and
+ * with it the ack the SPU then blocks on in SPU_RdInMbox. Havok's SPU task
+ * stalls on the first physics step that way (port 2), and the PPU step waits
+ * for it forever. */
+static u32 s_spurs_port_queue[64];
+
+uint32_t spurs_port_queue(uint32_t port)
+{
+    return port < 64 ? s_spurs_port_queue[port] : 0;
+}
+
 s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
                                  s32 isDynamic)
 {
-    (void)isDynamic;
     /* KEEP the queue id. SPURS signals the application through the queue it
      * attaches here, and this discarded it -- so nothing SPURS ever did could
      * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
@@ -649,15 +663,32 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     u8* port_h = GUEST_PTR(port, u8*);
 
-    *port_h = 0; /* give it port 0 */
-    printf("[cellSpurs] AttachLv2EventQueue(queue=%u)\n", queue);
+    /* Static: the caller names the port in *port. Dynamic: pick a free one,
+     * 0x10..0x3F first (the low ports are the ones titles ask for by number),
+     * and hand it back. This used to write 0 either way, so every attach
+     * landed on port 0 and the SPU's real port number routed nowhere. */
+    u32 p = *port_h;
+    if (isDynamic) {
+        p = 64;
+        for (u32 i = 0x10; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
+        for (u32 i = 0; i < 0x10 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
+        if (p == 64) return CELL_SPURS_CORE_ERROR_BUSY;
+        *port_h = (u8)p;
+    } else if (p >= 64) {
+        return CELL_SPURS_CORE_ERROR_INVAL;
+    } else if (s_spurs_port_queue[p]) {
+        return CELL_SPURS_CORE_ERROR_BUSY;
+    }
+    s_spurs_port_queue[p] = queue;
+    printf("[cellSpurs] AttachLv2EventQueue(queue=%u) port=%u%s\n", queue, p,
+           isDynamic ? " (dynamic)" : "");
     return CELL_OK;
 }
 
 s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
 {
-    (void)port;
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (port < 64) s_spurs_port_queue[port] = 0;
     printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
     return CELL_OK;
 }

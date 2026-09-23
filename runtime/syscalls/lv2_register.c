@@ -1572,7 +1572,10 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
 static int spu_deliver_user_event(spu_context* spu, uint32_t value)
 {
     unsigned code = value >> 24;
-    if (!spu->spu_group_id) return 0;
+    /* No lv2 group: SPU code under SPURS. Only its user events route, through
+     * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
+    extern uint32_t spurs_port_queue(uint32_t port);
+    if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) return 0;
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
      * 128 acknowledges the result; 192 is the impatient, no-ack form. */
     if (code == 128 || code == 192) {
@@ -1596,10 +1599,14 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
         uint32_t data = spu_channel_read(&spu->ch_out_mbox);
         unsigned port = code & 63;
         uint32_t queue = 0;
-        AcquireSRWLockShared(&s_spu_port_lock);
-        spu_group_t* group = spu_find_group(spu->spu_group_id);
-        if (group) queue = group->user_event_ports[port];
-        ReleaseSRWLockShared(&s_spu_port_lock);
+        if (!spu->spu_group_id) {
+            queue = spurs_port_queue(port);
+        } else {
+            AcquireSRWLockShared(&s_spu_port_lock);
+            spu_group_t* group = spu_find_group(spu->spu_group_id);
+            if (group) queue = group->user_event_ports[port];
+            ReleaseSRWLockShared(&s_spu_port_lock);
+        }
         result = CELL_ENOTCONN;
         if (queue) {
             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,

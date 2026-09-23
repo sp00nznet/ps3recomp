@@ -35,6 +35,7 @@
  * exact.
  */
 
+#include "spu_coherency.h"
 #include "spu_workload.h"
 #include "spu_context.h"
 
@@ -396,6 +397,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
+    spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
     free(ls);
     return 0;
 }

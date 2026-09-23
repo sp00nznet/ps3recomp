@@ -329,6 +329,10 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
         extern void spu_thread_publish_ctx(uint32_t tid, void* c);
         spu_thread_publish_ctx(opts->spu_id, 0);   /* run over: ctx is a stack local */
     }
+    /* ctx is a stack local that may have taken a lock-line reservation; left
+     * in the reserver set it is walked by the next PPU store to that line.
+     * GH3's Havok task returning is what first hit it. */
+    spu_coh_unregister(&ctx);
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
     return 0;
 }
