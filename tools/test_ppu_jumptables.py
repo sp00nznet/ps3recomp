@@ -45,6 +45,10 @@ def w_lwzx(rt, ra, rb):    return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 
 def w_add(rt, ra, rb):     return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (266 << 1)
 def w_slwi(ra, rs, n):     return (21 << 26) | (rs << 21) | (ra << 16) | (n << 11) | (0 << 6) | ((31 - n) << 1)
 def w_bctr():              return (19 << 26) | (20 << 21) | (528 << 1)
+def w_blr():               return (19 << 26) | (20 << 21) | (16 << 1)
+def w_ld(rt, ra, d):       return (58 << 26) | (rt << 21) | (ra << 16) | (d & 0xFFFC)
+def w_std(rs, ra, d):      return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC)
+def w_bc(bo, bi, rel):     return (16 << 26) | (bo << 21) | (bi << 16) | (rel & 0xFFFC)
 
 
 def w_mtctr(rs):
@@ -155,12 +159,71 @@ def test_tie_keeps_first_candidate():
     check("tie between operands keeps the first", got, [0x14000, 0x14004])
 
 
+def test_two_level_base_past_early_return():
+    """Two-level base loaded in the prologue, an early return in between.
+
+        lwz    r30, 8(r2)        <- prologue: the base's base
+        cmplwi cr0, r3, 2
+        bc     (le) -> +12       <- to the dispatch
+        ld     r30, 0(r1)        <- early-return epilogue restores r30...
+        blr                      <- ...and returns: never reaches the bctr
+        lwz    r11, -16(r30)     <- the table base, through r30
+        slwi r9,r3,2; lwzx r0,r9,r11; add r0,r0,r11; mtctr r0; bctr
+
+    GH3 func_0074715C. The base scans stopped at the early blr (missing the
+    prologue load), and once widened they latched the epilogue's `ld r30` as the
+    nearest definition. Dropped, the switch lifted to an indirect tail call and
+    the case bodies clobbered the caller's r25.
+    """
+    mid, table = 0x200800, 0x11000
+    mem = {TOC + 8: mid, mid - 16: table,
+           table + 0: 0x100, table + 4: 0x200, table + 8: 0xFFFFFFFF}
+    words = [w_lwz(30, 2, 8), w_cmplwi(0, 3, 2), w_bc(4, 1, 12),
+             w_ld(30, 1, 0), w_blr(),
+             w_lwz(11, 30, -16), w_slwi(9, 3, 2), w_lwzx(0, 9, 11),
+             w_add(0, 0, 11), w_mtctr(0), w_bctr()]
+    insns = decode_all(words)
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [TOC], TEXT_LO, TEXT_HI, func_starts=[TEXT_LO])
+    check("two-level base past an early return", tables.get(insns[-1].addr),
+          [0x11100, 0x11200])
+
+
+def test_base_before_fallthrough_split():
+    """The table base is loaded before a split point that is not an entry.
+
+        lwz  r30, 8(r2)         <- first "function"
+        std  r30, 0x450(r1)     <- a STORE of r30: reads it, must not end the scan
+        slwi r9, r3, 2          <- falls through into...
+        lwz  r11, -16(r30)      <- ...a func_starts entry (GH3 0x0076571C)
+        lwzx r0,r9,r11; add r0,r0,r11; mtctr r0; bctr
+
+    find_functions cut the function here, so bounding the scan at the nearest
+    start hid the r30 load. A start the previous instruction falls into is
+    skipped.
+    """
+    mid, table = 0x200900, 0x11000
+    mem = {TOC + 8: mid, mid - 16: table,
+           table + 0: 0x100, table + 4: 0x200, table + 8: 0xFFFFFFFF}
+    words = [w_lwz(30, 2, 8), w_std(30, 1, 0x450), w_slwi(9, 3, 2),
+             w_lwz(11, 30, -16), w_lwzx(0, 9, 11), w_add(0, 0, 11),
+             w_mtctr(0), w_bctr()]
+    insns = decode_all(words)
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [TOC], TEXT_LO, TEXT_HI,
+                                  func_starts=[TEXT_LO, TEXT_LO + 12])
+    check("base before a fall-through split point", tables.get(insns[-1].addr),
+          [0x11100, 0x11200])
+
+
 def main() -> int:
     test_encodings()
     test_absolute_base_is_second_operand()
     test_offset_idiom()
     test_offset_both_operands_r2_loaded()
     test_tie_keeps_first_candidate()
+    test_two_level_base_past_early_return()
+    test_base_before_fallthrough_split()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1
