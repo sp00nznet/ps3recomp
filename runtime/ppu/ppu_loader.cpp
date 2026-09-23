@@ -575,6 +575,27 @@ static void samp_report(void)
     fflush(stderr);
 }
 
+/* PS3_SAMPLE_MAIN=1: profile ONLY the boot thread (guest tid 1), and credit a
+ * sample whose RIP is in runtime code (vm_read32, ps3_indirect_call, ...) to
+ * the nearest lifted return address on its stack. A thread that is busy but
+ * mostly inside non-inline memory helpers otherwise reads as "other" and the
+ * guest histogram says nothing about where it loops. */
+static DWORD s_samp_boot_tid;
+static int   s_samp_main = -1;
+
+static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
+{
+    (void)h;
+    const uintptr_t* sp = (const uintptr_t*)c->Rsp;
+    for (int i = 0; i < 512; i++) {          /* 4 KB of stack */
+        uintptr_t v;
+        __try { v = sp[i]; } __except (1) { return 0; }
+        uint32_t g = samp_lookup(v);
+        if (g) return g;
+    }
+    return 0;
+}
+
 static DWORD WINAPI samp_thread(LPVOID p)
 {
     unsigned period = (unsigned)(uintptr_t)p;
@@ -594,6 +615,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
             THREADENTRY32 te; te.dwSize = sizeof te;
             if (Thread32First(snap, &te)) do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+                if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                       FALSE, te.th32ThreadID);
                 if (!h) continue;
@@ -602,6 +624,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     if (GetThreadContext(h, &c)) {
                         s_samp_total++;
                         uint32_t g = samp_lookup((uintptr_t)c.Rip);
+                        if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
                                  samp_tid2(te.th32ThreadID, 1, 0); }
                         else { int nt = samp_mod_hit((uintptr_t)c.Rip);
@@ -673,6 +696,8 @@ void ps3_sampler_start(void)
     const char* e = getenv("PS3_SAMPLE");
     if (!e) return;
     unsigned ms = (unsigned)atoi(e); if (!ms) ms = 5;
+    s_samp_boot_tid = GetCurrentThreadId();
+    s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */

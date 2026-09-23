@@ -439,20 +439,22 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (s_ae == 1) { extern uint32_t g_barrier_sync_watch;
             g_barrier_sync_watch = s_aea; } /* arm PUTLLC OK/FAIL verdict log */ }
       if (s_ae == 1 && ((uint32_t)ea & ~127u) == s_aea) {
-          static int _n = 0;
-          if (_n++ < 48) {
+          static int _n = 0, s_cap = -1;
+          /* SPU_ATOM_EA_MAX=<n>: lines to print (default 48, 0 = unlimited). */
+          if (s_cap < 0) { const char* m = getenv("SPU_ATOM_EA_MAX"); s_cap = m ? atoi(m) : 48; }
+          if (!s_cap || _n++ < s_cap) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
               static int s_af = -1;
-              if (s_af < 0) s_af = getenv("SPU_ATOM_FULL") ? 1 : 0;
-              char buf[640]; int p = 0;
+              if (s_af < 0) { const char* f = getenv("SPU_ATOM_FULL"); s_af = f ? (atoi(f) > 1 ? 2 : 1) : 0; }
+              char buf[1024]; int p = 0;
               /* lr (gpr[0]) as well as pc: these atomics sit in generic helpers,
                * so pc names the HELPER and only lr names the real caller. */
               p += snprintf(buf + p, sizeof buf - p,
                             "[atom-ea] cmd=0x%X img=%d pc=0x%05X lr=0x%05X ea=0x%08X",
                             cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                             ctx->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)ea);
-              int nb = s_af ? 64 : 8;   /* 64 covers +0x30 pendingRecv */
+              int nb = s_af == 2 ? 128 : s_af ? 64 : 8;   /* 64 covers +0x30 pendingRecv; =2 the whole line */
               p += snprintf(buf + p, sizeof buf - p, " RAM=");
               for (int i = 0; i < nb && p < (int)sizeof buf - 4; i++)
                   p += snprintf(buf + p, sizeof buf - p, "%02X%s", r[i],

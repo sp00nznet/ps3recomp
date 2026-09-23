@@ -82,14 +82,9 @@ s32 cellSyncRwmTryWrite(CellSyncRwm* rwm, const void* src);
  * -----------------------------------------------------------------------*/
 #define CELL_SYNC_QUEUE_MAX_DEPTH   1024
 
+/* Opaque: guest big-endian layout, accessed by EA -- see cellSync.c. */
 typedef struct CellSyncQueue {
-    atomic_uint head;
-    atomic_uint tail;
-    atomic_uint count;
-    u32         depth;
-    u32         elemSize;
-    u8*         buffer;
-    atomic_uint lock;  /* simple spinlock for push/pop */
+    u8 raw[32];
 } CellSyncQueue;
 
 s32 cellSyncQueueInitialize(CellSyncQueue* queue, void* buffer,

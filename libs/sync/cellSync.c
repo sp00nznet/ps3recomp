@@ -342,6 +342,21 @@ s32 cellSyncRwmTryWrite(CellSyncRwm* rwm, const void* src)
 
 /* =========================================================================
  * Bounded Queue
+ *
+ * CellSyncQueue lives in guest memory and SPU code (Sony's SPU-side libsync)
+ * pushes into it with GETLLAR/PUTLLC on the same words, so the HLE has to use
+ * the real big-endian layout -- an invented host struct means the SPU reads
+ * size=0 and a garbage buffer pointer, and its pushes never reach the PPU.
+ * GH3's job completions arrive exactly this way. Layout (32 bytes):
+ *
+ *   +0x00 u32  _pop:8  | next:24     next = slot the next push writes
+ *   +0x04 u32  _push:8 | count:24    _pop/_push = op-in-progress flags
+ *   +0x08 u32  size                   element size in bytes
+ *   +0x0C u32  depth
+ *   +0x10 u64  buffer                 guest EA
+ *
+ * ctrl updates run under the SPU lock-line lock and notify, so they are one
+ * transaction against an SPU PUTLLC on that line.
  * =====================================================================*/
 
 static void queue_spinlock_acquire(atomic_uint* lock)
@@ -361,200 +376,170 @@ static void queue_spinlock_release(atomic_uint* lock)
     atomic_store(lock, 0);
 }
 
+static int sq_trace(void){ static int v=-1; if(v<0) v=getenv("SYNC_QTRACE")?1:0; return v; }
+
+/* Apply op to ctrl atomically; op returns 0 to leave ctrl untouched. */
+typedef int (*sq_op)(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos);
+
+static int sq_apply(uint32_t q, sq_op op, uint32_t* pos)
+{
+    uint32_t depth = vm_read32(q + 0x0C);
+    spu_lockline_lock();
+    uint32_t x0 = vm_read32(q), x4 = vm_read32(q + 4);
+    int ok = op(&x0, &x4, depth, pos);
+    if (ok) {
+        uint32_t raw[2] = { ps3_bswap32(x0), ps3_bswap32(x4) };
+        memcpy(vm_ptr8(q), raw, 8);
+        if (spu_coh_is_reserved(q)) spu_coh_notify_write(q);
+    }
+    spu_lockline_unlock();
+    return ok;
+}
+
+static void sq_and(uint32_t q, uint32_t m0, uint32_t m4)
+{
+    spu_lockline_lock();
+    uint32_t raw[2] = { ps3_bswap32(vm_read32(q) & m0), ps3_bswap32(vm_read32(q + 4) & m4) };
+    memcpy(vm_ptr8(q), raw, 8);
+    if (spu_coh_is_reserved(q)) spu_coh_notify_write(q);
+    spu_lockline_unlock();
+}
+
+static int sq_push_begin(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos)
+{
+    uint32_t next = *x0 & 0xFFFFFF, pop = *x0 >> 24;
+    uint32_t count = *x4 & 0xFFFFFF, push = *x4 >> 24;
+    if (push || count + pop >= depth) return 0;
+    *pos = next;
+    next = next + 1 != depth ? next + 1 : 0;
+    *x0 = (pop << 24) | next;
+    *x4 = (1u << 24) | (count + 1);
+    return 1;
+}
+
+static int sq_pop_begin(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos)
+{
+    uint32_t next = *x0 & 0xFFFFFF, pop = *x0 >> 24;
+    uint32_t count = *x4 & 0xFFFFFF, push = *x4 >> 24;
+    if (pop || count <= push) return 0;
+    *pos = (next + depth - count) % depth;
+    *x0 = (1u << 24) | next;
+    *x4 = (push << 24) | (count - 1);
+    return 1;
+}
+
+static int sq_peek_begin(uint32_t* x0, uint32_t* x4, uint32_t depth, uint32_t* pos)
+{
+    uint32_t next = *x0 & 0xFFFFFF, pop = *x0 >> 24;
+    uint32_t count = *x4 & 0xFFFFFF, push = *x4 >> 24;
+    if (pop || count <= push) return 0;
+    *pos = (next + depth - count) % depth;
+    *x0 = (1u << 24) | next;
+    return 1;
+}
+
+static int sq_clear_1(uint32_t* x0, uint32_t* x4, uint32_t d, uint32_t* p)
+{ (void)x4; (void)d; (void)p; if (*x0 >> 24) return 0; *x0 |= 1u << 24; return 1; }
+static int sq_clear_2(uint32_t* x0, uint32_t* x4, uint32_t d, uint32_t* p)
+{ (void)x0; (void)d; (void)p; if (*x4 >> 24) return 0; *x4 |= 1u << 24; return 1; }
+
+static uint32_t sq_elem(uint32_t q, uint32_t pos)
+{
+    return (uint32_t)vm_read64(q + 0x10) + pos * vm_read32(q + 0x08);
+}
+
 s32 cellSyncQueueInitialize(CellSyncQueue* queue, void* buffer,
                             u32 size, u32 depth)
 {
-    queue = GUEST_PTR(queue, CellSyncQueue*);
-    buffer = GUEST_PTR(buffer, void*);
-    if (!queue || !buffer)
-        return CELL_SYNC_ERROR_NULL_POINTER;
+    uint32_t q = (uint32_t)(uintptr_t)queue, b = (uint32_t)(uintptr_t)buffer;
+    if (!q) return CELL_SYNC_ERROR_NULL_POINTER;
+    if (size && !b) return CELL_SYNC_ERROR_NULL_POINTER;
+    if (!depth || size % 16) return CELL_SYNC_ERROR_INVAL;
+    if (q % 32 || b % 16) return CELL_SYNC_ERROR_ALIGN;
 
-    if (size == 0 || depth == 0 || depth > CELL_SYNC_QUEUE_MAX_DEPTH)
-        return CELL_SYNC_ERROR_INVAL;
-
-    atomic_store(&queue->head, 0);
-    atomic_store(&queue->tail, 0);
-    atomic_store(&queue->count, 0);
-    atomic_store(&queue->lock, 0);
-    queue->depth = depth;
-    queue->elemSize = size;
-    queue->buffer = (u8*)buffer;
-
-    memset(buffer, 0, (size_t)size * depth);
-
-    return CELL_OK;
-}
-
-s32 cellSyncQueuePush(CellSyncQueue* queue, const void* data)
-{
-    queue = GUEST_PTR(queue, CellSyncQueue*);
-    data = GUEST_PTR(data, const void*);
-    if (!queue || !data)
-        return CELL_SYNC_ERROR_NULL_POINTER;
-
-    int spins = 0;
-
-    /* Spin until there's space */
-    while (atomic_load(&queue->count) >= queue->depth) {
-        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
-    }
-
-    queue_spinlock_acquire(&queue->lock);
-
-    if (atomic_load(&queue->count) >= queue->depth) {
-        queue_spinlock_release(&queue->lock);
-        return cellSyncQueuePush(queue, data); /* retry */
-    }
-
-    u32 tail = atomic_load(&queue->tail);
-    memcpy(queue->buffer + (size_t)tail * queue->elemSize,
-           data, queue->elemSize);
-    atomic_store(&queue->tail, (tail + 1) % queue->depth);
-    atomic_fetch_add(&queue->count, 1);
-
-    queue_spinlock_release(&queue->lock);
+    vm_write32(q + 0x08, size);
+    vm_write32(q + 0x0C, depth);
+    vm_write64(q + 0x10, b);
+    vm_write64(q + 0x18, 0);
+    vm_write64(q, 0);
+    if (sq_trace()) fprintf(stderr, "[SYNCQ] init q=0x%08X buf=0x%08X size=%u depth=%u\n", q, b, size, depth);
     return CELL_OK;
 }
 
 s32 cellSyncQueueTryPush(CellSyncQueue* queue, const void* data)
 {
-    queue = GUEST_PTR(queue, CellSyncQueue*);
-    data = GUEST_PTR(data, const void*);
-    if (!queue || !data)
-        return CELL_SYNC_ERROR_NULL_POINTER;
-
-    if (atomic_load(&queue->count) >= queue->depth)
-        return CELL_SYNC_ERROR_OVERFLOW;
-
-    unsigned int expected = 0;
-    if (!atomic_compare_exchange_strong(&queue->lock, &expected, 1))
-        return CELL_SYNC_ERROR_BUSY;
-
-    if (atomic_load(&queue->count) >= queue->depth) {
-        atomic_store(&queue->lock, 0);
-        return CELL_SYNC_ERROR_OVERFLOW;
-    }
-
-    u32 tail = atomic_load(&queue->tail);
-    memcpy(queue->buffer + (size_t)tail * queue->elemSize,
-           data, queue->elemSize);
-    atomic_store(&queue->tail, (tail + 1) % queue->depth);
-    atomic_fetch_add(&queue->count, 1);
-
-    atomic_store(&queue->lock, 0);
+    uint32_t q = (uint32_t)(uintptr_t)queue, d = (uint32_t)(uintptr_t)data;
+    if (!q || !d) return CELL_SYNC_ERROR_NULL_POINTER;
+    uint32_t pos;
+    if (!sq_apply(q, sq_push_begin, &pos)) return CELL_SYNC_ERROR_BUSY;
+    uint32_t n = vm_read32(q + 0x08);
+    vm_memcpy_to(sq_elem(q, pos), vm_ptr8(d), n);
+    sq_and(q, 0xFFFFFFFFu, 0x00FFFFFFu);            /* clear _push */
+    if (sq_trace()) fprintf(stderr, "[SYNCQ] push q=0x%08X pos=%u\n", q, pos);
     return CELL_OK;
 }
+
+s32 cellSyncQueuePush(CellSyncQueue* queue, const void* data)
+{
+    s32 rc;
+    int spins = 0;
+    while ((rc = cellSyncQueueTryPush(queue, data)) == CELL_SYNC_ERROR_BUSY)
+        if (++spins > 100) { SYNC_YIELD(); spins = 0; }
+    return rc;
+}
+
+static s32 sq_take(CellSyncQueue* queue, void* data, sq_op op)
+{
+    uint32_t q = (uint32_t)(uintptr_t)queue, d = (uint32_t)(uintptr_t)data;
+    if (!q || !d) return CELL_SYNC_ERROR_NULL_POINTER;
+    uint32_t pos;
+    if (!sq_apply(q, op, &pos)) return CELL_SYNC_ERROR_BUSY;
+    uint32_t n = vm_read32(q + 0x08);
+    vm_memcpy_to(d, vm_ptr8(sq_elem(q, pos)), n);
+    sq_and(q, 0x00FFFFFFu, 0xFFFFFFFFu);            /* clear _pop */
+    if (sq_trace()) fprintf(stderr, "[SYNCQ] %s q=0x%08X pos=%u\n",
+                            op == sq_pop_begin ? "pop " : "peek", q, pos);
+    return CELL_OK;
+}
+
+s32 cellSyncQueueTryPop(CellSyncQueue* queue, void* data) { return sq_take(queue, data, sq_pop_begin); }
 
 s32 cellSyncQueuePop(CellSyncQueue* queue, void* data)
 {
-    queue = GUEST_PTR(queue, CellSyncQueue*);
-    data = GUEST_PTR(data, void*);
-    if (!queue || !data)
-        return CELL_SYNC_ERROR_NULL_POINTER;
-
+    s32 rc;
     int spins = 0;
-
-    while (atomic_load(&queue->count) == 0) {
-        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
-    }
-
-    queue_spinlock_acquire(&queue->lock);
-
-    if (atomic_load(&queue->count) == 0) {
-        queue_spinlock_release(&queue->lock);
-        return cellSyncQueuePop(queue, data); /* retry */
-    }
-
-    u32 head = atomic_load(&queue->head);
-    memcpy(data, queue->buffer + (size_t)head * queue->elemSize,
-           queue->elemSize);
-    atomic_store(&queue->head, (head + 1) % queue->depth);
-    atomic_fetch_sub(&queue->count, 1);
-
-    queue_spinlock_release(&queue->lock);
-    return CELL_OK;
-}
-
-s32 cellSyncQueueTryPop(CellSyncQueue* queue, void* data)
-{
-    queue = GUEST_PTR(queue, CellSyncQueue*);
-    data = GUEST_PTR(data, void*);
-    if (!queue || !data)
-        return CELL_SYNC_ERROR_NULL_POINTER;
-
-    if (atomic_load(&queue->count) == 0)
-        return CELL_SYNC_ERROR_EMPTY;
-
-    unsigned int expected = 0;
-    if (!atomic_compare_exchange_strong(&queue->lock, &expected, 1))
-        return CELL_SYNC_ERROR_BUSY;
-
-    if (atomic_load(&queue->count) == 0) {
-        atomic_store(&queue->lock, 0);
-        return CELL_SYNC_ERROR_EMPTY;
-    }
-
-    u32 head = atomic_load(&queue->head);
-    memcpy(data, queue->buffer + (size_t)head * queue->elemSize,
-           queue->elemSize);
-    atomic_store(&queue->head, (head + 1) % queue->depth);
-    atomic_fetch_sub(&queue->count, 1);
-
-    atomic_store(&queue->lock, 0);
-    return CELL_OK;
+    while ((rc = sq_take(queue, data, sq_pop_begin)) == CELL_SYNC_ERROR_BUSY)
+        if (++spins > 100) { SYNC_YIELD(); spins = 0; }
+    return rc;
 }
 
 s32 cellSyncQueuePeek(CellSyncQueue* queue, void* data)
 {
-    queue = GUEST_PTR(queue, CellSyncQueue*);
-    data = GUEST_PTR(data, void*);
-    if (!queue || !data)
-        return CELL_SYNC_ERROR_NULL_POINTER;
-
-    if (atomic_load(&queue->count) == 0)
-        return CELL_SYNC_ERROR_EMPTY;
-
-    queue_spinlock_acquire(&queue->lock);
-
-    if (atomic_load(&queue->count) == 0) {
-        queue_spinlock_release(&queue->lock);
-        return CELL_SYNC_ERROR_EMPTY;
-    }
-
-    u32 head = atomic_load(&queue->head);
-    memcpy(data, queue->buffer + (size_t)head * queue->elemSize,
-           queue->elemSize);
-
-    queue_spinlock_release(&queue->lock);
-    return CELL_OK;
+    s32 rc;
+    int spins = 0;
+    while ((rc = sq_take(queue, data, sq_peek_begin)) == CELL_SYNC_ERROR_BUSY)
+        if (++spins > 100) { SYNC_YIELD(); spins = 0; }
+    return rc;
 }
 
 s32 cellSyncQueueSize(CellSyncQueue* queue, u32* size)
 {
-    queue = GUEST_PTR(queue, CellSyncQueue*);
+    uint32_t q = (uint32_t)(uintptr_t)queue;
     size = GUEST_PTR(size, u32*);
-    if (!queue || !size)
-        return CELL_SYNC_ERROR_NULL_POINTER;
-
-    *size = atomic_load(&queue->count);
+    if (!q || !size) return CELL_SYNC_ERROR_NULL_POINTER;
+    *size = ps3_bswap32(vm_read32(q + 4) & 0xFFFFFF);   /* guest u32, BE */
     return CELL_OK;
 }
 
 s32 cellSyncQueueClear(CellSyncQueue* queue)
 {
-    queue = GUEST_PTR(queue, CellSyncQueue*);
-    if (!queue)
-        return CELL_SYNC_ERROR_NULL_POINTER;
-
-    queue_spinlock_acquire(&queue->lock);
-    atomic_store(&queue->head, 0);
-    atomic_store(&queue->tail, 0);
-    atomic_store(&queue->count, 0);
-    queue_spinlock_release(&queue->lock);
-
+    uint32_t q = (uint32_t)(uintptr_t)queue, p;
+    if (!q) return CELL_SYNC_ERROR_NULL_POINTER;
+    while (!sq_apply(q, sq_clear_1, &p)) SYNC_YIELD();
+    while (!sq_apply(q, sq_clear_2, &p)) SYNC_YIELD();
+    sq_and(q, 0, 0);
     return CELL_OK;
 }
-
 /* =========================================================================
  * Lock-Free Queue
  *
