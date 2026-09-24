@@ -261,6 +261,12 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     s_state.hdc = GetDC(s_state.hwnd);
     s_state.last_fps_time = GetTickCount64();
 
+    /* Keep the display awake, as any PC game does. With the monitor asleep a
+     * vsync'd Present crawls (~4 fps); guest frames stretch to 250 ms and GH3's
+     * Havok step takes huge timesteps, which is how an unattended run stalled
+     * in the intro movie while an attended one did not. */
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+
     /* Register as the active RSX backend */
     rsx_set_backend(&s_null_backend);
 

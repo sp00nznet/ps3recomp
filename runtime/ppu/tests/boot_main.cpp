@@ -505,6 +505,13 @@ extern "C" const char* g_last_hle_name;
 /* Defined with the debug console below; writes to stderr and, when the
  * console is servicing a command, also to its response file. */
 static void dbg_printf(const char* fmt, ...);
+/* While dump_threads holds a thread suspended, dbg_printf formats into this
+ * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
+ * and writing then deadlocks the watchdog -- and with it every thread that
+ * logs. GH3 froze solid (0% CPU, log silent mid-boot) exactly that way. */
+static __declspec(thread) char   s_dbg_capbuf[16384];
+static __declspec(thread) char*  s_dbg_cap = NULL;
+static __declspec(thread) size_t s_dbg_capn = 0;
 
 extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
 extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
@@ -542,6 +549,7 @@ static void dump_threads(const char* label, HMODULE self)
             HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
                                    FALSE, te.th32ThreadID);
             if (!th) continue;
+            s_dbg_capn = 0; s_dbg_capbuf[0] = 0; s_dbg_cap = s_dbg_capbuf;
             SuspendThread(th);
             CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
             if (GetThreadContext(th, &ctx)) {
@@ -629,6 +637,8 @@ static void dump_threads(const char* label, HMODULE self)
                 }
             }
             ResumeThread(th);
+            s_dbg_cap = NULL;
+            if (s_dbg_capn) dbg_printf("%s", s_dbg_capbuf);
             CloseHandle(th);
         } while (Thread32Next(snap, &te));
     }
@@ -663,6 +673,13 @@ static void dbg_printf(const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
+    if (s_dbg_cap) {             /* a thread is suspended: format only, no stream lock */
+        int n = vsnprintf(s_dbg_cap + s_dbg_capn, sizeof s_dbg_capbuf - s_dbg_capn, fmt, ap);
+        if (n > 0) s_dbg_capn += (size_t)n;
+        if (s_dbg_capn >= sizeof s_dbg_capbuf) s_dbg_capn = sizeof s_dbg_capbuf - 1;
+        va_end(ap);
+        return;
+    }
     if (s_dbg_out) { va_list c; va_copy(c, ap); vfprintf(s_dbg_out, fmt, c); va_end(c); }
     vfprintf(stderr, fmt, ap);
     va_end(ap);

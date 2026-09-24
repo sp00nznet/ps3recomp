@@ -922,6 +922,15 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     }
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
+    /* PPU_CASWATCH=<hex ea>: log successful stwcx. on that 128-byte line.
+     * PPU_WWATCH hooks plain stores only; an atomic counter (a semaphore an SPU
+     * spins on) is written exclusively through here and looked untouched. */
+    { static int64_t s_cw = -2;
+      if (s_cw == -2) { const char* e = getenv("PPU_CASWATCH"); s_cw = e ? (int64_t)(strtoul(e, 0, 16) & ~127u) : -1; }
+      if (ok && s_cw >= 0 && ((uint32_t)ea & ~127u) == (uint32_t)s_cw) {
+          static int n; if (n++ < 200)
+              fprintf(stderr, "[caswatch] 0x%08X %08X -> %08X lr=0x%08X tid=%u\n", (uint32_t)ea, expected, val,
+                      self ? (uint32_t)self->lr : 0u, self ? (unsigned)self->thread_id : 0u); } }
     /* PPU_CAS_FAIL=1: histogram the EAs whose store-conditional keeps FAILING.
      *
      * A lwarx/stwcx. retry loop that never succeeds is a livelock, and it is
