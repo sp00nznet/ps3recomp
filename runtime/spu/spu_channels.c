@@ -420,7 +420,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                     cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
         if (cmd == MFC_GETLLAR_CMD) {
             memset(ls, 0, MFC_ATOMIC_LINE);
-            ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 0;
+            ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 4;
         } else {
             ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
         }
@@ -522,7 +522,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
          * stale, which is exactly what makes the lost-reservation event fire. */
         memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
-        ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
+        /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
+         * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
+         * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
+        ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
         spu_lockline_unlock();
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
@@ -688,7 +691,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * reservation here would commit a PUTLLC against a snapshot this store
          * has already overwritten. */
         spu_coh_notify_write(ea);
-        ctx->resv_valid = 0; ctx->atomic_stat = 0;
+        ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
         return 1;
 

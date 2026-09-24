@@ -845,9 +845,22 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
         return CELL_SPURS_TASK_ERROR_STAT;
     }
 
-    /* Find a free task slot */
-    for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
-        if (!s_tasks[i].in_use) {
+    /* Find a free task slot IN THIS TASKSET: the first task id whose bit in the
+     * taskset's enabled bitset (+0x30, 128 bits, task 0 = MSB) is clear. Task
+     * exit clears that bit (spu_taskset_task_exited), so ids recycle the way
+     * real SPURS recycles them. The old scan of the global s_tasks[] never
+     * freed a slot unless the task was joined; Havok creates a task per step
+     * and never joins, so after 128 steps CreateTask failed and the physics
+     * step waited forever for a task that was never started.
+     * ponytail: s_tasks[] is shared by every taskset and now only records the
+     * last task per slot id -- enough for JoinTask2's lookup; key it by
+     * (taskset, id) if a title joins tasks in two tasksets at once. */
+    u32 free_slot = CELL_SPURS_MAX_TASK;
+    for (u32 t = 0; t < CELL_SPURS_MAX_TASK; t++)
+        if (!(vm_read8(taskset_ea + 0x30 + t / 8) & (0x80u >> (t % 8)))) { free_slot = t; break; }
+    if (free_slot < CELL_SPURS_MAX_TASK) {
+        u32 i = free_slot;
+        {
             s_tasks[i].in_use = 1;
             s_tasks[i].id = s_next_task_id++;
             s_tasks[i].active = 1;
@@ -961,6 +974,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
         }
     }
 
+    fprintf(stderr, "[cellSpurs] CreateTask: taskset 0x%08X has no free task id (all 128 enabled)\n",
+            taskset_ea);
     return CELL_SPURS_TASK_ERROR_NOMEM;
 }
 
