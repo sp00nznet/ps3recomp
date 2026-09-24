@@ -2225,7 +2225,42 @@ extern "C" void ppu_dump_bctrl_ring(uint32_t thread_id, const char* tag)
     fflush(f);
 }
 
+/* PPU_CSCHECK=1: every indirect call must hand back r1, r2 and r14..r31 as it
+ * found them (the ABI's non-volatile set; r2 is restored by the caller's TOC
+ * reload, so it is left out). A lifted function that does not -- a switch
+ * whose dispatcher was lifted as a tail call, a split function whose second
+ * half restores from the wrong frame -- hands its caller garbage in a register
+ * the caller trusts, and the damage surfaces far away as a "vtable used as an
+ * object" or a double-allocated heap block. Reports the target once each. */
+static void ps3_indirect_call_impl(ppu_context* ctx);
+/* The impl declares these at block scope; outside an extern "C" function that
+ * would give them C++ linkage, so pin it here. */
+extern "C" uint32_t ps3_hle_count(void);
 extern "C" void ps3_indirect_call(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
+    if (!on) { ps3_indirect_call_impl(ctx); return; }
+    uint64_t save[19]; uint32_t tgt = (uint32_t)ctx->ctr;
+    save[0] = ctx->gpr[1];
+    for (int r = 14; r < 32; r++) save[r - 13] = ctx->gpr[r];
+    ps3_indirect_call_impl(ctx);
+    if (ctx->gpr[1] != save[0] || memcmp(&ctx->gpr[14], &save[1], 18 * sizeof(uint64_t))) {
+        static uint32_t seen[256]; static unsigned n;
+        for (unsigned i = 0; i < n; i++) if (seen[i] == tgt) return;
+        if (n < 256) seen[n++] = tgt;
+        char buf[400]; int p = snprintf(buf, sizeof buf, "[cscheck] target 0x%08X changed:", tgt);
+        if (ctx->gpr[1] != save[0]) p += snprintf(buf + p, sizeof buf - p, " r1 %08X->%08X",
+                                                  (uint32_t)save[0], (uint32_t)ctx->gpr[1]);
+        for (int r = 14; r < 32 && p < (int)sizeof buf - 40; r++)
+            if (ctx->gpr[r] != save[r - 13])
+                p += snprintf(buf + p, sizeof buf - p, " r%d %08X->%08X", r,
+                              (uint32_t)save[r - 13], (uint32_t)ctx->gpr[r]);
+        fprintf(stderr, "%s\n", buf);
+    }
+}
+
+static void ps3_indirect_call_impl(ppu_context* ctx)
 {
     g_active_ctx = ctx;
     /* BCTRL_RING=1: keep the last N indirect-call targets per thread, and let

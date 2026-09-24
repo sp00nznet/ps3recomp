@@ -2366,23 +2366,29 @@ class PPULifter:
                     f"d[0]=(a[0]&~c[0])|(b[0]&c[0]); d[1]=(a[1]&~c[1])|(b[1]&c[1]); }}")
 
         # VMX compare (vcmpequw, vcmpeqfp, vcmpgefp, vcmpgtfp)
-        if mn.startswith("vcmpeqfp"):
+        # Float compares and vcmpequw. The dot forms set CR6 (8 = all lanes
+        # true, 2 = all lanes false), which these ignored: 567 dot-form
+        # compares in Guitar Hero III branched on whatever CR6 last held.
+        # Result masks are all-ones / all-zero, so no swap on the way out.
+        vcmp_f = {"vcmpeqfp": "a[i]==b[i]", "vcmpgefp": "a[i]>=b[i]",
+                  "vcmpgtfp": "a[i]>b[i]"}
+        if mn.rstrip(".") in vcmp_f or mn.rstrip(".") == "vcmpequw":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
-
-        if mn.startswith("vcmpgefp"):
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]>=b[i]?~0u:0; }}")
-
-        if mn.startswith("vcmpgtfp"):
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]>b[i]?~0u:0; }}")
+            if mn.rstrip(".") == "vcmpequw":
+                load = (f"uint32_t a[4],b[4]; ppu_vldu4(&ctx->vr[{va}],a); "
+                        f"ppu_vldu4(&ctx->vr[{vb}],b); ")
+                pred = "a[i]==b[i]"
+            else:
+                load = (f"float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); "
+                        f"ppu_vldf4(&ctx->vr[{vb}],b); ")
+                pred = vcmp_f[mn.rstrip(".")]
+            body = (f"{{ {load}uint32_t d[4]; int t=0; "
+                    f"for(int i=0;i<4;i++){{ int r=({pred}); d[i]=r?~0u:0u; t+=r; }} "
+                    f"memcpy(&ctx->vr[{vd}], d, 16);")
+            if mn.endswith("."):
+                body += (" uint32_t c6=(t==4?8u:0u)|(t==0?2u:0u); "
+                         "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+            return body + " }"
 
         # VMX shift (vsldoi) — shift left double by octet immediate
         if mn == "vsldoi":
@@ -2546,11 +2552,23 @@ class PPULifter:
 
         # Float min/max
         if mn == "vmaxfp" or mn == "vminfp":
+            # Lanes are big-endian in ctx->vr, so load through ppu_vldf4 like
+            # every other float op. This read them as host floats -- comparing
+            # byte-reversed bit patterns -- and it dropped a NaN in vA, which
+            # VMX propagates. Guitar Hero III reduces every Havok AABB with
+            # these (292 sites): the boxes came out wrong, some inverted
+            # (min=+FLT_MAX, max=-FLT_MAX), and the broadphase built pair
+            # lists it then could not undo -- freeing stack memory into the
+            # heap. VMX: a NaN operand gives that NaN, quieted (vA first); for
+            # equal operands max prefers +0 and min prefers -0.
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            cmp = ">" if mn == "vmaxfp" else "<"
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+            if mn == "vmaxfp":
+                pick = "(a[i]>b[i]) ? a[i] : (b[i]>a[i]) ? b[i] : (signbit(a[i]) ? b[i] : a[i])"
+            else:
+                pick = "(a[i]<b[i]) ? a[i] : (b[i]<a[i]) ? b[i] : (signbit(a[i]) ? a[i] : b[i])"
+            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i] = (a[i]!=a[i]) ? a[i]+a[i] : (b[i]!=b[i]) ? b[i]+b[i] : ({pick}); "
+                    f"ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         # Splat immediate (vspltisb/h/w) — splat a 5-bit signed immediate
         if mn in ("vspltisb", "vspltish", "vspltisw"):
@@ -2600,6 +2618,21 @@ class PPULifter:
             return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
                     f"for(int i=0;i<4;i++) d[i]=floorf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
+        # vrfin / vrfiz had no lowering at all: they lifted to a TODO comment,
+        # so vD kept whatever it held before. Guitar Hero III uses vrfin (9
+        # sites, Havok's AABB quantization among them); a stale register there
+        # gives endpoints that disagree with the overlap bits computed from the
+        # same boxes, and the broadphase then removes pairs it never added.
+        if mn == "vrfin":  # round to FP integer, nearest (ties to even)
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=nearbyintf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
+
+        if mn == "vrfiz":  # round to FP integer toward zero
+            vd, vb = int(ops[0][1:]), int(ops[-1][1:])
+            return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=truncf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
+
         if mn == "vrfip":  # round to FP integer toward +inf (ceil); vrfip is vD,vB
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
             return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
@@ -2634,10 +2667,13 @@ class PPULifter:
         # Compare with Rc (vcmpeqfp., vcmpgefp., etc.)
         if mn.startswith("vcmpbfp"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
+            # Big-endian lanes both ways (it read host floats and stored host
+            # words). vcmpbfp: bit 0 = !(a <= b), bit 1 = !(a >= -b); a NaN
+            # fails both compares and so sets both bits.
+            return (f"{{ float a[4],b[4]; uint32_t d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
                     f"for(int i=0;i<4;i++) {{ uint32_t r=0; "
-                    f"if(a[i]>b[i]) r|=0x80000000u; if(a[i]<-b[i]) r|=0x40000000u; d[i]=r; }} }}")
+                    f"if(!(a[i]<=b[i])) r|=0x80000000u; if(!(a[i]>=-b[i])) r|=0x40000000u; d[i]=r; }} "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); " + (f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(((d[0]|d[1]|d[2]|d[3])==0?2u:0u)<<4); " if mn.endswith(".") else "") + "}")
 
         # ------- Additional VMX integer instructions -------
         # Byte compare equal

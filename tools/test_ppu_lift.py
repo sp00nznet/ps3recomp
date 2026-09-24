@@ -670,6 +670,28 @@ def build_vcases():
           5, be_h([0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1111, 0x2222, 0x3333, 0x4444]),
           2, be_h([0xDEF0] * 8))
 
+    # vmaxfp / vminfp read host floats until GH3 needed them (292 sites, every
+    # Havok AABB). 1.0 vs 2.0 discriminates: native reads of the BE bytes are
+    # denormals ordered the other way round. The NaN and +-0 lanes pin the VMX
+    # rules (NaN operand propagates; max prefers +0, min prefers -0).
+    NAN = struct.unpack(">f", b"\x7f\xc0\x00\x00")[0]
+    vcase("vmaxfp canary", vx_form(1034, 2, 0, 1),
+          1, be_f([2.0, -2.0, 5.0, -0.0]), 2, be_f([2.0, -1.0, NAN, 0.0]),
+          va_reg=0, va_bytes=be_f([1.0, -1.0, NAN, 0.0]))
+    vcase("vminfp canary", vx_form(1098, 2, 0, 1),
+          1, be_f([2.0, -2.0, NAN, -0.0]), 2, be_f([1.0, -2.0, NAN, -0.0]),
+          va_reg=0, va_bytes=be_f([1.0, -1.0, 5.0, 0.0]))
+    # vrfin/vrfiz had no lowering (a TODO comment: vD unchanged). Ties to even.
+    vcase("vrfin", vx_form(522, 2, 0, 1),
+          1, be_f([1.5, 2.5, -1.5, 2.4]), 2, be_f([2.0, 2.0, -2.0, 2.0]))
+    vcase("vrfiz", vx_form(586, 2, 0, 1),
+          1, be_f([1.5, 2.5, -1.5, -2.7]), 2, be_f([1.0, 2.0, -1.0, -2.0]))
+    # vcmpbfp: lane 0 in bounds, 1 above (+b), 2 below (-b), 3 NaN (both).
+    vcase("vcmpbfp", vx_form(966, 2, 0, 1),
+          1, be_f([2.0, 2.0, 2.0, 2.0]),
+          2, be_w([0, 0x80000000, 0x40000000, 0xC0000000]),
+          va_reg=0, va_bytes=be_f([1.0, 3.0, -3.0, NAN]))
+
 build_vcases()
 
 # ---------------------------------------------------------------------------
