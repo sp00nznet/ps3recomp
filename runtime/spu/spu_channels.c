@@ -527,6 +527,19 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
+        /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
+         * that nobody is releasing (a ticket lock, a counter barrier). Say so
+         * once per line with the line's head, so the stuck word is visible
+         * without a per-function probe. */
+        { static SPU_THREAD_LOCAL uint32_t t_ea; static SPU_THREAD_LOCAL unsigned long t_n;
+          if (ea != t_ea) { t_ea = ea; t_n = 0; }
+          else if (++t_n == 4000000) {
+              const uint8_t* m = vm_base + ea;
+              fprintf(stderr, "[spu-spin] img=%d pc=0x%05X lr=0x%05X GETLLAR ea=0x%08X x4M; line:"
+                              " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+                      m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
+          } }
         spu_lockline_unlock();
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
@@ -593,6 +606,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+            { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+              spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
@@ -684,6 +699,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
         spu_lockline_lock();
+        { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+          spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
@@ -1535,6 +1552,27 @@ static void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint
     } else { t_src = 0; return; }
     if (f) { fwrite(ls, 1, size, f); fclose(f); }
     t_next_ea = ea + size; t_next_lsa = lsa + size;
+}
+
+/* SPU_LOCKGUARD=<hex ea>: the word at that EA is a ticket lock (serving,next
+ * halfwords). Log any SPU write that moves either halfword by anything other
+ * than 0 or +1 -- a stale whole-line store rolling the lock back. `src` is the
+ * new bytes for [ea, ea+size). */
+void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint32_t size, const char* what)
+{
+    static int64_t s_g = -2;
+    if (s_g == -2) { const char* e = getenv("SPU_LOCKGUARD"); s_g = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+    if (s_g < 0 || !vm_base) return;
+    uint32_t g = (uint32_t)s_g;
+    if (g < ea || g + 4 > ea + size) return;
+    const uint8_t* o = vm_base + g; const uint8_t* n = src + (g - ea);
+    unsigned os = (o[0] << 8) | o[1], on = (o[2] << 8) | o[3];
+    unsigned ns = (n[0] << 8) | n[1], nn = (n[2] << 8) | n[3];
+    int bad = !(ns == os || ns == ((os + 1) & 0xFFFF)) || !(nn == on || nn == ((on + 1) & 0xFFFF));
+    if (bad) { static int c; if (c++ < 32)
+        fprintf(stderr, "[lockguard] %s img=%d pc=0x%05X ea=0x%08X size=%u: %04X/%04X -> %04X/%04X\n",
+                what, ctx ? ctx->image_id : -1, ctx ? (unsigned)(ctx->pc & SPU_LS_MASK) : 0u,
+                ea, size, os, on, ns, nn); }
 }
 
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)

@@ -590,9 +590,9 @@ static void dump_threads(const char* label, HMODULE self)
                                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
                         region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
                     int maxk = (int)((region_end - (uint64_t)sp) / 8);
-                    if (maxk > 0x20000 / 8) maxk = 0x20000 / 8;
+                    if (maxk > 0x200000 / 8) maxk = 0x200000 / 8;   /* lifted SPU frames are big */
                     int found = 0;
-                    for (int k = 0; k < maxk && found < 20; k++) {
+                    for (int k = 0; k < maxk && found < 40; k++) {
                         uint64_t v = sp[k];
                         if (v < (uint64_t)self) continue;
                         HMODULE mm = NULL;

@@ -54,13 +54,45 @@ static int sync_trace(void){ static int v=-1; if(v<0){const char*e=getenv("SYNC_
 #define SYNC_TID() ((unsigned long)0)
 #endif
 
+/* SYNC_WATCH=<hex ea>: log every HLE operation on that one mutex with its word
+ * before the op, so a PPU re-initialise under an SPU waiter is visible. */
+static uint32_t sync_watch(void){ static int64_t v=-2; if(v==-2){const char*e=getenv("SYNC_WATCH"); v=e?(int64_t)strtoul(e,0,16):-1;} return v<0?0u:(uint32_t)v; }
+#define SYNC_WATCH_LOG(op, ea, m) do { if ((ea) && (ea) == sync_watch()) { \
+        static int _c; if (_c++ < 400) fprintf(stderr, "[SYNCW] %s ea=0x%08X word=%08X tid=%lu\n", op, (ea), \
+            sync_bswap32(atomic_load(&(m)->lock)), SYNC_TID()); } } while (0)
+
+/* The mutex word is shared with SPU code that takes it with GETLLAR/PUTLLC.
+ * A PUTLLC compares its snapshot and then copies the whole 128-byte line,
+ * under the lock-line lock; a host CAS outside that lock can land between
+ * the two and be overwritten -- a PPU unlock lost that way leaves m_freed one
+ * short and the next SPU waiter spins forever (GH3: Havok's integrate task
+ * on 0x110C1540, mid intro movie). Change the word the way ppu_stwcx32 does:
+ * under the lock, then tell any reserving SPU its line moved. */
+extern void spu_lockline_lock(void);
+extern void spu_lockline_unlock(void);
+extern int  spu_coh_is_reserved(uint32_t ea);
+extern void spu_coh_notify_write(uint32_t ea);
+static int sync_cas(CellSyncMutex* m, uint32_t ea, uint32_t* expected, uint32_t desired)
+{
+    spu_lockline_lock();
+    int ok = atomic_compare_exchange_strong(&m->lock, expected, desired);
+    if (ok && spu_coh_is_reserved(ea)) spu_coh_notify_write(ea);
+    spu_lockline_unlock();
+    return ok;
+}
+
 s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
 {
+    unsigned int _ea = (unsigned int)(uintptr_t)mutex;
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
+    SYNC_WATCH_LOG("INIT", _ea, mutex);
+    spu_lockline_lock();
     atomic_store(&mutex->lock, 0);   /* m_freed = m_order = 0 -> free */
+    if (spu_coh_is_reserved(_ea)) spu_coh_notify_write(_ea);
+    spu_lockline_unlock();
     return CELL_OK;
 }
 
@@ -70,6 +102,7 @@ s32 cellSyncMutexLock(CellSyncMutex* mutex)
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    SYNC_WATCH_LOG("LOCK", _ea, mutex);
 
     /* Take a ticket. */
     uint32_t raw, g;
@@ -79,7 +112,7 @@ s32 cellSyncMutexLock(CellSyncMutex* mutex)
         g   = sync_bswap32(raw);
         ticket = (uint16_t)g;                       /* m_order */
         uint32_t ng = (g & 0xFFFF0000u) | (uint16_t)(ticket + 1);
-        if (atomic_compare_exchange_weak(&mutex->lock, &raw, sync_bswap32(ng)))
+        if (sync_cas(mutex, _ea, &raw, sync_bswap32(ng)))
             break;
     }
     /* Wait until it is served. */
@@ -101,6 +134,7 @@ s32 cellSyncMutexTryLock(CellSyncMutex* mutex)
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    SYNC_WATCH_LOG("TRYLOCK", _ea, mutex);
 
     uint32_t raw = atomic_load(&mutex->lock);
     uint32_t g   = sync_bswap32(raw);
@@ -110,7 +144,7 @@ s32 cellSyncMutexTryLock(CellSyncMutex* mutex)
         return CELL_SYNC_ERROR_BUSY;
 
     uint32_t ng = ((uint32_t)freed << 16) | (uint16_t)(order + 1);
-    if (atomic_compare_exchange_strong(&mutex->lock, &raw, sync_bswap32(ng))) {
+    if (sync_cas(mutex, _ea, &raw, sync_bswap32(ng))) {
         if (sync_trace()) fprintf(stderr, "[SYNC] TRYLOCK ea=0x%08X tid=%lu OK\n", _ea, SYNC_TID());
         return CELL_OK;
     }
@@ -123,13 +157,14 @@ s32 cellSyncMutexUnlock(CellSyncMutex* mutex)
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    SYNC_WATCH_LOG("UNLOCK", _ea, mutex);
 
     if (sync_trace()) fprintf(stderr, "[SYNC] UNLOCK  ea=0x%08X tid=%lu\n", _ea, SYNC_TID());
     for (;;) {                                      /* m_freed++ */
         uint32_t raw = atomic_load(&mutex->lock);
         uint32_t g   = sync_bswap32(raw);
         uint32_t ng  = ((uint32_t)(uint16_t)((g >> 16) + 1) << 16) | (uint16_t)g;
-        if (atomic_compare_exchange_weak(&mutex->lock, &raw, sync_bswap32(ng)))
+        if (sync_cas(mutex, _ea, &raw, sync_bswap32(ng)))
             return CELL_OK;
     }
 }
