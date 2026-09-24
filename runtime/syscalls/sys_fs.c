@@ -95,8 +95,22 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     if (!path || !*path || stat(path, &st) == 0)
         return;
     char* p = strstr(path, "/PS3_GAME/");
-    if (!p)
+    if (!p) {
+        /* The reverse: sys_fs flattens any "USRDIR/" path to <root>/USRDIR/...,
+         * which misses on a disc-layout tree. GH3's Bink movies (ATVI, INTRO --
+         * the attract loop) opened as <root>/USRDIR/DATA/MOVIES and failed. */
+        char* u = strstr(path, "/USRDIR/");
+        if (!u) u = strstr(path, "\\USRDIR\\");
+        if (!u) return;
+        char alt[1024];
+        size_t head = (size_t)(u - path);
+        if (head + 10 + strlen(u) >= sizeof alt) return;
+        memcpy(alt, path, head);
+        snprintf(alt + head, sizeof alt - head, "/PS3_GAME%s", u);
+        fs_normalize_sep(alt);
+        if (stat(alt, &st) == 0) snprintf(path, cap, "%s", alt);
         return;
+    }
     char alt[1024];
     size_t head = (size_t)(p - path);
     if (head + 1 >= sizeof alt)
@@ -452,6 +466,12 @@ int64_t sys_fs_read(ppu_context* ctx)
 
     void* buf = vm_to_host(buf_addr);
     long pos_before = ftell(f->fp);
+    /* The VM commits pages on first user-mode touch; a read the CRT hands to
+     * the kernel (anything past its 4 KB buffer) into a still-reserved page
+     * fails instead, and fread comes back short. GH3's Bink reader saw that
+     * as a read error on every movie and never decoded a frame -- solid green
+     * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
+    if (size) vm_commit(buf_addr, (uint32_t)size);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
