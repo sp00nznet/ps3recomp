@@ -805,11 +805,16 @@ class PPULifter:
                 if (_off, _m.group(1)) in _saved_slots:
                     _reg_snap.add(_reg)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
-                elif not _has_stdu and _write_counts[_off] == 0 and not _off_escapes(_off):
+                elif (not _has_stdu and _write_counts[_off] == 0 and not _off_escapes(_off)
+                        and _reg not in _reg_snap and _mem_snap.setdefault(_reg, _off) == _off):
                     # pure tail-entry: the save lives in the original function, so
                     # this body never writes the slot; snapshot from memory at entry.
                     # (Skip slots whose address escaped to a callee -- see above.)
-                    _mem_snap.setdefault(_reg, _off)
+                    # One snapshot per register: a load of the same register from a
+                    # DIFFERENT slot is a spill reload and stays a real load. Bink's
+                    # plane decoder (GH3 func_00610450) restores r23 from 0x888 and
+                    # reloads its row bound into r23 from 0x918; both became the
+                    # 0x888 value, the row loop never hit zero and the movie froze.
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
         if _reg_snap or _mem_snap:
             _decls = [f"    uint64_t _cs_{_n} = ctx->gpr[{_n}];"
