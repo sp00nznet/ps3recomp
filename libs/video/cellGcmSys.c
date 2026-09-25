@@ -835,6 +835,18 @@ static void nv3089_blit(void)
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
     u32 dst_pitch = s_gcm2d.pitch >> 16;
     if (!out_w || !out_h || !in_pitch || !dst_pitch) return;
+    /* A copy out of a surface the live renderer drew exists only on the GPU;
+     * mirror 1:1 blits there too (the guest-memory copy below still runs). */
+    if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+        rsx_live_draw_enabled()) {
+        const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
+        const int sl = (s_nv3089.src_dma != 0xFEED0001u);
+        const int dl = (s_gcm2d.dst_dma  != 0xFEED0001u);
+        rsx_live_draw_blit(sl ? 0u : 1u, s_nv3089.in_off + v0 * in_pitch + u0 * 4u, in_pitch,
+                           dl ? 0u : 1u, s_gcm2d.dst_offset + (s_nv3089.out_pt >> 16) * dst_pitch
+                                         + (s_nv3089.out_pt & 0xFFFF) * 4u, dst_pitch,
+                           out_w, out_h);
+    }
     /* Only the 32-bit colour formats are handled; anything else would need a
      * per-format converter and is better skipped loudly than written wrong. */
     u32 f = s_nv3089.fmt & 0xFF;

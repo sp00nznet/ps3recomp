@@ -79,6 +79,11 @@ void rsx_live_draw_set_fifo_position(u32 get, u32 put);
  * surface.  Guest memory changes are deliberately tracked separately from
  * actual D3D render-target mutations. */
 void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value);
+/* 1:1 NV3089 blit whose source is a live GPU surface: copy it on the GPU.
+ * Addresses are location-relative byte offsets of the rect's top-left.
+ * Returns 1 when handled (the guest-memory copy still runs regardless). */
+int  rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
+                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h);
 
 /* Block until the GPU finishes all queued draws (RSX SET_REFERENCE / sync
  * fence). Mirrors RPCS3 nv406e::set_reference's sync() so REF advances only

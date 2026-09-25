@@ -39,6 +39,8 @@ void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
 void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
 { (void)d; (void)o; (void)v; }
+int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
+{ (void)sl; (void)sa; (void)sp; (void)dl; (void)da; (void)dp; (void)w; (void)h; return 0; }
 void rsx_live_draw_flush(void) {}
 void rsx_live_draw_present(u32 b) { (void)b; }
 void rsx_live_draw_set_movie_mode(int on) { (void)on; }
@@ -93,6 +95,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include "rsx_vertex_formats.h"
+#include <sys/stat.h>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -143,7 +146,9 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define SRV_HEAP_SLOTS   (SRV_VTEX_BASE + MAX_VTEX)
 #define SRV_DEPTH_SOURCE_BASE SRV_HEAP_SLOTS
 #define UAV_ZDEPTH_BASE   (SRV_DEPTH_SOURCE_BASE + MAX_SURFACES)
-#define SRV_CPU_HEAP_SLOTS (UAV_ZDEPTH_BASE + MAX_SURFACES)
+/* Per-surface copy a draw samples when it reads its own render target. */
+#define SRV_FEEDBACK_BASE (UAV_ZDEPTH_BASE + MAX_SURFACES)
+#define SRV_CPU_HEAP_SLOTS (SRV_FEEDBACK_BASE + MAX_SURFACES)
 #define SRV_TABLE_SIZE   16
 #define SRV_RING_TABLES  4096
 
@@ -187,6 +192,7 @@ typedef struct {
     ID3D12Resource* tex;
     u32 w, h;
     DXGI_FORMAT fmt;
+    ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
 #if !defined(YZ_PERF_CLEAN)
     u32 resource_serial;
     u32 last_write_generation;
@@ -1313,6 +1319,18 @@ static D3D12_BLEND_OP gcm_blend_op(u32 e)
     }
 }
 
+/* SURFACE_COLOR_TARGET selector -> number of colour targets written, A first.
+ * 0x02 (B alone) and anything unknown draw to A only, as before. */
+static u32 ld_rt_count(u32 sel)
+{
+    switch (sel) {
+    case 0x13: return 2;
+    case 0x17: return 3;
+    case 0x1F: return 4;
+    default:   return 1;
+    }
+}
+
 typedef struct {
     u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
@@ -1322,6 +1340,11 @@ typedef struct {
     /* TM: this title renders HDR into FP16 (SURFACE_FORMAT 0xB) targets;
      * the RTV format is PSO state, so it belongs in the key. */
     u32 rt_fp16;
+    /* Colour targets the draw writes (SURFACE_COLOR_TARGET: A, AB, ABC,
+     * ABCD). GH3's venue pass writes A and B; the post pass then samples B.
+     * With only A bound, B stayed empty and that pass painted the scene
+     * black. NumRenderTargets is PSO state, so it is keyed too. */
+    u32 rt_count;
     /* Stencil is PSO state in D3D12, so it lives here and feeds the PSO key
      * like every other field. The reference value is dynamic
      * (OMSetStencilRef) and deliberately NOT part of this struct. */
@@ -1340,6 +1363,7 @@ static void decode_render_state(render_state_t* rs)
     rsx_dsp_get_surface(&g.rsx, &alpha_surface);
     rs->alpha_ref_format = alpha_surface.color_format;
     rs->rt_fp16 = alpha_surface.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
+    rs->rt_count = ld_rt_count(alpha_surface.color_target);
     rs->blend_enable = rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1;
     const u32 sf = rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR);
     const u32 df = rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR);
@@ -2870,6 +2894,10 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * just like dynamic texture and zeta replacements. */
     if (s->tex)
         retire_texture(s->tex);
+    if (s->fb_tex) {                 /* sized for the old resource */
+        retire_texture(s->fb_tex);
+        s->fb_tex = NULL;
+    }
     s->tex = replacement;
     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
     s->fmt = want_fmt;
@@ -2883,6 +2911,116 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     srv_write(SRV_SURFACE_BASE + slot, s->tex);
     if (slot == g.n_surfaces) g.n_surfaces++;
     return slot;
+}
+
+/* A draw that samples its own render target. RSX reads and writes the same
+ * surface in one pass (GH3's post pass reads the scene at 0x200000 while
+ * drawing into 0x200000); D3D12 cannot, and the lookup used to fall back to
+ * guest VRAM -- empty, so the pass painted the scene black. Snapshot the
+ * target into a per-surface copy and sample that. Returns the SRV slot, or
+ * SRV_WHITE if the copy cannot be made. */
+static u32 surface_feedback_srv(u32 slot)
+{
+    surface_t* s = &g.surfaces[slot];
+    if (!s->tex) return SRV_WHITE;
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    for (int k = 0; k < 2; k++) {
+        b[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    int fresh = 0;
+    if (!s->fb_tex) {
+        D3D12_RESOURCE_DESC rd;
+        s->tex->lpVtbl->GetDesc(s->tex, &rd);
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+                g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                &IID_ID3D12Resource, (void**)&s->fb_tex))) {
+            s->fb_tex = NULL;
+            return SRV_WHITE;
+        }
+        srv_write(SRV_FEEDBACK_BASE + slot, s->fb_tex);
+        fresh = 1;
+    }
+    b[0].Transition.pResource = s->tex;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = s->fb_tex;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g.list->lpVtbl->ResourceBarrier(g.list, fresh ? 1 : 2, b);
+    g.list->lpVtbl->CopyResource(g.list, s->fb_tex, s->tex);
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    return SRV_FEEDBACK_BASE + slot;
+}
+
+/* Find the live surface whose guest rows (at `pitch`) contain byte `abs`, with
+ * room for a w x h rect there. Returns the slot and the rect's origin. */
+static int surface_containing(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
+                              u32* ox, u32* oy)
+{
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const surface_t* s = &g.surfaces[i];
+        if (!s->tex || s->location != location || abs < s->offset) continue;
+        const u32 d = abs - s->offset, y = d / pitch, x = (d % pitch) / 4u;
+        if (x + w <= s->w && y + h <= s->h) { *ox = x; *oy = y; return (int)i; }
+    }
+    return -1;
+}
+
+/* NV3089 scaled-image blit whose SOURCE is a live surface: the pixels exist
+ * only on the GPU, so the guest-memory copy in cellGcmSys moves black. GH3
+ * copies its 1040x592 scene out to 0x1651500 every frame, runs its post pass
+ * sampling that copy, and copies it back -- all black, so attract mode showed
+ * only its overlay. Do the copy on the GPU, creating a live surface for the
+ * destination so later texture lookups at that address find it. 1:1 only.
+ * Returns 1 when handled. */
+int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
+                       u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h)
+{
+    if (!g.ready || !src_pitch || !dst_pitch || !w || !h) return 0;
+    u32 sx, sy, dx = 0, dy = 0;
+    const int si = surface_containing(src_loc, src_abs, src_pitch, w, h, &sx, &sy);
+    if (si < 0) return 0;
+    int di = surface_containing(dst_loc, dst_abs, dst_pitch, w, h, &dx, &dy);
+    if (di < 0) {
+        const u32 slot = surface_get(dst_loc, dst_abs, dst_pitch / 4u, h,
+                                     g.surfaces[si].fmt);
+        if (slot == LD_INVALID_SURFACE) return 0;
+        di = (int)slot;
+        if (w > g.surfaces[di].w || h > g.surfaces[di].h) return 0;
+    }
+    if (di == si || g.surfaces[di].fmt != g.surfaces[si].fmt) return 0;
+    ID3D12Resource* src = g.surfaces[si].tex;
+    ID3D12Resource* dst = g.surfaces[di].tex;
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    for (int k = 0; k < 2; k++) {
+        b[k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[k].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    b[0].Transition.pResource = src; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = dst; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    D3D12_TEXTURE_COPY_LOCATION s = {0}, d = {0};
+    s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    d.pResource = dst; d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX box = { sx, sy, 0, sx + w, sy + h, 1 };
+    g.list->lpVtbl->CopyTextureRegion(g.list, &d, dx, dy, 0, &s, &box);
+    for (int k = 0; k < 2; k++) {
+        b[k].Transition.StateBefore = b[k].Transition.StateAfter;
+        b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_surface_note_write((u32)di, LD_SURFACE_WRITE_COPY);
+    return 1;
 }
 
 static u32 current_surface(void)
@@ -3366,6 +3504,7 @@ static u64 ld_hash_structural_render_state(
     LD_HASH_RENDER_FIELD(front_face);
     LD_HASH_RENDER_FIELD(color_mask);
     LD_HASH_RENDER_FIELD(rt_fp16);
+    LD_HASH_RENDER_FIELD(rt_count);
     LD_HASH_RENDER_FIELD(stencil_enable);
     LD_HASH_RENDER_FIELD(stencil_two_sided);
     LD_HASH_RENDER_FIELD(s_func);
@@ -3786,9 +3925,10 @@ static ID3D12PipelineState* build_pso(
     apply_render_state(&pd, rs);
     pd.SampleMask = 0xFFFFFFFFu;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = rs->rt_fp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                   : DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.NumRenderTargets = rs->rt_count ? rs->rt_count : 1;
+    for (u32 r = 0; r < pd.NumRenderTargets; r++)
+        pd.RTVFormats[r] = rs->rt_fp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                       : DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
     ID3D12PipelineState* pso = NULL;
 #if defined(YZ_PERF_PROFILE)
@@ -5604,6 +5744,20 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
     static int inited = 0;
     static FILE* file = NULL;
     static u64 draw = 0;
+    /* RSX_DRAW_CSV_FROM=<frame>: skip rows before that frame. Logging every
+     * draw from boot slows a 10-minute run to an hour. */
+    { static long from = -1;
+      if (from < 0) { const char* e = getenv("RSX_DRAW_CSV_FROM"); from = e ? atol(e) : 0; }
+      if ((long)g_ld_frames < from) return; }
+    /* RSX_DRAW_CSV_GATE=<file>: rows only while <file> exists (polled every
+     * 512 draws), so a capture can be switched on when the scene of interest
+     * is on screen instead of guessing its frame number. */
+    { static const char* gate = (const char*)-1; static int open_gate = 0; static unsigned poll;
+      if (gate == (const char*)-1) gate = getenv("RSX_DRAW_CSV_GATE");
+      if (gate) {
+          if ((poll++ & 511u) == 0) { struct stat st; open_gate = stat(gate, &st) == 0; }
+          if (!open_gate) return;
+      } }
     const int a010_only = getenv("RSX_DRAW_CSV_A010_ONLY") != NULL;
     if (a010_only) {
         if (InterlockedCompareExchange(
@@ -5627,7 +5781,7 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
                     "attr4_hash,attr5_hash,attr6_hash,attr7_hash,"
                     "attr8_hash,attr9_hash,attr10_hash,attr11_hash,"
                     "attr12_hash,attr13_hash,attr14_hash,attr15_hash,"
-                    "active_attr_mask,used_attr_mask\n");
+                    "active_attr_mask,used_attr_mask,tex\n");
                 fprintf(stderr, "[live-diff] RSX_DRAW_CSV armed: %s\n", path);
             } else {
                 fprintf(stderr, "[live-diff] cannot open RSX_DRAW_CSV: %s\n",
@@ -5690,8 +5844,17 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
         seen_vtex, seen_vtxfmt, seen_freqdiv);
     for (u32 attr = 0; attr < 16; attr++)
         fprintf(file, ",%016llx", (unsigned long long)attr_hash[attr]);
-    fprintf(file, ",0x%04X,0x%04X\n",
+    fprintf(file, ",0x%04X,0x%04X,",
             active_attr_mask, dc.layout.mask & 0xFFFFu);
+    /* Enabled fragment texture units, so a pass that samples a surface (or an
+     * empty copy of one) is visible in the row: unit:loc:offset:fmt:WxH. */
+    for (u32 u = 0; u < 16; u++) {
+        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (t.enabled)
+            fprintf(file, "%u:%u:%X:%02X:%ux%u ", u, t.location, t.offset,
+                    t.format & 0xFF, t.width, t.height);
+    }
+    fputc('\n', file);
     fflush(file);
 #endif
 }
@@ -6324,6 +6487,34 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_stats.group_drop_surface++;
         return;
     }
+    /* LD_SKIP_SAMPLING=<hex offset>: drop draws that sample a texture at that
+     * offset. Debug only -- removing a post-process pass shows whether the
+     * scene under it has any colour at all. */
+    { static int64_t skip = -2;
+      if (skip == -2) { const char* e = getenv("LD_SKIP_SAMPLING"); skip = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      if (skip >= 0)
+          for (u32 u = 0; u < 16; u++) {
+              rsx_dsp_texture st; rsx_dsp_get_texture(&g.rsx, u, &st);
+              if (st.enabled && st.offset == (u32)skip) return;
+          } }
+    /* MRT: colour targets B..D, resolved (and created) here, before any of
+     * this draw's commands are recorded. They share A's format and clip. */
+    u32 mrt[4] = { target, 0, 0, 0 };
+    u32 n_mrt = 1;
+    {
+        rsx_dsp_surface msf;
+        rsx_dsp_get_surface(&g.rsx, &msf);
+        const u32 want = ld_rt_count(msf.color_target);
+        for (u32 r = 1; r < want; r++) {
+            const u32 s = surface_get(msf.color_location[r], msf.color_offset[r],
+                                      msf.clip_w, msf.clip_h,
+                                      msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                          : DXGI_FORMAT_R8G8B8A8_UNORM);
+            if (s == LD_INVALID_SURFACE || s == target) break;
+            mrt[n_mrt++] = s;
+        }
+    }
     live_draw_csv_emit(prim, n_tri, "execute");
     if (rsx_live_draw_a010_probe_active() && target < 64)
         g_ld_a010_probe_touched |= 1ull << target;
@@ -6512,7 +6703,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 fprintf(stderr, "\n");
             }
         }
-        if (sampled >= 0) {
+        if (sampled < 0 && g.surfaces[target].location == t.location &&
+            g.surfaces[target].offset == t.offset) {
+            /* Reads its own render target: sample a copy of it. */
+            slots[u] = surface_feedback_srv(target);
+            g_ld_bind_surf++;
+        } else if (sampled >= 0) {
             /* LD_ALIAS_DBG also reports the HIT. A texture that aliases a render
              * surface when it should not is exactly as interesting as one that
              * fails to alias when it should, and only the miss was visible --
@@ -6650,7 +6846,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             g_ld_stats.implicit_depth_clears++;
         }
     }
-    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, have_dsv ? &dsv : NULL);
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[4];
+        rtvs[0] = rtv;
+        for (u32 r = 1; r < n_mrt; r++)
+            rtvs[r] = rtv_handle(LD_SWAP_BUFFERS + mrt[r]);
+        g.list->lpVtbl->OMSetRenderTargets(g.list, n_mrt, rtvs, FALSE,
+                                           have_dsv ? &dsv : NULL);
+    }
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
@@ -6779,6 +6982,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
     }
     ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
+    for (u32 r = 1; r < n_mrt; r++)
+        ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
     if (current_zslot) {
         render_state_t depth_state;
         decode_render_state(&depth_state);
