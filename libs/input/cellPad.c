@@ -577,8 +577,12 @@ skip_inject: ;
         len = CELL_PAD_LEN_CHANGE_PRESS_ON;
 
     data->len = len;
-    data->button[0] = (u16)len;
-    data->button[1] = 0; /* reserved */
+    /* button[0] is reserved and 0 on hardware; button[1] carries the pad mode
+     * in its high nibble (0x7) and len/2 in its low one. GH3 drops any packet
+     * whose button[0] is non-zero -- with len (8) there, every press was
+     * received and thrown away, and "Press any button" never advanced. */
+    data->button[0] = 0;
+    data->button[1] = (u16)(0x70 | ((len / 2) & 0xF));
 
     /* Digital buttons. hs->buttons packs both halves into one 16-bit mask
      * (SELECT=bit0..LEFT=bit7 = DIGITAL1; L2=bit8..SQUARE=bit15 = DIGITAL2).
