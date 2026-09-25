@@ -1275,16 +1275,13 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
     build_save_path(save_path, sizeof(save_path), dirName);
     int is_new = !dir_has_save(save_path);
 
-    uint32_t func_opd     = (uint32_t)(uintptr_t)funcStat;
-    uint32_t userdata_ea  = (uint32_t)(uintptr_t)userdata;
-    s32 cb = dispatch_func_stat(func_opd, is_new, dirName, userdata_ea);
-
-    if (cb < 0) {
-        if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_SAVEDATA_ERROR_NODATA;
-        return CELL_SAVEDATA_ERROR_CBRESULT;
-    }
-    return CELL_OK;
+    (void)is_new;
+    /* Run the whole sequence: funcStat, then the funcFile loop that writes the
+     * files. Stopping after funcStat left the title waiting for file callbacks
+     * that never came -- GH3 sat on "Saving..." forever after its first
+     * autosave. savedata_execute marshals both callbacks through guest memory
+     * (dispatch_func_stat_full / dispatch_func_file). */
+    return savedata_execute(dirName, 1, setBuf, funcStat, funcFile, userdata);
 }
 
 s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
