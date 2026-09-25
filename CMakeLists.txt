@@ -247,6 +247,11 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # the base ISA and Clang fuses by default there. A PPC fmadd is
         # spelt as one where the lifter means one.
         -ffp-contract=off
+        # Explicit, because the per-config defaults cannot be trusted: this
+        # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
+        # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
+        # was unoptimised without a word. Duplicating a default -O2 is harmless.
+        $<$<CONFIG:Release,RelWithDebInfo>:-O2>
     )
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.

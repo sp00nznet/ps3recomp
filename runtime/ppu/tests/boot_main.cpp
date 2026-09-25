@@ -77,6 +77,69 @@ void     ps3_load_prx_modules(void) {}
  * excludes the multimedia timer API, so it must be asked for by name -- and
  * AFTER windows.h, since timeapi.h uses UINT and friends. */
 #include <timeapi.h>
+
+/* Process-wide getenv cache. The runtime has ~700 `if (getenv("X"))` diagnostic
+ * gates, many on per-draw / per-syscall paths, and the UCRT getenv takes the
+ * environment lock and scans every variable each time: profiled at ~30% of
+ * GH3's main PPU thread and ~35% of the RSX thread in gameplay. Defining the
+ * import slot here (an object in the link beats the import library's lazy
+ * definition) routes every dllimport'ed getenv call through this cache.
+ * Nothing in the runtime mutates the environment after startup, so a value is
+ * looked up once and the pointer stays valid forever. Reads are lock-free:
+ * a slot's key is published last, after its value.
+ * ponytail: 1024 open-addressed slots, fixed; names past that fall back to the OS lookup. */
+namespace {
+struct EnvSlot { const char* volatile key; const char* val; };
+EnvSlot  s_env[1024];
+SRWLOCK  s_env_lock = SRWLOCK_INIT;
+
+unsigned env_hash(const char* s)
+{
+    unsigned h = 2166136261u;
+    for (; *s; s++) h = (h ^ (unsigned char)(*s >= 'a' && *s <= 'z' ? *s - 32 : *s)) * 16777619u;
+    return h;
+}
+
+const char* env_lookup_os(const char* name)
+{
+    DWORD n = GetEnvironmentVariableA(name, NULL, 0);
+    if (!n) return NULL;
+    char* v = (char*)malloc(n);
+    if (!v || GetEnvironmentVariableA(name, v, n) >= n) { free(v); return NULL; }
+    return v;
+}
+
+char* __cdecl cached_getenv(const char* name)
+{
+    if (!name || !*name) return NULL;
+    const unsigned mask = 1023, h = env_hash(name);
+    for (unsigned i = h & mask, n = 0; n <= mask; n++, i = (i + 1) & mask) {
+        const char* k = s_env[i].key;
+        MemoryBarrier();
+        if (!k) break;
+        if (!_stricmp(k, name)) return (char*)s_env[i].val;
+    }
+    AcquireSRWLockExclusive(&s_env_lock);
+    const char* val = NULL; int found = 0;
+    unsigned i = h & mask, n = 0;
+    for (; n <= mask; n++, i = (i + 1) & mask) {
+        if (!s_env[i].key) break;
+        if (!_stricmp(s_env[i].key, name)) { val = s_env[i].val; found = 1; break; }
+    }
+    if (!found) {
+        val = env_lookup_os(name);
+        if (n <= mask) {
+            s_env[i].val = val;
+            MemoryBarrier();
+            s_env[i].key = _strdup(name);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_env_lock);
+    return (char*)val;
+}
+}
+extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
+
 /* Last-chance crash reporter: vm_base accesses are bounds-guarded, so a real
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
  * runtime-struct walk). Print the faulting address and the RIP as a module
@@ -730,6 +793,78 @@ static void dbg_knobs(const char* prefix)
     dbg_printf("  (%d set; docs/DIAGNOSTICS.md lists all of them)%c", n, 10);
 }
 
+/* "prof <host-tid> [sec]": sample ONE thread at ~1 kHz and unwind it through
+ * .pdata (exact, unlike dump_threads' stack scan), then print the hottest
+ * functions exclusive (leaf) and inclusive (anywhere on the stack), keyed by
+ * function start. exe entries print as rva=; resolve against the link map.
+ * Only lock-free work happens while the thread is suspended.
+ * ponytail: fixed 4096-slot tables; a thread touching more functions drops the rest. */
+#define PROF_SLOTS 4096
+static uint64_t s_prof_key[3][PROF_SLOTS];
+static uint32_t s_prof_ct[3][PROF_SLOTS];
+static void prof_hit(int tab, uint64_t key)
+{
+    for (uint32_t i = (uint32_t)((key >> 4) * 2654435761u) % PROF_SLOTS, n = 0; n < PROF_SLOTS;
+         n++, i = (i + 1) % PROF_SLOTS) {
+        if (s_prof_key[tab][i] == key) { s_prof_ct[tab][i]++; return; }
+        if (!s_prof_key[tab][i]) { s_prof_key[tab][i] = key; s_prof_ct[tab][i] = 1; return; }
+    }
+}
+static void dbg_prof(DWORD tid, unsigned sec)
+{
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) { dbg_printf("  cannot open tid %lu%c", (unsigned long)tid, 10); return; }
+    memset(s_prof_key, 0, sizeof s_prof_key); memset(s_prof_ct, 0, sizeof s_prof_ct);
+    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
+    unsigned samples = 0;
+    const ULONGLONG end = GetTickCount64() + sec * 1000ull;
+    while (GetTickCount64() < end) {
+        if (SuspendThread(h) == (DWORD)-1) break;
+        CONTEXT c; c.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(h, &c)) {
+            samples++;
+            uint64_t seen[24]; int ns = 0, got = 0;
+            for (int d = 0; d < 24 && c.Rip; d++) {
+                DWORD64 base = 0;
+                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+                uint64_t key = rf ? base + rf->BeginAddress : c.Rip;
+                if (d == 0) prof_hit(0, key);
+                /* first exe frame of a sample whose leaf is in a DLL: who called out */
+                if (!got && (uintptr_t)(key - exe) < 0x40000000u) { got = 1; if (d > 0) prof_hit(2, key); }
+                int dup = 0; for (int k = 0; k < ns; k++) dup |= seen[k] == key;
+                if (!dup) { seen[ns++] = key; prof_hit(1, key); }
+                if (!rf) break;                       /* leaf without unwind data: stop */
+                void* hd; DWORD64 ef;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &ef, NULL);
+            }
+        }
+        ResumeThread(h);
+        Sleep(1);
+    }
+    CloseHandle(h);
+    dbg_printf("  prof tid %lu: %u samples over %us%c", (unsigned long)tid, samples, sec, 10);
+    for (int tab = 0; tab < 3; tab++) {
+        static const char* tn[3] = { "exclusive", "inclusive", "exe caller of DLL leaf" };
+        dbg_printf("  --- %s ---%c", tn[tab], 10);
+        for (int rank = 0; rank < 40; rank++) {
+            uint32_t best = 0; int bi = -1;
+            for (int k = 0; k < PROF_SLOTS; k++) if (s_prof_ct[tab][k] > best) { best = s_prof_ct[tab][k]; bi = k; }
+            if (bi < 0) break;
+            uint64_t key = s_prof_key[tab][bi];
+            HMODULE m = NULL; char path[MAX_PATH] = "?";
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)key, &m);
+            if (m) GetModuleFileNameA(m, path, sizeof path);
+            const char* b = strrchr(path, 92); b = b ? b + 1 : path;
+            if ((uintptr_t)m == exe) dbg_printf("  %5.1f%%  rva=0x%llX%c", 100.0 * best / (samples ? samples : 1),
+                                                (unsigned long long)(key - exe), 10);
+            else dbg_printf("  %5.1f%%  %s+0x%llX%c", 100.0 * best / (samples ? samples : 1), b,
+                            (unsigned long long)(key - (uintptr_t)m), 10);
+            s_prof_ct[tab][bi] = 0;
+        }
+    }
+}
+
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;
@@ -764,6 +899,7 @@ static DWORD WINAPI debug_console(LPVOID param)
 
         if (!strcmp(verb, "help")) {
             dbg_printf("  threads          stacks of every guest thread, symbolised%c", 10);
+            dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
@@ -771,6 +907,8 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
         } else if (!strcmp(verb, "threads")) {
             dump_threads("console", self);
+        } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
+            dbg_prof((DWORD)a, b ? b : 5);
         } else if (!strcmp(verb, "hle")) {
             dbg_printf("  last HLE = 0x%08X (%s)%c", g_last_hle_nid,
                        g_last_hle_name ? g_last_hle_name : "", 10);

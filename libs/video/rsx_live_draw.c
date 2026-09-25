@@ -1218,6 +1218,7 @@ static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
 }
 static u64 fnv1a(const void* data, u32 n, u64 h);
 static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface);
+static u64 live_legacy_pso_key(void);
 static void ld_vertex_diag_emit(const char* reason, int dump_surface);
 
 /* ---------------------------------------------------------------------------
@@ -2981,23 +2982,57 @@ static int surface_containing(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
  * sampling that copy, and copies it back -- all black, so attract mode showed
  * only its overlay. Do the copy on the GPU, creating a live surface for the
  * destination so later texture lookups at that address find it. 1:1 only.
- * Returns 1 when handled. */
+ * Returns 1 when handled, <= 0 when not (reason codes in ld_blit_gpu). */
+static FILE* s_csv_file;       /* defined with live_draw_csv_emit */
+static int   s_csv_gate_open;
+
+static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
+                       u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h);
 int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
+                       u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h)
+{
+    const int r = ld_blit_gpu(src_loc, src_abs, src_pitch, dst_loc, dst_abs, dst_pitch, w, h);
+    if (s_csv_file && s_csv_gate_open) {
+        fprintf(s_csv_file, "#blit,%u,%u:0x%X/%u,%u:0x%X/%u,%ux%u,gpu=%d\n", g_ld_frames,
+                src_loc, src_abs, src_pitch, dst_loc, dst_abs, dst_pitch, w, h, r);
+        fflush(s_csv_file);
+    }
+    /* LD_BLIT_DUMP=<dir>: while the CSV gate is open, read back the first four
+     * blits' destination surfaces right after the copy (one frame's worth). */
+    { static const char* dir = (const char*)-1; static u32 n;
+      if (dir == (const char*)-1) dir = getenv("LD_BLIT_DUMP");
+      if (!(s_csv_file && s_csv_gate_open)) n = 0;
+      else if (dir && r == 1 && n < 4) {
+          u32 dx, dy;
+          const int di = surface_containing(dst_loc, dst_abs, dst_pitch, w, h, &dx, &dy);
+          if (di >= 0) {
+              char path[MAX_PATH * 2];
+              snprintf(path, sizeof(path), "%s\\blit_f%06u_%u_dst%08X.ppm", dir, g_ld_frames, n,
+                       g.surfaces[di].offset);
+              ld_dump_surface_ppm(path, &g.surfaces[di]);
+          }
+          n++;
+      } }
+    return r;
+}
+
+static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h)
 {
     if (!g.ready || !src_pitch || !dst_pitch || !w || !h) return 0;
     u32 sx, sy, dx = 0, dy = 0;
     const int si = surface_containing(src_loc, src_abs, src_pitch, w, h, &sx, &sy);
-    if (si < 0) return 0;
+    if (si < 0) return -1;            /* source is not a live surface */
     int di = surface_containing(dst_loc, dst_abs, dst_pitch, w, h, &dx, &dy);
     if (di < 0) {
         const u32 slot = surface_get(dst_loc, dst_abs, dst_pitch / 4u, h,
                                      g.surfaces[si].fmt);
-        if (slot == LD_INVALID_SURFACE) return 0;
+        if (slot == LD_INVALID_SURFACE) return -2;
         di = (int)slot;
-        if (w > g.surfaces[di].w || h > g.surfaces[di].h) return 0;
+        if (w > g.surfaces[di].w || h > g.surfaces[di].h) return -3;
     }
-    if (di == si || g.surfaces[di].fmt != g.surfaces[si].fmt) return 0;
+    if (di == si) return -4;
+    if (g.surfaces[di].fmt != g.surfaces[si].fmt) return -5;
     ID3D12Resource* src = g.surfaces[si].tex;
     ID3D12Resource* dst = g.surfaces[di].tex;
     D3D12_RESOURCE_BARRIER b[2] = {0};
@@ -4284,13 +4319,16 @@ static ID3D12PipelineState* get_pso(
               }
           }
       } }
-    if (getenv("LD_HLSL_DUMP")) {
-        char fn[64]; FILE* f;
-        snprintf(fn, sizeof fn, "hlsl_%02u.vs.txt", g.n_psos);
+    /* LD_HLSL_DUMP=<dir>: files named by the PSO key the draw CSV prints. */
+    { static const char* hd = (const char*)-1;
+      if (hd == (const char*)-1) hd = getenv("LD_HLSL_DUMP");
+      if (hd) {
+        char fn[MAX_PATH]; FILE* f;
+        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.vs.txt", hd, (unsigned long long)live_legacy_pso_key());
         f = fopen(fn, "wb"); if (f) { fputs(vi > 0 ? vs_hlsl : "<vp fail>", f); fclose(f); }
-        snprintf(fn, sizeof fn, "hlsl_%02u.ps.txt", g.n_psos);
+        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
         f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
-    }
+      } }
     if (vi > 0 && fi > 0)
         pso = build_pso(
             vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload);
@@ -5734,6 +5772,11 @@ static u64 live_decoded_vertex_hash(u64 attr_hash[16])
 
 /* RSX_DRAW_CSV=path: uncapped per-draw fingerprints for direct comparison
  * with the working RPCS3 .rxs replay.  Default-off and renderer-neutral. */
+/* The open RSX_DRAW_CSV and its gate, for marker rows from outside a draw
+ * (rsx_live_draw_blit notes each 2D copy where it falls in the draw stream). */
+static FILE* s_csv_file;
+static int   s_csv_gate_open = 1;
+
 static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
 {
 #if defined(YZ_PERF_CLEAN) && !defined(YZ_PERF_PROFILE)
@@ -5756,9 +5799,11 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
       if (gate == (const char*)-1) gate = getenv("RSX_DRAW_CSV_GATE");
       if (gate) {
           if ((poll++ & 511u) == 0) { struct stat st; open_gate = stat(gate, &st) == 0; }
+          s_csv_gate_open = open_gate;
           if (!open_gate) return;
       } }
-    const int a010_only = getenv("RSX_DRAW_CSV_A010_ONLY") != NULL;
+    static int a010_only = -1;
+    if (a010_only < 0) a010_only = getenv("RSX_DRAW_CSV_A010_ONLY") != NULL;
     if (a010_only) {
         if (InterlockedCompareExchange(
                 &g_yz_a010_root_active, 0, 0) == 0)
@@ -5769,6 +5814,7 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
         const char* path = getenv("RSX_DRAW_CSV");
         if (path && path[0]) {
             file = fopen(path, "w");
+            s_csv_file = file;
             if (file) {
                 fprintf(file,
                     "draw,frame,outcome,surf,prim,verts,source_verts,decoded_hash,"
@@ -5795,6 +5841,21 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
 
     const u32 target = current_surface();
     const u32 surf = target < g.n_surfaces ? g.surfaces[target].offset : 0;
+    /* LD_DRAW_DUMP=<dir> [LD_DRAW_DUMP_EVERY=k, default 10]: in the first
+     * gated frame, read back each k-th draw's target BEFORE it is recorded,
+     * named by frame-relative index -- bisects which draw changes a surface. */
+    { static const char* dir = (const char*)-1; static u32 every, frame = ~0u, idx, dumped_frame = ~0u;
+      if (dir == (const char*)-1) { dir = getenv("LD_DRAW_DUMP");
+          const char* e = getenv("LD_DRAW_DUMP_EVERY"); every = e ? (u32)atoi(e) : 10; if (!every) every = 10; }
+      if (frame != g_ld_frames) { frame = g_ld_frames; idx = 0; }
+      if (dir && target < g.n_surfaces && (dumped_frame == ~0u || dumped_frame == frame) &&
+          (idx % every) == 0) {
+          dumped_frame = frame;
+          char path[MAX_PATH * 2];
+          snprintf(path, sizeof(path), "%s\\draw_f%06u_i%04u_%08X.ppm", dir, frame, idx, surf);
+          ld_dump_surface_ppm(path, &g.surfaces[target]);
+      }
+      idx++; }
     const u64 regs_hash = fnv1a(
         g.rsx.regs, RSX_DSP_NUM_REGS * sizeof(g.rsx.regs[0]),
         1469598103934665603ull);
@@ -5854,6 +5915,14 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
             fprintf(file, "%u:%u:%X:%02X:%ux%u ", u, t.location, t.offset,
                     t.format & 0xFF, t.width, t.height);
     }
+    if (rs.blend_enable)
+        fprintf(file, "bf=%X/%X/%X/%X eq=%X/%X ", rs.sf_rgb, rs.df_rgb, rs.sf_a, rs.df_a,
+                rs.eq_rgb, rs.eq_a);
+    fprintf(file, "at=%u/0x%X/0x%X ", rs.alpha_test_enable, rs.alpha_func, rs.alpha_ref_raw);
+    fprintf(file, "A=%u:%X/%u fmt=%u rt=%u ", sf.color_location[0], sf.color_offset[0], sf.color_pitch[0], sf.color_format, sf.raster_type);
+    fprintf(file, "ct=0x%X B=%u:%X C=%u:%X D=%u:%X ", sf.color_target,
+            sf.color_location[1], sf.color_offset[1], sf.color_location[2], sf.color_offset[2],
+            sf.color_location[3], sf.color_offset[3]);
     fputc('\n', file);
     fflush(file);
 #endif
@@ -6497,6 +6566,53 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               rsx_dsp_texture st; rsx_dsp_get_texture(&g.rsx, u, &st);
               if (st.enabled && st.offset == (u32)skip) return;
           } }
+    /* LD_TRACE_PSO=<hex key>: raw vertex attributes + unit-0 texels of the
+     * first three draws with that CSV pso_key. */
+    { static u64 tk = 1; static int tn;
+      if (tk == 1) { const char* e = getenv("LD_TRACE_PSO"); tk = e ? _strtoui64(e, 0, 16) : 0; }
+      if (tk && live_legacy_pso_key() == tk && tn >= 3) {
+          static u32 every;
+          if (dc.inl && (++every % 60) == 0)
+              fprintf(stderr, "[pso-trace] frame=%u col=%02X%02X%02X%02X\n", g_ld_frames,
+                      dc.inl[16], dc.inl[17], dc.inl[18], dc.inl[19]);
+      }
+      if (tk && tn < 3 && live_legacy_pso_key() == tk) {
+          tn++;
+          if (dc.inl) {
+              fprintf(stderr, "[pso-trace] inline stride=%u bytes=%u:", dc.inl_stride, dc.inl_bytes);
+              for (u32 k = 0; k < dc.inl_bytes && k < 6 * dc.inl_stride; k++)
+                  fprintf(stderr, "%s%02X", (k % dc.inl_stride) ? "" : " |", dc.inl[k]);
+              fprintf(stderr, "\n");
+          }
+          for (u32 ai = 0; ai < 16; ai++) {
+              rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, ai, &va);
+              if (!va.type) continue;
+              fprintf(stderr, "[pso-trace] attr%u type=%u size=%u stride=%u loc=%u off=0x%X:",
+                      ai, va.type, va.size, va.stride, va.location, va.offset);
+              for (u32 vi = 0; vi < 6; vi++) {
+                  const u8* p = guest_ptr(va.location, va.offset + vi * va.stride, 16);
+                  if (!p) break;
+                  fprintf(stderr, " |");
+                  for (u32 k = 0; k < (va.type == RSX_VTX_TYPE_FLOAT ? 4u * va.size : 4u) && k < 16; k++)
+                      fprintf(stderr, "%02X", p[k]);
+              }
+              fprintf(stderr, "\n");
+          }
+          { u32 fl = 0; const u32 fo = rsx_dsp_fragment_program(&g.rsx, &fl);
+            const u8* fp = guest_ptr(fl, fo, 16 * 8);
+            if (fp) { fprintf(stderr, "[pso-trace] fp %u:0x%X:", fl, fo);
+                      for (u32 k = 0; k < 16 * 8; k++) fprintf(stderr, "%s%02X", (k & 15) ? "" : " ", fp[k]);
+                      fprintf(stderr, "\n"); } }
+          rsx_dsp_texture t0; rsx_dsp_get_texture(&g.rsx, 0, &t0);
+          const u8* tp = guest_ptr(t0.location, t0.offset, 32);
+          if (tp) { { rsx_dsp_texture t1; rsx_dsp_get_texture(&g.rsx, 1, &t1); fprintf(stderr, "[pso-trace] outmask=0x%X inmask=0x%X tex0 fmt=0x%X remap=0x%X tex1 remap=0x%X:", rsx_dsp_reg(&g.rsx, 0x1FF4), rsx_dsp_reg(&g.rsx, 0x1FF0), t0.format, t0.remap, t1.remap); }
+                    for (u32 k = 0; k < 32; k++) fprintf(stderr, "%02X", tp[k]);
+                    fprintf(stderr, "\n"); }
+      } }
+    /* LD_SKIP_PSO=<hex key>: drop draws with that CSV pso_key. Debug only. */
+    { static u64 skipk = 1;
+      if (skipk == 1) { const char* e = getenv("LD_SKIP_PSO"); skipk = e ? _strtoui64(e, 0, 16) : 0; }
+      if (skipk && live_legacy_pso_key() == skipk) return; }
     /* MRT: colour targets B..D, resolved (and created) here, before any of
      * this draw's commands are recorded. They share A's format and clip. */
     u32 mrt[4] = { target, 0, 0, 0 };
@@ -6716,7 +6832,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
              * surf=N] in the frame stats) had no way to show WHY. Guitar Hero
              * III does that: every bind lands on a surface and not one real
              * texture is ever created, so the screen stays black. */
-            if (getenv("LD_ALIAS_DBG")) {
+            static int alias_dbg = -1;
+            if (alias_dbg < 0) alias_dbg = getenv("LD_ALIAS_DBG") != NULL;
+            if (alias_dbg) {
                 static u32 n_hit = 0;
                 if (n_hit++ < 24)
                     fprintf(stderr, "[alias-hit] tex %u:0x%08X fmt=0x%02X %ux%u "
@@ -7097,6 +7215,13 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
                     g_ld_frames, g_ld_stats.clears, target, mask,
                     rsx_dsp_clear_color(&g.rsx), z >> 8, z & 0xFF);
         }
+    }
+    if (s_csv_file && s_csv_gate_open) {
+        fprintf(s_csv_file, "#clear,%u,0x%X,mask=0x%02X,scissor=0x%08X/0x%08X,cmask=0x%08X,argb=0x%08X\n",
+                g_ld_frames, g.surfaces[target].offset, mask,
+                rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL),
+                rsx_dsp_reg(&g.rsx, M_COLOR_MASK), rsx_dsp_clear_color(&g.rsx));
+        fflush(s_csv_file);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
@@ -8314,13 +8439,19 @@ void rsx_live_draw_present(u32 buffer_id)
       int gate;
       { static int onv = -1;
         if (onv < 0) onv = getenv("LD_SURF_DUMP_ON_VRAM") ? 1 : 0;
-        gate = onv ? (g_ld_ps1_vram_ready != 0) : (g_ld_frames >= at); }
+        gate = onv ? (g_ld_ps1_vram_ready != 0) : (g_ld_frames >= at);
+        /* LD_SURF_DUMP_GATE=<file>: fire when <file> appears instead. */
+        static const char* gf = (const char*)-1;
+        if (gf == (const char*)-1) gf = getenv("LD_SURF_DUMP_GATE");
+        /* Re-arms when the file goes away, so each appearance dumps once. */
+        if (gf && sd) { FILE* f = fopen(gf, "rb"); gate = f != NULL; if (f) fclose(f);
+                        if (!gate) done = 0; } }
       if (sd && sd[0] && !done && gate) {
           done = 1;
           for (u32 i = 0; i < g.n_surfaces; i++) {
               char path[MAX_PATH * 2];
-              snprintf(path, sizeof(path), "%s\\surf_%02u_%08X_%ux%u.ppm",
-                       sd, i, g.surfaces[i].offset,
+              snprintf(path, sizeof(path), "%s\\f%06u_surf_%02u_%08X_%ux%u.ppm",
+                       sd, g_ld_frames, i, g.surfaces[i].offset,
                        g.surfaces[i].w, g.surfaces[i].h);
               const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[i]);
               fprintf(stderr, "[surf-dump] slot=%u %u:0x%08X %ux%u nonblack=%llu"

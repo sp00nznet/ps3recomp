@@ -529,6 +529,26 @@ static int samp_mod_hit(uintptr_t rip)
     return 0;
 }
 
+/* Host-code RVAs in the main exe, 16-byte buckets: the module line only says
+ * "gh3.exe", this says which runtime/backend function. Resolve offline
+ * against the link map. */
+#define SAMP_RVAS 8192
+static uint32_t s_rva_key[SAMP_RVAS];
+static uint64_t s_rva_ct[SAMP_RVAS];
+
+static void samp_rva_hit(uintptr_t rip)
+{
+    static uintptr_t base;
+    if (!base) base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t off = rip - base;
+    if (off >= 0x40000000u) return;
+    uint32_t key = (uint32_t)(off >> 4) + 1;
+    for (uint32_t i = (key * 2654435761u) % SAMP_RVAS, n = 0; n < SAMP_RVAS; n++, i = (i + 1) % SAMP_RVAS) {
+        if (s_rva_key[i] == key) { s_rva_ct[i]++; return; }
+        if (!s_rva_key[i]) { s_rva_key[i] = key; s_rva_ct[i] = 1; return; }
+    }
+}
+
 static void samp_report(void)
 {
     fprintf(stderr, "[samp] %llu samples, %llu in guest code (%.1f%%)\n",
@@ -572,6 +592,20 @@ static void samp_report(void)
                 s_t2_id[k], (unsigned long long)s_t2_guest[k],
                 (unsigned long long)s_t2_ntdll[k], (unsigned long long)s_t2_other[k]);
     }
+    for (int rank = 0; rank < 25; rank++) {
+        uint64_t best = 0; int bi = -1;
+        for (int k = 0; k < SAMP_RVAS; k++)
+            if (s_rva_ct[k] > best) { best = s_rva_ct[k]; bi = k; }
+        if (bi < 0 || !best) break;
+        fprintf(stderr, "[samp] rva 0x%08X %5.1f%% (%llu)\n", (s_rva_key[bi] - 1) << 4,
+                s_samp_total ? 100.0 * (double)best / (double)s_samp_total : 0.0,
+                (unsigned long long)best);
+        s_rva_ct[bi] = 0;
+    }
+    memset(s_rva_key, 0, sizeof s_rva_key); memset(s_rva_ct, 0, sizeof s_rva_ct);
+    memset(s_t2_id, 0, sizeof s_t2_id); memset(s_t2_guest, 0, sizeof s_t2_guest);
+    memset(s_t2_ntdll, 0, sizeof s_t2_ntdll); memset(s_t2_other, 0, sizeof s_t2_other);
+    s_samp_total = s_samp_guest = 0;
     fflush(stderr);
 }
 
@@ -628,6 +662,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
                                  samp_tid2(te.th32ThreadID, 1, 0); }
                         else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                               if (!nt) samp_rva_hit((uintptr_t)c.Rip);
                                samp_tid2(te.th32ThreadID, 0, nt); }
                     }
                     ResumeThread(h);

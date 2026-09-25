@@ -835,6 +835,23 @@ static void nv3089_blit(void)
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
     u32 dst_pitch = s_gcm2d.pitch >> 16;
     if (!out_w || !out_h || !in_pitch || !dst_pitch) return;
+    /* NV3089_GATE=<file>: log every blit's geometry while <file> exists, so a
+     * capture covers the scene of interest instead of the first N since boot. */
+    { static const char* gate = (const char*)-1; static unsigned poll; static int open_gate;
+      if (gate == (const char*)-1) gate = getenv("NV3089_GATE");
+      if (gate) {
+          if ((poll++ & 63u) == 0) { FILE* g = fopen(gate, "rb"); open_gate = g != NULL; if (g) fclose(g); }
+          if (open_gate) {
+              int _sl = (s_nv3089.src_dma != 0xFEED0001u), _dl = (s_gcm2d.dst_dma != 0xFEED0001u);
+              printf("[NV3089G] fmt=0x%X out=%ux%u at %u,%u in=%ux%u uv=0x%08X ds=0x%X dt=0x%X src=0x%08X/%u dst=0x%08X/%u swz=%d%c",
+                     s_nv3089.fmt & 0xFF, out_w, out_h, out_x, out_y,
+                     s_nv3089.in_sz & 0xFFFF, s_nv3089.in_sz >> 16, s_nv3089.in_uv,
+                     s_nv3089.ds_dx, s_nv3089.dt_dy,
+                     cellGcmResolveLocated(_sl, s_nv3089.in_off), in_pitch,
+                     cellGcmResolveLocated(_dl, s_gcm2d.dst_offset), dst_pitch,
+                     s_nv309e.active, 10);
+          }
+      } }
     /* A copy out of a surface the live renderer drew exists only on the GPU;
      * mirror 1:1 blits there too (the guest-memory copy below still runs). */
     if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
@@ -1738,6 +1755,28 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  */
                 static int s1_2d = -1;
                 if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+                /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
+                 * non-zero subchannel -- what each binding slot actually carries. */
+                { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
+                  if (sg == (const char*)-1) sg = getenv("GCM_SUBCH_GATE");
+                  const u32 cm3 = m & 0x1FFCu;
+                  /* GCM_VAL_WATCH=<hex>: every FIFO word carrying that value, any method. */
+                  { static u32 vw = 1;
+                    if (vw == 1) { const char* e = getenv("GCM_VAL_WATCH"); vw = e ? (u32)strtoul(e, 0, 16) : 0; }
+                    if (vw && vm_read32(dea) == vw) {
+                        static int vn; if (vn++ < 64)
+                            printf("[valwatch] subch=%u method=0x%04X = 0x%08X get=0x%X%c", subch, m, vw, s_fifo_getoff, 10);
+                    } }
+                  /* ...and surface offsets (colour 0x210/0x218/0x288/0x28C, zeta 0x214) and texture 1 offset */
+                  if (sg && !subch && (cm3 == 0x210 || cm3 == 0x214 || cm3 == 0x218 || cm3 == 0x288 || cm3 == 0x28C ||
+                                       cm3 == 0x1A20)) {
+                      if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
+                      if (open_g) printf("[surfreg] 0x%04X = 0x%08X%c", cm3, vm_read32(dea), 10);
+                  }
+                  if (sg && subch) {
+                      if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
+                      if (open_g) printf("[subch] %u 0x%04X = 0x%08X%c", subch, m, vm_read32(dea), 10);
+                  } }
                 /* Mirror the whole method stream into the live NV4097->D3D12
                  * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
                  * It wants the raw method with its subchannel bits -- it

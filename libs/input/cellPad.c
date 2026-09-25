@@ -663,6 +663,8 @@ skip_inject: ;
      *
      *   echo 0x0008 > pad.txt    # START
      *   echo 0x4000 > pad.txt    # CROSS
+     *   echo 0x0040 4 > pad.txt  # DOWN for 4 polls (menus auto-repeat a
+     *                            # long hold; the default is 40)
      */
     { static int s_pf = -1; static char pf_path[512];
       static unsigned held_mask = 0; static int held_n = 0;
@@ -675,8 +677,10 @@ skip_inject: ;
               if (f) {
                   char buf[64]; buf[0] = 0;
                   if (fgets(buf, sizeof buf, f)) {
-                      unsigned m = (unsigned)strtoul(buf, 0, 0);
-                      if (m) { held_mask = m; held_n = 40;
+                      char* rest;
+                      unsigned m = (unsigned)strtoul(buf, &rest, 0);
+                      int n = (int)strtol(rest, 0, 0);
+                      if (m) { held_mask = m; held_n = n > 0 ? n : 40;
                                printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
                   }
                   fclose(f);
