@@ -255,6 +255,9 @@ static s32 dispatch_func_file(uint32_t func_opd, uint32_t* userdata_ea,
     out->fileSize = vm_read32(set_ea + 36);
     out->fileBufSize = vm_read32(set_ea + 40);
     out->fileBuf = buffer ? vm_base + buffer : NULL;
+    /* fread/fwrite on fileBuf go through the kernel, which cannot fault in a
+     * demand-committed guest page (see sys_fs_read). Commit it first. */
+    if (buffer && out->fileBufSize) vm_commit(buffer, out->fileBufSize);
     return marshal_cbresult_read_result(cb_ea);
 }
 
@@ -341,12 +344,6 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
     s32 result = marshal_cbresult_read_result(cb_ea);
     printf("[cellSaveData] funcStat returned cbResult.result=%d\n", result);
     return result;
-}
-
-static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName,
-                              uint32_t userdata_ea)
-{
-    return dispatch_func_stat_full(func_opd, is_new, dirName, &userdata_ea, NULL, NULL);
 }
 
 /* Dispatch a List/Fixed selection callback.
@@ -827,6 +824,10 @@ static s32 savedata_execute(const char* dirName, int is_save,
                                                  &callback_userdata, exc_size, &fileSet);
             if (cbResult.result != CELL_SAVEDATA_CBRESULT_OK_NEXT) break;
             s32 exc = process_file_op(save_path, &fileSet);
+            printf("[cellSaveData] file op=%u type=%u name='%s' off=%u size=%u buf=%u -> %d\n",
+                   fileSet.fileOperation, fileSet.fileType,
+                   fileSet.fileName ? fileSet.fileName : "", fileSet.fileOffset,
+                   fileSet.fileSize, fileSet.fileBufSize, exc);
             if (exc < 0) { free(fileList); return exc; }
             exc_size = (u32)exc;
         }
@@ -1159,29 +1160,22 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     build_save_path(save_path, sizeof(save_path), dirName);
     int is_new = !dir_has_save(save_path);
 
-    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
-    /* userdata arrives as a GUEST address in a pointer type (same convention as
-     * funcStat/dirName). The callback recovers its own object from it. */
-    uint32_t userdata_ea = (uint32_t)(uintptr_t)userdata;
-    s32 cb = dispatch_func_stat(func_opd, is_new, dirName, userdata_ea);
-
-    if (cb < 0) {
-        /* flОw first-boot: its funcStat returns ERR_NODATA on a new profile
-         * (isNewData=1). The callback already ran and told the game "no save",
-         * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
-         * parked in MODE_AUTO_LOAD (no app loop, no flips).
-         * Per the SDK the correct return here is CELL_SAVEDATA_ERROR_NODATA,
-         * and a real title handles it; that flОw does not is a bug somewhere in
-         * its MODE_AUTO_LOAD state machine we have not tracked down. Keep the
-         * compat return until that is understood -- it was dropped once already
-         * in the fold merge and cost a boot regression. */
-        if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_OK;
-        return CELL_SAVEDATA_ERROR_CBRESULT;
-    }
-    /* OK_LAST or OK_NEXT — with no actual file load infrastructure for
-     * now, succeed without invoking funcFile. */
-    return CELL_OK;
+    (void)is_new;
+    /* Full sequence: funcStat, then the funcFile loop that reads the files.
+     * Stopping after funcStat (OK_NEXT) left a title with a save on disk
+     * waiting for its data forever -- GH3's second boot sat on "Checking HDD".
+     *
+     * flОw first-boot: its funcStat returns ERR_NODATA on a new profile
+     * (isNewData=1). The callback already ran and told the game "no save",
+     * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
+     * parked in MODE_AUTO_LOAD (no app loop, no flips).
+     * Per the SDK the correct return here is CELL_SAVEDATA_ERROR_NODATA,
+     * and a real title handles it; that flОw does not is a bug somewhere in
+     * its MODE_AUTO_LOAD state machine we have not tracked down. Keep the
+     * compat return until that is understood -- it was dropped once already
+     * in the fold merge and cost a boot regression. */
+    s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
+    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
 }
 
 s32 cellSaveDataDelete2(u32 container)
@@ -1303,22 +1297,11 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
     build_save_path(save_path, sizeof(save_path), dirName);
     int is_new = !dir_has_save(save_path);
 
-    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
-    /* userdata arrives as a GUEST address in a pointer type (same convention as
-     * funcStat/dirName). The callback recovers its own object from it. */
-    uint32_t userdata_ea = (uint32_t)(uintptr_t)userdata;
-    s32 cb = dispatch_func_stat(func_opd, is_new, dirName, userdata_ea);
-
-    if (cb < 0) {
-        /* Same first-boot compat return as cellSaveDataAutoLoad2 above (flОw
-         * calls this old non-_2 variant): ERR_NODATA from funcStat on a new
-         * profile must not surface as an error, or the title parks in
-         * MODE_AUTO_LOAD. See the longer note there. */
-        if (cb == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_OK;
-        return CELL_SAVEDATA_ERROR_CBRESULT;
-    }
-    return CELL_OK;
+    (void)is_new;
+    /* Same as cellSaveDataAutoLoad2 above, including flОw's first-boot compat
+     * return (it calls this old non-_2 variant). */
+    s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
+    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
 }
 
 s32 cellSaveDataDelete(u32 version, const char* dirName,

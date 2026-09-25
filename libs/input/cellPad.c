@@ -685,7 +685,19 @@ skip_inject: ;
           }
           if (held_n > 0) { held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF);
+              /* A held button also reads full pressure in press mode; titles
+               * that enable it (GH3) can key menus off the pressure words. */
+              static const struct { u16 bit; u8 off; } pm[] = {
+                  { 0x0020, CELL_PAD_BTN_OFFSET_PRESS_RIGHT }, { 0x0080, CELL_PAD_BTN_OFFSET_PRESS_LEFT },
+                  { 0x0010, CELL_PAD_BTN_OFFSET_PRESS_UP },    { 0x0040, CELL_PAD_BTN_OFFSET_PRESS_DOWN },
+                  { 0x1000, CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE }, { 0x2000, CELL_PAD_BTN_OFFSET_PRESS_CIRCLE },
+                  { 0x4000, CELL_PAD_BTN_OFFSET_PRESS_CROSS }, { 0x8000, CELL_PAD_BTN_OFFSET_PRESS_SQUARE },
+                  { 0x0400, CELL_PAD_BTN_OFFSET_PRESS_L1 },    { 0x0800, CELL_PAD_BTN_OFFSET_PRESS_R1 },
+                  { 0x0100, CELL_PAD_BTN_OFFSET_PRESS_L2 },    { 0x0200, CELL_PAD_BTN_OFFSET_PRESS_R2 } };
+              if (s_port_setting[port_no] & CELL_PAD_SETTING_PRESS_ON)
+                  for (unsigned k = 0; k < sizeof pm / sizeof pm[0]; k++)
+                      if (held_mask & pm[k].bit) data->button[pm[k].off] = 255; }
       } }
 
     /* Analog sticks */
