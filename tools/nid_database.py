@@ -90,6 +90,8 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellGcmSys", "cellGcmGetFlipStatus"),
     ("cellGcmSys", "cellGcmResetFlipStatus"),
     ("cellGcmSys", "cellGcmSetWaitFlip"),
+    ("cellGcmSys", "cellGcmSetWaitFlipUnsafe"),
+    ("cellGcmSys", "cellGcmGetReport"),
     ("cellGcmSys", "cellGcmSetFlip"),
     ("cellGcmSys", "cellGcmGetCurrentField"),
     ("cellGcmSys", "cellGcmGetLabelAddress"),

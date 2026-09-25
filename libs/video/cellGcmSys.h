@@ -61,7 +61,7 @@ extern "C" {
 #define CELL_GCM_MAX_ZCULL_COUNT        8
 
 /* Report / label limits */
-#define CELL_GCM_MAX_REPORT_COUNT       256
+#define CELL_GCM_MAX_REPORT_COUNT       65536   /* the 1 MB report area, 16 bytes each */
 #define CELL_GCM_MAX_LABEL_COUNT        256
 
 /* Report data size (timestamp u64 + value u32 + pad u32 = 16 bytes) */
@@ -230,6 +230,8 @@ void cellGcmSetFlipMode(u32 mode);
 
 /* NID: 0xC44D8F34 */
 void cellGcmSetWaitFlip(void);
+void cellGcmSetWaitFlipUnsafe(void);
+u32 cellGcmGetReport(u32 type, u32 index);
 
 /* NID: 0x51C9D62B */
 void cellGcmResetFlipStatus(void);

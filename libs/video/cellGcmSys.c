@@ -585,6 +585,11 @@ void cellGcmSetWaitFlip(void)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 }
 
+/* NID: 0xDF6476BD. The same wait without libgcm's command-buffer space check;
+ * this HLE writes no command, so it is the same call. GH3 makes it ~36 times
+ * a boot and got a faked CELL_OK (no wait at all) before this was registered. */
+void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
+
 /* NID: 0x51C9D62B */
 void cellGcmResetFlipStatus(void)
 {
@@ -1824,6 +1829,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
                     if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+                    /* NV4097_GET_REPORT: (type << 24) | offset into the report
+                     * area. Sample counts are not measured, so a ZPASS query
+                     * reports "visible" -- the conservative answer; reading 0
+                     * tells the title every queried object is occluded. */
+                    if (m == 0x1800) {
+                        const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
+                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
+                        if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                            s_report_data[idx].timestamp = get_timestamp_ns();
+                            s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                        }
+                    }
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
@@ -2669,6 +2686,17 @@ CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
 }
 
 /* NID: 0x97FC4B73 */
+/* NID: 0x99D397AC. The value NV4097_GET_REPORT stored at this index (the
+ * walker fills it). Unregistered, every call returned a faked 0. */
+u32 cellGcmGetReport(u32 type, u32 index)
+{
+    { static int n = 0;
+      if (n++ < 8 || (n % 2000) == 0) printf("[cellGcmSys] GetReport(type=%u, index=%u) -> %u%c", type, index,
+                          index < CELL_GCM_MAX_REPORT_COUNT ? s_report_data[index].value : 0u, 10); }
+    if (index >= CELL_GCM_MAX_REPORT_COUNT) return 0;
+    return s_report_data[index].value;
+}
+
 u64 cellGcmGetTimeStamp(u32 index)
 {
     if (index >= CELL_GCM_MAX_REPORT_COUNT)

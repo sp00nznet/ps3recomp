@@ -108,8 +108,15 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 void spu_coh_unregister(spu_context* ctx)
 {
     if (!ctx) return;
+    /* Under the lock-line lock, which every walker of s_coh_ctxs holds: a
+     * notifier that loaded this pointer just before the NULL store would
+     * otherwise go on dereferencing it after the job returned and its stack
+     * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
+     * spu_coh_notify_write, reading a freed thread stack. */
+    spu_lockline_lock();
     for (int i = 0; i < SPU_COH_MAX_CTX; i++)
-        if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; return; }
+        if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; break; }
+    spu_lockline_unlock();
 }
 
 int spu_coh_is_reserved(uint32_t addr)

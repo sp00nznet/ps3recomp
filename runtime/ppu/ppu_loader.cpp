@@ -1746,7 +1746,11 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                                  const char* hi = getenv("PPU_WVAL_HI");
                                  s_wvlo = lo ? (uint32_t)strtoul(lo, 0, 0) : 0;
                                  s_wvhi = hi ? (uint32_t)strtoul(hi, 0, 0) : 0xFFFFFFFFu; }
-      if (s_wv && v == s_wv && a >= s_wvlo && a < s_wvhi) {
+      /* PPU_WVAL_GATE=<file>: only while <file> exists (checked on matches). */
+      static const char* s_wvg = (const char*)-1;
+      if (s_wvg == (const char*)-1) s_wvg = getenv("PPU_WVAL_GATE");
+      if (s_wv && v == s_wv && a >= s_wvlo && a < s_wvhi &&
+          (!s_wvg || GetFileAttributesA(s_wvg) != INVALID_FILE_ATTRIBUTES)) {
           static int _n = 0;
           if (_n++ < 24) {
               fprintf(stderr, "[wv] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
