@@ -5932,6 +5932,18 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
                 if (dc.inl[o] > amax) amax = dc.inl[o];
             fprintf(file, "va=%u ", amax);
         }
+        /* ...and the xy bounding box of attr 0 when it is float (screen-space HUD). */
+        rsx_dsp_vertex_attr p0; rsx_dsp_get_vertex_attr(&g.rsx, 0, &p0);
+        if (p0.type == RSX_VTX_TYPE_FLOAT && p0.size >= 2) {
+            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+            for (u32 o = dc.inl_off[0]; o + 8 <= dc.inl_bytes; o += dc.inl_stride) {
+                u32 xb = (dc.inl[o] << 24) | (dc.inl[o+1] << 16) | (dc.inl[o+2] << 8) | dc.inl[o+3];
+                u32 yb = (dc.inl[o+4] << 24) | (dc.inl[o+5] << 16) | (dc.inl[o+6] << 8) | dc.inl[o+7];
+                float x, y; memcpy(&x, &xb, 4); memcpy(&y, &yb, 4);
+                if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+            }
+            fprintf(file, "bb=%.0f,%.0f-%.0f,%.0f ", x0, y0, x1, y1);
+        }
     }
     fprintf(file, "A=%u:%X/%u fmt=%u rt=%u ", sf.color_location[0], sf.color_offset[0], sf.color_pitch[0], sf.color_format, sf.raster_type);
     fprintf(file, "ct=0x%X B=%u:%X C=%u:%X D=%u:%X ", sf.color_target,

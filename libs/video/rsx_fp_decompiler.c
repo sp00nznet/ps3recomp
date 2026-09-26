@@ -624,6 +624,18 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
                          tex_unit, tex_unit, a, a);
             break;
+        case OP_TXB: case OP_TXL: {
+            /* Biased / explicit-LOD sample; bias or LOD is src1.x (RPCS3
+             * TEXTURE_SAMPLE2D_BIAS / _LOD). GH3's fret buttons and fret lines
+             * are TXB: unhandled, they sampled nothing and output alpha 0. */
+            const int cube = (tex_cube_mask >> tex_unit) & 1u;
+            char tn[32];
+            snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
+                     opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
+                     cube ? "xyz" : "xy", b);
+            break;
+        }
         case OP_KIL:
             /* Fragment kill. Predicated by the same exec_if condition as any
              * other instruction (RPCS3 FragmentProgramDecompiler case
