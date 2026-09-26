@@ -39,6 +39,18 @@
 #  define host_backend_color    rsx_metal_backend_debug_color
 #  define host_backend_center   rsx_metal_backend_readback_center
 #  define host_backend_guest_draws rsx_metal_backend_guest_draws
+#elif defined(PS3RECOMP_RSX_VULKAN)
+/* Opt-in (-DPS3RECOMP_RSX_VULKAN=ON): same entry points and test hooks. */
+#  include "rsx_vulkan_backend.h"
+#  define HOST_BACKEND_NAME     "Vulkan"
+#  define HOST_BACKEND_GUEST_SHADERS 0
+#  define host_backend_init     rsx_vulkan_backend_init
+#  define host_backend_shutdown rsx_vulkan_backend_shutdown
+#  define host_backend_pump     rsx_vulkan_backend_pump_messages
+#  define host_backend_present  rsx_vulkan_backend_present
+#  define host_backend_color    rsx_vulkan_backend_debug_color
+#  define host_backend_center   rsx_vulkan_backend_readback_center
+#  define host_backend_guest_draws rsx_vulkan_backend_guest_draws
 #else
 #  include "rsx_null_backend.h"
 #  define HOST_BACKEND_NAME     "null (headless software)"
