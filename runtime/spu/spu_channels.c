@@ -183,6 +183,14 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * recursion guard halted the SPU at 2000 after a few minutes of idling. */
     ctx->host_depth = 0;
     ctx->irq_frame = 0;
+    /* Nest-safe: a job run synchronously from inside another SPU's execution
+     * re-enters here on the same host thread. The halt target is per-thread,
+     * so save the outer one and put it back on the way out -- otherwise the
+     * outer run's next halt longjmps into this (by then dead) frame, and a
+     * stack-local job context skips its coherency unregister (GH3: crashes in
+     * spu_coh_notify_write on a freed stack). */
+    jmp_buf outer_env; const int outer_armed = s_spu_halt_armed;
+    if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof(jmp_buf));
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
     /* Lockstep gate (env SPU_LOCKSTEP, default off): join the round-robin
@@ -220,7 +228,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         SPU_DRAIN(ctx);
     }
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
-    s_spu_halt_armed = 0;
+    s_spu_halt_armed = outer_armed;
+    if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
     return halted;
 }
 

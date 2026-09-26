@@ -5919,6 +5919,20 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
         fprintf(file, "bf=%X/%X/%X/%X eq=%X/%X ", rs.sf_rgb, rs.df_rgb, rs.sf_a, rs.df_a,
                 rs.eq_rgb, rs.eq_a);
     fprintf(file, "at=%u/0x%X/0x%X ", rs.alpha_test_enable, rs.alpha_func, rs.alpha_ref_raw);
+    fprintf(file, "sc=%08X/%08X ", rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL));
+    if (rs.stencil_enable)
+        fprintf(file, "st=%X/%X/%X/%X/%X/%X ref=%X ", rs.s_func, rs.s_func_mask, rs.s_write_mask, rs.s_fail, rs.s_zfail, rs.s_zpass, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC + 4));
+    /* Inline draws (HUD sprites): the largest vertex-colour alpha byte, attr 3
+     * as UB4 -- an element faded to 0 is drawn but invisible. */
+    if (dc.inl && dc.inl_stride) {
+        rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, 3, &va);
+        if (va.type == RSX_VTX_TYPE_UNORM8 && va.size == 4) {
+            u32 amax = 0;
+            for (u32 o = dc.inl_off[3] + 3; o < dc.inl_bytes; o += dc.inl_stride)
+                if (dc.inl[o] > amax) amax = dc.inl[o];
+            fprintf(file, "va=%u ", amax);
+        }
+    }
     fprintf(file, "A=%u:%X/%u fmt=%u rt=%u ", sf.color_location[0], sf.color_offset[0], sf.color_pitch[0], sf.color_format, sf.raster_type);
     fprintf(file, "ct=0x%X B=%u:%X C=%u:%X D=%u:%X ", sf.color_target,
             sf.color_location[1], sf.color_offset[1], sf.color_location[2], sf.color_offset[2],
@@ -6605,10 +6619,23 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                       fprintf(stderr, "\n"); } }
           rsx_dsp_texture t0; rsx_dsp_get_texture(&g.rsx, 0, &t0);
           const u8* tp = guest_ptr(t0.location, t0.offset, 32);
-          if (tp) { { rsx_dsp_texture t1; rsx_dsp_get_texture(&g.rsx, 1, &t1); fprintf(stderr, "[pso-trace] outmask=0x%X inmask=0x%X tex0 fmt=0x%X remap=0x%X tex1 remap=0x%X:", rsx_dsp_reg(&g.rsx, 0x1FF4), rsx_dsp_reg(&g.rsx, 0x1FF0), t0.format, t0.remap, t1.remap); }
+          if (tp) { { rsx_dsp_texture t1; rsx_dsp_get_texture(&g.rsx, 1, &t1); fprintf(stderr, "[pso-trace] outmask=0x%X inmask=0x%X tex0 fmt=0x%X remap=0x%X wrap=0x%X border=0x%08X filter=0x%X tex1 remap=0x%X wrap=0x%X:", rsx_dsp_reg(&g.rsx, 0x1FF4), rsx_dsp_reg(&g.rsx, 0x1FF0), t0.format, t0.remap, t0.wrap, rsx_dsp_reg(&g.rsx, 0x1A1C), t0.filter, t1.remap, t1.wrap); }
                     for (u32 k = 0; k < 32; k++) fprintf(stderr, "%02X", tp[k]);
                     fprintf(stderr, "\n"); }
       } }
+    /* LD_FORCE_VA=1: debug -- inline draws whose UB4 vertex colour (attr 3)
+     * has alpha 0 everywhere get alpha 255, to see what a faded-out element is. */
+    { static int fva = -1; if (fva < 0) fva = getenv("LD_FORCE_VA") ? 1 : 0;
+      if (fva && dc.inl && dc.inl_stride) {
+          rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, 3, &va);
+          if (va.type == RSX_VTX_TYPE_UNORM8 && va.size == 4) {
+              u32 amax = 0;
+              for (u32 o = dc.inl_off[3] + 3; o < dc.inl_bytes; o += dc.inl_stride)
+                  if (dc.inl[o] > amax) amax = dc.inl[o];
+              if (!amax)
+                  for (u32 o = dc.inl_off[3] + 3; o < dc.inl_bytes; o += dc.inl_stride)
+                      ((u8*)dc.inl)[o] = 255;
+          } } }
     /* LD_SKIP_PSO=<hex key>: drop draws with that CSV pso_key. Debug only. */
     { static u64 skipk = 1;
       if (skipk == 1) { const char* e = getenv("LD_SKIP_PSO"); skipk = e ? _strtoui64(e, 0, 16) : 0; }
@@ -7025,15 +7052,20 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         (LONG)(g.surfaces[target].h ? g.surfaces[target].h : g.height)
     };
     /* Guest scissor, intersected with the surface rect. The nv40 reset value
-     * is a full-window 4096x4096 (never-written regs read 0 here, which the
-     * w==0 test treats as "no scissor"), so ordinary streams keep the old
-     * full-surface rect and only genuine game scissors narrow it. */
+     * is a full-window 4096x4096; never-written regs read 0 here, so an
+     * unwritten scissor means "no scissor". A WRITTEN zero width or height is
+     * a real, empty scissor and must clip everything: GH3's gameplay venue
+     * sits under a ViewportElement whose clip window is off-screen (scissor
+     * x=1039 w=0), and drawing it full-screen painted its never-rendered
+     * texture over the whole scene. */
     {
         const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
         const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
         const LONG sx = (LONG)(sh & 0xFFFFu), sw = (LONG)(sh >> 16);
         const LONG sy = (LONG)(sv & 0xFFFFu), svh = (LONG)(sv >> 16);
-        if (sw > 0 && svh > 0) {
+        const int written = g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] != 0 ||
+                            g.rsx.seen[M_SCISSOR_VERTICAL >> 2] != 0;
+        if (written) {
             if (sx > sc.left)            sc.left   = sx;
             if (sy > sc.top)             sc.top    = sy;
             if (sx + sw  < sc.right)     sc.right  = sx + sw;

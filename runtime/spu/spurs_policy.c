@@ -535,6 +535,7 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
         memcpy(out_2700, ctx->ls + 0x2700, n);
     }
     int st = (int)ctx->status;
+    { extern void spu_coh_unregister(spu_context*); spu_coh_unregister(ctx); }
     free(ctx);
     return st;
 }

@@ -683,6 +683,13 @@ void ppu_gcm_pump(void)
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
+    /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
+    { static int d = -1; static unsigned nv, nf, calls;
+      if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
+      if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
+               if ((calls % 20000) == 0)
+                   fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
+                           calls, nv, nf, s_vblank_count, 10); } }
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,

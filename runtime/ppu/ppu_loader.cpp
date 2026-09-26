@@ -2284,10 +2284,60 @@ static void ps3_indirect_call_impl(ppu_context* ctx);
 /* The impl declares these at block scope; outside an extern "C" function that
  * would give them C++ linkage, so pin it here. */
 extern "C" uint32_t ps3_hle_count(void);
+/* PS3_ICALL_GATE=<file>: while <file> exists, histogram indirect-call targets
+ * (per guest thread) and how often each returned r3 == 0; the table prints
+ * when the file goes away. A script CFunc polled every frame and always
+ * answering false is how a stalled script sequence shows up. */
+static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
+{
+    static const char* gate = (const char*)-1;
+    if (gate == (const char*)-1) gate = getenv("PS3_ICALL_GATE");
+    if (!gate) return;
+    enum { N = 4096 };
+    static uint32_t key[N], tid[N], cnt[N], zero[N]; static SRWLOCK lk = SRWLOCK_INIT;
+    static volatile LONG open_ = 0; static DWORD last = 0;
+    if (phase == 0) {
+        DWORD now = GetTickCount();
+        if (now - last > 100) {
+            last = now;
+            const int o = GetFileAttributesA(gate) != INVALID_FILE_ATTRIBUTES;
+            if (!o && open_) {
+                AcquireSRWLockExclusive(&lk);
+                open_ = 0;
+                for (int r = 0; r < 1500; r++) {
+                    uint32_t b = 0; int bi = -1;
+                    for (int i = 0; i < N; i++) if (cnt[i] > b) { b = cnt[i]; bi = i; }
+                    if (bi < 0) break;
+                    fprintf(stderr, "[icall] tid=%u target=0x%08X calls=%u ret0=%u\n",
+                            tid[bi], key[bi], cnt[bi], zero[bi]);
+                    cnt[bi] = 0;
+                }
+                memset(key, 0, sizeof key); memset(cnt, 0, sizeof cnt); memset(zero, 0, sizeof zero);
+                ReleaseSRWLockExclusive(&lk);
+            } else if (o) open_ = 1;
+        }
+        return;
+    }
+    if (!open_) return;
+    const uint32_t t = (uint32_t)ctx->thread_id, z = (uint32_t)ctx->gpr[3] == 0;
+    /* PS3_ICALL_TRACE=<tid>: also log every call on that guest thread, in order. */
+    { static int tt = -2; if (tt == -2) { const char* e = getenv("PS3_ICALL_TRACE"); tt = e ? atoi(e) : -1; }
+      if (tt >= 0 && (uint32_t)tt == t) fprintf(stderr, "[ict] %08X %u\n", tgt, (uint32_t)ctx->gpr[3]); }
+    AcquireSRWLockExclusive(&lk);
+    for (uint32_t i = (tgt * 2654435761u + t) % N, n = 0; n < N; n++, i = (i + 1) % N) {
+        if (key[i] == tgt && tid[i] == t) { cnt[i]++; zero[i] += z; break; }
+        if (!cnt[i]) { key[i] = tgt; tid[i] = t; cnt[i] = 1; zero[i] = z; break; }
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     static int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
+    { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
+      if (hg) { const uint32_t tgt = (uint32_t)ctx->ctr; icall_hist(ctx, tgt, 0);
+                ps3_indirect_call_impl(ctx); icall_hist(ctx, tgt, 1); return; } }
     if (!on) { ps3_indirect_call_impl(ctx); return; }
     uint64_t save[19]; uint32_t tgt = (uint32_t)ctx->ctr;
     save[0] = ctx->gpr[1];
