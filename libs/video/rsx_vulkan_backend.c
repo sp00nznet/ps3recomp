@@ -40,6 +40,11 @@
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
+/* SDL2 is already required off Windows (cellPad, cellAudio); here it only
+ * opens the optional window. Same include style as those two. */
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_vulkan.h>
+
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -55,7 +60,7 @@
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) \
     X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFormatProperties) \
-    X(vkCreateDevice) X(vkGetDeviceProcAddr)
+    X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties)
 #define VK_DEVICE_FNS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkDeviceWaitIdle) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
@@ -78,13 +83,24 @@
     X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
-    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw)
+    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
+/* Window-system entry points, loaded only when a window was requested, so a
+ * headless run never depends on a driver that can present. */
+#define VK_WSI_INSTANCE_FNS(X) \
+    X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) \
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR)
+#define VK_WSI_DEVICE_FNS(X) \
+    X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
+    X(vkAcquireNextImageKHR) X(vkQueuePresentKHR)
 
 #define VK_DECLARE(name) static PFN_##name p##name;
 static PFN_vkGetInstanceProcAddr pvkGetInstanceProcAddr;
 VK_GLOBAL_FNS(VK_DECLARE)
 VK_INSTANCE_FNS(VK_DECLARE)
 VK_DEVICE_FNS(VK_DECLARE)
+VK_WSI_INSTANCE_FNS(VK_DECLARE)
+VK_WSI_DEVICE_FNS(VK_DECLARE)
 
 /* ---------------------------------------------------------------------------
  * Backend state
@@ -148,6 +164,22 @@ typedef struct vk_state {
     VkCommandBuffer  cmd;
     VkFence          fence;
 
+    /* Optional window (PS3RECOMP_VK_WINDOW=1). Rendering stays offscreen
+     * either way -- readback and the tests are unchanged -- and a present
+     * additionally blits the frame into the window's swapchain. */
+    int              windowed;
+    SDL_Window*      window;
+    const char*      inst_exts[16];
+    u32              inst_ext_count;
+    VkSurfaceKHR     surface;
+    VkSwapchainKHR   swapchain;
+    VkExtent2D       sc_extent;
+    u32              sc_count;
+    VkImage          sc_images[8];
+    VkSemaphore      sc_done[8];      /* per image: the present waits on it */
+    VkSemaphore      sem_acquire;
+    double           hold_seconds;
+
     const rsx_state* state;           /* live RSX state, for draws       */
     u32              clear_argb;
     u32              last_center;
@@ -195,12 +227,24 @@ static int vk_load_instance_functions(void)
     return 0;
 }
 
+static int vk_load_wsi_instance_functions(void)
+{
+    VK_WSI_INSTANCE_FNS(LOAD_I)
+    return 0;
+}
+
 static int vk_load_device_functions(void)
 {
 #define LOAD_D(name) \
     if (!(p##name = (PFN_##name)pvkGetDeviceProcAddr(s_vk.device, #name))) \
         { VK_LOG("missing device function " #name "\n"); return -1; }
     VK_DEVICE_FNS(LOAD_D)
+    return 0;
+}
+
+static int vk_load_wsi_device_functions(void)
+{
+    VK_WSI_DEVICE_FNS(LOAD_D)
     return 0;
 }
 
@@ -227,9 +271,29 @@ static int vk_find_graphics_queue(VkPhysicalDevice pd, u32* family)
     if (n == 0 || n > 64) return -1;
     VkQueueFamilyProperties props[64];
     pvkGetPhysicalDeviceQueueFamilyProperties(pd, &n, props);
-    for (u32 i = 0; i < n; i++)
-        if (props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { *family = i; return 0; }
+    for (u32 i = 0; i < n; i++) {
+        if (!(props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+        if (s_vk.windowed) {           /* the same queue must also present */
+            VkBool32 ok = VK_FALSE;
+            if (pvkGetPhysicalDeviceSurfaceSupportKHR(pd, i, s_vk.surface, &ok) != VK_SUCCESS || !ok)
+                continue;
+        }
+        *family = i; return 0;
+    }
     return -1;
+}
+
+static int vk_has_device_extension(VkPhysicalDevice pd, const char* name)
+{
+    u32 n = 0;
+    if (pvkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL) != VK_SUCCESS || n == 0) return 0;
+    VkExtensionProperties* e = (VkExtensionProperties*)malloc(n * sizeof *e);
+    if (!e) return 0;
+    int found = 0;
+    if (pvkEnumerateDeviceExtensionProperties(pd, NULL, &n, e) == VK_SUCCESS)
+        for (u32 i = 0; i < n && !found; i++) found = strcmp(e[i].extensionName, name) == 0;
+    free(e);
+    return found;
 }
 
 static int vk_pick_device(void)
@@ -247,11 +311,14 @@ static int vk_pick_device(void)
         VkPhysicalDeviceProperties p;
         pvkGetPhysicalDeviceProperties(devs[i], &p);
         u32 fam;
-        int usable = vk_find_graphics_queue(devs[i], &fam) == 0;
+        int usable = vk_find_graphics_queue(devs[i], &fam) == 0 &&
+                     (!s_vk.windowed ||
+                      vk_has_device_extension(devs[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME));
         VK_LOG("device %u: %s (type %d, api %u.%u.%u)%s\n", i, p.deviceName,
                (int)p.deviceType, VK_API_VERSION_MAJOR(p.apiVersion),
                VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion),
-               usable ? "" : " -- no graphics queue");
+               usable ? "" : (s_vk.windowed ? " -- cannot present to the window"
+                                            : " -- no graphics queue"));
         if (!usable) continue;
         if (forced) {
             if ((u32)atoi(forced) == i) { best = (int)i; break; }
@@ -865,6 +932,250 @@ static void vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     vk_submit_and_wait();
 }
 
+/* ---------------------------------------------------------------------------
+ * Optional window: PS3RECOMP_VK_WINDOW=1
+ *
+ * An SDL2 window with a Vulkan swapchain. Rendering still targets the
+ * offscreen image, so readback and every test are unchanged; a present then
+ * also blits that image into the next swapchain image. Any failure on this
+ * path drops back to headless with a message instead of failing the run.
+ * -------------------------------------------------------------------------*/
+static int vk_env_on(const char* name)
+{
+    const char* v = getenv(name);
+    return v && v[0] && v[0] != '0';
+}
+
+static void vk_window_drop(const char* why)
+{
+    if (why) VK_LOG("window disabled, continuing headless: %s\n", why);
+    if (s_vk.device && pvkDeviceWaitIdle) {
+        pvkDeviceWaitIdle(s_vk.device);
+        for (u32 i = 0; i < 8; i++)
+            if (s_vk.sc_done[i]) {
+                pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
+                s_vk.sc_done[i] = VK_NULL_HANDLE;
+            }
+        if (s_vk.sem_acquire) pvkDestroySemaphore(s_vk.device, s_vk.sem_acquire, NULL);
+        if (s_vk.swapchain && pvkDestroySwapchainKHR)
+            pvkDestroySwapchainKHR(s_vk.device, s_vk.swapchain, NULL);
+    }
+    if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
+        pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
+    if (s_vk.window) {
+        SDL_DestroyWindow(s_vk.window);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    }
+    s_vk.window = NULL;
+    s_vk.surface = VK_NULL_HANDLE;
+    s_vk.swapchain = VK_NULL_HANDLE;
+    s_vk.sem_acquire = VK_NULL_HANDLE;
+    s_vk.sc_count = 0;
+    s_vk.windowed = 0;
+}
+
+static void vk_window_open(const char* title)
+{
+    if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
+        return;
+    }
+    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
+    if (vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
+                                   SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                   (int)s_vk.width, (int)s_vk.height, flags);
+    s_vk.windowed = 1;          /* so vk_window_drop also shuts SDL video down */
+    if (!s_vk.window) {
+        char why[256];
+        snprintf(why, sizeof why, "SDL_CreateWindow failed: %s", SDL_GetError());
+        vk_window_drop(why);
+        return;
+    }
+    unsigned n = 0;
+    if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
+        !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
+        char why[256];
+        snprintf(why, sizeof why, "no Vulkan surface extensions (%s)", SDL_GetError());
+        vk_window_drop(why);
+        return;
+    }
+    s_vk.inst_ext_count = n;
+    const char* hold = getenv("PS3RECOMP_VK_HOLD");
+    s_vk.hold_seconds = hold ? atof(hold) : 0.0;
+    VK_LOG("window: SDL video driver '%s', %u surface extension(s)\n",
+           SDL_GetCurrentVideoDriver(), n);
+}
+
+static int vk_create_swapchain(void)
+{
+    VkSurfaceCapabilitiesKHR caps;
+    VK_CHECK(pvkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_vk.phys, s_vk.surface, &caps),
+             "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        VK_LOG("swapchain images cannot be blit destinations\n"); return -1;
+    }
+
+    u32 nf = 0;
+    VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, NULL),
+             "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    if (nf == 0) { VK_LOG("surface reports no formats\n"); return -1; }
+    if (nf > 64) nf = 64;
+    VkSurfaceFormatKHR fmts[64];
+    VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts),
+             "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    /* UNORM, not SRGB: the offscreen target holds the guest's values as-is. */
+    VkSurfaceFormatKHR fmt = fmts[0];
+    if (nf == 1 && fmts[0].format == VK_FORMAT_UNDEFINED) {
+        fmt.format = VK_FORMAT_B8G8R8A8_UNORM;
+    } else {
+        static const VkFormat pref[] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM };
+        int found = 0;
+        for (size_t k = 0; k < 2 && !found; k++)
+            for (u32 i = 0; i < nf; i++)
+                if (fmts[i].format == pref[k]) { fmt = fmts[i]; found = 1; break; }
+    }
+    VkFormatProperties fp;
+    pvkGetPhysicalDeviceFormatProperties(s_vk.phys, fmt.format, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+        VK_LOG("swapchain format %d cannot be a blit destination\n", (int)fmt.format); return -1;
+    }
+
+    VkExtent2D ext = caps.currentExtent;
+    if (ext.width == 0xFFFFFFFFu) {
+        int w = 0, hh = 0;
+        SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &hh);
+        ext.width = (u32)w; ext.height = (u32)hh;
+        if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
+        if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
+        if (ext.width  > caps.maxImageExtent.width)  ext.width  = caps.maxImageExtent.width;
+        if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
+    }
+    if (!ext.width || !ext.height) { VK_LOG("window has no drawable area\n"); return -1; }
+
+    u32 count = caps.minImageCount + 1;
+    if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
+
+    static const VkCompositeAlphaFlagBitsKHR alphas[] = {
+        VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+        VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+    };
+    VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    for (size_t k = 0; k < 4; k++)
+        if (caps.supportedCompositeAlpha & alphas[k]) { alpha = alphas[k]; break; }
+
+    VkSwapchainKHR old = s_vk.swapchain;
+    VkSwapchainCreateInfoKHR sci = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = s_vk.surface, .minImageCount = count,
+        .imageFormat = fmt.format, .imageColorSpace = fmt.colorSpace,
+        .imageExtent = ext, .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .preTransform = caps.currentTransform, .compositeAlpha = alpha,
+        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
+        .clipped = VK_TRUE, .oldSwapchain = old,
+    };
+    VkSwapchainKHR sc = VK_NULL_HANDLE;
+    VkResult r = pvkCreateSwapchainKHR(s_vk.device, &sci, NULL, &sc);
+    if (old) pvkDestroySwapchainKHR(s_vk.device, old, NULL);
+    s_vk.swapchain = VK_NULL_HANDLE;
+    if (r != VK_SUCCESS) { VK_LOG("vkCreateSwapchainKHR failed (VkResult %d)\n", (int)r); return -1; }
+    s_vk.swapchain = sc;
+
+    u32 n = 0;
+    VK_CHECK(pvkGetSwapchainImagesKHR(s_vk.device, sc, &n, NULL), "vkGetSwapchainImagesKHR");
+    if (n == 0 || n > 8) { VK_LOG("unsupported swapchain image count %u\n", n); return -1; }
+    VK_CHECK(pvkGetSwapchainImagesKHR(s_vk.device, sc, &n, s_vk.sc_images), "vkGetSwapchainImagesKHR");
+
+    for (u32 i = 0; i < 8; i++)
+        if (s_vk.sc_done[i]) {
+            pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
+            s_vk.sc_done[i] = VK_NULL_HANDLE;
+        }
+    VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    for (u32 i = 0; i < n; i++)
+        VK_CHECK(pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sc_done[i]), "vkCreateSemaphore");
+
+    s_vk.sc_extent = ext;
+    s_vk.sc_count = n;
+    VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
+    return 0;
+}
+
+static void vk_swapchain_lost(void)
+{
+    pvkDeviceWaitIdle(s_vk.device);
+    if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
+}
+
+/* Blit the offscreen target into the next swapchain image and present it. */
+static void vk_present_window(void)
+{
+    if (!s_vk.windowed || !s_vk.swapchain) return;
+
+    u32 idx = 0;
+    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+                                        s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
+    }
+
+    if (vk_begin()) return;
+    vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageMemoryBarrier b = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = s_vk.sc_images[idx], .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          0, 0, NULL, 0, NULL, 1, &b);
+    VkImageBlit blit = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = { { 0, 0, 0 },
+                        { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
+    };
+    pvkCmdBlitImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
+                    s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1, &blit, VK_FILTER_LINEAR);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = 0;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                          0, 0, NULL, 0, NULL, 1, &b);
+    if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
+
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sem_acquire,
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd,
+        .signalSemaphoreCount = 1, .pSignalSemaphores = &s_vk.sc_done[idx],
+    };
+    pvkResetFences(s_vk.device, 1, &s_vk.fence);
+    if (pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence) != VK_SUCCESS) {
+        VK_LOG("vkQueueSubmit (window) failed\n"); return;
+    }
+    pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
+
+    VkPresentInfoKHR pi = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
+        .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
+    };
+    r = pvkQueuePresentKHR(s_vk.queue, &pi);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
+    else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
+}
+
 static void vk_dump_ppm(const unsigned char* rgba)
 {
     FILE* f = fopen(s_vk.dump_path, "wb");
@@ -904,6 +1215,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
     if (s_vk.dump_path) vk_dump_ppm(px);
+    vk_present_window();
 }
 
 static rsx_backend s_vulkan_backend = {
@@ -921,12 +1233,13 @@ static rsx_backend s_vulkan_backend = {
 /* ---------------------------------------------------------------------------
  * Public entry points
  * -------------------------------------------------------------------------*/
-static int vk_init_all(u32 width, u32 height)
+static int vk_init_all(u32 width, u32 height, const char* title)
 {
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
 
+    vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;
 
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -934,18 +1247,47 @@ static int vk_init_all(u32 width, u32 height)
                               .apiVersion = VK_API_VERSION_1_0 };
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                 .pApplicationInfo = &app };
-    VK_CHECK(pvkCreateInstance(&ci, NULL, &s_vk.instance), "vkCreateInstance");
+    if (s_vk.windowed) {
+        ci.enabledExtensionCount   = s_vk.inst_ext_count;
+        ci.ppEnabledExtensionNames = s_vk.inst_exts;
+    }
+    VkResult ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
+    if (ir != VK_SUCCESS && s_vk.windowed) {
+        vk_window_drop("vkCreateInstance with the surface extensions failed");
+        ci.enabledExtensionCount = 0;
+        ci.ppEnabledExtensionNames = NULL;
+        ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
+    }
+    if (ir != VK_SUCCESS) { VK_LOG("vkCreateInstance failed (VkResult %d)\n", (int)ir); return -1; }
     if (vk_load_instance_functions()) return -1;
-    if (vk_pick_device()) return -1;
+    if (s_vk.windowed) {
+        if (vk_load_wsi_instance_functions()) {
+            vk_window_drop("the driver has no surface functions");
+        } else if (!SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface)) {
+            char why[256];
+            snprintf(why, sizeof why, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+            vk_window_drop(why);
+        }
+    }
+    if (vk_pick_device()) {
+        if (!s_vk.windowed) return -1;
+        vk_window_drop("no device can present to the window");
+        if (vk_pick_device()) return -1;
+    }
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
+    static const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-                               .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
+                               .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
+                               .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
+                               .ppEnabledExtensionNames = s_vk.windowed ? dev_exts : NULL };
     VK_CHECK(pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device), "vkCreateDevice");
     if (vk_load_device_functions()) return -1;
+    if (s_vk.windowed && vk_load_wsi_device_functions())
+        vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -988,13 +1330,20 @@ static int vk_init_all(u32 width, u32 height)
     pvkCmdClearColorImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
     pvkCmdClearDepthStencilImage(s_vk.cmd, s_vk.depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &dr);
     if (vk_submit_and_wait()) return -1;
+
+    if (s_vk.windowed) {
+        VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
+            vk_create_swapchain())
+            vk_window_drop("the swapchain could not be created");
+    }
     return 0;
 }
 
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_vk, 0, sizeof s_vk);
-    if (vk_init_all(width, height)) {
+    if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();
         return -1;
     }
@@ -1007,8 +1356,18 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 void rsx_vulkan_backend_shutdown(void)
 {
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
+    if (s_vk.windowed && s_vk.swapchain && s_vk.presented && s_vk.hold_seconds > 0.0) {
+        VK_LOG("holding the last frame on screen for %.1f s "
+               "(Esc or closing the window ends it early)\n", s_vk.hold_seconds);
+        const Uint32 end = SDL_GetTicks() + (Uint32)(s_vk.hold_seconds * 1000.0);
+        while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
+            if (rsx_vulkan_backend_pump_messages() != 0) break;
+            vk_present_window();         /* FIFO: paced by the display */
+        }
+    }
+    if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
-        pvkDeviceWaitIdle(s_vk.device);
+        if (pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
         if (s_vk.pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_vk.pipe_layout, NULL);
@@ -1034,7 +1393,17 @@ void rsx_vulkan_backend_shutdown(void)
     memset(&s_vk, 0, sizeof s_vk);
 }
 
-int rsx_vulkan_backend_pump_messages(void) { return 0; }
+int rsx_vulkan_backend_pump_messages(void)
+{
+    if (!s_vk.windowed) return 0;
+    int quit = 0;
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT) quit = 1;
+        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+    }
+    return quit ? -1 : 0;
+}
 
 void rsx_vulkan_backend_present(void) { vk_cb_present(&s_vk, 0); }
 

@@ -8,8 +8,11 @@
  * Stage V1 (this file): offscreen colour + depth targets, NV4097 CLEAR_SURFACE
  * (colour and depth), the fallback draw path (the headless null backend's
  * contract: flat colour, depth test, texture unit 0, point sampling), and
- * present with a CPU readback of the frame. Every ps3recomp_host scene passes
- * on it. No window yet, no guest shaders yet -- those are the next stages.
+ * present with a CPU readback of the frame. Every fixed-function
+ * ps3recomp_host scene passes on it; the scenes that need the guest's own
+ * programs (--shader, --mip, --rtt, --depthtex, --mrt, --mrt-a) report that
+ * and are skipped, as on the null backend. Stage V2 adds an optional window
+ * (below). Guest programs are next.
  *
  * Vulkan is loaded at run time (dlopen of libvulkan.so.1), not linked, so:
  *   - building needs only the Vulkan headers, not a target-arch libvulkan
@@ -24,6 +27,14 @@
  *                             order) instead of the first non-CPU device.
  *   PS3RECOMP_VK_DUMP=<path>  write every presented frame to <path> as a
  *                             binary PPM (overwritten each present).
+ *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2
+ *                             window. Rendering and readback are unchanged, so
+ *                             every test gives the same result with or without
+ *                             it; if the window cannot be opened the run
+ *                             continues headless and says why.
+ *   PS3RECOMP_VK_FULLSCREEN=1 with a window: borderless full screen.
+ *   PS3RECOMP_VK_HOLD=<sec>   with a window: keep the last frame on screen
+ *                             this long before shutdown closes it.
  */
 
 #ifndef PS3RECOMP_RSX_VULKAN_BACKEND_H
@@ -43,7 +54,8 @@ int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 /* Unregister and destroy every Vulkan object, then unload the library. */
 void rsx_vulkan_backend_shutdown(void);
 
-/* No window at V0, so no event queue: always 0. */
+/* Headless: always 0. Windowed: drains SDL's event queue; -1 once the
+ * window has been closed or Esc pressed. */
 int  rsx_vulkan_backend_pump_messages(void);
 
 /* Read the frame back to host memory (and to PS3RECOMP_VK_DUMP if set). */
