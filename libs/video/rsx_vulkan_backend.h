@@ -5,10 +5,11 @@
  * entry points and test hooks as the Metal and headless null backends, so
  * runtime/host/host_posix.c drives it unchanged.
  *
- * Stage V0 (this file): offscreen colour target, NV4097 CLEAR_SURFACE, present
- * with a CPU readback of the frame. No window, no draws yet -- those are the
- * next stages. It already runs the harness's default clear/flip check on a real
- * GPU, which is the point: every later stage is testable the same way.
+ * Stage V1 (this file): offscreen colour + depth targets, NV4097 CLEAR_SURFACE
+ * (colour and depth), the fallback draw path (the headless null backend's
+ * contract: flat colour, depth test, texture unit 0, point sampling), and
+ * present with a CPU readback of the frame. Every ps3recomp_host scene passes
+ * on it. No window yet, no guest shaders yet -- those are the next stages.
  *
  * Vulkan is loaded at run time (dlopen of libvulkan.so.1), not linked, so:
  *   - building needs only the Vulkan headers, not a target-arch libvulkan
