@@ -37,6 +37,11 @@ typedef struct {
     u32      fps;
 
     int      window_closed;
+
+    /* Title-bar stats: base caption, and frames/time at the last refresh. */
+    char     title[128];
+    u64      title_frames;
+    ULONGLONG title_time;
 } NullBackendState;
 
 static NullBackendState s_state;
@@ -261,6 +266,8 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
 
     s_state.hdc = GetDC(s_state.hwnd);
     s_state.last_fps_time = GetTickCount64();
+    snprintf(s_state.title, sizeof(s_state.title), "%s", title ? title : "ps3recomp");
+    s_state.title_time = s_state.last_fps_time;
 
     /* Keep the display awake, as any PC game does. With the monitor asleep a
      * vsync'd Present crawls (~4 fps); guest frames stretch to 250 ms and GH3's
@@ -295,6 +302,25 @@ int rsx_null_backend_pump_messages(void)
             return -1;
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
+    }
+    /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
+     * live-draw frame, window size. Here on the window's own thread, so the
+     * WM_SETTEXT never blocks the renderer. */
+    ULONGLONG now = GetTickCount64();
+    if (s_state.hwnd && now - s_state.title_time >= 1000) {
+        extern u32 rsx_live_draw_get_last_draws(void);
+        extern double rsx_live_draw_get_present_fps(void);
+        /* Live draw owns presentation (and end_frame never runs) when enabled. */
+        double fps = rsx_live_draw_get_present_fps();
+        if (fps <= 0.0)
+            fps = (s_state.frame_count - s_state.title_frames) * 1000.0 /
+                  (double)(now - s_state.title_time);
+        char tb[256];
+        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u", s_state.title, fps,
+                 rsx_live_draw_get_last_draws(), s_state.width, s_state.height);
+        SetWindowTextA(s_state.hwnd, tb);
+        s_state.title_frames = s_state.frame_count;
+        s_state.title_time = now;
     }
     return s_state.window_closed ? -1 : 0;
 }
