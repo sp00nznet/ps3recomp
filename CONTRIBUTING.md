@@ -237,6 +237,23 @@ For feature requests, describe the use case — which game needs it and why.
 
 ps3recomp is [MIT licensed](LICENSE). By contributing, you agree that your contributions will be licensed under the same terms.
 
+### Where your code comes from
+
+Contributions must be your own work, or come from a source whose licence is
+compatible with MIT (MIT, BSD, zlib, Apache-2.0, public domain). Specifically:
+
+- **Don't port code from GPL projects.** RPCS3 is GPL-2.0, and so are many
+  other emulators. Comparing behaviour against RPCS3 is encouraged (see above);
+  copying or translating its code into ps3recomp is not, even rewritten line by
+  line. Reading it to understand what a syscall or HLE module does is fine;
+  carrying its code or structure across is not. A fix you saw there is best
+  submitted as a description of the behaviour, and we'll write it fresh.
+- **If something came from elsewhere, say so in the PR**, with a link, and
+  keep any copyright header. A licence problem found at review costs a
+  comment; one found after release means untangling history.
+- The same applies to AI-assisted code: if it looks like it reproduces an
+  existing project, check where it came from before submitting it.
+
 ## Questions?
 
 Open a [GitHub Discussion](https://github.com/sp00nznet/ps3recomp/discussions) or file an issue. We're a small community but we're responsive.
