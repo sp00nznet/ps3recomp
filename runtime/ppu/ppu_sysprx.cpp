@@ -534,6 +534,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
  * every receive/poll would-block. errno lives in a guest scratch cell since
  * _sys_net_errno_loc returns a POINTER the game dereferences. */
 #define SYS_NET_EWOULDBLOCK_V 35
+extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
 {
@@ -856,6 +857,10 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
     ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
 
+    /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
+     * first because the first registration of a NID wins, so these shadow the
+     * offline model below; without the variable nothing changes. */
+    if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(gcm_guest_alloc);
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
      * sys_net NID LBP imports so none fall to the unresolved-NID default. */
     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);

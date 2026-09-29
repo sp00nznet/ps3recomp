@@ -24,18 +24,27 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * PS3 network error codes
  * -----------------------------------------------------------------------*/
-#define SYS_NET_ERROR_BASE          0x80410100
-#define SYS_NET_EWOULDBLOCK         (SYS_NET_ERROR_BASE | 0x03)
-#define SYS_NET_EINPROGRESS         (SYS_NET_ERROR_BASE | 0x06)
-#define SYS_NET_EALREADY            (SYS_NET_ERROR_BASE | 0x07)
-#define SYS_NET_ENOTCONN            (SYS_NET_ERROR_BASE | 0x0B)
-#define SYS_NET_ECONNREFUSED        (SYS_NET_ERROR_BASE | 0x13)
-#define SYS_NET_ETIMEDOUT           (SYS_NET_ERROR_BASE | 0x16)
-#define SYS_NET_ECONNRESET          (SYS_NET_ERROR_BASE | 0x15)
-#define SYS_NET_ECONNABORTED        (SYS_NET_ERROR_BASE | 0x14)
-#define SYS_NET_ENOMEM              (SYS_NET_ERROR_BASE | 0x23)
-#define SYS_NET_EBADF               (SYS_NET_ERROR_BASE | 0x27)
-#define SYS_NET_EINVAL              (SYS_NET_ERROR_BASE | 0x28)
+/* sys_net_errno values. libnet is a BSD stack: a failing call returns -1 and
+ * leaves a plain BSD errno in the cell _sys_net_errno_loc points at -- not a
+ * 0x8041xxxx CELL code. LBP's recvfrom drain loop waits for exactly 35. */
+#define SYS_NET_EBADF               9
+#define SYS_NET_ENOMEM              12
+#define SYS_NET_EINVAL              22
+#define SYS_NET_EWOULDBLOCK         35
+#define SYS_NET_EINPROGRESS         36
+#define SYS_NET_EALREADY            37
+#define SYS_NET_ENOTSOCK            38
+#define SYS_NET_EMSGSIZE            40
+#define SYS_NET_EADDRINUSE          48
+#define SYS_NET_EADDRNOTAVAIL       49
+#define SYS_NET_ENETUNREACH         51
+#define SYS_NET_ECONNABORTED        53
+#define SYS_NET_ECONNRESET          54
+#define SYS_NET_EISCONN             56
+#define SYS_NET_ENOTCONN            57
+#define SYS_NET_ETIMEDOUT           60
+#define SYS_NET_ECONNREFUSED        61
+#define SYS_NET_EHOSTUNREACH        65
 
 /* PS3 address families */
 #define SYS_NET_AF_INET             2
@@ -120,6 +129,9 @@ typedef struct sys_net_hostent {
  * API functions (matching PS3 NID exports from sys_net)
  * -----------------------------------------------------------------------*/
 
+/* Pointer parameters are GUEST addresses (the HLE adapter passes r3..r10
+ * through untouched); every function translates them itself. */
+
 /* Network init/shutdown */
 int32_t sys_net_initialize_network_ex(void* param);
 int32_t sys_net_finalize_network(void);
@@ -145,19 +157,29 @@ int32_t sys_net_bnet_setsockopt(int32_t s, int32_t level, int32_t optname,
 int32_t sys_net_bnet_getsockopt(int32_t s, int32_t level, int32_t optname,
                                 void* optval, uint32_t* optlen);
 int32_t sys_net_bnet_getsockname(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen);
+int32_t sys_net_bnet_getpeername(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen);
 
 /* I/O multiplexing */
 int32_t sys_net_bnet_poll(sys_net_pollfd* fds, uint32_t nfds, int32_t timeout_ms);
 int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
                             void* exceptfds, void* timeout);
 
-/* DNS */
-int32_t sys_net_bnet_inet_aton(const char* cp, uint32_t* inp);
-/* gethostbyname returns a guest pointer to a static hostent */
+/* Address helpers and DNS. inet_addr returns the address the way the guest
+ * reads it from a register (a.b.c.d -> 0xAABBCCDD); the pointer-returning
+ * calls return guest addresses of module-owned scratch. */
+int32_t  sys_net_bnet_inet_aton(const char* cp, uint32_t* inp);
+uint32_t sys_net_bnet_inet_addr(const char* cp);
+uint32_t sys_net_bnet_inet_ntoa(uint32_t addr);
 uint32_t sys_net_bnet_gethostbyname(const char* name);
 
-/* Thread-local errno */
-int32_t* sys_net_errno_loc(void);
+/* Guest address of the errno cell. */
+uint32_t sys_net_errno_loc(void);
+
+/* Register the host-socket handlers under libnet's real export NIDs. Called
+ * from ppu_sysprx_register() when PS3_NET_ONLINE is set, BEFORE the offline
+ * model registers -- the first registration of a NID wins. guest_alloc gives
+ * the scratch the guest must read (errno, hostent, inet_ntoa's string). */
+void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsigned int align));
 
 #ifdef __cplusplus
 }

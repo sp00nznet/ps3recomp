@@ -160,25 +160,24 @@ pthread_setschedparam(thread, SCHED_OTHER, &param);
 | **Non-blocking** | `ioctlsocket(fd, FIONBIO, &mode)` | `fcntl(fd, F_SETFL, O_NONBLOCK)` |
 | **Poll** | `WSAPoll()` | `poll()` |
 
+### Offline by default, host sockets with `PS3_NET_ONLINE`
+
+Without `PS3_NET_ONLINE`, every libnet import is answered by the offline model in
+`runtime/ppu/ppu_sysprx.cpp`: receives and polls would-block, sends vanish, DNS
+fails. With it set, `ps3_net_host_register()` (`libs/network/sysNet.c`) registers
+real host-socket handlers under libnet's export NIDs (`socket`, `sendto`,
+`socketpoll`, `socketselect`, `_sys_net_errno_loc`, ...) ahead of the offline
+ones; the first registration of a NID wins.
+
+`libs/network/tests/test_sys_net.c` drives every handler through its NID over
+loopback, and runs in CI on all three platforms.
+
 ### Error Code Translation
 
-Winsock errors are translated to PS3 errno values:
-
-```c
-static int winsock_to_ps3_errno(int wsa_err)
-{
-    switch (wsa_err) {
-    case WSAEWOULDBLOCK:   return SYS_NET_EWOULDBLOCK;
-    case WSAECONNREFUSED:  return SYS_NET_ECONNREFUSED;
-    case WSAETIMEDOUT:     return SYS_NET_ETIMEDOUT;
-    case WSAEINPROGRESS:   return SYS_NET_EINPROGRESS;
-    case WSAEALREADY:      return SYS_NET_EALREADY;
-    case WSAECONNRESET:    return SYS_NET_ECONNRESET;
-    // ... more mappings
-    default:               return SYS_NET_EINVAL;
-    }
-}
-```
+libnet is a BSD stack: a failing call returns -1 and leaves a plain BSD errno
+(35 = `EWOULDBLOCK`) in the cell `_sys_net_errno_loc` returns. Winsock's
+`WSAE*` codes are the BSD value plus 10000, so Windows translates by
+subtraction; Linux errno numbers differ and go through a table.
 
 ### DNS Resolution
 
@@ -186,15 +185,11 @@ Both platforms use `getaddrinfo()` for DNS resolution (Winsock2 and POSIX both s
 
 ### Socket Address Handling
 
-PS3 uses big-endian `sockaddr_in`. The conversion:
-
-```c
-// PS3 sockaddr → host sockaddr
-struct sockaddr_in host_addr;
-host_addr.sin_family = AF_INET;
-host_addr.sin_port = ps3_addr->sin_port;      // Already in network byte order
-host_addr.sin_addr.s_addr = ps3_addr->sin_addr; // Already in network byte order
-```
+Pointer arguments are guest addresses. `sockaddr_in` needs no byte swap: its
+port and address are already in network order in guest memory, so the bytes
+copy straight into the host struct. Everything else the guest reads back -
+pollfd events, fd_set words, option values, `socklen_t` - is big-endian and
+goes through `vm_read*`/`vm_write*`.
 
 ---
 

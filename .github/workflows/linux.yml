@@ -105,6 +105,13 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
+      # handler is called through the NID it registered under.
+      - name: Run the sys_net loopback test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
+          /tmp/test_sys_net
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler

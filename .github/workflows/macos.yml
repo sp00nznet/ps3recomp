@@ -79,6 +79,13 @@ jobs:
                 -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
+      # handler is called through the NID it registered under.
+      - name: Run the sys_net loopback test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
+          /tmp/test_sys_net
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge
