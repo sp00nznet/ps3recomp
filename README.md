@@ -50,7 +50,7 @@ same as running a game, and only one row claims that.
 |---|---|---|---|
 | Runtime library builds | yes | yes | yes |
 | Lifter + 8 test suites | yes | yes | yes |
-| Render backend | D3D12 | Metal | null (headless software) |
+| Render backend | D3D12 | Metal | null (headless software); Vulkan opt-in, early |
 | Runs a recompiled game | **yes** | **no** | no |
 
 The gap on macOS is the PPU boot scaffold — `ppu_loader.cpp`, `boot_main.cpp`
@@ -95,9 +95,11 @@ longer has to reimplement them to draw anything.
   through the decompiler, then textures. `ps3recomp_host` already drives
   cellGcm → RSX → Metal with no lifted game, so each step is testable before a
   title exists to run.
-- **Linux** has no renderer at all — the headless backend is a CPU triangle
-  filler for CI, deliberately. Vulkan is the obvious target, and it starts from
-  the same neutral draw record Metal reads.
+- **Linux** has an early, opt-in Vulkan backend (`-DPS3RECOMP_RSX_VULKAN=ON`):
+  clears, the fixed-function fallback draw path, depth, one texture unit and an
+  optional window. It does not translate guest programs yet, so the
+  `ps3recomp_host` modes that need them are skipped on it. The default is still
+  the headless backend, a CPU triangle filler for CI, deliberately.
 
 **Deliberately not claimed:** the table above says "no" for running a game on
 macOS and Linux, and it will keep saying "no" until a title actually boots to

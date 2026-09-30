@@ -129,6 +129,7 @@ cmake --install build --prefix /usr/local
 | CMake Option | Default | Description |
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
+| `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
 
@@ -200,14 +201,16 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 ## Graphics Backends
 
-**There is no CMake option for the renderer.** Everything under `libs/video/` is
-compiled into `ps3recomp_runtime`, and the backend is selected by host platform:
+Everything under `libs/video/` is compiled into `ps3recomp_runtime` and the
+backend is selected by host platform. The one exception is the Vulkan backend,
+which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
 
 | Host | Backend | Source | Status |
 |------|---------|--------|--------|
 | Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
-| Linux | null / headless software | `libs/video/` null path | No hardware backend yet. The guest command stream is executed and validated, but nothing is presented to a window. |
+| Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
+| Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Early: clears, the fixed-function fallback draw path (the null backend's contract), depth, texture unit 0 and an optional window. No guest programs yet. See below. |
 
 So on Windows a plain `cmake --build` already gives you the working renderer --
 there is nothing to switch on. If you are bringing up a port and want frames on
@@ -223,6 +226,35 @@ backend gets brought up and regression-tested before any title exists:
 cmake --build build --target ps3recomp_host
 ./build/ps3recomp_host
 ```
+
+### The Vulkan backend (Linux, opt-in)
+
+```bash
+# Headers only -- Debian/Ubuntu: libvulkan-dev, Fedora: vulkan-headers
+cmake -S . -B build -G Ninja -DPS3RECOMP_RSX_VULKAN=ON
+cmake --build build --target ps3recomp_host
+./build/ps3recomp_host --draw
+```
+
+`libvulkan` is loaded at run time, so building needs only the headers, which
+also keeps cross-compiling for aarch64 simple (point
+`-DPS3RECOMP_VULKAN_INCLUDE_DIR=` at them if the cross sysroot has none). Only
+Vulkan 1.0 entry points are used; it has been run on Mesa's lavapipe and on
+NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
+
+| Environment variable | Effect |
+|---|---|
+| `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
+| `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
+| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
+| `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
+| `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
+
+Without a GPU, Mesa's lavapipe runs every check, e.g.
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./build/ps3recomp_host --tex`
+(the ICD file name varies by distribution). The modes that need guest programs
+(`--shader`, `--mip`, `--rtt`, `--depthtex`, `--mrt`, `--mrt-a`) report that
+and are skipped, as on the null backend.
 
 ### `RSX_LIVE_DRAW` is not required
 
