@@ -24,9 +24,10 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * PS3 network error codes
  * -----------------------------------------------------------------------*/
-/* sys_net_errno values. libnet is a BSD stack: a failing call returns -1 and
- * leaves a plain BSD errno in the cell _sys_net_errno_loc points at -- not a
- * 0x8041xxxx CELL code. LBP's recvfrom drain loop waits for exactly 35. */
+/* sys_net_errno values: plain BSD numbers (35 = EWOULDBLOCK), left in the
+ * cell _sys_net_errno_loc points at. A failing call also returns them in-band
+ * as 0x80010200 | errno (0x80010223 for EWOULDBLOCK), which titles compare
+ * against directly. */
 #define SYS_NET_EBADF               9
 #define SYS_NET_ENOMEM              12
 #define SYS_NET_EINVAL              22

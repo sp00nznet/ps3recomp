@@ -434,14 +434,46 @@ static uint32_t vm_read_be32(uint32_t guest_addr)
  * touching the out-param, so the caller (an LBP 1.30 boot job) read heap
  * garbage. Fill it — zeros, matching RPCS3's default unconfigured console_psid —
  * and return CELL_OK. */
+/* Online, every player needs their own: titles use it to tell consoles apart.
+ * Simpsons Arcade hashes it into the key each player announces when joining a
+ * match, and with every console at zero the host took the joining player for
+ * itself and never gave them a slot. PS3_OPEN_PSID=<32 hex digits> sets it;
+ * otherwise the player's name derives one (np_psnr_identity: --username,
+ * PS3_NP_ONLINE_ID, or the OS login when online); otherwise it stays zero, so
+ * offline saves keyed on it are untouched. */
+extern const char* np_psnr_identity(void);   /* libs/network/np_psnr.c */
+static void open_psid(uint32_t w[4])
+{
+    const char* e = getenv("PS3_OPEN_PSID");
+    const char* id = np_psnr_identity();
+    w[0] = w[1] = w[2] = w[3] = 0;
+    if (e && strlen(e) >= 32) {
+        for (int i = 0; i < 4; i++) {
+            char part[9];
+            memcpy(part, e + i * 8, 8);
+            part[8] = 0;
+            w[i] = (uint32_t)strtoul(part, NULL, 16);
+        }
+    } else if (id && *id) {
+        uint32_t h = 2166136261u;   /* FNV-1a, re-seeded per word */
+        for (int i = 0; i < 4; i++) {
+            for (const char* p = id; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+            w[i] = h;
+            h ^= 0x9E3779B9u;
+        }
+    }
+}
+
 static int64_t sys_ss_get_open_psid_handler(ppu_context* ctx)
 {
     uint32_t ptr = (uint32_t)ctx->gpr[3];
     if (ptr) {
-        vm_write_be32(ptr + 0,  0);   /* high[63:32] */
-        vm_write_be32(ptr + 4,  0);   /* high[31:0]  */
-        vm_write_be32(ptr + 8,  0);   /* low[63:32]  */
-        vm_write_be32(ptr + 12, 0);   /* low[31:0]   */
+        uint32_t w[4];
+        open_psid(w);
+        vm_write_be32(ptr + 0,  w[0]);   /* high[63:32] */
+        vm_write_be32(ptr + 4,  w[1]);   /* high[31:0]  */
+        vm_write_be32(ptr + 8,  w[2]);   /* low[63:32]  */
+        vm_write_be32(ptr + 12, w[3]);   /* low[31:0]   */
     }
     ctx->gpr[3] = 0;   /* CELL_OK */
     return 0;

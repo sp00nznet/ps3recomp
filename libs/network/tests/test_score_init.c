@@ -14,6 +14,10 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+/* sceNp.c reports ONLINE and queues its manager callback through these. */
+int np_psnr_enabled(void) { return 0; }
+const char* np_psnr_online_id(void) { return "PS3Player"; }
+s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]) { (void)opd; (void)args; return 0; }
 int main(void)
 {
     vm_base = calloc(1, 65536);

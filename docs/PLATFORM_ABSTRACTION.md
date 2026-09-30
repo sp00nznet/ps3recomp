@@ -174,8 +174,11 @@ loopback, and runs in CI on all three platforms.
 
 ### Error Code Translation
 
-libnet is a BSD stack: a failing call returns -1 and leaves a plain BSD errno
-(35 = `EWOULDBLOCK`) in the cell `_sys_net_errno_loc` returns. Winsock's
+A failing call returns `0x80010200 | errno` (0x80010223 for `EWOULDBLOCK`) and
+leaves the plain BSD errno (35) in the cell `_sys_net_errno_loc` returns.
+Titles compare the return value itself: Simpsons Arcade's connect wrapper waits
+for 0x80010224 (`EINPROGRESS`) and treated a plain -1 as a failure it never
+retried. Winsock's
 `WSAE*` codes are the BSD value plus 10000, so Windows translates by
 subtraction; Linux errno numbers differ and go through a table.
 

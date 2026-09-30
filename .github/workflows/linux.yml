@@ -112,6 +112,27 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
           /tmp/test_sys_net
 
+      # Matching2 over psnr without a server: response relocation, attribute
+      # packing, and the room structs a title reads.
+      - name: Run the Matching2 test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
+          /tmp/test_np_matching2
+
+      # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
+      # and PSN's online ID rules.
+      - name: Run the player-name test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
+          /tmp/test_np_identity
+
+      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+      # packets before the title sees them, punching toward peers.
+      - name: Run the NAT traversal test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
+          /tmp/test_np_nat
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler

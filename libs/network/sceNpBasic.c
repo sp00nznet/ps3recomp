@@ -101,11 +101,11 @@ s32 sceNpBasicUnregisterHandler(void)
     return CELL_OK;
 }
 
+/* The list counts answer without sceNpBasicInit: titles built on libsceNp2
+ * never call it (NP init brings Basic up), and Simpsons Arcade asks whether a
+ * joining player is on its block list -- an error there reads as "unknown". */
 s32 sceNpBasicGetFriendListEntryCount(u32* count)
 {
-    if (!s_initialized)
-        return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
-
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
@@ -218,9 +218,6 @@ s32 sceNpBasicRecvInGameInvitation(void* data, u32 dataMaxSize,
 
 s32 sceNpBasicGetBlockListEntryCount(u32* count)
 {
-    if (!s_initialized)
-        return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
-
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
@@ -238,5 +235,28 @@ s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     /* No-op in offline mode */
+    return CELL_OK;
+}
+
+/* Players met online, and the context-sensitive (XMB) handler: nothing is
+ * recorded, the history is empty, the handler is accepted and never fires. */
+s32 sceNpBasicGetPlayersHistoryEntryCount(u32 options, u32* count)
+{
+    (void)options;
+    if (!count) return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
+    vm_write32((u32)(uintptr_t)count, 0);
+    return CELL_OK;
+}
+
+s32 sceNpBasicAddPlayersHistoryAsync(const void* npids, u32 count, const void* description, u32* reqId)
+{
+    (void)npids; (void)count; (void)description;
+    if (reqId) vm_write32((u32)(uintptr_t)reqId, 1);
+    return CELL_OK;
+}
+
+s32 sceNpBasicRegisterContextSensitiveHandler(const void* context, void* handler, void* arg)
+{
+    (void)context; (void)handler; (void)arg;
     return CELL_OK;
 }

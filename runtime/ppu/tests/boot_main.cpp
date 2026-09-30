@@ -252,6 +252,7 @@ static void derive_vfs_root(const char* eboot)
 extern "C" uint8_t* vm_base = nullptr;
 extern "C" uint32_t ppu_vm_size;   /* defined in ppu_loader.cpp (OOB guard) */
 extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
+extern "C" void np_psnr_setup(const char* username, const char* server);  /* libs/network/np_psnr.c */
 
 /* Guest-callback dispatch + RSX vblank/flip driver.
  *
@@ -1084,7 +1085,24 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) { printf("usage: %s <PPU ELF>\n", argv[0]); return 2; }
+    /* <PPU ELF> [--username NAME] [--psnr host[:port]], flags in any order. */
+    const char* elf = NULL;
+    const char* username = NULL;
+    const char* psnr = NULL;
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        const char** flag = !strncmp(a, "--username", 10) ? &username
+                          : !strncmp(a, "--psnr", 6)      ? &psnr : NULL;
+        if (!flag) { if (!elf) elf = a; continue; }
+        const char* eq = strchr(a, '=');
+        if (eq) *flag = eq + 1;
+        else if (i + 1 < argc) *flag = argv[++i];
+    }
+    if (!elf) {
+        printf("usage: %s <PPU ELF> [--username NAME] [--psnr host[:port]]\n", argv[0]);
+        return 2;
+    }
+    np_psnr_setup(username, psnr);
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
@@ -1126,10 +1144,10 @@ int main(int argc, char** argv)
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
 
-    uint32_t entry = ppu_load_elf(argv[1]);
+    uint32_t entry = ppu_load_elf(elf);
     if (!entry) { printf("load failed\n"); return 1; }
 
-    derive_vfs_root(argv[1]);
+    derive_vfs_root(elf);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
 
     /* Real title id, from the game's own PARAM.SFO. cellGame has been able to

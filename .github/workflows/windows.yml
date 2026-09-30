@@ -110,6 +110,33 @@ jobs:
           .\test_sys_net.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # Matching2 over psnr without a server: response relocation, attribute
+      # packing, and the room structs a title reads.
+      - name: Run the Matching2 test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_matching2.exe libs/network/tests/test_np_matching2.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_matching2.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
+      # and PSN's online ID rules.
+      - name: Run the player-name test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_identity.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+      # packets before the title sees them, punching toward peers.
+      - name: Run the NAT traversal test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_nat.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
       # sync_stress has always been the Windows-native suite; now that its

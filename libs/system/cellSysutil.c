@@ -204,6 +204,9 @@ s32 cellSysutilCheckCallback(void)
      * its dismissal. Done before the drain so the callback it queues is
      * delivered on this same poll. */
     { extern void cellMsgDialog_tick(void); cellMsgDialog_tick(); }
+    /* Turn psnr replies and pushes into queued NP callbacks first, so this
+     * same poll delivers them. A no-op when no psnr server is configured. */
+    { extern void np_psnr_pump(void); np_psnr_pump(); }
     drain_guest_completions();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll

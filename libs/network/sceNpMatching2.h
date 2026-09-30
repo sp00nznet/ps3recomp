@@ -1,8 +1,11 @@
 /*
  * ps3recomp - sceNpMatching2 HLE
  *
- * Online matchmaking: lobbies, rooms, signaling, and session management.
- * Offline stub — returns server unavailable for all operations.
+ * Rooms over a psnr server (np_psnr.h). Offline -- no PSNR_SERVER -- every
+ * server request fails with SERVER_NOT_AVAILABLE, as before.
+ *
+ * Pointer parameters are guest addresses, passed as u32. Structure layouts
+ * are the SDK ABI; see the offset comments in sceNpMatching2.c.
  */
 
 #ifndef PS3RECOMP_SCE_NP_MATCHING2_H
@@ -15,100 +18,81 @@
 extern "C" {
 #endif
 
-/* ---------------------------------------------------------------------------
- * Error codes
- * -----------------------------------------------------------------------*/
 #define SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED       0x80022C01
 #define SCE_NP_MATCHING2_ERROR_ALREADY_INITIALIZED   0x80022C02
 #define SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT      0x80022C03
 #define SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY         0x80022C04
-#define SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE   0x80022C05
+#define SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE  0x80022C05
 #define SCE_NP_MATCHING2_ERROR_NOT_CONNECTED         0x80022C06
 #define SCE_NP_MATCHING2_ERROR_CONTEXT_NOT_FOUND     0x80022C07
+#define SCE_NP_MATCHING2_ERROR_EVENT_DATA_NOT_FOUND  0x80022C08
 
-/* ---------------------------------------------------------------------------
- * Constants
- * -----------------------------------------------------------------------*/
-#define SCE_NP_MATCHING2_CTX_MAX         8
-#define SCE_NP_MATCHING2_LOBBY_MAX       16
-#define SCE_NP_MATCHING2_ROOM_MAX        16
+/* Server-side errors delivered in callbacks. */
+#define SCE_NP_MATCHING2_SERVER_ERROR_BAD_REQUEST    0x80022B01
+#define SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM   0x80022B13
+#define SCE_NP_MATCHING2_SERVER_ERROR_ROOM_FULL      0x80022B19
+#define SCE_NP_MATCHING2_SERVER_ERROR_FORBIDDEN      0x80022B07
 
-/* Callback event types */
-#define SCE_NP_MATCHING2_EVENT_SignalingOptParam    1
-#define SCE_NP_MATCHING2_EVENT_RoomMessage          2
-#define SCE_NP_MATCHING2_EVENT_RoomMemberUpdate     3
-#define SCE_NP_MATCHING2_EVENT_LobbyMessage         4
+#define SCE_NP_MATCHING2_CTX_MAX 8
 
-/* ---------------------------------------------------------------------------
- * Types
- * -----------------------------------------------------------------------*/
-typedef u16 SceNpMatching2CtxId;
+typedef u16 SceNpMatching2ContextId;
 typedef u32 SceNpMatching2RequestId;
 typedef u64 SceNpMatching2RoomId;
-typedef u64 SceNpMatching2LobbyId;
-
-typedef void (*SceNpMatching2RequestCallback)(SceNpMatching2CtxId ctxId,
-                                                SceNpMatching2RequestId reqId,
-                                                u16 event, s32 errorCode,
-                                                const void* data, void* arg);
-
-typedef void (*SceNpMatching2SignalingCallback)(SceNpMatching2CtxId ctxId,
-                                                  SceNpMatching2RoomId roomId,
-                                                  u16 event,
-                                                  s32 errorCode,
-                                                  const void* data, void* arg);
-
-/* ---------------------------------------------------------------------------
- * Functions
- * -----------------------------------------------------------------------*/
 
 /* Lifecycle */
+s32 sceNp2Init(u32 poolSize, u32 pool);
+s32 sceNp2Term(void);
 s32 sceNpMatching2Init(u32 poolSize, s32 threadPriority, s32 threadStackSize);
+s32 sceNpMatching2Init2(u32 stackSize, s32 priority, u32 param);
 s32 sceNpMatching2Term(void);
+s32 sceNpMatching2Term2(void);
 
-/* Context management */
-s32 sceNpMatching2CreateContext(const void* npId, const void* commId,
-                                  u32 passPhrase, SceNpMatching2CtxId* ctxId);
-s32 sceNpMatching2DestroyContext(SceNpMatching2CtxId ctxId);
-s32 sceNpMatching2ContextStart(SceNpMatching2CtxId ctxId);
-s32 sceNpMatching2ContextStop(SceNpMatching2CtxId ctxId);
+/* Contexts */
+s32 sceNpMatching2CreateContext(u32 npId, u32 commId, u32 passPhrase, u32 ctxId, s32 option);
+s32 sceNpMatching2DestroyContext(u16 ctxId);
+s32 sceNpMatching2ContextStart(u16 ctxId);
+s32 sceNpMatching2ContextStartAsync(u16 ctxId, u32 timeout);
+s32 sceNpMatching2ContextStop(u16 ctxId);
+s32 sceNpMatching2ContextStopAsync(u16 ctxId, u32 timeout);
+s32 sceNpMatching2SetDefaultRequestOptParam(u16 ctxId, u32 optParam);
 
 /* Callbacks */
-s32 sceNpMatching2RegisterSignalingCallback(SceNpMatching2CtxId ctxId,
-                                              SceNpMatching2SignalingCallback cb,
-                                              void* arg);
-s32 sceNpMatching2RegisterRoomEventCallback(SceNpMatching2CtxId ctxId,
-                                              SceNpMatching2RequestCallback cb,
-                                              void* arg);
+s32 sceNpMatching2RegisterContextCallback(u16 ctxId, u32 cb, u32 arg);
+s32 sceNpMatching2RegisterRoomEventCallback(u16 ctxId, u32 cb, u32 arg);
+s32 sceNpMatching2RegisterRoomMessageCallback(u16 ctxId, u32 cb, u32 arg);
+s32 sceNpMatching2RegisterSignalingCallback(u16 ctxId, u32 cb, u32 arg);
+s32 sceNpMatching2RegisterLobbyEventCallback(u16 ctxId, u32 cb, u32 arg);
+s32 sceNpMatching2RegisterLobbyMessageCallback(u16 ctxId, u32 cb, u32 arg);
 
-/* Lobby operations */
-s32 sceNpMatching2SearchLobby(SceNpMatching2CtxId ctxId,
-                                const void* optParam,
-                                SceNpMatching2RequestId* reqId);
-s32 sceNpMatching2JoinLobby(SceNpMatching2CtxId ctxId,
-                              SceNpMatching2LobbyId lobbyId,
-                              const void* optParam,
-                              SceNpMatching2RequestId* reqId);
-s32 sceNpMatching2LeaveLobby(SceNpMatching2CtxId ctxId,
-                               SceNpMatching2RequestId* reqId);
+/* Server and world (one of each, answered locally) */
+s32 sceNpMatching2GetServerIdListLocal(u16 ctxId, u32 serverId, u32 maxNum);
+s32 sceNpMatching2GetServerInfo(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2CreateServerContext(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2DeleteServerContext(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2GetWorldInfoList(u16 ctxId, u32 req, u32 opt, u32 reqId);
 
-/* Room operations */
-s32 sceNpMatching2CreateRoom(SceNpMatching2CtxId ctxId,
-                               const void* optParam,
-                               SceNpMatching2RequestId* reqId);
-s32 sceNpMatching2JoinRoom(SceNpMatching2CtxId ctxId,
-                             SceNpMatching2RoomId roomId,
-                             const void* optParam,
-                             SceNpMatching2RequestId* reqId);
-s32 sceNpMatching2LeaveRoom(SceNpMatching2CtxId ctxId,
-                              SceNpMatching2RequestId* reqId);
-s32 sceNpMatching2SearchRoom(SceNpMatching2CtxId ctxId,
-                               const void* optParam,
-                               SceNpMatching2RequestId* reqId);
+/* Rooms */
+s32 sceNpMatching2SearchRoom(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2CreateJoinRoom(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2JoinRoom(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2LeaveRoom(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2KickoutRoomMember(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2SetRoomDataExternal(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2SetRoomDataInternal(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2SendRoomMessage(u16 ctxId, u32 req, u32 opt, u32 reqId);
+s32 sceNpMatching2GetEventData(u16 ctxId, u32 eventKey, u32 buf, u32 bufLen);
+s32 sceNpMatching2AbortRequest(u16 ctxId, u32 reqId);
 
-/* Request polling */
-s32 sceNpMatching2AbortRequest(SceNpMatching2CtxId ctxId,
-                                 SceNpMatching2RequestId reqId);
+/* Signaling (mesh, established as members join) */
+s32 sceNpMatching2SignalingGetConnectionStatus(u16 ctxId, u64 roomId, u16 memberId,
+                                               u32 connStatus, u32 peerAddr, u32 peerPort);
+s32 sceNpMatching2SignalingGetPingInfo(u16 ctxId, u32 req, u32 opt, u32 reqId);
+
+/* Not SDK exports. Kept so NID tables generated against the old stub still link. */
+s32 sceNpMatching2SearchLobby(u16 ctxId, u32 opt, u32 reqId);
+s32 sceNpMatching2JoinLobby(u16 ctxId, u64 lobbyId, u32 opt, u32 reqId);
+s32 sceNpMatching2LeaveLobby(u16 ctxId, u32 reqId);
+s32 sceNpMatching2CreateRoom(u16 ctxId, u32 opt, u32 reqId);
 
 #ifdef __cplusplus
 }

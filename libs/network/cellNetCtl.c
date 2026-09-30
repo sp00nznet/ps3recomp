@@ -9,6 +9,7 @@
 #include "cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
 #include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
+#include "np_psnr.h"      /* np_psnr_identity -- the player name the MAC derives from */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -188,13 +189,23 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_ETHER_ADDR:
-        /* Fake PS3-like MAC: 00:04:1F:xx:xx:xx (Sony OUI) */
-        info->ether_addr.data[0] = 0x00;
-        info->ether_addr.data[1] = 0x04;
-        info->ether_addr.data[2] = 0x1F;
-        info->ether_addr.data[3] = 0xAB;
-        info->ether_addr.data[4] = 0xCD;
-        info->ether_addr.data[5] = 0xEF;
+        /* Fake PS3-like MAC: 00:04:1F:xx:xx:xx (Sony OUI). With a player name
+         * (np_psnr_identity) the low three bytes come from it, so two players
+         * are two consoles; otherwise the historical AB:CD:EF. */
+        {
+            const char* id = np_psnr_identity();
+            uint32_t h = 0xABCDEFu;
+            if (id && *id) {
+                h = 2166136261u;   /* FNV-1a */
+                for (const char* p = id; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+            }
+            info->ether_addr.data[0] = 0x00;
+            info->ether_addr.data[1] = 0x04;
+            info->ether_addr.data[2] = 0x1F;
+            info->ether_addr.data[3] = (uint8_t)(h >> 16);
+            info->ether_addr.data[4] = (uint8_t)(h >> 8);
+            info->ether_addr.data[5] = (uint8_t)h;
+        }
         break;
 
     case CELL_NET_CTL_INFO_MTU:

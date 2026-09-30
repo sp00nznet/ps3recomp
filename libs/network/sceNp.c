@@ -10,6 +10,8 @@
 #include <string.h>
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "np_psnr.h"
+#include "../system/cellSysutil.h"
 
 
 /* ---------------------------------------------------------------------------
@@ -33,11 +35,17 @@ void sceNpSetFakeUsername(const char* username)
     }
 }
 
-/* Build a fake NP ID from the current username */
+const char* np_fake_username(void)
+{
+    return s_fake_username;
+}
+
+/* Build a fake NP ID from the current username (PS3_NP_ONLINE_ID wins, so
+ * two instances on one machine can be two players). */
 static void np_build_fake_id(SceNpId* npId)
 {
     memset(npId, 0, sizeof(SceNpId));
-    strncpy(npId->handle.data, s_fake_username, SCE_NP_ONLINEID_MAX_LENGTH);
+    strncpy(npId->handle.data, np_psnr_online_id(), SCE_NP_ONLINEID_MAX_LENGTH);
     npId->handle.term = '\0';
 }
 
@@ -51,7 +59,7 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     (void)poolPtr;
 
     printf("[sceNp] Init(poolSize=%u, username=\"%s\")\n",
-           poolSize, s_fake_username);
+           poolSize, np_psnr_online_id());
 
     if (s_np_initialized)
         return SCE_NP_ERROR_ALREADY_INITIALIZED;
@@ -81,8 +89,12 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
     if (!npId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
+    /* A guest address, like every sibling getter's: writing through it
+     * untranslated hit a host address and crashed Simpsons Arcade the first
+     * time it asked for its NP ID online. */
+    npId = GUEST_PTR(npId, SceNpId*);
     np_build_fake_id(npId);
-    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, s_fake_username);
+    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
     return CELL_OK;
 }
 
@@ -98,10 +110,10 @@ s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     memset(onlineId, 0, sizeof(SceNpOnlineId));
-    strncpy(onlineId->data, s_fake_username, SCE_NP_ONLINEID_MAX_LENGTH);
+    strncpy(onlineId->data, np_psnr_online_id(), SCE_NP_ONLINEID_MAX_LENGTH);
     onlineId->term = '\0';
 
-    printf("[sceNp] GetOnlineId(user=%d) -> \"%s\"\n", userId, s_fake_username);
+    printf("[sceNp] GetOnlineId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
     return CELL_OK;
 }
 
@@ -117,11 +129,11 @@ s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     memset(onlineName, 0, sizeof(SceNpOnlineName));
-    strncpy(onlineName->data, s_fake_username,
+    strncpy(onlineName->data, np_psnr_online_id(),
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
 
     printf("[sceNp] GetOnlineName(user=%d) -> \"%s\"\n",
-           userId, s_fake_username);
+           userId, np_psnr_online_id());
     return CELL_OK;
 }
 
@@ -138,12 +150,12 @@ s32 sceNpGetUserProfile(s32 userId, SceNpUserInfo* userInfo)
 
     memset(userInfo, 0, sizeof(SceNpUserInfo));
     np_build_fake_id(&userInfo->npId);
-    strncpy(userInfo->onlineName.data, s_fake_username,
+    strncpy(userInfo->onlineName.data, np_psnr_online_id(),
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
     /* Leave avatar URL empty */
 
     printf("[sceNp] GetUserProfile(user=%d) -> \"%s\"\n",
-           userId, s_fake_username);
+           userId, np_psnr_online_id());
     return CELL_OK;
 }
 
@@ -219,8 +231,12 @@ s32 sceNpManagerGetStatus(s32* status)
      * parameters straight through as guest values, so dereferencing one
      * writes to whatever host address shares that number. Same trap as
      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
-    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)SCE_NP_MANAGER_STATUS_OFFLINE);
-    printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
+    /* Signed in when there is a psnr server to be signed in to. */
+    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
+    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
+    { static s32 last = -2;
+      if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
+      last = st; }
     return CELL_OK;
 }
 
@@ -228,10 +244,16 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
 {
     if (!s_np_initialized)
         return SCE_NP_ERROR_NOT_INITIALIZED;
-    /* Stored for bookkeeping; we never transition online so never fire it. */
     s_npmgr_cb     = callback;
     s_npmgr_cb_arg = arg;
     printf("[sceNp] ManagerRegisterCallback()\n");
+    /* Online: tell the title it is signed in, as the console does once the
+     * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback. */
+    if (np_psnr_enabled() && callback) {
+        const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_STATUS_ONLINE, 0,
+                              (u64)(u32)(uintptr_t)arg, 0, 0, 0, 0, 0 };
+        cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, args);
+    }
     return CELL_OK;
 }
 
@@ -247,6 +269,23 @@ s32 sceNpManagerGetNpId(SceNpId* npId)               { return sceNpGetNpId(0, np
 s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId) { return sceNpGetOnlineId(0, onlineId); }
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* name) { return sceNpGetOnlineName(0, name); }
 s32 sceNpManagerGetAccountAge(s32* age)              { return sceNpGetAccountAge(0, age); }
+
+/* Parental controls: an unrestricted adult account. Unimplemented, these
+ * returned OK without writing, and the title read whatever was in its stack. */
+s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
+    if (age) vm_write32((u32)(uintptr_t)age, 25);
+    return CELL_OK;
+}
+
+s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
+    return CELL_OK;
+}
 
 /* Score setup is local even while the NP manager is offline. Games may
  * initialize it before starting the worker that decides whether to use PSN. */
