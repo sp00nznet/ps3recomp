@@ -50,7 +50,7 @@ same as running a game, and only one row claims that.
 |---|---|---|---|
 | Runtime library builds | yes | yes | yes |
 | Lifter + 8 test suites | yes | yes | yes |
-| Render backend | D3D12 | Metal | null (headless software) |
+| Render backend | D3D12 | Metal | null (headless software); Vulkan (opt-in) |
 | Runs a recompiled game | **yes** | **no** | no |
 
 The gap on macOS is the PPU boot scaffold — `ppu_loader.cpp`, `boot_main.cpp`
@@ -95,9 +95,13 @@ longer has to reimplement them to draw anything.
   through the decompiler, then textures. `ps3recomp_host` already drives
   cellGcm → RSX → Metal with no lifted game, so each step is testable before a
   title exists to run.
-- **Linux** has no renderer at all — the headless backend is a CPU triangle
-  filler for CI, deliberately. Vulkan is the obvious target, and it starts from
-  the same neutral draw record Metal reads.
+- **Linux** has an opt-in Vulkan backend (`-DPS3RECOMP_RSX_VULKAN=ON`). With
+  guest programs on (glslang at build time, `PS3RECOMP_VK_GUEST_PROGRAMS=1`) it
+  runs on the shared register-file draw engine, the path Metal takes, and every
+  `ps3recomp_host` scene passes on it -- including render-to-texture, MRT and
+  depth textures; without them it draws the null backend's fixed-function
+  contract. It has not run a recompiled title yet. The default is still the
+  headless backend, a CPU triangle filler for CI, deliberately.
 
 **Deliberately not claimed:** the table above says "no" for running a game on
 macOS and Linux, and it will keep saying "no" until a title actually boots to
@@ -391,7 +395,7 @@ Want to port a game? Start with the [Getting Started](#getting-started) section,
 - **RPCS3's HLE modules** — 100+ modules of battle-tested PS3 system behavior
 - **XenonRecomp's PowerPC lifter** — adapted for Cell PPU (same ISA family, different extensions)
 - **LLVM** — for optimized native code generation from lifted C
-- **Direct3D 12 / Metal** — for RSX graphics translation. D3D12 is the backend that runs games today; Metal is the macOS one, and the headless null backend is what CI draws with. Vulkan is the intended Linux backend and is **not written yet** — the comments in `libs/video` that mention it are describing the plan, not the tree
+- **Direct3D 12 / Metal** — for RSX graphics translation. D3D12 is the backend that runs games today; Metal is the macOS one, and the headless null backend is what CI draws with. Vulkan is the Linux one, opt-in (see [docs/BUILDING.md](docs/BUILDING.md#the-vulkan-backend-linux-opt-in)); like Metal, it has not run a recompiled title yet
 - **SDL2** — input and audio off Windows. `cellPad` and `cellAudio` select their SDL2 backends unconditionally on non-Windows hosts, so it is required there; on Windows they use XInput and WASAPI. It does no windowing here — each graphics backend makes its own
 
 ## Contributing

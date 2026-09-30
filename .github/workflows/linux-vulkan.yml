@@ -1,0 +1,90 @@
+# Builds the opt-in Vulkan RSX backend and runs every ps3recomp_host scene on
+# it, with Mesa's lavapipe standing in for a GPU (a CPU Vulkan driver, so the
+# runner needs none).
+#
+# Two passes, one per draw path:
+#   - without guest programs, the rsx_state vtable's fixed-function path: the
+#     same scenes the null-backend job checks, now through Vulkan;
+#   - with guest programs, the shared register-file draw engine (the path the
+#     Metal backend takes): all eleven draw scenes, including the ones only a
+#     translating backend can pass (--shader, --mip, --rtt, --depthtex, --mrt,
+#     --mrt-a), under the Khronos validation layer.
+#
+# The second pass fails on any of: a scene's own check, a single validation
+# message, a scene that did not take the engine path, or one that reported
+# "nothing to check" -- a skipped scene is not a passed one.
+name: Linux (Vulkan)
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  vulkan:
+    name: Linux x64 Vulkan on lavapipe (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # As in linux.yml: SDL2 is required off Windows, and Ubuntu's glslang
+      # CMake config refuses to load without glslang-tools. spirv-tools is
+      # what glslang's HLSL legalization runs on -- without it the translator
+      # emits different, possibly invalid, SPIR-V. The Vulkan headers build
+      # the backend (libvulkan itself is loaded at run time); lavapipe is in
+      # mesa-vulkan-drivers; the validation layer is its own package.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev clang \
+            glslang-dev glslang-tools spirv-tools \
+            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPS3RECOMP_RSX_VULKAN=ON | tee configure.log
+          # Without glslang the second pass would only ever skip: say so here.
+          grep -q "Vulkan: *guest programs available" configure.log
+
+      - name: Build
+        run: cmake --build build --target ps3recomp_host
+
+      - name: Fixed-function path (no guest programs)
+        run: |
+          fail=0
+          for m in "" "--draw" "--draw --frames=60" "--depth" "--tex" "--quads" "--threads"; do
+            rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
+            echo "::group::ps3recomp_host ${m:-(default)} -> exit $rc"; cat run.log; echo "::endgroup::"
+            [ "$rc" -eq 0 ] || { echo "::error::${m:-default}: exit $rc"; fail=1; }
+          done
+          exit $fail
+
+      - name: Draw engine with guest programs, under the validation layer
+        env:
+          PS3RECOMP_VK_GUEST_PROGRAMS: "1"
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+        run: |
+          fail=0
+          # --threads is not here: it checks guest thread stacks and returns
+          # before any backend exists (the first pass still runs it).
+          for m in "" "--draw" "--depth" "--quads" "--shader" \
+                   "--tex" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a"; do
+            rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
+            name=${m:-default}
+            echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"
+            [ "$rc" -eq 0 ] || { echo "::error::$name: exit $rc"; fail=1; }
+            if grep -q "VUID" run.log; then echo "::error::$name: Vulkan validation messages"; fail=1; fi
+            grep -q "register-file draw engine path" run.log || { echo "::error::$name: not on the draw engine"; fail=1; }
+            if grep -q "nothing to check" run.log; then echo "::error::$name: skipped, not checked"; fail=1; fi
+          done
+          exit $fail
