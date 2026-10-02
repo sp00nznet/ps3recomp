@@ -391,6 +391,64 @@ _CS_ADDR_OF_RE = re.compile(
     r'ctx->gpr\[\d+\] = ctx->gpr\[1\] \+ \(int64_t\)\((-?0x[0-9A-Fa-f]+|-?\d+)\);')
 
 
+_CS_CALL_RE = re.compile(r'\bfunc_[0-9A-Fa-f]+\(ctx\)|ps3_indirect_call|ps3_hle_call')
+
+
+_CS_COND_RETURN_RE = re.compile(r'^if \(.*\) return;(?:\s*/\*.*\*/)?$')
+_CS_TAIL_TRAMP_RE = re.compile(r'^\{ g_trampoline_fn = [^;]*; return; \}$')
+
+
+def _is_epilogue_restore(lines, i, reg, off=None):
+    """True when the `ld rREG, off(r1)` lifted at lines[i] sits in a straight-line
+    epilogue: nothing after it reads rREG before the body returns (plain
+    `return;` or a tail trampoline), with no label, branch or call in between.
+
+    A callee-save restore hands the register back to the CALLER, so the body
+    never reads it again. A load whose value the body goes on to use is a
+    reload of a frame LOCAL -- which the body may have rewritten through a store
+    the frame-offset scan cannot see (an indexed `stvx v,r1,rN`, a callee
+    writing through an `addi rN,r1,X` out-pointer). Ben 10 0x4F5000 (a gap
+    fragment of the UI layout 0x4F4F2C) does `stvx v1,r1,r28` (r28=0xD0) then
+    `ld r27,0xd0(r1)` / `ld r25,0xd8(r1)` to read the widget size it just
+    computed; snapshotting those two loads at fragment entry fed the pivot of
+    the dialog band a stale size (pivot -0 instead of -208.5), which pushed the
+    band half a piece to the right.
+
+    Control flow after the load:
+      * a conditional return (`b<cond>lr` -> `if (c) return;`) leaves the
+        function on the taken path, so the scan carries on down the
+        fall-through path;
+      * a CONDITIONAL cross-fragment branch (`if (c) { g_trampoline_fn = ...;
+        return; }`) is not an exit: the fall-through goes on and may read rREG;
+      * an UNCONDITIONAL tail trampoline ends the C body but not necessarily
+        the guest function: a `b` to a later fragment of the SAME function is a
+        plain continuation whose target may read rREG. It only counts as an
+        epilogue exit once the frame has been popped (a write to r1 between the
+        load and the branch: `addi r1,r1,N` / `ld r1,0(r1)` then the tail call),
+        or when the slot is in the red zone (negative `off`: a frameless leaf
+        restores from there and has no frame to pop before its tail call)."""
+    tok = f"ctx->gpr[{reg}]"
+    popped = off is not None and str(off).lstrip().startswith("-")
+    for line in lines[i + 1:]:
+        s = line.strip()
+        if s == "return;":
+            return True
+        if tok in s:
+            return False
+        if _CS_COND_RETURN_RE.match(s):
+            continue
+        if _CS_TAIL_TRAMP_RE.match(s):
+            return popped
+        if s.startswith("ctx->gpr[1] ="):
+            popped = True
+            continue
+        if (s.startswith("loc_") or s.startswith("goto ") or s.startswith("if ")
+                or s.startswith("switch") or "g_trampoline_fn" in s
+                or _CS_CALL_RE.search(s)):
+            return False
+    return False
+
+
 def _xea(ra, rb):
     """X-form (indexed) effective-address base: in PPC indexed addressing an rA
     field of 0 denotes the literal value 0, NOT the contents of GPR r0. Returns
@@ -812,10 +870,14 @@ class PPULifter:
                     _reg_snap.add(_reg)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
                 elif (not _has_stdu and _write_counts[_off] == 0 and not _off_escapes(_off)
-                        and _reg not in _reg_snap and _mem_snap.setdefault(_reg, _off) == _off):
+                        and _reg not in _reg_snap
+                        and _is_epilogue_restore(func.body_lines, _i, _reg, _off)
+                        and _mem_snap.setdefault(_reg, _off) == _off):
                     # pure tail-entry: the save lives in the original function, so
                     # this body never writes the slot; snapshot from memory at entry.
                     # (Skip slots whose address escaped to a callee -- see above.)
+                    # Only for a real epilogue restore: a load whose value the body
+                    # still uses is a frame local (see _is_epilogue_restore).
                     # One snapshot per register: a load of the same register from a
                     # DIFFERENT slot is a spill reload and stays a real load. Bink's
                     # plane decoder (GH3 func_00610450) restores r23 from 0x888 and
@@ -2427,9 +2489,15 @@ class PPULifter:
         # VMX integer compare
         if mn.startswith("vcmpequh"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            # The dot form (vcmpequh.) sets CR6 like the other vector compares:
+            # 8 = every lane equal, 2 = no lane equal. It used to leave CR6
+            # stale, so the `b[n]e cr6` after it followed an older compare.
             return (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<8;i++) d[i]=a[i]==b[i]?(uint16_t)~0:0; }}")
+                    f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; int t=0; "
+                    f"for(int i=0;i<8;i++){{ d[i]=a[i]==b[i]?(uint16_t)~0:0; t+=a[i]==b[i]; }}"
+                    + (" uint32_t c6=(t==8?8u:0u)|(t==0?2u:0u); "
+                       "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);" if mn.endswith(".") else "")
+                    + " }")
 
         if mn.startswith("vcmpequw"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -2690,9 +2758,13 @@ class PPULifter:
         # Byte compare equal
         if mn.startswith("vcmpequb"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            # Dot form: CR6 as for vcmpequh. above (8 = all lanes equal, 2 = none).
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<16;i++) d[i]=a[i]==b[i]?0xFFu:0u; }}")
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; int t=0; "
+                    f"for(int i=0;i<16;i++){{ d[i]=a[i]==b[i]?0xFFu:0u; t+=a[i]==b[i]; }}"
+                    + (" uint32_t c6=(t==16?8u:0u)|(t==0?2u:0u); "
+                       "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);" if mn.endswith(".") else "")
+                    + " }")
 
         # Saturating add
         if mn == "vaddsbs":

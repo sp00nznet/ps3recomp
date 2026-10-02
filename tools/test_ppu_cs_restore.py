@@ -25,7 +25,9 @@ def w_addi(rt, ra, s): return (14 << 26) | (rt << 21) | (ra << 16) | (s & 0xFFFF
 def w_blr():           return (19 << 26) | (20 << 21) | (16 << 1)
 
 
-words = [w_ld(23, 1, 0x888), w_addi(23, 23, 1), w_ld(23, 1, 0x918), w_blr()]
+# The row bound is reloaded and used (stays a real load); only the last load,
+# which nothing reads before the return, is a callee-save restore.
+words = [w_ld(23, 1, 0x918), w_addi(23, 23, 1), w_ld(23, 1, 0x888), w_blr()]
 insns = [ppu_disasm.decode(w, BASE + 4 * i) for i, w in enumerate(words)]
 func = PPULifter().lift_function(insns, BASE, BASE + 4 * len(words))
 body = "\n".join(func.body_lines)
