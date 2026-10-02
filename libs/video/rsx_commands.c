@@ -641,15 +641,31 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
-    /* NV4097_SET_TRANSFORM_CONSTANT[0..63] — up to 64 dwords (16 vec4s) per
-     * command. Each register slot writes to a lane of one vertex constant
-     * vec4: vec_index = LOAD + (reg_offset/4), lane = reg_offset%4.
+    /* Registers that sit right after the 32-dword constant window. Taken as
+     * constants c(load+8..15) they overwrite whatever was uploaded there. */
+    if (method == NV4097_SET_VERTEX_ATTRIB_INPUT_MASK) {
+        state->vertex_attrib_input_mask = data;
+        return 0;
+    }
+    if (method == NV4097_SET_TRANSFORM_BRANCH_BITS) {
+        state->transform_branch_bits = data;
+        return 0;
+    }
+    if (method == NV4097_INVALIDATE_L2) {
+        /* Post-transform/L2 cache invalidate: the host keeps no such cache,
+         * nothing to drop. */
+        return 0;
+    }
+
+    /* NV4097_SET_TRANSFORM_CONSTANT[0..31] — up to 32 dwords (8 vec4s) per
+     * command, 0x1F00..0x1F7C. Each register slot writes to a lane of one
+     * vertex constant vec4: vec_index = LOAD + (reg_offset/4), lane = reg_offset%4.
      * The data arrives as a host-endian u32; reinterpret the bits as float
      * because the game's intent is "these 32 bits are a float". The hardware
      * does NOT auto-advance LOAD between commands — games re-issue
      * SET_TRANSFORM_CONSTANT_LOAD before each block. */
     if (method >= NV4097_SET_TRANSFORM_CONSTANT &&
-        method <  NV4097_SET_TRANSFORM_CONSTANT + 64 * 4) {
+        method <  NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) {
         u32 reg_offset = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
         u32 slot = state->transform_constant_load + (reg_offset >> 2);
         u32 lane = reg_offset & 3;

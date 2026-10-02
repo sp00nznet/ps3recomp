@@ -154,10 +154,15 @@ extern "C" {
 #define NV4097_SET_TRANSFORM_PROGRAM_START      0x00001EA0
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
-/* Vertex constants are written as up to 64 dwords (16 vec4s) per command,
- * starting at 0x1F00. Slot = transform_constant_load + (reg/4); lane = reg%4.
+/* Vertex constants are written as up to 32 dwords (8 vec4s) per command,
+ * 0x1F00..0x1F7C. Slot = transform_constant_load + (reg/4); lane = reg%4.
+ * 0x1F80..0x1FFC are other registers (below), not more constants.
  * The hardware supports 512 vec4 constants total in the vertex register file. */
 #define NV4097_SET_TRANSFORM_CONSTANT           0x00001F00
+#define NV4097_SET_TRANSFORM_CONSTANT_DWORDS    32
+#define NV4097_INVALIDATE_L2                    0x00001FD8
+#define NV4097_SET_VERTEX_ATTRIB_INPUT_MASK     0x00001FF0
+#define NV4097_SET_TRANSFORM_BRANCH_BITS        0x00001FF8
 #define RSX_MAX_VERTEX_CONSTANTS                512
 
 /* Color mask */
@@ -335,6 +340,8 @@ typedef struct rsx_state {
     u32 shader_control;       /* SET_SHADER_CONTROL (0x40 = 32-bit colour exports) */
     u32 fragment_program_addr;
     u32 vertex_attrib_output_mask;
+    u32 vertex_attrib_input_mask;      /* 0x1FF0 */
+    u32 transform_branch_bits;         /* 0x1FF8: VP static branch condition bits */
     u32 transform_program_load;
     u32 transform_program_start; /* vertex program load slot index */
     u32 transform_constant_load;

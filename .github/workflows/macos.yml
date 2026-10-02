@@ -287,6 +287,10 @@ jobs:
           # restart cuts bounding topology expansion. Runs on Linux too.
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_rsx_draw_engine
+          # The NV4097 method decoder on its own: the vertex-constant window is
+          # 32 dwords and the registers after it are not constants.
+          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
+          /tmp/test_rsx_transform_constants
 
       # The Win32 shim the runtime runs through on macOS: interlocked widths
       # and return conventions, SRW/CS/condition variables, events, semaphores,
