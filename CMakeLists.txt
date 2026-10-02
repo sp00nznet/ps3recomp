@@ -257,10 +257,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
-        # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
-        # hottest SPU op in lifted audio code.
-        -msse4.1
     )
+    # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
+    # hottest SPU op in lifted audio code. Probed rather than assumed: recent
+    # Apple clang rejects the flag outright for arm64 ("unsupported option
+    # '-msse4.1'"), which stops the whole runtime from building there.
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
+    if(PS3RECOMP_HAS_MSSE41)
+        target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
+    endif()
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
     #
