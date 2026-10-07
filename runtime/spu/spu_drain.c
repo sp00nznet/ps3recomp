@@ -17,9 +17,6 @@ typedef struct spu_irq_frame {
 } spu_irq_frame;
 
 /* Pending cross-function transfer target for this host thread's SPU context. */
-SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
-SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
-SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
 /* yz_lockstep_tick now has its real body in spu_lockstep.c (milestone 2). */
 
@@ -29,7 +26,7 @@ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 /* PM flow trace (SPURS_PM_FLOW=1): record every cross-function transfer of ONE
  * policy-module run (the ctx spurs_policy.c arms) so the post-claim decision
  * path can be reconstructed offline. Written by the drain-loop hook below;
- * armed/dumped by spu_run_policy_module. */
+ * armed and dumped by a diagnostic caller. */
 uint32_t          g_pm_flow_buf[8192];
 volatile unsigned g_pm_flow_n = 0;
 void* volatile    g_pm_flow_ctx = 0;
@@ -48,18 +45,8 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
  * ended where it should not have (spurs_policy.c, [pm-end]). */
-static _Thread_local uint32_t t_recent[32];
-static _Thread_local uint32_t t_recent_n;
-unsigned spu_recent_pcs(uint32_t* out, unsigned max)
-{
-    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
-    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
-    return k;
-}
-
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
@@ -68,13 +55,13 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
      * via `bi $r0`, but some branch to 0 DIRECTLY, which the lifter turns into
      * a plain trampoline that never reaches spu_indirect_branch. The drain sees
      * every step, so catch it here too. Step 0 is the real entry. */
-    static int s_no_ls0 = -1;
+    static _Atomic int s_no_ls0 = -1;
     if (s_no_ls0 < 0) s_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
     /* SPU_EXITTRACE=<img>: remember the last PCs this image executed and dump
      * them when the job ends. "Why did it exit here" is a question about the
      * path taken, and a forward trace from the entry never reaches far enough
      * to show it. */
-    static int64_t s_et = -2;
+    static _Atomic int64_t s_et = -2;
     if (s_et == -2) { const char* e = getenv("SPU_EXITTRACE");
                       s_et = e ? strtol(e, 0, 0) : -1; }
     static uint32_t s_ring[64]; static uint32_t s_ri;
@@ -84,7 +71,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
         static int _n = 0;
-        if (_n++ < 8)
+        if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
             fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
                     ctx->image_id);
         if (s_et >= 0 && ctx->image_id == s_et) {
@@ -99,9 +86,9 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     /* SPU_STEPTRACE=<img>: pc and the argument registers at every trampoline
      * step. This runs on each drain iteration, so it is the finest-grained
      * view of a register file changing under a running job. */
-    { static int64_t s_t = -2;
+    { static _Atomic int64_t s_t = -2;
       if (s_t == -2) { const char* e = getenv("SPU_STEPTRACE"); s_t = e ? strtol(e,0,0) : -1; }
-      static int64_t s_from = -2;
+      static _Atomic int64_t s_from = -2;
       if (s_from == -2) { const char* e = getenv("SPU_STEPTRACE_FROM");
                           s_from = e ? strtol(e,0,16) : -1; }
       static int s_armed = 0;
@@ -109,7 +96,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
           if (s_from >= 0 && !s_armed &&
               ((uint32_t)ctx->pc & SPU_LS_MASK) == (uint32_t)s_from) s_armed = 1;
           static int n = 0;
-          if ((s_from < 0 || s_armed) && n++ < 40) {
+          if ((s_from < 0 || s_armed) && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 40) {
               fprintf(stderr, "[step] pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0],
                       ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
@@ -119,7 +106,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
         g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
 
-    static int s_on = -1;
+    static _Atomic int s_on = -1;
     if (s_on < 0) s_on = getenv("SPU_JOBDRAIN") ? 1 : 0;
     if (!s_on || ctx->image_id != 2 || !ctx->policy_mode) return;
 
@@ -145,7 +132,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
         marked++;
     }
     static int _n = 0;
-    if (marked && _n++ < 12)
+    if (marked && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 12)
         fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
 }
 
@@ -194,12 +181,10 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img)
  * brhz cond1,Exit` to LS 0x2D30, skipping the Load setup.) Default OFF; kept
  * env-gated for experiments: SPU_SN_DEFER=<n> ticks (0 = immediate, faithful
  * to the current synchronous list execution). */
-void* volatile   g_sn_defer_ctx = 0;
-volatile unsigned g_sn_defer     = 0;
 
 unsigned spu_sn_defer_ticks(void)
 {
-    static int s_n = -1;
+    static _Atomic int s_n = -1;
     if (s_n < 0) { const char* e = getenv("SPU_SN_DEFER"); s_n = e ? atoi(e) : 0; }
     return (unsigned)(s_n < 0 ? 0 : s_n);
 }
@@ -223,8 +208,17 @@ unsigned spu_sn_defer_ticks(void)
  * until iret). */
 static void spu_irq_regs_save(spu_context* ctx)
 {
+    /* T-0001 (2026-10-08): no nesting guard existed despite the "no nesting"
+     * contract below -- a second take while a save is armed silently
+     * OVERWRITES the snapshot and loses the outer resume point. Log it. */
+    { static int _n = 0;
+      if (ctx->irq_saved && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+          fprintf(stderr, "[t0001-irq] NESTED TAKE while save armed: "
+                  "old resume=%05X new resume=%05X (outer snapshot LOST)\n",
+                  ctx->irq_resume_pc & SPU_LS_MASK, ctx->srr0 & SPU_LS_MASK); }
     ctx->irq_saved = 1;
     ctx->irq_resume_pc = ctx->srr0;
+    ctx->irq_save_steps = ctx->steps;      /* T-0001: staleness detection */
     memcpy(ctx->irq_gpr, ctx->gpr, sizeof ctx->irq_gpr);
 }
 
@@ -245,6 +239,20 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
         if (ctx->irq_saved) {
             if ((ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
                 ctx->int_enable) {
+                /* T-0001 (2026-10-08): a restore firing long after its take
+                 * means the genuine iret was MISSED (e.g. executed by the
+                 * interpreter, which has no irq_saved awareness) and this is
+                 * a STALE snapshot being memcpy'd over a live register file
+                 * at an unrelated moment -- the false-fire corruption family.
+                 * steps-since-take is recorded on save; a job launch or hot
+                 * loop head re-branching to the old resume pc triggers it. */
+                { uint64_t _age = ctx->steps - ctx->irq_save_steps;
+                  static int _n = 0;
+                  if (_age > 100000 && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+                      fprintf(stderr, "[t0001-irq] STALE RESTORE: take was %llu steps "
+                              "ago (resume=%05X) -- genuine iret was MISSED\n",
+                              (unsigned long long)_age,
+                              ctx->irq_resume_pc & SPU_LS_MASK); }
                 memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
                 ctx->irq_saved = 0;
                 /* The iret completed below the frame that took the interrupt:
@@ -253,20 +261,20 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                 if (f && ctx->host_depth <= f->depth)
                     ctx->irq_frame = f->prev;      /* returned to its loop the ordinary way */
                 if (f && ctx->host_depth > f->depth) {
-                    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+                    { static _Atomic int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
                       static int _n = 0;
-                      if (s_it && _n++ < 200)
+                      if (s_it && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
-                    longjmp(f->env, 1);
+                    SPU_LONGJMP(f->env, 1);
                 }
                 if (!f && ctx->host_depth > 0) {
                     /* Taken by the top-level driver loop (depth 0), which
                      * keeps no frame: the driver's own restart re-enters at
                      * srr0 with the host stack empty, which is that frame. */
-                    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+                    { static _Atomic int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
                       static int _n = 0;
-                      if (s_it && _n++ < 200)
+                      if (s_it && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to the driver (srr0=0x%05X)\n",
                                   ctx->host_depth, ctx->pc & SPU_LS_MASK); }
                     extern void spu_restart_dispatch(spu_context*);
@@ -284,8 +292,8 @@ void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
 {
     /* Stall-and-notify still settling: let the SPU run on (see above). */
-    if (g_sn_defer && g_sn_defer_ctx == (void*)ctx) {
-        if (--g_sn_defer == 0) g_sn_defer_ctx = 0;
+    if (ctx->sn_defer) {
+        ctx->sn_defer--;
         return tf;
     }
     const uint8_t* v = ctx->ls;      /* vector word at LS 0, big-endian */
@@ -299,23 +307,23 @@ void (*spu_take_interrupt(spu_context* ctx,
         target = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK;
     } else {
         static int _w = 0;
-        if (_w++ < 4)
+        if (__atomic_fetch_add(&_w, 1, __ATOMIC_RELAXED) < 4)
             fprintf(stderr, "[spu-int] pending (st=0x%X mask=0x%X) but LS0 word "
                     "0x%08X is no branch -- not taken\n",
-                    ctx->event_status, ctx->event_mask, w);
+                    spu_ev_get(ctx), ctx->event_mask, w);
         return tf;
     }
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
-    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
-      if (s_it) { static int _n = 0; if (_n++ < 200)
+    { static _Atomic int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+      if (s_it) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
         fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",
                 ctx->srr0 & SPU_LS_MASK, ctx->host_depth,
                 ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0]); } }
     ctx->pc = target & SPU_LS_MASK;
     { static int _n = 0;
-      if (_n++ < 16) {
+      if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 16) {
           /* WWS Load->Run diagnosis: the job-manager interrupt handler advances
            * g_WwsJob_loadJobState kReadCommands(1)->kExecuteCommands(2) only if
            * (a) the ch25 stall mask has tag 0 (kLoadJob_readCommands) AND
@@ -325,7 +333,7 @@ void (*spu_take_interrupt(spu_context* ctx,
           fprintf(stderr, "[spu-int] TAKEN img=%d events=0x%X&0x%X vector->0x%05X "
                   "(srr0=0x%05X) stallstat=0x%X parked=0x%X loadJobState@12A0=%02X%02X%02X%02X "
                   "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", ctx->image_id,
-                  ctx->event_status, ctx->event_mask, ctx->pc, ctx->srr0,
+                  spu_ev_get(ctx), ctx->event_mask, ctx->pc, ctx->srr0,
                   ctx->list_stall_stat, ctx->list_stall_mask,
                   js[0],js[1],js[2],js[3], js[4],js[5],js[6],js[7],
                   js[8],js[9],js[10],js[11], js[12],js[13],js[14],js[15]); } }
@@ -335,7 +343,7 @@ void (*spu_take_interrupt(spu_context* ctx,
 /* See the declaration in spu_context.h. */
 void spu_depth_guard(spu_context* ctx)
 {
-    static uint32_t s_max = 0;
+    static _Atomic uint32_t s_max = 0;
     if (!s_max) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
         s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
@@ -345,13 +353,12 @@ void spu_depth_guard(spu_context* ctx)
      * not "where are we" but "what cycle got us here" -- one pc names a point,
      * a ring names the loop. */
     enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
-    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
-    s_n++;
+    uint32_t* const s_ring = ctx->depth_ring;     /* per SPU context: its own cycle */
+    const uint32_t s_n = ++ctx->depth_ring_n;
+    s_ring[(s_n - 1) % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
 
     if (ctx->host_depth < s_max) return;
-    static int s_reported = 0;
+    static _Atomic int s_reported = 0;
     if (s_reported < 1) {   /* one report: five SPU threads all trip together */
         s_reported++;
         fprintf(stderr, "[spu-depth] img=%d pc=0x%05X lr=0x%05X host_depth=%u"
@@ -371,7 +378,7 @@ void spu_depth_guard(spu_context* ctx)
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
 int spu_tailret_enabled(void)
 {
-    static int s_on = -1;
+    static _Atomic int s_on = -1;
     if (s_on < 0) { const char* e = getenv("SPU_TAILRET"); s_on = (e && e[0] == 0x31) ? 1 : 0; }
     return s_on;
 }
@@ -418,7 +425,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             yz_lockstep_tick(ctx);
             spu_task_launch_check(ctx, (void*)fn);
-            if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+            if (ctx->int_enable && !ctx->irq_saved && (spu_ev_get(ctx) & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
                     /* Interrupt taken here: this loop is the frame the iret
@@ -429,7 +436,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         f.image_id = ctx->image_id;
                         ctx->irq_frame = &f;
                     }
-                    if (setjmp(f.env) == 0) {
+                    if (SPU_SETJMP(f.env) == 0) {
                         vf(ctx);
                     } else {
                         /* iret fired deeper: registers restored, pc = srr0 */
@@ -449,10 +456,19 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
         {
             uint32_t pc = ctx->pc & SPU_LS_MASK;
-            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+            spu_drain_fn fn = 0;
+            int owned = 0;
+            for (unsigned slot = 0; slot < 4; ++slot)
+                if (ctx->resident_code[slot].image_id &&
+                    pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+                    fn = spu_lookup(pc, ctx->resident_code[slot].image_id); owned = 1; break;
+                }
+            if (!owned && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
+            if (!owned && !fn) fn = spu_lookup(pc, ctx->image_id);
+            for (unsigned slot = 0; slot < 4 && !fn; ++slot)   /* resident module code outside its image */
+                if (ctx->resident_code[slot].image_id) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
             if (fn) {
-                { static int _n = 0; if (_n++ < 8)
+                { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
                             (int)ctx->resident_ovl); }

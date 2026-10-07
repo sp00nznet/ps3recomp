@@ -135,7 +135,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * for a disc title patched to e.g. v1.30) -- mirror ppu_fs.cpp host_path.
      * PS3_HDD0_ROOT = host dir that /dev_hdd0 maps into (contains game/<title>/). */
     {
-        static const char* hdd0_root = NULL; static int hdd0_init = 0;
+        static const char* hdd0_root = NULL; static _Atomic int hdd0_init = 0;
         if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
         if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
             snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
@@ -150,7 +150,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * missed. ps1_netemu loads its PS1 BIOS as /dev_flash/ps1emu/ps1_rom.bin and
      * refuses to boot without it. Keep both halves of the split filesystem agreed. */
     {
-        static const char* fw = NULL; static int fw_init = 0;
+        static const char* fw = NULL; static _Atomic int fw_init = 0;
         if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
         if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
             snprintf(host_path, (size_t)host_path_size, "%s/%s", fw, ps3_path + 11);
@@ -482,7 +482,7 @@ int64_t sys_fs_read(ppu_context* ctx)
      * genuinely has not reached its end; if they repeat, the disc read is stuck
      * and the movie is looping over the same sectors forever. Those need
      * opposite fixes and nothing else distinguishes them. */
-    { static int s_ft = -1;
+    { static _Atomic int s_ft = -1;
       if (s_ft < 0) { const char* e = getenv("PS3_FSTRACE");
                       s_ft = e ? (atoi(e) > 0 ? atoi(e) : 200) : 0; }
       if (s_ft) { static unsigned long fn;

@@ -29,6 +29,7 @@
 /* The real PPU store and store-conditional path the hook lives in. */
 #include "../../ppu/ppu_memory.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -345,6 +346,96 @@ static void test_block_stores(void)
 /* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
+/* ===========================================================================
+ * Membership: a context is in the reserving set at most once
+ * ===========================================================================*/
+static void test_unregister_after_slot_reuse(void)
+{
+    TEST("re-reserving after an earlier slot frees does not add a second copy");
+    spu_reset(&g_spu_a, 0);
+    spu_reset(&g_spu_b, 1);
+    spu_coh_unregister(&g_spu_a);
+    spu_coh_unregister(&g_spu_b);
+    spu_getllar(&g_spu_a, LINE_A);          /* A takes the first slot   */
+    spu_getllar(&g_spu_b, LINE_B);          /* B the one after it       */
+    spu_coh_unregister(&g_spu_a);           /* the first slot is free   */
+    spu_getllar(&g_spu_b, LINE_B);          /* B again: still one entry */
+    spu_coh_unregister(&g_spu_b);           /* ...so this removes it    */
+
+    /* Out of the set, B must not be notified even holding a reservation
+     * (its context could be gone: a stack local whose thread exited). */
+    g_wakes = 0;
+    g_spu_b.resv_ea = LINE_B; g_spu_b.resv_valid = 1; g_spu_b.event_status = 0;
+    vm_write32(LINE_B + 8, 0x55555555u);
+    CHECK_EQ_U32(g_spu_b.event_status, 0);
+    CHECK(g_wakes == 0);
+}
+
+/* ===========================================================================
+ * PPU lwarx reservations: the 128-byte granule, cleared by any other agent's
+ * store to it -- including a store of the bytes already there.
+ * ===========================================================================*/
+static uint32_t g_other_store_ea;
+static uint32_t g_other_store_val;
+static void* other_ppu_store(void* arg)
+{
+    (void)arg;
+    vm_write32(g_other_store_ea, g_other_store_val);   /* another PPU thread's store */
+    spu_coh_ppu_thread_exit();
+    return NULL;
+}
+static void store_from_other_thread(uint32_t ea, uint32_t val)
+{
+    pthread_t th;
+    g_other_store_ea = ea; g_other_store_val = val;
+    pthread_create(&th, NULL, other_ppu_store, NULL);
+    pthread_join(th, NULL);
+}
+static int ppu_holds(uint32_t ea)
+{
+    spu_lockline_lock();
+    int h = spu_coh_ppu_holds(ea);
+    spu_lockline_unlock();
+    return h;
+}
+static void ppu_reserve(uint32_t ea)
+{
+    spu_lockline_lock();
+    spu_coh_ppu_reserve(ea);
+    spu_lockline_unlock();
+}
+
+static void test_ppu_reservation_granule(void)
+{
+    TEST("an SPU write anywhere in the granule clears a PPU reservation");
+    ppu_reserve(LINE_A);
+    CHECK(ppu_holds(LINE_A + 4));                   /* same granule: still held */
+    spu_lockline_lock(); spu_coh_notify_write_except(LINE_A + 0x40, &g_spu_a); spu_lockline_unlock();
+    CHECK(!ppu_holds(LINE_A));
+
+    TEST("another PPU thread's store clears it -- even of identical bytes");
+    vm_write32(LINE_A + 0x20, 0x12345678u);
+    ppu_reserve(LINE_A);
+    store_from_other_thread(LINE_A + 0x20, 0x12345678u);
+    CHECK(!ppu_holds(LINE_A));
+
+    TEST("the thread's own store leaves its reservation");
+    ppu_reserve(LINE_A);
+    vm_write32(LINE_A + 0x24, 0x1u);
+    CHECK(ppu_holds(LINE_A));
+
+    TEST("a store to the next line leaves it");
+    store_from_other_thread(LINE_A + 128, 0x2u);
+    CHECK(ppu_holds(LINE_A));
+
+    TEST("a released slot is reusable and starts empty");
+    spu_coh_ppu_thread_exit();
+    CHECK(!ppu_holds(LINE_A));
+    ppu_reserve(LINE_B);
+    CHECK(ppu_holds(LINE_B));
+    spu_coh_ppu_thread_exit();
+}
+
 int main(void)
 {
     test_bitmap();
@@ -353,6 +444,8 @@ int main(void)
     test_all_store_widths();
     test_store_conditional();
     test_block_stores();
+    test_unregister_after_slot_reuse();
+    test_ppu_reservation_granule();
 
     printf("\nSPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);

@@ -108,7 +108,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if (n++ < 60)
+      static int n=0; if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 60)
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
@@ -124,7 +124,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
      * Deliberately unlocked: the counts are a diagnostic, and a lost increment
      * under a race cannot change which site is at the top of a 30k-per-second
      * poll. */
-    { static long s_pt = -1;
+    { static _Atomic long s_pt = -1;
       if (s_pt < 0) { const char* e = getenv("PS3_POLLTOP");
                       s_pt = e ? (long)strtoul(e, 0, 10) : 0;
                       if (s_pt < 0) s_pt = 0; }
@@ -170,12 +170,12 @@ int64_t sys_timer_usleep(ppu_context* ctx)
      * address, dump the registers and the object they point at. A poll loop
      * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
      * which is the part you actually need to find who never releases it. */
-    { static long s_wo = -1;
+    { static _Atomic long s_wo = -1;
       if (s_wo < 0) { const char* e = getenv("PS3_WAIT_OBJ");
                       s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
         static int _n = 0;
-        if (_n++ < 8) {
+        if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8) {
           /* Dump the words at EVERY plausible object register, not just r29.
            * Which register holds the object is per-title -- r29 was right for
            * the title this was written for and is a spin COUNTER in Guitar
@@ -207,7 +207,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 
     /* POLLSITE: resolve the host chain of the 1ms poller (LBP bringup) to
      * guest functions -- names the stage that is starving. */
-    { static int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
+    { static _Atomic int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
       if (_ps > 0 && usec == 1000) { _ps--;
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }
@@ -270,6 +270,30 @@ int64_t sys_timer_sleep(ppu_context* ctx)
 #else
     sleep(sec);
 #endif
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_time_get_timezone
+ *
+ * r3 = pointer to receive timezone offset in minutes (s32*)
+ * r4 = pointer to receive daylight-saving offset in minutes (s32*)
+ *
+ * RPCS3 reports the configured region; the default is UTC with no DST,
+ * which is what we report (call sites in guest CRTs just cache the values).
+ * -----------------------------------------------------------------------*/
+int64_t sys_time_get_timezone(ppu_context* ctx)
+{
+    uint32_t tz_addr  = LV2_ARG_PTR(ctx, 0);
+    uint32_t dst_addr = LV2_ARG_PTR(ctx, 1);
+
+    if (tz_addr != 0) {
+        write_be32(tz_addr, 0);
+    }
+    if (dst_addr != 0) {
+        write_be32(dst_addr, 0);
+    }
 
     return CELL_OK;
 }
@@ -676,5 +700,6 @@ void sys_timer_init(lv2_syscall_table* tbl)
     /* Register these but be aware of collisions */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
     lv2_syscall_register(tbl, SYS_TIMER_SLEEP,             sys_timer_sleep);
+    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE,        sys_time_get_timezone);
     lv2_syscall_register(tbl, SYS_TIME_GET_CURRENT_TIME,   sys_time_get_current_time);
 }

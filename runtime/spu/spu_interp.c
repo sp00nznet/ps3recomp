@@ -20,9 +20,14 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 
 /* Work descriptor for the next SYS_SPU_THREAD_STOP_RECEIVE_EVENT service, set
  * by the event-port send that wakes a sim SPU. Single-slot: dispatch is
- * synchronous -- the sending PPU thread runs the SPU inline. */
-uint32_t g_spu_pending_evt[3];
-int      g_spu_pending_evt_valid;
+ * synchronous -- the sending PPU thread runs the SPU inline. Thread-local for
+ * exactly that reason: a global let an SPU running on its own host thread take
+ * whatever event a PPU had just staged, ahead of the ones queued before it
+ * (and the event was still queued as well) -- the mc suite's recv case saw its
+ * second and third events arrive swapped. Only the inline re-run on the
+ * sending thread can see the slot; every other SPU receives from its queue. */
+SPU_THREAD_LOCAL uint32_t g_spu_pending_evt[3];
+SPU_THREAD_LOCAL int      g_spu_pending_evt_valid;
 
 /* ---- decode: 32-bit insn -> fields (mirrors spu_disasm.spu_decode order) ---- */
 typedef struct {
@@ -111,12 +116,28 @@ static int spu_step(spu_context* ctx) {
     const uint8_t* p = ctx->ls;
     uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
-    spu_ins d; spu_decode1(insn, pc, &d);
-    uint32_t next = pc + 4;
+    /* Decode once per LS word. A decode is a function of (word, pc) alone, so
+     * a per-thread cache indexed by pc and validated against the word is
+     * right for every context and image the thread runs, and code a DMA or
+     * overlay replaces simply re-decodes. */
+    typedef struct { uint32_t insn; uint32_t valid; spu_ins d; } spu_dent;
+    static _Thread_local spu_dent* dc;
+    if (!dc) dc = (spu_dent*)calloc(0x10000, sizeof *dc);
+    spu_ins d;
+    if (dc) {
+        spu_dent* e = &dc[(m >> 2) & 0xFFFF];
+        if (!e->valid || e->insn != insn) { spu_decode1(insn, pc, &e->d); e->insn = insn; e->valid = 1; }
+        d = e->d;
+    } else {
+        spu_decode1(insn, pc, &d);
+    }
+    uint32_t next = (pc + 4) & 0x3FFFC;
+    uint32_t call_link = 0;   /* set by a taken branch-and-link: the return address */
 
     switch (d.op) {
     /* immediates / loads */
-    case SPU_il: case SPU_ilh: DST = spu_splat_u32((uint32_t)(int32_t)I); break;
+    case SPU_il:  DST = spu_il(I); break;
+    case SPU_ilh: DST = spu_ilh((uint16_t)I); break;   /* halfword splat, NOT a word splat */
     case SPU_ilhu: DST = spu_splat_u32((uint32_t)I << 16); break;
     case SPU_ila:  DST = spu_splat_u32((uint32_t)I & 0x3FFFF); break;
     case SPU_iohl: DST = spu_ori(DST, (int32_t)((uint32_t)I & 0xFFFF)); break;
@@ -143,6 +164,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_cg:   DST = spu_cg(A,B); break;
     case SPU_cgx:  DST = spu_cgx(A,B,DST); break;
     case SPU_mpyi: DST = spu_mpyi(A,I); break;
+    case SPU_mpyui: DST = spu_mpyui(A,I); break;
     /* logical */
     case SPU_and: DST = spu_and(A,B); break;
     case SPU_or:  DST = spu_or(A,B); break;
@@ -158,6 +180,9 @@ static int spu_step(spu_context* ctx) {
     case SPU_andbi:DST = spu_andbi(A,I); break;
     case SPU_andhi:DST = spu_andhi(A,I); break;
     case SPU_orhi: DST = spu_orhi(A,I); break;
+    case SPU_orbi: DST = spu_orbi(A,I); break;
+    case SPU_xorhi:DST = spu_xorhi(A,I); break;
+    case SPU_xorbi:DST = spu_xorbi(A,I); break;
     case SPU_orx:  DST = spu_orx(A); break;
     /* compares */
     case SPU_ceq: DST = spu_ceq(A,B); break;
@@ -253,15 +278,20 @@ static int spu_step(spu_context* ctx) {
     case SPU_clgthi:DST = spu_clgthi(A,I); break;
     /* integer / byte extras */
     case SPU_bg:    DST = spu_bg(A,B); break;
+    case SPU_bgx:   DST = spu_bgx(A,B,DST); break;   /* RR: rt is accumulator + dest */
     case SPU_absdb: DST = spu_absdb(A,B); break;
     case SPU_avgb:  DST = spu_avgb(A,B); break;
     case SPU_sumb:  DST = spu_sumb(A,B); break;
     case SPU_mpys:  DST = spu_mpys(A,B); break;
     case SPU_mpyhh: DST = spu_mpyhh(A,B); break;
     case SPU_mpyhhu:DST = spu_mpyhhu(A,B); break;
-    case SPU_mpyhha:DSTC = spu_mpyhha(A,B,T); break;  /* RRR */
+    case SPU_mpyhha: DST = spu_mpyhha(A,B,DST); break;   /* RR (0x346): rt is accumulator + dest, NOT RRR */
+    case SPU_mpyhhau:DST = spu_mpyhhau(A,B,DST); break;
     /* rotate / shift extras */
     case SPU_rothm:    DST = spu_rothm(A,B); break;
+    case SPU_rothmi:   DST = spu_rothmi(A,I); break;
+    case SPU_rotmah:   DST = spu_rothma(A,B); break;
+    case SPU_rotmahi:  DST = spu_rotmahi(A,I); break;
     case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
     case SPU_rotqmbii: DST = spu_rotqmbii(A,(int)I); break;
     case SPU_rotqbybi: DST = spu_rotqbybi(A,B); break;
@@ -270,28 +300,89 @@ static int spu_step(spu_context* ctx) {
     /* channels */
     case SPU_wrch: spu_wrch(ctx, d.ch, DST); break;
     case SPU_rdch: DST = spu_rdch(ctx, d.ch); break;
-    case SPU_rchcnt: DST = spu_splat_u32(spu_rchcnt(ctx, d.ch)); break;
+    case SPU_rchcnt: DST = spu_pref_u32(spu_rchcnt(ctx, d.ch)); break;   /* count in the preferred word, rest zero (as the lifter) */
     /* hints / no-ops */
     case SPU_nop: case SPU_lnop: case SPU_sync: case SPU_dsync:
     case SPU_hbr: case SPU_hbra: case SPU_hbrr: case SPU_mtspr:
-    case SPU_mfspr: case SPU_fscrrd: case SPU_fscrwr: break;
+    case SPU_fscrwr: break;
+    case SPU_mfspr: DST = spu_mfspr(A); break;      /* SPRs read as zero */
+    case SPU_fscrrd: DST = spu_fscrrd(A); break;    /* FPSCR reads as zero */
+    /* double precision */
+    case SPU_dfa:  DST = spu_dfa(A,B); break;
+    case SPU_dfs:  DST = spu_dfs(A,B); break;
+    case SPU_dfm:  DST = spu_dfm(A,B); break;
+    case SPU_dfma: DST = spu_dfma(A,B,DST); break;   /* RR: rt is accumulator + dest */
+    case SPU_dfms: DST = spu_dfms(A,B,DST); break;
+    case SPU_dfnms:DST = spu_dfnms(A,B,DST); break;
+    case SPU_dfnma:DST = spu_dfnma(A,B,DST); break;
+    case SPU_dfceq:  DST = spu_dfceq(A,B); break;
+    case SPU_dfcgt:  DST = spu_dfcgt(A,B); break;
+    case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
+    case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
+    case SPU_dftsv:  DST = spu_dftsv(A, (int32_t)(d.rb & 0x7F)); break;   /* I7 sits in the rb field */
     /* control flow */
     case SPU_br: case SPU_bra: next = d.tgt; break;
-    case SPU_brsl: case SPU_brasl: DST = spu_link(pc + 4); next = d.tgt;
+    case SPU_brsl: case SPU_brasl: DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt; call_link = (pc + 4) & 0x3FFFC;
         { extern void spu_trace_call(uint32_t,uint32_t); spu_trace_call(pc, d.tgt); } break;
     case SPU_brz:  if (PREF(DST) == 0) next = d.tgt; break;
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
     case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    case SPU_bi:   next = PREF(A) & 0x3FFFC; break;
-    case SPU_bisl: DST = spu_link(pc + 4); next = PREF(A) & 0x3FFFC; break;
-    case SPU_iret: next = ctx->srr0 & 0x3FFFC; break;
+    /* T-0001 (2026-10-08): the bi/iret interrupt-enable/disable bits (E =
+     * 0x40000 -> int_enable=1, D = 0x80000 -> int_enable=0, effective when the
+     * branch is taken) were decoded ONLY by the lifter; the interpreter dropped
+     * them, distorting every interrupt window that executes interpreted.
+     * Mirror spu_lifter.py:942-943. */
+    #define SPU_IED_BITS() do { \
+        if (insn & 0x40000u) ctx->int_enable = 1; \
+        else if (insn & 0x80000u) ctx->int_enable = 0; \
+    } while (0)
+    case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
+    case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
+        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; call_link = (pc + 4) & 0x3FFFC; break; }
+    case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;
+        DST = spu_link((pc + 4) & 0x3FFFC);
+        if ((spu_ev_get(ctx) & ctx->event_mask) != 0) {
+            next = tg; call_link = (pc + 4) & 0x3FFFC;
+            SPU_IED_BITS(); }   /* E/D effective when taken, like the lift */
+        break; }
+    case SPU_iret: next = ctx->srr0 & 0x3FFFC;
+        /* T-0001 (2026-10-08, CONFIRMED root cause): the register-file
+         * save/restore contract was enforced ONLY on the lifted dispatch
+         * path (spu_indirect_branch -> spu_irq_regs_maybe_restore). The
+         * WWS interrupt handler's iret frequently executes HERE, in the
+         * interpreter, where irq_saved was never checked -- the restore
+         * was silently missed and the stale 128-GPR snapshot stayed
+         * armed in the persistent LLE thread, later false-firing
+         * (pc == resume && int_enable) on an unrelated dispatch and
+         * memcpy'ing interrupt-time registers over live job parameters.
+         * boot22's tripwires caught: 8 missed restores, 8 nested takes
+         * (each losing the outer snapshot), and 1 stale restore firing
+         * 145,874 steps after its take.
+         *
+         * Hardware contract: the handler preserves every register; state
+         * it publishes lives in LS/channels. On a genuine return to the
+         * take point, restore the interrupted register file. */
+        SPU_IED_BITS();                              /* E/D bits, like the lift */
+        if (ctx->irq_saved) {
+            if (next == (ctx->irq_resume_pc & SPU_LS_MASK)) {
+                memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
+                ctx->irq_saved = 0;
+            } else {
+                static int _n = 0;
+                if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+                    fprintf(stderr, "[t0001-irq] INTERP IRET to %05X but save "
+                            "resume=%05X -- mismatch, snapshot stays armed\n",
+                            next, ctx->irq_resume_pc & SPU_LS_MASK);
+            }
+        }
+        break;
     case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_stop: case SPU_stopd:
-        ctx->pc = next; ctx->stop_code = (uint32_t)I;
+        ctx->pc = next; ctx->stop_code = (d.op == SPU_stopd) ? 0x3FFFu : (uint32_t)I;   /* stopd carries no code field: RPCS3 reports 0x3FFF */
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
     /* conditional halts (assertions): stop the SPU when the condition holds,
      * else continue. The preferred word of ra is compared. */
@@ -307,14 +398,69 @@ static int spu_step(spu_context* ctx) {
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
                 d.op < SPU_OP_COUNT ? spu_op_name[d.op] : "?", insn, pc);
+        spu_ls_watch_dump("unimplemented-op");
+        /* T-0001: the recurring title-window faults die here (executing
+         * data after a smashed control chain). Give this path the same
+         * full LS + GPR state dump the branch-to-0 handler has, so every
+         * fault variant yields a fresh 256 KB dump for offline analysis.
+         * One-shot budget; path from YDKJ_SPU_LSDUMP else recomp_spu_ls.bin. */
+        { static int _dumped = 0;
+          if (__sync_fetch_and_add(&_dumped, 1) == 0) {
+            const char* dp = getenv("YDKJ_SPU_LSDUMP");
+            if (!dp || !*dp) dp = "recomp_spu_ls.bin";
+            FILE* lf = fopen(dp, "wb");
+            if (lf) { fwrite(ctx->ls, 1, SPU_LS_SIZE, lf); fclose(lf);
+                      fprintf(stderr, "[SPU] dumped 256KB LS -> %s\n", dp); }
+            fprintf(stderr, "[SPU] image_id=%d pc=0x%05X  GPR dump (r0..r127):\n",
+                    ctx->image_id, ctx->pc & SPU_LS_MASK);
+            for (int g = 0; g < 128; g++) {
+                fprintf(stderr, " r%-3d=%08X %08X %08X %08X", g,
+                        ctx->gpr[g]._u32[0], ctx->gpr[g]._u32[1],
+                        ctx->gpr[g]._u32[2], ctx->gpr[g]._u32[3]);
+                if ((g & 1) == 1) fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "\n"); fflush(stderr);
+          } }
         ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1;
+    }
+    /* Interpreted code CALLING lifted code: run the callee as a subroutine and
+     * carry on at the link address, as the SPU does. Without this the run loop
+     * saw a lifted pc, "rejoined the fast path" and returned to whatever lifted
+     * code had started the interpreter -- which then continued as if ITS call
+     * had returned, with the interpreted function's frame still on the stack
+     * and its work half done. inFamous's SPURS jobs call code they load at
+     * runtime (LS 0x21xxx/0x22xxx), which calls back into the job's lifted
+     * functions; the stale frames ended with a saved link register read from
+     * the job's output records and a kernel thread branching into data. */
+    /* The call is made exactly as lifted code makes one (the lifter's bisl):
+     * host_depth bracket, dispatch, then drain until the pc comes back to the
+     * link. A callee that leaves some other way -- a context switch reloading
+     * r0 -- unwinds through spu_drain_call's restart, as it would from a
+     * lifted caller. */
+    if (call_link && ctx->image_id >= 0 && spu_lifted_lookup(ctx, next)) {
+        int32_t si = (int32_t)ctx->image_id;
+        { extern void spu_xfer_log_call(const spu_context*, uint32_t, uint32_t); spu_xfer_log_call(ctx, pc, next); }
+        ctx->pc = next;
+        ctx->host_depth++;
+        spu_indirect_branch(ctx);
+        spu_drain_call(ctx, call_link);
+        ctx->host_depth--;
+        spu_img_restore(ctx, si);
+        if (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)) return 1;
+        next = ctx->pc & 0x3FFFC;
     }
     ctx->pc = next;
     return 0;
 }
 
-uint32_t g_spu_interp_last_pc = 0;
-uint64_t g_spu_interp_steps   = 0;
+SPU_THREAD_LOCAL uint32_t g_spu_interp_last_pc = 0;   /* per run, read back on the running thread */
+/* Exit status of the last spu_run_interp_job on this host thread (stop 0x102). */
+SPU_THREAD_LOCAL int     g_spu_interp_exit_valid  = 0;
+SPU_THREAD_LOCAL int32_t g_spu_interp_exit_status = 0;
+/* ...and of a sys_spu_thread_group_exit (stop 0x101): the group's status. */
+SPU_THREAD_LOCAL int     g_spu_interp_group_exit_valid  = 0;
+SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status = 0;
+SPU_THREAD_LOCAL uint64_t g_spu_interp_steps   = 0;
 
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
 #define SPU_TRACE_N 32
@@ -335,6 +481,45 @@ void spu_trace_dump(uint32_t at) {
     }
 }
 
+spu_context* volatile g_spu_oracle_trace_ctx = 0;
+long g_spu_oracle_trace_left = 0;
+
+/* SPU_INTERP_XFER_LOG=N: the first N hand-offs from interpreted code to
+ * lifted code (a call, or the rejoin when the run reaches a lifted pc), with
+ * the image whose lift was chosen and the word local store actually holds
+ * there -- to tell "the lift owns this code" from "a stale registration for
+ * some other image's code shadows what was DMA'd in since". */
+static void spu_xfer_log(const spu_context* ctx, const char* kind, uint32_t from, uint32_t to)
+{
+    static _Atomic long s_left = -1;
+    if (s_left < 0) { const char* e = getenv("SPU_INTERP_XFER_LOG"); s_left = e ? atol(e) : 0; }
+    if (s_left <= 0 || s_left-- <= 0) return;
+    int owner = ctx->image_id, slot_hit = -1;
+    for (unsigned k = 0; k < 4; ++k)
+        if (ctx->resident_code[k].image_id && to - ctx->resident_code[k].lsa < ctx->resident_code[k].size) {
+            owner = ctx->resident_code[k].image_id; slot_hit = (int)k; break; }
+    uint32_t w = ((uint32_t)ctx->ls[to] << 24) | ((uint32_t)ctx->ls[to+1] << 16) |
+                 ((uint32_t)ctx->ls[to+2] << 8) | ctx->ls[to+3];
+    /* A resident slot's code came from source_ea: compare what the lift was
+     * made from with what local store holds now. */
+    const char* st = "";
+    uint32_t sw = 0;
+    if (slot_hit >= 0 && ctx->resident_code[slot_hit].source_ea) {
+        extern uint8_t* vm_base;
+        uint32_t ea = ctx->resident_code[slot_hit].source_ea + (to - ctx->resident_code[slot_hit].lsa);
+        sw = ((uint32_t)vm_base[ea] << 24) | ((uint32_t)vm_base[ea+1] << 16) |
+             ((uint32_t)vm_base[ea+2] << 8) | vm_base[ea+3];
+        st = sw == w ? " match" : " STALE";
+    }
+    char line[220];
+    snprintf(line, sizeof line, "[interp-xfer] %s 0x%05X -> 0x%05X img=%d owner=%d slot=%d%s ls=%08X src=%08X%s r1=0x%05X\n",
+             kind, from, to, ctx->image_id, owner, slot_hit,
+             slot_hit >= 0 ? "" : " (base image)", w, sw, st, ctx->gpr[1]._u32[0]);
+    fputs(line, stderr);
+}
+
+void spu_xfer_log_call(const spu_context* ctx, uint32_t from, uint32_t to) { spu_xfer_log(ctx, "call", from, to); }
+
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
@@ -345,14 +530,14 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     uint64_t steps = 0;
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
-    static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
-    static uint64_t _cap=0; { static int _ci=0; if(!_ci){_ci=1; const char*e=getenv("SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0;} }
+    static _Atomic int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
+    static _Atomic uint64_t _cap=0; { static _Atomic int _ci=0; if(!_ci){const char*e=getenv("SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0; _ci=1;} }
     /* YDKJ_CRI_GATE1TRACE=N: cri decode task busy-spins in the validator func_00026E80
      * (LS 0x26E80..0x26F14), a straight-line leaf that returns r3 = 0 / 0x8041090F /
      * 0x80410909. Hand-decoding its selb/fsm/gb/ceqh lanes proved unreliable, so log the
      * ACTUAL runtime result + inputs the first N times it returns. Fires on range-exit
      * (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
-    static int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
+    static _Atomic int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
     static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
@@ -376,7 +561,12 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) {
+            { static _Atomic int s_rj = -1; if (s_rj < 0) { const char* e = getenv("SPU_REJOIN_DBG"); s_rj = e ? atoi(e) : 0; }
+              if (s_rj > 0 && steps > 1000) { s_rj--; fprintf(stderr, "[rejoin] img=%d pc=0x%05X after %llu steps (from 0x%05X)\n",
+                  ctx->image_id, ctx->pc, (unsigned long long)steps, start_lsa & 0x3FFFC); } }
+            spu_xfer_log(ctx, "rejoin", g_spu_interp_last_pc, ctx->pc);
+            g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
@@ -393,7 +583,18 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             }
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
+        /* SPU_TRACE_INTERP=1: emit the same per-instruction PC trace a --trace lift
+         * does (spu_trace_pc), so an interpreted run diffs against a lifted one. */
+        { static _Atomic int s_ti = -1; if (s_ti < 0) s_ti = getenv("SPU_TRACE_INTERP") ? 1 : 0;
+          if (s_ti) { extern void spu_trace_pc(spu_context*, uint32_t); spu_trace_pc(ctx, ctx->pc); } }
         steps++;
+        /* T-0001 (2026-10-08): ctx->steps is the cross-path instruction clock
+         * (the drain loop bumps it once per lifted trampoline). The
+         * interpreter kept only this LOCAL counter, so ctx->steps froze
+         * during interpreted runs -- breaking the irq staleness metric and
+         * any timing analysis. Advance it here per interpreted instruction
+         * (closer to true rate than the trampoline approximation). */
+        ctx->steps++;
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (_tr>0 && _cap && steps == _cap) {
@@ -409,7 +610,43 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             #undef LB
             fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
         }
-        if (spu_step(ctx)) {
+        /* Oracle trace (armed by SPU_LS_DUMP_LIST + SPU_TRACE_N, see spu_dma.h): pc, opcode and
+         * the register named by the rt field after the step -- same format as the RPCS3 oracle's
+         * "[oracle] T" lines, so the two traces diff directly. */
+        extern spu_context* volatile g_spu_oracle_trace_ctx; extern long g_spu_oracle_trace_left;
+        const uint32_t _tpc = ctx->pc;
+        const uint32_t _top = ((uint32_t)ctx->ls[_tpc] << 24) | ((uint32_t)ctx->ls[_tpc+1] << 16) |
+                              ((uint32_t)ctx->ls[_tpc+2] << 8) | ctx->ls[_tpc+3];
+        /* SPU_INTERP_HIST=1: which (image, 4 KB LS page) the interpreter spends
+         * its steps in -- the candidates for ahead-of-time lifting. */
+        { static _Atomic int on = -1; if (on < 0) on = getenv("SPU_INTERP_HIST") ? 1 : 0;
+          if (on) {
+              static _Atomic unsigned long long hist[64][64]; static _Atomic unsigned long long tot;
+              const int img = ctx->image_id < 0 ? 63 : (ctx->image_id & 63);
+              hist[img][(_tpc >> 12) & 63]++;
+              if ((++tot % 200000000ull) == 0) {
+                  fprintf(stderr, "[spu-hist] after %llu interpreted steps:\n", (unsigned long long)tot);
+                  for (int i = 0; i < 64; i++) for (int j = 0; j < 64; j++)
+                      if (hist[i][j] > tot / 50) fprintf(stderr, "[spu-hist]   img %d page 0x%05X: %.1f%%\n",
+                                                        i == 63 ? -1 : i, j << 12, 100.0 * hist[i][j] / tot);
+              } } }
+        if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED)) {   /* group terminated */
+            ctx->status = SPU_STATUS_STOPPED_BY_HALT; ctx->stop_code = 0;
+            g_spu_interp_steps = steps;
+            return 0;
+        }
+        if (ctx->interp_step_budget && steps >= ctx->interp_step_budget) {
+            /* test hook: budget exhausted while still running (T-0001) */
+            g_spu_interp_steps = steps;
+            return 0xFFFFFFFFu;
+        }
+        const int _st = spu_step(ctx);
+        if (g_spu_oracle_trace_ctx == ctx && _tpc >= 0x3780 && g_spu_oracle_trace_left-- > 0) {
+            const u128* r = &ctx->gpr[_top & 0x7F];
+            fprintf(stderr, "[oracle] T %05x %08x r%u=%08x %08x %08x %08x\n", _tpc, _top, _top & 0x7F,
+                    r->_u32[0], r->_u32[1], r->_u32[2], r->_u32[3]);
+        }
+        if (_st) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
              * the SPU queue number to its out-mailbox, stops, and lv2 replies
              * with {CELL_OK, data1, data2, data3} in the in-mailbox -- which is
@@ -429,6 +666,15 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 ctx->status = SPU_STATUS_RUNNING;
                 continue;
             }
+            /* lv2 stop-and-signal syscalls (yield, receive_event from a bound
+             * SPU queue, tryreceive_event): the same service lifted threads use
+             * (spu_stop). The pc is already past the stop. */
+            { extern int (*g_spu_lv2_stop_hook)(spu_context*);
+              if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && g_spu_lv2_stop_hook &&
+                  g_spu_lv2_stop_hook(ctx)) {
+                  ctx->status = SPU_STATUS_RUNNING;
+                  continue;
+              } }
             g_spu_interp_steps = steps;
             if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
@@ -444,6 +690,7 @@ void spu_dispatch(spu_context* ctx, uint32_t target) {
         spu_lifted_fn fn = spu_lifted_lookup(ctx, target);
         if (fn) { ctx->pc = target; fn(ctx); return; }
         uint32_t next = spu_interp_run(ctx, target);
+        if (next == 0xFFFFFFFFu) return;   /* interp_step_budget exhausted (test hook) */
         if (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))
             return;
         if ((next & 0x3FFFC) == target) return;   /* no-progress guard */

@@ -992,7 +992,7 @@ not changed while a title runs.
   `runtime/spu/spu_interp.c:329`
 - **`SPU_CHHIST`** — SPU_CHHIST=1: which channels a job actually touches, and how often. A worker that never issues an MFC command is either not being handed its work descriptor or is waiting on a channel we never satisfy; the channel mix distinguishes those. */
   `runtime/spu/spu_channels.c:564`  _(+2 more sites)_
-- **`SPU_CH_BLOCK`** — _(no description in source)_
+- **`SPU_CH_BLOCK`** — default on: an empty blocking read channel (in-mailbox, signals, event status with a mask) stalls the SPU until a producer wakes it. `=0` returns at once instead (legacy).
   `runtime/spu/spu_channels.c:652`
 - **`SPU_CMDDUMP`** — SPU_CMDDUMP=1: decode the FULL WWS command list (8-byte cmds). Each CommandFlags u32: commandNum=(f>>9)&7, outputShareable=(f>>13)&1, shareableWriteIfDiscarded=(f>>12)&1, logBufSet=(f>>5)&0xF, logBuf=f&0x1F. Answers lifter-vs-builder: are shareable-output UseBuffer + kRunJob + store commands PRESENT in the list the PPU built? */
   `runtime/spu/spu_dma.h:1319`
@@ -1010,7 +1010,7 @@ not changed while a title runs.
   `runtime/spu/spu_dma.h:1193`
 - **`SPU_DMA_LAX`** — the guest image. YDKJ issues exactly one such PUT -- 16 KB from a 4-byte-aligned EA of 0x00542004, straight over the title's own data -- and every later call through the clobbered OPDs reports "code 0x00000000 not registered". SPU_DMA_LAX=1 restores the old permissive behaviour. */
   `runtime/spu/spu_dma.h:215`
-- **`SPU_DMA_REPEAT_LIMIT`** — _(no description in source)_
+- **`SPU_DMA_REPEAT_LIMIT`** — off by default. `=N` halts an SPU that issues the same DMA transfer N times in a row (a wedged job), naming its pc. Polling memory with one GET is legitimate, so it is never on by default.
   `runtime/spu/spu_dma.h:1099`
 - **`SPU_DMA_SKIP_DUMP`** — SPU_DMA_SKIP_DUMP=1: show the LS payload a skipped PUT was carrying. A job that DMAs a small buffer to a garbage EA in a tight loop is usually an SPU-side assert/print path, and the payload names the actual complaint -- far more useful than the address it failed at. */
   `runtime/spu/spu_dma.h:392`
@@ -1042,7 +1042,7 @@ not changed while a title runs.
   `runtime/ppu/ppu_sysprx.cpp:701`
 - **`SPU_IMG_DUMP`** — _(no description in source)_
   `runtime/syscalls/lv2_register.c:573`
-- **`SPU_INTERP_UNLIFTED`** — _(no description in source)_
+- **`SPU_INTERP_UNLIFTED`** — default on: a branch to unlifted LS that holds code runs on the interpreter. `=0` ends the job there instead (loud stop).
   `runtime/spu/spu_channels.c:1767`
 - **`SPU_IRQTRACE`** — _(no description in source)_
   `runtime/spu/spu_channels.c:1548`  _(+1 more sites)_

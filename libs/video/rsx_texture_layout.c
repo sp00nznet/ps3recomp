@@ -313,7 +313,14 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * and the sampler presents them as {G,R,G,R}. */
     static const u8 lanes_argb[4] = {3, 0, 1, 2};
     static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
-    const u8* src2res = ((rsx_fmt & 0x9Fu) == 0x8Bu) ? lanes_g8b8 : lanes_argb;
+    /* B8 is one channel uploaded as R8: the sampler presents it on R, G and
+     * B with A = 1 (RPCS3's B8 mapping {ONE, R, R, R}), so a remap that reads
+     * the B lane -- the only real one -- must not land on an empty component.
+     * inFamous's fog/DOF pass reads its 256x256 B8 lookup through B and drew
+     * the whole scene black. */
+    static const u8 lanes_b8[4]   = {3, 0, 0, 0};
+    const u32 base = rsx_fmt & 0x9Fu;
+    const u8* src2res = base == 0x8Bu ? lanes_g8b8 : base == 0x81u ? lanes_b8 : lanes_argb;
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
 

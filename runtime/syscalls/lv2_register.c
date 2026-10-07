@@ -10,6 +10,7 @@
  * remain available as direct C calls for the runtime to use.
  */
 
+#include "../memory/guest_mem_atomic.h"
 #include <stdlib.h>   /* calloc, free */
 #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
@@ -26,6 +27,7 @@
 extern void sys_rsx_init(lv2_syscall_table* tbl);   /* libs/video/sys_rsx.c */
 extern void sys_raw_spu_init(lv2_syscall_table* tbl);   /* runtime/spu/spu_raw.c */
 extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
+#include "lv2_spu_image.h"
 
 /* Guest scratch for an SPU ELF staged by sys_spu_image_open, which reads the
  * file in and then re-enters the import path with it. Shares the 16 MB region
@@ -88,7 +90,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
               memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
               if (strstr(tmp, pat)) {
                   static int _n = 0;
-                  if (_n++ < 4) {
+                  if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 4) {
                       uint32_t sp = (uint32_t)ctx->gpr[1];
                       fprintf(stderr, "[TTY_BT] \"%.70s\" tid=%llu cia=0x%08X lr=0x%08X chain:",
                               tmp, (unsigned long long)ctx->thread_id,
@@ -112,7 +114,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
             char tmp[256]; uint32_t n = len < 255 ? len : 255;
             memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
             if (strstr(tmp, "NULL pointer") || strstr(tmp, "E2004090") || strstr(tmp, "CRICRS")) {
-                static int _cb = 0; if (_cb++ < 4) {
+                static int _cb = 0; if (__atomic_fetch_add(&_cb, 1, __ATOMIC_RELAXED) < 4) {
                     uint32_t sp = (uint32_t)ctx->gpr[1];
                     fprintf(stderr, "[CRIBT] \"%.60s\" cia=0x%08X lr=0x%08X chain:", tmp,
                             (uint32_t)ctx->cia, (uint32_t)ctx->lr);
@@ -136,7 +138,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
             memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
             if (strstr(tmp, "ASSERT") || strstr(tmp, "Tuner") || strstr(tmp, "usertrace") ||
                 strstr(tmp, "libspurs")) {
-                static int _ab = 0; if (_ab++ < 4) {
+                static int _ab = 0; if (__atomic_fetch_add(&_ab, 1, __ATOMIC_RELAXED) < 4) {
                     uint32_t sp = (uint32_t)ctx->gpr[1];
                     fprintf(stderr, "\n[ASSERTBT] \"%.70s\" cia=0x%08X lr=0x%08X chain:", tmp,
                             (uint32_t)ctx->cia, (uint32_t)ctx->lr);
@@ -163,7 +165,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
                 strstr(ptmp, "out of memory on request")) {
                 extern void ppu_log_host_chain(const char*);
                 static int _pn = 0;
-                if (_pn++ < 3) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
+                if (__atomic_fetch_add(&_pn, 1, __ATOMIC_RELAXED) < 3) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
             }
         }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
@@ -247,11 +249,17 @@ static int64_t sys_tty_read(ppu_context* ctx)
  *   TERMINATED       = 0x0004 — sys_spu_thread_group_terminate() fired
  * -----------------------------------------------------------------------*/
 
-#define SPU_GROUP_STATE_INITIALIZED  0
-#define SPU_GROUP_STATE_READY        1
-#define SPU_GROUP_STATE_RUNNING      2
-#define SPU_GROUP_STATE_STOPPED      3
-#define SPU_GROUP_STATE_DESTROYED    4
+/* The lv2 run states (RPCS3's lv2 is the reference for the kernel): a group is
+ * NOT_INITIALIZED until every one of its threads has been initialized, then
+ * INITIALIZED -- startable, joinable, destroyable -- and returns there once a
+ * run is over -- when its last thread stops, joined or not -- so it can be
+ * started again; the run's result waits for one join (join_state). */
+#define SPU_GROUP_STATE_NOT_INITIALIZED 0
+#define SPU_GROUP_STATE_INITIALIZED  1
+#define SPU_GROUP_STATE_READY        2
+#define SPU_GROUP_STATE_RUNNING      3
+#define SPU_GROUP_STATE_STOPPED      4
+#define SPU_GROUP_STATE_DESTROYED    5
 
 #define SPU_GROUP_CAUSE_GROUP_EXIT        0x0001u
 #define SPU_GROUP_CAUSE_ALL_THREADS_EXIT  0x0002u
@@ -294,7 +302,14 @@ typedef struct {
      * block for every thread in a group, rewriting it between calls -- reading
      * it lazily hands every thread the last thread's values. */
     uint64_t args[4];
-    uint32_t img_ea;         /* sys_spu_image descriptor EA (for LS segment load) */
+    uint32_t run_gen;        /* the group run this thread's host thread belongs to */
+    int      host_live;      /* a host thread exists and has not been reaped */
+    uint32_t img_ea;         /* sys_spu_image descriptor EA it was initialized with */
+    /* The image, COPIED at initialize as lv2 does: the descriptor (and a USER
+     * image's segment list) may be freed or reused once the thread exists. */
+    uint32_t    nsegs;
+    lv2_spu_seg segs[LV2_SPU_MAX_SEGS];
+    uint32_t    img_src;     /* EA of the ELF the image came from, 0 unknown */
     /* Real SPU execution: the architectural context a thread running its own
      * lifted image owns, allocated at group_start and holding that thread's
      * local store. NULL for fallback and interpreter threads. */
@@ -336,6 +351,10 @@ typedef struct {
      * waiting on the command queue never woke. */
     struct { uint32_t spup; uint32_t queue; } evt_bind[8];
     int                 evt_bind_n;
+    /* sys_spu_thread_bind_queue(id, spuq, spuq_num): the event queues this
+     * thread receives from with sys_spu_thread_receive_event(spuq_num). */
+    struct { uint32_t num; uint32_t queue; } q_bind[16];
+    int                 q_bind_n;
 } spu_thread_t;
 
 typedef struct {
@@ -344,6 +363,7 @@ typedef struct {
     int      state;
     uint32_t num_threads;
     uint32_t thread_indices[8];  /* table index into s_spu_threads */
+    uint32_t init_mask;          /* thread slots initialized so far */
     char     name[32];
     int32_t  exit_status;        /* final ppu-side status the group reports */
     uint32_t cause;              /* how the group ended */
@@ -352,7 +372,24 @@ typedef struct {
      * into this queue with source = SYS_SPU_THREAD_GROUP_EVENT (0x100..) so
      * PPU code blocked on sys_event_queue_receive wakes up. */
     uint32_t event_queue_id;
+    /* Queue connected for SYS_SPU_THREAD_GROUP_EVENT_RUN (et 1): lv2 sends
+     * {0xFFFFFFFF53505500, group id, 0, 0} to it when the group starts (as
+     * RPCS3; checked by tests/conformance/mc). Nothing is sent at join. */
+    uint32_t run_queue_id;
     uint32_t user_event_ports[64];
+    int32_t  type;               /* SYS_SPU_THREAD_GROUP_TYPE_* */
+    /* The run in progress and its end, as lv2 keeps them: a run ends when its
+     * last thread stops (or on group exit / terminate), whether or not anyone
+     * is joining; the group is then INITIALIZED again and the result waits in
+     * join_state for one join to take it. */
+    uint32_t run_gen;            /* bumped when a run ends */
+    uint32_t running;            /* threads of the current run still going */
+    uint32_t join_state;         /* cause of a finished run nobody joined yet */
+    int      has_waiter;         /* a thread is blocked in group_join */
+    int      waiter_done;
+    uint32_t waiter_cause;
+    int32_t  waiter_status;
+    int      has_sched;          /* context-switched (not NON_CONTEXT) */
 } spu_group_t;
 
 static spu_group_t  s_spu_groups[MAX_SPU_GROUPS];
@@ -361,10 +398,26 @@ static uint32_t     s_spu_next_group_id  = 0x1000;
 static uint32_t     s_spu_next_thread_id = 0x2000;
 static int          s_spu_initialized    = 0;
 
+/* Table slots are claimed and published without a lock: several PPU threads
+ * create, look up and destroy groups and threads at once (lv2 serialises
+ * these per object, not globally). in_use is the publication flag -- 0 free,
+ * 2 being filled in, 1 live -- so a lookup that sees 1 (acquire) sees the
+ * slot's id and fields as written before the release that set it. */
+#define SLOT_LIVE(p)      (__atomic_load_n(&(p)->in_use, __ATOMIC_ACQUIRE) == 1)
+#define SLOT_PUBLISH(p)   __atomic_store_n(&(p)->in_use, 1, __ATOMIC_RELEASE)
+#define SLOT_FREE(p)      __atomic_store_n(&(p)->in_use, 0, __ATOMIC_RELEASE)
+static int slot_claim(int* in_use)
+{
+    int z = 0;
+    return __atomic_compare_exchange_n(in_use, &z, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+/* Zero a claimed slot without touching in_use (the first member). */
+#define SLOT_CLEAR(p) memset((char*)(p) + sizeof((p)->in_use), 0, sizeof(*(p)) - sizeof((p)->in_use))
+
 static spu_group_t* spu_find_group(uint32_t id)
 {
     for (int i = 0; i < MAX_SPU_GROUPS; i++) {
-        if (s_spu_groups[i].in_use && s_spu_groups[i].id == id)
+        if (SLOT_LIVE(&s_spu_groups[i]) && s_spu_groups[i].id == id)
             return &s_spu_groups[i];
     }
     return NULL;
@@ -373,14 +426,15 @@ static spu_group_t* spu_find_group(uint32_t id)
 static spu_group_t* spu_alloc_group(void)
 {
     for (int i = 0; i < MAX_SPU_GROUPS; i++) {
-        if (!s_spu_groups[i].in_use) {
-            memset(&s_spu_groups[i], 0, sizeof(s_spu_groups[i]));
-            s_spu_groups[i].in_use = 1;
-            s_spu_groups[i].id     = s_spu_next_group_id++;
-            s_spu_groups[i].state  = SPU_GROUP_STATE_INITIALIZED;
-            s_spu_groups[i].exit_status = 0;
-            s_spu_groups[i].cause  = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
-            return &s_spu_groups[i];
+        spu_group_t* g = &s_spu_groups[i];
+        if (slot_claim(&g->in_use)) {
+            SLOT_CLEAR(g);
+            g->id          = __atomic_fetch_add(&s_spu_next_group_id, 1, __ATOMIC_RELAXED);
+            g->state       = SPU_GROUP_STATE_NOT_INITIALIZED;
+            g->exit_status = 0;
+            g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+            SLOT_PUBLISH(g);
+            return g;
         }
     }
     return NULL;
@@ -389,7 +443,7 @@ static spu_group_t* spu_alloc_group(void)
 static spu_thread_t* spu_find_thread(uint32_t tid)
 {
     for (int i = 0; i < MAX_SPU_THREADS; i++) {
-        if (s_spu_threads[i].in_use && s_spu_threads[i].tid == tid)
+        if (SLOT_LIVE(&s_spu_threads[i]) && s_spu_threads[i].tid == tid)
             return &s_spu_threads[i];
     }
     return NULL;
@@ -398,11 +452,12 @@ static spu_thread_t* spu_find_thread(uint32_t tid)
 static spu_thread_t* spu_alloc_thread(void)
 {
     for (int i = 0; i < MAX_SPU_THREADS; i++) {
-        if (!s_spu_threads[i].in_use) {
-            memset(&s_spu_threads[i], 0, sizeof(s_spu_threads[i]));
-            s_spu_threads[i].in_use = 1;
-            s_spu_threads[i].tid    = s_spu_next_thread_id++;
-            return &s_spu_threads[i];
+        spu_thread_t* t = &s_spu_threads[i];
+        if (slot_claim(&t->in_use)) {
+            SLOT_CLEAR(t);
+            t->tid = __atomic_fetch_add(&s_spu_next_thread_id, 1, __ATOMIC_RELAXED);
+            SLOT_PUBLISH(t);
+            return t;
         }
     }
     return NULL;
@@ -412,20 +467,14 @@ static void vm_write_be32(uint32_t guest_addr, uint32_t val)
 {
     extern uint8_t* vm_base;
     if (!vm_base || !guest_addr) return;
-    uint8_t* p = vm_base + guest_addr;
-    p[0] = (uint8_t)(val >> 24);
-    p[1] = (uint8_t)(val >> 16);
-    p[2] = (uint8_t)(val >>  8);
-    p[3] = (uint8_t)(val);
+    gm_store32(vm_base + guest_addr, __builtin_bswap32(val));   /* single-copy atomic */
 }
 
 static uint32_t vm_read_be32(uint32_t guest_addr)
 {
     extern uint8_t* vm_base;
     if (!vm_base || !guest_addr) return 0;
-    const uint8_t* p = vm_base + guest_addr;
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
+    return __builtin_bswap32(gm_load32(vm_base + guest_addr));
 }
 
 /* syscall 872: sys_ss_get_open_psid(CellSsOpenPSID* psid { u64 high; u64 low })
@@ -479,16 +528,47 @@ static int64_t sys_ss_get_open_psid_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_initialize(nspu, nrawspu) — one-shot global init */
+/* Evaluates v once: it is often a call whose arguments are read from r3. */
+#define LV2_RET(ctx, v) do { const int32_t lv2_ret_ = (int32_t)(v); \
+    (ctx)->gpr[3] = (uint64_t)(int64_t)lv2_ret_; return lv2_ret_; } while (0)
+
+/* SPU limits (RPCS3's spu_limits_t): of the six SPUs a process may use,
+ * max_raw are raw SPUs and max_spu the rest. Context-switched groups share
+ * SPUs, so they count as the largest of them; non-context groups occupy
+ * theirs; a cooperate-with-system group is one shared SPU plus num-1
+ * occupied ones, and there may be only one. */
+static uint32_t s_spu_max_spu = 6, s_spu_max_raw = 0;
+
+static int spu_limits_busy(uint32_t spu_limit, uint32_t raw_limit,
+                           uint32_t physical, uint32_t controllable, uint32_t system_coop)
+{
+    for (int i = 0; i < MAX_SPU_GROUPS; i++) {
+        const spu_group_t* g = &s_spu_groups[i];
+        if (!SLOT_LIVE(g)) continue;
+        if (g->type & 0x20) {
+            system_coop++;
+            if (controllable < 1) controllable = 1;
+            physical += g->num_threads - 1;
+        } else if (g->has_sched) {
+            if (controllable < g->num_threads) controllable = g->num_threads;
+        } else {
+            physical += g->num_threads;
+        }
+    }
+    return spu_limit + raw_limit > 6 || physical >= spu_limit || controllable > spu_limit ||
+           system_coop > 1;
+}
+
+/* sys_spu_initialize(max_usable_spu, max_raw_spu) */
 static int64_t sys_spu_initialize_handler(ppu_context* ctx)
 {
-    uint32_t nspu    = (uint32_t)ctx->gpr[3];
-    uint32_t nrawspu = (uint32_t)ctx->gpr[4];
-    fprintf(stderr, "[SPU] initialize(nspu=%u, nrawspu=%u)\n", nspu, nrawspu);
-    fflush(stderr);
+    const uint32_t max_raw = (uint32_t)ctx->gpr[4];
+    if (max_raw > 5) LV2_RET(ctx, CELL_EINVAL);
+    if (spu_limits_busy(6 - max_raw, max_raw, 0, 0, 0)) LV2_RET(ctx, CELL_EBUSY);
+    s_spu_max_raw = max_raw;
+    s_spu_max_spu = 6 - max_raw;
     s_spu_initialized = 1;
-    ctx->gpr[3] = 0;
-    return 0;
+    LV2_RET(ctx, CELL_OK);
 }
 
 /* sys_spu_thread_group_create(out_id_ea, num, prio, attr_ea)
@@ -509,24 +589,52 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     uint32_t attr_ea  = (uint32_t)ctx->gpr[6];
     fprintf(stderr, "[SPU] thread_group_create(num=%u prio=%d)\n", num, prio);
 
-    spu_group_t* g = spu_alloc_group();
-    if (!g) {
-        fprintf(stderr, "[SPU] group_create: out of groups\n");
-        fflush(stderr);
-        ctx->gpr[3] = (uint64_t)(int64_t)-1; /* EAGAIN-ish */
-        return -1;
+    /* lv2's checks (RPCS3 sys_spu_thread_group_create), for a process
+     * without root permission. Memory containers are not modelled: a
+     * MEMORY_FROM_CONTAINER group is accepted without charging one. */
+    const uint32_t nsize   = vm_read_be32(attr_ea + 0);
+    uint32_t       name_ea = vm_read_be32(attr_ea + 4);
+    const int32_t  gtype   = (int32_t)vm_read_be32(attr_ea + 8);
+    if (nsize > 0x80 || !num) LV2_RET(ctx, CELL_EINVAL);
+    uint32_t max_threads = 6, min_threads = 1;
+    int needs_root = 0, sched = 1;
+    switch (gtype) {
+    case 0x0: case 0x4: case 0x18:
+        break;
+    case 0x20: case 0x22: case 0x24: case 0x26:
+        needs_root = gtype == 0x22 || gtype == 0x26;
+        min_threads = 2;
+        break;
+    case 0x2: case 0x6: case 0xA: case 0x102: case 0x106: case 0x10A:
+    case 0x202: case 0x206: case 0x20A: case 0x902: case 0x906:
+    case 0xA02: case 0xA06: case 0xC02: case 0xC06:
+        if (gtype & 0x700) max_threads = 1;
+        needs_root = 1;
+        break;
+    default:
+        LV2_RET(ctx, CELL_EINVAL);
     }
-    if (num > 8) num = 8;
-    g->num_threads = num;
+    const int coop = (gtype & 0x20) != 0;
+    if (!coop && (gtype & 0x8)) sched = 0;
+    if (num < min_threads || num > max_threads || needs_root ||
+        (sched && !coop && (prio > 255 || prio < 16)))
+        LV2_RET(ctx, CELL_EINVAL);
+    {
+        const uint32_t physical = coop ? num - 1 : sched ? 0 : num;
+        const uint32_t controllable = coop ? 1 : sched ? num : 0;
+        if (s_spu_max_spu + s_spu_max_raw > 6 || physical > s_spu_max_spu || controllable > s_spu_max_spu)
+            LV2_RET(ctx, CELL_EINVAL);
+        if (spu_limits_busy(s_spu_max_spu, s_spu_max_raw, physical, controllable,
+                            controllable && physical ? 1u : 0u))
+            LV2_RET(ctx, CELL_EBUSY);
+    }
 
-    int32_t  gtype   = 0;
-    uint32_t name_ea = 0;
-    if (attr_ea) {
-        uint32_t nsize = vm_read_be32(attr_ea + 0);
-        name_ea        = vm_read_be32(attr_ea + 4);
-        gtype          = (int32_t)vm_read_be32(attr_ea + 8);
-        if (!nsize) name_ea = 0;
-    }
+    spu_group_t* g = spu_alloc_group();
+    if (!g) LV2_RET(ctx, CELL_EAGAIN);
+    g->num_threads = num;
+    g->type        = gtype;
+    g->has_sched   = sched;
+    if (!nsize) name_ea = 0;
     if (name_ea && vm_base) {
         const char* src = (const char*)(vm_base + name_ea);
         size_t i = 0;
@@ -540,130 +648,82 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u prio=%d type=0x%X name=%.31s\n",
             g->id, num, prio, gtype, g->name);
     fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+    LV2_RET(ctx, CELL_OK);
 }
 
-/* HLE SPURS kernel (YDKJ_SPURSKERNEL): libsre hands its 5 cellSpurs SPU threads
- * an EMPTY image (the firmware SPU kernel can't run as static-recompiled code),
- * so group_start would instantly complete them and the SPURS handler asserts the
- * SPU side is dead. Instead, register THIS as the threads' PPU fallback: it runs
- * as a host "SPU" that keeps the group genuinely RUNNING. Minimal first version
- * idles; the full version polls the SPURS taskset (ctx = args_ea) and dispatches
- * the title's lifted SPU task images. */
-#define YDKJ_SPURS_KERNEL_ENTRY 0x5B555253u  /* 'SURS' marker entry */
-/* Project-side runner: runs the REAL lifted SPURS SPU kernel (sk_a, lifted in
- * the title build, not the runtime lib) on this SPU thread. Set by the project
- * at startup (src/ydkj_spurs_kernel.c). If unset, fall back to the idle loop. */
-int32_t (*g_ydkj_spurs_kernel_run)(uint32_t tid, uint32_t args_ea) = 0;
-static int32_t ydkj_hle_spurs_kernel(uint32_t tid, uint32_t args_ea,
-                                     uint32_t args_size, void* user)
-{
-    (void)args_size; (void)user;
-    fprintf(stderr, "[HLE-SPURS] kernel SPU tid=0x%X ctx=0x%08X running\n", tid, args_ea);
-    fflush(stderr);
-    if (g_ydkj_spurs_kernel_run)
-        return g_ydkj_spurs_kernel_run(tid, args_ea);   /* run the lifted kernel */
-    /* Keep the group running so the SPURS handler sees a live SPU. */
-    for (int i = 0; i < 1200; i++) {
-#ifdef _WIN32
-        Sleep(50);
-#else
-        struct timespec ts = {0, 50*1000*1000}; nanosleep(&ts, 0);
-#endif
-    }
-    return 0;
-}
 
 /* sys_spu_thread_initialize(out_tid_ea, group_id, thread_num, img_ea, attr_ea, args_ea) */
+
+/* sys_spu_thread_initialize(thread*, group, spu_num, img*, attr*, arg*): the
+ * kernel's checks (RPCS3's lv2 is the reference for the kernel), then the
+ * image and arguments are copied into the thread. */
 static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
 {
     uint32_t out_tid_ea = (uint32_t)ctx->gpr[3];
     uint32_t group_id   = (uint32_t)ctx->gpr[4];
     uint32_t thread_num = (uint32_t)ctx->gpr[5];
     uint32_t img_ea     = (uint32_t)ctx->gpr[6];
-    /* attr_ea         = (uint32_t)ctx->gpr[7];  // unused */
+    uint32_t attr_ea    = (uint32_t)ctx->gpr[7];
     uint32_t args_ea    = (uint32_t)ctx->gpr[8];
 
+    if (thread_num >= 8) LV2_RET(ctx, CELL_EINVAL);
+    if (!attr_ea || !args_ea || !img_ea || !out_tid_ea) LV2_RET(ctx, CELL_EFAULT);
+    if (vm_read_be32(attr_ea + 4) > 0x80) LV2_RET(ctx, CELL_EINVAL);           /* name_len */
+    if (vm_read_be32(attr_ea + 8) & ~0x3u) LV2_RET(ctx, CELL_EINVAL);          /* option */
+
+    uint32_t entry = 0, nsegs = 0, src = 0;
+    lv2_spu_seg segs[LV2_SPU_MAX_SEGS];
+    const int32_t rr = lv2_spu_image_resolve(img_ea, &entry, segs, &nsegs, &src);
+    if (rr) LV2_RET(ctx, rr);
+    if (vm_read_be32(img_ea) == 0) {             /* USER segments are checked; KERNEL ones came from lv2 */
+        int have_copy = 0, have_info = 0;
+        for (uint32_t i = 0; i < nsegs; i++) {
+            const lv2_spu_seg* g = &segs[i];
+            if (g->type == LV2_SPU_SEG_COPY) {
+                if (g->addr % 4) LV2_RET(ctx, CELL_EINVAL);
+                have_copy = 1;
+            } else if (g->type == LV2_SPU_SEG_INFO) {
+                if (g->size > 256 || have_info) LV2_RET(ctx, CELL_EINVAL);
+                have_info = 1;
+                continue;
+            } else if (g->type != LV2_SPU_SEG_FILL) {
+                LV2_RET(ctx, CELL_EINVAL);
+            }
+            if (!g->size || (g->ls | g->size) % 0x10 || g->ls >= 0x40000 || g->size > 0x40000)
+                LV2_RET(ctx, CELL_EINVAL);
+            for (uint32_t j = 0; j < i; j++)
+                if (segs[j].type != LV2_SPU_SEG_INFO &&
+                    g->ls + g->size > segs[j].ls && segs[j].ls + segs[j].size > g->ls)
+                    LV2_RET(ctx, CELL_EINVAL);       /* overlapping */
+        }
+        if (!have_copy) LV2_RET(ctx, CELL_EINVAL);
+    }
+
     spu_group_t* g = spu_find_group(group_id);
-    if (!g) {
-        fprintf(stderr, "[SPU] thread_init: group 0x%X not found\n", group_id);
-        fflush(stderr);
-        ctx->gpr[3] = (uint64_t)(int64_t)-1;
-        return -1;
-    }
+    if (!g) LV2_RET(ctx, CELL_ESRCH);
+    if (g->state != SPU_GROUP_STATE_NOT_INITIALIZED || (g->init_mask & (1u << thread_num)))
+        LV2_RET(ctx, CELL_EBUSY);
     spu_thread_t* t = spu_alloc_thread();
-    if (!t) {
-        ctx->gpr[3] = (uint64_t)(int64_t)-1;
-        return -1;
-    }
-    t->group_id = group_id;
-    t->index    = thread_num;
-    /* Record the SPURS kernel context EA (the SPU thread's argument) so the
-     * event layer can dispatch the title's real lifted SPU task runtime against
-     * it when a PPU thread blocks waiting for SPU completion. */
-    { extern uint32_t g_ydkj_spurs_ctx_ea; if (args_ea) g_ydkj_spurs_ctx_ea = args_ea; }
-    /* Optional title hook: run the real lifted SPURS kernel on this SPU thread's
-     * context (libsre leaves the kernel image empty + never starts the group). */
-    { extern void (*g_spurs_kernel_hook)(uint32_t); if (g_spurs_kernel_hook) g_spurs_kernel_hook(args_ea); }
-    /* Read entry point from the SPU image struct if available.
-     * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
-    if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
-    t->img_ea    = img_ea;
-    t->args_ea   = args_ea;
-    t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
-    /* lv2 copy semantics: take the four u64s now (see spu_thread_t.args). */
+    if (!t) LV2_RET(ctx, CELL_ENOMEM);
+    t->group_id    = group_id;
+    t->index       = thread_num;
+    t->entry_point = entry;
+    t->img_ea      = img_ea;
+    t->nsegs       = nsegs;
+    memcpy(t->segs, segs, sizeof(lv2_spu_seg) * nsegs);
+    t->img_src     = src;
+    t->args_ea     = args_ea;
+    t->args_size   = 0;
     for (int a = 0; a < 4; a++) {
-        uint64_t hi = args_ea ? vm_read_be32(args_ea + (uint32_t)a * 8)     : 0;
-        uint64_t lo = args_ea ? vm_read_be32(args_ea + (uint32_t)a * 8 + 4) : 0;
+        uint64_t hi = vm_read_be32(args_ea + (uint32_t)a * 8);
+        uint64_t lo = vm_read_be32(args_ea + (uint32_t)a * 8 + 4);
         t->args[a] = (hi << 32) | lo;
     }
-
-    /* Empty image (entry=0) OR the real SPURS kernel-A entry (0x818, now that
-     * _sys_spu_image_import parses the kernel ELF) on a cellSpurs SPU thread ->
-     * route to the HLE SPURS kernel (YDKJ_SPURSKERNEL) so group_start runs a live
-     * SPU instead of an instant no-op. */
-    if ((t->entry_point == 0 || t->entry_point == 0x818) && getenv("YDKJ_SPURSKERNEL")) {
-        t->entry_point = YDKJ_SPURS_KERNEL_ENTRY;
-        static int s_reg = 0;
-        if (!s_reg) { s_reg = 1;
-            spu_register_ppu_fallback(YDKJ_SPURS_KERNEL_ENTRY, ydkj_hle_spurs_kernel, 0); }
-    }
-
-    if (getenv("SPU_IMG_DUMP") && img_ea && thread_num == 0) {
-        uint32_t type  = vm_read_be32(img_ea + 0);
-        uint32_t entry = vm_read_be32(img_ea + 4);
-        uint32_t segs  = vm_read_be32(img_ea + 8);
-        uint32_t nsegs = vm_read_be32(img_ea + 12);
-        fprintf(stderr, "[SPUIMG] img=0x%08X type=0x%X entry=0x%X segs=0x%08X nsegs=%u\n",
-                img_ea, type, entry, segs, nsegs);
-        for (uint32_t s = 0; s < nsegs && s < 8; s++) {
-            uint32_t b = segs + s * 0x18;  /* sys_spu_segment: type,ls,size,src(pa64) */
-            fprintf(stderr, "[SPUIMG]  seg%u type=0x%X ls=0x%X size=0x%X src=0x%08X%08X\n",
-                    s, vm_read_be32(b+0), vm_read_be32(b+4), vm_read_be32(b+8),
-                    vm_read_be32(b+0x10), vm_read_be32(b+0x14));
-        }
-        fflush(stderr);
-    }
-
-    if (thread_num < 8)
-        g->thread_indices[thread_num] = (uint32_t)(t - s_spu_threads);
-
-    /* EXPERIMENT (YDKJ_SPUREADY): the lifted libsre cellSpursInitialize busy-polls the
-     * SPU-thread descriptor field at img_ea+0x38 (e.g. 0x101671A8) for a non-zero
-     * "thread created/ready" status BEFORE it populates the SPURS instance / starts the
-     * group — but nothing in our HLE ever writes it (real lv2 does). Write the tid there
-     * to clear the poll so libsre can proceed past init. Diagnostic; value may need tuning. */
-    if (img_ea && getenv("YDKJ_SPUREADY")) {
-        uint32_t before = vm_read_be32(img_ea + 0x38);
-        vm_write_be32(img_ea + 0x38, t->tid);
-        fprintf(stderr, "[SPUREADY] wrote tid=0x%X to img+0x38=0x%08X (was 0x%08X)\n",
-                t->tid, img_ea + 0x38, before);
-        fflush(stderr);
-    }
-
+    g->thread_indices[thread_num] = (uint32_t)(t - s_spu_threads);
+    g->init_mask |= 1u << thread_num;
+    if ((uint32_t)__builtin_popcount(g->init_mask) == g->num_threads)
+        g->state = SPU_GROUP_STATE_INITIALIZED;
     vm_write_be32(out_tid_ea, t->tid);
-
     fprintf(stderr, "[SPU] thread_init group=0x%X index=%u img=0x%08X args=0x%08X -> tid=0x%X entry=0x%08X\n",
             group_id, thread_num, img_ea, args_ea, t->tid, t->entry_point);
     fflush(stderr);
@@ -698,6 +758,130 @@ static void spu_spawn_host_thread(spu_thread_handle_t* out,
 }
 #endif
 
+static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea, uint32_t args_size, void* user);
+
+/* One lock and condition for every group's run state (start, thread
+ * completion, join, terminate). */
+static SRWLOCK            s_grp_lock = SRWLOCK_INIT;
+/* Guards spu_thread_t.live_ctx. The context it points at is a stack local of
+ * the run that published it: a PPU thread writing that context's mailbox or
+ * signal registers holds this shared, and the run takes it exclusive to
+ * unpublish, so it cannot return (and free the frame) mid-write. */
+static SRWLOCK            s_live_ctx_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_grp_cv   = CONDITION_VARIABLE_INIT;
+
+/* The run is over (lock held): settle cause and status, return the group to
+ * INITIALIZED, and hand the result to a blocked joiner or keep it for the
+ * next join. */
+static void spu_group_run_end_locked(spu_group_t* g)
+{
+    if (g->cause != SPU_GROUP_CAUSE_GROUP_EXIT && g->cause != SPU_GROUP_CAUSE_TERMINATED) {
+        g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+        g->exit_status = 0;
+    }
+    g->running = 0;
+    g->run_gen++;
+    g->state = SPU_GROUP_STATE_INITIALIZED;
+    if (g->has_waiter) {
+        g->waiter_cause  = g->cause;
+        g->waiter_status = g->exit_status;
+        g->waiter_done   = 1;
+        g->join_state    = 0;
+    } else {
+        g->join_state = g->cause;
+    }
+    WakeAllConditionVariable(&s_grp_cv);
+}
+
+/* Ask every running thread of the group to stop: each checks at its next
+ * channel wait, interpreter step or lifted trampoline. Wakes the ones parked
+ * in a channel read. Holds s_grp_lock (s_live_ctx_lock is taken inside).
+ * Returns how many were asked. */
+static int spu_group_request_stop_locked(spu_group_t* g)
+{
+    int asked = 0;
+    AcquireSRWLockShared(&s_live_ctx_lock);
+    for (int i = 0; i < 8; i++) {
+        if (!(g->init_mask & (1u << i))) continue;
+        uint32_t idx = g->thread_indices[i];
+        if (idx >= MAX_SPU_THREADS) continue;
+        spu_thread_t* t = &s_spu_threads[idx];
+        if (!__atomic_load_n(&t->running, __ATOMIC_ACQUIRE)) continue;
+        spu_context* c = t->live_ctx ? (spu_context*)t->live_ctx : t->sctx;
+        if (!c) continue;
+        __atomic_store_n(&c->stop_request, 1u, __ATOMIC_RELEASE);
+        extern void spu_ch_wake(spu_context*);
+        spu_ch_wake(c);
+        asked++;
+    }
+    ReleaseSRWLockShared(&s_live_ctx_lock);
+    return asked;
+}
+
+/* Wait, bounded, until none of the group's threads is running. Holds
+ * s_grp_lock on entry and exit, not while it sleeps. Returns 1 if they all
+ * stopped. */
+static int spu_group_wait_stopped_locked(spu_group_t* g, int max_ms)
+{
+    for (int ms = 0;; ms++) {
+        int any = 0;
+        for (int i = 0; i < 8; i++) {
+            if (!(g->init_mask & (1u << i))) continue;
+            uint32_t idx = g->thread_indices[i];
+            if (idx < MAX_SPU_THREADS && __atomic_load_n(&s_spu_threads[idx].running, __ATOMIC_ACQUIRE))
+                any = 1;
+        }
+        if (!any) return 1;
+        if (ms >= max_ms) return 0;
+        ReleaseSRWLockExclusive(&s_grp_lock);
+#ifdef _WIN32
+        Sleep(1);
+#else
+        { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
+#endif
+        AcquireSRWLockExclusive(&s_grp_lock);
+    }
+}
+
+/* A thread of the run `gen` has stopped; a group exit it made ends the run. */
+static void spu_group_thread_done(uint32_t group_id, uint32_t gen, int group_exit, int32_t gstatus)
+{
+    AcquireSRWLockExclusive(&s_grp_lock);
+    spu_group_t* g = spu_find_group(group_id);
+    if (g && g->state == SPU_GROUP_STATE_RUNNING && gen == g->run_gen) {
+        if (group_exit) {
+            g->cause       = SPU_GROUP_CAUSE_GROUP_EXIT;
+            g->exit_status = gstatus;
+            spu_group_request_stop_locked(g);       /* lv2 stops the other threads */
+            spu_group_run_end_locked(g);
+        } else if (--g->running == 0) {
+            spu_group_run_end_locked(g);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_grp_lock);
+}
+
+/* Reap host threads of earlier runs that have finished. */
+static void spu_group_reap(spu_group_t* g)
+{
+    for (int i = 0; i < 8; i++) {               /* slots are thread indices 0..7 */
+        if (!(g->init_mask & (1u << i))) continue;
+        uint32_t idx = g->thread_indices[i];
+        if (idx >= MAX_SPU_THREADS) continue;
+        spu_thread_t* t = &s_spu_threads[idx];
+        if (!t->host_live || __atomic_load_n(&t->running, __ATOMIC_ACQUIRE)) continue;
+#ifdef _WIN32
+        if (t->host_thread) { WaitForSingleObject(t->host_thread, INFINITE); CloseHandle(t->host_thread); }
+        t->host_thread = NULL;
+#else
+        pthread_join(t->host_thread, NULL);
+        pthread_mutex_destroy(&t->finish_event.mu);
+        pthread_cond_destroy(&t->finish_event.cv);
+#endif
+        t->host_live = 0;
+    }
+}
+
 /* Host-thread entry for a thread running its image's own lifted SPU code.
  *
  * Everything SPU here is in runtime/spu/spu_lifted_thread.c; this is the part
@@ -716,27 +900,20 @@ static void* spu_exec_thread_proc(void* arg)
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
-    if (r.group_exit) {
-        spu_group_t* g = spu_find_group(t->group_id);
-        if (g) {
-            g->exit_status = r.group_status;
-            /* Say the group exited on its own request. group_join used to
-             * overwrite the cause unconditionally, which made a guest-initiated
-             * sys_spu_thread_group_exit indistinguishable from every thread
-             * simply running out. */
-            g->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
-        }
-    }
 #ifdef _WIN32
-    t->running = 0;
+    __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
     SetEvent(t->finish_event);
-    return 0;
 #else
     pthread_mutex_lock(&t->finish_event.mu);
-    t->running = 0;
+    __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
     t->finish_event.done = 1;
     pthread_cond_broadcast(&t->finish_event.cv);
     pthread_mutex_unlock(&t->finish_event.mu);
+#endif
+    spu_group_thread_done(t->group_id, t->run_gen, r.group_exit, r.group_status);
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
 #endif
 }
@@ -768,17 +945,27 @@ static void* spu_fallback_thread_proc(void* arg)
         fprintf(stderr, "[SPU-DONE-EVT] tid=0x%X rc=0x%X -> queue=%u\n",
                 t->tid, rc, t->connected_queue);
     }
-    /* Mark complete and signal anyone waiting in group_join. */
+    /* Mark complete, then let the group see the thread stop. */
+    {
+        extern SPU_THREAD_LOCAL int g_spu_interp_group_exit_valid;
+        extern SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status;
+        const int gx = t->fb_handler == spu_interp_fallback && g_spu_interp_group_exit_valid;
+        const int32_t gs = g_spu_interp_group_exit_status;
 #ifdef _WIN32
-    t->running = 0;
-    SetEvent(t->finish_event);
+        __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
+        SetEvent(t->finish_event);
+#else
+        pthread_mutex_lock(&t->finish_event.mu);
+        __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
+        t->finish_event.done = 1;
+        pthread_cond_broadcast(&t->finish_event.cv);
+        pthread_mutex_unlock(&t->finish_event.mu);
+#endif
+        spu_group_thread_done(t->group_id, t->run_gen, gx, gs);
+    }
+#ifdef _WIN32
     return 0;
 #else
-    pthread_mutex_lock(&t->finish_event.mu);
-    t->running = 0;
-    t->finish_event.done = 1;
-    pthread_cond_broadcast(&t->finish_event.cv);
-    pthread_mutex_unlock(&t->finish_event.mu);
     return NULL;
 #endif
 }
@@ -787,25 +974,11 @@ static void* spu_fallback_thread_proc(void* arg)
  * (type 1) are memcpy'd from their guest source EA; FILL segments (type 2) are
  * zeroed. Mirrors sys_spu_image_import's segment layout {type,ls_start,size,
  * src(pa64)} (0x18 bytes each). Returns the entry point, or 0 on failure. */
-static uint32_t spu_load_image_to_ls(uint32_t img_ea, uint8_t* ls)
+static uint32_t spu_load_image_to_ls(const spu_thread_t* t, uint8_t* ls)
 {
-    if (!img_ea || !ls || !vm_base) return 0;
-    uint32_t entry = vm_read_be32(img_ea + 4);
-    uint32_t segs  = vm_read_be32(img_ea + 8);
-    uint32_t nsegs = vm_read_be32(img_ea + 12);
-    for (uint32_t s = 0; s < nsegs && s < 64; s++) {
-        uint32_t b        = segs + s * 0x18;
-        uint32_t type     = vm_read_be32(b + 0x00);
-        uint32_t ls_start = vm_read_be32(b + 0x04) & (SPU_LS_SIZE - 1);
-        uint32_t size     = vm_read_be32(b + 0x08);
-        uint32_t src_lo   = vm_read_be32(b + 0x14);
-        if (ls_start + size > SPU_LS_SIZE) size = SPU_LS_SIZE - ls_start;
-        if (type == 1 && src_lo)              /* COPY: guest EA -> LS */
-            memcpy(ls + ls_start, vm_base + src_lo, size);
-        else if (type == 2)                   /* FILL: zero */
-            memset(ls + ls_start, 0, size);
-    }
-    return entry;
+    if (!t || !ls) return 0;
+    lv2_spu_load_segments(t->segs, t->nsegs, ls);
+    return t->entry_point;
 }
 
 /* PPU-fallback that runs an un-lifted SPU thread via the interpreter. Registered
@@ -825,7 +998,7 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
     if (!t) return -1;
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
     if (!ls) return -1;
-    uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+    uint32_t entry = spu_load_image_to_ls(t, ls);
     if (getenv("SPU_ARGS_DUMP") && vm_base && args_ea) {
         fprintf(stderr, "[SPU-ARGS] tid=0x%X args@0x%08X:", tid, args_ea);
         for (int i = 0; i < 8; i++) fprintf(stderr, " %08X", vm_read_be32(args_ea + i*4));
@@ -833,11 +1006,14 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
     }
     fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
             tid, entry, t->img_ea, args_ea);
-    int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1,  /* pure interp: no fast-path rejoin */
+    int32_t sc = spu_run_interp_job(ls, entry, t->args, -1,  /* pure interp: no fast-path rejoin */
                                     t->tid, t->group_id, 0); /* identify for mbox->event delivery */
-    { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+    { extern SPU_THREAD_LOCAL uint32_t g_spu_interp_last_pc; extern SPU_THREAD_LOCAL uint64_t g_spu_interp_steps;
       fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
               tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
+    { extern SPU_THREAD_LOCAL int g_spu_interp_exit_valid;
+      extern SPU_THREAD_LOCAL int32_t g_spu_interp_exit_status;
+      if (g_spu_interp_exit_valid) return g_spu_interp_exit_status; }
     return sc;
 }
 
@@ -850,6 +1026,12 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
 int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 {
     if (!getenv("RD_SPU_INTERP")) return 0;
+    /* This re-runs a worker on the calling PPU thread, which is only right in
+     * the synchronous sim mode, where the worker has no host thread of its
+     * own. With real SPU threads (RD_SPU_INTERP_ASYNC) the worker is already
+     * running and drains its own queue; a second run here would execute the
+     * same SPU program twice at once. */
+    if (getenv("RD_SPU_INTERP_ASYNC")) return 0;
     /* Two callers reach here: an event-port send, which carries the frame's
      * work descriptor in data2, and the blocking-receive path, which has none
      * and passes 0. A worker started without a descriptor reads an empty inbox,
@@ -864,10 +1046,10 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
     }
     for (uint32_t i = 0; i < MAX_SPU_THREADS; i++) {
         spu_thread_t* t = &s_spu_threads[i];
-        if (!t->in_use || t->connected_queue != comp_queue || !t->img_ea) continue;
+        if (!SLOT_LIVE(t) || t->connected_queue != comp_queue || !t->img_ea) continue;
         uint8_t* ls = spu_thread_get_or_alloc_ls(t);
         if (!ls) return 0;
-        uint32_t entry = spu_load_image_to_ls(t->img_ea, ls);
+        uint32_t entry = spu_load_image_to_ls(t, ls);
         fprintf(stderr, "[SPU-FRAME] tid=0x%X q=%u work=0x%08X -> re-run\n",
                 t->tid, comp_queue, work_ea);
         /* Seed the inbound mailbox with the work descriptor when we HAVE one.
@@ -886,8 +1068,8 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * pointers are where the job DMAs from and to, so a job that writes
          * only scratch is either reading the wrong descriptor or the descriptor
          * does not name the buffer we expect. */
-        { static int _wd = -1; if (_wd < 0) _wd = getenv("SPU_WORKDESC_DUMP") ? 1 : 0;
-          if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 3) {
+        { static _Atomic int _wd = -1; if (_wd < 0) _wd = getenv("SPU_WORKDESC_DUMP") ? 1 : 0;
+          if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 3) {
               fprintf(stderr, "[WORKDESC] tid=0x%X ea=0x%08X:%c", t->tid, work_ea, 10);
               for (int r = 0; r < 16; r++) {
                   fprintf(stderr, "  +0x%03X:", r * 16);
@@ -895,14 +1077,14 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
                       fprintf(stderr, " %08X", vm_read_be32(work_ea + r*16 + c*4));
                   fprintf(stderr, "%c", 10);
               } } } }
-        { static int _wh = -1; if (_wh < 0) _wh = getenv("SPU_WORKDESC_HDR") ? 1 : 0;
-          if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 40)
+        { static _Atomic int _wh = -1; if (_wh < 0) _wh = getenv("SPU_WORKDESC_HDR") ? 1 : 0;
+          if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 40)
               fprintf(stderr, "[WORKHDR] tid=0x%X ea=0x%08X w0=%u w1=%u f2=%g f3=%g%c",
                       t->tid, work_ea, vm_read_be32(work_ea), vm_read_be32(work_ea+4),
                       (double)*(const float*)&(const uint32_t){0}, 0.0, 10); }
           if (_wh && work_ea > 0x1000000u && vm_base) { } }
-        { static int _sd = -1; if (_sd < 0) _sd = getenv("SPU_SEED_DBG") ? 1 : 0;
-          if (_sd) { static int _n = 0; if (_n++ < 12)
+        { static _Atomic int _sd = -1; if (_sd < 0) _sd = getenv("SPU_SEED_DBG") ? 1 : 0;
+          if (_sd) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 12)
               fprintf(stderr, "[SPU-SEED] tid=0x%X entry=0x%05X args=0x%08X seed=0x%08X%c",
                       t->tid, entry, t->args_ea, work_ea, 10); } }
         /* Do NOT seed the inbound mailbox. It is the reply channel for the
@@ -910,17 +1092,17 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * worker's spu_printf helper treats a non-empty inbox as EBUSY. The
          * work descriptor reaches the SPU through that service instead. */
         LARGE_INTEGER _t0, _t1, _fq; QueryPerformanceCounter(&_t0);
-        int32_t frc = spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
+        int32_t frc = spu_run_interp_job(ls, entry, t->args, -1, t->tid, t->group_id,
                                          getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
-        { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
+        { static _Atomic int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
-              extern uint64_t g_spu_interp_steps;
+              extern SPU_THREAD_LOCAL uint64_t g_spu_interp_steps;
               double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
-              static int _n = 0; if (_n++ < 20)
+              static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 20)
                   fprintf(stderr, "[spu-speed] tid=0x%X %llu insns in %.3f s = %.1f M/s%c",
                           t->tid, (unsigned long long)g_spu_interp_steps, sec,
                           sec > 0 ? g_spu_interp_steps / sec / 1e6 : 0.0, 10); } }
-        { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+        { extern SPU_THREAD_LOCAL uint32_t g_spu_interp_last_pc; extern SPU_THREAD_LOCAL uint64_t g_spu_interp_steps;
           fprintf(stderr, "[SPU-FRAME] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
                   t->tid, frc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
         return 1;
@@ -929,17 +1111,31 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 }
 
 /* sys_spu_thread_group_start(id) */
+extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
 {
     uint32_t id = (uint32_t)ctx->gpr[3];
     spu_group_t* g = spu_find_group(id);
-    if (!g) { ctx->gpr[3] = (uint64_t)(int64_t)-1; return -1; }
-    g->state = SPU_GROUP_STATE_RUNNING;
-    /* This run has produced no cause yet. group_join now preserves a cause a
-     * thread reported, so a group id started a second time has to begin with a
-     * clean one or it would report the previous run's exit forever. */
+    if (!g) LV2_RET(ctx, CELL_ESRCH);
+    spu_group_reap(g);
+    AcquireSRWLockExclusive(&s_grp_lock);
+    if (g->state != SPU_GROUP_STATE_INITIALIZED) {
+        ReleaseSRWLockExclusive(&s_grp_lock);
+        LV2_RET(ctx, CELL_ESTAT);
+    }
+    /* A new run: no cause yet, an unjoined result of the previous run is
+     * dropped (lv2 clears join_state at start), and `running` holds a guard
+     * reference until every thread is launched, so one that finishes at once
+     * cannot end the run before its siblings have started. */
+    g->state       = SPU_GROUP_STATE_RUNNING;
     g->cause       = 0;
     g->exit_status = 0;
+    g->join_state  = 0;
+    g->running     = 1;
+    const uint32_t gen = g->run_gen;
+    ReleaseSRWLockExclusive(&s_grp_lock);
+    if (g->run_queue_id)
+        sys_event_queue_push_by_id(g->run_queue_id, 0xFFFFFFFF53505500ull, (uint64_t)id, 0, 0);
 
     /* DIAG (YDKJ_INSTDUMP): dump the CellSpurs instance at group_start time, to
      * see whether libsre has populated it BEFORE the SPU kernel threads spawn.
@@ -956,7 +1152,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
       static int s_d = 0;
       if (vm_base && s_d < 4) {
         s_d++;
-        static int _idump = -1;
+        static _Atomic int _idump = -1;
         if (_idump < 0) _idump = getenv("YDKJ_INSTDUMP") ? 1 : 0;
         /* Dump BOTH candidate instance addrs: the real one is 0x40009F00 (init arg);
          * 0x40009D00 was the old hardcoded guess. See which libsre actually populated. */
@@ -993,18 +1189,33 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     int spawned = 0;
     int instant = 0;
     int nofb    = 0;   /* subset of `instant` that had no fallback at all */
-    for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
+    /* A thread sits at its own index (0..7), not packed below num_threads: lv2
+     * lets a one-thread group use index 5, as inFamous's Bink group does. */
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(g->init_mask & (1u << i))) continue;
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
         spu_thread_t* t = &s_spu_threads[idx];
-        if (!t->in_use) continue;
+        if (!SLOT_LIVE(t)) continue;
 
         /* Real SPU execution first. If the title registered lifted code for
          * this thread's image, the thread runs THAT -- on its own host thread,
          * as a real SPU would, with group_join waiting on it exactly as it
          * waits on a fallback thread. Images with no lifted code fall through
          * to the fallback and interpreter paths below, unchanged. */
-        if (spu_lifted_thread_available(t->entry_point)) {
+        /* Which lifted image is this? By content first: images very often
+         * share an entry address (every plain SPU program starting at LS 0),
+         * so "some image has a function at the entry" picks one of them
+         * arbitrarily, and the thread would run another program's code. The
+         * fingerprint names the image exactly; the entry lookup stays for
+         * images registered without one. */
+        int fp_img = 0;
+        if (t->img_src && vm_base) {
+            size_t isz = spu_elf_image_size(vm_base + t->img_src, 1u << 20);
+            if (isz && !spu_workload_find_img(spu_workload_fingerprint(vm_base + t->img_src, isz), &fp_img))
+                fp_img = 0;
+        }
+        if (fp_img > 0 || spu_lifted_thread_available(t->entry_point)) {
             if (!t->sctx) t->sctx = (spu_context*)calloc(1, sizeof(spu_context));
             if (t->sctx) {
                 spu_lifted_thread_desc d;
@@ -1012,9 +1223,24 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 d.group_id = id;
                 d.entry    = t->entry_point;
                 d.img_ea   = t->img_ea;
+                d.image_id = fp_img;
+                d.segs     = (const struct lv2_spu_seg_s*)t->segs;
+                d.nsegs    = t->nsegs;
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
-                t->running = 1;
+                /* Logged before the thread starts: it owns the registers after. */
+                fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
+                        "args=0x%08X -> LIFTED SPU execution (image %d, "
+                        "r3=0x%08X%08X r4=0x%08X%08X r5=0x%08X%08X r6=0x%08X%08X)\n",
+                        id, t->tid, t->entry_point, t->args_ea, t->sctx->image_id,
+                        t->sctx->gpr[3]._u32[0], t->sctx->gpr[3]._u32[1],
+                        t->sctx->gpr[4]._u32[0], t->sctx->gpr[4]._u32[1],
+                        t->sctx->gpr[5]._u32[0], t->sctx->gpr[5]._u32[1],
+                        t->sctx->gpr[6]._u32[0], t->sctx->gpr[6]._u32[1]);
+                __atomic_store_n(&t->running, 1, __ATOMIC_RELEASE);
+                t->run_gen = gen;
+                t->host_live = 1;
+                AcquireSRWLockExclusive(&s_grp_lock); g->running++; ReleaseSRWLockExclusive(&s_grp_lock);
 #ifdef _WIN32
                 if (!t->finish_event)
                     t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -1029,14 +1255,6 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 t->finish_event.done = 0;
                 spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t);
 #endif
-                fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
-                        "args=0x%08X -> LIFTED SPU execution (image %d, "
-                        "r3=0x%08X%08X r4=0x%08X%08X r5=0x%08X%08X r6=0x%08X%08X)\n",
-                        id, t->tid, t->entry_point, t->args_ea, t->sctx->image_id,
-                        t->sctx->gpr[3]._u32[0], t->sctx->gpr[3]._u32[1],
-                        t->sctx->gpr[4]._u32[0], t->sctx->gpr[4]._u32[1],
-                        t->sctx->gpr[5]._u32[0], t->sctx->gpr[5]._u32[1],
-                        t->sctx->gpr[6]._u32[0], t->sctx->gpr[6]._u32[1]);
                 spawned++;
                 continue;
             }
@@ -1050,9 +1268,8 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * existed; only the SPURS path consulted this one, so a title driving
          * plain SPU thread groups never ran a line of its lifted SPU code. */
         if (!fb && t->img_ea && vm_base) {
-            extern uint32_t ps3_spu_image_source_ea(uint32_t img_ea);
             extern int32_t spu_registry_fallback(uint32_t, uint32_t, uint32_t, void*);
-            uint32_t src = ps3_spu_image_source_ea(t->img_ea);
+            uint32_t src = t->img_src;
             size_t isz = src ? spu_elf_image_size(vm_base + src, 1u << 20) : 0;
             if (isz) {
                 uint64_t fp = spu_workload_fingerprint(vm_base + src, isz);
@@ -1098,22 +1315,22 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 }
             }
         }
-        if (!fb && getenv("RD_SPU_INTERP") && t->img_ea) {
-            /* No lifted fallback: interpret the image instead of instant-
-             * completing. Additive + env-gated so it can't destabilize titles
-             * that rely on a registered fallback. */
+        if (!fb && t->img_ea) {
+            /* No lifted code: the image runs on the interpreter. (It used to
+             * "complete" instantly with status 0 unless RD_SPU_INTERP was set --
+             * an SPU thread that never ran, reported as successful.) */
             fb = spu_interp_fallback;
             user = NULL;
         }
         if (!fb) {
             t->exit_status = 0;
-            t->running = 0;
+            __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
             instant++; nofb++;
             continue;
         }
         t->fb_handler = fb;
         t->fb_user    = user;
-        t->running    = 1;
+        __atomic_store_n(&t->running, 1, __ATOMIC_RELEASE);
         /* Interpreted sim jobs are fire-and-forget compute (DMA in -> compute ->
          * DMA out -> stop) that don't block on PPU input mid-run. Running them on
          * an async host thread races the PPU's own use of the results (e.g. the
@@ -1130,11 +1347,24 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * mailbox word: one run consumed it, the other polled an empty box and
          * parked, and which got it varied run to run. */
         if (fb == spu_interp_fallback && !getenv("RD_SPU_INTERP_ASYNC")) {
+            extern SPU_THREAD_LOCAL int g_spu_interp_group_exit_valid;
+            extern SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status;
             t->exit_status = fb(t->tid, t->args_ea, t->args_size, user);
-            t->running = 0;
+            __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
+            if (g_spu_interp_group_exit_valid) {
+                AcquireSRWLockExclusive(&s_grp_lock);
+                if (g->state == SPU_GROUP_STATE_RUNNING && g->run_gen == gen) {
+                    g->cause       = SPU_GROUP_CAUSE_GROUP_EXIT;
+                    g->exit_status = g_spu_interp_group_exit_status;
+                }
+                ReleaseSRWLockExclusive(&s_grp_lock);
+            }
             instant++;
             continue;
         }
+        t->run_gen = gen;
+        t->host_live = 1;
+        AcquireSRWLockExclusive(&s_grp_lock); g->running++; ReleaseSRWLockExclusive(&s_grp_lock);
 #ifdef _WIN32
         /* Manual-reset event so multiple group_join callers all see "set" */
         if (!t->finish_event)
@@ -1163,14 +1393,16 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * flag for the same reason.
          *
          * Bounded, so a worker that dies during init cannot hang group_start. */
-        if (fb == spu_registry_fallback) {
-            for (int spin = 0; spin < 2000 && !t->live_ctx && t->running; spin++)
+        if (fb == spu_registry_fallback || fb == spu_interp_fallback) {
+            for (int spin = 0; spin < 2000 && !__atomic_load_n(&t->live_ctx, __ATOMIC_ACQUIRE) &&
+                               __atomic_load_n(&t->running, __ATOMIC_ACQUIRE); spin++)
 #ifdef _WIN32
                 Sleep(1);
 #else
                 { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
 #endif
-            if (!t->live_ctx)
+            if (!__atomic_load_n(&t->live_ctx, __ATOMIC_ACQUIRE) &&
+                __atomic_load_n(&t->running, __ATOMIC_ACQUIRE))
                 fprintf(stderr, "[SPU] group_start tid=0x%X: worker never published "
                         "a context -- mailbox writes will fall back to re-runs\n",
                         t->tid);
@@ -1180,10 +1412,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         spawned++;
     }
 
+    /* Drop the guard; if every thread already finished (or none was
+     * launched), the run ends here. */
+    AcquireSRWLockExclusive(&s_grp_lock);
+    if (g->state == SPU_GROUP_STATE_RUNNING && g->run_gen == gen && --g->running == 0)
+        spu_group_run_end_locked(g);
+    ReleaseSRWLockExclusive(&s_grp_lock);
     if (spawned == 0) {
-        g->state = SPU_GROUP_STATE_STOPPED;
-        g->cause = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
-        g->exit_status = 0;
         /* `instant` counts BOTH no-fallback threads and threads that ran to
          * completion synchronously (the interpreter path). Reporting "no
          * fallback" whenever spawned==0 hid a perfectly working interpreted
@@ -1199,96 +1434,50 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_group_join(id, *cause, *status) */
+/* sys_spu_thread_group_join(id, *cause, *status)
+ *
+ * As lv2: ESTAT before every thread is initialized; EBUSY while another
+ * thread is joining; a run that ended and was not joined yet is returned at
+ * once (and only once); otherwise the caller sleeps until the current -- or,
+ * for a group that is not running, the next -- run ends. */
 static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
 {
     uint32_t id         = (uint32_t)ctx->gpr[3];
     uint32_t cause_ea   = (uint32_t)ctx->gpr[4];
     uint32_t status_ea  = (uint32_t)ctx->gpr[5];
 
+    AcquireSRWLockExclusive(&s_grp_lock);
     spu_group_t* g = spu_find_group(id);
-    if (!g) {
-        /* Unknown group id — Sony returns CELL_ESRCH but we've seen
-         * games probe with stale IDs, so be lenient and fake a success. */
-        vm_write_be32(cause_ea,  SPU_GROUP_CAUSE_ALL_THREADS_EXIT);
-        vm_write_be32(status_ea, 0);
-        fprintf(stderr, "[SPU] group_join id=0x%X (unknown, faked ok)\n", id);
-        fflush(stderr);
-        ctx->gpr[3] = 0;
-        return 0;
+    if (!g) { ReleaseSRWLockExclusive(&s_grp_lock); LV2_RET(ctx, CELL_ESRCH); }
+    if (g->state == SPU_GROUP_STATE_NOT_INITIALIZED) {
+        ReleaseSRWLockExclusive(&s_grp_lock);
+        LV2_RET(ctx, CELL_ESTAT);
     }
-    /* If the group was never started, mark it stopped so a subsequent
-     * destroy doesn't trip a "still running" check. */
-    if (g->state == SPU_GROUP_STATE_INITIALIZED ||
-        g->state == SPU_GROUP_STATE_READY) {
-        g->state = SPU_GROUP_STATE_STOPPED;
+    if (g->has_waiter) { ReleaseSRWLockExclusive(&s_grp_lock); LV2_RET(ctx, CELL_EBUSY); }
+    uint32_t cause;
+    int32_t  status;
+    if (g->state == SPU_GROUP_STATE_INITIALIZED && g->join_state) {
+        cause  = g->join_state;
+        status = g->exit_status;
+        g->join_state = 0;
+    } else {
+        g->has_waiter  = 1;
+        g->waiter_done = 0;
+        while (!g->waiter_done)
+            SleepConditionVariableSRW(&s_grp_cv, &s_grp_lock, INFINITE, 0);
+        g->has_waiter = 0;
+        cause  = g->waiter_cause;
+        status = g->waiter_status;
     }
+    ReleaseSRWLockExclusive(&s_grp_lock);
+    spu_group_reap(g);
 
-    /* Wait for any host-thread fallbacks to finish, then collect the
-     * worst exit status. Real SPU group_join is a blocking syscall —
-     * games rely on it to know all SPU work is done before reading
-     * back results. */
-    if (g->state == SPU_GROUP_STATE_RUNNING) {
-        int32_t worst = 0;
-        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
-            uint32_t idx = g->thread_indices[i];
-            if (idx >= MAX_SPU_THREADS) continue;
-            spu_thread_t* t = &s_spu_threads[idx];
-            if (!t->in_use) continue;
-            if (t->running) {
-#ifdef _WIN32
-                if (t->finish_event)
-                    WaitForSingleObject(t->finish_event, INFINITE);
-                if (t->host_thread) {
-                    CloseHandle(t->host_thread);
-                    t->host_thread = NULL;
-                }
-#else
-                pthread_mutex_lock(&t->finish_event.mu);
-                while (!t->finish_event.done)
-                    pthread_cond_wait(&t->finish_event.cv, &t->finish_event.mu);
-                pthread_mutex_unlock(&t->finish_event.mu);
-                pthread_join(t->host_thread, NULL);
-                pthread_mutex_destroy(&t->finish_event.mu);
-                pthread_cond_destroy(&t->finish_event.cv);
-#endif
-            }
-            if (t->exit_status < worst) worst = t->exit_status;
-        }
-        /* ALL_THREADS_EXIT is only the DEFAULT. A thread that stopped on
-         * the SPU-side sys_spu_thread_group_exit already recorded GROUP_EXIT
-         * and the status it asked for, and a terminate recorded TERMINATED;
-         * overwriting either made a group the guest deliberately exited
-         * indistinguishable from one whose threads merely ran out. Cause 0 is
-         * the unset sentinel (GROUP_EXIT=1, ALL_THREADS_EXIT=2, TERMINATED=4). */
-        if (g->cause != SPU_GROUP_CAUSE_GROUP_EXIT &&
-            g->cause != SPU_GROUP_CAUSE_TERMINATED) {
-            g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
-            g->exit_status = worst;
-        }
-        g->state       = SPU_GROUP_STATE_STOPPED;
-    }
-
-    /* Notify any connected event queue. Real PS3 sends a SYS_SPU_THREAD_GROUP
-     * event with type-specific data; we collapse to a "group stopped" tag
-     * (data1 = group_id, data2 = exit_status, data3 = cause). PPU code
-     * blocked in sys_event_queue_receive on this queue wakes up here. */
-    if (g->event_queue_id) {
-        sys_event_queue_push_by_id(g->event_queue_id,
-                                   (uint64_t)g->id,
-                                   (uint64_t)(int64_t)g->exit_status,
-                                   (uint64_t)g->cause,
-                                   0);
-    }
-
-    vm_write_be32(cause_ea,  g->cause);
-    vm_write_be32(status_ea, (uint32_t)g->exit_status);
-
+    if (cause_ea)  vm_write_be32(cause_ea,  cause);
+    if (status_ea) vm_write_be32(status_ea, (uint32_t)status);
     fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
-            id, g->cause, g->exit_status, g->event_queue_id);
+            id, cause, status, g->event_queue_id);
     fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+    LV2_RET(ctx, CELL_OK);
 }
 
 /* sys_spu_thread_group_destroy(id) */
@@ -1308,23 +1497,48 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
         return 0;
     }
     spu_group_t* g = spu_find_group(id);
-    if (g) {
-        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+    if (!g) LV2_RET(ctx, CELL_ESRCH);
+    /* EBUSY while a run is in progress (lv2: state above INITIALIZED). */
+    if (g->state == SPU_GROUP_STATE_RUNNING) LV2_RET(ctx, CELL_EBUSY);
+    /* A run that ended by group exit or terminate can leave a thread still
+     * finishing on its host thread; it must be gone before its context is. */
+    int stopped;
+    AcquireSRWLockExclusive(&s_grp_lock);
+    spu_group_request_stop_locked(g);
+    stopped = spu_group_wait_stopped_locked(g, 5000);
+    ReleaseSRWLockExclusive(&s_grp_lock);
+    spu_group_reap(g);
+    {
+        for (int i = 0; i < 8; i++) {
             uint32_t idx = g->thread_indices[i];
-            if (idx < MAX_SPU_THREADS) {
+            if ((g->init_mask & (1u << i)) && idx < MAX_SPU_THREADS) {
                 spu_thread_t* t = &s_spu_threads[idx];
                 if (t->local_store) {
                     free(t->local_store);
                     t->local_store = NULL;
                 }
-                if (t->sctx) {
+                if (t->sctx && !stopped && __atomic_load_n(&t->running, __ATOMIC_ACQUIRE)) {
+                    fprintf(stderr, "[SPU] group_destroy id=0x%X: tid=0x%X still running after "
+                            "5 s -- leaking its context rather than freeing it under it\n", id, t->tid);
+                    t->sctx = NULL;
+                } else if (t->sctx) {
+                    /* Out of every table keyed by the context's address first:
+                     * the coherence registry would otherwise notify freed
+                     * memory (mcx X5 under ThreadSanitizer: SEGV in
+                     * notify_spus), and the MFC slot registry would hand the
+                     * dead context's queue and tag state to the next context
+                     * calloc places at the same address. */
+                    extern void spu_coh_unregister(spu_context*);
+                    extern void spu_mfc_release(spu_context*);
+                    spu_coh_unregister(t->sctx);
+                    spu_mfc_release(t->sctx);
                     free(t->sctx);
                     t->sctx = NULL;
                 }
-                t->in_use = 0;
+                SLOT_FREE(t);
             }
         }
-        g->in_use = 0;
+        SLOT_FREE(g);
     }
     fprintf(stderr, "[SPU] group_destroy id=0x%X  caller_lr=0x%08X cia=0x%08X r3..r6=%08X %08X %08X %08X\n",
             id, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
@@ -1340,16 +1554,46 @@ static int64_t sys_spu_thread_group_terminate_handler(ppu_context* ctx)
 {
     uint32_t id     = (uint32_t)ctx->gpr[3];
     int32_t  status = (int32_t)ctx->gpr[4];
+    AcquireSRWLockExclusive(&s_grp_lock);
     spu_group_t* g = spu_find_group(id);
-    if (g) {
-        g->state = SPU_GROUP_STATE_STOPPED;
-        g->cause = SPU_GROUP_CAUSE_TERMINATED;
-        g->exit_status = status;
+    if (!g) { ReleaseSRWLockExclusive(&s_grp_lock); LV2_RET(ctx, CELL_ESRCH); }
+    if (g->state != SPU_GROUP_STATE_RUNNING) {
+        ReleaseSRWLockExclusive(&s_grp_lock);
+        LV2_RET(ctx, CELL_ESTAT);
     }
-    fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d\n", id, status);
+    /* lv2 stops the group's SPUs before this returns. Ask every running
+     * thread's context to stop (each checks at its next channel wait,
+     * interpreter step or lifted trampoline), wake the ones parked in a
+     * channel read, and wait for the last of them to end the run itself --
+     * so group_join and group_destroy never race a host thread still
+     * executing on the context they are about to free (mcx suite, X5). */
+    g->cause       = SPU_GROUP_CAUSE_TERMINATED;
+    g->exit_status = status;
+    const uint32_t gen = g->run_gen;
+    const int asked = spu_group_request_stop_locked(g);
+    int ms = 0;
+    while (asked && g->state == SPU_GROUP_STATE_RUNNING && g->run_gen == gen && ms < 5000) {
+        ReleaseSRWLockExclusive(&s_grp_lock);
+#ifdef _WIN32
+        Sleep(1);
+#else
+        { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
+#endif
+        ms++;
+        AcquireSRWLockExclusive(&s_grp_lock);
+    }
+    if (g->state == SPU_GROUP_STATE_RUNNING && g->run_gen == gen) {
+        if (asked)
+            fprintf(stderr, "[SPU] group_terminate id=0x%X: a thread did not stop within 5 s "
+                    "(a loop with no channel access or branch the runtime can see) -- "
+                    "ending the run with it still executing\n", id);
+        spu_group_run_end_locked(g);
+    }
+    ReleaseSRWLockExclusive(&s_grp_lock);
+    fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d (%d thread(s) stopped)\n",
+            id, status, asked);
     fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+    LV2_RET(ctx, CELL_OK);
 }
 
 /* sys_spu_thread_get_exit_status(tid, *status)
@@ -1365,7 +1609,7 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
         return -1;
     }
-    if (t->running) {
+    if (__atomic_load_n(&t->running, __ATOMIC_ACQUIRE)) {
         /* Still in flight — Sony's behaviour. Games that want the exit code
          * synchronously should call group_join first. */
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003; /* CELL_ESTAT */
@@ -1452,7 +1696,7 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
          * real fix is resident SPU threads, or a printf port that resolves
          * to its thread; this is the floor until one of those exists. */
         static int warned = 0;
-        if (warned++ < 8) {
+        if (__atomic_fetch_add(&warned, 1, __ATOMIC_RELAXED) < 8) {
             fprintf(stderr, "[SPU] write_spu_mb: thread 0x%X not found -- "
                             "dropping the word and reporting CELL_OK, as the "
                             "unimplemented stub did\n", tid);
@@ -1465,73 +1709,28 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
     /* Preferred path: the worker is alive and blocked in rdch on its own host
      * thread. Write its mailbox and wake it, so it resumes exactly where it was
      * with its registers intact. */
+    AcquireSRWLockShared(&s_live_ctx_lock);
     if (t->live_ctx || t->sctx) {
         extern void spu_ch_wake(spu_context* c);
         spu_context* c = t->live_ctx ? (spu_context*)t->live_ctx : t->sctx;
 
-        /* Back-pressure. The inbound mailbox is a single slot and
-         * spu_channel_write overwrites unconditionally, so a PPU thread writing
-         * faster than the worker drains silently destroyed commands: this title
-         * managed 42,562 writes against 32 replies. Hardware reports a FULL
-         * mailbox instead and the caller retries -- which the game already does,
-         * in exactly the tight loop that made the flood visible. Report busy and
-         * drop nothing.
-         *
-         * Still wake the worker: it is the only thing that can drain the slot,
-         * and a missed wake here would turn back-pressure into a livelock. */
-        /* Full mailbox: WAIT for the worker to drain it, do not reject.
-         *
-         * The slot is single-entry and spu_channel_write overwrites, so a write
-         * arriving while the previous command is unread would destroy it. The
-         * first attempt at fixing that returned CELL_EBUSY, on the theory that
-         * the caller retries -- and one code path does, spinning thousands of
-         * times and burning CPU the renderer needs. But another path does NOT
-         * retry: it writes once, takes the error as "sent", and goes straight to
-         * sys_event_queue_receive. That deadlocks outright -- the worker waits
-         * for a command that was refused while the PPU waits for its reply.
-         *
-         * Waiting fixes both: no command is ever dropped, and a PPU thread that
-         * would otherwise spin sleeps instead. Real hardware has a 4-deep inbox,
-         * so this blocks far more often than it should -- a proper FIFO would be
-         * the faithful fix.
-         *
-         * ponytail: bounded 250 ms so a wedged worker degrades to the old EBUSY
-         * instead of hanging the PPU thread forever. */
-        if (spu_channel_has_data(&c->ch_in_mbox)) {
-            spu_ch_wake(c);                       /* only it can drain the slot */
-            int waited = 0;
-            while (spu_channel_has_data(&c->ch_in_mbox) && waited < 250) {
-#ifdef _WIN32
-                Sleep(1);
-#else
-                { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-#endif
-                waited++;
-            }
-            if (spu_channel_has_data(&c->ch_in_mbox)) {
-                static int _n = 0;
-                if (_n++ < 8)
-                    fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> BUSY after "
-                            "%d ms (mailbox still holds 0x%08X)\n",
-                            tid, val, waited, c->ch_in_mbox.value);
-                ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
-                return (int64_t)(int32_t)CELL_EBUSY;
-            }
-            { static int _n = 0;
-              if (_n++ < 8)
-                  fprintf(stderr, "[SPU] write_spu_mb tid=0x%X: waited %d ms for the "
-                          "mailbox to drain\n", tid, waited); }
-        }
-
+        /* The inbound mailbox is four deep, and a write to a full one replaces
+         * its newest entry: it neither fails nor waits (RPCS3 and the CBEA
+         * agree; tests/conformance/mc mcx X2). Earlier versions made it one
+         * deep and blocked the writer up to 250 ms per word, then failed with
+         * CELL_EBUSY -- a title that writes a multi-word command in one go
+         * saw its second word refused. */
         { static int _n = 0;
-          if (_n++ < 32)
+          if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 32)
               fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> live worker\n",
                       tid, val); }
-        spu_channel_write(&c->ch_in_mbox, val);
+        spu_channel_push_inmbox(&c->ch_in_mbox, val);
         spu_ch_wake(c);
+        ReleaseSRWLockShared(&s_live_ctx_lock);
         ctx->gpr[3] = 0;
         return 0;
     }
+    ReleaseSRWLockShared(&s_live_ctx_lock);
 
     /* Fallback: no run in flight (the worker finished). Queue the word and
      * re-run it from its entry with the value pre-loaded. */
@@ -1564,8 +1763,9 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
         return -1;
     }
     g->event_queue_id = queue_id;
-    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X\n",
-            group_id, queue_id);
+    if ((uint32_t)ctx->gpr[5] == 1) g->run_queue_id = queue_id;   /* SYS_SPU_THREAD_GROUP_EVENT_RUN */
+    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X et=%u\n",
+            group_id, queue_id, (uint32_t)ctx->gpr[5]);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -1573,14 +1773,29 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
 
 /* User-event ports are independent of group lifecycle event connections. */
 static SRWLOCK s_spu_port_lock = SRWLOCK_INIT;
+/* sys_spu_thread_group_disconnect_event_all_threads(id, spup) -- 252 */
+static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(ppu_context* ctx)
+{
+    const uint32_t port = (uint32_t)ctx->gpr[4];
+    if (port > 63) LV2_RET(ctx, CELL_EINVAL);
+    spu_group_t* g = spu_find_group((uint32_t)ctx->gpr[3]);
+    if (!g) LV2_RET(ctx, CELL_ESRCH);
+    AcquireSRWLockExclusive(&s_spu_port_lock);
+    g->user_event_ports[port] = 0;
+    ReleaseSRWLockExclusive(&s_spu_port_lock);
+    LV2_RET(ctx, CELL_OK);
+}
+
 static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_context* ctx)
 {
+    extern int sys_event_queue_exists(uint32_t queue_id);
     spu_group_t* g = spu_find_group((uint32_t)ctx->gpr[3]);
     uint64_t requested = ctx->gpr[5];
     uint32_t output = (uint32_t)ctx->gpr[6];
     uint32_t result = CELL_OK;
-    if (!g) result = CELL_ESRCH;
-    else if (!requested) result = CELL_EINVAL;
+    if (!requested) result = CELL_EINVAL;
+    else if (!g || !sys_event_queue_exists((uint32_t)ctx->gpr[4])) result = CELL_ESRCH;
+    else if (g->state == SPU_GROUP_STATE_NOT_INITIALIZED) result = CELL_ESTAT;
     else if (!output) result = CELL_EFAULT;
     else {
         result = CELL_EISCONN;
@@ -1588,7 +1803,7 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
         for (unsigned port = 0; port < 64; ++port) {
             if ((requested & (1ull << port)) && !g->user_event_ports[port]) {
                 g->user_event_ports[port] = (uint32_t)ctx->gpr[4];
-                vm_base[output] = (uint8_t)port;
+                gm_store8(vm_base + output, (uint8_t)port);
                 result = CELL_OK;
                 break;
             }
@@ -1608,7 +1823,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
     extern uint32_t spurs_port_queue(uint32_t port);
     if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
-        if (code < 128) { static int n; if (n++ < 16)
+        if (code < 128) { static int n; if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 16)
             fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
                     code & 63, spu->image_id, value); }
         return 0;
@@ -1617,7 +1832,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
      * 128 acknowledges the result; 192 is the impatient, no-ack form. */
     if (code == 128 || code == 192) {
         uint32_t result = CELL_EINVAL;
-        if (spu->ch_out_mbox.count) {
+        if (spu_channel_count(&spu->ch_out_mbox)) {
             uint32_t flag_id = spu_channel_read(&spu->ch_out_mbox);
             uint32_t bit = value & 0xFFFFFFu;
             if (bit < 64) {
@@ -1632,7 +1847,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
     }
     if (code >= 128) return 0;
     uint32_t result = CELL_EINVAL;
-    if (spu->ch_out_mbox.count) {
+    if (spu_channel_count(&spu->ch_out_mbox)) {
         uint32_t data = spu_channel_read(&spu->ch_out_mbox);
         unsigned port = code & 63;
         uint32_t queue = 0;
@@ -1643,6 +1858,13 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
             spu_group_t* group = spu_find_group(spu->spu_group_id);
             if (group) queue = group->user_event_ports[port];
             ReleaseSRWLockShared(&s_spu_port_lock);
+            /* A port bound to this one thread by sys_spu_thread_connect_event
+             * (SYS_SPU_THREAD_EVENT_USER) rather than group-wide. */
+            if (!queue) {
+                spu_thread_t* t = spu_find_thread(spu->spu_id);
+                if (t) for (int i = 0; i < t->evt_bind_n; i++)
+                    if (t->evt_bind[i].spup == port) { queue = t->evt_bind[i].queue; break; }
+            }
         }
         result = CELL_ENOTCONN;
         if (queue) {
@@ -1659,7 +1881,7 @@ static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
     spu_group_t* g = spu_find_group(group_id);
-    if (g) g->event_queue_id = 0;
+    if (g) { g->event_queue_id = 0; if ((uint32_t)ctx->gpr[4] == 1) g->run_queue_id = 0; }
     fprintf(stderr, "[SPU] group_disconnect_event group=0x%X\n", group_id);
     fflush(stderr);
     ctx->gpr[3] = 0;
@@ -1694,6 +1916,91 @@ static int64_t sys_spu_thread_connect_event_handler(ppu_context* ctx)
     return 0;
 }
 
+/* sys_spu_thread_bind_queue(id, spuq, spuq_num) / unbind_queue(id, spuq_num).
+ * The SPU later names spuq_num in sys_spu_thread_receive_event; these were
+ * stubs, so the SPU could never receive anything the PPU sent it (inFamous'
+ * Bink movie SPU polled tryreceive forever and the splash never played). */
+static int64_t sys_spu_thread_bind_queue_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t eq  = (uint32_t)ctx->gpr[4];
+    uint32_t num = (uint32_t)ctx->gpr[5];
+    spu_thread_t* t = spu_find_thread(tid);
+    int32_t rc = CELL_OK;
+    if (!t) rc = (int32_t)0x80010005;                 /* ESRCH */
+    else {
+        int slot = -1;
+        for (int i = 0; i < t->q_bind_n; i++)
+            if (t->q_bind[i].num == num) { slot = i; break; }
+        if (slot >= 0) rc = (int32_t)0x80010014;      /* EBUSY: number in use */
+        else if (t->q_bind_n >= 16) rc = (int32_t)0x80010004; /* ENOMEM */
+        else { t->q_bind[t->q_bind_n].num = num; t->q_bind[t->q_bind_n].queue = eq; t->q_bind_n++; }
+    }
+    fprintf(stderr, "[SPU] thread_bind_queue tid=0x%X queue=0x%X spuq_num=0x%X -> 0x%X\n",
+            tid, eq, num, (uint32_t)rc);
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+    return 0;
+}
+
+static int64_t sys_spu_thread_unbind_queue_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t num = (uint32_t)ctx->gpr[4];
+    spu_thread_t* t = spu_find_thread(tid);
+    int32_t rc = (int32_t)0x80010005;                 /* ESRCH */
+    if (t) {
+        for (int i = 0; i < t->q_bind_n; i++)
+            if (t->q_bind[i].num == num) {
+                t->q_bind[i] = t->q_bind[--t->q_bind_n];
+                rc = CELL_OK;
+                break;
+            }
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+    return 0;
+}
+
+/* lv2 stop-and-signal service for lifted SPU threads (installed as
+ * g_spu_lv2_stop_hook). Returns 1 when the stop was a syscall serviced here,
+ * so the SPU resumes at the next instruction:
+ *   0x100 yield            -- nothing to do but resume
+ *   0x110 receive_event    -- out mbox = spuq_num; reply {rc, d1, d2, d3}
+ *   0x111 tryreceive_event -- same, but EBUSY instead of blocking
+ * The reply goes through the context's rcv_evt words, which the inbound
+ * mailbox hands out before anything else. On an error only rc is sent, which
+ * is what the SPU-side wrapper reads before it gives up. */
+extern int32_t sys_event_queue_pop_internal(uint32_t, int, sys_event_t*);
+static int spu_lv2_stop_service(spu_context* spu)
+{
+    if (!spu->spu_group_id) return 0;                 /* SPURS, not an lv2 thread */
+    if (spu->stop_code == 0x100) return 1;
+    if (spu->stop_code != 0x110 && spu->stop_code != 0x111) return 0;
+    spu_thread_t* t = spu_find_thread(spu->spu_id);
+    if (!t) return 0;
+    uint32_t num = spu_channel_count(&spu->ch_out_mbox) ? spu_channel_read(&spu->ch_out_mbox) : 0xFFFFFFFFu;
+    uint32_t queue = 0;
+    for (int i = 0; i < t->q_bind_n; i++)
+        if (t->q_bind[i].num == num) { queue = t->q_bind[i].queue; break; }
+    sys_event_t ev;
+    int32_t rc = queue ? sys_event_queue_pop_internal(queue, spu->stop_code == 0x110, &ev)
+                       : (int32_t)0x80010002;         /* EINVAL: nothing bound */
+    spu->rcv_evt[0] = (uint32_t)rc;
+    if (rc == CELL_OK) {
+        spu->rcv_evt[1] = (uint32_t)ev.data1;
+        spu->rcv_evt[2] = (uint32_t)ev.data2;
+        spu->rcv_evt[3] = (uint32_t)ev.data3;
+        spu->rcv_evt_n = 4;
+    } else {
+        spu->rcv_evt_n = 1;
+    }
+    spu->rcv_evt_i = 0;
+    { static int n = 0; if (rc == CELL_OK && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 16)
+        fprintf(stderr, "[SPU] tid=0x%X receive_event spuq=0x%X q=%u -> d1=0x%llX d2=0x%llX d3=0x%llX\n",
+                spu->spu_id, num, queue, (unsigned long long)ev.data1,
+                (unsigned long long)ev.data2, (unsigned long long)ev.data3); }
+    return 1;
+}
+
 /* SPU -> PPU outbound mailbox delivery. Installed into spu_channels.c's
  * g_spu_out_mbox_hook; called when a (kernel/policy/task) SPU thread writes
  * WrOutMbox/WrOutIntrMbox. Route the value to the event queue bound to the SPU
@@ -1723,7 +2030,7 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     }
     if (!q && t && t->connected_queue) q = t->connected_queue;
     if (!q) { spu_group_t* g = spu_find_group(group_id); if (g) q = g->event_queue_id; }
-    { static int s_d = 0; if (getenv("SPU_MBOXTRACE") && s_d++ < 64)
+    { static int s_d = 0; if (getenv("SPU_MBOXTRACE") && __atomic_fetch_add(&s_d, 1, __ATOMIC_RELAXED) < 64)
         fprintf(stderr, "[SPU->PPU] deliver? spu=0x%X intr=%d val=0x%08X q=%u (thread %s)\n",
                 spu_id, is_intr, value, q, t ? "found" : "MISSING"); }
     if (!q) return;
@@ -1732,7 +2039,7 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     sys_event_queue_push_by_id(q,
         ((uint64_t)spu_id << 32) | (is_intr ? 0x2u : 0x1u),
         (uint64_t)value, 0, 0);
-    { static int s_w = 0; if (s_w++ < 32)
+    { static int s_w = 0; if (__atomic_fetch_add(&s_w, 1, __ATOMIC_RELAXED) < 32)
         fprintf(stderr, "[SPU->PPU] mbox deliver spu=0x%X intr=%d val=0x%08X -> q=%u\n",
                 spu_id, is_intr, value, q); }
 }
@@ -1807,9 +2114,9 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint32_t value_ea  = (uint32_t)ctx->gpr[5];
     uint32_t type      = (uint32_t)ctx->gpr[6];
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+    { static _Atomic int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
       static int n = 0;
-      if (s_t && n++ < 12)
+      if (s_t && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 12)
           { extern void ppu_guest_caller(char*, size_t);
             char who[64]; ppu_guest_caller(who, sizeof who);
             fprintf(stderr, "[spu-readls] tid=0x%08X off=0x%05X size=%u from %s\n",
@@ -1826,11 +2133,10 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
           uint64_t v = 0;
           for (uint32_t k = 0; k < type && k < 8; k++)
               v = (v << 8) | jls[ls_offset + k];
-          for (int k = 0; k < 8; k++)
-              vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
-          { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+          gm_store64(vm_base + value_ea, __builtin_bswap64(v));
+          { static _Atomic int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
             static int n = 0;
-            if (s_t && n++ < 8)
+            if (s_t && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
                 fprintf(stderr, "[spu-readls] chain 0x%08X off=0x%05X -> 0x%llX\n",
                         tid, ls_offset, (unsigned long long)v); }
           ctx->gpr[3] = 0;
@@ -1898,7 +2204,10 @@ uint32_t spu_thread_get_group_id(uint32_t tid)
 void spu_thread_publish_ctx(uint32_t tid, void* c)
 {
     spu_thread_t* t = spu_find_thread(tid);
-    if (t) t->live_ctx = c;
+    if (!t) return;
+    AcquireSRWLockExclusive(&s_live_ctx_lock);
+    __atomic_store_n(&t->live_ctx, c, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&s_live_ctx_lock);
 }
 
 /* Public: consume the pending inbound-mailbox command for a SPU thread, if any.
@@ -1912,161 +2221,25 @@ uint32_t spu_thread_take_pending_inmbox(uint32_t tid)
     return v;
 }
 
-static uint16_t vm_read_be16(uint32_t a)
-{
-    extern uint8_t* vm_base;
-    if (!vm_base || !a) return 0;
-    const uint8_t* p = vm_base + a;
-    return (uint16_t)((p[0] << 8) | p[1]);
-}
-
-/* sys_spu_image_import(sys_spu_image_t* img, const void* src, uint32_t type)
- * (Lv2 System Call & Library Reference, p.108). Parse the SPU ELF at `src`
- * (guest memory) and fill the image-management struct so the entry point and
- * segment table are real -- previously this zeroed the struct, so every SPU
- * thread came up with entry=0, matched no fallback, and "instantly completed"
- * (cellmark's SPU benchmarks read 0 as a result).
- *
- * sys_spu_image  { u32 type; u32 entry_point; sys_spu_segment* segs; int nsegs; }
- * sys_spu_segment{ int type; u32 ls_start; int size; u64 src_pa; }  (0x18, src@0x10)
- * PT_LOAD -> COPY segment (src_pa = src + p_offset); a memsz>filesz tail -> a
- * FILL(0) segment, exactly as the SDK counts them. */
+/* The kernel's SPU image objects: _sys_spu_image_import (157), which takes a
+ * copy of an SPU ELF for liblv2's PROTECT import, _sys_spu_image_close (158)
+ * and _sys_spu_image_get_segments (159). The work is lv2_spu_image.c; liblv2's
+ * sys_spu_image_import / close, which call these, are in ppu_sysprx.cpp. */
 static int64_t sys_spu_image_import_handler(ppu_context* ctx)
 {
-    extern uint8_t* vm_base;
-    uint32_t img_ea = (uint32_t)ctx->gpr[3];
-    uint32_t src_ea = (uint32_t)ctx->gpr[4];
-    uint32_t itype  = (uint32_t)ctx->gpr[5];   /* PROTECT(0) / DIRECT(1) */
-    (void)itype;
+    LV2_RET(ctx, lv2_spu_image_import((uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                                      (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]));
+}
 
-    if (!img_ea || !src_ea || !vm_base) {
-        if (img_ea && vm_base) memset(vm_base + img_ea, 0, 16);
-        ctx->gpr[3] = (uint64_t)(int64_t)-14;  /* EFAULT */
-        return -14;
-    }
+static int64_t sys_spu_image_close_handler(ppu_context* ctx)
+{
+    LV2_RET(ctx, lv2_spu_image_close((uint32_t)ctx->gpr[3]));
+}
 
-    /* Validate SPU ELF32 (big-endian) magic. */
-    const uint8_t* e = vm_base + src_ea;
-    if (!(e[0] == 0x7F && e[1] == 'E' && e[2] == 'L' && e[3] == 'F')) {
-        memset(vm_base + img_ea, 0, 16);
-        fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -- not an ELF\n", img_ea, src_ea);
-        fflush(stderr);
-        ctx->gpr[3] = (uint64_t)(int64_t)-8;   /* ENOEXEC */
-        return -8;
-    }
-
-    uint32_t entry   = vm_read_be32(src_ea + 0x18);
-    /* A raw SPU is started by an MMIO store, not a syscall, so this import is the
-     * last chance to identify the image by content. Fingerprint it here and the
-     * raw-SPU layer resolves the lifted entry from the same workload registry
-     * SPURS jobs use (runtime/spu/spu_raw.c). No-op for a SPU-thread image. */
-    spu_raw_note_image(src_ea, entry);
-    uint32_t phoff   = vm_read_be32(src_ea + 0x1C);
-    uint16_t phentsz = vm_read_be16(src_ea + 0x2A);
-    uint16_t phnum   = vm_read_be16(src_ea + 0x2C);
-    if (phentsz == 0) phentsz = 0x20;
-
-    /* Build the segment array in a dedicated guest scratch region (below the
-     * TLS block at 0x0E000000). SPU images allow at most 32 segments. */
-    static uint32_t s_spu_seg_bump = 0x0D000000u;
-    uint32_t segs_ea = s_spu_seg_bump;
-    int nsegs = 0;
-
-    for (uint16_t i = 0; i < phnum && nsegs < 32; i++) {
-        uint32_t ph = phoff + (uint32_t)i * phentsz;
-        if (vm_read_be32(src_ea + ph + 0x00) != 1) continue;   /* PT_LOAD */
-        uint32_t p_off = vm_read_be32(src_ea + ph + 0x04);
-        uint32_t p_va  = vm_read_be32(src_ea + ph + 0x08);
-        uint32_t p_fsz = vm_read_be32(src_ea + ph + 0x10);
-        uint32_t p_msz = vm_read_be32(src_ea + ph + 0x14);
-
-        uint32_t seg = segs_ea + (uint32_t)nsegs * 0x18;        /* COPY */
-        vm_write_be32(seg + 0x00, 1);                           /* SYS_SPU_SEGMENT_TYPE_COPY */
-        vm_write_be32(seg + 0x04, p_va);                        /* ls_start   */
-        vm_write_be32(seg + 0x08, p_fsz);                       /* size       */
-        /* sys_spu_segment.src is a u32 EA at +0x10 (not a BE u64 hi/lo pair):
-         * LBP's FMOD overlay loader reads read32(seg+0x10) as the DMA source,
-         * so the address must sit at +0x10. Putting it at +0x14 (as a u64 lo)
-         * left +0x10 zero -> overlays DMA'd from NULL -> empty LS -> unresolved
-         * branch. +0x14 kept = addr too, harmless for any u64-lo reader. */
-        vm_write_be32(seg + 0x10, src_ea + p_off);              /* src EA (@+0x10) */
-        vm_write_be32(seg + 0x14, src_ea + p_off);
-        nsegs++;
-
-        if (p_msz > p_fsz && nsegs < 32) {                      /* BSS tail -> FILL 0 */
-            seg = segs_ea + (uint32_t)nsegs * 0x18;
-            vm_write_be32(seg + 0x00, 2);                       /* SYS_SPU_SEGMENT_TYPE_FILL */
-            vm_write_be32(seg + 0x04, p_va + p_fsz);            /* ls_start */
-            vm_write_be32(seg + 0x08, p_msz - p_fsz);           /* size     */
-            vm_write_be32(seg + 0x10, 0);                       /* value    */
-            vm_write_be32(seg + 0x14, 0);
-            nsegs++;
-        }
-    }
-    s_spu_seg_bump += (uint32_t)nsegs * 0x18;
-    if (s_spu_seg_bump >= 0x0E000000u) s_spu_seg_bump = 0x0D000000u;  /* wrap */
-
-    vm_write_be32(img_ea + 0x00, 0);        /* type = SYS_SPU_IMAGE_TYPE_USER */
-    vm_write_be32(img_ea + 0x04, entry);    /* entry_point */
-    vm_write_be32(img_ea + 0x08, nsegs ? segs_ea : 0);  /* segs (guest EA) */
-    vm_write_be32(img_ea + 0x0C, (uint32_t)nsegs);
-
-    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -> entry=0x%05X nsegs=%d\n",
-            img_ea, src_ea, entry, nsegs);
-    /* SPU_DUMP_IMPORT=<dir>: save each unique imported ELF (FMOD's runtime-
-     * materialized SPU overlay plugins) so they can be lifted + registered.
-     * Extent = max(p_off+p_fsz) over PT_LOADs, re-walked here cheaply. */
-    { const char* dd = getenv("SPU_DUMP_IMPORT");
-      if (dd && *dd) {
-          static uint32_t s_seen[16]; static int s_nseen = 0;
-          int dup = 0;
-          for (int k = 0; k < s_nseen; k++) if (s_seen[k] == src_ea) dup = 1;
-          if (!dup && s_nseen < 16) {
-              s_seen[s_nseen++] = src_ea;
-              uint32_t ext = 0x40;
-              for (uint16_t i2 = 0; i2 < phnum; i2++) {
-                  uint32_t ph2 = phoff + (uint32_t)i2 * phentsz;
-                  if (vm_read_be32(src_ea + ph2 + 0x00) != 1) continue;
-                  uint32_t end2 = vm_read_be32(src_ea + ph2 + 0x04) + vm_read_be32(src_ea + ph2 + 0x10);
-                  if (end2 > ext) ext = end2;
-              }
-              uint32_t shend = vm_read_be32(src_ea + 0x20) +
-                               (uint32_t)vm_read_be16(src_ea + 0x2E) * vm_read_be16(src_ea + 0x30);
-              if (shend > ext && shend < 0x400000) ext = shend;
-              char path[512];
-              snprintf(path, sizeof path, "%s/import_%08X.elf", dd, src_ea);
-              FILE* fo = fopen(path, "wb");
-              if (fo) { fwrite(vm_base + src_ea, 1, ext, fo); fclose(fo);
-                        fprintf(stderr, "[SPU] import dumped: %s (%u bytes)\n", path, ext); }
-          }
-      } }
-#ifdef _WIN32
-    /* LBP retries this import in a tight loop (134x observed) with no other
-     * syscall in between -- something it derives from the filled struct keeps
-     * it unsatisfied. Print the guest caller chain for the first few so the
-     * retry loop can be identified. */
-    { static int _bt_n = 0;
-      if (_bt_n++ < 3) {
-          /* Matches func_entry in the generated ppu_recomp.h. */
-          struct lv2_bt_fentry { uint64_t addr; void* func; const char* name; };
-          extern const struct lv2_bt_fentry function_table[];
-          extern const uint64_t function_table_count;
-          void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
-          char ln[800]; int p = snprintf(ln, sizeof ln, "[SPU]   import bt:");
-          for (int i = 0; i < fr; i++) {
-              uintptr_t t = (uintptr_t)bt[i]; uint32_t bg = 0; uintptr_t bh = 0;
-              for (uint64_t k = 0; k < function_table_count; k++) {
-                  uintptr_t h = (uintptr_t)function_table[k].func;
-                  if (h <= t && h > bh) { bh = h; bg = (uint32_t)function_table[k].addr; }
-              }
-              if (bg && (t - bh) < 0x14000) p += snprintf(ln + p, sizeof(ln) - p, " %08X", bg);
-          }
-          fprintf(stderr, "%s\n", ln);
-      } }
-#endif
-    fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+static int64_t sys_spu_image_get_segments_handler(ppu_context* ctx)
+{
+    LV2_RET(ctx, lv2_spu_image_get_segments((uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                                            (int32_t)ctx->gpr[5]));
 }
 
 /* sys_spu_image_open(*img, *path) — load an SPU ELF from the VFS, parse its
@@ -2313,20 +2486,21 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
         return -1;
     }
-    if (t->sctx) {
-        spu_channel* ch = &t->sctx->ch_sig_notify[num];
+    AcquireSRWLockShared(&s_live_ctx_lock);
+    spu_context* sc = t->live_ctx ? (spu_context*)t->live_ctx : t->sctx;
+    if (sc) {
+        spu_channel* ch = &sc->ch_sig_notify[num];
         int or_mode = (t->spu_cfg >> num) & 1;
-        if (or_mode && ch->count)
-            ch->value |= val;
-        else
-            spu_channel_write(ch, val);
+        if (or_mode) spu_channel_or(ch, val);
+        else         spu_channel_overwrite(ch, val);      /* one word, replaced */
         extern void spu_ch_wake(spu_context*);
-        spu_ch_wake(t->sctx);
-        { static int n = 0; if (n < 12) { n++;
+        spu_ch_wake(sc);
+        { static _Atomic int n = 0; if (n < 12) { n++;
             fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X (%s)\n",
                     tid, num + 1, val, or_mode ? "OR" : "overwrite");
             fflush(stderr); } }
     }
+    ReleaseSRWLockShared(&s_live_ctx_lock);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -2422,10 +2596,29 @@ static int64_t sys_usbd_receive_event_handler(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Numbers retail lv2 does not implement (DEX/debug-only or unassigned; RPCS3's
+ * uns_func entries): the kernel answers ENOSYS. liblv2 probes at least one of
+ * them (462) at process start and takes a different path on success, so
+ * answering these CELL_OK like the generic unimplemented fallback misleads it. */
+static const uint16_t s_lv2_unused_syscalls[] = {
+    6, 15, 20, 32, 42, 59, 79, 162, 164, 168, 183, 189, 195, 217, 218, 219, 241,
+    255, 261, 270, 280, 290, 316, 347, 366, 371, 399, 416, 420, 430, 440, 459,
+    462, 469, 477, 491, 515, 526, 576, 629, 632, 660, 697, 698, 727, 730, 740,
+    750, 760, 770, 780, 790, 848, 854, 886, 898, 958, 973, 990, 999, 1008, 1020,
+};
+static int64_t sys_unused_enosys(ppu_context* ctx) { (void)ctx; return (int32_t)CELL_ENOSYS; }
+
+void lv2_prx_register_syscalls(lv2_syscall_table* tbl);   /* lv2_prx.c */
+void sys_lwsync_register(lv2_syscall_table* tbl);         /* sys_lwsync.c */
+
 void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 {
     /* Initialize the table with unimplemented stubs first */
     lv2_syscall_table_init(tbl);
+    for (size_t i = 0; i < sizeof s_lv2_unused_syscalls / sizeof s_lv2_unused_syscalls[0]; i++)
+        lv2_syscall_register(tbl, s_lv2_unused_syscalls[i], sys_unused_enosys);
+    lv2_prx_register_syscalls(tbl);
+    sys_lwsync_register(tbl);
 
     /* Process control */
     lv2_syscall_register(tbl, SYS_PROCESS_GETPID, sys_process_getpid_handler);
@@ -2500,7 +2693,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_INITIALIZE,             sys_spu_initialize_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_OPEN,             sys_spu_image_open_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_IMPORT,           sys_spu_image_import_handler);
-    lv2_syscall_register(tbl, SYS_SPU_IMAGE_CLOSE,            sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_IMAGE_CLOSE,            sys_spu_image_close_handler);
+    lv2_syscall_register(tbl, SYS_SPU_IMAGE_GET_SEGMENTS,     sys_spu_image_get_segments_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CREATE,    sys_spu_thread_group_create_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DESTROY,   sys_spu_thread_group_destroy_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_START,     sys_spu_thread_group_start_handler);
@@ -2516,7 +2710,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     { extern void (*g_spu_out_mbox_hook)(uint32_t,uint32_t,int,uint32_t);
       g_spu_out_mbox_hook = ydkj_spu_out_mbox_deliver; }
     { extern int (*g_spu_user_event_hook)(spu_context*, uint32_t);
-      g_spu_user_event_hook = spu_deliver_user_event; }
+      g_spu_user_event_hook = spu_deliver_user_event;
+      { extern int (*g_spu_lv2_stop_hook)(spu_context*); g_spu_lv2_stop_hook = spu_lv2_stop_service; } }
     lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_group_connect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_group_disconnect_event_handler);
@@ -2526,8 +2721,9 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_SPU_CFG,    sys_spu_thread_set_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_SPU_CFG,    sys_spu_thread_get_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SPU_MB,  sys_spu_thread_write_spu_mb_handler);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_bind_queue_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_unbind_queue_handler);
+    lv2_syscall_register(tbl, 252, sys_spu_thread_group_disconnect_event_all_threads_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
 }
 
@@ -2589,18 +2785,21 @@ int lv2_try_syscall(ppu_context* ctx)
     /* YDKJ diag: full event-syscall trace (#128..141) during SPURS init to find
      * why libsre asserts ESRCH in event_helper.c. Snapshot args BEFORE handler. */
     uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
+    uint32_t _a6 = (uint32_t)ctx->gpr[6], _a7 = (uint32_t)ctx->gpr[7], _a8 = (uint32_t)ctx->gpr[8],
+             _a9 = (uint32_t)ctx->gpr[9];
     ctx->gpr[3] = (uint64_t)h(ctx);
     /* LV2_ERRDBG=1: every syscall that returns non-OK, deduped by (number,
      * result). A guest that asserts on a result once per frame is easier to
      * find from this side than by reading its lifted code. */
-    { static int _ed = -1; if (_ed < 0) _ed = getenv("LV2_ERRDBG") ? 1 : 0;
+    { static _Atomic int _ed = -1; if (_ed < 0) _ed = getenv("LV2_ERRDBG") ? 1 : 0;
       if (_ed && (int32_t)ctx->gpr[3] != 0) {
           static uint64_t seen[64]; static int ns = 0;
           uint64_t k = ((uint64_t)num << 32) | (uint32_t)ctx->gpr[3];
           int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
           if (!f && ns < 64) { seen[ns++] = k;
-              fprintf(stderr, "[lv2err] syscall %u(r3=0x%08X r4=0x%08X r5=0x%08X)"
-                              " -> 0x%08X lr=0x%08X%c",
-                      num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, 10); } } }
+              fprintf(stderr, "[lv2err] syscall %u(r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X"
+                              " r7=0x%08X r8=0x%08X r9=0x%08X) -> 0x%08X lr=0x%08X%c",
+                      num, _a3, _a4, _a5, _a6, _a7, _a8, _a9, (uint32_t)ctx->gpr[3],
+                      (uint32_t)ctx->lr, 10); } } }
     return 1;
 }

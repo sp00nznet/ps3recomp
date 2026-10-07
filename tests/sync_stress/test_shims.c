@@ -53,5 +53,5 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
  * to an SPU thread. Defined by runtime/spu/spu_interp.c, which this suite
  * does not link; nothing here binds a port to an SPU, so the values are
  * never read back. */
-uint32_t g_spu_pending_evt[3];
-int      g_spu_pending_evt_valid;
+__thread uint32_t g_spu_pending_evt[3];
+__thread int      g_spu_pending_evt_valid;

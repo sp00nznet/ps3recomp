@@ -12,6 +12,10 @@
 
 #include <stdlib.h>
 #include "spu_coherency.h"
+#ifndef _WIN32
+#include <execinfo.h>
+#include <dlfcn.h>
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -88,16 +92,171 @@ static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
 
 unsigned long g_spu_lr_raise = 0;
 
-void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+/* A memory barrier executed on behalf of every thread of the process: when it
+ * returns, each thread has passed a full barrier since this call began. The
+ * asymmetric half of the store-then-check handshake in VM_WRITE_COH, which
+ * keeps the PPU's common store path free of a hardware fence. */
+#if defined(_WIN32)
+void spu_process_barrier(void) { FlushProcessWriteBuffers(); }
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_state.h>   /* thread_get_register_pointer_values */
+void spu_process_barrier(void)
+{
+    /* Reading a thread's register state forces it to a context-synchronising
+     * point. (On ARM64 an mprotect TLB shootdown is broadcast in hardware and
+     * does not serialise the other cores, so that trick is not a barrier.) */
+    thread_act_array_t th; mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        return;
+    }
+    for (mach_msg_type_number_t i = 0; i < n; i++) {
+        uintptr_t sp, regs[128]; size_t cnt = 128;
+        (void)thread_get_register_pointer_values(th[i], &sp, &cnt, regs);
+        mach_port_deallocate(mach_task_self(), th[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof(th[0]));
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+#elif defined(__linux__)
+#include <linux/membarrier.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+void spu_process_barrier(void)
+{
+    static _Atomic int s_ok = -1;
+    if (s_ok < 0)
+        s_ok = syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
+    if (!s_ok || syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) != 0)
+        syscall(__NR_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+#else
+void spu_process_barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+#endif
+
+static void coh_mark_line(uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    /* Atomic, though the writers hold the lock-line lock: spu_coh_is_reserved
+     * reads these with no lock on every PPU store. A line's first reservation
+     * is the one moment a PPU store can slip past: its writer checked the bit
+     * (still 0), and its unlocked store may land after this SPU's snapshot.
+     * The PPU side stores first and re-checks (VM_WRITE_COH); a process-wide
+     * barrier here, before the caller snapshots the line, orders the two --
+     * every PPU thread either has its store visible to the snapshot or sees
+     * the bit on its re-check and breaks the reservation. Bits are never
+     * cleared, so the barrier runs once per line, ever. */
+    const unsigned char bit = (unsigned char)(1u << (line & 7));
+    const unsigned char was = __atomic_fetch_or(&s_coh_bitmap[line >> 3], bit, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&s_coh_armed, 1, __ATOMIC_SEQ_CST);
+    if (!(was & bit)) spu_process_barrier();
+}
+
+/* ---------------------------------------------------------------------------
+ * PPU reservations (lwarx/ldarx), held to the same rule as an SPU's GETLLAR:
+ * the reservation is the whole 128-byte granule, and ANY store to the granule
+ * by another agent -- an SPU DMA PUT, PUTLLC or PUTLLUC, another PPU thread's
+ * store or store-conditional -- clears it. Comparing values cannot express
+ * that (a store of identical bytes still clears a reservation), so a PPU
+ * reservation marks its line in the bitmap like an SPU's does, which routes
+ * every writer of the line through the notify below, and the notify clears
+ * the record. A thread's own plain stores leave its own reservation alone.
+ *
+ * Records live in this static table, indexed by a per-thread slot claimed on
+ * the thread's first lwarx and released at its exit: nothing points into a
+ * thread's stack, so a thread that dies without releasing leaks a slot, not
+ * a dangling pointer. Every access holds the lock-line lock.
+ * -------------------------------------------------------------------------*/
+#define SPU_COH_MAX_PPU 256
+static struct { uint32_t line; uint32_t valid; uint32_t used; } s_ppu_resv[SPU_COH_MAX_PPU];
+static int s_ppu_resv_hi;                         /* slots in use are below this */
+#ifdef _WIN32
+static __declspec(thread) int t_ppu_slot = -1;
+#else
+static __thread int t_ppu_slot = -1;
+#endif
+
+static void ppu_resv_clear(uint32_t line, int except)
+{
+    for (int i = 0; i < s_ppu_resv_hi; i++)
+        if (i != except && s_ppu_resv[i].valid && s_ppu_resv[i].line == line)
+            s_ppu_resv[i].valid = 0;
+}
+
+void spu_coh_ppu_reserve(uint32_t ea)
+{
+    coh_mark_line(ea);
+    if (t_ppu_slot < 0) {
+        for (int i = 0; i < SPU_COH_MAX_PPU; i++)
+            if (!s_ppu_resv[i].used) {
+                s_ppu_resv[i].used = 1;
+                t_ppu_slot = i;
+                if (i >= s_ppu_resv_hi) s_ppu_resv_hi = i + 1;
+                break;
+            }
+        if (t_ppu_slot < 0) {
+            static int warned;
+            if (!warned++) fprintf(stderr, "[spu-coh] more than %d PPU threads hold reservations\n",
+                                   SPU_COH_MAX_PPU);
+            return;
+        }
+    }
+    s_ppu_resv[t_ppu_slot].line = ea & ~127u;
+    s_ppu_resv[t_ppu_slot].valid = 1;
+}
+
+int spu_coh_ppu_holds(uint32_t ea)
+{
+    return t_ppu_slot >= 0 && s_ppu_resv[t_ppu_slot].valid &&
+           s_ppu_resv[t_ppu_slot].line == (ea & ~127u);
+}
+
+void spu_coh_ppu_drop(void)
+{
+    if (t_ppu_slot >= 0) s_ppu_resv[t_ppu_slot].valid = 0;
+}
+
+void spu_coh_ppu_thread_exit(void)
+{
+    if (t_ppu_slot < 0) return;
+    spu_lockline_lock();
+    s_ppu_resv[t_ppu_slot].valid = 0;
+    s_ppu_resv[t_ppu_slot].used = 0;
+    spu_lockline_unlock();
+    t_ppu_slot = -1;
+}
+
+void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+{
+    coh_mark_line(ea);
 
     if (!ctx) return;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    /* Already a member anywhere? Look at every slot before taking a free one:
+     * stopping at the first free slot re-added a context that sat in a later
+     * slot (an earlier context's slot had since been freed), and unregister
+     * then removed one copy and left the other pointing at a dead stack. */
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
         if (s_coh_ctxs[i] == ctx) return;
-        if (s_coh_ctxs[i] == NULL) { s_coh_ctxs[i] = ctx; return; }
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        if (s_coh_ctxs[i] == NULL) {
+            s_coh_ctxs[i] = ctx;
+            /* SPU_COH_LOG=1: name each context as it joins the reserving set,
+             * with the host call chain that reserved, so an entry that outlives
+             * its context can be traced to the path that skipped unregister. */
+#ifndef _WIN32
+            { static _Atomic int s_l = -1; if (s_l < 0) s_l = getenv("SPU_COH_LOG") ? 1 : 0;
+              if (s_l) {
+                  void* bt[8]; int n = backtrace(bt, 8);
+                  fprintf(stderr, "[spu-coh] + ctx %p img=%d spu=0x%X slot %d:", (void*)ctx,
+                          ctx->image_id, ctx->spu_id, i);
+                  for (int k = 1; k < n; k++) { Dl_info di;
+                      if (dladdr(bt[k], &di) && di.dli_sname) fprintf(stderr, " %s", di.dli_sname); }
+                  fprintf(stderr, "\n"); } }
+#endif
+            return;
+        }
     }
     /* More live SPU contexts than the registry holds. The ones already in it
      * still get their events; this one would silently never wake, so say so. */
@@ -129,7 +288,7 @@ void spu_coh_unregister(spu_context* ctx)
      * spu_coh_notify_write, reading a freed thread stack. */
     spu_lockline_lock();
     for (int i = 0; i < SPU_COH_MAX_CTX; i++)
-        if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; break; }
+        if (s_coh_ctxs[i] == ctx) s_coh_ctxs[i] = NULL;
     spu_lockline_unlock();
 }
 
@@ -146,7 +305,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t c = (uintptr_t)s_coh_ctxs[i];
         if (c >= lo && c < hi) {
             static int _n = 0;
-            if (_n++ < 16)
+            if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 16)
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, s_coh_ctxs[i]->image_id);
             s_coh_ctxs[i] = NULL;
@@ -157,9 +316,9 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (!s_coh_armed) return 0;
+    if (!__atomic_load_n(&s_coh_armed, __ATOMIC_ACQUIRE)) return 0;
     uint32_t line = addr >> SPU_COH_LINE_SHIFT;
-    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    return (__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_RELAXED) >> (line & 7)) & 1u;
 }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
@@ -175,11 +334,12 @@ int spu_coh_is_reserved(uint32_t addr)
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
+    ppu_resv_clear(line, -1);
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            spu_ev_raise(c, SPU_EVENT_LR);
             c->resv_valid = 0;
             g_spu_lr_raise++;
             spu_ch_wake(c);
@@ -187,19 +347,33 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     }
 }
 
+static void notify_spus(uint32_t line);
+
 void spu_coh_notify_write(uint32_t ea)
 {
-    uint32_t line = ea & ~127u;
+    ppu_resv_clear(ea & ~127u, -1);
+    notify_spus(ea & ~127u);
+}
+
+/* A store by the current PPU thread: its own reservation survives it. */
+void spu_coh_notify_write_from_ppu(uint32_t ea)
+{
+    ppu_resv_clear(ea & ~127u, t_ppu_slot);
+    notify_spus(ea & ~127u);
+}
+
+static void notify_spus(uint32_t line)
+{
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            spu_ev_raise(c, SPU_EVENT_LR);
             c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */
-            { static int s_w = -1;
+            { static _Atomic int s_w = -1;
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
               if (s_w) { static unsigned long long n;
                   if ((++n % 200000) == 1)

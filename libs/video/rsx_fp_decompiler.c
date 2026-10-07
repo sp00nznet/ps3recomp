@@ -107,6 +107,29 @@ u32 rsx_fp_read_word(const u8* p)
     return (be << 16) | (be >> 16);   /* 16-bit half-word swap */
 }
 
+u32 rsx_fp_texture_mask(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0;
+    u32 off = 0, mask = 0;
+    while (off + 16 <= max_bytes) {
+        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+        const u32 op = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+        if (op == OP_TEX || op == OP_TXP || op == OP_TXD || op == OP_TXL || op == OP_TXB)
+            mask |= 1u << ((w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT);
+        if (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+            ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+            ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) {
+            if (off + 16 <= max_bytes) off += 16;
+        }
+        if (w0 & FP_END) break;
+    }
+    return mask;
+}
+
 u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
 {
     if (!ucode) return 0;
@@ -353,7 +376,14 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
-        snprintf(base, sizeof(base), "%s", input_expr(input_src));
+        /* WPOS in a buffered shader: SV_POSITION is top-left origin, the RSX
+         * window origin may be bottom (SHADER_WINDOW bit 12), where
+         * WPOS.y = height - row. fp_alpha.y/.z carry the scale and bias. */
+        if (buffered && input_src == 0x0)
+            snprintf(base, sizeof(base),
+                     "float4(input.position.x, input.position.y * fp_alpha.y + fp_alpha.z, input.position.zw)");
+        else
+            snprintf(base, sizeof(base), "%s", input_expr(input_src));
     } else { /* CONST */
         if (buffered && has_k)
             snprintf(
@@ -1143,7 +1173,7 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
     }
     { static int dbg = -1;
       if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
-      if (dbg) { static int m = 0; if (m++ < 3) {
+      if (dbg) { static int m = 0; if (__atomic_fetch_add(&m, 1, __ATOMIC_RELAXED) < 3) {
         fprintf(stderr, "[FPK] %d consts%c", n, 10);
         for (int _q = 0; _q < n; _q++)
             fprintf(stderr, "   k[%2d] = (%g %g %g %g)%c", _q, out[_q*4+0],

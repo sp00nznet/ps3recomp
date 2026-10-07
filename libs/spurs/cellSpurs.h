@@ -30,18 +30,32 @@ extern "C" {
 #define CELL_SPURS_CORE_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x11)
 #define CELL_SPURS_CORE_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x09)
 
-#define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS | 0x21)
-#define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS | 0x22)
-#define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS | 0x23)
-#define CELL_SPURS_TASK_ERROR_NOMEM             (CELL_ERROR_BASE_SPURS | 0x24)
-#define CELL_SPURS_TASK_ERROR_SRCH              (CELL_ERROR_BASE_SPURS | 0x25)
-#define CELL_SPURS_TASK_ERROR_NOENT             (CELL_ERROR_BASE_SPURS | 0x26)
-#define CELL_SPURS_TASK_ERROR_BUSY              (CELL_ERROR_BASE_SPURS | 0x2A)
-#define CELL_SPURS_TASK_ERROR_STAT              (CELL_ERROR_BASE_SPURS | 0x2F)
-#define CELL_SPURS_TASK_ERROR_ALIGN             (CELL_ERROR_BASE_SPURS | 0x30)
-#define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x31)
-#define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS | 0x32)
-#define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x29)
+/* Workload-level calls (ReadyCount*, signals, workload data/info, shutdown,
+ * WakeUp...) report this family, not CORE. */
+#define CELL_SPURS_POLICY_MODULE_ERROR_AGAIN         (0x80410800 | 0x01)
+#define CELL_SPURS_POLICY_MODULE_ERROR_INVAL         (0x80410800 | 0x02)
+#define CELL_SPURS_POLICY_MODULE_ERROR_NOSYS         (0x80410800 | 0x03)
+#define CELL_SPURS_POLICY_MODULE_ERROR_NOMEM         (0x80410800 | 0x04)
+#define CELL_SPURS_POLICY_MODULE_ERROR_SRCH          (0x80410800 | 0x05)
+#define CELL_SPURS_POLICY_MODULE_ERROR_NOENT         (0x80410800 | 0x06)
+#define CELL_SPURS_POLICY_MODULE_ERROR_PERM          (0x80410800 | 0x09)
+#define CELL_SPURS_POLICY_MODULE_ERROR_BUSY          (0x80410800 | 0x0A)
+#define CELL_SPURS_POLICY_MODULE_ERROR_STAT          (0x80410800 | 0x0F)
+#define CELL_SPURS_POLICY_MODULE_ERROR_ALIGN         (0x80410800 | 0x10)
+#define CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER  (0x80410800 | 0x11)
+
+#define CELL_SPURS_TASK_ERROR_AGAIN             (0x80410900 | 0x01)
+#define CELL_SPURS_TASK_ERROR_INVAL             (0x80410900 | 0x02)
+#define CELL_SPURS_TASK_ERROR_NOSYS             (0x80410900 | 0x03)
+#define CELL_SPURS_TASK_ERROR_NOMEM             (0x80410900 | 0x04)
+#define CELL_SPURS_TASK_ERROR_SRCH              (0x80410900 | 0x05)
+#define CELL_SPURS_TASK_ERROR_NOENT             (0x80410900 | 0x06)
+#define CELL_SPURS_TASK_ERROR_BUSY              (0x80410900 | 0x0A)
+#define CELL_SPURS_TASK_ERROR_STAT              (0x80410900 | 0x0F)
+#define CELL_SPURS_TASK_ERROR_ALIGN             (0x80410900 | 0x10)
+#define CELL_SPURS_TASK_ERROR_NULL_POINTER      (0x80410900 | 0x11)
+#define CELL_SPURS_TASK_ERROR_FAULT             (0x80410900 | 0x0D)
+#define CELL_SPURS_TASK_ERROR_PERM              (0x80410900 | 0x09)
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -289,6 +303,7 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 flags);
 
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,

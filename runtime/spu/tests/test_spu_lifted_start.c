@@ -599,7 +599,7 @@ static void test_user_event_ports(uint32_t gid, uint32_t tid)
           captured_event[1] == tid && captured_event[2] == 0x100000ABCDull &&
           captured_event[3] == 0x12345678,
           "send_event routes the port, source and payload correctly");
-    check(spu->ch_out_mbox.count == 0 && spu->ch_in_mbox.count == 1 &&
+    check(spu_channel_count(&spu->ch_out_mbox) == 0 && spu_channel_count(&spu->ch_in_mbox) == 1 &&
           spu_channel_read(&spu->ch_in_mbox) == 0, "send_event consumes data and acknowledges success");
     push_result = -1;
     spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(1));
@@ -609,7 +609,7 @@ static void test_user_event_ports(uint32_t gid, uint32_t tid)
     push_result = 0;
     spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(2));
     spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x51000000));
-    check(captured_queue == 78 && spu->ch_in_mbox.count == 0,
+    check(captured_queue == 78 && spu_channel_count(&spu->ch_in_mbox) == 0,
           "throw_event uses its own port and produces no acknowledgement");
     spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(3));
     spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x12000000));
@@ -619,7 +619,7 @@ static void test_user_event_ports(uint32_t gid, uint32_t tid)
     spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(44));
     spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0xC000003F));
     check(captured_flag == 44 && captured_flag_bits == (1ull << 63) &&
-          captured_queue == 0 && spu->ch_in_mbox.count == 0,
+          captured_queue == 0 && spu_channel_count(&spu->ch_in_mbox) == 0,
           "impatient flag request sets its bit without a queue event or ack");
     spu_wrch(spu, SPU_WrOutMbox, spu_splat_u32(44));
     spu_wrch(spu, SPU_WrOutIntrMbox, spu_splat_u32(0x80000000));

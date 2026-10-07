@@ -20,6 +20,7 @@
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE
 #endif
+#include "../memory/guest_mem_atomic.h"
 #include "cellGcmSys.h"
 #include "../memory/vm.h"           /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"
@@ -171,9 +172,7 @@ extern int  cellGcm_take_flip_pending_synced(void);
 
 static void guest_w32(uint32_t addr, uint32_t v)
 {
-    uint8_t* p = vm_base + addr;
-    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >>  8); p[3] = (uint8_t)v;
+    gm_store32(vm_base + addr, __builtin_bswap32(v));
 }
 
 /* One guest VM, with its size published for the OOB guard above. */

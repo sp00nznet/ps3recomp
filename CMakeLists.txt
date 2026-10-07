@@ -26,7 +26,7 @@ option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 # ---------------------------------------------------------------------------
 
 # HLE library sources
-file(GLOB_RECURSE HLE_SOURCES
+file(GLOB_RECURSE HLE_SOURCES CONFIGURE_DEPENDS
     "libs/system/*.c"
     "libs/filesystem/*.c"
     "libs/input/*.c"
@@ -81,7 +81,7 @@ set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # u
 list(APPEND HLE_SOURCES ${AT3_SOURCES})
 
 # Runtime core (syscalls, PPU, SPU, memory)
-file(GLOB_RECURSE RUNTIME_SOURCES
+file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
     "runtime/*.c"
     "runtime/*.cpp"
 )
@@ -449,6 +449,9 @@ if(UNIX)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/ppu_lifter.py"
             COMMENT "Generating the smoke title's image and ppu_recomp.h")
 
+        # The table is scanned from the library sources: a new export needs a
+        # regenerated table, or its import falls through to the unresolved stub.
+        file(GLOB HLE_LIB_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/libs/*/*.c")
         add_custom_command(
             OUTPUT "${SMOKE_GEN}/ppu_hle_nids.cpp"
             COMMAND "${Python3_EXECUTABLE}"
@@ -456,6 +459,7 @@ if(UNIX)
                     --out "${SMOKE_GEN}/ppu_hle_nids.cpp" --all
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/nid_database.py"
+                    ${HLE_LIB_SOURCES}
             COMMENT "Generating the HLE NID -> handler table")
 
         add_executable(ps3recomp_boot_smoke

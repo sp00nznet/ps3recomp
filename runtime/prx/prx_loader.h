@@ -114,6 +114,34 @@ uint32_t prx_resolve_export(uint32_t nid);
 /* Number of exports currently registered (diagnostics/tests). */
 uint32_t prx_export_registry_count(void);
 
+/*
+ * The two halves of prx_load_module, for lv2's PRX loader, which does them at
+ * different times: a module's image is placed when it is loaded
+ * (_sys_prx_load_module) and its exports are linked when it is started
+ * (_sys_prx_start_module), and unlinked again when it is stopped.
+ */
+int  prx_place_module(const prx_module* m, prx_register_fn reg);
+void prx_publish_exports(const prx_module* m);
+void prx_withdraw_exports(const prx_module* m);
+
+/*
+ * Firmware (or title) modules lifted at build time. Each registers itself
+ * under the file name a guest loads it by ("liblv2.sprx", "libsre.sprx");
+ * lv2's PRX loader (runtime/syscalls/lv2_prx.c) finds it there instead of
+ * reading and decrypting a file. tools/gen_prx_module.py writes the
+ * registration for a lifted module.
+ */
+typedef struct {
+    const char* file;          /* file name, without directory */
+    prx_module  mod;
+    uint32_t    start_opd;     /* module_start OPD EA (relocated), 0 if none */
+    uint32_t    stop_opd;      /* module_stop OPD EA, 0 if none */
+    const char* module_name;   /* module_info name ("cellSre_Library") */
+} prx_static_module;
+
+void                     prx_static_register(const prx_static_module* m);
+const prx_static_module* prx_static_find(const char* file);
+
 #ifdef __cplusplus
 }
 #endif

@@ -2662,7 +2662,7 @@ static u32 vertex_texture_mask(void)
         } else {
             g_ld_vtex_unsupported++;
             static u32 warned = 0;
-            if (warned++ < 16 && vertex_texture_trace_enabled())
+            if (__atomic_fetch_add(&warned, 1, __ATOMIC_RELAXED) < 16 && vertex_texture_trace_enabled())
                 fprintf(stderr,
                         "[vtex] enabled but unsupported unit=%u off=0x%08X "
                         "fmt=0x%02X dim=%u cube=%u %ux%u pitch=%u ctl=0x%08X\n",
@@ -2858,7 +2858,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * actual world pass while the bad command link is isolated. */
     if (want_w > 8192u || want_h > 8192u) {
         static u32 invalid_surface_logs = 0;
-        if (invalid_surface_logs++ < 32u)
+        if (__atomic_fetch_add(&invalid_surface_logs, 1, __ATOMIC_RELAXED) < 32u)
             fprintf(stderr,
                     "[surface-guard] rejected implausible surface 0x%X "
                     "%ux%u; preserving slot=%s\n",
@@ -2870,7 +2870,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         /* Out of slots is now the only way a surface can be lost, so say so
          * once rather than silently returning an invalid handle. */
         static u32 full_logs = 0;
-        if (full_logs++ < 8)
+        if (__atomic_fetch_add(&full_logs, 1, __ATOMIC_RELAXED) < 8)
             fprintf(stderr, "[surfsz] surface table full (%u); dropping "
                             "%u:0x%X %ux%u\n",
                     (unsigned)MAX_SURFACES, location, offset, want_w, want_h);
@@ -2878,7 +2878,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     }
     slot = g.n_surfaces;
     { static u32 new_logs = 0;
-      if (new_logs++ < 24)
+      if (__atomic_fetch_add(&new_logs, 1, __ATOMIC_RELAXED) < 24)
           fprintf(stderr, "[surfsz] new live surface %u:0x%X %ux%u (slot %u)\n",
                   location, offset, want_w, want_h, slot); }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2896,7 +2896,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         &IID_ID3D12Resource, (void**)&replacement);
     if (FAILED(create_hr)) {
         static u32 surface_fail_logs = 0;
-        if (surface_fail_logs++ < 32) {
+        if (__atomic_fetch_add(&surface_fail_logs, 1, __ATOMIC_RELAXED) < 32) {
             const HRESULT removed = g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
             fprintf(stderr,
                     "[surface-fail] color %u:0x%X %ux%u hr=0x%08lX "
@@ -3990,7 +3990,7 @@ static ID3D12PipelineState* build_pso(
         }
     }
     if (FAILED(vs_hr)) {
-        if (compile_fail_logs++ < 32) {
+        if (__atomic_fetch_add(&compile_fail_logs, 1, __ATOMIC_RELAXED) < 32) {
             const char* msg = err ? (const char*)err->lpVtbl->GetBufferPointer(err)
                                   : "no compiler diagnostic";
             fprintf(stderr, "[pso-fail] vertex compile: %.768s\n", msg);
@@ -4052,7 +4052,7 @@ static ID3D12PipelineState* build_pso(
         }
     }
     if (FAILED(ps_hr)) {
-        if (compile_fail_logs++ < 32) {
+        if (__atomic_fetch_add(&compile_fail_logs, 1, __ATOMIC_RELAXED) < 32) {
             const char* msg = err ? (const char*)err->lpVtbl->GetBufferPointer(err)
                                   : "no compiler diagnostic";
             fprintf(stderr, "[pso-fail] pixel compile: %.768s\n", msg);
@@ -4106,7 +4106,7 @@ static ID3D12PipelineState* build_pso(
 #endif
     if (FAILED(hr)) {
         const HRESULT removed = g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
-        if (create_fail_logs++ < 32)
+        if (__atomic_fetch_add(&create_fail_logs, 1, __ATOMIC_RELAXED) < 32)
             fprintf(stderr,
                     "[pso-fail] create hr=0x%08lX removed=0x%08lX "
                     "depth{test=%u write=%u func=%u} blend=%u "
@@ -4237,7 +4237,7 @@ static ID3D12PipelineState* get_pso(
     if (txl_mask && !(txl_mask & vtex_mask)) {
         g_ld_vtex_missing_for_txl++;
         static u32 warned = 0;
-        if (warned++ < 32 && vertex_texture_trace_enabled()) {
+        if (__atomic_fetch_add(&warned, 1, __ATOMIC_RELAXED) < 32 && vertex_texture_trace_enabled()) {
             fprintf(stderr,
                     "[vtex] TXL shader has no supported binding txl=0x%X "
                     "bound=0x%X start=%u instrs=%u\n",
@@ -4396,7 +4396,7 @@ static ID3D12PipelineState* get_pso(
             const int np = rsx_fp_apply_unnorm_scale(
                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask);
             { static int n = 0;
-              if (n++ < 8)
+              if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
                   fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
                                   " patched=%d\n",
                           unnorm_mask, cube_mask, unnorm_dim[0][0],
@@ -6952,7 +6952,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
           if (uvd < 0) uvd = getenv("LD_UVDBG") ? 1 : 0;
           if (uvd && t.location == 1u && t.offset == 0x400000u) {
               static unsigned long n = 0;
-              if (n++ < 4) {
+              if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 4) {
                   const u32 vbase = rsx_dsp_vertex_data_base_offset(&g.rsx);
                   fprintf(stderr, "[uvdbg] unit=%u ps1fb %ux%u pitch=%u fmt=0x%02X"
                                   " base=0x%X target=%u\n",
@@ -7017,7 +7017,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
           } }
         if (sampled < 0 && LD_DIAG_ENABLED("LD_ALIAS_DBG")) {
             static u32 n_dbg = 0;
-            if (n_dbg++ < 24) {
+            if (__atomic_fetch_add(&n_dbg, 1, __ATOMIC_RELAXED) < 24) {
                 fprintf(stderr, "[alias-miss] tex %u:0x%08X fmt=0x%02X %ux%u target=%u surf:",
                         t.location, t.offset, t.format, t.width, t.height, target);
                 for (u32 i = 0; i < g.n_surfaces; i++)
@@ -7043,7 +7043,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             if (alias_dbg < 0) alias_dbg = getenv("LD_ALIAS_DBG") != NULL;
             if (alias_dbg) {
                 static u32 n_hit = 0;
-                if (n_hit++ < 24)
+                if (__atomic_fetch_add(&n_hit, 1, __ATOMIC_RELAXED) < 24)
                     fprintf(stderr, "[alias-hit] tex %u:0x%08X fmt=0x%02X %ux%u "
                             "-> surface[%d] %u:0x%08X %ux%u" "\n",
                             t.location, t.offset, t.format, t.width, t.height,
@@ -8725,7 +8725,7 @@ void rsx_live_draw_present(u32 buffer_id)
     if (target == LD_INVALID_SURFACE) {
         target = current_surface();
         static u32 fallback_logs = 0;
-        if (fallback_logs++ < 32)
+        if (__atomic_fetch_add(&fallback_logs, 1, __ATOMIC_RELAXED) < 32)
             fprintf(stderr,
                     "[live-draw] flip %u has no registered/rendered scanout; "
                     "falling back to current surface %u\n",

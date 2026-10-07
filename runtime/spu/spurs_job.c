@@ -255,7 +255,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR + 4, job_ea);
 
     { static int _n = 0;
-      if (_n++ < 4)
+      if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 4)
           fprintf(stderr,
               "[spurs-job] job 0x%08X: bin 0x%08X+%u -> LS 0 | io=0x%05X(%u, %u dma, %u used)"
               " out=0x%05X(%u) scratch=0x%05X(%u) stack_top=0x%05X(%u) cache=%u"
@@ -268,7 +268,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * its DMA and atomic EAs from these words, so when a job spins on a
      * lock-line address that is not backed, this is what to read first. */
     { static int _d = 0;
-      if (getenv("SPURS_JOB_DESCDUMP") && _d++ < 4) {
+      if (getenv("SPURS_JOB_DESCDUMP") && __atomic_fetch_add(&_d, 1, __ATOMIC_RELAXED) < 4) {
           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
@@ -346,7 +346,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
     { static int _n = 0;
-      if (_n++ < 4)
+      if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 4)
           fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
                   ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
                   image_id); }
@@ -368,15 +368,15 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     s_job_ls_valid = 1;
 
     g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
-                          ? ctx.ch_out_mbox.value : 0;
+                          ? spu_channel_peek(&ctx.ch_out_mbox) : 0;
     g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)
-                          ? ctx.ch_out_intr_mbox.value : 0;
+                          ? spu_channel_peek(&ctx.ch_out_intr_mbox) : 0;
     g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
     { uint32_t _cb = g32(job_ea + 0x4C);
       g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
+    { static _Atomic int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
       static int n = 0;
-      if (s_t && n++ < 16 && g_spurs_job_mbox_valid)
+      if (s_t && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 16 && g_spurs_job_mbox_valid)
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 

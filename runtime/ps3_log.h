@@ -36,7 +36,7 @@ static __inline int ps3_log_verbose(void)
      * 40 s with the log discarded and one with it redirected to a file -- the
      * logging changes what the title does. Measure timing-sensitive behaviour
      * with PS3_VERBOSE=0. */
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char* e = getenv("PS3_VERBOSE");
         if (e) v = (e[0] && e[0] != '0') ? 1 : 0;

@@ -52,6 +52,7 @@ typedef struct ppu_thread_info {
     uint64_t     entry_addr;   /* guest entry point */
     uint64_t     tls_addr;
     uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
+    int          held;         /* created by _sys_ppu_thread_create, not yet started */
 
 #ifdef _WIN32
     HANDLE       host_thread;

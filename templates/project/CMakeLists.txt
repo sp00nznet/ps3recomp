@@ -90,6 +90,9 @@ if(EXISTS "${RECOMP_DIR}/ppu_hle_nids.cpp")
 else()
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(HLE_NID_TABLE "${CMAKE_CURRENT_BINARY_DIR}/ppu_hle_nids.cpp")
+    # The table is scanned from the library sources: a new export needs a
+    # regenerated table, or its import falls through to the unresolved stub.
+    file(GLOB HLE_LIB_SOURCES CONFIGURE_DEPENDS "${PS3RECOMP_DIR}/libs/*/*.c")
     add_custom_command(
         OUTPUT "${HLE_NID_TABLE}"
         COMMAND "${Python3_EXECUTABLE}"
@@ -97,6 +100,7 @@ else()
                 --out "${HLE_NID_TABLE}" --all
         DEPENDS "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
                 "${PS3RECOMP_DIR}/tools/nid_database.py"
+                ${HLE_LIB_SOURCES}
         COMMENT "Generating the HLE NID -> handler table")
     message(STATUS "HLE NID table:   generated (every module)")
 endif()
@@ -156,6 +160,22 @@ if(PORT_ENABLE_SPU)
     endif()
 endif()
 
+# Lifted SPU side of firmware modules (tools/lift_firmware_spu.py): libsre's SPURS
+# kernel and the code bodies it streams into local store, so they run lifted
+# instead of on the SPU interpreter when the firmware's own libsre is used.
+set(FIRMWARE_SPU_DIR "" CACHE PATH
+    "Directory of lifted firmware SPU code (<dir>/<image>/spu_recomp.c + *_spu_register.c)")
+if(PORT_ENABLE_SPU AND FIRMWARE_SPU_DIR)
+    file(GLOB FIRMWARE_SPU CONFIGURE_DEPENDS
+         "${FIRMWARE_SPU_DIR}/*/spu_recomp.c" "${FIRMWARE_SPU_DIR}/*_spu_register.c")
+    list(LENGTH FIRMWARE_SPU FIRMWARE_SPU_COUNT)
+    message(STATUS "Firmware SPU:    ${FIRMWARE_SPU_COUNT} file(s) from ${FIRMWARE_SPU_DIR}")
+    list(APPEND SPU_SOURCES ${FIRMWARE_SPU})
+    if(NOT "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c" IN_LIST SPU_SOURCES)
+        list(APPEND SPU_SOURCES "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+    endif()
+endif()
+
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
@@ -196,6 +216,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     "${PS3RECOMP_DIR}/runtime/spu"
     "${PS3RECOMP_DIR}/runtime/memory"
     "${PS3RECOMP_DIR}/runtime/syscalls"
+    "${PS3RECOMP_DIR}/runtime/prx"             # prx_loader.h, for lifted PRX modules
     "${PS3RECOMP_DIR}/runtime/platform"        # win32_compat.h and friends
     "${PS3RECOMP_DIR}/libs/video"
     "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -230,6 +251,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(${PROJECT_NAME} PRIVATE
         -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
+        # The lift spells PPC arithmetic as signed C arithmetic, which must wrap;
+        # without this, clang exploits overflow UB (e.g. folds "x*x < 0" to false).
+        -fwrapv
     )
 elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE

@@ -65,10 +65,22 @@ void spu_coh_notify_write(uint32_t ea);
 /* Remove a context from the reserving set. MUST be called before a
  * transient (stack-allocated) spu_context goes out of scope. */
 void spu_coh_unregister(spu_context* ctx);
+void spu_process_barrier(void);
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
 /* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
  * write does not cost it its reservation on hardware. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self);
+/* A store by the current PPU thread: like spu_coh_notify_write, but leaves
+ * that thread's own lwarx reservation alone. */
+void spu_coh_notify_write_from_ppu(uint32_t ea);
+
+/* PPU lwarx/ldarx reservations: the whole 128-byte granule, cleared by any
+ * other agent's store to it (see spu_coherency.c). reserve/holds/drop expect
+ * the lock-line lock held; thread_exit takes it. */
+void spu_coh_ppu_reserve(uint32_t ea);
+int  spu_coh_ppu_holds(uint32_t ea);
+void spu_coh_ppu_drop(void);
+void spu_coh_ppu_thread_exit(void);
 
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */

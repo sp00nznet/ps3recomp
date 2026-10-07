@@ -34,8 +34,8 @@ for gen in "$HERE"/gen_test_*.py; do
     exe="$HERE/test_${name}.exe"
 
     rm -rf "$gen_out"
-    python "$gen" > /dev/null
-    python "$TOOLS/spu_lifter.py" --auto-functions "$elf" \
+    python3 "$gen" > /dev/null
+    python3 "$TOOLS/spu_lifter.py" --auto-functions "$elf" \
         --output "$gen_out" > /dev/null
 
     # Optional per-test extra build args (extra sources / -I dirs). A

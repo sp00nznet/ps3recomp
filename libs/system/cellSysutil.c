@@ -301,7 +301,11 @@ s32 cellSysutilGetSystemParamString(s32 id, u32 buf_ea, u32 bufsize)
 
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME: {
-        const char* s = "ps3recomp_user";
+        /* PS3_NICKNAME=<name>: match an oracle (RPCS3 answers its "System Name", e.g.
+         * RPCS3-735). Titles copy it into heap strings, so a different length shifts
+         * every later allocation and breaks address-for-address diffs. */
+        const char* s = getenv("PS3_NICKNAME");
+        if (!s || !*s) s = "ps3recomp_user";
         u32 i;
         for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(buf_ea + i, (uint8_t)s[i]);
         vm_write8(buf_ea + i, 0);

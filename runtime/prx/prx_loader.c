@@ -15,6 +15,10 @@
  * the loader independent of the memory backend's init path. */
 extern uint8_t* vm_base;
 
+static void prx_watch_add(const prx_module* m);      /* PS3_PRX_WATCH, below */
+static void prx_watch_remove(const prx_module* m);
+static void prx_watch_start(void);
+
 /* ---- export registry ---------------------------------------------------- *
  * Flat NID -> guest-address table, filled as modules load. A handful of system
  * PRXs export a few hundred symbols total, so a linear array with linear lookup
@@ -49,6 +53,158 @@ uint32_t prx_resolve_export(uint32_t nid)
 }
 
 uint32_t prx_export_registry_count(void) { return s_export_reg_n; }
+
+static void prx_export_unregister(uint32_t nid, uint32_t guest_addr)
+{
+    for (uint32_t i = 0; i < s_export_reg_n; i++) {
+        if (s_export_reg[i].nid == nid && s_export_reg[i].guest_addr == guest_addr) {
+            s_export_reg[i] = s_export_reg[--s_export_reg_n];
+            return;
+        }
+    }
+}
+
+int prx_place_module(const prx_module* m, prx_register_fn reg)
+{
+    if (!m || !m->image || !m->image_size || !vm_base) return 0;
+    memcpy(vm_base + m->base, m->image, m->image_size);
+    if (reg)
+        for (uint64_t i = 0; i < m->func_count; i++)
+            if (m->funcs[i].func) reg((uint32_t)m->funcs[i].addr, m->funcs[i].func);
+    return 1;
+}
+
+void prx_publish_exports(const prx_module* m)
+{
+    for (uint32_t i = 0; m && m->exports && i < m->export_count; i++)
+        if (m->exports[i].nid) prx_export_register(m->exports[i].nid, m->base + m->exports[i].vaddr);
+    if (m) { prx_watch_add(m); prx_watch_start(); }
+}
+
+void prx_withdraw_exports(const prx_module* m)
+{
+    for (uint32_t i = 0; m && m->exports && i < m->export_count; i++)
+        if (m->exports[i].nid) prx_export_unregister(m->exports[i].nid, m->base + m->exports[i].vaddr);
+    if (m) prx_watch_remove(m);
+}
+
+/* ---- PS3_PRX_WATCH: catch whatever overwrites a loaded module's OPDs ------ *
+ * A published export is an OPD inside the placed image, and nothing rewrites
+ * an OPD after relocation. inFamous (T-0017) intermittently finds liblv2's
+ * lwmutex/lwcond OPDs reading zero mid-boot, after which every thread that
+ * takes a lock calls address 0. Polling every export against the original
+ * image bytes says WHEN that happens and what the overwrite looks like (its
+ * extent and contents), which is what names the writer: a DMA, a memset, a
+ * stray guest store. Off unless PS3_PRX_WATCH is set; POSIX only for now. */
+#define PRX_WATCH_CAP 32
+static const prx_module* volatile s_watch[PRX_WATCH_CAP];
+
+static void prx_watch_add(const prx_module* m)
+{
+    for (int i = 0; i < PRX_WATCH_CAP; i++) if (s_watch[i] == m) return;
+    for (int i = 0; i < PRX_WATCH_CAP; i++)
+        if (!s_watch[i]) { s_watch[i] = m; return; }
+}
+static void prx_watch_remove(const prx_module* m)
+{
+    for (int i = 0; i < PRX_WATCH_CAP; i++) if (s_watch[i] == m) s_watch[i] = NULL;
+}
+
+#ifndef _WIN32
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+
+static double prx_watch_now_s(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* One overwritten run: grow from `off` while guest bytes differ from the
+ * image, tolerating gaps of up to 32 equal bytes (a store pattern that
+ * happens to match the original for a few bytes is still one write). */
+static void prx_watch_report(const prx_module* m, uint32_t off, uint32_t nid, double t0)
+{
+    const uint8_t* g = vm_base + m->base;
+    uint32_t lo = off, hi = off + 8, gap;
+    for (gap = 0; lo > 0 && gap <= 32; ) { lo--; if (g[lo] != m->image[lo]) gap = 0; else gap++; }
+    lo += gap;
+    for (gap = 0; hi < m->image_size && gap <= 32; hi++) { if (g[hi] != m->image[hi]) gap = 0; else gap++; }
+    hi -= gap;
+    fprintf(stderr, "[prx-watch] t=+%.3fs %s OPD of NID 0x%08X at 0x%08X changed;"
+                    " overwritten run 0x%08X..0x%08X (%u bytes)\n",
+            prx_watch_now_s() - t0, m->name ? m->name : "?", nid, m->base + off,
+            m->base + lo, m->base + hi, hi - lo);
+    for (uint32_t a = lo & ~15u, rows = 0; a < hi && rows < 16; a += 16, rows++) {
+        char line[160]; int p = snprintf(line, sizeof line, "[prx-watch]   %08X now:", m->base + a);
+        for (uint32_t k = 0; k < 16; k += 4)
+            p += snprintf(line + p, sizeof line - p, " %02X%02X%02X%02X",
+                          g[a+k], g[a+k+1], g[a+k+2], g[a+k+3]);
+        p += snprintf(line + p, sizeof line - p, "  was:");
+        for (uint32_t k = 0; k < 16; k += 4)
+            p += snprintf(line + p, sizeof line - p, " %02X%02X%02X%02X",
+                          m->image[a+k], m->image[a+k+1], m->image[a+k+2], m->image[a+k+3]);
+        fprintf(stderr, "%s\n", line);
+    }
+    fflush(stderr);
+}
+
+static void* prx_watch_thread(void* arg)
+{
+    (void)arg;
+    const double t0 = prx_watch_now_s();
+    int reports = 0;
+    fprintf(stderr, "[prx-watch] polling published OPDs every 1 ms\n");
+    while (reports < 16) {
+        for (int i = 0; i < PRX_WATCH_CAP; i++) {
+            const prx_module* m = s_watch[i];
+            if (!m || !m->exports) continue;
+            for (uint32_t j = 0; j < m->export_count; j++) {
+                uint32_t off = m->exports[j].vaddr;
+                if (!m->exports[j].nid || off + 8 > m->image_size) continue;
+                if (memcmp(vm_base + m->base + off, m->image + off, 8) == 0) continue;
+                prx_watch_report(m, off, m->exports[j].nid, t0);
+                /* Report a module once: the first hit's run covers its
+                 * neighbours, and a flood would bury the timing. */
+                s_watch[i] = NULL;
+                reports++;
+                break;
+            }
+        }
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void prx_watch_start(void)
+{
+    static int started = 0;
+    if (started || !getenv("PS3_PRX_WATCH")) return;
+    started = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, prx_watch_thread, NULL) == 0) pthread_detach(t);
+}
+#else
+static void prx_watch_start(void) {}
+#endif
+
+/* ---- statically lifted modules, by file name ----------------------------- */
+#define PRX_STATIC_CAP 32
+static const prx_static_module* s_static[PRX_STATIC_CAP];
+static uint32_t                 s_static_n = 0;
+
+void prx_static_register(const prx_static_module* m)
+{
+    if (m && s_static_n < PRX_STATIC_CAP) s_static[s_static_n++] = m;
+}
+
+const prx_static_module* prx_static_find(const char* file)
+{
+    for (uint32_t i = 0; file && i < s_static_n; i++)
+        if (strcmp(s_static[i]->file, file) == 0) return s_static[i];
+    return NULL;
+}
 
 prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
 {
@@ -101,6 +257,9 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
             exports_published++;
         }
     }
+
+    prx_watch_add(m);
+    prx_watch_start();
 
     r.ok = 1;
     fprintf(stderr,

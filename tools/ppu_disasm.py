@@ -798,6 +798,34 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.mnemonic = "lvlxl"
             result.operands = f"v{rd}, r{ra}, r{rb}"
             return result
+        if xo_full == 807:  # lvrxl (Cell ext: Load Vector Right Indexed Last)
+            result.mnemonic = "lvrxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 660:  # stdbrx (Store Doubleword Byte-Reverse Indexed)
+            result.mnemonic = "stdbrx"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 533:  # lswx (Load String Word Indexed)
+            result.mnemonic = "lswx"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 661:  # stswx (Store String Word Indexed)
+            result.mnemonic = "stswx"
+            result.operands = f"r{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 68:   # td (Trap Doubleword)
+            result.mnemonic = "td"
+            result.operands = f"{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full in (342, 374):  # dst / dstst (data stream touch: hints)
+            result.mnemonic = "dst" if xo_full == 342 else "dstst"
+            result.operands = f"r{ra}, r{rb}, {rd & 3}"
+            return result
+        if xo_full == 822:  # dss / dssall
+            result.mnemonic = "dss"
+            result.operands = f"{rd & 3}"
+            return result
         if xo_full == 532:  # ldbrx (Load Doubleword Byte-Reverse Indexed)
             result.mnemonic = "ldbrx"
             result.operands = f"r{rd}, r{ra}, r{rb}"
@@ -1066,6 +1094,14 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.mnemonic = vmx_simm[xo_full]
             simm = va - 32 if va >= 16 else va
             result.operands = f"v{vd}, {simm}"
+            return result
+
+        # VSCR moves: mfvscr vD (only vD), mtvscr vB (only vB).
+        if xo_full == 1540:
+            result.mnemonic, result.operands = "mfvscr", f"v{vd}"
+            return result
+        if xo_full == 1604:
+            result.mnemonic, result.operands = "mtvscr", f"v{vb}"
             return result
 
         # lvx / stvx (X-form under opcode 31 actually, but some are opcd 4)

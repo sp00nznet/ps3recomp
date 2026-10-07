@@ -16,7 +16,7 @@ indirect call the runtime is not making. This tells the two apart.
 """
 import os, re, sys, json, collections
 
-DEF = re.compile(r'^void (func_[0-9A-Fa-f]+)\(ppu_context\*')
+DEF = re.compile(r'^void (?:__attribute__\(\(weak\)\) )?(func_[0-9A-Fa-f]+)\(ppu_context\*')
 CALL = re.compile(r'\b(func_[0-9A-Fa-f]+)\(ctx\)')
 TRAMP = re.compile(r'g_trampoline_fn\s*=\s*\(void\(\*\)\(void\*\)\)(func_[0-9A-Fa-f]+)')
 
