@@ -4103,6 +4103,11 @@ def main() -> None:
                         default=max(1, os.cpu_count() or 1),
                         help="Worker processes for the main lift "
                              "(default: CPU count; 1 = serial)")
+    parser.add_argument("--chunk-lines", type=int, default=600_000,
+                        help="Maximum lines per source chunk (default: 600000). "
+                             "A smaller value means more, smaller translation "
+                             "units: GCC needs about 2 GB at -O1 for 240k lines, "
+                             "so a host short on memory wants ~150000.")
     parser.add_argument("--code-end", type=lambda x: int(x, 0), default=None,
                         help="Highest valid executable address (exclusive). "
                              "Branch/call/jump-table targets at or above this are "
@@ -4647,7 +4652,8 @@ def main() -> None:
         print(f"Wrote {os.path.basename(src_path)}")
     else:
         print("Writing C source (split into chunks)...", flush=True)
-        paths = lifter.write_source_files(args.output, base=base)
+        paths = lifter.write_source_files(args.output, base=base,
+                                          max_lines=args.chunk_lines)
         print(f"Wrote {header_path}")
         print(f"Wrote {len(paths)} source chunks: "
               f"{os.path.basename(paths[0])} .. {os.path.basename(paths[-1])}")
