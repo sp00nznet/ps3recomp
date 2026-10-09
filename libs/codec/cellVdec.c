@@ -1,14 +1,19 @@
 /*
  * ps3recomp - cellVdec HLE implementation
  *
- * Stub video decoder. Accepts AU data and delivers AUDONE callbacks
- * but does not perform actual H.264/MPEG-2 decoding. Games that
- * require video playback will need an FFmpeg/libav integration here.
+ * H.264 and MPEG-2 decode through libavcodec when the runtime is built with
+ * PS3RECOMP_FFMPEG_RUNTIME and the library is present (vdec_ffmpeg.c,
+ * ffmpeg_runtime.c): every AU is decoded, pictures are queued in display
+ * order and announced with PICOUT, and GetPicture converts them to the
+ * requested format. Otherwise this is the callback-only decoder it always
+ * was: AUDONE and PICOUT per AU, and a black picture.
  */
 
 #include "cellVdec.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include "vdec_ffmpeg.h"
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
@@ -17,6 +22,17 @@
  * Internal state
  * -----------------------------------------------------------------------*/
 #define MAX_VDEC 4
+#define VDEC_QUEUE   32   /* decoded pictures waiting for GetPicture */
+#define VDEC_BUSY_AT 16   /* refuse new AUs past this many (EndSeq can add more) */
+#define VDEC_AU_RING 64   /* AUs remembered for pictures that come out late */
+
+/* A decoded picture waiting for the title (decoder path only). */
+typedef struct {
+    u8* yuv;            /* I420, width x height */
+    CellVdecPicItem item;
+    int pictType;       /* 1 I, 2 P, 3 B, 0 unknown */
+    int key;
+} VdecPic;
 
 typedef struct {
     int in_use;
@@ -29,6 +45,13 @@ typedef struct {
     u32 auCount;        /* total AUs decoded */
     u16 width;          /* configured resolution (0 = use default) */
     u16 height;
+    /* Decoder path: NULL when there is no libavcodec, and then nothing
+     * below is used. */
+    VdecFf* ff;
+    VdecPic queue[VDEC_QUEUE];
+    u32 qHead, qCount;
+    CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
+    u32 newPics;        /* pictures queued by the current decode call */
 } VdecSlot;
 
 static VdecSlot s_vdec[MAX_VDEC];
@@ -46,6 +69,59 @@ static void vdec_notify(CellVdecHandle handle, u32 msg_type, s32 msg_data)
     if (!v->cbFunc || !g_ps3_guest_caller) return;
     g_ps3_guest_caller(v->cbFunc, (u64)handle, (u64)msg_type,
                        (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * Decoder path (libavcodec present)
+ * -----------------------------------------------------------------------*/
+
+static void vdec_queue_clear(VdecSlot* v)
+{
+    for (u32 i = 0; i < v->qCount; i++)
+        free(v->queue[(v->qHead + i) % VDEC_QUEUE].yuv);
+    v->qHead = v->qCount = 0;
+}
+
+/* vdec_ff_emit_fn: queue a decoded picture under the item of the AU it was
+ * decoded from. Pictures leave the decoder in display order, so with B-frames
+ * that is not the AU just submitted; the token is that AU's auCount. */
+static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
+{
+    VdecSlot* v = (VdecSlot*)ctx;
+    if (v->qCount == VDEC_QUEUE) {
+        printf("[cellVdec] picture queue full; dropping the oldest\n");
+        free(v->queue[v->qHead].yuv);
+        v->qHead = (v->qHead + 1) % VDEC_QUEUE;
+        v->qCount--;
+    }
+    const CellVdecAuInfo* au = &v->aus[pic->token % VDEC_AU_RING];
+    VdecPic* q = &v->queue[(v->qHead + v->qCount) % VDEC_QUEUE];
+    memset(q, 0, sizeof(*q));
+    q->yuv = pic->yuv;
+    q->pictType = pic->pict_type;
+    q->key = pic->key;
+    q->item.codecType = v->codecType;
+    q->item.startAddr = au->startAddr;
+    q->item.size      = au->size;
+    q->item.auNum     = pic->token;
+    q->item.pts       = au->pts;
+    q->item.dts       = au->dts;
+    q->item.userData  = au->userData;
+    q->item.status    = 0;
+    q->item.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
+    q->item.width     = (u16)pic->width;
+    q->item.height    = (u16)pic->height;
+    v->qCount++;
+    v->newPics++;
+}
+
+/* PICOUT for each picture the last decoder call queued. */
+static void vdec_notify_new_pics(CellVdecHandle handle)
+{
+    u32 n = s_vdec[handle].newPics;
+    s_vdec[handle].newPics = 0;
+    while (n--)
+        vdec_notify(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
 }
 
 /* ---------------------------------------------------------------------------
@@ -96,8 +172,11 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
             s_vdec[i].codecType = codec_type;
             s_vdec[i].cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
             s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
+            s_vdec[i].ff = vdec_ff_open(codec_type);
             vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellVdec] Open -> handle=%u\n", i);
+            if (s_vdec[i].ff)
+                printf("[cellVdec] decoding with libavcodec\n");
             return CELL_OK;
         }
     }
@@ -111,6 +190,11 @@ s32 cellVdecClose(CellVdecHandle handle)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
 
+    if (s_vdec[handle].ff) {
+        vdec_queue_clear(&s_vdec[handle]);
+        vdec_ff_close(s_vdec[handle].ff);
+        s_vdec[handle].ff = NULL;
+    }
     s_vdec[handle].in_use = 0;
     return CELL_OK;
 }
@@ -123,6 +207,11 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
         return (s32)CELL_VDEC_ERROR_ARG;
 
     s_vdec[handle].seqStarted = 1;
+    if (s_vdec[handle].ff) {
+        /* A new sequence: nothing from the last one is shown. */
+        vdec_ff_reset(s_vdec[handle].ff);
+        vdec_queue_clear(&s_vdec[handle]);
+    }
     return CELL_OK;
 }
 
@@ -134,6 +223,13 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
         return (s32)CELL_VDEC_ERROR_ARG;
 
     s_vdec[handle].seqStarted = 0;
+
+    /* Pictures the decoder still holds for reordering come out now, each
+     * with its PICOUT, before SEQDONE. */
+    if (s_vdec[handle].ff) {
+        vdec_ff_drain(s_vdec[handle].ff, vdec_on_picture, &s_vdec[handle]);
+        vdec_notify_new_pics(handle);
+    }
 
     /* Notify sequence done */
     vdec_notify(handle, CELL_VDEC_MSG_TYPE_SEQDONE, CELL_OK);
@@ -166,6 +262,20 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
            handle, au.startAddr, au.size,
            (unsigned long long)au.pts);
+
+    if (v->ff) {
+        if (v->qCount >= VDEC_BUSY_AT)
+            return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
+        v->auCount++;
+        v->aus[v->auCount % VDEC_AU_RING] = au;
+        v->newPics = 0;
+        if (au.size)   /* an empty packet would mean end of stream to FFmpeg */
+            vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
+                           vdec_on_picture, v);
+        vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
+        vdec_notify_new_pics(handle);
+        return CELL_OK;
+    }
 
     /* Step 1: Report AU consumed */
     vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
@@ -210,10 +320,9 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
 #define VDEC_ITEM_EA(h)  (VM_HLE_INJECT_BASE + 0x50000u + (u32)(h) * 0x100u)
 #define VDEC_INFO_EA(h)  (VDEC_ITEM_EA(h) + 0x80u)
 
-static void vdec_write_item(CellVdecHandle handle)
+static void vdec_write_item(CellVdecHandle handle, const CellVdecPicItem* p)
 {
     const VdecSlot* v = &s_vdec[handle];
-    const CellVdecPicItem* p = &v->lastPic;
     u32 it = VDEC_ITEM_EA(handle), info = VDEC_INFO_EA(handle);
     for (u32 o = 0; o < 0x100; o += 4) vm_write32(it + o, 0);
     vm_write32(it + 0x00, v->codecType);
@@ -236,6 +345,26 @@ static void vdec_write_item(CellVdecHandle handle)
     vm_write16(info + 2, p->height);
 }
 
+/* The decoder path also reports the picture type.
+ * ASSUMPTION (field order of the SDK's CellVdecAvcInfo / CellVdecMpeg2Info,
+ * not yet checked against a title):
+ *   AVC   +0x04 u8 pictureType[2] (0 I, 1 P, 2 B, 3 unknown),
+ *         +0x06 u8 idrPictureFlag;
+ *   MPEG2 +0x12 u8 picture_coding_type[2] (1 I, 2 P, 3 B, as in the bitstream).
+ * pict_type is FFmpeg's (1 I, 2 P, 3 B, 0 none). */
+static void vdec_write_pic_type(CellVdecHandle handle, const VdecPic* q)
+{
+    u32 info = VDEC_INFO_EA(handle);
+    int t = q->pictType;
+    if (s_vdec[handle].codecType == CELL_VDEC_CODEC_TYPE_AVC) {
+        vm_write8(info + 0x04, (u8)(t >= 1 && t <= 3 ? t - 1 : 3));
+        vm_write8(info + 0x05, 3);
+        vm_write8(info + 0x06, (u8)(q->key && t == 1));
+    } else if (s_vdec[handle].codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
+        vm_write8(info + 0x12, (u8)(t >= 1 && t <= 3 ? t : 0));
+    }
+}
+
 /* cellVdecGetPicItem(handle, &item): the NEXT picture's item, without
  * consuming it; cellVdecGetPicture is what takes it off the queue. */
 s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
@@ -243,9 +372,19 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
     u32 out = (u32)(uintptr_t)picItem;
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !out)
         return (s32)CELL_VDEC_ERROR_ARG;
+    const VdecSlot* v = &s_vdec[handle];
+    if (v->ff) {
+        if (!v->qCount)
+            return (s32)CELL_VDEC_ERROR_EMPTY;
+        const VdecPic* q = &v->queue[v->qHead];
+        vdec_write_item(handle, &q->item);
+        vdec_write_pic_type(handle, q);
+        vm_write32(out, VDEC_ITEM_EA(handle));
+        return CELL_OK;
+    }
     if (!s_vdec[handle].hasPic)
         return (s32)CELL_VDEC_ERROR_EMPTY;
-    vdec_write_item(handle);
+    vdec_write_item(handle, &v->lastPic);
     vm_write32(out, VDEC_ITEM_EA(handle));
     return CELL_OK;
 }
@@ -254,15 +393,33 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
  * the requested format and consume it. format is a guest CellVdecPicFormat
  * { u32 formatType; u32 colorMatrixType; u8 alpha; }; formatType 0 ARGB32,
  * 1 RGBA32, 2 UYVY422, 3 YUV420 planar.
- * ponytail: there is no H.264/MPEG-2 decoder behind this, so the picture is
- * black at the item's size (1280x720 unless set). Real frames need a decoder;
- * titles that only pace playback on PICOUT/GetPicture run as they should. */
+ * With libavcodec the picture is the decoded one (vdec_take_picture). Without
+ * it the picture is black at the item's size (1280x720 unless set); titles
+ * that only pace playback on PICOUT/GetPicture run as they should. */
+static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alpha)
+{
+    if (!v->qCount)
+        return (s32)CELL_VDEC_ERROR_EMPTY;
+    VdecPic* q = &v->queue[v->qHead];
+    v->qHead = (v->qHead + 1) % VDEC_QUEUE;
+    v->qCount--;
+    if (dst)                                           /* NULL: a skip */
+        vdec_store_picture(dst, q->yuv, q->item.width, q->item.height,
+                           type, matrix, alpha);
+    free(q->yuv);
+    q->yuv = NULL;
+    return CELL_OK;
+}
+
 s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
 {
     u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
+    if (v->ff)
+        return vdec_take_picture(v, dst, vm_read32(fmt_ea + 0),
+                                 vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 8));
     if (!v->hasPic)
         return (s32)CELL_VDEC_ERROR_EMPTY;
     v->hasPic = 0;
@@ -293,6 +450,24 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
     }
     for (u32 y = 0; y < h; y++) guest_struct_store(dst + y * rowlen, row, rowlen);
     return CELL_OK;
+}
+
+/* cellVdecGetPictureExt(handle, format2, outBuff, arg4): GetPicture with a
+ * CellVdecPicFormat2. ASSUMPTION (SDK field order): +0 u32 formatType,
+ * +4 u32 colorMatrixType, +8 u32 unk0, +0xC u8 alpha; arg4 is unused here.
+ * Without a decoder this does what the call did before it was implemented
+ * (an unregistered import): return CELL_OK and touch nothing. */
+s32 cellVdecGetPictureExt(CellVdecHandle handle, const void* format,
+                          void* outBuff, u32 arg4)
+{
+    (void)arg4;
+    u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
+    if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !s_vdec[handle].ff)
+        return CELL_OK;
+    if (!fmt_ea)
+        return (s32)CELL_VDEC_ERROR_ARG;
+    return vdec_take_picture(&s_vdec[handle], dst, vm_read32(fmt_ea + 0),
+                             vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 0xC));
 }
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)

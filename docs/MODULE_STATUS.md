@@ -63,7 +63,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellPamf | PAMF Container | **Complete** | Big-endian PAMF header parser, stream queries, entry points, AVC/ATRAC3+/LPCM/AC3 info |
-| cellVdec | Video Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PICOUT callbacks (populated PicItem), no actual H.264/MPEG2 decode (needs FFmpeg) |
+| cellVdec | Video Decode | Partial | H.264 and MPEG-2 decode through FFmpeg loaded at run time (`-DPS3RECOMP_FFMPEG_RUNTIME=ON`, libavcodec present): pictures in display order with PICOUT, pts/dts/userData and picture type in the PicItem, YUV420/UYVY/ARGB/RGBA output, EndSeq flush. Without FFmpeg: AUDONE+PICOUT per AU and a black picture, as before |
 | cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PCMOUT callbacks (populated PcmItem), no actual AAC/ATRAC3+ decode (needs FFmpeg) |
 | cellDmux | Demuxer | Partial | Open/close, ES enable/disable, stream set with callback sequencing, AU retrieval, flush |
 | cellVpost | Video Post | **Complete** | Handle management, query, exec stub (no actual color conversion/scaling) |
@@ -182,6 +182,6 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 1. **RSX command buffer processing** — Translate NV47xx methods to Vulkan/D3D12 draw calls (the graphics mountain)
 2. **cellSpurs** — Actual SPU program execution on host threads
-3. **cellVdec / cellAdec / cellDmux** — Integrate FFmpeg for actual video/audio decoding and demuxing
+3. **cellAdec / cellDmux / cellSail** — Real audio decode and PAMF demux on the run-time FFmpeg loader cellVdec uses (`libs/codec/ffmpeg_runtime.c`)
 4. **cellJpgEnc / cellPngEnc** — Integrate stb_image_write for actual encoding
 5. **Remaining niche modules** — cellAdecExt, cellAudioExt, and any other game-specific needs
