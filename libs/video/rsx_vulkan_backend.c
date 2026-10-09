@@ -210,6 +210,7 @@ typedef struct vk_state {
     u32              last_center;
     u32              presented;
     const char*      dump_path;
+    u32              dump_every;       /* write every nth presented frame */
 } vk_state;
 
 static vk_state s_vk;
@@ -1848,7 +1849,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     s_vk.presented++;
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
-    if (s_vk.dump_path) vk_dump_ppm(px);
+    if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
     vk_present_window();
 }
 
@@ -2968,6 +2969,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
+    /* Writing a full frame to disk on every present costs more than the
+     * present itself and slows a title enough to change what it does; a
+     * live title wants one now and then, not all of them. */
+    { const char* e = getenv("PS3RECOMP_VK_DUMP_EVERY");
+      s_vk.dump_every = (e && atoi(e) > 0) ? (u32)atoi(e) : 1; }
 
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;
