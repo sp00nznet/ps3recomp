@@ -30,7 +30,9 @@ extern "C" {
  * Codec types
  * -----------------------------------------------------------------------*/
 #define CELL_VDEC_CODEC_TYPE_AVC       0x00000001
-#define CELL_VDEC_CODEC_TYPE_MPEG2     0x00000002
+/* MPEG-2 is 0 in the SDK's CellVdecCodecType. It was 2 here, a value no
+ * title passes; nothing compared against it until the decoder path. */
+#define CELL_VDEC_CODEC_TYPE_MPEG2     0x00000000
 #define CELL_VDEC_CODEC_TYPE_DIVX      0x00000005
 
 /* Picture format */
@@ -108,6 +110,8 @@ s32 cellVdecEndSeq(CellVdecHandle handle);
 s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auInfo);
 
 s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff);
+s32 cellVdecGetPictureExt(CellVdecHandle handle, const void* format,
+                          void* outBuff, u32 arg4);
 s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem);
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode);

@@ -184,6 +184,25 @@ if(PS3RECOMP_RSX_VULKAN)
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
 endif()
 
+# cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
+# is loaded at run time (dlopen / LoadLibrary), never linked, so building needs
+# only the FFmpeg headers, and a binary run where FFmpeg is absent -- or with
+# PS3RECOMP_FFMPEG=0 -- keeps the callback-only decoders. FFmpeg stays a
+# separate, user-supplied LGPL library. See libs/codec/ffmpeg_runtime.h.
+option(PS3RECOMP_FFMPEG_RUNTIME "Decode media through FFmpeg loaded at run time (needs the FFmpeg headers)" OFF)
+if(PS3RECOMP_FFMPEG_RUNTIME)
+    find_path(PS3RECOMP_FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
+    if(NOT PS3RECOMP_FFMPEG_INCLUDE_DIR)
+        message(FATAL_ERROR "FFmpeg headers not found. Debian/Ubuntu: "
+            "libavcodec-dev, Fedora: ffmpeg-free-devel, MSYS2: mingw-w64-x86_64-ffmpeg "
+            "-- or pass -DPS3RECOMP_FFMPEG_INCLUDE_DIR=<dir containing libavcodec/avcodec.h>")
+    endif()
+    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_FFMPEG_INCLUDE_DIR}")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
+    target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
+    message(STATUS "  FFmpeg:       run-time loaded (headers in ${PS3RECOMP_FFMPEG_INCLUDE_DIR})")
+endif()
+
 # ---------------------------------------------------------------------------
 # Guest shaders on Metal: HLSL -> SPIR-V -> MSL
 # ---------------------------------------------------------------------------
@@ -368,6 +387,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    # cellVdec through its guest API: the callback-only decoder always, and
+    # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
+    add_subdirectory(libs/codec/tests)
 endif()
 
 # ---------------------------------------------------------------------------

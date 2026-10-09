@@ -130,8 +130,30 @@ cmake --install build --prefix /usr/local
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
 | `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
+| `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded-opt-in) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
+
+### FFmpeg (run-time loaded, opt-in)
+
+```bash
+# Headers only -- Debian/Ubuntu: libavcodec-dev, Fedora: ffmpeg-free-devel
+cmake -S . -B build -G Ninja -DPS3RECOMP_FFMPEG_RUNTIME=ON
+```
+
+FFmpeg is never linked. The first `cellVdecOpen` loads libavcodec and
+libavutil with `dlopen` / `LoadLibrary` and resolves the few functions the
+decoder calls. The library has to be the major version the headers describe
+(`libavcodec.so.63` / `avcodec-63.dll` for FFmpeg 9.0), because the decoder
+reads `AVFrame` fields and FFmpeg keeps their layout only within a major
+version; another major is reported and not used. Ship the matching FFmpeg DLLs
+next to a Windows build, or rely on the system's on Linux. When the library is
+missing, or `PS3RECOMP_FFMPEG=0` is set, the decoders keep the callback-only
+behaviour every build had before. `PS3RECOMP_FFMPEG_AVCODEC` and
+`PS3RECOMP_FFMPEG_AVUTIL` name the library files to load instead.
+
+FFmpeg stays a separate LGPL library supplied by the user; nothing from it is
+compiled into the runtime.
 
 ### Running the Tests
 
@@ -141,8 +163,11 @@ cmake --build build-tests
 ctest --test-dir build-tests --output-on-failure
 ```
 
-The test build currently registers the deterministic synchronization stress
-suite. It can still be configured directly from `tests/sync_stress` when
+The test build registers the deterministic synchronization stress suite, the
+fiber switch test and cellVdec's guest-API test. With
+`-DPS3RECOMP_FFMPEG_RUNTIME=ON` and an `ffmpeg` program on `PATH`, it also
+generates small H.264 and MPEG-2 streams into the build tree and checks every
+decoded picture against FFmpeg's own decode. It can still be configured directly from `tests/sync_stress` when
 testing an alternate runtime tree with `PS3RECOMP_TREE_ROOT`.
 
 ### Checking the PPU boot scaffold
