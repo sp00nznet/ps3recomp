@@ -1511,9 +1511,21 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     if (!s_on) return;
     static long s_n = 0;
     if (s_n++ >= 16) return;
+    const uint32_t fn = ppu_prof_resolve_host(ra);
     fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
-            width * 8, a, a, ppu_prof_resolve_host(ra),
-            s_n == 16 ? "  [further NULL reads not reported]" : "");
+            width * 8, a, a, fn, s_n == 16 ? "  [further NULL reads not reported]" : "");
+    /* PS3_NULL_READ_STACK=1: guest-fn is the nearest host symbol, which can
+     * name a neighbour; the guest call chain names the reader. Once for each
+     * of the first four distinct guest-fn values. */
+    { static int s_stk = -1;
+      static uint32_t s_done[4]; static int s_nd = 0;
+      if (s_stk < 0) { const char* e = getenv("PS3_NULL_READ_STACK"); s_stk = (e && *e && *e != '0') ? 1 : 0; }
+      int seen = 0;
+      for (int i = 0; i < s_nd; i++) seen |= (s_done[i] == fn);
+      if (s_stk && !seen && s_nd < 4 && g_active_ctx) {
+          s_done[s_nd++] = fn;
+          ppu_dump_guest_stack(g_active_ctx, "null-read");
+      } }
     fflush(stderr);
 }
 
