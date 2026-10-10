@@ -2060,7 +2060,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         if (!known && ns < 64) { seen[ns][0] = fp_addr; seen[ns][1] = cube_mask; ns++;
             fprintf(stderr, "[CUBEKEY] fp=0x%X cube_mask=0x%X (distinct pairs=%d)%c",
                     fp_addr, cube_mask, ns, 10); } } }
-    static char hlsl[32768];
+    static char hlsl[RSX_FP_HLSL_BUFFER_SIZE];
     /* Signature changed when the newer decompiler was adopted: the third
      * parameter is now SET_SHADER_CONTROL, not an exports-32 flag. This
      * backend does not track that register, so let the decompiler infer it. */

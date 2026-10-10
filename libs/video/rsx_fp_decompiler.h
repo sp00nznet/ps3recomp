@@ -21,6 +21,11 @@ extern "C" {
 #define RSX_FP_BUFFERED_CONSTANTS_API 1
 #define RSX_FP_MAX_INLINE_CONSTANTS 2048u
 
+/* Source capacity for native backends decoding up to 4096 bytecode bytes.
+ * Predicated instructions can expand beyond 32 KiB of HLSL. This is a caller
+ * allocation size, not a limit imposed by the decompiler API. */
+#define RSX_FP_HLSL_BUFFER_SIZE (256u * 1024u)
+
 /* Runtime payload for a structurally decompiled fragment program. Values are
  * retained as host-order IEEE-754 bit patterns so signed zero, infinities,
  * NaNs, and NaN payloads survive the guest-word conversion exactly. One slot

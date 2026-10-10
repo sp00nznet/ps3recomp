@@ -300,6 +300,33 @@ int main(void)
         check_absent("lif_handled", hlsl, "unhandled FP opcode");
     }
 
+    /* A 4096-byte program fits the D3D12 caller's input bound, but its
+     * predicated, CC-writing instructions expand beyond 32 KiB of HLSL.
+     * Assemble it here instead of depending on a captured game shader. */
+    {
+        enum { INSTRUCTION_COUNT = 256 };
+        u8 prog[INSTRUCTION_COUNT * 16];
+        static char backend_hlsl[RSX_FP_HLSL_BUFFER_SIZE];
+        for (int i = 0; i < INSTRUCTION_COUNT; i++) {
+            u8* ins = prog + i * 16;
+            u32 end = i == INSTRUCTION_COUNT - 1 ? END : 0u;
+            u32 opcode = i == 0 ? OPC(0x01) : OPC(0x04);
+            u32 condition = i == 0 ? EXEC_ALWAYS : (1u << 20);
+            put_word(ins + 0, opcode | OUTMASK_ALL | INSRC(1) |
+                             (1u << 8) | end); /* MOV/MAD r0, set CC0 */
+            put_word(ins + 4, T_INPUT | SWZ_IDENT | condition);
+            put_word(ins + 8, T_TEMP | REG(0) | SWZ_IDENT);
+            put_word(ins + 12, T_TEMP | REG(1) | SWZ_IDENT);
+        }
+        int n = rsx_fp_decompile(prog, sizeof(prog), RSX_FP_CTRL_AUTO,
+                                 backend_hlsl, sizeof(backend_hlsl));
+        printf("-- source capacity: %d instr, %zu HLSL bytes\n",
+               n, strlen(backend_hlsl));
+        check_true("backend_source_capacity", n == INSTRUCTION_COUNT);
+        check_true("source_exceeds_old_capacity", strlen(backend_hlsl) > 32768u);
+        check("large_program_return", backend_hlsl, "return (_o == _o) ? _o");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
