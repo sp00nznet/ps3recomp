@@ -1912,6 +1912,19 @@ static VkFormat vk_eng_format(rsx_be_format f, u32* bpp)
     }
 }
 
+/* Colour formats the E2 passes render into: RGBA8 for ordinary and display
+ * targets, RGBA16F for SET_SURFACE_FORMAT 0xB HDR targets. Both are required
+ * colour attachment formats with blending in Vulkan 1.0. */
+#define VK_ENG_RT_FORMATS 2
+static int vk_eng_rt_index(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM:      return 0;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return 1;
+    default:                            return -1;
+    }
+}
+
 static u32 vk_eng_alloc(void)
 {
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
@@ -2038,9 +2051,8 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     (void)user;
     u32 bpp;
     const VkFormat vf = vk_eng_format(fmt, &bpp);
-    /* E1: the render pass is built for R8G8B8A8, so that is the one colour
-     * target format for now; FP16 HDR targets need their own pass. */
-    if (vf != VK_FORMAT_R8G8B8A8_UNORM || !w || !h || w > 4096u || h > 4096u) {
+    /* Only formats the E2 passes are built for (vk_eng_rt_index). */
+    if (vk_eng_rt_index(vf) < 0 || !w || !h || w > 4096u || h > 4096u) {
         VK_LOG("engine: colour target format %d %ux%u not supported yet\n", (int)fmt, w, h);
         return 0;
     }
@@ -2361,8 +2373,8 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
  * vtable guest path already creates. Vertex inputs are the engine's compact
  * layout: slot n is a float4 at n*16, at location n, as Metal reads it.
  * Known gaps, stated rather than guessed: vertex-texture units (their
- * samplers s0..s3 would alias the pixel samplers' binding), FP16 and other
- * non-RGBA8 colour targets, depth-only passes, and stencil (the depth format
+ * samplers s0..s3 would alias the pixel samplers' binding), colour targets
+ * other than RGBA8 and RGBA16F, depth-only passes, and stencil (the depth format
  * has no stencil aspect yet, so the test is inert). */
 #define VK_ENG_MAX_PIPE   512
 #define VK_ENG_TOPOLOGIES 5
@@ -2373,13 +2385,14 @@ typedef struct vk_eng_pipe {
     VkShaderModule      vs, fs;
     rsx_be_render_state rs;
     u32                 nslots, stride, rt_count;
+    VkFormat            rt_fmt;          /* picks the render pass it is built against */
     VkPipeline          variant[VK_ENG_TOPOLOGIES];
 } vk_eng_pipe;
 
 static vk_eng_pipe s_epipe[VK_ENG_MAX_PIPE];
 
 static struct {
-    VkRenderPass rp[RSX_BE_MAX_COLOR_TARGETS + 1];      /* by colour count */
+    VkRenderPass rp[VK_ENG_RT_FORMATS][RSX_BE_MAX_COLOR_TARGETS + 1]; /* by format, colour count */
     struct { u32 key[RSX_BE_MAX_COLOR_TARGETS + 1]; VkFramebuffer fb; } fb[VK_ENG_FB_CACHE];
     u32          fb_count;
     vk_image     scratch_depth;                          /* when no zeta is bound */
@@ -2408,17 +2421,19 @@ static void vk_eng_drop_framebuffers(void)
     s_e2.fb_count = 0;
 }
 
-/* The render pass for `n` RGBA8 colour attachments plus depth, LOAD/STORE in
- * GENERAL like the vtable path's: clears are separate operations. */
-static VkRenderPass vk_eng_render_pass(u32 n)
+/* The render pass for `n` colour attachments of format `cf` plus depth,
+ * LOAD/STORE in GENERAL like the vtable path's: clears are separate
+ * operations. An MRT set shares target A's format (engine contract). */
+static VkRenderPass vk_eng_render_pass(VkFormat cf, u32 n)
 {
-    if (n < 1 || n > RSX_BE_MAX_COLOR_TARGETS) return VK_NULL_HANDLE;
-    if (s_e2.rp[n]) return s_e2.rp[n];
+    const int fi = vk_eng_rt_index(cf);
+    if (fi < 0 || n < 1 || n > RSX_BE_MAX_COLOR_TARGETS) return VK_NULL_HANDLE;
+    if (s_e2.rp[fi][n]) return s_e2.rp[fi][n];
     VkAttachmentDescription att[RSX_BE_MAX_COLOR_TARGETS + 1];
     VkAttachmentReference   cref[RSX_BE_MAX_COLOR_TARGETS];
     for (u32 i = 0; i <= n; i++) {
         att[i] = (VkAttachmentDescription){
-            .format = (i < n) ? VK_FORMAT_R8G8B8A8_UNORM : s_vk.depth_format,
+            .format = (i < n) ? cf : s_vk.depth_format,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
@@ -2433,9 +2448,9 @@ static VkRenderPass vk_eng_render_pass(u32 n)
     VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
                                    .attachmentCount = n + 1, .pAttachments = att,
                                    .subpassCount = 1, .pSubpasses = &sub };
-    if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_e2.rp[n]) != VK_SUCCESS)
-        s_e2.rp[n] = VK_NULL_HANDLE;
-    return s_e2.rp[n];
+    if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_e2.rp[fi][n]) != VK_SUCCESS)
+        s_e2.rp[fi][n] = VK_NULL_HANDLE;
+    return s_e2.rp[fi][n];
 }
 
 /* Tables carried from the Metal backend, itself copied from the D3D12 live
@@ -2515,7 +2530,9 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     (void)user;
     /* Same gate as Metal: no guest programs, no engine pipelines. */
     if (!s_g.on || !vs_hlsl || !ps_hlsl || !rs || !layout || !vertex_stride) return 0;
-    if (rt_fmt != RSX_BE_FMT_R8G8B8A8) {
+    u32 rt_bpp;
+    const VkFormat cf = vk_eng_format(rt_fmt, &rt_bpp);
+    if (vk_eng_rt_index(cf) < 0) {
         if (!(s_e2.warned & 1u)) { VK_LOG("engine: colour format %d not supported yet\n", (int)rt_fmt); s_e2.warned |= 1u; }
         return 0;
     }
@@ -2534,6 +2551,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     P->nslots = layout->count;
     P->stride = vertex_stride;
     P->rt_count = rt_count;
+    P->rt_fmt = cf;
     P->used = 1;
     return slot + 1u;
 }
@@ -2558,7 +2576,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
     if (P->variant[topo_idx]) return P->variant[topo_idx];
-    VkRenderPass rp = vk_eng_render_pass(P->rt_count);
+    VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, P->rt_count);
     if (!rp || P->nslots > VK_GUEST_ATTRS) return VK_NULL_HANDLE;
     const rsx_be_render_state* rs = &P->rs;
 
@@ -2656,8 +2674,9 @@ static void vk_eng2_shutdown(void* user)
 {
     for (u32 i = 1; i <= VK_ENG_MAX_PIPE; i++) vk_eng_pipeline_release(user, i);
     vk_eng_drop_framebuffers();
-    for (u32 n = 0; n <= RSX_BE_MAX_COLOR_TARGETS; n++)
-        if (s_e2.rp[n]) pvkDestroyRenderPass(s_vk.device, s_e2.rp[n], NULL);
+    for (u32 f = 0; f < VK_ENG_RT_FORMATS; f++)
+        for (u32 n = 0; n <= RSX_BE_MAX_COLOR_TARGETS; n++)
+            if (s_e2.rp[f][n]) pvkDestroyRenderPass(s_vk.device, s_e2.rp[f][n], NULL);
     vk_destroy_image(&s_e2.scratch_depth);
     vk_destroy_buffer(&s_e2.indices);
     memset(&s_e2, 0, sizeof s_e2);
@@ -2856,6 +2875,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     if (!rt0) return;
     for (u32 i = 1; i < n; i++)
         if (!vk_eng_get(s_eng_bound.rt[i], VK_ENG_COLOR)) return;
+    if (rt0->fmt != P->rt_fmt) {
+        if (!(s_e2.warned & 32u)) { VK_LOG("engine: draw into colour format %d with a pipeline built for %d skipped\n", (int)rt0->fmt, (int)P->rt_fmt); s_e2.warned |= 32u; }
+        return;
+    }
     const u32 w = rt0->w, h = rt0->h;
     vk_eng_obj* zo = vk_eng_get(s_eng_bound.depth, VK_ENG_DEPTH);
     VkImageView dview = (zo && zo->w >= w && zo->h >= h) ? zo->im.view : vk_eng_scratch_depth(w, h);
@@ -2863,7 +2886,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     const u32 dkey = (zo && dview == zo->im.view) ? s_eng_bound.depth : 0xFFFFFFFFu;
 
     VkPipeline pipe = vk_eng_variant(P, (u32)topology - 1u);
-    VkRenderPass rp = vk_eng_render_pass(n);
+    VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, n);
     VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
     if (!pipe || !rp || !fb) return;
 
