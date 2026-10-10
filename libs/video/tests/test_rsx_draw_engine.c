@@ -239,8 +239,23 @@ static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
 static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                           void* out, u32 pitch)
 {
-    (void)u; (void)s; (void)x; (void)y; (void)pitch;
-    if (w == 1 && h == 1) memcpy(out, g_stub_pixel, 4);
+    (void)u; (void)s; (void)x; (void)y;
+    for (u32 r = 0; r < h; r++)
+        for (u32 c = 0; c < w; c++)
+            memcpy((u8*)out + (size_t)r * pitch + c * 4u, g_stub_pixel, 4);
+}
+
+/* The last rectangle pushed into a colour target, and its first pixel. */
+static struct { int n; u32 surface, x, y, w, h; u8 first[4]; } g_written;
+
+static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
+                             const void* rows, u32 row_bytes)
+{
+    (void)u; (void)row_bytes;
+    g_written.n++;
+    g_written.surface = s; g_written.x = x; g_written.y = y;
+    g_written.w = w; g_written.h = h;
+    memcpy(g_written.first, rows, 4);
 }
 
 static const rsx_draw_backend g_stub_backend = {
@@ -253,6 +268,7 @@ static const rsx_draw_backend g_stub_backend = {
     .texture_release = stub_texture_release,
     .color_target_create = stub_color_create,
     .color_target_release = stub_color_release,
+    .color_target_write = stub_color_write,
     .surface_view = stub_surface_view,
     .depth_target_create = stub_depth_create,
     .depth_target_release = stub_release,
@@ -284,6 +300,7 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_SURFACE_CLIP_H      0x0200
 #define M_SURFACE_CLIP_V      0x0204
 #define M_SURFACE_FORMAT      0x0208
+#define M_COLOR_A_PITCH       0x020C
 #define M_COLOR_A_OFFSET      0x0210
 #define M_ZETA_OFFSET         0x0214
 #define M_COLOR_B_OFFSET      0x0218
@@ -897,6 +914,46 @@ static void test_queued_flip_buffer(void)
     engine_down();
 }
 
+/* A 2D transfer reads and writes guest memory; the pixels it touches live in
+ * the engine's surfaces, so they are synced both ways around it. */
+static void test_transfer_coherence(void)
+{
+    printf("-- transfer coherence\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 1024u);                 /* 256 pixels of A8R8G8B8 */
+    draw_triangle();
+    const u32 surface = stub.bound_rt[0];
+
+    /* The guest wrote A,R,G,B bytes at (2,3): they reach the surface as R,G,B,A. */
+    u8* px = vm_base + GUEST_LOCAL_EA + 0x40000u + 3u * 1024u + 2u * 4u;
+    px[0] = 0x80; px[1] = 0x01; px[2] = 0x02; px[3] = 0x03;
+    memset(&g_written, 0, sizeof g_written);
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u + 3u * 1024u + 2u * 4u,
+                                1024u, 5u, 4u);
+    CHECK(g_written.n == 1 && g_written.surface == surface,
+          "a transfer into a surface's bytes is pushed to that surface");
+    CHECK(g_written.x == 2 && g_written.y == 3 && g_written.w == 5 && g_written.h == 4,
+          "at the rectangle the bytes describe (%u,%u %ux%u)",
+          g_written.x, g_written.y, g_written.w, g_written.h);
+    CHECK(g_written.first[0] == 0x01 && g_written.first[1] == 0x02 &&
+          g_written.first[2] == 0x03 && g_written.first[3] == 0x80,
+          "A8R8G8B8 guest bytes arrive as R,G,B,A");
+
+    /* Another pitch lays the rows out elsewhere, and other memory is not a surface. */
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u, 2048u, 4u, 4u);
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_MAIN, 0x40000u, 1024u, 4u, 4u);
+    CHECK(g_written.n == 1, "a different pitch or memory space touches no surface");
+
+    /* A transfer reading a surface's bytes gets the GPU's pixels first. */
+    u8* rd = vm_base + GUEST_LOCAL_EA + 0x40000u + 1024u;
+    memset(rd, 0, 8);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, 0x40000u + 1024u, 1024u, 2u, 1u);
+    CHECK(rd[0] == 0x44 && rd[1] == 0x11 && rd[2] == 0x22 && rd[3] == 0x33 &&
+          rd[4] == 0x44 && rd[7] == 0x33,
+          "the surface's R,G,B,A pixels land in guest memory as A8R8G8B8");
+    engine_down();
+}
+
 static unsigned custom_reads;
 static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
 {
@@ -986,6 +1043,7 @@ int main(void)
     test_readback();
     test_custom_guest_mapping();
     test_queued_flip_buffer();
+    test_transfer_coherence();
     test_inline_array();
 
     free(vm_base);

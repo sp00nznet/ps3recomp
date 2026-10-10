@@ -1927,10 +1927,11 @@ static vk_eng_obj* vk_eng_get(u32 handle, int kind)
     return (o->kind == kind) ? o : NULL;
 }
 
-/* Copy `rows` rows of `w` texels from host memory into one level / layer of
- * an image that is in GENERAL. */
-static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
-                              size_t tight, u32 rows, const void* src, u32 row_bytes)
+/* Copy `rows` rows of `w` texels from host memory into a w x h rectangle at
+ * (x, y) of one level / layer of an image that is in GENERAL. */
+static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
+                                u32 w, u32 h, size_t tight, u32 rows,
+                                const void* src, u32 row_bytes)
 {
     if (tight > row_bytes) tight = row_bytes;
     vk_buffer st = {0};
@@ -1943,6 +1944,7 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
         vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+            .imageOffset = { (int32_t)x, (int32_t)y, 0 },
             .imageExtent = { w, h, 1 },
         };
         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
@@ -1950,6 +1952,13 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
     }
     vk_destroy_buffer(&st);
     return rc;
+}
+
+/* The same into the whole of a level, from its origin. */
+static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
+                              size_t tight, u32 rows, const void* src, u32 row_bytes)
+{
+    return vk_eng_upload_region(img, layer, mip, 0, 0, w, h, tight, rows, src, row_bytes);
 }
 
 static int vk_eng_upload(VkImage img, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
@@ -2154,6 +2163,18 @@ static void vk_eng_present(void* user, u32 surface)
         vk_submit_and_wait();
     }
     vk_cb_present(&s_vk, 0);
+}
+
+/* Pixels a 2D transfer put into guest memory, pushed into the colour target
+ * that rectangle belongs to. */
+static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
+                                      u32 w, u32 h, const void* rows, u32 row_bytes)
+{
+    (void)user;
+    vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!o || o->fmt != VK_FORMAT_R8G8B8A8_UNORM) return;   /* rows are R,G,B,A */
+    if (!rows || !w || !h || x + w > o->w || y + h > o->h) return;
+    vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
 }
 
 static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
@@ -2946,6 +2967,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,
     .readback             = vk_eng_readback,
+    .color_target_write   = vk_eng_color_target_write,
 };
 
 static rsx_backend s_vulkan_backend = {
