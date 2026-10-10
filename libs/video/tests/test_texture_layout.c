@@ -663,6 +663,22 @@ static void test_remap_g8b8_lanes(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(n[i], m[i]);
 }
 
+/* B8 has one channel, presented as {1,B,B,B}. A crossbar taking every output
+ * from B (0xAAFF, a distance-field font atlas) must read that channel, not
+ * component 2 of a one-channel resource. */
+static void test_remap_b8_lanes(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAFFu, FMT_B8 | FMT_LN, m);
+    CHECK_EQ(m[A_], 0); CHECK_EQ(m[R_], 0);
+    CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0);
+
+    u8 n[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_B8, n);
+    CHECK_EQ(n[A_], RSX_REMAP_ONE); CHECK_EQ(n[R_], 0);
+    CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
+}
+
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
  * NOT a bent table cancelling a reversed crossbar, which is how the old bug
  * hid on DXT while breaking everything else. */
@@ -702,6 +718,7 @@ int main(void)
     test_decode_rejects_nonsense();
     test_remap_identity();
     test_remap_identity_packs_to_d3d_default();
+    test_remap_b8_lanes();
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
