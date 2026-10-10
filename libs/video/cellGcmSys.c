@@ -108,6 +108,16 @@ int cellGcm_take_flip_pending(void)
     return v;
 }
 
+/* The flip now names this buffer. The shared draw engine presents on the
+ * host's call and only learns a buffer from 0xE944 by itself, so it would
+ * keep presenting display buffer 0 for a title that flips through 0xFEAD. */
+static void gcm_set_current_display_buffer(u32 bufferId)
+{
+    s_current_display_buffer_id = bufferId;
+    if (rsx_draw_engine_enabled())
+        rsx_draw_engine_note_flip(bufferId);
+}
+
 
 /* Configuration */
 static CellGcmConfig s_config;
@@ -1638,7 +1648,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
-                s_current_display_buffer_id = w & 7u;
+                gcm_set_current_display_buffer(w & 7u);
                 s_flip_pending = 1;
                 s_flip_request_count++;
             } else {
@@ -2137,6 +2147,22 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                 g_gcm_fifo_drained_ea, spins);
 }
 
+/* A host that brings its backend up on another thread -- a frame clock that
+ * opens the window while the title boots -- can register the draw engine after
+ * the title has already called cellGcmSetDisplayBuffer. The engine then knows
+ * no scanout, and every flip presents whatever surface happens to be bound:
+ * Twisted Metal on Linux showed an offscreen target instead of its composited
+ * display buffer. rsx_draw_engine_init calls this to catch up. */
+void cellGcm_replay_display_buffers_to_engine(void)
+{
+    for (u32 i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++)
+        if (s_display_buffer_set[i])
+            rsx_draw_engine_set_display_buffer(i, 0, s_display_buffers[i].offset,
+                                               s_display_buffers[i].pitch,
+                                               s_display_buffers[i].width,
+                                               s_display_buffers[i].height);
+}
+
 /* NID: 0xDC09357E */
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height)
@@ -2243,7 +2269,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
      * the drain does this half when it reaches it (see the 0xFEAD case). */
     if (!in_fifo) {
-        s_current_display_buffer_id = bufferId;
+        gcm_set_current_display_buffer(bufferId);
         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
         s_flip_request_count++;
     }
@@ -2340,7 +2366,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
 
-    s_current_display_buffer_id = bufferId;
+    gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();

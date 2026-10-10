@@ -26,6 +26,8 @@
  * that reads guest data declares them (rsx_vertex_fetch.h). */
 extern u8* vm_base;
 u32 cellGcmResolveLocated(int local, u32 offset);
+/* cellGcmSys.c: the display buffers registered before the engine came up. */
+void cellGcm_replay_display_buffers_to_engine(void);
 /* Non-zero only when the offset's page is in the IO table, so a caller can
  * tell IO-mapped main memory from "assume VRAM". */
 u32 cellGcmResolveIO(u32 offset);
@@ -1676,6 +1678,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
+    /* Display buffers the title registered before the backend came up. */
+    cellGcm_replay_display_buffers_to_engine();
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
             g.width, g.height);
     return 0;
@@ -1753,6 +1757,11 @@ void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
     eng_present(g.last_flip_buffer);
+}
+
+void rsx_draw_engine_note_flip(u32 buffer_id)
+{
+    g.last_flip_buffer = buffer_id & 7u;
 }
 
 u32 rsx_draw_engine_guest_draws(void)

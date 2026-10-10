@@ -248,6 +248,10 @@ void rsx_draw_engine_flush(void);
 void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
+/* A flip the engine never sees as 0xE944 (a 0xFEAD driver word or the SetFlip
+ * HLE, both handled by cellGcmSys): remember the buffer for the host's next
+ * rsx_draw_engine_present() without presenting now. */
+void rsx_draw_engine_note_flip(u32 buffer_id);
 
 /* --- test hooks ---------------------------------------------------------- */
 

@@ -55,6 +55,9 @@ u32 cellGcmResolveIO(u32 offset)
     return offset < GUEST_LOCAL_EA ? offset : 0;
 }
 
+/* No cellGcmSys here: nothing was registered before the engine came up. */
+void cellGcm_replay_display_buffers_to_engine(void) {}
+
 /* ---- the stub backend ---------------------------------------------------- */
 
 #define STUB_MAX_OBJECTS 8192
@@ -894,6 +897,11 @@ static void test_queued_flip_buffer(void)
     CHECK(presented_surface == second && first != second, "queued flip selects second buffer");
     rsx_draw_engine_present();
     CHECK(presented_surface == second, "host present retains last queued buffer");
+    int presents = stub.n_present;
+    rsx_draw_engine_note_flip(0);
+    CHECK(stub.n_present == presents, "noting a flip does not present");
+    rsx_draw_engine_present();
+    CHECK(presented_surface == first, "host present follows the noted flip");
     engine_down();
 }
 
