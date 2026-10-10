@@ -3644,6 +3644,8 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     return ctx.gpr[3];
 }
 
+extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
@@ -3670,6 +3672,9 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * and concurrently-emitted fences vanished (the boot-loading stall). */
     { extern uint64_t ppu_thread_register_main(void);
       ctx.thread_id = ppu_thread_register_main(); }
+    /* For samplers on other threads (a port's periodic stack dump): the main
+     * thread's context lives on this frame, not in the thread table. */
+    g_ppu_main_ctx = &ctx;
 
     /* PS3 process-entry ABI: the loader hands _start register state the CRT
      * (_initialize) consumes directly:
