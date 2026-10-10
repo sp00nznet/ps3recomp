@@ -6,9 +6,9 @@
 #   - without guest programs, the rsx_state vtable's fixed-function path: the
 #     same scenes the null-backend job checks, now through Vulkan;
 #   - with guest programs, the shared register-file draw engine (the path the
-#     Metal backend takes): all eleven draw scenes, including the ones only a
+#     Metal backend takes): all twelve draw scenes, including the ones only a
 #     translating backend can pass (--shader, --mip, --rtt, --depthtex, --mrt,
-#     --mrt-a), under the Khronos validation layer.
+#     --mrt-a, --cube), under the Khronos validation layer.
 #
 # The second pass fails on any of: a scene's own check, a single validation
 # message, a scene that did not take the engine path, or one that reported
@@ -78,7 +78,7 @@ jobs:
           # --threads is not here: it checks guest thread stacks and returns
           # before any backend exists (the first pass still runs it).
           for m in "" "--draw" "--depth" "--quads" "--shader" \
-                   "--tex" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a"; do
+                   "--tex" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
             name=${m:-default}
             echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"

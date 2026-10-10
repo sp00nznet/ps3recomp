@@ -257,7 +257,7 @@ Without a GPU, Mesa's lavapipe runs every check, e.g.
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./build/ps3recomp_host --tex`
 (the ICD file name varies by distribution). Without guest programs, the modes
 that need them (`--shader`, `--mip`, `--rtt`, `--depthtex`, `--mrt`,
-`--mrt-a`) report that and are skipped, as on the null backend.
+`--mrt-a`, `--cube`) report that and are skipped, as on the null backend.
 
 #### Guest programs and the draw engine
 
@@ -277,9 +277,9 @@ PS3RECOMP_VK_GUEST_PROGRAMS=1 ./build/ps3recomp_host --rtt
 
 With guest programs on, the backend runs on the register-file draw engine
 (`rsx_draw_engine.h`), as the Metal backend does: the engine owns surfaces,
-render-to-texture, MRT, depth textures, vertex compaction and pipeline keys,
-and every `ps3recomp_host` scene passes. Not handled yet, and logged once when
-a title reaches them: cube maps, vertex-texture units, colour targets other
+render-to-texture, MRT, depth textures, cube maps, vertex compaction and
+pipeline keys, and every `ps3recomp_host` scene passes. Not handled yet, and
+logged once when a title reaches them: vertex-texture units, colour targets other
 than RGBA8 (e.g. the FP16 HDR target), depth-only passes, stencil (the depth
 format has no stencil aspect), and depth snapshots on devices whose depth
 format is not `D32_SFLOAT`. Everything is submitted synchronously for now:
