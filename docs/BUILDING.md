@@ -280,7 +280,7 @@ With guest programs on, the backend runs on the register-file draw engine
 render-to-texture, MRT, depth textures, vertex compaction and pipeline keys,
 and every `ps3recomp_host` scene passes. Not handled yet, and logged once when
 a title reaches them: cube maps, vertex-texture units, colour targets other
-than RGBA8 (e.g. the FP16 HDR target), depth-only passes, stencil (the depth
+than RGBA8 and RGBA16F (the FP16 HDR target), depth-only passes, stencil (the depth
 format has no stencil aspect), and depth snapshots on devices whose depth
 format is not `D32_SFLOAT`. Everything is submitted synchronously for now:
 correct first, fast later.
