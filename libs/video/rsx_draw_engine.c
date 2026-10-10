@@ -87,6 +87,7 @@ extern u32 ppu_vm_size;
 typedef struct {
     u32 location, offset;
     u32 w, h;
+    u32 pitch;              /* guest bytes per row, from SET_SURFACE_PITCH */
     rsx_be_format fmt;
     u32 handle;
 } eng_surface;
@@ -581,6 +582,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
                                       sf.clip_w, sf.clip_h, fmt);
     if (first == ENG_INVALID) return 0;
+    g.surfaces[first].pitch = sf.color_pitch[sel];
     slots[0] = first;
     u32 n = 1;
 
@@ -594,6 +596,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
                                          sf.color_offset[i + 1],
                                          sf.clip_w, sf.clip_h, fmt);
         if (slot == ENG_INVALID) break;
+        g.surfaces[slot].pitch = sf.color_pitch[i + 1];
         /* A set naming one buffer twice would attach the same target twice,
          * which no host API allows. */
         int seen = 0;
@@ -602,6 +605,131 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
         slots[n++] = slot;
     }
     return n;
+}
+
+/* ---- coherence with guest memory around 2D transfers ------------------- */
+
+/* The surface holding guest bytes [offset, offset + pitch * h) as a w x h
+ * rectangle of 32-bit pixels, and the rectangle's position inside it. Only a
+ * surface laid out with the transfer's own pitch qualifies: another pitch puts
+ * the rows elsewhere, and an FP16 target right after an RGBA8 one would
+ * otherwise resolve into the RGBA8 one's rows. The CLOSEST base at or below
+ * the address wins: surfaces' guest ranges overlap (rsx_live_draw.c's resolve
+ * takes the same rule, and its comment records copying out of a stale surface
+ * at 0x0 before it did). */
+static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* x, u32* y)
+{
+    u32 best = ENG_INVALID;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const eng_surface* s = &g.surfaces[i];
+        if (!s->handle || s->location != location || offset < s->offset) continue;
+        if (s->fmt != RSX_BE_FMT_R8G8B8A8 || s->pitch != pitch) continue;
+        const u32 d = offset - s->offset;
+        if (d / pitch >= s->h || (d % pitch) / 4u >= s->w) continue;
+        if (best != ENG_INVALID && g.surfaces[best].offset > s->offset) continue;
+        best = i;
+        *x = (d % pitch) / 4u;
+        *y = d / pitch;
+    }
+    return best;
+}
+
+static u8* s_coherence_rows;
+static u32 s_coherence_cap;
+
+/* RSX_ENGINE_COHERENCE_LOG=<n>: log the first n transfers the engine syncs,
+ * with how many non-zero pixels moved -- the question when a composite comes
+ * out black is whether the GPU surface had anything in it. */
+static int eng_coherence_log(void)
+{
+    static int left = -1;
+    if (left < 0) { const char* e = getenv("RSX_ENGINE_COHERENCE_LOG"); left = e ? atoi(e) : 0; }
+    return left > 0 ? left-- : 0;
+}
+
+static u32 eng_nonzero_pixels(const u8* rows, u32 n)
+{
+    u32 k = 0;
+    for (u32 i = 0; i < n; i++, rows += 4) k += (rows[0] | rows[1] | rows[2]) != 0;
+    return k;
+}
+
+static u8* eng_coherence_buffer(u32 bytes)
+{
+    if (s_coherence_cap < bytes) {
+        u8* n = (u8*)realloc(s_coherence_rows, bytes);
+        if (!n) return NULL;
+        s_coherence_rows = n;
+        s_coherence_cap = bytes;
+    }
+    return s_coherence_rows;
+}
+
+void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+{
+    if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
+    u32 x = 0, y = 0;
+    const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
+    if (slot == ENG_INVALID) {
+        if (eng_coherence_log())
+            fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u: no surface\n",
+                    location, offset, w, h);
+        return;
+    }
+    const eng_surface* s = &g.surfaces[slot];
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    u8* rows = eng_coherence_buffer(w * 4u * h);
+    if (!rows) return;
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    g.be->readback(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+    if (eng_coherence_log())
+        fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X at %u,%u:"
+                        " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
+                eng_nonzero_pixels(rows, w * h));
+    const int rgba = rsx_texture_argb_is_rgba();
+    for (u32 r = 0; r < h; r++) {
+        u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
+        if (!dst) return;
+        const u8* src = rows + (size_t)r * w * 4u;
+        for (u32 c = 0; c < w; c++, src += 4, dst += 4) {
+            if (rgba) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
+            else      { dst[0] = src[3]; dst[1] = src[0]; dst[2] = src[1]; dst[3] = src[2]; }
+        }
+    }
+}
+
+void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+{
+    if (!g.ready || !g.be->color_target_write || !pitch || !w || !h) return;
+    u32 x = 0, y = 0;
+    const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
+    if (slot == ENG_INVALID) {
+        if (eng_coherence_log())
+            fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u: no surface\n",
+                    location, offset, w, h);
+        return;
+    }
+    const eng_surface* s = &g.surfaces[slot];
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    u8* rows = eng_coherence_buffer(w * 4u * h);
+    if (!rows) return;
+    const int rgba = rsx_texture_argb_is_rgba();
+    for (u32 r = 0; r < h; r++) {
+        const u8* src = eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
+        if (!src) return;
+        u8* dst = rows + (size_t)r * w * 4u;
+        for (u32 c = 0; c < w; c++, src += 4, dst += 4) {
+            if (rgba) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
+            else      { dst[0] = src[1]; dst[1] = src[2]; dst[2] = src[3]; dst[3] = src[0]; }
+        }
+    }
+    if (eng_coherence_log())
+        fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"
+                        " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
+                eng_nonzero_pixels(rows, w * h));
+    g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
 }
 
 static u32 eng_current_surface(void)

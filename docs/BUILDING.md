@@ -252,6 +252,7 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 
 | `PS3RECOMP_VK_GUEST_PROGRAMS=1` | Run the guest's own vertex/fragment programs (needs the translator, below); also makes the draw engine the default path |
 | `PS3RECOMP_RSX_ENGINE=dispatch\|vtable` | Pick the draw path explicitly -- the engine's own switch, shared with Metal |
+| `RSX_ENGINE_COHERENCE_LOG=<n>` | Log the first *n* syncs between guest memory and the engine's surfaces around NV3089 transfers, with how many non-zero pixels moved |
 
 Without a GPU, Mesa's lavapipe runs every check, e.g.
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./build/ps3recomp_host --tex`

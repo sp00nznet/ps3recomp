@@ -845,6 +845,32 @@ static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
     return off;
 }
 
+/* The draw engine renders on the host GPU, so the scene a title copies out
+ * with NV3089 is not in guest memory, and what it copies in never reaches the
+ * engine's surfaces. Around the guest-memory copy below: write the source
+ * rectangle back from any engine surface first, and push the written
+ * rectangle into any engine surface after. 32-bit pixels only. */
+static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
+{
+    if (!rsx_draw_engine_enabled() || !out_w || !out_h) return;
+    const u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 */
+    const u32 sx0 = u0 >> 4, sy0 = v0 >> 4;
+    const u32 sx1 = (u32)((((u64)u0 << 8) + (u64)(out_w - 1) * s_nv3089.ds_dx) >> 20);
+    const u32 sy1 = (u32)((((u64)v0 << 8) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
+    if (sx1 < sx0 || sy1 < sy0) return;
+    const u32 loc = (s_nv3089.src_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    rsx_draw_engine_guest_read(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
+                               sx1 - sx0 + 1u, sy1 - sy0 + 1u);
+}
+
+static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
+{
+    if (!rsx_draw_engine_enabled() || x1 <= x0 || y1 <= y0) return;
+    const u32 loc = (s_gcm2d.dst_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    rsx_draw_engine_guest_wrote(loc, s_gcm2d.dst_offset + y0 * dst_pitch + x0 * 4u, dst_pitch,
+                                x1 - x0, y1 - y0);
+}
+
 static void nv3089_blit(void)
 {
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
@@ -919,6 +945,7 @@ static void nv3089_blit(void)
         u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
         u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
         u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
+        nv3089_engine_read(in_pitch, out_w, out_h);
         /* Copy words verbatim through raw pointers rather than vm_read32/
          * vm_write32: this moves ~500k pixels per blit and several blits run per
          * frame, and the two byte swaps would cancel anyway. */
@@ -988,6 +1015,7 @@ static void nv3089_blit(void)
     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
+    if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
     for (u32 y = 0; y < out_h; y++) {
         u32 dy = out_y + y;
         if (dy < cy0 || dy >= cy1) continue;
@@ -1004,6 +1032,12 @@ static void nv3089_blit(void)
             else if (bpp == 2) vm_write16(d, vm_read16(s));
             else               vm_write8(d, vm_read8(s));
         }
+    }
+    if (bpp == 4) {
+        const u32 x0 = out_x > cx0 ? out_x : cx0, y0 = out_y > cy0 ? out_y : cy0;
+        const u32 x1 = (out_x + out_w < cx1) ? out_x + out_w : cx1;
+        const u32 y1 = (out_y + out_h < cy1) ? out_y + out_h : cy1;
+        nv3089_engine_wrote(dst_pitch, x0, y0, x1, y1);
     }
     { static int _n = 0; static int cap = -1;
       if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }

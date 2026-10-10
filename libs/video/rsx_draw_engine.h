@@ -135,6 +135,11 @@ typedef struct rsx_draw_backend {
     u32  (*color_target_create)(void* user, rsx_be_format fmt, u32 w, u32 h,
                                 const void* seed, u32 seed_row_bytes);
     void (*color_target_release)(void* user, u32 surface);
+    /* Optional. Write R,G,B,A rows into a rectangle of a colour target: pixels
+     * the guest put there outside any draw, with a 2D transfer. NULL when the
+     * backend cannot, and the engine then leaves the target as it is. */
+    void (*color_target_write)(void* user, u32 surface, u32 x, u32 y, u32 w,
+                               u32 h, const void* rows, u32 row_bytes);
     /* A texture handle for a colour target a texture unit names, wearing that
      * unit's TEXTURE_CONTROL1 crossbar. An uploaded texture bakes the crossbar
      * in when it is decoded, so only a surface bind needs this; 0 means the
@@ -248,6 +253,21 @@ void rsx_draw_engine_flush(void);
 void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
+
+/* Guest memory and the surfaces the engine renders on the host GPU, kept
+ * coherent around a 2D transfer (NV3089) that the FIFO walker performs on
+ * guest memory. A title copies its rendered scene out to main memory for
+ * post-processing, back into VRAM, and into its display buffer with such
+ * transfers; on the engine those pixels exist only on the GPU.
+ *
+ * Before the transfer reads guest bytes, guest_read writes the pixels of any
+ * engine surface in that rectangle back to guest memory. After it writes,
+ * guest_wrote pushes the guest bytes into any engine surface the rectangle
+ * falls in. `offset` is the rectangle's first byte, `pitch` the guest row
+ * pitch, `w` and `h` in 32-bit pixels. Only 8-bit-per-channel surfaces laid
+ * out with the same pitch take part; anything else is left alone. */
+void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 
 /* --- test hooks ---------------------------------------------------------- */
 
