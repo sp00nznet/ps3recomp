@@ -28,7 +28,7 @@ void spu_indirect_branch_mt(spu_context* ctx)
      * but never returns). Each SPU job runs on its own host thread, so a
      * thread-local counter + small PC ring is race-free; a trace line prints
      * every ~4M dispatches -- a healthy task finishes long before tripping. */
-    { static int s_watch = -1;
+    { static _Atomic int s_watch = -1;
       if (s_watch < 0) s_watch = getenv("PS3_SPU_PCWATCH") ? 1 : 0;
       if (s_watch) {
           static _Thread_local unsigned long long n;
@@ -58,8 +58,17 @@ void spu_indirect_branch_mt(spu_context* ctx)
         /* Resident overlay first (mirrors the full resolver): streamed plugin
          * code owns its LS range; base-image entries at the same address are
          * stale bytes and must lose. */
-        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-        if (!fn) fn = spu_lookup(pc, ctx->image_id);
+        spu_dispatch_fn fn = 0;
+        int owned = 0;
+        for (unsigned slot = 0; slot < 4; ++slot)
+            if (ctx->resident_code[slot].image_id &&
+                pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+                fn = spu_lookup(pc, ctx->resident_code[slot].image_id); owned = 1; break;
+            }
+        if (!owned && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
+        if (!owned && !fn) fn = spu_lookup(pc, ctx->image_id);
+        for (unsigned slot = 0; slot < 4 && !fn; ++slot)   /* resident module code outside its image */
+            if (ctx->resident_code[slot].image_id) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);

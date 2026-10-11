@@ -52,6 +52,20 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
  * stubbed to zero unless rsx_vp_decompile_ex receives a bound-unit mask. */
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
 
+/* Which vp_c[] rows a decompiled program can read. Every constant-typed
+ * source field of every instruction up to the end flag counts, used by its
+ * opcode or not -- the decompiler emits all three, so this is a superset of
+ * what the shader reads. `relative` means some read is vp_c[(N + aX) & 511]
+ * and any row may be read. `valid` is 0 when no end flag was found; treat the
+ * whole block as read then. lo > hi means no constant is read. */
+typedef struct rsx_vp_const_usage {
+    u32 lo, hi;
+    int relative;
+    int valid;
+} rsx_vp_const_usage;
+int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes,
+                             rsx_vp_const_usage* usage);
+
 /* The VP slot the next program decompiled starts at (NV4097 transform
  * program start). Branch targets are absolute slots; this makes them relative
  * to the ucode pointer handed in. Defaults to 0. */

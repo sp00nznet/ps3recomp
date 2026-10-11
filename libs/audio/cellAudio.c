@@ -373,7 +373,7 @@ static int audio_backend_room(void)
     if (FAILED(hr)) {
         /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
          * change, sleep, ...): pace on the clock rather than spin. */
-        static int _n = 0; if (_n++ < 4)
+        static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 4)
             fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
         return -1;
     }
@@ -409,6 +409,24 @@ static inline float ld_be_f32(const float* p)
 }
 
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
+/* Hand one mixed block to the host device. Shared by the Windows and POSIX
+ * mixer loops so the debug taps behave the same on both:
+ *   AUDIO_WAV=<file>  append the final mix as raw f32le stereo 48 kHz
+ *                     (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>)
+ *   PS3_AUDIO_MUTE=1  silence the HOST output only; the title still sees a
+ *                     working device and every mix/pacing path runs as normal
+ *                     (unlike PS3_NO_AUDIO, which changes what the guest does).
+ *                     AUDIO_WAV still records the real mix. */
+static void audio_submit_mix(void)
+{
+    { static FILE* _wf = (FILE*)-1;
+      if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
+      if (_wf) { fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); fflush(_wf); } }
+    { static int mute = -1; if (mute < 0) mute = getenv("PS3_AUDIO_MUTE") ? 1 : 0;
+      if (mute) memset(s_mix_buffer, 0, sizeof(s_mix_buffer)); }
+    audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+}
+
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
@@ -573,12 +591,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
-        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
-         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
-        { static FILE* _wf = (FILE*)-1;
-          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        audio_submit_mix();
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
@@ -608,17 +621,31 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    /* Pace by what the device has actually consumed. The old loop mixed a
+     * block and then slept a fixed 2-5 ms -- with a block being 256 samples
+     * (5.33 ms at 48 kHz) that ran the guest's audio clock up to ~2.6x faster
+     * than real time whenever the queue was short, so the title's producers
+     * fell behind and the output was chopped garbage. Keep ~4 blocks
+     * (~21 ms) queued: mix only when the device has drained below that. */
+    /* Also never run ahead of the wall clock by more than those ~4 blocks:
+     * with no host device (or one that swallows samples) the queue reads 0
+     * forever and the device bound alone would spin. */
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    unsigned long long mixed = 0;
     while (s_mix_thread_running) {
-        audio_mix_one_block();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        audio_notify_event_queues();
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        unsigned long long el_us = (unsigned long long)(now.tv_sec - t0.tv_sec) * 1000000ull
+                                 + (unsigned long long)((now.tv_nsec - t0.tv_nsec) / 1000);
+        unsigned long long ahead_us = mixed * CELL_AUDIO_BLOCK_SAMPLES * 1000000ull / 48000ull;
+        if (audio_backend_queued_samples() >= CELL_AUDIO_BLOCK_SAMPLES * 4 ||
+            ahead_us > el_us + 4ull * CELL_AUDIO_BLOCK_SAMPLES * 1000000ull / 48000ull) {
+            usleep(1000);
+            continue;
         }
+        mixed++;
+        audio_mix_one_block();
+        audio_submit_mix();
+        audio_notify_event_queues();
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
@@ -1074,7 +1101,7 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     vm_write32(cfg + 24, port->buf_size);                                   /* portSize */
     vm_write32(cfg + 28, (u32)port->port_addr);                             /* portAddr */
 
-    { static int _n = 0; if (_n++ < 24)
+    { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 24)
         fprintf(stderr, "[cellAudio] GetPortConfig(port=%u) status=%s bufEA=0x%08X ridxEA=0x%08X\n",
                 portNum, port->running ? "RUN" : "READY",
                 (u32)port->port_addr, (u32)port->read_idx_addr); }

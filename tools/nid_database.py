@@ -291,6 +291,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSpurs", "cellSpursLFQueuePush"),
     ("cellSpurs", "cellSpursLFQueuePop"),
     ("cellSpurs", "cellSpursLFQueueAttachLv2EventQueue"),
+    ("cellSpurs", "_cellSpursLFQueuePushBody"),
     ("cellSpurs", "cellSpursLFQueueDetachLv2EventQueue"),
     # Sync utilities used with SPURS
     ("cellSpurs", "_cellSpursTasksetAttributeInitialize"),

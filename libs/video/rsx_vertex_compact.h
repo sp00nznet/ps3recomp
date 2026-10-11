@@ -44,6 +44,13 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    /* Direct table for a draw whose references share one base_index and
+     * span a small vertex-id range: id - lo indexes these, tagged by
+     * direct_generation like the hash slots. */
+    u32* direct_tag;
+    u32* direct_value;
+    u32 direct_capacity;
+    u32 direct_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {
@@ -116,6 +123,14 @@ void rsx_vertex_fetch_plan_prepare(
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
 
+/* rsx_vertex_fetch_one for refs[0..count), vertex i at out + i * stride,
+ * filled attribute by attribute with decoders chosen once per attribute.
+ * Same output bit for bit, and the same verdict: 0 exactly when some
+ * reference's fetch_one would return 0 (the output is then incomplete). */
+int rsx_vertex_fetch_all(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out);
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */
@@ -125,6 +140,27 @@ int rsx_vertex_remap_build(
 
 u32 rsx_vertex_remap_index(
     const rsx_vertex_remap* remap, u32 occurrence);
+
+/* The draw's whole index range instead of its unique vertices: when every
+ * reference shares one base_index and the range lo..hi of vertex ids is no
+ * longer than the reference count, refs becomes lo, lo+1, ..., hi (*out_count
+ * = hi - lo + 1) and occurrence i maps to vertex_id - lo. Returns 0, leaving
+ * refs untouched, when that does not apply (use rsx_vertex_remap_build).
+ *
+ * A mesh's indices cover its vertex range almost exactly (inFamous: span 1.00x
+ * the unique count, every draw), so this fetches the same vertices without
+ * deduplicating, in address order. Occurrence i always satisfies
+ * refs[rsx_vertex_remap_index(remap, i)] == the original refs[i]. */
+int rsx_vertex_remap_build_range(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* out_count);
+
+/* The hash-table form of rsx_vertex_remap_build, always. The ordinary call
+ * takes a direct table when the references allow it; this is the reference
+ * that path is tested against. */
+int rsx_vertex_remap_build_hashed(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count);
 
 void rsx_vertex_remap_destroy(rsx_vertex_remap* remap);
 

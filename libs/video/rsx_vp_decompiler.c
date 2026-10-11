@@ -263,6 +263,40 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
     return instrs;
 }
 
+int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes,
+                             rsx_vp_const_usage* usage)
+{
+    if (!usage) return -1;
+    usage->lo = 1; usage->hi = 0; usage->relative = 0; usage->valid = 0;
+    if (!ucode) return -1;
+    u32 off = 0;
+    int instrs = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 d1 = rd_le(ucode + off + 4);
+        const u32 d2 = rd_le(ucode + off + 8);
+        const u32 d3 = rd_le(ucode + off + 12);
+        off += 16;
+        instrs++;
+        /* The same fields emit_src's callers decode. */
+        const u32 const_src = (d1 >> 12) & 0x3FF;
+        const int index_const = (d3 >> 1) & 1;
+        const u32 src[3] = {
+            ((d2 >> 23) & 0x1FF) | ((d1 & 0xFF) << 9),
+            (d2 >> 6) & 0x1FFFF,
+            ((d3 >> 21) & 0x7FF) | ((d2 & 0x3F) << 11),
+        };
+        for (int i = 0; i < 3; i++) {
+            if ((src[i] & 3u) != 3u) continue;
+            if (index_const) { usage->relative = 1; continue; }
+            const u32 c = const_src & 511u;
+            if (usage->lo > usage->hi) { usage->lo = usage->hi = c; }
+            else { if (c < usage->lo) usage->lo = c; if (c > usage->hi) usage->hi = c; }
+        }
+        if (d3 & 1u) { usage->valid = 1; return instrs; }
+    }
+    return -1;
+}
+
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
     u32 input_mask, char* out, u32 out_size);

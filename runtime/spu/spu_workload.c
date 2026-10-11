@@ -5,6 +5,7 @@
  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
+#include "../memory/guest_mem_atomic.h"
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
@@ -295,7 +296,7 @@ static pthread_mutex_t s_ts_ls_dir = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static int spu_persist_ls_enabled(void)
-{ static int _p = -1; if (_p < 0) _p = getenv("LBP_PERSIST_LS") ? 1 : 0; return _p; }
+{ static _Atomic int _p = -1; if (_p < 0) _p = getenv("LBP_PERSIST_LS") ? 1 : 0; return _p; }
 
 /* ---- Global SPU execution serialization (LBP_SPU_SERIAL) ------------------
  * Default runs each SPU task on its own detached host thread, so N tasks race:
@@ -308,7 +309,7 @@ static int spu_persist_ls_enabled(void)
  * a single SPU's task scheduling; with LBP_WS_DRAIN a genuinely unsignalled
  * task drains and releases. Opt-in; default keeps concurrent per-thread SPU. */
 static int spu_serial_enabled(void)
-{ static int _s = -1; if (_s < 0) _s = getenv("LBP_SPU_SERIAL") ? 1 : 0; return _s; }
+{ static _Atomic int _s = -1; if (_s < 0) _s = getenv("LBP_SPU_SERIAL") ? 1 : 0; return _s; }
 #ifdef _WIN32
 static SRWLOCK s_spu_serial = SRWLOCK_INIT;
 void spu_serial_acquire(void){ if (spu_serial_enabled()) AcquireSRWLockExclusive(&s_spu_serial); }
@@ -371,15 +372,27 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
  * the ELF EA at +0x14 and the context save EA at +0x1C. */
 #define TS_TRACK 8
 static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
+#if defined(_WIN32)
 static volatile LONG s_ts_lock;
+#else
+/* Portable spinlock: C11 atomics (the Win32 path is the original). */
+#include <stdatomic.h>
+#include <sched.h>
+static atomic_uint s_ts_lock;
+#endif
 static uint8_t* ts_running(uint32_t taskset_ea)
 {
     for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
     for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) { s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running; }
     return NULL;
 }
+#if defined(_WIN32)
 static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
 static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
+#else
+static void ts_lock(void)   { while (atomic_exchange_explicit(&s_ts_lock, 1u, memory_order_acquire)) sched_yield(); }
+static void ts_unlock(void) { atomic_store_explicit(&s_ts_lock, 0u, memory_order_release); }
+#endif
 
 static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
 {
@@ -391,6 +404,7 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
     ts_unlock();
 }
 
+static int spu_task_dispatch_claimed(uint32_t, uint32_t, const uint8_t*, uint32_t, uint32_t);
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
@@ -422,7 +436,9 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", t, taskset_ea, elf, done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
-        spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
+        ts_unlock();                      /* claimed above (run bit set under the lock) */
+        spu_task_dispatch_claimed(taskset_ea, t, vm_base + elf, (uint32_t)sz, ctx);
+        ts_lock();
     }
     ts_unlock();
 }
@@ -445,7 +461,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
         ls = ts_slot->ls;
-        { static int _n = 0; if (_n++ < 24)
+        { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 24)
             fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
                     j->taskset_ea, j->taskid, j->image_id,
                     ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
@@ -670,44 +686,6 @@ static void spu_async_run(spu_async_job* j)
                         const uint8_t* q = vm_base + p;
                         fprintf(stderr, "  [desc+%02X]=0x%08X -> +00:%08X +40:%08X +50:%08X(gate) +54:%08X\n",
                                 wi*4, p, RDBE32(q,0), RDBE32(q,0x40), RDBE32(q,0x50), RDBE32(q,0x54));
-                    }
-                    fflush(stderr);
-                }
-                if (getenv("LBP_REAL_POLICY") && j->taskset_ea) {
-                    extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
-                                                              uint64_t,uint32_t,uint8_t*,uint32_t);
-                    /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
-                    uint32_t ts = j->taskset_ea;
-                    uint32_t spurs_ea = 0;
-                    if (vm_base) { const uint8_t* t = vm_base + ts;
-                        spurs_ea = RDBE32(t, 0x64);
-                        /* Why did the policy exit without dispatching? Dump the task
-                         * bitsets it reads (task N = bit 127-N; task 2 = bit 125). */
-                        fprintf(stderr, "[taskset-bits] RUNNING=%08X%08X READY=%08X%08X ENABLED=%08X%08X SIGNALLED=%08X%08X WAITING=%08X%08X\n",
-                                RDBE32(t,0x00),RDBE32(t,0x04), RDBE32(t,0x10),RDBE32(t,0x14),
-                                RDBE32(t,0x30),RDBE32(t,0x34), RDBE32(t,0x40),RDBE32(t,0x44),
-                                RDBE32(t,0x50),RDBE32(t,0x54)); }
-                    uint8_t real2700[0x180];
-                    int st = spurs_run_taskset_policy_probe(ts, j->taskid, spurs_ea,
-                                                            (uint64_t)ts, 3, real2700, sizeof real2700);
-                    fprintf(stderr, "[real-pm] status=0x%X -- LS 0x2700 diff (build_context vs real policy):\n", st);
-                    for (uint32_t o = 0; o < sizeof real2700; o += 4) {
-                        uint32_t bc = ((uint32_t)ls[0x2700+o]<<24)|((uint32_t)ls[0x2700+o+1]<<16)|
-                                      ((uint32_t)ls[0x2700+o+2]<<8)|ls[0x2700+o+3];
-                        uint32_t rp = ((uint32_t)real2700[o]<<24)|((uint32_t)real2700[o+1]<<16)|
-                                      ((uint32_t)real2700[o+2]<<8)|real2700[o+3];
-                        if (bc != rp)
-                            fprintf(stderr, "   0x%04X: build=%08X real=%08X\n", 0x2700+o, bc, rp);
-                    }
-                    /* EMPIRICAL TEST (LBP_POLICY_CTX): overlay the REAL policy's
-                     * SpursTasksetContext onto binkspu's LS 0x2700, replacing the C
-                     * reimpl, then let binkspu run with it. If the movie plane fills
-                     * (not green) the policy's fuller ctx is the fix (H1); if still
-                     * green, the frame-output gate is Bink-layer (H2). Keeps the
-                     * build_context 0x100 kernel ctx (moduleId "TK") intact. */
-                    if (getenv("LBP_POLICY_CTX")) {
-                        memcpy(ls + 0x2700, real2700, sizeof real2700);
-                        fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
                     }
                     fflush(stderr);
                 }
@@ -1013,11 +991,11 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    { static int _n = 0; if (_n++ < 24)
+    { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 24)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
     /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
-    { static int s_on = -1; if (s_on < 0) s_on = getenv("SPU_SIG_STATS") ? 1 : 0;
+    { static _Atomic int s_on = -1; if (s_on < 0) s_on = getenv("SPU_SIG_STATS") ? 1 : 0;
       if (s_on) {
           static uint32_t ts[32], tk[32]; static uintptr_t ca[32]; static unsigned cnt[32];
           static unsigned long long t0;
@@ -1052,7 +1030,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     static _Thread_local unsigned long long s_wait_exit_ms;
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
-      static int _n = 0; if (_n++ < 200 || (_n % 500) == 0)
+      static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200 || (_n % 500) == 0)
         fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
                 _n, taskId, taskset_ea,
                 s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
@@ -1071,17 +1049,16 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             for (int row = 0; row < 4; row++) {
                 uint32_t p = b + 0x40 + 16u * (uint32_t)row;
                 extern uint8_t* vm_base;
-                uint16_t ticket = (uint16_t)((vm_base[p] << 8) | vm_base[p+1]);
+                uint16_t ticket = __builtin_bswap16(gm_load16(vm_base + p));
                 for (int lane = 0; lane < 7; lane++) {
                     uint32_t la = p + 2 + 2u * (uint32_t)lane;
-                    uint16_t cur = (uint16_t)((vm_base[la] << 8) | vm_base[la+1]);
+                    uint16_t cur = __builtin_bswap16(gm_load16(vm_base + la));
                     if (cur != 0xFFFF && cur < ticket) {
-                        vm_base[la]   = (uint8_t)(ticket >> 8);
-                        vm_base[la+1] = (uint8_t)ticket;
+                        gm_store16(vm_base + la, __builtin_bswap16(ticket));
                     }
                 }
             }
-            { static int _a = 0; if (_a++ < 8)
+            { static int _a = 0; if (__atomic_fetch_add(&_a, 1, __ATOMIC_RELAXED) < 8)
                 fprintf(stderr, "[sync-ack] lanes advanced to tickets (sync=0x%08X)\n", b); }
         }
     }
@@ -1127,7 +1104,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    if (drained) { static int _d = 0; if (_d++ < 24)
+    if (drained) { static int _d = 0; if (__atomic_fetch_add(&_d, 1, __ATOMIC_RELAXED) < 24)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     spu_serial_acquire();       /* resume: re-take the serial lock */
@@ -1201,7 +1178,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
-        static int _d=0; if (_d++ < 1) {
+        static int _d=0; if (__atomic_fetch_add(&_d, 1, __ATOMIC_RELAXED) < 1) {
             /* Dump a larger window of the task context buffer + scan for any word
              * that looks like the LS[0xBEC0] target (i.e. a small LS-range value),
              * to see if the kernel-restored LS data lives here (real game data). */
@@ -1256,4 +1233,141 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     pthread_detach(th);
 #endif
     return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Unlifted SPURS tasks on the interpreter, with the taskset policy module's
+ * task ABI (as libsre sets it up; checked by tests/conformance/mc --suite
+ * spurs):
+ *   r3 = the task's CellSpursTaskArgument (task_info[id].args, 16 bytes)
+ *   r4 = {taskset->args (u64), taskset->spurs (u64)}
+ *   LS 0x27C4 (SpursTasksetContext.syscallAddr) = the task syscall entry:
+ *     r3 = syscall number (low 4 bits: 0 exit, 1 yield, ...), returns via r0.
+ * The syscall entry and the return-from-main link are planted `stop`s that
+ * this runner services. Only images with no lifted registration come here;
+ * the lifted path (spu_workload_dispatch_async) is unchanged.
+ * -----------------------------------------------------------------------*/
+#define TASK_INTERP_SYSCALL_LS  0xA70u
+#define TASK_INTERP_RETURN_LS   0xA80u
+#define TASK_INTERP_STOP_SC     0x3E2u
+#define TASK_INTERP_STOP_RET    0x3E3u
+
+typedef struct { uint32_t taskset_ea, taskid, size; const uint8_t* image; } spu_task_interp_job;
+
+static uint32_t ti_be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static void ti_put32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+
+static void spu_task_interp_run(spu_task_interp_job* j)
+{
+    extern uint8_t* vm_base;
+    extern uint32_t spu_interp_run(spu_context*, uint32_t);
+    spu_context* ctx = (spu_context*)malloc(sizeof(spu_context));
+    if (!ctx) return;
+    memset(ctx, 0, sizeof(*ctx));
+    spu_context_init(ctx, 0);
+    uint32_t entry = 0;
+    if (!spu_elf_load_to_ls(j->image, j->size, ctx->ls, &entry)) {
+        fprintf(stderr, "[spurs-task] taskset 0x%08X task %u: ELF load failed\n", j->taskset_ea, j->taskid);
+    } else {
+        const uint8_t* ts = vm_base + j->taskset_ea;
+        const uint8_t* ti = ts + 0x80 + 0x30 * j->taskid;
+        uint8_t* ls = ctx->ls;
+        ti_put32(ls + 0x27C4, TASK_INTERP_SYSCALL_LS);
+        ti_put32(ls + TASK_INTERP_SYSCALL_LS, TASK_INTERP_STOP_SC);
+        ti_put32(ls + TASK_INTERP_RETURN_LS, TASK_INTERP_STOP_RET);
+        for (int k = 0; k < 4; k++) ctx->gpr[3]._u32[k] = ti_be32(ti + 4 * k);
+        ctx->gpr[4]._u32[0] = ti_be32(ts + 0x68); ctx->gpr[4]._u32[1] = ti_be32(ts + 0x6C);
+        ctx->gpr[4]._u32[2] = ti_be32(ts + 0x60); ctx->gpr[4]._u32[3] = ti_be32(ts + 0x64);
+        ctx->gpr[1]._u32[0] = 0x3FFF0;
+        ctx->gpr[0]._u32[0] = TASK_INTERP_RETURN_LS;           /* return from main = exit */
+        uint32_t pc = entry;
+        for (;;) {
+            spu_interp_run(ctx, pc);
+            if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == TASK_INTERP_STOP_SC) {
+                uint32_t sc = ctx->gpr[3]._u32[0] & 0xF;
+                if (sc == 0) break;                            /* CELL_SPURS_TASK_SYSCALL_EXIT */
+                if (sc != 1) {                                 /* yield is a no-op here */
+                    static int n = 0;
+                    if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
+                        fprintf(stderr, "[spurs-task] task syscall %u not modelled (returning 0)\n", sc);
+                }
+                ctx->gpr[3] = spu_make_preferred_u32(0);
+                pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                continue;
+            }
+            if (!(ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == TASK_INTERP_STOP_RET))
+                fprintf(stderr, "[spurs-task] taskset 0x%08X task %u ended: status 0x%X stop 0x%X pc 0x%05X\n",
+                        j->taskset_ea, j->taskid, ctx->status, ctx->stop_code, ctx->pc);
+            break;
+        }
+    }
+    { extern void spu_coh_unregister(spu_context*); spu_coh_unregister(ctx); }
+    free(ctx);
+    spu_taskset_task_exited(j->taskset_ea, j->taskid);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI spu_task_interp_thread(LPVOID p)
+#else
+static void* spu_task_interp_thread(void* p)
+#endif
+{
+    spu_task_interp_job* j = (spu_task_interp_job*)p;
+    spu_task_interp_run(j);
+    free(j);
+    return 0;
+}
+
+int spu_task_dispatch_interp(uint32_t taskset_ea, uint32_t taskid,
+                             const uint8_t* image, uint32_t image_size)
+{
+    spu_task_interp_job* j = (spu_task_interp_job*)malloc(sizeof(*j));
+    if (!j) return 0;
+    j->taskset_ea = taskset_ea; j->taskid = taskid; j->image = image; j->size = image_size;
+    fprintf(stderr, "[spurs-task] taskset 0x%08X task %u: no lifted image, interpreting\n",
+            taskset_ea, taskid);
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 1u << 20, spu_task_interp_thread, j, 0, NULL);
+    if (!th) { free(j); return 0; }
+    CloseHandle(th);
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, spu_task_interp_thread, j) != 0) { free(j); return 0; }
+    pthread_detach(th);
+#endif
+    return 1;
+}
+
+/* Start an already-claimed task (its running bit is set). */
+static int spu_task_dispatch_claimed(uint32_t taskset_ea, uint32_t taskid, const uint8_t* image,
+                                     uint32_t image_size, uint32_t context_ea)
+{
+    int image_id = 0;
+    if (spu_workload_find_img(spu_workload_fingerprint(image, image_size), &image_id))
+        return spu_workload_dispatch_async(image, image_size, context_ea);
+    return spu_task_dispatch_interp(taskset_ea, taskid, image, image_size);
+}
+
+/* Claim (running bit clear -> set, under the taskset lock) and start. Two
+ * starters race for a freshly created task: cellSpursCreateTask, and a
+ * sibling's exit (spu_taskset_task_exited), which starts any enabled, ready,
+ * not-running task. Only the one that claims it launches it; without the claim
+ * a task occasionally ran twice. */
+int spu_task_dispatch(uint32_t taskset_ea, uint32_t taskid, const uint8_t* image,
+                      uint32_t image_size, uint32_t context_ea)
+{
+    if (taskset_ea && taskid < 128) {
+        int claimed = 0;
+        ts_lock();
+        uint8_t* r = ts_running(taskset_ea);
+        uint8_t m = (uint8_t)(0x80u >> (taskid & 7));
+        if (r && !(r[taskid / 8] & m)) { r[taskid / 8] |= m; claimed = 1; }
+        ts_unlock();
+        if (!claimed) return 1;                    /* someone else started it */
+    }
+    return spu_task_dispatch_claimed(taskset_ea, taskid, image, image_size, context_ea);
 }

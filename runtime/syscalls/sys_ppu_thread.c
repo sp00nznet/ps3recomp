@@ -16,6 +16,11 @@
 #endif
 static PPU_TLS jmp_buf s_exit_jmp;
 static PPU_TLS int     s_exit_armed = 0;
+/* Set by sys_ppu_thread_exit once it has recorded the status and signalled
+ * the joiner. The thread procedure's epilogue must then do nothing to the
+ * slot: the joiner may already be reading it, and a detached thread's slot is
+ * FREE and may belong to a new thread by the time the epilogue runs. */
+static PPU_TLS int     s_exit_done = 0;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
@@ -75,6 +80,17 @@ static void table_unlock(void)
 #endif
 }
 
+/* A guest stack for a host thread that runs guest code outside any guest
+ * thread (callbacks into guest code: ppu_guest_call). Returns the usable top,
+ * or 0. Taken from the same region as thread stacks, under the same lock. */
+uint32_t sys_ppu_thread_alloc_stack(uint32_t size)
+{
+    table_lock();
+    uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, size);
+    table_unlock();
+    return base ? base + size : 0;
+}
+
 /* Find a free slot. Returns index or -1. Must be called under lock. */
 static int find_free_slot(void)
 {
@@ -92,6 +108,14 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
     ppu_thread_info* t = &g_ppu_threads[thread_id - 1];
     if (t->state == PPU_THREAD_STATE_FREE) return NULL;
     return t;
+}
+
+/* A thread's priority, for the kernel's PRIORITY-protocol sleep queues;
+ * INT_MIN if there is no such thread. */
+int32_t ppu_thread_priority_of(uint64_t thread_id)
+{
+    ppu_thread_info* t = find_thread(thread_id);
+    return t ? t->priority : INT32_MIN;
 }
 
 /* ---------------------------------------------------------------------------
@@ -119,6 +143,14 @@ static void* ppu_host_thread_proc(void* param)
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+
+#ifndef _WIN32
+    /* A thread made by _sys_ppu_thread_create runs only once
+     * sys_ppu_thread_start says so (on Windows it is created suspended). */
+    pthread_mutex_lock(&info->finish_mutex);
+    while (info->held) pthread_cond_wait(&info->finish_cond, &info->finish_mutex);
+    pthread_mutex_unlock(&info->finish_mutex);
+#endif
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
@@ -161,6 +193,18 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
+    /* Its lwarx reservation record (spu_coherency.c) goes with the thread. */
+    { extern void spu_coh_ppu_thread_exit(void); spu_coh_ppu_thread_exit(); }
+
+    if (s_exit_done) {             /* sys_ppu_thread_exit finished the slot */
+        s_exit_done = 0;
+#ifdef _WIN32
+        return 0;
+#else
+        return NULL;
+#endif
+    }
+
     /* Mark as finished */
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
@@ -196,7 +240,7 @@ static void* ppu_host_thread_proc(void* param)
 #ifdef _WIN32
 static HANDLE g_gate_pending[256];
 static int    g_gate_n = 0;
-static int    g_gate_on = -1;
+static _Atomic int    g_gate_on = -1;
 void ydkj_release_pending_threads(void)
 {
     if (g_gate_on <= 0) return;
@@ -222,6 +266,10 @@ void ydkj_release_pending_threads(void) {}
  * for main before any sys_ppu_thread_create so every thread has a unique
  * nonzero id and the special cases die.
  * -----------------------------------------------------------------------*/
+/* The main thread's priority: the title's sys_process_param_t.primary_prio
+ * (the loader sets it from PT_PROC_PARAM), else lv2's default, 1001. */
+int32_t g_ppu_primary_prio = 1001;
+
 uint64_t ppu_thread_register_main(void)
 {
     table_lock();
@@ -231,6 +279,7 @@ uint64_t ppu_thread_register_main(void)
         t->ctx.thread_id = 1;
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
+        t->priority = g_ppu_primary_prio;
         strncpy(t->name, "main", sizeof(t->name) - 1);
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -301,7 +350,8 @@ int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
     }
     if (t->state == PPU_THREAD_STATE_FREE) return 0;
     *tid  = (unsigned)(idx + 1);
-    *cia  = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    { unsigned pp = __atomic_load_n(&t->prof_pc, __ATOMIC_RELAXED);
+      *cia = pp ? pp : (unsigned)t->ctx.cia; }
     *name = t->name;
     return 1;
 }
@@ -313,13 +363,16 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
     char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
     ppu_thread_info* t = (ppu_thread_info*)p;
     int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
-    if (!in_range) { s_prof_main_pc = lr; return; }
-    { static int _n = 0; if (_n++ < 0)
-        fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
-                vctx, (void*)g_ppu_threads, in_range, lr); }
-    if (in_range)
-        t->prof_pc = lr;
+    if (!in_range) { __atomic_store_n(&s_prof_main_pc, lr, __ATOMIC_RELAXED); return; }
+    /* Read by the profiler's sampling thread: relaxed atomics, not a lock. */
+    __atomic_store_n(&t->prof_pc, lr, __ATOMIC_RELAXED);
 }
+
+/* Set by _sys_ppu_thread_create around its call into sys_ppu_thread_create:
+ * the new thread's TLS pointer (r13) and whether it waits for
+ * sys_ppu_thread_start. */
+static __thread uint64_t s_create_tls;
+static __thread int      s_create_held;
 
 int64_t sys_ppu_thread_create(ppu_context* ctx)
 {
@@ -362,6 +415,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
     uint64_t thread_id = (uint64_t)(slot + 1);
     t->ctx.thread_id = thread_id;
+    t->ctx.gpr[13]   = s_create_tls;
+    t->held          = s_create_held;
 
     t->state      = PPU_THREAD_STATE_RUNNING;
     t->priority   = priority;
@@ -418,19 +473,6 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         #undef RB
       } }
 
-    /* Diagnostic (YDKJ_NOHDLR): suppress libsre's SPURS handler threads (entry in
-     * the libsre image range) -- they assert that the SPU side isn't operational
-     * and crash. Skipping them lets the main thread (already past
-     * cellSpursInitialize) keep running, to see how far it gets. The thread is
-     * "created" (tid returned) but never spawned. */
-    if (getenv("YDKJ_NOHDLR") && entry >= 0x30000000 && entry < 0x30040000) {
-        fprintf(stderr, "[SYS]   (suppressed libsre handler thread entry=0x%08llX)\n",
-                (unsigned long long)entry);
-        t->state = PPU_THREAD_STATE_RUNNING; /* leave it parked */
-        table_unlock();
-        return CELL_OK;
-    }
-
     /* Create the host thread. Give it a large RESERVED stack: each recompiled
      * guest call is a real host call, so deep guest call chains nest deeply on
      * the host stack and overflow the 1 MB default. Reserve 256 MB (committed
@@ -440,7 +482,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     /* Gate only guest worker threads (game .text entry), never libsre/system threads. */
     unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
     int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
-    if (_gate_this) _initflag |= CREATE_SUSPENDED;
+    if (_gate_this || t->held) _initflag |= CREATE_SUSPENDED;
     t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
@@ -450,7 +492,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
-    if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
+    if (_gate_this && !t->held && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
     /* The guest's top priorities (0 is highest, 3071 lowest) are its audio and
      * I/O pollers. At normal host priority they wake late under a busy frame:
      * The Simpsons Arcade Game's music thread (prio 0) polls the audio read
@@ -503,6 +545,62 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * _sys_ppu_thread_create (syscall 52) / sys_ppu_thread_start (syscall 53)
+ *
+ * The raw lv2 ABI: r3 = &tid (u64), r4 = &{u32 entry OPD, u32 tls}, r5 = arg,
+ * r6 = unk, r7 = prio, r8 = stack size, r9 = flags, r10 = name. Translated to
+ * the sys_ppu_thread_create argument order above.
+ * As in lv2, the thread gets r13 = the param block's TLS pointer and does not
+ * run until sys_ppu_thread_start: liblv2 records the new thread in its own
+ * thread list between the two calls.
+ * -----------------------------------------------------------------------*/
+static int64_t sys_ppu_thread_create_raw(ppu_context* ctx)
+{
+    uint32_t param = LV2_ARG_PTR(ctx, 1);
+    if (!param) return (int64_t)(int32_t)CELL_EFAULT;
+    const uint8_t* p = (const uint8_t*)vm_to_host(param);
+    uint32_t entry = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    if (!entry) return (int64_t)(int32_t)CELL_EFAULT;
+    /* lv2's checks (RPCS3 _sys_ppu_thread_create), for a process without
+     * debug/root permission: priority 0..3071; joinable + interrupt is EPERM. */
+    const int32_t prio = (int32_t)ctx->gpr[7];
+    if (prio < 0 || prio > 3071) return (int64_t)(int32_t)CELL_EINVAL;
+    if ((ctx->gpr[9] & 3) == 3) return (int64_t)(int32_t)CELL_EPERM;
+    uint32_t tls = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | p[7];
+    uint64_t r[7] = { ctx->gpr[3], entry, ctx->gpr[5], ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10] };
+    uint64_t save[7];
+    for (int i = 0; i < 7; i++) { save[i] = ctx->gpr[3 + i]; ctx->gpr[3 + i] = r[i]; }
+    s_create_tls = tls;
+    s_create_held = 1;
+    int64_t rc = sys_ppu_thread_create(ctx);
+    s_create_tls = 0;
+    s_create_held = 0;
+    for (int i = 1; i < 7; i++) ctx->gpr[3 + i] = save[i];
+    return rc;
+}
+
+/* sys_ppu_thread_start(id): ESRCH for no such thread, EBUSY if it was
+ * already started (or never held: created through the HLE path). */
+static int64_t sys_ppu_thread_start(ppu_context* ctx)
+{
+    table_lock();
+    ppu_thread_info* t = find_thread(LV2_ARG_U64(ctx, 0));
+    if (!t) { table_unlock(); return (int64_t)(int32_t)CELL_ESRCH; }
+    if (!t->held) { table_unlock(); return (int64_t)(int32_t)CELL_EBUSY; }
+#ifdef _WIN32
+    t->held = 0;
+    ResumeThread(t->host_thread);
+#else
+    pthread_mutex_lock(&t->finish_mutex);
+    t->held = 0;
+    pthread_cond_broadcast(&t->finish_cond);
+    pthread_mutex_unlock(&t->finish_mutex);
+#endif
+    table_unlock();
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * sys_ppu_thread_exit
  *
  * r3 = exit status
@@ -532,13 +630,14 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
         pthread_cond_signal(&t->finish_cond);
         pthread_mutex_unlock(&t->finish_mutex);
 #endif
+        s_exit_done = 1;
     }
     table_unlock();
 
     /* Hardware never returns from this. Unwind to the thread proc so the guest
      * cannot keep running past its own exit. */
     {
-        static int allow = -1;
+        static _Atomic int allow = -1;
         if (allow < 0) allow = getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1;
         if (allow && s_exit_armed) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
     }
@@ -555,7 +654,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static int n=0; if(__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED)<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -704,7 +803,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
      * derivation is wrong or the struct is never initialised. Read r30 out of
      * the live context instead of deriving it: no TOC arithmetic, no
      * assumption about which callback is running. */
-    { static int sw = -1;
+    { static _Atomic int sw = -1;
       if (sw < 0) sw = getenv("PS1_SPINWAIT") ? 1 : 0;
       if (sw) {
           static unsigned long n;
@@ -734,7 +833,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
      * emulator retires over a billion R3000 instructions while emitting no GP0
      * drawing commands, and nothing else distinguishes "running the game" from
      * "spinning in a wait loop". */
-    { static int pc_on = -1;
+    { static _Atomic int pc_on = -1;
       if (pc_on < 0) pc_on = getenv("PS1_R3000_PC") ? 1 : 0;
       if (pc_on) {
           const uint32_t lr = (uint32_t)ctx->lr;
@@ -875,7 +974,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
                  * forever; if it changes, the input is moving and the fault is
                  * in the extraction or the table lookup. Sampling at yields is
                  * enough because this window already takes 15,213 of them. */
-                { static int lw = -2; static uint32_t lwb;
+                { static _Atomic int lw = -2; static _Atomic uint32_t lwb;
                   if (lw == -2) { const char* e = getenv("PS1_LOOPWATCH");
                                   lw = e ? 1 : 0;
                                   lwb = e ? (uint32_t)strtoul(e, 0, 16) : 0u; }
@@ -914,7 +1013,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
                * This measures it instead: a flag per 64-byte bucket across the
                * BIOS, reported once, so "CdInit was entered" becomes an
                * observation rather than a deduction. */
-              { static int cen = -1;
+              { static _Atomic int cen = -1;
                 if (cen < 0) cen = getenv("PS1_PC_CENSUS") ? 1 : 0;
                 if (cen) {
                     /* 0xBFC00000..0xBFC80000 in 64-byte buckets = 8192 flags */
@@ -1277,6 +1376,79 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
+/* PS3_THREAD_DUMP=<seconds>: every N seconds print each live guest thread's
+ * last call site (ctx->lr, written at every lifted call) and the saved-LR
+ * back chain of its guest stack. "Where is every thread right now" is the
+ * first question of any hang, and none of the per-primitive WAIT logs answer
+ * it for a thread spinning in guest code or parked in an HLE wait. */
+#ifndef _WIN32
+#include <pthread.h>
+#include <unistd.h>
+static uint32_t td_rd32(uint32_t a)
+{
+    extern uint8_t* vm_base;
+    if (a < 0x10000u || a > 0xEFFFFFF0u) return 0;
+    const uint8_t* p = vm_base + a;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static void* thread_dump_main(void* arg)
+{
+    const unsigned sec = (unsigned)(uintptr_t)arg;
+    for (;;) {
+        sleep(sec);
+        fprintf(stderr, "[tdump] ---- guest threads ----\n");
+        for (int i = 0; i < PPU_THREAD_MAX; i++) {
+            ppu_thread_info* t = &g_ppu_threads[i];
+            if (t->state != PPU_THREAD_STATE_RUNNING && t->state != PPU_THREAD_STATE_DETACHED) continue;
+            const ppu_context* c = &t->ctx;
+            fprintf(stderr, "[tdump] tid=%-3d %-28s lr=0x%08X sp=0x%08X prof=0x%08X chain:",
+                    i + 1, t->name, (uint32_t)c->lr, (uint32_t)c->gpr[1], t->prof_pc);
+            uint32_t sp = (uint32_t)c->gpr[1];
+            for (int d = 0; d < 14 && sp; d++) {
+                const uint32_t next = td_rd32(sp + 4);      /* low word of the 64-bit back chain */
+                if (!next || next <= sp) break;
+                fprintf(stderr, " 0x%x", td_rd32(next + 20)); /* low word of saved LR at +16 */
+                sp = next;
+            }
+            fputc('\n', stderr);
+        }
+        fflush(stderr);
+    }
+    return NULL;
+}
+
+/* PS3_MEMDUMP_AT=<ea>:<len>:<sec>:<file>[,...]: <sec> seconds after start,
+ * write <len> bytes of guest memory at <ea> to <file> (raw). For state that
+ * has to be read in the middle of a stall -- a SPURS instance, a job queue --
+ * where no frame-based trigger ever fires. */
+typedef struct { uint32_t ea, len, sec; char file[256]; } memdump_req;
+static void* memdump_main(void* arg)
+{
+    extern uint8_t* vm_base;
+    memdump_req* r = (memdump_req*)arg;
+    sleep(r->sec);
+    FILE* f = fopen(r->file, "wb");
+    if (f) { fwrite(vm_base + r->ea, 1, r->len, f); fclose(f); }
+    fprintf(stderr, "[memdump] 0x%08X+0x%X at %us -> %s%s\n", r->ea, r->len, r->sec, r->file,
+            f ? "" : " (open failed)");
+    free(r);
+    return NULL;
+}
+static void memdump_start(const char* spec)
+{
+    char buf[2048];
+    strncpy(buf, spec, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+    for (char* tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+        memdump_req* r = (memdump_req*)calloc(1, sizeof *r);
+        if (!r) return;
+        if (sscanf(tok, "%x:%x:%u:%255s", &r->ea, &r->len, &r->sec, r->file) != 4 ||
+            (uint64_t)r->ea + r->len > 0x100000000ull) { free(r); continue; }
+        pthread_t th;
+        if (pthread_create(&th, NULL, memdump_main, r) == 0) pthread_detach(th); else free(r);
+    }
+}
+#endif
+
 void sys_ppu_thread_init(lv2_syscall_table* tbl)
 {
     /* Initialize stack allocator */
@@ -1284,6 +1456,13 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
 
     /* Clear thread table */
     memset(g_ppu_threads, 0, sizeof(g_ppu_threads));
+#ifndef _WIN32
+    { const char* e = getenv("PS3_THREAD_DUMP");
+      if (e && atoi(e) > 0) { pthread_t th;
+          pthread_create(&th, NULL, thread_dump_main, (void*)(uintptr_t)atoi(e));
+          pthread_detach(th); } }
+    { const char* e = getenv("PS3_MEMDUMP_AT"); if (e && *e) memdump_start(e); }
+#endif
 
 #ifdef _WIN32
     if (!s_table_lock_init) {
@@ -1292,7 +1471,8 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     }
 #endif
 
-    lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create);
+    lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create_raw);
+    lv2_syscall_register(tbl, SYS_PPU_THREAD_START,               sys_ppu_thread_start);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_EXIT,                sys_ppu_thread_exit);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_YIELD,               sys_ppu_thread_yield);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_JOIN,                sys_ppu_thread_join);

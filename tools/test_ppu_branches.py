@@ -46,10 +46,13 @@ def main() -> int:
     # b<cond>lrl: the conditional LR twin of b<cond>ctrl.
     assert "ps3_indirect_call" in bnelrl, bnelrl
     assert "ctx->lr" in bnelrl, bnelrl
-    assert bnelrl.startswith("if ("), bnelrl
+    # LK=1 writes LR = CIA + 4 whether or not the branch is taken (PowerISA
+    # Book I 2.4), so the LR update precedes the condition; the call is guarded.
+    assert "if (" in bnelrl and bnelrl.index("ctx->lr = ") < bnelrl.index("if ("), bnelrl
 
     # The CTR-based call it mirrors, unchanged.
-    assert bctrl == "ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);", bctrl
+    # bctrl links too (LR = CIA + 4) before calling through CTR.
+    assert bctrl == "ctx->lr = 0x00001004; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);", bctrl
 
     # A chunk that ends on a conditional branch falls through when it is not
     # taken, so it needs the fall-through tail; an unconditional one does not.

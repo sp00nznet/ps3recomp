@@ -13,6 +13,10 @@
  * Context-aware HLE: guest pointers (path, buffers, out params) are read/written
  * through vm_base in big-endian.
  */
+#ifndef _WIN32
+#include <atomic>
+#include <execinfo.h>
+#endif
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
@@ -95,7 +99,7 @@ static void host_path(char* out, size_t cap, const char* guest)
      * /dev_hdd0/game/<title>/), mirroring the PS3/RPCS3 layout: base data on
      * /dev_bdvd (disc), update data on /dev_hdd0. Set PS3_HDD0_ROOT to the host
      * dir that /dev_hdd0 maps into (the one containing game/<title>/). */
-    static const char* hdd0_root = nullptr; static int hdd0_init = 0;
+    static const char* hdd0_root = nullptr; static std::atomic<int> hdd0_init = 0;
     if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
         snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
@@ -388,27 +392,27 @@ static void cellFsRead(ppu_context* ctx)
      * a second, so it cannot be watched to its end -- truncating the stream makes
      * the demuxer see EOF and the movie finish, which is what advances the title
      * to whatever follows the intro. Deliberately a testing knob, not a fix. */
-    { static int efd = -2; static long elim = 0;
+    { static std::atomic<int> efd = -2; static std::atomic<long> elim = 0;
       if (efd == -2) { const char* e = getenv("PS3_FSLOG_EOF");
           if (e) { efd = atoi(e); const char* c = strchr(e, 44); elim = c ? atol(c + 1) : 0; }
           else efd = -1; }
       if (efd >= 0 && fd == efd && elim > 0 && fpos_before >= elim) {
           static int once = 0;
-          if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, elim);
+          if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, (long)elim);
           n = 0;
       } }
     if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
     /* PS3_FSLOG_READS=<fd>: log every read on one descriptor. PS3_FSLOG caps at 20
      * lines and they are all spent before a movie ever opens, so it cannot
      * answer "is the streamer reading the .avi". */
-    { static int wfd = -2;
+    { static std::atomic<int> wfd = -2;
       if (wfd == -2) { const char* e = getenv("PS3_FSLOG_READS"); wfd = e ? atoi(e) : -1; }
       if (wfd >= 0 && fd == wfd)
           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
                   fd, (unsigned long long)nbytes, n, fpos_before); }
-    if (getenv("PS3_FSLOG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
+    if (getenv("PS3_FSLOG")) { static int _fd=0; if(__atomic_fetch_add(&_fd, 1, __ATOMIC_RELAXED)<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
 #ifdef _WIN32
-    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
+    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(__atomic_fetch_add(&_b, 1, __ATOMIC_RELAXED)<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
 #endif
     /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
@@ -420,12 +424,24 @@ static void cellFsRead(ppu_context* ctx)
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
       int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
-      if(_n++<50 || first_for_fd || getenv("FS_READ_ALL"))
+      if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<50 || first_for_fd || getenv("FS_READ_ALL"))
         fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
                 (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
       if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
+#ifndef _WIN32
+      /* FS_READ_HOSTBT=<path substring>: host backtrace for reads of matching
+       * files. Lifted guest functions are host functions named func_<addr>, so
+       * the host stack IS the guest call chain -- no guest stack walk needed. */
+      { static const char* want = (const char*)-1;
+        if (want == (const char*)-1) want = getenv("FS_READ_HOSTBT");
+        if (want && *want && fd>=0 && fd<64 && strstr(g_fd_path[fd], want)) {
+            void* fr[48]; int k = backtrace(fr, 48);
+            fprintf(stderr, "[fs] read-bt fd=%d:\n", fd);
+            backtrace_symbols_fd(fr, k, 2);
+        } }
+#endif
       if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
           for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
           fprintf(stderr,"\n"); } }
@@ -493,7 +509,7 @@ static void cellFsWrite(ppu_context* ctx)
  * granularity. */
 static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t blk_ptr)
 {
-    static uint64_t bs = 0;
+    static std::atomic<uint64_t> bs = 0;
     if (!bs) {
         const char* e = getenv("PS3_FS_BLOCK_SIZE");
         bs = (e && *e) ? (uint64_t)strtoull(e, nullptr, 0) : 4096ull;
@@ -545,14 +561,18 @@ static void cellFsLseek(ppu_context* ctx)
  * DLFileDeviceStream, stat@obj+0xD8) then have the trailing blksize clobber the
  * field right after the stat (the fd at obj+0x10c), which later fails lseek.
  * Layout: mode@0 uid@4 gid@8 atime@0x0C mtime@0x14 ctime@0x1C size@0x24 blksize@0x2C. */
-static void write_stat(uint32_t sb, uint32_t mode, uint64_t size)
+/* Times are the host file's (Unix seconds, as CellFsStat's time_t). They used to be 0, and
+ * inFamous's menu catalog loader (func_002C5A30) skips a file whose mtime equals its cached
+ * value -- which starts at 0 -- so it never parsed cache/load_menu_catalog.log, the "empire"
+ * lookup failed, and the boot never pushed the task that starts the save autoload. */
+static void write_stat(uint32_t sb, uint32_t mode, uint64_t size, const struct stat* st)
 {
     vm_write32(sb + 0x00, mode);
     vm_write32(sb + 0x04, 0);            /* uid */
     vm_write32(sb + 0x08, 0);            /* gid */
-    vm_write64(sb + 0x0C, 0);            /* atime */
-    vm_write64(sb + 0x14, 0);            /* mtime */
-    vm_write64(sb + 0x1C, 0);            /* ctime */
+    vm_write64(sb + 0x0C, st ? (uint64_t)st->st_atime : 0);   /* atime */
+    vm_write64(sb + 0x14, st ? (uint64_t)st->st_mtime : 0);   /* mtime */
+    vm_write64(sb + 0x1C, st ? (uint64_t)st->st_ctime : 0);   /* ctime */
     vm_write64(sb + 0x24, size);         /* size */
     vm_write64(sb + 0x2C, 0x200);        /* blksize */
 }
@@ -571,7 +591,7 @@ static void cellFsStat(ppu_context* ctx)
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
-    if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
+    if (sb) write_stat(sb, mode, (uint64_t)st.st_size, &st);
     if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
     ctx->gpr[3] = CELL_OK;
 }
@@ -599,8 +619,9 @@ static void cellFsFstat(ppu_context* ctx)
           if (c > 0 && sz > c) {
               fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
               sz = c; } } }
-    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+    struct stat hst; const int have_st = fstat(fileno(g_files[fd]), &hst) == 0;
+    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz, have_st ? &hst : nullptr);
+    if (getenv("PS3_FSLOG")) { static int _n=0; if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
     ctx->gpr[3] = CELL_OK;
 }
 

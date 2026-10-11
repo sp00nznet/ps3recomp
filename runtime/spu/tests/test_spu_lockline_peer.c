@@ -53,7 +53,8 @@
 /* Guest memory. The DMA and atomic paths index straight off this, so it has to
  * cover every EA the test uses; a PUT below 0x10000 is rejected as malformed
  * (the null-destination guard), so the lines live well above that. */
-static uint8_t g_guest_mem[1u << 20];
+/* Page-aligned, like the runtime's vm_base (64-bit atomics fault misaligned). */
+static _Alignas(4096) uint8_t g_guest_mem[1u << 20];
 uint8_t* vm_base = g_guest_mem;
 uint32_t ppu_vm_size = 0;
 
@@ -172,8 +173,8 @@ static void test_putllc_breaks_peer(void)
     /* Both SPUs take the same line, exactly as five SPURS kernels do. */
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
-    CHECK(g_a.resv_valid == 1);
-    CHECK(g_b.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_a) == 1);
+    CHECK(SPU_RESV_VALID(&g_b) == 1);
 
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLC_CMD);
@@ -187,13 +188,13 @@ static void test_putllc_breaks_peer(void)
     CHECK(g_spu_lr_raise == raised + 1);
 
     TEST("...and drops the peer's reservation");
-    CHECK(g_a.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_a) == 0);
 
     /* The committer consumed its reservation; hardware does not report that as
      * a loss, so it takes no event of its own. */
     TEST("...and does not raise a self-LR on the committer");
     CHECK_EQ_U32(g_b.event_status & SPU_EVENT_LR, 0);
-    CHECK(g_b.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_b) == 0);
 
     /* The whole point of the event: the peer's own commit has to lose. */
     TEST("the peer's PUTLLC then fails and writes nothing");
@@ -219,7 +220,7 @@ static void test_failed_putllc_is_quiet(void)
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLC_CMD);
     CHECK_EQ_U32(g_b.atomic_stat, 1);
     CHECK_EQ_U32(g_a.event_status, 0);
-    CHECK(g_a.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_a) == 1);
     CHECK(g_spu_lr_raise == raised);
     CHECK_EQ_U32(g_guest_mem[LINE_A + 8], 0x5A);   /* nothing was committed */
 }
@@ -238,7 +239,7 @@ static void test_putlluc_breaks_peer(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_a) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
     CHECK(mem_is(LINE_A, 0xB0, 128));
 
@@ -259,7 +260,7 @@ static void test_putlluc_breaks_peer(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
     CHECK_EQ_U32(g_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_b.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_b) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 }
 
@@ -277,7 +278,7 @@ static void test_plain_put_breaks_peer(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_put(&g_b, LSA_B, LINE_A, 128);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_a) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 
     TEST("...and the transfer itself still lands");
@@ -299,7 +300,7 @@ static void test_plain_put_breaks_peer(void)
     stage(&g_b, LSA_B, 0xC0, 16);
     spu_put(&g_b, LSA_B, LINE_A + 112, 16);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_a) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 }
 
@@ -314,7 +315,7 @@ static void test_plain_put_elsewhere_is_quiet(void)
     stage(&g_b, LSA_B, 0xB0, 128);
     spu_put(&g_b, LSA_B, LINE_B, 128);
     CHECK_EQ_U32(g_a.event_status, 0);
-    CHECK(g_a.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_a) == 1);
     CHECK(g_spu_lr_raise == raised);
     CHECK(mem_is(LINE_B, 0xB0, 128));
 
@@ -322,7 +323,7 @@ static void test_plain_put_elsewhere_is_quiet(void)
     stage(&g_b, LSA_B, 0xC0, 128);
     spu_put(&g_b, LSA_B, LINE_A - 128, 128);
     CHECK_EQ_U32(g_a.event_status, 0);
-    CHECK(g_a.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_a) == 1);
     CHECK(g_spu_lr_raise == raised);
 }
 
@@ -340,7 +341,7 @@ static void test_wide_put_finds_the_reserved_line(void)
     stage(&g_b, LSA_B, 0xB0, 0x200);
     spu_put(&g_b, LSA_B, LINE_D, 0x200);
     CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_a) == 0);
     CHECK(g_spu_lr_raise == raised + 1);
 
     TEST("...and the whole span landed");
@@ -350,17 +351,11 @@ static void test_wide_put_finds_the_reserved_line(void)
 /* ===========================================================================
  * The event acknowledge against a concurrent raise
  *
- * Built with the lock rather than raced for. The main thread holds the
- * lock-line lock, so the acknowledge cannot get past it, and that it has not
- * completed is asserted -- which is what makes the interleaving a fact of the
- * run rather than a hope. The raise then happens under the same lock, and the
- * acknowledge is let through afterwards: exactly the order that loses the edge
- * when the acknowledge is a bare read-modify-write.
- *
- * The two waits below decide nothing. An acknowledge that has not started yet
- * lands after the raise and keeps it just the same; what the assertion rules
- * out is the acknowledge COMPLETING while the lock is held, which is the only
- * way the raise can be read, overwritten and lost.
+ * A bare read-modify-write acknowledge can read the status, have an LR raise
+ * land, and write the stale value back: the edge is lost and the SPU sleeps
+ * on a reservation it no longer holds. spu_ev_ack and spu_ev_raise are atomic
+ * RMWs, so no interleaving loses it; the test races the two 20000 times and
+ * checks every outcome.
  * ===========================================================================*/
 #define ACK_TAG_EVENT  0x1u    /* MFC tag-status update: what the ack asks for */
 
@@ -378,41 +373,44 @@ static void* ack_thread(void* arg)
 
 static void test_ack_keeps_a_concurrent_raise(void)
 {
-    reset_pair();
-    g_ack_entered = 0;
-    g_ack_done = 0;
-
-    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
-    g_a.event_status = ACK_TAG_EVENT;      /* the event the SPU is acking */
-
-    spu_lockline_lock();
-
-    pthread_t t;
-    if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
-        spu_lockline_unlock();
-        TEST("the acknowledging thread starts");
-        CHECK(0);
-        return;
+    /* The property, raced directly: an acknowledge of one bit and a peer's
+     * LR raise, started together, must end with the raise kept and the
+     * acknowledged bit gone, whichever lands first. This used to be checked
+     * through the mechanism (the acknowledge blocking on the lock-line lock);
+     * spu_ev_ack and spu_ev_raise are atomic read-modify-writes now, and the
+     * acknowledge takes no lock (T-0015). */
+    enum { ROUNDS = 20000 };
+    int lost = 0, kept_ack = 0, resv_left = 0;
+    for (int i = 0; i < ROUNDS; i++) {
+        reset_pair();
+        g_ack_entered = 0;
+        g_ack_done = 0;
+        spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+        g_a.event_status = ACK_TAG_EVENT;      /* the event the SPU is acking */
+        pthread_t t;
+        if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
+            TEST("the acknowledging thread starts");
+            CHECK(0);
+            return;
+        }
+        while (!g_ack_entered) YieldProcessor();
+        /* The raise a peer's commit would make, under its line's stripe. */
+        const uint64_t m = spu_lockline_mask_ea(LINE_A);
+        spu_lockline_lock_mask(m);
+        spu_coh_notify_write(LINE_A);
+        spu_lockline_unlock_mask(m);
+        pthread_join(t, NULL);
+        const uint32_t ev = __atomic_load_n(&g_a.event_status, __ATOMIC_ACQUIRE);
+        if (!(ev & SPU_EVENT_LR)) lost++;
+        if (ev & ACK_TAG_EVENT) kept_ack++;
+        if (SPU_RESV_VALID(&g_a)) resv_left++;
     }
-
-    while (!g_ack_entered) YieldProcessor();
-    Sleep(2);                              /* time to arrive at the lock */
-
-    TEST("the acknowledge cannot complete while the lock-line lock is held");
-    CHECK(g_ack_done == 0);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
-
-    /* The raise a peer's commit would make, under the lock that peer holds. */
-    spu_coh_notify_write(LINE_A);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
-
-    spu_lockline_unlock();
-    pthread_join(t, NULL);
-
-    TEST("the acknowledge clears what it asked for and keeps the raise");
-    CHECK(g_ack_done == 1);
-    CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+    TEST("an acknowledge racing an LR raise never loses the raise");
+    CHECK_EQ_U32((uint32_t)lost, 0);
+    TEST("the acknowledge always clears the bit it asked for");
+    CHECK_EQ_U32((uint32_t)kept_ack, 0);
+    TEST("the raise always breaks the reservation");
+    CHECK_EQ_U32((uint32_t)resv_left, 0);
 }
 
 /* ===========================================================================

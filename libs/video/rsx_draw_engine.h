@@ -147,6 +147,15 @@ typedef struct rsx_draw_backend {
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
+    /* A sampleable copy of a colour target as it stands at this point in the
+     * stream, for a draw that samples a surface it is also writing (a
+     * read-modify-write post pass: the RSX reads the old texel). 0 when the
+     * backend cannot; the engine then binds nothing better than before. */
+    u32  (*color_snapshot)(void* user, u32 surface);
+    /* A depth target decoded the way the RSX returns one sampled through a
+     * colour format (A8R8G8B8 over a Z24S8 buffer): RGBA8 with a = D[23:16],
+     * r = D[15:8], g = D[7:0], b = stencil -- RPCS3 decode_depth24. */
+    u32  (*depth_snapshot_rgba8)(void* user, u32 depth, u32 w, u32 h);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang
@@ -205,6 +214,15 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
+
+    /* Optional. bind_vs_constants for a block of `total_bytes` (the full
+     * VPConst layout) of which only rows [first, first + count) of `rows` and
+     * the `tail_bytes` at row 512 (the viewport epilogue) are read by the
+     * bound program, so only those need to reach the GPU. A backend that
+     * leaves this NULL gets the whole block through bind_vs_constants. */
+    void (*bind_vs_constants_range)(void* user, const void* rows, u32 first,
+                                    u32 count, const void* tail,
+                                    u32 tail_bytes, u32 total_bytes);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

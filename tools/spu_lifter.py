@@ -338,6 +338,43 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     return jumps
 
 
+def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
+    """Group contiguous chunks into function-sized runs for --merge-chunks.
+
+    find_spu_functions starts a new "function" at every branch target, so a real
+    function arrives as basic-block-sized chunks, and every branch between them
+    is a trampoline: return to the drain loop, look up, call. A group runs from
+    a chunk that starts a real function -- a brsl/brasl call target, an entry
+    point, or the first chunk after a gap -- across every chunk contiguous with
+    it, up to the next such start or the size cap. Returns {group_start: end}.
+    Chunks inside a group are still lifted on their own as well (callers keep
+    lifting every bound), so an indirect branch or a cross-function branch into
+    the middle of a group still has a registered function to land on."""
+    call_targets = set(entry_points)
+    for ins in insns:
+        if ins.mnemonic in ("brsl", "brasl"):
+            tgt = SPULifter._branch_target(ins)
+            if tgt is not None:
+                call_targets.add(tgt)
+    groups = {}
+    ordered = sorted(bounds)
+    i = 0
+    while i < len(ordered):
+        start, end = ordered[i]
+        n = (end - start) // 4
+        j = i + 1
+        while (j < len(ordered) and ordered[j][0] == end
+               and ordered[j][0] not in call_targets
+               and n + (ordered[j][1] - ordered[j][0]) // 4 <= max_insns):
+            end = ordered[j][1]
+            n += (ordered[j][1] - ordered[j][0]) // 4
+            j += 1
+        if j > i + 1:
+            groups[start] = end
+        i = j
+    return groups
+
+
 def compute_link_returns(insns, bounds) -> set:
     """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
     as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
@@ -456,6 +493,11 @@ def compute_link_returns(insns, bounds) -> set:
     return returns
 
 
+
+# lv2 stop-and-signal syscalls that resume at the next instruction (the same
+# set as find_spu_functions.LV2_RESUMING_STOPS, which decides function extents).
+LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
+
 class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
@@ -524,7 +566,10 @@ class SPULifter:
         # into the next sequential function. Emit a tail-call so the chain isn't
         # truncated (this was silently dropping execution mid-job).
         _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
-        if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
+        if (last_insn is not None
+                and (last_insn.mnemonic not in _TERMINATORS
+                     or (last_insn.mnemonic == "stop"
+                         and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
                 f"    {{ ctx->pc = 0x{end:X}; "
@@ -610,7 +655,15 @@ class SPULifter:
         if mn == "stop":
             # Preserve the 14-bit stop-and-signal code: SPURS leaf tasks use
             # `stop <code>` to invoke kernel syscalls (EXIT/YIELD/WAIT_SIGNAL/...).
-            return (f"ctx->stop_code = 0x{insn.raw & 0x3FFF:X}u; "
+            code = insn.raw & 0x3FFF
+            if code in LV2_RESUMING_STOPS:
+                # lv2 services these and resumes at the next instruction (the
+                # reply is read from the inbound mailbox right after the stop).
+                # spu_stop puts the context back to RUNNING when it serviced it.
+                return (f"ctx->stop_code = 0x{code:X}u; "
+                        f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); "
+                        f"if (ctx->status != SPU_STATUS_RUNNING) return;")
+            return (f"ctx->stop_code = 0x{code:X}u; "
                     f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
         # ---- immediate loaders ----
@@ -657,7 +710,8 @@ class SPULifter:
                     f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
                     f"spu_halt(ctx); return; }}")
         if mn == "stopd":
-            return ("ctx->stop_code = 0u; "
+            # stopd has no code field; the architected stop code it reports is 0x3FFF (RPCS3 STOPD).
+            return ("ctx->stop_code = 0x3FFFu; "
                     "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
         # ---- integer arithmetic (register) ----
@@ -838,7 +892,7 @@ class SPULifter:
             tgt = self._branch_target(insn)
             # Link register: preferred word only, other slots ZERO (real HW /
             # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
-            link = f"{g(link_rt)} = spu_link(0x{addr + 4:X});"
+            link = f"{g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X});"   # wraps at the end of LS
             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
             # infinite loop on real SPU (re-sets the link each pass, never
             # advances) -- a trap, NOT a call. Emitting a host call recurses
@@ -925,19 +979,21 @@ class SPULifter:
             # Indirect call: nested dispatch bracketed like brsl (host_depth +
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
-            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                    f"{{ int32_t _si = (int32_t)ctx->image_id; "
-                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
+            # read the target BEFORE writing the link: rt may be the same register as ra
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
+                    f"int32_t _si = (int32_t)ctx->image_id; "
+                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
-            link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
-            tgt_reg = _reg(ops[-1])
-            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+            link_rt = insn.raw & 0x7F            # rt = link
+            tgt_reg = (insn.raw >> 7) & 0x7F     # ra = target (the disassembler's last operand is rb, not the target)
+            # read the target before writing the link: rt may alias ra
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
-                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
+                    f"{_ied}ctx->pc = _tg; "
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }} }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -1011,8 +1067,9 @@ class SPULifter:
 
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
+        weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
-            lines.append(f"void {f.name}(spu_context* ctx) {{")
+            lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
@@ -1089,6 +1146,16 @@ def main() -> None:
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
+    p.add_argument("--return-entries", action="store_true",
+                   help="Also make the return address of every call (brsl, "
+                        "brasl, bisl, bisled) an entry point. Code that is "
+                        "resumed rather than returned to needs it: a SPURS task "
+                        "calls the policy module's syscall entry, the policy "
+                        "saves the task and exits to the kernel (abandoning the "
+                        "host frames), and later resumes the task by branching "
+                        "to that return address. Splits existing functions only "
+                        "(never seeds a gap), and the splits do not start new "
+                        "--merge-chunks groups, so straight-line speed is kept.")
     p.add_argument("--code-end", type=lambda x: int(x, 0), default=0,
                    help="Address where executable code ends and an embedded "
                         "rodata/const tail begins. Drops any auto-detected "
@@ -1099,6 +1166,15 @@ def main() -> None:
                         "garbage `functions` (e.g. the LBP WWS physics jobmods, "
                         "which append a zlib inflate string table + float tables "
                         "after the code at 0xAE68 / 0xAE48).")
+    p.add_argument("--merge-chunks", action="store_true",
+                   help="Emit each run of contiguous chunks from one call target "
+                        "to the next as ONE C function (branches between them "
+                        "become gotos) instead of one function per chunk linked "
+                        "by trampolines. Every chunk is still emitted and "
+                        "registered on its own for indirect entry, so this only "
+                        "changes speed, not which code can be reached.")
+    p.add_argument("--max-group-insns", type=int, default=4000,
+                   help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
                    help="Comma-separated `bi $rN` addresses to emit as GENERIC "
                         "indirect dispatch, overriding the link-register-return "
@@ -1148,6 +1224,28 @@ def main() -> None:
         else:
             # No boundary info: treat the whole image as one function.
             bounds = [(base, base + len(data))]
+
+    # Call return addresses as entries (--return-entries): split the bound that
+    # contains each one. Not merge-group seeds -- see the option's help.
+    if args.return_entries:
+        hi = args.code_end or (base + len(data))
+        rets = sorted({i.addr + 4 for i in disassemble_spu(data, base)
+                       if i.mnemonic in ("brsl", "brasl", "bisl", "bisled")
+                       and i.addr + 4 < hi})
+        newb = []
+        for (s0, e0) in sorted(set(bounds)):
+            cuts = [a for a in rets if s0 < a < e0]
+            prev = s0
+            for a in cuts:
+                newb.append((prev, a)); prev = a
+            newb.append((prev, e0))
+        by_start = {}
+        for s0, e0 in newb:
+            if s0 not in by_start or e0 < by_start[s0]:
+                by_start[s0] = e0
+        sys.stderr.write("[spu_lifter] return entries: %d call return address(es), %d -> %d bound(s)\n"
+                         % (len(rets), len(bounds), len(by_start)))
+        bounds = sorted(by_start.items())
 
     # Add extra function entry points (indirect-branch targets auto-detect misses)
     # by splitting whichever bound contains each address.
@@ -1221,8 +1319,17 @@ def main() -> None:
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
+    groups = {}
+    if args.merge_chunks:
+        seeds = {base}
+        if args.extra_funcs:
+            seeds |= {int(x, 0) for x in args.extra_funcs.split(",") if x.strip()}
+        groups = merge_chunk_groups(insns, bounds, args.max_group_insns,
+                                    entry_points=seeds)
+        print(f"  {len(groups)} merged function group(s) "
+              f"(--merge-chunks, max {args.max_group_insns} insns)")
     for s, e in bounds:
-        lifter.lift_function(insns, s, e)
+        lifter.lift_function(insns, s, groups.get(s, e))
 
     os.makedirs(args.output, exist_ok=True)
     hp = os.path.join(args.output, args.header_name)

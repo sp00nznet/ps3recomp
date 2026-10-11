@@ -46,8 +46,9 @@ extern "C" {
 extern uint32_t g_ps3_sdk_version;
 
 
-#define SYS_PPU_THREAD_CREATE           41
-#define SYS_PPU_THREAD_EXIT             42
+/* lv2 numbering (as RPCS3's lv2.cpp): 41 is _sys_ppu_thread_exit, 42 is
+ * unused, 52 is _sys_ppu_thread_create (param-struct ABI), 53 starts it. */
+#define SYS_PPU_THREAD_EXIT             41
 #define SYS_PPU_THREAD_YIELD            43
 #define SYS_PPU_THREAD_JOIN             44
 #define SYS_PPU_THREAD_DETACH           45
@@ -55,6 +56,8 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_PPU_THREAD_SET_PRIORITY     47
 #define SYS_PPU_THREAD_GET_PRIORITY     48
 #define SYS_PPU_THREAD_GET_STACK_INFORMATION 49
+#define SYS_PPU_THREAD_CREATE           52
+#define SYS_PPU_THREAD_START            53
 #define SYS_PPU_THREAD_RENAME           56
 
 /* Synchronization */
@@ -139,6 +142,7 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_TIMER_SLEEP                 142
 
 /* Time */
+#define SYS_TIME_GET_TIMEZONE           144
 #define SYS_TIME_GET_CURRENT_TIME       145
 #define SYS_TIME_GET_TIMEBASE_FREQUENCY 147
 

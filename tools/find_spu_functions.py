@@ -546,6 +546,18 @@ _TERMINATORS_NO_FALLTHROUGH = {
 }
 
 
+# lv2 SPU-thread syscalls made with stop-and-signal. The kernel services them
+# and RESUMES the SPU at the next instruction, which reads the reply from the
+# inbound mailbox (sys_spu_thread_receive_event: stop 0x110, then rdch x4).
+# Ending the function at the stop dropped that reply-handling code from the
+# lift entirely. 0x101/0x102 (group/thread exit) really are terminal.
+LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
+
+
+def is_resuming_stop(ins):
+    return ins.mnemonic == "stop" and (ins.raw & 0x3FFF) in LV2_RESUMING_STOPS
+
+
 def is_return(ins):
     """SPU ABI: `bi $r0` is the standard return."""
     if ins.mnemonic != "bi":
@@ -569,7 +581,7 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
             break
         if is_return(ins):
             return pc + 4
-        if ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH:
+        if ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH and not is_resuming_stop(ins):
             # Unconditional control flow -- if the target is not within this
             # range, the function ends here.
             return pc + 4

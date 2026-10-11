@@ -84,6 +84,7 @@ extern "C" {
  * a fat format. Overruns are counted, not silently truncated -- half a
  * vertex stream is worse than no draw. */
 #define RSX_DSP_INLINE_MAX_BYTES 65536
+#define RSX_DSP_IMM_MAX 256       /* immediate-mode vertices per BEGIN/END */
 
 typedef struct rsx_dispatch rsx_dispatch;
 
@@ -136,6 +137,19 @@ struct rsx_dispatch {
      * emits no inline arrays at all, still lost an order of magnitude of
      * poll rate in the regression gate purely from the added stride. */
     u8  inline_data[RSX_DSP_INLINE_MAX_BYTES];
+
+    /* Immediate mode: SET_VERTEX_DATA*_M between BEGIN_END(prim) and
+     * BEGIN_END(0). Every write latches the attribute's register value (as a
+     * float4); fully writing ATTR0 closes a vertex, which snapshots every
+     * attribute's current value (RPCS3 draw_command_processor::
+     * append_to_push_buffer). Kept after inline_data for the reason above. */
+    float imm_val[RSX_DSP_NUM_VERTEX_ATTR][4];
+    u32   imm_mask;                   /* attributes written this pair       */
+    u32   imm_a0_dw;                  /* ATTR0 dwords written this vertex   */
+    u32   imm_n;                      /* vertices closed this pair          */
+    u32   imm_dropped;                /* vertices past RSX_DSP_IMM_MAX      */
+    u32   pair_packets;               /* array/index/inline packets this pair */
+    float imm_vert[RSX_DSP_IMM_MAX][RSX_DSP_NUM_VERTEX_ATTR][4];
 };
 
 /* ---- lifecycle -------------------------------------------------------- */

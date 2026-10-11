@@ -11,6 +11,7 @@
 #ifndef PPU_MEMORY_H
 #define PPU_MEMORY_H
 
+#include "../memory/guest_mem_atomic.h"
 #include "../../include/ps3emu/endian.h"
 #include "ppu_context.h"
 
@@ -66,34 +67,30 @@ static inline uint64_t* vm_ptr64(uint32_t addr) { return (uint64_t*)vm_translate
  * -----------------------------------------------------------------------*/
 static inline uint8_t vm_read8(uint32_t addr)
 {
-    return *vm_ptr8(addr);
+    return gm_load8(vm_ptr8(addr));
 }
 
 static inline uint16_t vm_read16(uint32_t addr)
 {
-    uint16_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint16_t raw = gm_load16(vm_ptr8(addr));
     return ps3_bswap16(raw);
 }
 
 static inline uint32_t vm_read32(uint32_t addr)
 {
-    uint32_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint32_t raw = gm_load32(vm_ptr8(addr));
     return ps3_bswap32(raw);
 }
 
 static inline uint64_t vm_read64(uint32_t addr)
 {
-    uint64_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint64_t raw = gm_load64(vm_ptr8(addr));
     return ps3_bswap64(raw);
 }
 
 static inline float vm_read_f32(uint32_t addr)
 {
-    uint32_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint32_t raw = gm_load32(vm_ptr8(addr));
     raw = ps3_bswap32(raw);
     float result;
     memcpy(&result, &raw, sizeof(result));
@@ -102,8 +99,7 @@ static inline float vm_read_f32(uint32_t addr)
 
 static inline double vm_read_f64(uint32_t addr)
 {
-    uint64_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint64_t raw = gm_load64(vm_ptr8(addr));
     raw = ps3_bswap64(raw);
     double result;
     memcpy(&result, &raw, sizeof(result));
@@ -134,20 +130,35 @@ void        ppu_resv_break_store(uint64_t ea);
 int         spu_coh_is_reserved(uint32_t addr);
 void        spu_lockline_lock(void);
 void        spu_lockline_unlock(void);
+uint64_t    spu_lockline_mask_ea(uint32_t ea);
+uint64_t    spu_lockline_mask_range(uint32_t ea, uint32_t len);
+void        spu_lockline_lock_mask(uint64_t mask);
+void        spu_lockline_unlock_mask(uint64_t mask);
 void        spu_coh_notify_write(uint32_t addr);
+void        spu_coh_notify_write_from_ppu(uint32_t addr);
 #ifdef __cplusplus
 }
 #endif
 
-#define VM_WRITE_COH(addr, src, n)                                            \
+#define VM_WRITE_COH(addr, src, n)                                               \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(addr))) {                          \
-            spu_lockline_lock();                                              \
-            memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
-            spu_coh_notify_write((uint32_t)(addr));                           \
-            spu_lockline_unlock();                                            \
+        const uint32_t _ca = (uint32_t)(addr);                                  \
+        if (spu_coh_is_reserved(_ca)) {                                        \
+            const uint64_t _llm = spu_lockline_mask_range(_ca, (uint32_t)(n)); \
+            spu_lockline_lock_mask(_llm);                                     \
+            gm_store_bytes(vm_ptr8(_ca), (src), (n));                           \
+            spu_coh_notify_write_from_ppu(_ca);                               \
+            spu_lockline_unlock_mask(_llm);                                   \
         } else {                                                              \
-            memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
+            gm_store_bytes(vm_ptr8(_ca), (src), (n));                           \
+            /* store, then re-check: see spu_coh_reserve */                  \
+            __atomic_signal_fence(__ATOMIC_SEQ_CST);                          \
+            if (spu_coh_is_reserved(_ca)) {                                    \
+                const uint64_t _llm = spu_lockline_mask_range(_ca, (uint32_t)(n)); \
+                spu_lockline_lock_mask(_llm);                                 \
+                spu_coh_notify_write_from_ppu(_ca);                           \
+                spu_lockline_unlock_mask(_llm);                               \
+            }                                                                 \
         }                                                                     \
     } while (0)
 
@@ -247,7 +258,7 @@ static inline void vm_block_notify(uint32_t guest_dst, size_t len)
     uint32_t first = guest_dst & ~127u;
     uint32_t last  = (uint32_t)(guest_dst + (len - 1)) & ~127u;
     for (uint32_t line = first; ; line += 128u) {
-        if (spu_coh_is_reserved(line)) spu_coh_notify_write(line);
+        if (spu_coh_is_reserved(line)) spu_coh_notify_write_from_ppu(line);
         if (line == last) break;
     }
 }
@@ -255,10 +266,11 @@ static inline void vm_block_notify(uint32_t guest_dst, size_t len)
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
     if (vm_block_reserved(guest_dst, len)) {
-        spu_lockline_lock();
+        const uint64_t llm = spu_lockline_mask_range(guest_dst, (uint32_t)len);
+        spu_lockline_lock_mask(llm);
         memcpy(vm_ptr8(guest_dst), host_src, len);
         vm_block_notify(guest_dst, len);
-        spu_lockline_unlock();
+        spu_lockline_unlock_mask(llm);
     } else {
         memcpy(vm_ptr8(guest_dst), host_src, len);
     }
@@ -267,10 +279,11 @@ static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 {
     if (vm_block_reserved(guest_dst, len)) {
-        spu_lockline_lock();
+        const uint64_t llm = spu_lockline_mask_range(guest_dst, (uint32_t)len);
+        spu_lockline_lock_mask(llm);
         memset(vm_ptr8(guest_dst), val, len);
         vm_block_notify(guest_dst, len);
-        spu_lockline_unlock();
+        spu_lockline_unlock_mask(llm);
     } else {
         memset(vm_ptr8(guest_dst), val, len);
     }
@@ -320,12 +333,13 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
      * reverse), and the reserving SPU gets its lost-reservation event. */
     int ok;
     if (spu_coh_is_reserved(addr)) {
-        spu_lockline_lock();
+        const uint64_t llm = spu_lockline_mask_ea(addr);
+        spu_lockline_lock_mask(llm);
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,
             memory_order_acq_rel, memory_order_acquire);
-        if (ok) spu_coh_notify_write(addr);
-        spu_lockline_unlock();
+        if (ok) spu_coh_notify_write_from_ppu(addr);
+        spu_lockline_unlock_mask(llm);
     } else {
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,
@@ -369,12 +383,13 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
 
     int ok;
     if (spu_coh_is_reserved(addr)) {
-        spu_lockline_lock();
+        const uint64_t llm = spu_lockline_mask_ea(addr);
+        spu_lockline_lock_mask(llm);
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,
             memory_order_acq_rel, memory_order_acquire);
-        if (ok) spu_coh_notify_write(addr);
-        spu_lockline_unlock();
+        if (ok) spu_coh_notify_write_from_ppu(addr);
+        spu_lockline_unlock_mask(llm);
     } else {
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,

@@ -36,12 +36,36 @@ extern "C" {
 /* SPU external event: lock-line reservation lost. */
 #define SPU_EVENT_LR  0x400u
 
-/* The lock-line lock. One process-wide spinlock serializing every lock-line
- * transaction, SPU and PPU alike: the SPU's GETLLAR snapshot and PUTLLC
- * compare-and-commit, and a PPU store or stwcx to a line some SPU has
- * reserved. The critical sections are two 128-byte memcpy and a memcmp. */
-void spu_lockline_lock(void);
-void spu_lockline_unlock(void);
+/* The lock-line lock, striped by line. Every lock-line transaction, SPU and
+ * PPU alike -- the SPU's GETLLAR snapshot and PUTLLC compare-and-commit, a
+ * PPU store or stwcx to a line some SPU has reserved -- holds the stripe of
+ * each 128-byte line it reads or writes, so transactions on different lines
+ * run in parallel and those on one line serialize exactly as before.
+ *
+ * spu_lockline_lock/unlock take EVERY stripe: the old global lock, for the
+ * rare operation that has to exclude all line traffic (the context registry)
+ * and for callers that do not name an address. Several stripes are always
+ * taken in ascending order, so no two holders deadlock.
+ *
+ * An agent moving its reservation from line A to line B holds both stripes:
+ * a notifier writing A then never sees the owner half-way through re-pointing
+ * it, so a reservation is neither kept past a write nor lost to a spurious
+ * one. Reservation fields read under another line's stripe are accessed
+ * atomically. */
+#define SPU_LL_STRIPES 64
+void     spu_lockline_lock(void);
+void     spu_lockline_unlock(void);
+uint64_t spu_lockline_mask_ea(uint32_t ea);
+uint64_t spu_lockline_mask_range(uint32_t ea, uint32_t len);
+void     spu_lockline_lock_mask(uint64_t mask);
+void     spu_lockline_unlock_mask(uint64_t mask);
+
+/* A lock-free read of `ea`'s line, seqlock style: every stripe holder bumps
+ * the stripe's sequence (odd while held). begin waits for an even value and
+ * returns it; the read is good if valid() still sees that value. A GETLLAR
+ * reads this way, so SPUs polling one line no longer serialize on its lock. */
+uint32_t spu_lockline_read_begin(uint32_t ea);
+int      spu_lockline_read_valid(uint32_t ea, uint32_t seq);
 
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.
@@ -50,6 +74,9 @@ void spu_lockline_unlock(void);
  * reserved again microseconds later, so unmarking would buy nothing; a stale
  * mark costs one locked PPU store to a line the kernel owns anyway. */
 void spu_coh_reserve(spu_context* ctx, uint32_t ea);
+
+/* The line the calling PPU thread holds an lwarx reservation on, or ~0u. */
+uint32_t spu_coh_ppu_held_line(void);
 
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
@@ -65,10 +92,22 @@ void spu_coh_notify_write(uint32_t ea);
 /* Remove a context from the reserving set. MUST be called before a
  * transient (stack-allocated) spu_context goes out of scope. */
 void spu_coh_unregister(spu_context* ctx);
+void spu_process_barrier(void);
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
 /* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
  * write does not cost it its reservation on hardware. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self);
+/* A store by the current PPU thread: like spu_coh_notify_write, but leaves
+ * that thread's own lwarx reservation alone. */
+void spu_coh_notify_write_from_ppu(uint32_t ea);
+
+/* PPU lwarx/ldarx reservations: the whole 128-byte granule, cleared by any
+ * other agent's store to it (see spu_coherency.c). reserve/holds/drop expect
+ * the lock-line lock held; thread_exit takes it. */
+void spu_coh_ppu_reserve(uint32_t ea);
+int  spu_coh_ppu_holds(uint32_t ea);
+void spu_coh_ppu_drop(void);
+void spu_coh_ppu_thread_exit(void);
 
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */

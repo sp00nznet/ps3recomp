@@ -106,3 +106,6 @@ build-gate/
 # Scratch space for generated test drivers and their output (test_ppu_lift.py,
 # test_milestone.py).
 scratch/
+
+# SPU differential test build products (runtime/spu/tests/build_diff_test.sh)
+runtime/spu/tests/build_diff/

@@ -182,7 +182,6 @@ static DWORD WINAPI frame_clock(LPVOID)
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? "OK -- window open" : "FAILED");
 
-    unsigned  last_flip = 0;
     ULONGLONG next_tick = GetTickCount64();
 
     for (;;) {
@@ -200,7 +199,6 @@ static DWORD WINAPI frame_clock(LPVOID)
              * mixed one. */
             if (rsx_ok && cellGcm_take_flip_pending()) {
                 present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
             }
             /* Drain the FIFO every tick. This is what writes the RSX sync-fence
              * labels the game's per-frame logic blocks on, so it has to keep
@@ -218,7 +216,6 @@ static DWORD WINAPI frame_clock(LPVOID)
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
                 present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
             }
             cellGcm_rsx_process_fifo();
 
@@ -226,16 +223,18 @@ static DWORD WINAPI frame_clock(LPVOID)
                 rsx_ok = 0;              /* window closed */
                 continue;
             }
-            /* Present on a guest flip. A present on a fixed clock can catch the
-             * drain mid-frame and flash a partial one. Before the first flip
-             * present freely, so the window is not blank during boot. */
-            unsigned fc = cellGcm_flip_request_count();
-            if (fc != last_flip) {
+            /* Present a flip the drain just reached, now: the drain stops at
+             * the flip, so the batch is exactly the finished frame, and the
+             * guest is waiting on this flip before it starts the next one.
+             * Consuming the pending flag here matters -- this used to present
+             * on the flip count changing and leave the flag set, so the check
+             * above re-showed the same frame on the next pass with no draws:
+             * every frame was presented twice. Before the first flip present
+             * freely, so the window is not blank during boot. */
+            if (cellGcm_take_flip_pending())
                 present_guest_frame();
-                last_flip = fc;
-            } else if (fc == 0) {
+            else if (cellGcm_flip_request_count() == 0)
                 rsx_backend_present();
-            }
         }
     }
     return 0;

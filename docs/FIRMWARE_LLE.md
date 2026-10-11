@@ -139,27 +139,42 @@ discovery pass (branch targets, tail entries) fills in interior functions within
 
 ## Step 4: load, patch, and bind at runtime
 
-This step is per-game integration and is intentionally not covered by generic tooling here,
-the same way ps3recomp's existing game runner pattern (see the `host_main` / runner code a
-port project builds per [GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md)) is per-game. At
-a high level, a runner that wants to use a lifted firmware module needs to:
+`tools/lift_firmware_module.py` runs steps 2 and 3 and writes the rest:
 
-1. **Load the image.** Copy `<name>_image.bin` into guest memory at `--base` (or map it there),
-   the same way the runner already places the game's own ELF segments.
-2. **Patch the module's own import stub slots.** Walk `<name>_imports.json` and write your
-   HLE bridge descriptor (whatever the runtime's NID dispatch convention is, see
-   `import_stubs.cpp` / `nid_dispatch()` as described in
-   [GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md)'s HLE bridge section) into each stub slot
-   address, exactly as you would for a game's own unresolved imports.
-3. **Bind the game's imports to the lifted module.** For every NID in the game's own import
-   table that belongs to the firmware module's library (for SPURS: the `cellSpurs`/SPURS NIDs),
-   look up that NID in `<name>_exports.json` and point the game's import stub at that address
-   instead of an HLE bridge. From here on, the game's calls into that library reach the real,
-   lifted kernel code instead of a hand-written stand-in.
+```bash
+python tools/lift_firmware_module.py liblv2.prx --base 0x30000000 --out lle/liblv2
+python tools/lift_firmware_module.py libsysmodule.prx --base 0x30180000 --out lle/libsysmodule
+python tools/lift_firmware_module.py libsre.prx --base 0x30100000 --out lle/libsre
+```
 
-After this, the game's own SPURS calls run the actual scheduler loop: task creation, dispatch,
-and the SPU-side context switch machinery are all the lifted firmware code, not an
-approximation of it.
+Each output directory holds the lifted C (`<stem>_recomp*`, symbols prefixed `<stem>_`, the
+module's own imports lifted as `ps3_hle_call(nid)`) and `<stem>_module.cpp`, which embeds the
+relocated image and registers the module under its file name (`prx_static_register`,
+`runtime/prx/prx_loader.h`). Add those files to the build beside the title's lift; nothing else
+is per-game.
+
+At run time the modules are loaded the way lv2 loads them, by lv2's own PRX syscalls
+(`runtime/syscalls/lv2_prx.c`), with the build-time registry standing in for the files:
+
+1. **liblv2 starts the process.** If `liblv2.sprx` is in the build, the main thread enters its
+   `module_start` (r11 = the ELF's entry), as on the console. liblv2 sets up the heap and TLS,
+   loads libsysmodule, whose start loads the default module list (libsre among them) with
+   `_sys_prx_load_module_list`, starts each one, and then calls the ELF entry.
+2. **Loading places a module.** `_sys_prx_load_module` copies a registered module's image to its
+   base and binds its lifted functions. A firmware module that is not in the build is answered by
+   the HLE libraries, as RPCS3 does for the modules it runs HLE: the load returns an id with
+   nothing behind it.
+3. **Starting links its exports.** `_sys_prx_start_module` publishes the module's exports; from
+   then on `ps3_hle_call` sends an import with that NID to the module (through its OPD) instead
+   of the HLE handler -- the title's imports and the modules' imports of each other alike.
+
+What runs is then the firmware's own code end to end: liblv2's lwmutex, malloc, printf and
+thread wrappers over our lv2 syscalls, libsysmodule's module management, and libsre's SPURS
+with its real SPU kernel on our SPU runtime. `tests/conformance/spurs/run_spurs_conform.py
+--lle DIR` runs the SPURS suites that way and compares them against RPCS3.
+
+Limits: a lifted module has one fixed base, so it can be loaded once at a time; libgcm_sys and
+libfs, which RPCS3 runs LLE, are HLE here unless lifted too.
 
 ## What is proven vs. what is expected
 

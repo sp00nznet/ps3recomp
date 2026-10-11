@@ -143,16 +143,16 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (!c) return (int32_t)CELL_ESRCH;
     sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
     if (!m->active) { cond_unlock(c); return (int32_t)CELL_ESRCH; }
-    if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
+    if (__atomic_load_n(&m->owner_tid, __ATOMIC_RELAXED) != ctx->thread_id || __atomic_load_n(&m->lock_count, __ATOMIC_RELAXED) <= 0) {
         cond_unlock(c); return (int32_t)CELL_EPERM;
     }
     struct sys_cond_waiter waiter = {NULL, 0};
     struct sys_cond_waiter** tail = &c->waiters;
     while (*tail) tail = &(*tail)->next;
     *tail = &waiter;
-    int depth = m->lock_count;
-    m->owner_tid = 0;
-    m->lock_count = 0;
+    int depth = __atomic_load_n(&m->lock_count, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->owner_tid, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->lock_count, 0, __ATOMIC_RELAXED);
     for (int i = 0; i < depth; ++i) guest_unlock(m);
 
     int32_t result = CELL_OK;
@@ -196,8 +196,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
     *link = waiter.next;
     cond_unlock(c);
     for (int i = 0; i < depth; ++i) guest_lock(m);
-    m->owner_tid = ctx->thread_id;
-    m->lock_count = depth;
+    __atomic_store_n(&m->owner_tid, ctx->thread_id, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->lock_count, depth, __ATOMIC_RELAXED);
     return result;
 }
 

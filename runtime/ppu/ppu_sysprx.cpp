@@ -16,9 +16,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <atomic>
+#include <string>
 /* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
+#include "../syscalls/lv2_spu_image.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 
 extern "C" uint8_t* vm_base;
@@ -27,6 +33,8 @@ extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" uint64_t vm_read64(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
+extern "C" uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                   uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
 
 /* Simple bump allocator for TLS areas, in a free vm region below the stack. */
 static uint32_t s_tls_next = 0x0E000000u;
@@ -107,7 +115,13 @@ static void sys_process_is_stack(ppu_context* ctx)
  * unregistered context (bug); stamp a sentinel that matches no real thread. */
 #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
 
-#ifdef _WIN32
+/* Real lwmutex/lwcond on every host. They were _WIN32-only: on POSIX lock and
+ * unlock merely stamped the owner word, so there was no mutual exclusion at
+ * all, and lwcond_wait returned at once. The semaphores come from the
+ * win32_compat shim (pthread-backed) off Windows. */
+#define PS3_LWM_REAL 1
+
+#if PS3_LWM_REAL
 static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
 #endif
 static void sys_lwmutex_create(ppu_context* ctx)
@@ -124,7 +138,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
     vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
     vm_write32(lwm + 0x14, 0);
-#ifdef _WIN32
+#if PS3_LWM_REAL
     /* A recreate at a reused address must not inherit a locked slot (e.g. the
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
@@ -145,7 +159,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * thread. Recursion is handled explicitly via the guest owner/recur fields
  * we stamp (only the holder ever writes owner=self, so the re-lock check is
  * race-free). Keyed by guest address in an open-addressed table. */
-#ifdef _WIN32
+#if PS3_LWM_REAL
 #define LWM_HASH 65536u
 static struct LwmSlot { volatile long addr; HANDLE sem;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
@@ -159,7 +173,7 @@ static volatile long g_lwm_tab_lock = 0;
  * contended block it logs who holds it and for how long; on unlock it flags a
  * long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the
  * convoy root. Default OFF. */
-static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
+static int lwm_trace(void){ static std::atomic<int> v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
 static long long lwm_now_us(void){
 #ifdef _WIN32
     static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
@@ -221,7 +235,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
      * contended lock yields to other threads instead of hard-blocking). We had
      * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
     uint64_t timeout_us = ctx->gpr[4];
-#ifdef _WIN32
+#if PS3_LWM_REAL
     HANDLE s = lwm_sem(lwm);
     if (s) {
         /* Recursive re-lock by the current holder: bump the count, no wait.
@@ -268,7 +282,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t self = LWM_SELF(ctx);
-#ifdef _WIN32
+#if PS3_LWM_REAL
     HANDLE s = lwm_sem(lwm);
     if (s) {
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
@@ -295,7 +309,7 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     }
     vm_write32(lwm + LWM_RECUR, 0);
     vm_write32(lwm + LWM_OWNER, 0);
-#ifdef _WIN32
+#if PS3_LWM_REAL
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
         if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
             if (held > 100000) {
@@ -338,44 +352,141 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
  * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
  * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
- * handshakes, not long-term blocking. sys_lwcond_t: +0x00 lwmutex EA (be64),
- * +0x08 lwcond_queue id. */
+ * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes (RPCS3
+ * sys_lwcond.h): +0x00 lwmutex EA (be32), +0x04 lwcond_queue id (be32). A be64
+ * store at +0 left the pointer word 0 -- FIOS (func_00442AB8 in inFamous)
+ * reads it as "not created" and reports "wait for invalid cond" -- and the id
+ * store at +0x08 overran the struct into the title's next field. */
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
-    vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
-    vm_write32(lwcond + 0x08, ++s_lwcond_id);
+    vm_write32(lwcond + 0x00, lwmutex);
+    vm_write32(lwcond + 0x04, ++s_lwcond_id);
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
- * common single (non-recursive) hold. */
+
+/* Real lwcond semantics. The old wait released the lwmutex, slept 1 ms and
+ * returned success with every signal a no-op, on the theory that callers
+ * re-check a predicate in a loop. inFamous's movie player does not: it posts a
+ * frame-buffer request, waits once, and takes the first wakeup as "serviced"
+ * -- so it built Bink's frame planes from a NULL buffer and the decoder SPU
+ * DMA'd every video frame over the game's .text (jump tables included).
+ *
+ * Per lwcond EA: waiters registered and signal tokens granted. A waiter
+ * registers BEFORE it releases the lwmutex, and signalers hold that lwmutex,
+ * so no signal is lost; signal grants one token (if anyone waits), signal_all
+ * one per waiter. PS3_LWCOND_POLL=1 restores the old poll behaviour. */
+struct LwcondWaiter { uint32_t ea; bool released; LwcondWaiter* next; };
+static std::mutex s_lwc_mu;
+static std::condition_variable s_lwc_cv;
+static LwcondWaiter* s_lwc_head;   /* FIFO of registered waiters, all lwconds */
+
+static void lwc_enqueue(LwcondWaiter* w)   /* s_lwc_mu held */
+{
+    LwcondWaiter** p = &s_lwc_head;
+    while (*p) p = &(*p)->next;
+    w->next = nullptr;
+    *p = w;
+}
+
+static void lwc_unlink(LwcondWaiter* w)    /* s_lwc_mu held */
+{
+    for (LwcondWaiter** p = &s_lwc_head; *p; p = &(*p)->next)
+        if (*p == w) { *p = w->next; return; }
+}
+
+static bool lwc_poll_mode()
+{
+    static std::atomic<int> m = -1;
+    if (m < 0) m = getenv("PS3_LWCOND_POLL") ? 1 : 0;
+    return m == 1;
+}
+
+static int lwc_log()
+{
+    static std::atomic<int> n = -1;
+    if (n < 0) { const char* e = getenv("PS3_LWCOND_LOG"); n = e ? atoi(e) : 0; }
+    return n;
+}
+static std::atomic<int> s_lwc_logged{0};
+
+/* signal releases the oldest waiter registered on this lwcond, signal_all
+ * every one registered now. Released waiters leave the queue at once, so a
+ * thread that wakes and waits again can never take another waiter's wakeup. */
+static void lwc_signal(uint32_t ea, bool all, uint32_t tid = 0)
+{
+    std::lock_guard<std::mutex> lk(s_lwc_mu);
+    unsigned n = 0;
+    for (LwcondWaiter** p = &s_lwc_head; *p; ) {
+        LwcondWaiter* w = *p;
+        if (w->ea == ea) {
+            w->released = true;
+            *p = w->next;
+            n++;
+            if (!all) break;
+        } else {
+            p = &w->next;
+        }
+    }
+    if (lwc_log() && s_lwc_logged++ < lwc_log())
+        fprintf(stderr, "[lwcond] signal%s ea=0x%08X woke=%u tid=%u lwm_owner=0x%X\n", all ? "_all" : "", ea,
+                n, tid, vm_read32(vm_read32(ea) + LWM_OWNER));
+    if (n) s_lwc_cv.notify_all();
+}
+
+static void sys_lwcond_signal(ppu_context* ctx)     { lwc_signal((uint32_t)ctx->gpr[3], false, ctx->thread_id); ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_signal((uint32_t)ctx->gpr[3], true, ctx->thread_id);  ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_signal((uint32_t)ctx->gpr[3], false, ctx->thread_id); ctx->gpr[3] = 0; }
+
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-    uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
-#ifdef _WIN32
+    uint64_t timeout = ctx->gpr[4];                 /* microseconds, 0 = forever */
+    uint32_t lwmutex = vm_read32(lwcond + 0x00);
+    int32_t rc_out = 0;
+#if PS3_LWM_REAL
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
+        const bool poll = lwc_poll_mode();
+        if (lwc_log() && s_lwc_logged++ < lwc_log())
+            fprintf(stderr, "[lwcond] wait ea=0x%08X lwm=0x%08X timeout=%llu tid=%u\n", lwcond, lwmutex,
+                    (unsigned long long)timeout, (unsigned)ctx->thread_id);
+        LwcondWaiter me{lwcond, false, nullptr};
+        if (!poll) {
+            std::lock_guard<std::mutex> lk(s_lwc_mu);
+            lwc_enqueue(&me);
+        }
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
         ReleaseSemaphore(s, 1, NULL);
-        Sleep(1);
+        if (poll) {
+            Sleep(1);
+        } else {
+            std::unique_lock<std::mutex> lk(s_lwc_mu);
+            auto ready = [&] { return me.released; };
+            if (timeout) {
+                if (!s_lwc_cv.wait_for(lk, std::chrono::microseconds(timeout), ready)) {
+                    lwc_unlink(&me);
+                    rc_out = (int32_t)0x8001000B;   /* CELL_ETIMEDOUT */
+                    if (getenv("PS3_LWCOND_TOLOG")) { static std::atomic<int> n{0}; if (n++ < 400)
+                        fprintf(stderr, "[lwcond] TIMEOUT ea=0x%08X tid=%u after %lluus lr=0x%08X\n", lwcond,
+                                (unsigned)ctx->thread_id, (unsigned long long)timeout, (uint32_t)ctx->lr); }
+                }
+            } else {
+                s_lwc_cv.wait(lk, ready);
+            }
+        }
         WaitForSingleObject(s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
 #endif
-    ctx->gpr[3] = 0;
+    ctx->gpr[3] = (uint64_t)(int64_t)rc_out;
 }
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
@@ -467,6 +578,8 @@ extern "C" int64_t sys_ppu_thread_exit(ppu_context* ctx);
  * hand back 0 and the caller's init (sub_C1484 / KdConvert) bails. */
 static void hle_ppu_thread_create(ppu_context* ctx) { ctx->gpr[3] = sys_ppu_thread_create(ctx); }
 static void hle_ppu_thread_exit(ppu_context* ctx)   { ctx->gpr[3] = sys_ppu_thread_exit(ctx); }
+extern "C" void _cellSpursWorkloadAttributeInitialize_ctx(uint64_t* gpr);
+static void hle_spurs_wkattr_init(ppu_context* ctx) { _cellSpursWorkloadAttributeInitialize_ctx(ctx->gpr); }
 
 /* _cellGcmInitBody (NID 0x15BAE46B) -- the GCM init every PS3 game calls via the
  * cellGcmInit() SDK macro. cellGcmSys.c provides the layout-correct core
@@ -585,155 +698,283 @@ static void hle_net_socket(ppu_context* ctx) { static uint32_t s_fd = 3; ctx->gp
  * the RPCS3-offline oracle where broadcasts go out and nothing answers). */
 static void hle_net_sendto(ppu_context* ctx) { ctx->gpr[3] = (uint32_t)ctx->gpr[5]; }
 
-/* _sys_spu_image_import (sysPrxForUser NID 0xEBE5F72F) -- the user-space wrapper
- * libsre calls during cellSpursInitialize to load the SPURS SPU kernel into the
- * sys_spu_image struct. Previously UNRESOLVED -> returned 0 -> libsre proceeded
- * with an EMPTY image (entry=0) -> the 5 SPURS SPU threads ran nothing -> PPU
- * busy-waits on an SPU completion that never comes -> 0 GCM draws
- * (prx/spu_kernel/README.txt step 1). Parses the SPU ELF at r4 into the image
- * struct at r3.
+/* ---- liblv2 (sysPrxForUser): SPU images, formatted output, SPU printf -----
  *
- * The ELF-parse (segment/entry layout below) is lifted directly from sagemono's
- * sys_spu_image_import SYSCALL handler in PR #57 (fix/spu-image-import); this is
- * the sysPrxForUser LIBRARY counterpart libsre actually calls. Credit: sagemono
- * (PR #57) for the import implementation + SPU-image syscall-number fix.
- * Self-verifying: no-op unless r4 points to an ELF (so a wrong NID guess is safe).
- * sys_spu_image { u32 type; u32 entry; sys_spu_segment* segs; int nsegs; }
- * sys_spu_segment{ int type; u32 ls_start; int size; u64 src_pa }  (0x18, src@0x10) */
-/* Last SPU image parsed below: where its loadable bytes live, which local
- * store address they start at, and how far they span. Read by the SPU DMA
- * path (SPU_DSP_IMAGE_EA in spu_dma.h) to recover a section load whose
- * source address the title lost between import and use. */
+ * The functions firmware libsre imports from liblv2 that live above the
+ * kernel. Each one's behaviour is what Sony's liblv2 does when RPCS3 runs it
+ * (LLE), as tests/conformance/spurs/t_sysprx records it.
+ *
+ * The lv2 side of SPU images (kernel image objects, ELF parsing, loading a
+ * segment list into a local store) is runtime/syscalls/lv2_spu_image.c. */
+
+/* Kept defined for the SPU_DSP_IMAGE_EA recovery in spu_dma.h, which reads
+ * them. Nothing sets them any more: they recorded the last image the old
+ * import parsed, a per-title workaround for a DMA source address read as 0. */
 extern "C" uint32_t g_spu_image_src_ea = 0, g_spu_image_ls_start = 0,
                     g_spu_image_span = 0;
 
-/* img_ea -> the EA of the SPU ELF it was parsed from. Small and fixed: a title
- * has a handful of images, and a repeat import of the same descriptor replaces
- * its entry. */
-#define SPU_IMG_SRC_MAX 32
-static struct { uint32_t img, src; } s_spu_img_src[SPU_IMG_SRC_MAX];
+extern "C" void  spu_raw_note_image(uint32_t src_ea, uint32_t entry);  /* runtime/spu/spu_raw.c */
+extern "C" void* _sys_malloc(uint32_t size);                          /* libs/system/sysPrxForUser.c */
+extern "C" int32_t _sys_free(void* ptr);
 
-extern "C" void ps3_spu_image_record(uint32_t img_ea, uint32_t src_ea)
-{
-    if (!img_ea || !src_ea) return;
-    for (int i = 0; i < SPU_IMG_SRC_MAX; i++)
-        if (s_spu_img_src[i].img == img_ea || s_spu_img_src[i].img == 0) {
-            s_spu_img_src[i].img = img_ea; s_spu_img_src[i].src = src_ea; return;
-        }
-}
+enum : uint32_t {
+    LV2_EINVAL  = 0x80010002u,
+    LV2_ESRCH   = 0x80010005u,
+    LV2_ESTAT   = 0x8001000Fu,
+};
 
-extern "C" uint32_t ps3_spu_image_source_ea(uint32_t img_ea)
-{
-    for (int i = 0; i < SPU_IMG_SRC_MAX; i++)
-        if (s_spu_img_src[i].img == img_ea) return s_spu_img_src[i].src;
-    return 0;
-}
-
-extern "C" void spu_raw_note_image(uint32_t src_ea, uint32_t entry);  /* runtime/spu/spu_raw.c */
-
+/* sys_spu_image_import(sys_spu_image_t* img, const void* src, u32 type)
+ *
+ *   type 1 (DIRECT): liblv2 parses the ELF itself. The descriptor becomes
+ *     {0 (USER), entry, segs, nsegs}, segs pointing at a list it allocates:
+ *     a COPY per loadable segment (addr = the segment's bytes inside the
+ *     ELF), followed by a FILL of pattern 0 for a segment's zero-filled tail.
+ *   type 0 (PROTECT): the kernel takes a copy (_sys_spu_image_import, syscall
+ *     157): {1 (KERNEL), kernel image id, 0, 0}.
+ *   Any other type: EINVAL. A source that is not an SPU ELF (an SCE-wrapped
+ *   one included): ENOEXEC, either type. */
 static void hle_sys_spu_image_import(ppu_context* ctx)
 {
-    uint32_t img_ea = (uint32_t)ctx->gpr[3];
-    uint32_t src_ea = (uint32_t)ctx->gpr[4];
-    fprintf(stderr, "[HLE] _sys_spu_image_import(img=0x%08X src=0x%08X r5=0x%08X r6=0x%08X)\n",
-            img_ea, src_ea, (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
-    if (!img_ea || !src_ea || !vm_base) { ctx->gpr[3] = 0; return; }
-    const uint8_t* e = vm_base + src_ea;
-    if (!(e[0]==0x7F && e[1]=='E' && e[2]=='L' && e[3]=='F')) {
-        fprintf(stderr, "[HLE] _sys_spu_image_import: src not an ELF -> no-op\n");
-        fflush(stderr); ctx->gpr[3] = 0; return;
+    const uint32_t img = (uint32_t)ctx->gpr[3], src = (uint32_t)ctx->gpr[4];
+    const uint32_t type = (uint32_t)ctx->gpr[5];
+    if (type > 1) { ctx->gpr[3] = LV2_EINVAL; return; }
+
+    lv2_spu_seg segs[LV2_SPU_MAX_SEGS];
+    uint32_t entry = 0;
+    const int32_t n = lv2_spu_elf_segments(src, 0, segs, LV2_SPU_MAX_SEGS, &entry);
+    if (n < 0) { ctx->gpr[3] = (uint32_t)n; return; }
+
+    if (type == 0) {
+        ctx->gpr[3] = (uint32_t)lv2_spu_image_import(img, src, lv2_spu_elf_span(src), 0);
+        return;
     }
-    uint16_t machine = (uint16_t)((e[0x12] << 8) | e[0x13]);   /* 23 = SPU */
-    uint32_t entry   = vm_read32(src_ea + 0x18);
-    uint32_t phoff   = vm_read32(src_ea + 0x1C);
-    uint16_t phentsz = (uint16_t)((e[0x2A] << 8) | e[0x2B]); if (!phentsz) phentsz = 0x20;
-    uint16_t phnum   = (uint16_t)((e[0x2C] << 8) | e[0x2D]);
-    static uint32_t s_seg_bump = 0x0D000000u;
-    uint32_t segs_ea = s_seg_bump; int nsegs = 0;
-    for (uint16_t i = 0; i < phnum && nsegs < 32; i++) {
-        uint32_t ph = phoff + (uint32_t)i * phentsz;
-        if (vm_read32(src_ea + ph + 0x00) != 1) continue;      /* PT_LOAD */
-        uint32_t p_off = vm_read32(src_ea + ph + 0x04);
-        uint32_t p_va  = vm_read32(src_ea + ph + 0x08);
-        uint32_t p_fsz = vm_read32(src_ea + ph + 0x10);
-        uint32_t p_msz = vm_read32(src_ea + ph + 0x14);
-        uint32_t seg = segs_ea + (uint32_t)nsegs * 0x18;       /* COPY */
-        vm_write32(seg + 0x00, 1); vm_write32(seg + 0x04, p_va);
-        vm_write32(seg + 0x08, p_fsz);
-        /* src is the u64 at +0x10; its low word, which every 32-bit reader
-         * takes, is +0x14 -- but LBP's FMOD mixer reads the u32 at +0x10 as
-         * the DMA source (it DMA'd its DSP overlay from EA 0 and jumped into
-         * zeroed LS), so write both, as the lv2 syscall path already does. */
-        vm_write32(seg + 0x10, src_ea + p_off);
-        vm_write32(seg + 0x14, src_ea + p_off); nsegs++;
-        if (p_msz > p_fsz && nsegs < 32) {                     /* BSS tail -> FILL 0 */
-            seg = segs_ea + (uint32_t)nsegs * 0x18;
-            vm_write32(seg + 0x00, 2); vm_write32(seg + 0x04, p_va + p_fsz);
-            vm_write32(seg + 0x08, p_msz - p_fsz);
-            vm_write32(seg + 0x10, 0); vm_write32(seg + 0x14, 0); nsegs++;
-        }
+    const uint32_t list = (uint32_t)(uintptr_t)_sys_malloc((uint32_t)n * 0x18u);
+    for (int32_t i = 0; i < n; i++) {
+        const uint32_t s = list + (uint32_t)i * 0x18u;
+        vm_write32(s + 0x00, segs[i].type);
+        vm_write32(s + 0x04, segs[i].ls);
+        vm_write32(s + 0x08, segs[i].size);
+        vm_write32(s + 0x0C, 0);
+        vm_write32(s + 0x10, segs[i].addr);
+        vm_write32(s + 0x14, 0);
     }
-    s_seg_bump += (uint32_t)nsegs * 0x18;
-    if (s_seg_bump >= 0x0E000000u) s_seg_bump = 0x0D000000u;
-    /* Remember where this image's loadable bytes live, for the SPU-side
-     * recovery in spu_dma.h (SPU_DSP_IMAGE_EA). The segments are contiguous in
-     * the source image, so segment 0's address plus the span from its ls_start
-     * to the end of the last segment describes the whole thing. */
-    if (nsegs > 0) {
-        uint32_t last = segs_ea + (uint32_t)(nsegs - 1) * 0x18;
-        g_spu_image_src_ea   = vm_read32(segs_ea + 0x14);
-        g_spu_image_ls_start = vm_read32(segs_ea + 0x04);
-        g_spu_image_span     = vm_read32(last + 0x04) - g_spu_image_ls_start;
-    }
-    /* Remember which ELF this descriptor was parsed from. sys_spu_thread_group_
-     * start only gets the DESCRIPTOR, but the workload registry is keyed by a
-     * fingerprint of the ELF's own bytes -- without this the raw SPU path has no
-     * way to ask whether the image it is about to run was lifted. */
-    ps3_spu_image_record(img_ea, src_ea);
-    /* ...and ask that question now, while the ELF is still identified. A raw SPU
-     * is started by an MMIO store to its run-control register, with no syscall in
-     * between, so this import is the last point at which the image can be matched
-     * to a lifted entry (runtime/spu/spu_raw.c). No-op for a SPU-thread image. */
-    spu_raw_note_image(src_ea, entry);
-    vm_write32(img_ea + 0x00, 0);                              /* type = USER */
-    vm_write32(img_ea + 0x04, entry);
-    vm_write32(img_ea + 0x08, nsegs ? segs_ea : 0);
-    vm_write32(img_ea + 0x0C, (uint32_t)nsegs);
-    fprintf(stderr, "[HLE] _sys_spu_image_import -> entry=0x%05X nsegs=%d machine=%u (SPU=23)\n",
-            entry, nsegs, machine);
-    /* SPU_IMAGE_DIAG=1: r6 is a caller-supplied guest buffer that differs on
-     * every call, which this handler ignores -- it points the segments at the
-     * source image instead. Show the segments written and what the caller's
-     * buffer holds, to establish whether the caller expects it to be filled. */
-    if (getenv("SPU_IMAGE_DIAG")) {
-        for (int i = 0; i < nsegs; i++) {
-            uint32_t s = segs_ea + (uint32_t)i * 0x18;
-            fprintf(stderr, "        seg[%d] type=%u ls=0x%05X size=%u src=0x%08X%08X\n",
-                    i, vm_read32(s + 0x00), vm_read32(s + 0x04), vm_read32(s + 0x08),
-                    vm_read32(s + 0x10), vm_read32(s + 0x14));
-        }
-        uint32_t r6 = (uint32_t)ctx->gpr[6];
-        if (r6 && r6 < 0xD0000000u) {
-            /* Scan a window around the caller's buffer for the DSP descriptor
-             * the SPU later reads: its first word is 0x0052E1E8 and it carries
-             * the image's {entry, size, ls_start, size} at +0x150. Finding it
-             * at a fixed offset says r6 IS that descriptor. */
-            for (int32_t o = -0x400; o <= 0x400; o += 4) {
-                uint32_t a = (uint32_t)((int32_t)r6 + o);
-                if (vm_read32(a) == 0x0052E1E8u)
-                    fprintf(stderr, "        descriptor marker 0x0052E1E8 at r6%+d (0x%08X)\n", o, a);
-                if (vm_read32(a) == 0x00000248u && vm_read32(a + 4) == 0x00002CB0u)
-                    fprintf(stderr, "        image quad {248,2CB0,80,2CB0} at r6%+d (0x%08X) "
-                            "=> descriptor+0x150, descriptor=0x%08X, its +0x140=%08X %08X %08X %08X\n",
-                            o, a, a - 0x150,
-                            vm_read32(a - 0x10), vm_read32(a - 0xC),
-                            vm_read32(a - 8), vm_read32(a - 4));
-            }
-        }
-    }
-    fflush(stderr);
+    vm_write32(img + 0x00, 0);
+    vm_write32(img + 0x04, entry);
+    vm_write32(img + 0x08, list);
+    vm_write32(img + 0x0C, (uint32_t)n);
+    /* Which ELF the descriptor came from: the lifted-SPU registry is keyed by
+     * the ELF's bytes, and a raw SPU (started by an MMIO store, no syscall)
+     * can only be matched to its lifted entry here. */
+    lv2_spu_image_note_source(img, src);
+    spu_raw_note_image(src, entry);
     ctx->gpr[3] = 0;
 }
+
+/* sys_spu_image_close(sys_spu_image_t* img): USER frees the segment list
+ * liblv2 allocated; KERNEL closes the kernel object (ESRCH once it is gone).
+ * The descriptor itself is left as it was. */
+static void hle_sys_spu_image_close(ppu_context* ctx)
+{
+    const uint32_t img = (uint32_t)ctx->gpr[3];
+    if (vm_read32(img) == 0) {
+        _sys_free((void*)(uintptr_t)vm_read32(img + 8));
+        ctx->gpr[3] = 0;
+        return;
+    }
+    ctx->gpr[3] = (uint32_t)lv2_spu_image_close(img);
+}
+
+/* Formatted output. A guest variadic call puts argument k in r3+k for k < 8
+ * and the rest in the caller's parameter save area at SP + 48 + 8k (64-bit
+ * ELF ABI; floating-point arguments occupy the same slots). A guest va_list
+ * is a pointer to an array of those 64-bit slots. */
+struct lv2_varargs {
+    ppu_context* ctx;
+    int          k;    /* next argument index (register form) */
+    uint32_t     va;   /* nonzero: read from this va_list instead */
+    uint64_t next()
+    {
+        if (va) { uint64_t v = vm_read64(va); va += 8; return v; }
+        const int i = k++;
+        return i < 8 ? ctx->gpr[3 + i] : vm_read64((uint32_t)ctx->gpr[1] + 48u + 8u * (uint32_t)i);
+    }
+};
+
+/* liblv2's formatter, conversion by conversion:
+ *   flags - + space # 0, width and precision (either may be *), then:
+ *   h, hh and l are accepted and change nothing (an int and a long are both
+ *   32 bits); ll makes an integer 64-bit;
+ *   d i u o x X c s as C;
+ *   p prints 0x and lower-case hex, padded to the width;
+ *   n stores the count so far (u32) through its argument, unless it is NULL;
+ *   anything else prints that character and consumes no argument -- the
+ *   floating-point conversions included: liblv2 has none. */
+static std::string lv2_format(uint32_t fmt, lv2_varargs& a)
+{
+    std::string out;
+    if (!fmt) return out;
+    const char* f = (const char*)(vm_base + fmt);
+    char tmp[512];
+    while (*f) {
+        if (*f != '%') { out += *f++; continue; }
+        f++;
+        std::string spec = "%";
+        while (*f && strchr("-+ #0", *f)) spec += *f++;
+        if (*f == '*') { spec += std::to_string((int32_t)a.next()); f++; }
+        else while (*f >= '0' && *f <= '9') spec += *f++;
+        if (*f == '.') {
+            spec += *f++;
+            if (*f == '*') { spec += std::to_string((int32_t)a.next()); f++; }
+            else while (*f >= '0' && *f <= '9') spec += *f++;
+        }
+        int longs = 0;
+        for (;;) {
+            if (*f == 'h') f++;
+            else if (*f == 'l') { longs++; f++; }
+            else break;
+        }
+        const char c = *f;
+        if (!c) break;
+        f++;
+        int n = 0;
+        switch (c) {
+        case '%': out += '%'; continue;
+        case 'd': case 'i': {
+            const uint64_t v = a.next();
+            n = snprintf(tmp, sizeof tmp, (spec + "lld").c_str(),
+                         longs >= 2 ? (long long)v : (long long)(int32_t)v);
+            break;
+        }
+        case 'u': case 'o': case 'x': case 'X': {
+            const uint64_t v = a.next();
+            n = snprintf(tmp, sizeof tmp, (spec + "ll" + c).c_str(),
+                         (unsigned long long)(longs >= 2 ? v : (uint32_t)v));
+            break;
+        }
+        case 'c':
+            n = snprintf(tmp, sizeof tmp, (spec + 'c').c_str(), (int)(uint8_t)a.next());
+            break;
+        case 's': {
+            const uint32_t s = (uint32_t)a.next();
+            n = snprintf(tmp, sizeof tmp, (spec + 's').c_str(),
+                         s ? (const char*)(vm_base + s) : "(null)");
+            break;
+        }
+        case 'p': {
+            char hex[16];
+            snprintf(hex, sizeof hex, "0x%x", (uint32_t)a.next());
+            n = snprintf(tmp, sizeof tmp, (spec + 's').c_str(), hex);
+            break;
+        }
+        case 'n': {
+            const uint32_t p = (uint32_t)a.next();
+            if (p) vm_write32(p, (uint32_t)out.size());
+            continue;
+        }
+        default:
+            out += c;
+            continue;
+        }
+        if (n > 0) out.append(tmp, (size_t)n < sizeof tmp ? (size_t)n : sizeof tmp - 1);
+    }
+    return out;
+}
+
+/* Store into a guest buffer of `size` bytes the way liblv2 does: a string that
+ * fits is written with its NUL; one that does not gets its first size - 1
+ * characters and no NUL; size 0 writes nothing. Returns the full length. */
+static uint32_t lv2_store(uint32_t buf, uint32_t size, const std::string& s)
+{
+    if (size) {
+        if (s.size() < size) {
+            memcpy(vm_base + buf, s.data(), s.size());
+            vm_base[buf + s.size()] = 0;
+        } else {
+            memcpy(vm_base + buf, s.data(), size - 1);
+        }
+    }
+    return (uint32_t)s.size();
+}
+
+static void lv2_print(const std::string& s)
+{
+    fwrite(s.data(), 1, s.size(), stderr);   /* where sys_tty_write goes */
+    fflush(stderr);
+}
+
+static void hle_sys_printf(ppu_context* ctx)
+{
+    lv2_varargs a{ctx, 1, 0};
+    const std::string s = lv2_format((uint32_t)ctx->gpr[3], a);
+    lv2_print(s);
+    ctx->gpr[3] = (uint32_t)s.size();
+}
+
+static void hle_sys_vprintf(ppu_context* ctx)
+{
+    lv2_varargs a{ctx, 0, (uint32_t)ctx->gpr[4]};
+    const std::string s = lv2_format((uint32_t)ctx->gpr[3], a);
+    lv2_print(s);
+    ctx->gpr[3] = (uint32_t)s.size();
+}
+
+static void hle_sys_sprintf(ppu_context* ctx)
+{
+    lv2_varargs a{ctx, 2, 0};
+    const std::string s = lv2_format((uint32_t)ctx->gpr[4], a);
+    ctx->gpr[3] = lv2_store((uint32_t)ctx->gpr[3], (uint32_t)s.size() + 1, s);
+}
+
+static void hle_sys_vsprintf(ppu_context* ctx)
+{
+    lv2_varargs a{ctx, 0, (uint32_t)ctx->gpr[5]};
+    const std::string s = lv2_format((uint32_t)ctx->gpr[4], a);
+    ctx->gpr[3] = lv2_store((uint32_t)ctx->gpr[3], (uint32_t)s.size() + 1, s);
+}
+
+static void hle_sys_snprintf(ppu_context* ctx)
+{
+    lv2_varargs a{ctx, 3, 0};
+    const std::string s = lv2_format((uint32_t)ctx->gpr[5], a);
+    ctx->gpr[3] = lv2_store((uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], s);
+}
+
+static void hle_sys_vsnprintf(ppu_context* ctx)
+{
+    lv2_varargs a{ctx, 0, (uint32_t)ctx->gpr[6]};
+    const std::string s = lv2_format((uint32_t)ctx->gpr[5], a);
+    ctx->gpr[3] = lv2_store((uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], s);
+}
+
+/* SPU printf: _sys_spu_printf_initialize registers four guest callbacks
+ * (attach group, detach group, attach thread, detach thread); each
+ * attach/detach call invokes the matching one with the group or thread id and
+ * returns what it returns. Before initialize, or after finalize: ESTAT. */
+static std::atomic<uint32_t> s_spu_printf_cb[4];
+
+static void hle_sys_spu_printf_initialize(ppu_context* ctx)
+{
+    for (int i = 0; i < 4; i++) s_spu_printf_cb[i] = (uint32_t)ctx->gpr[3 + i];
+    ctx->gpr[3] = 0;
+}
+
+static void hle_sys_spu_printf_finalize(ppu_context* ctx)
+{
+    for (int i = 0; i < 4; i++) s_spu_printf_cb[i] = 0;
+    ctx->gpr[3] = 0;
+}
+
+static void lv2_spu_printf_call(ppu_context* ctx, int which)
+{
+    const uint32_t cb = s_spu_printf_cb[which];
+    if (!cb) { ctx->gpr[3] = LV2_ESTAT; return; }
+    ctx->gpr[3] = (uint32_t)ppu_guest_call(cb, (uint32_t)ctx->gpr[3], 0, 0, 0, 0, 0, 0, 0);
+}
+
+static void hle_sys_spu_printf_attach_group(ppu_context* ctx)  { lv2_spu_printf_call(ctx, 0); }
+static void hle_sys_spu_printf_detach_group(ppu_context* ctx)  { lv2_spu_printf_call(ctx, 1); }
+static void hle_sys_spu_printf_attach_thread(ppu_context* ctx) { lv2_spu_printf_call(ctx, 2); }
+static void hle_sys_spu_printf_detach_thread(ppu_context* ctx) { lv2_spu_printf_call(ctx, 3); }
 
 /* ---- sys_spinlock_* (sysPrxForUser) -------------------------------------
  *
@@ -822,7 +1063,7 @@ static void sys_spinlock_lock(ppu_context* ctx)
             unsigned long owner = spin_owner_of(ea);
             unsigned long me    = GetCurrentThreadId();
             static int reported = 0;
-            if (reported++ < 8)
+            if (__atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 8)
                 fprintf(stderr,
                         "[spinlock] STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
                         "held by tid %lu, this is tid %lu%s\n",
@@ -856,7 +1097,20 @@ static void sys_spinlock_unlock(ppu_context* ctx)
 extern "C" void ppu_sysprx_register(void)
 {
     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
-    ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
+    ps3_hle_register_ctx(0xEBE5F72Fu, "sys_spu_image_import",          hle_sys_spu_image_import);
+    ps3_hle_register_ctx(0xE0DA8EFDu, "sys_spu_image_close",           hle_sys_spu_image_close);
+    ps3_hle_register_ctx(0x9F04F7AFu, "_sys_printf",                   hle_sys_printf);
+    ps3_hle_register_ctx(0xFA7F693Du, "_sys_vprintf",                  hle_sys_vprintf);
+    ps3_hle_register_ctx(0xA1F9EAFEu, "_sys_sprintf",                  hle_sys_sprintf);
+    ps3_hle_register_ctx(0x791B9219u, "_sys_vsprintf",                 hle_sys_vsprintf);
+    ps3_hle_register_ctx(0x06574237u, "_sys_snprintf",                 hle_sys_snprintf);
+    ps3_hle_register_ctx(0x0618936Bu, "_sys_vsnprintf",                hle_sys_vsnprintf);
+    ps3_hle_register_ctx(0x45FE2FCEu, "_sys_spu_printf_initialize",    hle_sys_spu_printf_initialize);
+    ps3_hle_register_ctx(0xDD3B27ACu, "_sys_spu_printf_finalize",      hle_sys_spu_printf_finalize);
+    ps3_hle_register_ctx(0xDD0C1E09u, "_sys_spu_printf_attach_group",  hle_sys_spu_printf_attach_group);
+    ps3_hle_register_ctx(0x5FDFB2FEu, "_sys_spu_printf_detach_group",  hle_sys_spu_printf_detach_group);
+    ps3_hle_register_ctx(0x1AE10B92u, "_sys_spu_printf_attach_thread", hle_sys_spu_printf_attach_thread);
+    ps3_hle_register_ctx(0xB3BBCF2Au, "_sys_spu_printf_detach_thread", hle_sys_spu_printf_detach_thread);
 
     /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
      * first because the first registration of a NID wins, so these shadow the
@@ -917,6 +1171,9 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_get_id"),      "sys_ppu_thread_get_id",      sys_ppu_thread_get_id);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_create"),      "sys_ppu_thread_create",      hle_ppu_thread_create);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_exit"),        "sys_ppu_thread_exit",        hle_ppu_thread_exit);
+    /* 9 arguments: maxContention arrives on the stack (see cellSpurs.c). */
+    ps3_hle_register_ctx(ps3_compute_nid("_cellSpursWorkloadAttributeInitialize"),
+                         "_cellSpursWorkloadAttributeInitialize", hle_spurs_wkattr_init);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory"), "sys_mmapper_allocate_memory", sys_mmapper_allocate_memory);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory_from_container"), "sys_mmapper_allocate_memory_from_container", sys_mmapper_allocate_memory_from_container);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     crt_ok);

@@ -142,6 +142,7 @@ typedef enum {
     SPU_nop,
     SPU_nor,
     SPU_or,
+    SPU_orbi,
     SPU_orc,
     SPU_orhi,
     SPU_ori,
@@ -196,6 +197,8 @@ typedef enum {
     SPU_sync,
     SPU_wrch,
     SPU_xor,
+    SPU_xorbi,
+    SPU_xorhi,
     SPU_xori,
     SPU_xsbh,
     SPU_xshw,
@@ -343,6 +346,7 @@ static const char* const spu_op_name[SPU_OP_COUNT] = {
     [SPU_nop] = "nop",
     [SPU_nor] = "nor",
     [SPU_or] = "or",
+    [SPU_orbi] = "orbi",
     [SPU_orc] = "orc",
     [SPU_orhi] = "orhi",
     [SPU_ori] = "ori",
@@ -397,6 +401,8 @@ static const char* const spu_op_name[SPU_OP_COUNT] = {
     [SPU_sync] = "sync",
     [SPU_wrch] = "wrch",
     [SPU_xor] = "xor",
+    [SPU_xorbi] = "xorbi",
+    [SPU_xorhi] = "xorhi",
     [SPU_xori] = "xori",
     [SPU_xsbh] = "xsbh",
     [SPU_xshw] = "xshw",
@@ -451,6 +457,7 @@ static spu_op spu_dec_ri10(uint32_t op8) {
     switch (op8) {
     case 0x4: return SPU_ori;
     case 0x5: return SPU_orhi;
+    case 0x6: return SPU_orbi;
     case 0xC: return SPU_sfi;
     case 0xD: return SPU_sfhi;
     case 0x14: return SPU_andi;
@@ -461,6 +468,8 @@ static spu_op spu_dec_ri10(uint32_t op8) {
     case 0x24: return SPU_stqd;
     case 0x34: return SPU_lqd;
     case 0x44: return SPU_xori;
+    case 0x45: return SPU_xorhi;
+    case 0x46: return SPU_xorbi;
     case 0x4C: return SPU_cgti;
     case 0x4D: return SPU_cgthi;
     case 0x4E: return SPU_cgtbi;

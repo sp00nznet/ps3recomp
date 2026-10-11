@@ -99,7 +99,7 @@ static raw_spu s_spu[SPU_RAW_COUNT];
 
 static int dbg(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) v = getenv("SPU_RAW_DBG") ? 1 : 0;
     return v;
 }
@@ -140,11 +140,11 @@ static void publish(raw_spu* s)
     if (!c) return;
     be32_store(s->base + SPU_RAW_STATUS, c->status);
     be32_store(s->base + SPU_RAW_MBOX_STATUS,
-               MBOX_STATUS(c->ch_out_mbox.count,
-                           SPU_IN_MBOX_FREE(c->ch_in_mbox.count),
-                           c->ch_out_intr_mbox.count));
-    if (c->ch_out_mbox.count)
-        be32_store(s->base + SPU_RAW_OUT_MBOX, c->ch_out_mbox.value);
+               MBOX_STATUS(spu_channel_count(&c->ch_out_mbox),
+                           SPU_IN_MBOX_FREE(spu_channel_count(&c->ch_in_mbox)),
+                           spu_channel_count(&c->ch_out_intr_mbox)));
+    if (spu_channel_count(&c->ch_out_mbox))
+        be32_store(s->base + SPU_RAW_OUT_MBOX, spu_channel_peek(&c->ch_out_mbox));
 }
 
 /* ---------------------------------------------------------------------------
@@ -261,9 +261,9 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
             (unsigned)(s - s_spu), halted, (unsigned)(c->pc & SPU_LS_MASK),
             (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK),
             (unsigned long long)c->steps, c->stop_code,
-            (unsigned)c->ch_out_mbox.count, c->ch_out_mbox.value,
-            (unsigned)c->ch_out_intr_mbox.count, c->ch_out_intr_mbox.value,
-            (unsigned)c->ch_in_mbox.count);
+            (unsigned)spu_channel_count(&c->ch_out_mbox), spu_channel_peek(&c->ch_out_mbox),
+            (unsigned)spu_channel_count(&c->ch_out_intr_mbox), spu_channel_peek(&c->ch_out_intr_mbox),
+            (unsigned)spu_channel_count(&c->ch_in_mbox));
     fflush(stderr);
     return 0;
 }
@@ -367,7 +367,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
              * the chain of the last write against an earlier one: the frame
              * that is present early and missing late is the one that stopped
              * asking. */
-            { static int cap = -1; static int seen[SPU_RAW_COUNT];
+            { static _Atomic int cap = -1; static int seen[SPU_RAW_COUNT];
               if (cap < 0) { const char* e = getenv("SPU_MBOX_CHAIN");
                              cap = e ? atoi(e) : 0; }
               uint32_t si = (uint32_t)(s - s_spu);
@@ -388,7 +388,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
                   }
                   fprintf(stderr, "%s\n", b); fflush(stderr);
               } }
-            spu_channel_write(&s->ctx->ch_in_mbox, val);
+            spu_channel_push_inmbox(&s->ctx->ch_in_mbox, val);
             spu_ch_wake(s->ctx);
             publish(s);
         }
@@ -405,7 +405,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
          * signals keeps receiving from its event queue the whole time. So
          * either the writes stop or they land and the SPU does not see them --
          * and those are opposite bugs. This counts the writes as they happen. */
-        { static int s_ss = -1;
+        { static _Atomic int s_ss = -1;
           if (s_ss < 0) { const char* e = getenv("SPU_SIGSTAT");
                           s_ss = e ? (atoi(e) > 0 ? atoi(e) : 256) : 0; }
           if (s_ss) { static unsigned long long c[8][2]; static unsigned long long n;
@@ -497,9 +497,9 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
                       s->ctx->status, (unsigned long long)s->ctx->steps,
                       (unsigned)s->ctx->ch_out_mbox.count, (unsigned)s->ctx->ch_in_mbox.count,
                       g_active_ctx ? (uint32_t)g_active_ctx->lr : 0); }
-        *out = MBOX_STATUS(s->ctx->ch_out_mbox.count,
-                           SPU_IN_MBOX_FREE(s->ctx->ch_in_mbox.count),
-                           s->ctx->ch_out_intr_mbox.count);
+        *out = MBOX_STATUS(spu_channel_count(&s->ctx->ch_out_mbox),
+                           SPU_IN_MBOX_FREE(spu_channel_count(&s->ctx->ch_in_mbox)),
+                           spu_channel_count(&s->ctx->ch_out_intr_mbox));
         return 1;
     }
     if (off == SPU_RAW_STATUS) { *out = s->ctx->status; return 1; }
@@ -582,7 +582,7 @@ static int64_t sc_raw_spu_set_int_mask(ppu_context* ctx)
      * so if the guest only enables 0x1|0x2 that write raises nothing and the PPU
      * has to poll. If it stopped polling, the message sits unread and the SPUs
      * spin. This prints enough to tell those apart. */
-    { static int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
+    { static _Atomic int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
       if (_d) fprintf(stderr, "[spu-mask] spu%u class=%llu mask=0x%llX\n",
               n, (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5]); }
     return CELL_OK;

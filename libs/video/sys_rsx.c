@@ -217,7 +217,7 @@ void rsx_raise_user_cmd(uint32_t arg)
        * waiting for SigNotify2 from the thread that services this event, so
        * "did the last user command arrive before the freeze" is the join
        * between the two halves of the deadlock. */
-      if (n++ < 4 || (n % 256) == 0) {
+      if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 4 || (n % 256) == 0) {
           uint32_t mask = vm_read32(RSX_DRIVER_INFO_EA + RSX_DI_HANDLERS);
           fprintf(stderr, "[usercmd] #%lu arg=0x%08X handlers=0x%X qid=%u\n",
                   n, arg, mask, s_isr_qid); fflush(stderr); } }

@@ -160,6 +160,8 @@ const char* rsx_fp_opcode_name(u32 opcode);
  * walk logic so callers (e.g. a shader cache hashing the bytecode) agree with
  * the decompiler on where a program ends. */
 u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
+/* Bit u set when the program samples texture unit u (TEX/TXP/TXD/TXL/TXB). */
+u32 rsx_fp_texture_mask(const u8* ucode, u32 max_bytes);
 
 #ifdef __cplusplus
 }

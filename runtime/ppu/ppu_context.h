@@ -95,6 +95,9 @@ typedef struct ppu_context {
     uint64_t reserve_value;
     int      reserve_valid;
 
+    /* VRSAVE (SPR 256): software-managed; kept so mfspr returns what mtspr wrote */
+    uint32_t vrsave;
+
 } ppu_context;
 
 /* ---------------------------------------------------------------------------

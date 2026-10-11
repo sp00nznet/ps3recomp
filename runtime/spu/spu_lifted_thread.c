@@ -1,6 +1,7 @@
 /* spu_lifted_thread.c -- see spu_lifted_thread.h for what this is for. */
 
 #include "spu_lifted_thread.h"
+#include "../syscalls/lv2_spu_image.h"
 #include "spu_context.h"
 
 #include <stdio.h>
@@ -16,53 +17,6 @@ int  spu_image_of_function(uint32_t addr);
 void spu_indirect_branch(struct spu_context* ctx);
 int  spu_run_with_halt(void (*entry)(struct spu_context*), struct spu_context* ctx);
 void spu_mfc_release(struct spu_context* ctx);
-
-/* Guest memory is big-endian and this file reads descriptors out of it. lv2 has
- * its own copy of this helper; duplicating four lines is cheaper than exporting
- * one from a translation unit full of syscall handlers. */
-static uint32_t rd_be32(uint32_t ea)
-{
-    if (!vm_base) return 0;
-    const uint8_t* p = vm_base + ea;
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-}
-
-/* Lay a sys_spu_image's segments into a local store.
- *
- *   sys_spu_image   { u32 type; u32 entry_point; sys_spu_segment* segs; s32 nsegs; }
- *   sys_spu_segment { s32 type; u32 ls_start; s32 size; u64 src; }   (0x18 bytes)
- *
- * COPY (type 1) reads from the segment's source EA; FILL (type 2) writes the
- * value in the same field, which the SDK counts as a segment of its own for an
- * ELF's bss tail. INFO (type 4) is metadata and is not loaded.
- *
- * _sys_spu_image_import writes the source EA at both +0x10 and +0x14 (the
- * comment there explains why: readers disagree about whether the field is a u32
- * or the low half of a big-endian u64). Reading +0x10 first and falling back
- * keeps this working for images built by either convention. */
-static void spu_deploy_image(spu_context* ctx, uint32_t img_ea)
-{
-    if (!img_ea || !vm_base) return;
-    uint32_t segs_ea = rd_be32(img_ea + 0x08);
-    int32_t  nsegs   = (int32_t)rd_be32(img_ea + 0x0C);
-    if (!segs_ea) return;
-
-    for (int32_t i = 0; i < nsegs; i++) {
-        uint32_t s    = segs_ea + (uint32_t)i * 0x18u;
-        uint32_t type = rd_be32(s + 0x00);
-        uint32_t ls   = rd_be32(s + 0x04) & SPU_LS_MASK;
-        uint32_t size = rd_be32(s + 0x08);
-        uint32_t src  = rd_be32(s + 0x10);
-        if (!src) src = rd_be32(s + 0x14);
-        if (size > SPU_LS_SIZE - ls) size = SPU_LS_SIZE - ls;
-        if (type == 1) {
-            if (src) memcpy(&ctx->ls[ls], vm_base + src, size);
-        } else if (type == 2) {
-            memset(&ctx->ls[ls], (int)(src & 0xFFu), size);
-        }
-    }
-}
 
 int spu_lifted_thread_available(uint32_t entry)
 {
@@ -86,10 +40,10 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
      * case. Asking the registry which image owns the entry point gets the same
      * answer the title's own registration order implies, without the lv2 layer
      * having to know any image ids. */
-    { int img = spu_image_of_function(ctx->pc);
+    { int img = d->image_id > 0 ? d->image_id : spu_image_of_function(ctx->pc);
       ctx->image_id = (img >= 0) ? img : 0; }
 
-    if (d->img_ea) spu_deploy_image(ctx, d->img_ea);
+    if (d->segs) lv2_spu_load_segments((const lv2_spu_seg*)d->segs, d->nsegs, ctx->ls);
 
     /* sys_spu_thread_argument is four u64s and lv2 puts each in the preferred
      * doubleword of r3..r6 (RPCS3 sys_spu.cpp: gpr[3+i] = from64(0, arg[i])).
@@ -127,14 +81,14 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
      * the selector, not the status (CBEA p97, SPU_Status.StopCode): 0x102
      * THREAD_EXIT carries this thread's status, 0x101 GROUP_EXIT the group's. */
     if (ctx->status == SPU_STATUS_STOPPED_BY_STOP &&
-        ctx->stop_code == 0x102u && ctx->ch_out_mbox.count) {
-        r.exit_status = (int32_t)ctx->ch_out_mbox.value;
-        ctx->ch_out_mbox.count = 0;
+        ctx->stop_code == 0x102u && spu_channel_count(&ctx->ch_out_mbox)) {
+        r.exit_status = (int32_t)spu_channel_peek(&ctx->ch_out_mbox);
+        spu_channel_clear(&ctx->ch_out_mbox);
     } else if (ctx->status == SPU_STATUS_STOPPED_BY_STOP &&
-               ctx->stop_code == 0x101u && ctx->ch_out_mbox.count) {
+               ctx->stop_code == 0x101u && spu_channel_count(&ctx->ch_out_mbox)) {
         r.group_exit   = 1;
-        r.group_status = (int32_t)ctx->ch_out_mbox.value;
-        ctx->ch_out_mbox.count = 0;
+        r.group_status = (int32_t)spu_channel_peek(&ctx->ch_out_mbox);
+        spu_channel_clear(&ctx->ch_out_mbox);
     } else {
         /* Anything else -- a halt from the dispatcher's unresolved-branch
          * unwind, or a stop code outside the exit protocol -- is a fault. The
@@ -147,6 +101,7 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
             "-> status=%d%s%s\n",
             ctx->spu_id, ctx->status, ctx->pc, ctx->stop_code, r.exit_status,
             r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
+    if (r.faulted) spu_ls_watch_dump("thread-fault");
     fflush(stderr);
 
     /* The SPU has stopped, so its MFC engine is idle and the slot it holds in

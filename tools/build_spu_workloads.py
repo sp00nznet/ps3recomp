@@ -54,6 +54,40 @@ def img_size(b):
             end = max(end, be32(b, so + 0x10) + be32(b, so + 0x14))
     return min(end, len(b))
 
+def code_segments(b):
+    """(p_offset, p_vaddr, p_filesz) of each executable PT_LOAD segment."""
+    phoff, phnum = be32(b, 0x1C), be16(b, 0x2C)
+    out = []
+    for i in range(phnum):
+        p = phoff + i * 32
+        if be32(b, p) == 1 and (be32(b, p + 24) & 1) and be32(b, p + 16):
+            out.append((be32(b, p + 4), be32(b, p + 8), be32(b, p + 16)))
+    return out
+
+
+def guest_ea_finder(path):
+    """Return find(image_bytes) -> guest EA of that SPU image in the PPU ELF's
+    PT_LOAD segments, or None."""
+    b = open(path, "rb").read()
+    phoff = int.from_bytes(b[0x20:0x28], "big")
+    phnum = int.from_bytes(b[0x38:0x3A], "big")
+    segs = []
+    for i in range(phnum):
+        p = phoff + 56 * i
+        if int.from_bytes(b[p:p + 4], "big") == 1:
+            off = int.from_bytes(b[p + 8:p + 16], "big")
+            va = int.from_bytes(b[p + 16:p + 24], "big")
+            fs = int.from_bytes(b[p + 32:p + 40], "big")
+            segs.append((va, b[off:off + fs]))
+    def find(img):
+        for va, data in segs:
+            k = data.find(img)
+            if k >= 0:
+                return va + k
+        return None
+    return find
+
+
 def fnv1a64(b):
     h = 1469598103934665603
     for x in b:
@@ -121,6 +155,12 @@ def main():
     ap.add_argument("--constructor", action="store_true",
                     help="also emit an __attribute__((constructor)) that calls the register fn at startup")
     ap.add_argument("--relift", action="store_true", help="re-lift even if a prior lift exists")
+    ap.add_argument("--eboot", help="the title's PPU ELF: each image is found in its loaded "
+                    "segments by content, and its code segments are also registered as "
+                    "code regions at their guest EAs (see code_segments)")
+    ap.add_argument("--lift-arg", action="append", default=[],
+                    help="extra spu_lifter.py argument for every image, e.g. "
+                         "--lift-arg=--merge-chunks --lift-arg=--return-entries")
     ap.add_argument("--skip-lift", action="store_true",
                     help="do not run the lifter; assume --lifted already populated (still fixes includes + emits registry)")
     args = ap.parse_args()
@@ -136,8 +176,10 @@ def main():
         k, v = spec.split("=", 1)
         extra_funcs[k.strip()] = v.strip()
 
+    find_ea = guest_ea_finder(args.eboot) if args.eboot else None
     imgs = []  # (img, prefix, fingerprint, e_entry)
     text_fps = {}  # img -> executable-segment fingerprint
+    regions = {}  # img -> [(ea, lsa, span)]
     for e in elfs:
         b = open(e, "rb").read()
         if not is_spu_elf(b):
@@ -151,7 +193,7 @@ def main():
         if not args.skip_lift and (args.relift or not os.path.exists(srcc)):
             os.makedirs(outdir, exist_ok=True)
             cmd = [sys.executable, args.lifter, e, "--auto-functions", e,
-                   "--symbol-prefix", prefix, "-o", outdir]
+                   "--symbol-prefix", prefix, "-o", outdir] + args.lift_arg
             if img in extra_funcs:
                 cmd += ["--extra-funcs", extra_funcs[img]]
                 print(f"[build_spu_workloads] {img}: extra entries {extra_funcs[img]}")
@@ -165,6 +207,17 @@ def main():
 
         sz = img_size(b)
         e_entry = be32(b, 0x18)
+        # The image lives in guest memory (found in the PPU ELF). Firmware code
+        # that loads it itself (the SPURS taskset policy module DMAs a task's
+        # segments into local store) never goes through spu_workload_dispatch,
+        # so each code segment is also registered as a code region at the LS
+        # address it was lifted for.
+        if find_ea:
+            base = find_ea(b[:sz])
+            if base is None:
+                print(f"[build_spu_workloads] WARNING: {img} not found in {args.eboot}; no code region")
+            else:
+                regions[img] = [(base + off, va, fs) for off, va, fs in code_segments(b)]
         imgs.append((img, prefix, fnv1a64(b[:sz]), e_entry))
         text_fps[img] = text_fp(b)
 
@@ -191,6 +244,8 @@ def main():
     L.append('#include "spu_workload.h"')
     L.append("")
     L.append("extern void spu_begin_image(int image_id);")
+    if regions:
+        L.append("extern void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span, int image_id);")
     L.append("")
     L.append("/* per-image extern decls (prefixed entry fn + recomp_register) */")
     for img, prefix, fp, ent in imgs:
@@ -204,6 +259,8 @@ def main():
         L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
         if text_fps.get(img):  # same entry, keyed by the text segment (raw SPU proxy-DMA load)
             L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}.text\");")
+        for ea, lsa, span in regions.get(img, []):
+            L.append(f"    spu_overlay_register_region_at(0x{ea:08X}u, 0x{lsa:X}u, 0x{span:X}u, {i});")
     L.append("    spu_begin_image(0);")
     L.append("}")
     if args.constructor:

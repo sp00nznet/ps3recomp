@@ -68,10 +68,18 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
  * the workload sync header) and its command lists contain cross-lane barrier
  * commands, so a workload configured for N SPUs must be dispatched once per
  * spu_num or the un-run lanes deadlock every barrier. */
-int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
-                          const uint8_t* pm_host, uint32_t pm_size,
-                          uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
-                          uint32_t spu_num);
+/* Enter the policy module resident at LS 0xA00 of `ctx` (an SPU running the
+ * SPURS kernel, libs/spurs/spurs_kernel.c) with the kernel's entry registers,
+ * and run it until it branches to exitToKernel. entry == NULL interprets it.
+ * The module's selectWorkload calls go to g_spurs_kernel_select. Returns 0 on
+ * a proper exit to the kernel, -1 otherwise. */
+int spu_pm_enter(spu_context* ctx, spu_lifted_entry_fn entry, int image_id,
+                 uint64_t arg, uint64_t pm_ea, uint32_t poll_status);
+/* The kernel's selectWorkload for the SPU `ctx` runs on: isPoll as the module
+ * passed it in r3; returns {wid << 32 | pollStatus} for r3's preferred
+ * doubleword. Set by the SPURS kernel. */
+extern uint64_t (*g_spurs_kernel_select)(spu_context* ctx, uint32_t is_poll);
+
 
 /* Stage and enter one SPURS jobchain job (spurs_job.c). Unlike a policy module
  * or a task, a job binary is a raw image built by the SDK's job_elf-to-bin and
@@ -101,6 +109,14 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
  * writes the entry vaddr (e_entry, which may legitimately be 0) to *entry_out;
  * returns 0 if `image` is not a valid SPU ELF or a segment is out of range.
  * `ls` must point to SPU_LS_SIZE bytes (caller-zeroed if a clean BSS is wanted). */
+/* Start SPURS task `taskid` of the taskset at taskset_ea: the lifted image if
+ * one is registered (spu_workload_dispatch_async), else the interpreter with
+ * the taskset task ABI. Returns 1 when started. */
+int spu_task_dispatch(uint32_t taskset_ea, uint32_t taskid, const uint8_t* image,
+                      uint32_t image_size, uint32_t context_ea);
+int spu_task_dispatch_interp(uint32_t taskset_ea, uint32_t taskid,
+                             const uint8_t* image, uint32_t image_size);
+
 int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls,
                        uint32_t* entry_out);
 

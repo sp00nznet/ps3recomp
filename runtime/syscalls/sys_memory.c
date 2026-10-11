@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /*
  * ps3recomp - Memory management syscalls (implementation)
  */
@@ -24,8 +25,21 @@ uint32_t g_sys_mem_bump_ptr = 0;
  * 0x40000000+ matches where the real lv2 places these allocations (verified
  * against an RPCS3 boot log of Yakuza: Dead Souls); the window is outside
  * the pre-committed main region, so pages are committed on demand. */
-#define SYS_MEM_ALLOC_BASE  0x40000000u
-#define SYS_MEM_ALLOC_END   0x50000000u
+/* PS3_MEM_ALLOC_BASE=<hex> overrides the window base (the window stays 256 MB). RPCS3
+ * places 1 MB-page user allocations at 0x30000000 for inFamous; matching it makes guest
+ * pointers line up with the oracle, so LS/RAM dumps diff without a constant offset. */
+static uint32_t sys_mem_alloc_base(void)
+{
+    static _Atomic uint32_t s_base = 0;
+    if (!s_base) {
+        const char* e = getenv("PS3_MEM_ALLOC_BASE");
+        uint32_t b = e ? (uint32_t)strtoul(e, 0, 16) : 0;
+        s_base = (b && !(b & 0xFFFFF)) ? b : 0x40000000u;
+    }
+    return s_base;
+}
+#define SYS_MEM_ALLOC_BASE  (sys_mem_alloc_base())
+#define SYS_MEM_ALLOC_END   (sys_mem_alloc_base() + 0x10000000u)
 
 static uint32_t s_total_allocated = 0;
 
@@ -66,6 +80,20 @@ int64_t sys_memory_allocate(ppu_context* ctx)
 
     fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
             size, flags);
+    /* PS3_ALLOC_BT=1: the guest's saved-LR chain (frame+16 of each back-chain link),
+     * same walk as the RPCS3 oracle's "[oracle] sys_memory_allocate backchain". */
+    if (getenv("PS3_ALLOC_BT")) {
+        extern uint64_t vm_read64(uint64_t a);
+        char buf[512]; int p = snprintf(buf, sizeof buf, "lr=0x%x", (uint32_t)ctx->lr);
+        uint32_t sp = (uint32_t)ctx->gpr[1];
+        for (int i = 0; i < 16 && sp && sp < 0xF0000000u && p < (int)sizeof buf - 12; i++) {
+            uint32_t next = (uint32_t)vm_read64(sp);
+            if (!next || next < 0x10000u) break;
+            p += snprintf(buf + p, sizeof buf - p, " 0x%x", (uint32_t)vm_read64(next + 16));
+            sp = next;
+        }
+        fprintf(stderr, "[sys_memory] allocate backchain: %s\n", buf);
+    }
 
     /* Determine alignment based on page size flags */
     uint32_t alignment;
@@ -437,7 +465,7 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
     if (addr_out != 0)
         write_be32(addr_out, addr);
 
-    { static int n = 0; if (n++ < 4)
+    { static int n = 0; if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 4)
         fprintf(stderr, "[sys_memory] mmapper_allocate_memory size=0x%X -> 0x%08X\n",
                 size, addr); }
 

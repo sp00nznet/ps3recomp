@@ -166,8 +166,8 @@ extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
  * runtime-struct walk). Print the faulting address and the RIP as a module
  * offset (RVA) so it can be symbolized with llvm-symbolizer against the PDB. */
-extern "C" uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
-extern "C" const char* g_last_hle_name;
+extern "C" PPU_THREAD_LOCAL uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
+extern "C" PPU_THREAD_LOCAL const char* g_last_hle_name;
 
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
@@ -570,8 +570,8 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     return 0;
 }
 
-extern "C" uint32_t    g_last_hle_nid;
-extern "C" const char* g_last_hle_name;
+extern "C" PPU_THREAD_LOCAL uint32_t    g_last_hle_nid;
+extern "C" PPU_THREAD_LOCAL const char* g_last_hle_name;
 
 /* Windows-only from here to the end of hang_watchdog. Snapshotting every
  * OTHER thread and reading its instruction pointer needs tlhelp32 plus

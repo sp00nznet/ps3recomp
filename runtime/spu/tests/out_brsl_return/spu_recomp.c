@@ -5,7 +5,7 @@
 
 void spu_func_00000000(spu_context* ctx) {
         ctx->gpr[3] = spu_il(42);
-        ctx->gpr[0] = spu_link(0x8); spu_func_00000010(ctx);
+        ctx->gpr[0] = spu_link(0x8); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_func_00000010(ctx); spu_drain_call(ctx, 0x8); ctx->host_depth--; spu_img_restore(ctx, _si); }
         spu_wrch(ctx, SPU_WrOutMbox, ctx->gpr[3]);
         ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 }
@@ -13,7 +13,7 @@ void spu_func_00000000(spu_context* ctx) {
 void spu_func_00000010(spu_context* ctx) {
         ctx->gpr[4] = spu_il(100);
         ctx->gpr[3] = spu_a(ctx->gpr[3], ctx->gpr[4]);
-        return;
+        SPU_RET(ctx);
 }
 
 /* Function table */

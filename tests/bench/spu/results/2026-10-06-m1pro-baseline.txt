@@ -1,0 +1,415 @@
+411 kernels, 191 SPU ops benchmarked, 10 skipped (bisled, dfceq, dfcgt, dfcmeq, dfcmgt, dftsv, iret, stop, stopd, unk)
+barriers: 11958 inserted
+op        mode          note                           lifted op/s     ns/op   interp op/s     ns/op  speedup
+lnop      issue                                            48.23 G     0.021      109.61 M      9.12     440x
+sync      issue                                             8.83 G     0.113      109.30 M      9.15      81x
+dsync     issue                                             7.75 G     0.129      108.79 M      9.19      71x
+mfspr     issue                                             5.55 G     0.180      108.76 M      9.19      51x
+sf        lat                                               1.45 G     0.690      100.85 M      9.92      14x
+sf        tput                                              3.72 G     0.269      100.72 M      9.93      37x
+or        lat                                               1.52 G     0.660      100.27 M      9.97      15x
+or        tput                                              3.74 G     0.267       99.47 M     10.05      38x
+bg        lat                                             300.95 M     3.323       93.92 M     10.65       3x
+bg        tput                                              1.47 G     0.679       93.83 M     10.66      16x
+sfh       lat                                             139.63 M     7.162       91.08 M     10.98       2x
+sfh       tput                                            688.94 M     1.452       92.61 M     10.80       7x
+nor       lat                                             707.02 M     1.414       99.21 M     10.08       7x
+nor       tput                                              2.75 G     0.364       99.24 M     10.08      28x
+absdb     lat                                              50.60 M    19.763       54.42 M     18.38       1x
+absdb     tput                                            116.11 M     8.612       59.00 M     16.95       2x
+rot       lat                                             176.09 M     5.679       96.10 M     10.41       2x
+rot       tput                                            770.99 M     1.297       95.84 M     10.43       8x
+rotm      lat                                             243.30 M     4.110       95.70 M     10.45       3x
+rotm      tput                                              1.06 G     0.947       95.31 M     10.49      11x
+rotma     lat                                             290.81 M     3.439       93.93 M     10.65       3x
+rotma     tput                                              1.28 G     0.783       93.71 M     10.67      14x
+shl       lat                                             244.44 M     4.091       97.29 M     10.28       3x
+shl       tput                                              1.05 G     0.951       97.33 M     10.27      11x
+roth      lat                                             109.90 M     9.099       68.25 M     14.65       2x
+roth      tput                                            269.31 M     3.713       70.81 M     14.12       4x
+rothm     lat                                             131.50 M     7.605       74.49 M     13.43       2x
+rothm     tput                                            387.15 M     2.583       72.78 M     13.74       5x
+rotmah    lat                                             114.48 M     8.735       68.56 M     14.59       2x
+rotmah    tput                                            334.98 M     2.985       72.73 M     13.75       5x
+shlh      lat                                             125.43 M     7.972       77.20 M     12.95       2x
+shlh      tput                                            374.70 M     2.669       78.24 M     12.78       5x
+roti      lat                                             225.10 M     4.443       88.32 M     11.32       3x
+roti      tput                                              1.18 G     0.851       88.90 M     11.25      13x
+rotmi     lat                                              48.55 G     0.021      107.55 M      9.30     451x
+rotmi     tput                                             48.41 G     0.021      107.65 M      9.29     450x
+rotmai    lat                                             291.02 M     3.436       90.26 M     11.08       3x
+rotmai    tput                                              1.28 G     0.783       90.39 M     11.06      14x
+shli      lat                                             758.64 M     1.318       93.27 M     10.72       8x
+shli      tput                                              2.75 G     0.363       93.33 M     10.71      30x
+rothi     lat                                             112.53 M     8.886       71.85 M     13.92       2x
+rothi     tput                                            382.07 M     2.617       77.48 M     12.91       5x
+rothmi    lat                                              48.55 G     0.021      105.35 M      9.49     461x
+rothmi    tput                                             48.47 G     0.021      104.70 M      9.55     463x
+rotmahi   lat                                             144.86 M     6.903       68.31 M     14.64       2x
+rotmahi   tput                                            500.04 M     2.000       76.40 M     13.09       7x
+shlhi     lat                                             758.45 M     1.318       78.71 M     12.71      10x
+shlhi     tput                                              2.73 G     0.366       80.32 M     12.45      34x
+a         lat                                               1.52 G     0.659      100.71 M      9.93      15x
+a         tput                                              3.68 G     0.272      100.73 M      9.93      37x
+and       lat                                               1.52 G     0.659      100.18 M      9.98      15x
+and       tput                                              3.70 G     0.270      100.54 M      9.95      37x
+cg        lat                                             208.58 M     4.794       99.11 M     10.09       2x
+cg        tput                                            910.19 M     1.099       98.82 M     10.12       9x
+ah        lat                                             331.69 M     3.015       92.82 M     10.77       4x
+ah        tput                                              1.05 G     0.956       92.83 M     10.77      11x
+nand      lat                                             708.02 M     1.412       97.46 M     10.26       7x
+nand      tput                                              2.75 G     0.363       97.68 M     10.24      28x
+avgb      lat                                              66.54 M    15.029       71.12 M     14.06       1x
+avgb      tput                                            189.98 M     5.264       71.58 M     13.97       3x
+mtspr     issue                                            48.52 G     0.021      109.11 M      9.16     445x
+hbr       issue                                            48.43 G     0.021      108.53 M      9.21     446x
+gb        lat                                             115.35 M     8.670       99.74 M     10.03       1x
+gb        tput                                            766.94 M     1.304       99.60 M     10.04       8x
+gbh       lat                                             105.46 M     9.482       97.31 M     10.28       1x
+gbh       tput                                            535.91 M     1.866       97.14 M     10.29       6x
+gbb       lat                                              95.84 M    10.434       80.33 M     12.45       1x
+gbb       tput                                            379.27 M     2.637       81.32 M     12.30       5x
+fsm       lat                                             151.69 M     6.593      102.06 M      9.80       1x
+fsm       tput                                              1.11 G     0.898      101.75 M      9.83      11x
+fsmh      lat                                             113.72 M     8.794       83.40 M     11.99       1x
+fsmh      tput                                            544.32 M     1.837       83.85 M     11.93       6x
+fsmb      lat                                              73.86 M    13.539       79.57 M     12.57       1x
+fsmb      tput                                            385.25 M     2.596       81.02 M     12.34       5x
+frest     lat                                             114.69 M     8.719       80.13 M     12.48       1x
+frest     tput                                            345.85 M     2.891       80.94 M     12.36       4x
+frest     lat special                                     114.42 M     8.740       79.95 M     12.51       1x
+frest     tput special                                    346.00 M     2.890       81.20 M     12.32       4x
+frsqest   lat                                             126.00 M     7.937       73.26 M     13.65       2x
+frsqest   tput                                            404.89 M     2.470       78.50 M     12.74       5x
+frsqest   lat special                                     126.09 M     7.931       73.36 M     13.63       2x
+frsqest   tput special                                    405.17 M     2.468       77.99 M     12.82       5x
+rotqbybi  lat                                               1.51 G     0.661       88.90 M     11.25      17x
+rotqbybi  tput                                              3.84 G     0.260       88.73 M     11.27      43x
+rotqmbybi lat                                               1.51 G     0.663       87.40 M     11.44      17x
+rotqmbybi tput                                              3.81 G     0.262       87.15 M     11.47      44x
+shlqbybi  lat                                               1.51 G     0.660       89.07 M     11.23      17x
+shlqbybi  tput                                              3.22 G     0.310       89.43 M     11.18      36x
+cbx       lat                                             208.60 M     4.794       95.82 M     10.44       2x
+cbx       tput                                            737.00 M     1.357       95.47 M     10.47       8x
+chx       lat                                             195.61 M     5.112       94.08 M     10.63       2x
+chx       tput                                            707.39 M     1.414       85.75 M     11.66       8x
+cwx       lat                                             206.47 M     4.843       95.34 M     10.49       2x
+cwx       tput                                            716.98 M     1.395       94.20 M     10.62       8x
+cdx       lat                                             214.71 M     4.657       96.06 M     10.41       2x
+cdx       tput                                            735.57 M     1.359       96.17 M     10.40       8x
+rotqbi    lat                                             212.50 M     4.706       95.20 M     10.50       2x
+rotqbi    tput                                              1.15 G     0.866       94.83 M     10.55      12x
+rotqmbi   lat                                             147.45 M     6.782       94.28 M     10.61       2x
+rotqmbi   tput                                              1.00 G     0.999       94.77 M     10.55      11x
+shlqbi    lat                                             147.42 M     6.784       95.41 M     10.48       2x
+shlqbi    tput                                              1.03 G     0.972       95.37 M     10.49      11x
+rotqby    lat                                               1.51 G     0.660       92.52 M     10.81      16x
+rotqby    tput                                              3.75 G     0.267       92.02 M     10.87      41x
+rotqmby   lat                                               1.52 G     0.660       89.42 M     11.18      17x
+rotqmby   tput                                              3.74 G     0.268       89.11 M     11.22      42x
+shlqby    lat                                               1.52 G     0.659       88.97 M     11.24      17x
+shlqby    tput                                              3.71 G     0.270       88.90 M     11.25      42x
+orx       lat                                             211.72 M     4.723      102.84 M      9.72       2x
+orx       tput                                              1.28 G     0.779      102.75 M      9.73      12x
+cbd       lat                                             209.43 M     4.775       96.69 M     10.34       2x
+cbd       tput                                            720.53 M     1.388       96.62 M     10.35       7x
+chd       lat                                             197.82 M     5.055       93.42 M     10.70       2x
+chd       tput                                            715.33 M     1.398       93.01 M     10.75       8x
+cwd       lat                                             178.28 M     5.609       92.39 M     10.82       2x
+cwd       tput                                              1.31 G     0.764       92.64 M     10.79      14x
+cdd       lat                                             216.79 M     4.613       97.25 M     10.28       2x
+cdd       tput                                            784.11 M     1.275       96.93 M     10.32       8x
+rotqbii   lat                                             189.11 M     5.288       94.45 M     10.59       2x
+rotqbii   tput                                              1.11 G     0.899       94.53 M     10.58      12x
+rotqmbii  lat                                             201.84 M     4.954       96.55 M     10.36       2x
+rotqmbii  tput                                              1.18 G     0.848       96.40 M     10.37      12x
+shlqbii   lat                                             201.26 M     4.969       96.54 M     10.36       2x
+shlqbii   tput                                              1.18 G     0.849       93.97 M     10.64      13x
+rotqbyi   lat                                               1.52 G     0.659       96.45 M     10.37      16x
+rotqbyi   tput                                              3.63 G     0.275       96.61 M     10.35      38x
+rotqmbyi  lat                                               1.52 G     0.659       93.73 M     10.67      16x
+rotqmbyi  tput                                              3.55 G     0.281       93.27 M     10.72      38x
+shlqbyi   lat                                               1.52 G     0.660       94.63 M     10.57      16x
+shlqbyi   tput                                              3.71 G     0.270       94.49 M     10.58      39x
+nop       issue                                            48.47 G     0.021      109.76 M      9.11     442x
+cgt       lat                                               1.52 G     0.659       99.57 M     10.04      15x
+cgt       tput                                              3.73 G     0.268       99.68 M     10.03      37x
+xor       lat                                               1.52 G     0.659      101.39 M      9.86      15x
+xor       tput                                              3.79 G     0.264      101.55 M      9.85      37x
+cgth      lat                                             104.92 M     9.531       88.81 M     11.26       1x
+cgth      tput                                            509.78 M     1.962       88.92 M     11.25       6x
+eqv       lat                                               1.31 G     0.766       97.83 M     10.22      13x
+eqv       tput                                              3.36 G     0.298       97.68 M     10.24      34x
+cgtb      lat                                              85.38 M    11.712       64.64 M     15.47       1x
+cgtb      tput                                            277.25 M     3.607       69.13 M     14.47       4x
+sumb      lat                                             163.69 M     6.109       75.10 M     13.32       2x
+sumb      tput                                            477.30 M     2.095       75.85 M     13.18       6x
+hgt       issue         not taken                          48.54 G     0.021      104.72 M      9.55     464x
+clz       lat                                             301.07 M     3.322       93.39 M     10.71       3x
+clz       tput                                              1.36 G     0.737       93.41 M     10.71      15x
+xswd      lat                                             309.31 M     3.233      100.02 M     10.00       3x
+xswd      tput                                              1.51 G     0.661       99.95 M     10.01      15x
+xshw      lat                                             301.42 M     3.318       93.51 M     10.69       3x
+xshw      tput                                              1.25 G     0.800       93.33 M     10.71      13x
+cntb      lat                                              98.29 M    10.174       46.44 M     21.54       2x
+cntb      tput                                            110.14 M     9.079       46.45 M     21.53       2x
+xsbh      lat                                             110.12 M     9.081       83.47 M     11.98       1x
+xsbh      tput                                            518.84 M     1.927       84.35 M     11.86       6x
+clgt      lat                                               1.51 G     0.660       99.57 M     10.04      15x
+clgt      tput                                              3.74 G     0.267       96.72 M     10.34      39x
+andc      lat                                               1.52 G     0.659      101.42 M      9.86      15x
+andc      tput                                              3.77 G     0.265      101.57 M      9.85      37x
+fcgt      lat                                             200.79 M     4.980       79.03 M     12.65       3x
+fcgt      tput                                            565.01 M     1.770       79.64 M     12.56       7x
+fcgt      lat special                                     200.78 M     4.981       79.01 M     12.66       3x
+fcgt      tput special                                    564.94 M     1.770       79.82 M     12.53       7x
+fa        lat                                              74.63 M    13.399       77.40 M     12.92       1x
+fa        tput                                            231.24 M     4.325       77.54 M     12.90       3x
+fa        lat special                                      59.18 M    16.897       45.04 M     22.20       1x
+fa        tput special                                    100.32 M     9.968       45.09 M     22.18       2x
+fs        lat                                              73.98 M    13.517       77.59 M     12.89       1x
+fs        tput                                            230.74 M     4.334       77.73 M     12.86       3x
+fs        lat special                                      57.12 M    17.508       36.87 M     27.12       2x
+fs        tput special                                     87.59 M    11.417       36.78 M     27.19       2x
+fm        lat                                             184.11 M     5.432       78.50 M     12.74       2x
+fm        tput                                            382.92 M     2.611       79.24 M     12.62       5x
+fm        lat special                                      77.72 M    12.867       54.35 M     18.40       1x
+fm        tput special                                    142.61 M     7.012       54.56 M     18.33       3x
+clgth     lat                                             124.65 M     8.022       89.57 M     11.16       1x
+clgth     tput                                            336.34 M     2.973       89.16 M     11.22       4x
+orc       lat                                               1.52 G     0.659      101.26 M      9.88      15x
+orc       tput                                              3.26 G     0.307      101.24 M      9.88      32x
+fcmgt     lat                                             199.21 M     5.020       89.43 M     11.18       2x
+fcmgt     tput                                            827.88 M     1.208       89.14 M     11.22       9x
+fcmgt     lat special                                     199.06 M     5.024       89.56 M     11.17       2x
+fcmgt     tput special                                    829.08 M     1.206       89.54 M     11.17       9x
+dfa       lat                                              92.55 M    10.805       81.18 M     12.32       1x
+dfa       tput                                            578.10 M     1.730       81.25 M     12.31       7x
+dfa       lat special                                      95.58 M    10.463       83.06 M     12.04       1x
+dfa       tput special                                    676.41 M     1.478       83.13 M     12.03       8x
+dfs       lat                                              92.49 M    10.812       81.32 M     12.30       1x
+dfs       tput                                            579.06 M     1.727       81.09 M     12.33       7x
+dfs       lat special                                      95.65 M    10.455       83.27 M     12.01       1x
+dfs       tput special                                    677.24 M     1.477       83.40 M     11.99       8x
+dfm       lat                                              89.14 M    11.219       80.59 M     12.41       1x
+dfm       tput                                            573.59 M     1.743       80.51 M     12.42       7x
+dfm       lat special                                      92.72 M    10.785       82.82 M     12.07       1x
+dfm       tput special                                    660.76 M     1.513       81.96 M     12.20       8x
+clgtb     lat                                              85.88 M    11.645       69.73 M     14.34       1x
+clgtb     tput                                            166.42 M     6.009       73.68 M     13.57       2x
+hlgt      issue         not taken                          48.45 G     0.021      104.76 M      9.55     463x
+dfma      lat                                              68.00 M    14.707       68.02 M     14.70       1x
+dfma      tput                                            219.43 M     4.557       67.91 M     14.73       3x
+dfma      lat special                                      72.68 M    13.759       75.88 M     13.18       1x
+dfma      tput special                                    342.70 M     2.918       76.99 M     12.99       4x
+dfms      lat                                              67.81 M    14.748       68.32 M     14.64       1x
+dfms      tput                                            219.46 M     4.557       68.55 M     14.59       3x
+dfms      lat special                                      72.80 M    13.737       76.13 M     13.14       1x
+dfms      tput special                                    342.90 M     2.916       76.96 M     12.99       4x
+dfnms     lat                                              67.98 M    14.711       68.13 M     14.68       1x
+dfnms     tput                                            218.53 M     4.576       67.80 M     14.75       3x
+dfnms     lat special                                      72.75 M    13.747       75.73 M     13.20       1x
+dfnms     tput special                                    343.35 M     2.912       76.93 M     13.00       4x
+dfnma     lat                                              67.91 M    14.725       68.30 M     14.64       1x
+dfnma     tput                                            218.72 M     4.572       68.52 M     14.60       3x
+dfnma     lat special                                      72.82 M    13.732       75.98 M     13.16       1x
+dfnma     tput special                                    342.87 M     2.917       76.93 M     13.00       4x
+ceq       lat                                               1.52 G     0.659      101.43 M      9.86      15x
+ceq       tput                                              3.69 G     0.271      101.50 M      9.85      36x
+mpyhhu    lat                                             170.30 M     5.872       96.65 M     10.35       2x
+mpyhhu    tput                                              1.01 G     0.990       96.70 M     10.34      10x
+addx      lat                                             356.93 M     2.802       99.15 M     10.09       4x
+addx      tput                                              1.20 G     0.835       98.97 M     10.10      12x
+sfx       lat                                             303.15 M     3.299       92.01 M     10.87       3x
+sfx       tput                                              1.09 G     0.919       97.75 M     10.23      11x
+cgx       lat                                             266.98 M     3.746       93.87 M     10.65       3x
+cgx       tput                                              1.06 G     0.939       93.26 M     10.72      11x
+bgx       lat                                             238.24 M     4.197       94.07 M     10.63       3x
+bgx       tput                                            983.81 M     1.016       93.65 M     10.68      11x
+mpyhha    lat                                             226.19 M     4.421       94.67 M     10.56       2x
+mpyhha    tput                                              1.04 G     0.962       94.19 M     10.62      11x
+mpyhhau   lat                                             151.32 M     6.609       95.02 M     10.52       2x
+mpyhhau   tput                                            751.90 M     1.330       94.95 M     10.53       8x
+fscrrd    issue                                             5.54 G     0.180      107.34 M      9.32      52x
+fesd      lat                                             128.62 M     7.775       89.94 M     11.12       1x
+fesd      tput                                            588.30 M     1.700       89.77 M     11.14       7x
+fesd      lat special                                     130.00 M     7.692       90.43 M     11.06       1x
+fesd      tput special                                    776.27 M     1.288       90.34 M     11.07       9x
+frds      lat                                             102.84 M     9.724       88.41 M     11.31       1x
+frds      tput                                            701.75 M     1.425       88.69 M     11.28       8x
+frds      lat special                                     102.88 M     9.720       88.57 M     11.29       1x
+frds      tput special                                    700.51 M     1.428       88.92 M     11.25       8x
+fscrwr    issue                                            48.54 G     0.021      109.94 M      9.10     442x
+fceq      lat                                             200.79 M     4.980       78.97 M     12.66       3x
+fceq      tput                                            564.01 M     1.773       79.75 M     12.54       7x
+fceq      lat special                                     200.75 M     4.981       79.11 M     12.64       3x
+fceq      tput special                                    564.82 M     1.770       79.89 M     12.52       7x
+mpy       lat                                             232.44 M     4.302       95.98 M     10.42       2x
+mpy       tput                                              1.02 G     0.977       95.77 M     10.44      11x
+mpyh      lat                                             162.77 M     6.144       94.90 M     10.54       2x
+mpyh      tput                                            912.52 M     1.096       94.84 M     10.54      10x
+mpyhh     lat                                             225.76 M     4.429       95.90 M     10.43       2x
+mpyhh     tput                                              1.04 G     0.961       95.45 M     10.48      11x
+mpys      lat                                             201.06 M     4.974       93.96 M     10.64       2x
+mpys      tput                                            877.68 M     1.139       93.51 M     10.69       9x
+ceqh      lat                                             177.99 M     5.618       89.55 M     11.17       2x
+ceqh      tput                                            531.65 M     1.881       89.42 M     11.18       6x
+fcmeq     lat                                             181.85 M     5.499       89.86 M     11.13       2x
+fcmeq     tput                                            712.54 M     1.403       89.85 M     11.13       8x
+fcmeq     lat special                                     181.85 M     5.499       89.99 M     11.11       2x
+fcmeq     tput special                                    713.64 M     1.401       89.54 M     11.17       8x
+mpyu      lat                                             170.07 M     5.880       96.82 M     10.33       2x
+mpyu      tput                                              1.01 G     0.988       97.50 M     10.26      10x
+ceqb      lat                                              90.47 M    11.053       69.45 M     14.40       1x
+ceqb      tput                                            206.32 M     4.847       73.82 M     13.55       3x
+fi        lat                                             128.44 M     7.786       78.61 M     12.72       2x
+fi        tput                                            252.93 M     3.954       78.54 M     12.73       3x
+fi        lat special                                     128.74 M     7.768       79.77 M     12.54       2x
+fi        tput special                                    251.34 M     3.979       78.62 M     12.72       3x
+heq       issue         not taken                          48.32 G     0.021       99.47 M     10.05     486x
+cflts     lat                                             125.02 M     7.999       89.67 M     11.15       1x
+cflts     tput                                            491.21 M     2.036       89.99 M     11.11       5x
+cflts     lat special                                     121.98 M     8.198       88.80 M     11.26       1x
+cflts     tput special                                    450.05 M     2.222       88.86 M     11.25       5x
+cfltu     lat                                             111.06 M     9.004       85.80 M     11.66       1x
+cfltu     tput                                            362.17 M     2.761       85.31 M     11.72       4x
+cfltu     lat special                                     112.26 M     8.908       85.56 M     11.69       1x
+cfltu     tput special                                    361.54 M     2.766       85.38 M     11.71       4x
+csflt     lat                                              79.62 M    12.560       55.14 M     18.13       1x
+csflt     tput                                            169.89 M     5.886       55.23 M     18.11       3x
+cuflt     lat                                              89.47 M    11.177       62.83 M     15.92       1x
+cuflt     tput                                            219.43 M     4.557       63.19 M     15.83       3x
+fsmbi     issue                                             5.55 G     0.180       84.08 M     11.89      66x
+il        issue                                             5.54 G     0.180      100.16 M      9.98      55x
+ilhu      issue                                             5.54 G     0.180      102.46 M      9.76      54x
+ilh       issue                                           515.02 M     1.942       99.55 M     10.05       5x
+iohl      lat                                               1.52 G     0.659      101.75 M      9.83      15x
+iohl      tput                                              3.66 G     0.273       97.05 M     10.30      38x
+ori       lat                                               1.58 G     0.634      104.17 M      9.60      15x
+ori       tput                                              3.83 G     0.261      100.09 M      9.99      38x
+orhi      lat                                               1.52 G     0.659       92.23 M     10.84      16x
+orhi      tput                                              3.72 G     0.269       94.10 M     10.63      40x
+orbi      lat                                               1.58 G     0.634       70.52 M     14.18      22x
+orbi      tput                                              3.71 G     0.269       76.38 M     13.09      49x
+sfi       lat                                               1.56 G     0.643      100.18 M      9.98      16x
+sfi       tput                                              3.80 G     0.263      103.32 M      9.68      37x
+sfhi      lat                                             244.37 M     4.092       91.86 M     10.89       3x
+sfhi      tput                                            878.18 M     1.139       92.97 M     10.76       9x
+andi      lat                                               1.51 G     0.660      100.19 M      9.98      15x
+andi      tput                                              3.77 G     0.265      100.88 M      9.91      37x
+andhi     lat                                               1.51 G     0.661       91.89 M     10.88      16x
+andhi     tput                                              3.59 G     0.278       91.58 M     10.92      39x
+andbi     lat                                               1.52 G     0.660       65.27 M     15.32      23x
+andbi     tput                                              3.65 G     0.274       74.47 M     13.43      49x
+ai        lat                                               1.48 G     0.676      101.15 M      9.89      15x
+ai        tput                                              3.65 G     0.274      101.57 M      9.85      36x
+ahi       lat                                             270.69 M     3.694       92.35 M     10.83       3x
+ahi       tput                                              1.02 G     0.985       92.13 M     10.85      11x
+xori      lat                                               1.51 G     0.661       99.96 M     10.00      15x
+xori      tput                                              3.65 G     0.274       99.84 M     10.02      37x
+xorhi     lat                                               1.51 G     0.661       92.09 M     10.86      16x
+xorhi     tput                                              3.70 G     0.270       92.07 M     10.86      40x
+xorbi     lat                                               1.52 G     0.657       69.13 M     14.47      22x
+xorbi     tput                                              3.62 G     0.276       75.51 M     13.24      48x
+cgti      lat                                               1.54 G     0.650      101.36 M      9.87      15x
+cgti      tput                                              3.71 G     0.269      100.34 M      9.97      37x
+cgthi     lat                                             104.99 M     9.524       77.61 M     12.88       1x
+cgthi     tput                                            511.28 M     1.956       80.66 M     12.40       6x
+cgtbi     lat                                              85.94 M    11.637       68.65 M     14.57       1x
+cgtbi     tput                                            308.38 M     3.243       75.93 M     13.17       4x
+hgti      issue         not taken                          48.48 G     0.021      105.61 M      9.47     459x
+clgti     lat                                               1.51 G     0.660      100.25 M      9.97      15x
+clgti     tput                                              3.70 G     0.270      100.38 M      9.96      37x
+clgthi    lat                                             177.14 M     5.645       79.51 M     12.58       2x
+clgthi    tput                                            507.51 M     1.970       80.74 M     12.38       6x
+clgtbi    lat                                              68.60 M    14.577       70.12 M     14.26       1x
+clgtbi    tput                                            249.51 M     4.008       75.95 M     13.17       3x
+hlgti     issue         not taken                          48.48 G     0.021      107.53 M      9.30     451x
+mpyi      lat                                             232.17 M     4.307       96.14 M     10.40       2x
+mpyi      tput                                              1.02 G     0.980       97.06 M     10.30      11x
+mpyui     lat                                             168.05 M     5.950       97.38 M     10.27       2x
+mpyui     tput                                            902.63 M     1.108       97.64 M     10.24       9x
+ceqi      lat                                               1.51 G     0.661       99.83 M     10.02      15x
+ceqi      tput                                              3.70 G     0.270       99.33 M     10.07      37x
+ceqhi     lat                                             110.07 M     9.085       77.63 M     12.88       1x
+ceqhi     tput                                            525.46 M     1.903       79.90 M     12.52       7x
+ceqbi     lat                                              93.02 M    10.751       62.93 M     15.89       1x
+ceqbi     tput                                            313.27 M     3.192       72.79 M     13.74       4x
+heqi      issue         not taken                          48.41 G     0.021      106.15 M      9.42     456x
+hbra      issue                                            48.43 G     0.021      109.67 M      9.12     442x
+hbrr      issue                                            48.00 G     0.021      109.58 M      9.13     438x
+ila       issue                                             5.51 G     0.182      105.08 M      9.52      52x
+selb      lat                                             761.32 M     1.314       98.56 M     10.15       8x
+selb      tput                                              2.75 G     0.364       99.11 M     10.09      28x
+shufb     lat                                             378.05 M     2.645       81.71 M     12.24       5x
+shufb     tput                                              1.81 G     0.554       81.92 M     12.21      22x
+mpya      lat                                             151.43 M     6.604       94.02 M     10.64       2x
+mpya      tput                                            744.88 M     1.342       93.78 M     10.66       8x
+fnms      lat                                              36.05 M    27.743       27.18 M     36.79       1x
+fnms      tput                                             45.97 M    21.753       27.51 M     36.35       2x
+fnms      lat special                                      38.35 M    26.077       28.79 M     34.73       1x
+fnms      tput special                                     47.19 M    21.192       27.30 M     36.63       2x
+fma       lat                                              35.93 M    27.830       27.52 M     36.33       1x
+fma       tput                                             46.44 M    21.532       27.31 M     36.62       2x
+fma       lat special                                      39.10 M    25.578       28.80 M     34.72       1x
+fma       tput special                                     55.23 M    18.106       28.78 M     34.75       2x
+fms       lat                                              35.60 M    28.089       27.37 M     36.53       1x
+fms       tput                                             46.12 M    21.682       27.27 M     36.67       2x
+fms       lat special                                      36.49 M    27.404       27.57 M     36.28       1x
+fms       tput special                                     47.00 M    21.278       27.51 M     36.35       2x
+lqd       lat           pointer chase                     131.65 M     7.596       84.01 M     11.90       2x
+lqd       tput          8 chases                          954.12 M     1.048       85.87 M     11.64      11x
+lqx       lat           pointer chase                     125.64 M     7.959       85.74 M     11.66       1x
+lqa       issue                                             1.92 G     0.521       97.37 M     10.27      20x
+lqr       issue                                             1.92 G     0.522      101.21 M      9.88      19x
+stqd      issue                                           559.53 M     1.787       97.56 M     10.25       6x
+stqx      issue                                           548.14 M     1.824       96.99 M     10.31       6x
+stqa      issue                                             1.56 G     0.640      100.90 M      9.91      15x
+stqr      issue                                             1.56 G     0.640      100.40 M      9.96      16x
+br        issue         to the next word                   48.42 G     0.021      107.21 M      9.33     452x
+bra       issue         to the next word                   48.45 G     0.021      107.51 M      9.30     451x
+brz       issue         taken, to the next word            48.26 G     0.021      104.41 M      9.58     462x
+brz       issue         not taken                          48.53 G     0.021      107.06 M      9.34     453x
+brnz      issue         taken, to the next word            48.74 G     0.021      107.27 M      9.32     454x
+brnz      issue         not taken                          48.35 G     0.021      108.51 M      9.22     446x
+brhz      issue         taken, to the next word            48.51 G     0.021      104.40 M      9.58     465x
+brhz      issue         not taken                          43.20 G     0.023      106.36 M      9.40     406x
+brhnz     issue         taken, to the next word            48.56 G     0.021      106.54 M      9.39     456x
+brhnz     issue         not taken                          48.55 G     0.021      106.07 M      9.43     458x
+biz       issue         not taken                          49.18 G     0.020      108.79 M      9.19     452x
+binz      issue         not taken                          49.19 G     0.020      106.11 M      9.42     464x
+bihz      issue         not taken                          48.75 G     0.021      105.34 M      9.49     463x
+bihnz     issue         not taken                          48.64 G     0.021      106.26 M      9.41     458x
+brsl      issue         call + bi $0 return               165.92 M     6.027       51.26 M     19.51       3x
+brasl     issue         call + bi $0 return               166.02 M     6.023       51.46 M     19.43       3x
+bisl      issue         indirect call + bi $0 return       50.61 M    19.757       48.66 M     20.55       1x
+rchcnt    issue         MFC_RdTagStat                     192.84 M     5.186       64.60 M     15.48       3x
+rchcnt    issue         SPU_RdInMbox (empty)              181.24 M     5.518       62.93 M     15.89       3x
+rchcnt    issue         SPU_RdEventStat                   164.82 M     6.067       61.54 M     16.25       3x
+rdch      issue         SPU_RdDec                          33.05 M    30.259       33.03 M     30.28       1x
+rdch      issue         SPU_RdEventMask                   265.49 M     3.767       66.32 M     15.08       4x
+rdch      issue         MFC_RdTagMask                     181.60 M     5.507       63.67 M     15.71       3x
+rdch      issue         SPU_RdMachStat                    255.98 M     3.907       66.22 M     15.10       4x
+rdch      issue         SPU_RdSRR0                        266.49 M     3.753       66.89 M     14.95       4x
+wrch      issue         SPU_WrDec                          40.15 M    24.906       35.23 M     28.39       1x
+wrch      issue         SPU_WrEventMask (0)               400.47 M     2.497       70.32 M     14.22       6x
+wrch      issue         SPU_WrEventAck (0)                125.74 M     7.953       62.45 M     16.01       2x
+wrch      issue         SPU_WrSRR0                        400.99 M     2.494       70.78 M     14.13       6x
+wrch      issue         MFC_LSA                           201.50 M     4.963       64.78 M     15.44       3x
+wrch      issue         MFC_EAL                           188.83 M     5.296       63.27 M     15.80       3x
+wrch      issue         MFC_Size                          201.11 M     4.972       66.53 M     15.03       3x
+wrch      issue         MFC_TagID                         205.91 M     4.857       66.70 M     14.99       3x
+wrch      issue         MFC_WrTagMask                     202.88 M     4.929       65.45 M     15.28       3x
+dma       issue         GET 16 B + tag wait                 9.50 M   105.216        5.07 M    197.30       2x
+dma       issue         PUT 16 B + tag wait                 9.75 M   102.612        5.31 M    188.45       2x
+dma       issue         GET 128 B + tag wait                9.24 M   108.211        5.02 M    199.24       2x
+dma       issue         PUT 128 B + tag wait                8.57 M   116.675        4.83 M    207.25       2x
+dma       issue         GET 1024 B + tag wait               6.42 M   155.826        4.05 M    246.93       2x
+dma       issue         PUT 1024 B + tag wait               3.68 M   271.776        2.75 M    363.39       1x
+dma       issue         GET 16384 B + tag wait              1.25 M   796.892        1.13 M    881.42       1x
+dma       issue         PUT 16384 B + tag wait            390.56 K  2560.425      381.33 K   2622.40       1x
+dma       issue         GET 128 B x4, one tag wait         10.53 M    94.990        6.03 M    165.93       2x
+[spu-spin] img=0 pc=0x30010 lr=0x30010 GETLLAR ea=0x00100000 x4M; line: 00000000 00000000 00000000 00000000
+atomic    issue         GETLLAR + atomic stat              22.40 M    44.635       10.38 M     96.36       2x
+atomic    issue         GETLLAR, PUTLLC (succeeds)          9.70 M   103.100        4.68 M    213.49       2x
+atomic    issue         PUTLLUC + atomic stat              21.12 M    47.351        9.90 M    101.06       2x

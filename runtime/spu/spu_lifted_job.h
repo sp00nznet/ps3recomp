@@ -27,7 +27,7 @@ extern uint8_t* vm_base;
 
 
 /* Run an UN-LIFTED SPU image via the interpreter. Same context/LS/ABI bring-up
- * as spu_run_lifted_job (r1 = LS top, LS in/out, raw-thread arg EA in r3), but
+ * as spu_run_lifted_job (r1 = LS top, LS in/out, raw-thread args in r3..r6), but
  * the engine is the interpreter fetching from live local store — so a title's
  * SPU jobs run without lifting them first. The channel/DMA ABI (spu_wrch/rdch,
  * MFC) is shared, so DMA, mailboxes, and event signalling behave identically.
@@ -37,11 +37,10 @@ extern uint8_t* vm_base;
  * receives its per-frame work-descriptor EA (delivered by the game's per-frame
  * event-port send). 0 for the initial group_start run. */
 static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc,
-                                         uint32_t args_ea, int image_id,
+                                         const uint64_t* args, int image_id,
                                          uint32_t spu_id, uint32_t group_id,
                                          uint32_t inmbox_val)
 {
-    extern uint8_t* vm_base;
     spu_context ctx;
     spu_context_init(&ctx, 0);
     if (inmbox_val) spu_channel_write(&ctx.ch_in_mbox, inmbox_val);
@@ -56,7 +55,7 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     /* SPU_CTX_LOG=1: one line per job context, with its address. "Three
      * contexts for one dispatch" is otherwise unanswerable -- every other
      * probe sees contexts only once they reserve. */
-    { static int s_cl = -1;
+    { static _Atomic int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d entry=0x%05X\n",
                           (void*)&ctx, image_id, entry_pc); fflush(stderr); } }
@@ -64,24 +63,52 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;       /* SPU stack top, 16B aligned */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);
     /* Raw-SPU-thread ABI: sys_spu_thread_argument is 4 u64s (arg1..arg4) passed
-     * in r3..r6. Each is a 64-bit effective address the SPU treats as the pair
-     * {word0 = EA-low, word1 = EA-high}: DMA code writes MFC_EAL from word0 and
-     * asserts (dma.h) that word1 (EA-high) is 0 (main memory is 32-bit
-     * addressable). So the low 32 bits of the guest u64 go in word0, high in
-     * word1 -- NOT the plain big-endian doubleword order (which would put the EA
-     * in word1 and trip the assert on any real pointer arg). */
-    if (args_ea && vm_base) {
+     * in r3..r6, each in the register's preferred doubleword (big-endian bytes
+     * 0-7: word0 = high half, word1 = low half), exactly as LV2 and RPCS3
+     * (`gpr[3] = v128::from64(0, arg1)`) do. SPU code compiled for `uint64_t`
+     * parameters reads the EA low half with `rotqbyi 4` (mfc_ea2l). Verified by
+     * tests/conformance/mc against RPCS3. (d26a685 had swapped the halves to get
+     * a Rubber Ducky SPU past a dma.h assert; that masked a bug elsewhere.)
+     * `args` is the copy taken at sys_spu_thread_initialize, not the guest
+     * block, which games reuse for every thread. */
+    if (args) {
         for (int i = 0; i < 4; i++) {
-            const uint8_t* p = vm_base + args_ea + i * 8;
-            uint32_t hi = ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
-            uint32_t lo = ((uint32_t)p[4]<<24)|((uint32_t)p[5]<<16)|((uint32_t)p[6]<<8)|p[7];
-            ctx.gpr[3 + i]._u32[0] = lo;
-            ctx.gpr[3 + i]._u32[1] = hi;
+            ctx.gpr[3 + i]._u32[0] = (uint32_t)(args[i] >> 32);
+            ctx.gpr[3 + i]._u32[1] = (uint32_t)args[i];
         }
-    } else {
-        ctx.gpr[3]._u32[0] = args_ea;
     }
+    /* Resident for the run: PPU-side mailbox and signal writes
+     * (sys_spu_thread_write_spu_mb / write_snr) land in this context and wake
+     * it, instead of re-running the image from its entry. */
+    extern void spu_thread_publish_ctx(uint32_t tid, void* c);
+    if (spu_id) spu_thread_publish_ctx(spu_id, &ctx);
     spu_interp_run(&ctx, entry_pc);
+    if (spu_id) spu_thread_publish_ctx(spu_id, 0);   /* ctx is a stack local */
+    /* sys_spu_thread_exit: the SPU writes its status to SPU_WrOutMbox and stops
+     * with 0x102; lv2 pops that mailbox value as the thread's exit status (the
+     * stop code is only the selector). Same rule as spu_lifted_thread.c. */
+    {
+        extern SPU_THREAD_LOCAL int g_spu_interp_exit_valid;
+        extern SPU_THREAD_LOCAL int32_t g_spu_interp_exit_status;
+        extern SPU_THREAD_LOCAL int g_spu_interp_group_exit_valid;
+        extern SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status;
+        g_spu_interp_exit_valid = 0;
+        g_spu_interp_group_exit_valid = 0;
+        if (ctx.status == SPU_STATUS_STOPPED_BY_STOP && ctx.stop_code == 0x102u &&
+            spu_channel_has_data(&ctx.ch_out_mbox)) {
+            g_spu_interp_exit_valid  = 1;
+            g_spu_interp_exit_status = (int32_t)spu_channel_peek(&ctx.ch_out_mbox);
+            spu_channel_clear(&ctx.ch_out_mbox);
+        }
+        /* sys_spu_thread_group_exit: stop 0x101, the group's status in the
+         * same mailbox. */
+        if (ctx.status == SPU_STATUS_STOPPED_BY_STOP && ctx.stop_code == 0x101u &&
+            spu_channel_has_data(&ctx.ch_out_mbox)) {
+            g_spu_interp_group_exit_valid  = 1;
+            g_spu_interp_group_exit_status = (int32_t)spu_channel_peek(&ctx.ch_out_mbox);
+            spu_channel_clear(&ctx.ch_out_mbox);
+        }
+    }
     /* Completion signal, exactly ONCE per run. Real hardware raises a PPU event
      * only from WrOutIntrMbox; the plain mailbox is PPU-polled. But a sim SPU
      * that finishes by writing only the PLAIN mailbox (Rubber Ducky's
@@ -98,7 +125,7 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
          spu_channel_has_data(&ctx.ch_out_mbox)) {
         extern void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
         if (g_spu_out_mbox_hook)
-            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
+            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, spu_channel_peek(&ctx.ch_out_mbox));
     }
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
     /* `ctx` is about to go out of scope: take it out of the reserving set
@@ -161,7 +188,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     if (!entry) return -1;
     spu_context ctx;
     spu_context_init(&ctx, 0);
-    { static int s_cl = -1;
+    { static _Atomic int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
                           (void*)&ctx, image_id); fflush(stderr); } }
@@ -247,11 +274,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     } else {
         /* RAW SPU THREAD (opts set): sys_spu_thread_argument is FOUR u64s
          * (arg1..arg4) passed in r3..r6 -- not the address of that block. Each
-         * is a 64-bit EA the SPU reads as {word0 = EA-low, word1 = EA-high},
-         * so the guest u64's low half goes in word0 and the high half in word1
-         * (plain big-endian doubleword order would put the EA in word1 and trip
-         * the EA-high==0 assert in spu_dma.h on any real pointer argument).
-         * This is the same decode spu_run_interp_job already does.
+         * goes in the register's preferred doubleword (word0 = high half,
+         * word1 = low half), as LV2/RPCS3 do. Same decode as spu_run_interp_job.
          *
          * Handing the raw path `args_ea` itself instead made the worker read a
          * pointer-to-its-arguments where it expected argument one: MultiStream's
@@ -260,10 +284,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
         if (opts && args_ea && vm_base) {
             for (int i = 0; i < 4; i++) {
                 const uint8_t* p_ = vm_base + args_ea + i * 8;
-                uint32_t hi = ((uint32_t)p_[0]<<24)|((uint32_t)p_[1]<<16)|((uint32_t)p_[2]<<8)|p_[3];
-                uint32_t lo = ((uint32_t)p_[4]<<24)|((uint32_t)p_[5]<<16)|((uint32_t)p_[6]<<8)|p_[7];
-                ctx.gpr[3 + i]._u32[0] = lo;
-                ctx.gpr[3 + i]._u32[1] = hi;
+                ctx.gpr[3 + i]._u32[0] = ((uint32_t)p_[0]<<24)|((uint32_t)p_[1]<<16)|((uint32_t)p_[2]<<8)|p_[3];
+                ctx.gpr[3 + i]._u32[1] = ((uint32_t)p_[4]<<24)|((uint32_t)p_[5]<<16)|((uint32_t)p_[6]<<8)|p_[7];
             }
         } else {
             ctx.gpr[3]._u32[0] = args_ea;                       /* simple-job arg -> r3 */
@@ -307,9 +329,9 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                 "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
                 ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,
                 (unsigned)(ctx.pc & SPU_LS_MASK),
-                (unsigned)ctx.ch_in_mbox.count,
-                (unsigned)ctx.ch_out_mbox.count, ctx.ch_out_mbox.value,
-                (unsigned)ctx.ch_out_intr_mbox.count, ctx.ch_out_intr_mbox.value);
+                (unsigned)spu_channel_count(&ctx.ch_in_mbox),
+                (unsigned)spu_channel_count(&ctx.ch_out_mbox), spu_channel_peek(&ctx.ch_out_mbox),
+                (unsigned)spu_channel_count(&ctx.ch_out_intr_mbox), spu_channel_peek(&ctx.ch_out_intr_mbox));
         fflush(stderr);
     }
 
@@ -323,7 +345,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
         spu_channel_has_data(&ctx.ch_out_mbox)) {
         extern void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
         if (g_spu_out_mbox_hook)
-            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
+            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, spu_channel_peek(&ctx.ch_out_mbox));
     }
     if (opts && opts->spu_id) {
         extern void spu_thread_publish_ctx(uint32_t tid, void* c);
