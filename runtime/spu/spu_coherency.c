@@ -172,9 +172,12 @@ int spu_coh_is_reserved(uint32_t addr)
  *
  * The PUTLLC path already guards this case by dropping its own reservation
  * before notifying; this gives the DMA path the same ability. */
+void ppu_resv_break_line(uint32_t ea);   /* ppu_loader.cpp */
+
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
+    ppu_resv_break_line(ea);
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
@@ -190,6 +193,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    ppu_resv_break_line(ea);
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;

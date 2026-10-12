@@ -145,6 +145,12 @@ SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
  * expects an answer back through the completion event. */
 SPURS_JOB_TLS uint32_t g_spurs_job_cmd;
 SPURS_JOB_TLS int g_spurs_job_mbox_valid;
+/* The SPU number a job sees (cellSpursGetCurrentSpuId, kernel LS 0x1C8). A host
+ * thread that runs jobs concurrently with others must claim its own: titles
+ * key per-SPU resources on it (Edge output rings, one RSX label per SPU), and
+ * two jobs that both think they are SPU 0 corrupt each other's ring. */
+SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
+void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
 
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
@@ -244,8 +250,29 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         ls32(ls, ctx_ls + JC_CACHE_BUFFER + (uint32_t)i * 4u, cache_ls[i]);
     /* sizeJobDescriptor:4 is the first bitfield of a big-endian u32, so it
      * occupies the TOP 4 bits. 0 means 64 bytes, otherwise n*128. */
+    /* The low 28 bits are not padding to a "JOBCRT Ver13" crt (WWS/Edge jobs,
+     * Twisted Metal's JobQueue jobs): jm2 parks an LS pointer to its kernel
+     * block there, and the crt returns 0x80410A11 and STOPs before main when
+     * it is 0 -- so the job never runs and never clears its completion
+     * counter. Hand it the free 16 bytes after the context (zeroed); the crt
+     * only stashes the pointer and clears the field again. */
+    uint32_t jm_iface = memcmp(ls + 0x30, "JOBCRT Ver13", 12) == 0 ? ctx_ls + 0x30 : 0;
+    /* The same crt also reads the SPURS kernel context with ABSOLUTE loads
+     * (lqa): spuNum at 0x1C8 (cellSpursGetCurrentSpuId), the trace buffer at
+     * 0x210, a trace-enable byte at 0x175. On hardware the kernel owns
+     * 0x100-0x2FF; here the job is loaded at 0, so those reads returned the
+     * job's own instruction words and it indexed per-SPU tables with an opcode
+     * and halted. The lifted code never reads those bytes as data, so overlay
+     * the kernel's view: SPU 0, our DMA tag, tracing off. */
+    if (jm_iface) {
+        memset(ls + 0x170, 0, 0x10);
+        memset(ls + 0x1C0, 0, 0x10);
+        ls32(ls, 0x1C8, g_spurs_job_spu_num);
+        ls32(ls, 0x1CC, JOB_DMA_TAG);
+        memset(ls + 0x210, 0, 0x10);
+    }
     ls32(ls, ctx_ls + JC_SIZE_JOB_DESC,
-         (dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28);
+         ((dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28) | jm_iface);
     ls16(ls, ctx_ls + JC_NUM_IO_BUFFER,    (uint16_t)n_dma);
     ls16(ls, ctx_ls + JC_NUM_CACHE_BUFFER, (uint16_t)n_cache);
     ls32(ls, ctx_ls + JC_O_BUFFER, out_ls);
@@ -365,6 +392,22 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * and feeding them into the completion event turned 0x40000000 into a 1 GB
      * allocation request. Kept because the printf service needs them. */
     memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+    /* TEMP SPURS_JOB_LSWORD=<img>:<lsa>: after a job of that image, print the
+     * LS word at lsa and every other LS offset holding the same value. */
+    { static int img = -2; static uint32_t lsa; static int n = 0;
+      if (img == -2) { const char* e = getenv("SPURS_JOB_LSWORD"); img = -1;
+          if (e) { img = atoi(e); const char* c = strchr(e, ':'); lsa = c ? (uint32_t)strtoul(c + 1, 0, 16) : 0; } }
+      if (img == image_id && n++ < 3) {
+          const uint8_t* q = ctx.ls + (lsa & 0x3FFFC);
+          uint32_t v = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+          fprintf(stderr, "[lsword] img=%d job=0x%08X LS[0x%05X]=0x%08X io=0x%05X also at:", image_id, job_ea, lsa, v, io_ls);
+          for (uint32_t o = 0; o + 4 <= SPU_LS_SIZE; o += 4) {
+              const uint8_t* p = ctx.ls + o;
+              if (o != (lsa & 0x3FFFC) && ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]) == v)
+                  fprintf(stderr, " 0x%05X", o);
+          }
+          fprintf(stderr, "\n");
+      } }
     s_job_ls_valid = 1;
 
     g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
@@ -398,6 +441,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
+    { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
     free(ls);
     return 0;
 }

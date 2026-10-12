@@ -137,6 +137,20 @@ def read_symbols(buf, shs):
     return funcs
 
 
+def text_image(buf, phs):
+    """(bytes, vaddr) spanning EVERY executable PT_LOAD segment, gaps zeroed.
+    Some task ELFs carry a second PF_X segment (TM level-load task: 0x34B00,
+    called from the main text); lifting only the first left it as stubs."""
+    xs = [ph for ph in phs if ph["type"] == 1 and (ph["flags"] & 1)]
+    if not xs:
+        raise SystemExit("No executable PT_LOAD segment found")
+    lo = min(ph["vaddr"] for ph in xs)
+    img = bytearray(max(ph["vaddr"] + ph["filesz"] for ph in xs) - lo)
+    for ph in xs:
+        img[ph["vaddr"] - lo:ph["vaddr"] - lo + ph["filesz"]] = buf[ph["off"]:ph["off"] + ph["filesz"]]
+    return bytes(img), lo
+
+
 def pick_text(phs):
     """Return (file_off, vaddr, size) of the executable PT_LOAD segment."""
     for ph in phs:
@@ -595,8 +609,10 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
         text_off, text_va, text_size = 0, base, len(buf)
     else:
         elf = parse_elf(buf)
-        text_off, text_va, text_size = pick_text(elf["phs"])
-    code = buf[text_off:text_off + text_size]
+        text_off, text_va, _ = pick_text(elf["phs"])
+        code, text_va = text_image(buf, elf["phs"])
+    if raw:
+        code = buf[text_off:text_off + text_size]
     base = base_override if base_override is not None else text_va
     insns = disassemble_spu(code, base_addr=base)
     insns_by_addr = {ins.addr: ins for ins in insns}

@@ -117,6 +117,24 @@ static inline u128 spu_mpy(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._s3
 static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
 /* sfx: extended subtract rb-ra-1+carry; carry-in = low bit of old rt (RT is 3rd src). */
 static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
+/* Extended-range SPU single <-> double, by bit assembly (exact; this sits on
+ * every float op's slow path, so no ldexp/frexp). Exponent 255 is an ordinary
+ * binade, denormals read as zero, results truncate toward zero. */
+static inline double spu_xf_get(uint32_t b) {
+    uint32_t e = (b >> 23) & 0xFFu;
+    uint64_t d = (uint64_t)(b >> 31) << 63;
+    if (e) d |= ((uint64_t)(e - 127 + 1023) << 52) | ((uint64_t)(b & 0x7FFFFFu) << 29);
+    double v; memcpy(&v, &d, 8); return v;
+}
+static inline uint32_t spu_xf_put(double v) {
+    uint64_t d; memcpy(&d, &v, 8);
+    uint32_t s = (uint32_t)(d >> 63) << 31;
+    int de = (int)((d >> 52) & 0x7FFu);
+    if (de == 0x7FF || de >= 1023 + 129) return s | 0x7FFFFFFFu;   /* NaN/Inf/overflow saturate */
+    if (de < 1023 - 126) return s;                                  /* underflow: zero */
+    return s | ((uint32_t)(de - 1023 + 127) << 23) | (uint32_t)((d >> 29) & 0x7FFFFFu);
+}
+static inline int spu_xf_normal(uint32_t b) { uint32_t e = (b >> 23) & 0xFFu; return e != 0xFFu && (e != 0 || (b & 0x7FFFFFu) == 0); }
 /* FI decodes the base and step fields produced by the hardware estimate
  * instructions; its second operand is not an ordinary reciprocal float. */
 static inline u128 spu_fi(u128 a, u128 b) {
@@ -126,12 +144,12 @@ static inline u128 spu_fi(u128 a, u128 b) {
         uint32_t ra = a._u32[i];
         uint32_t exp = (rb >> 23) & 0xFFu;
         uint32_t base_bits = rb & 0xFFFFFC00u;
-        float base; memcpy(&base, &base_bits, sizeof base);
+        double base = spu_xf_get(base_bits);   /* frest of 0 gives exponent 255: extended range */
         uint32_t step_frac = rb & 0x3FFu;
-        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
-        if (base < 0.0f) step = -step;
-        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
-        r._f32[i] = base - step * y;
+        double step = ldexp((double)step_frac, (int)exp - 127 - 13);
+        if (base < 0.0) step = -step;
+        double y = ldexp((double)(ra & 0x7FFFFu), -19);
+        r._u32[i] = spu_xf_put(base - step * y);
     }
     return r;
 }
@@ -274,25 +292,53 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
 
 /* ---- single-precision float (4 lanes) ---- */
-static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
-static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
+/* ---- SPU single precision is NOT IEEE ----
+ * No Inf or NaN: biased exponent 255 is an ordinary (extended-range) number up
+ * to ~2^129, results that overflow saturate to +/-max (0x7FFFFFFF), and
+ * denormal operands and results are zero. Doing the arithmetic with host IEEE
+ * floats turns frest(0) = 0x7FFFFFFF ("max", which the next fm by 0 brings
+ * back to 0 on hardware) into a NaN that then spreads -- Twisted Metal's Havok
+ * solver handed NaN rigid-body times back to the PPU and its time-of-impact
+ * loop spun forever. Fast path: normal operands with a normal result are
+ * exactly the host float op; anything else goes through double. */
+#define SPU_XF_BIN(name, fexpr, dexpr)                                              \
+static inline u128 name(u128 a, u128 b) { u128 r; for (int i = 0; i < 4; i++) {     \
+    const uint32_t x = a._u32[i], y = b._u32[i];                                    \
+    if (spu_xf_normal(x) && spu_xf_normal(y)) {                                     \
+        const float fa_ = a._f32[i], fb_ = b._f32[i]; float q = (fexpr);            \
+        uint32_t qb; memcpy(&qb, &q, 4);                                            \
+        if (spu_xf_normal(qb)) { r._u32[i] = qb; continue; } }                      \
+    { const double da_ = spu_xf_get(x), db_ = spu_xf_get(y); r._u32[i] = spu_xf_put(dexpr); } } \
+    return r; }
+#define SPU_XF_TRI(name, fexpr, dexpr)                                              \
+static inline u128 name(u128 a, u128 b, u128 c) { u128 r; for (int i = 0; i < 4; i++) { \
+    const uint32_t x = a._u32[i], y = b._u32[i], z = c._u32[i];                     \
+    if (spu_xf_normal(x) && spu_xf_normal(y) && spu_xf_normal(z)) {                 \
+        const float fa_ = a._f32[i], fb_ = b._f32[i], fc_ = c._f32[i]; float q = (fexpr); \
+        uint32_t qb; memcpy(&qb, &q, 4);                                            \
+        if (spu_xf_normal(qb)) { r._u32[i] = qb; continue; } }                      \
+    { const double da_ = spu_xf_get(x), db_ = spu_xf_get(y), dc_ = spu_xf_get(z);   \
+      r._u32[i] = spu_xf_put(dexpr); } }                                            \
+    return r; }
+SPU_XF_BIN(spu_fa, fa_ + fb_, da_ + db_)
+SPU_XF_BIN(spu_fs, fa_ - fb_, da_ - db_)
+SPU_XF_BIN(spu_fm, fa_ * fb_, da_ * db_)
+SPU_XF_TRI(spu_fma,  fmaf(fa_, fb_, fc_),  fma(da_, db_, dc_))
+SPU_XF_TRI(spu_fms,  fmaf(fa_, fb_, -fc_), fma(da_, db_, -dc_))
+SPU_XF_TRI(spu_fnms, fmaf(fa_, -fb_, fc_), fma(da_, -db_, dc_))
+static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(spu_xf_get(a._u32[i])==spu_xf_get(b._u32[i]))?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(spu_xf_get(a._u32[i])>spu_xf_get(b._u32[i]))?0xFFFFFFFFu:0; return r; }
 
 /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
  * The canonical immediates 173 and 155 are identity conversions. */
 static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
+    for(int i=0;i<4;i++){ double v=spu_xf_get(a._u32[i])*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
 static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
+    for(int i=0;i<4;i++){ double v=spu_xf_get(a._u32[i])*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
 static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
-static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
-static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
 
 /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
  * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
@@ -409,8 +455,8 @@ static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._s3
 static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
-static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
-static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
+static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ double fa=fabs(spu_xf_get(a._u32[i])),fb=fabs(spu_xf_get(b._u32[i])); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
+static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ double fa=fabs(spu_xf_get(a._u32[i])),fb=fabs(spu_xf_get(b._u32[i])); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
 static const uint32_t spu_frest_fraction_lut[32] = {
     0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
     0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,

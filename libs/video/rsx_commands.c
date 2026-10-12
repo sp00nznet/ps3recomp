@@ -352,8 +352,49 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * for the frequency divisor (instancing). Captured for read_vp_vertex. */
     if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
 
-    { static u32 s_sem_off = 0;
+    /* NV4097_SET_CONTEXT_DMA_SEMAPHORE (0x01A4) picks where the semaphore
+     * offset points. CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER (0xFEED0001) is
+     * main memory by IO offset: Edge-style SPU geometry jobs release ring
+     * segments that way, and their producer polls that very word -- written
+     * into the label window instead, the read index never moved and every
+     * job spun until the DMA repeat limiter killed it. */
+    /* NV4097_SET_CONTEXT_DMA_NOTIFIES (0x0180) / NV4097_NOTIFY (0x0104): write
+     * {timestamp, 0} to notify slot (ctx & 7) ^ 7 in IO page 0xF1, for the
+     * CELL_GCM_CONTEXT_DMA_NOTIFY_MAIN_n objects (cellGcmGetNotifyDataAddress). */
+    { static u32 s_notify_ctx = 0;
+      if (method == 0x0180) s_notify_ctx = data;
+      if (method == 0x0104) {
+          if ((s_notify_ctx & ~7u) == (0x6660420Fu & ~7u)) {
+              extern void vm_write32(uint32_t a, uint32_t v);
+              extern u32 gcm_io_offset_to_ea(u32 io);
+              extern unsigned long long ps3_ms_now(void);
+              u32 ea = gcm_io_offset_to_ea(0x0F100000u + ((s_notify_ctx & 7u) ^ 7u) * 0x40u);
+              { static int n = 0; if (n++ < 4)   /* TEMP */
+                  fprintf(stderr, "[RSX] NOTIFY slot %u -> ea 0x%08X\n", (s_notify_ctx & 7u) ^ 7u, ea); }
+              if (ea) {
+                  unsigned long long ts = ps3_ms_now() * 1000000ull;
+                  vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts);
+                  vm_write32(ea + 8, 0); vm_write32(ea + 12, 0);
+              }
+          }
+          return 0;
+      } }
+    { static u32 s_sem_off = 0, s_sem_ctx = 0;
+      if (method == 0x01A4) {
+          if (data != s_sem_ctx) { static int _l = 0; if (_l++ < 8)
+              fprintf(stderr, "[RSX] semaphore context dma = 0x%08X\n", data); }
+          s_sem_ctx = data;
+      }
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
+      if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+        extern void vm_write32(uint32_t a, uint32_t v);
+        extern u32 gcm_io_offset_to_ea(u32 io);
+        u32 ea = gcm_io_offset_to_ea(s_sem_off);
+        u32 val = method == 0x1D74 ? data
+                : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+        if (ea) vm_write32(ea, val);
+        return 0;
+      }
       if (method == 0x1D70) {
         extern void vm_write32(uint32_t a, uint32_t v);
         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
@@ -365,6 +406,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        { static u32 seen[64]; static int ns = 0; int k = 0;   /* TEMP: distinct release offsets */
+          for (; k < ns; k++) if (seen[k] == s_sem_off) break;
+          if (k == ns && ns < 64) { seen[ns++] = s_sem_off;
+              fprintf(stderr, "[RSX] first back-end release @off 0x%X val 0x%08X\n", s_sem_off, val); } }
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
       }

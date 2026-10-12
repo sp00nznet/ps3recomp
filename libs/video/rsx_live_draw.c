@@ -3053,11 +3053,148 @@ int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
  * the source live (the alias below) showed whatever the title rendered into
  * it next, and the menu flickered to black on two frames in three.
  * Returns 1 when copied. */
+/* Scaled resolve as a draw. NV3089 scales with independent 20.12 factors per
+ * axis; Twisted Metal resolves its 1280x704 scene into a 642x432 rect at
+ * (39,24) of a 720x480 display buffer (ds ~1.99, dt ~1.63), which no
+ * CopyTextureRegion can express. Draw one triangle covering the destination
+ * rect and sample the source surface with a linear clamp sampler.
+ * One root signature, one PSO per destination format (cached). */
+static ID3D12RootSignature* g_sblit_rs;
+static struct { DXGI_FORMAT fmt; ID3D12PipelineState* pso; } g_sblit_pso[4];
+
+static ID3D12PipelineState* ld_scaled_blit_pso(DXGI_FORMAT fmt)
+{
+    for (int i = 0; i < 4; i++)
+        if (g_sblit_pso[i].pso && g_sblit_pso[i].fmt == fmt) return g_sblit_pso[i].pso;
+    static const char src[] =
+        "cbuffer C : register(b0) { float4 r; };\n"
+        "Texture2D t0 : register(t0);\n"
+        "SamplerState s0 : register(s0);\n"
+        "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+        "V vs(uint id : SV_VertexID) {\n"
+        "    V o; float2 q = float2((id << 1) & 2, id & 2);\n"
+        "    o.p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+        "    o.uv = r.xy + (r.zw - r.xy) * q; return o; }\n"
+        "float4 ps(V i) : SV_Target { return t0.SampleLevel(s0, i.uv, 0); }\n";
+    if (!g_sblit_rs) {
+        D3D12_DESCRIPTOR_RANGE range = {0};
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        range.NumDescriptors = 1;
+        D3D12_ROOT_PARAMETER p[2] = {0};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        p[0].Constants.Num32BitValues = 4;
+        p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[1].DescriptorTable.NumDescriptorRanges = 1;
+        p[1].DescriptorTable.pDescriptorRanges = &range;
+        p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC smp = {0};
+        smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        smp.MaxLOD = D3D12_FLOAT32_MAX;
+        smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {0};
+        rsd.NumParameters = 2; rsd.pParameters = p;
+        rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &smp;
+        ID3DBlob* sig = NULL; ID3DBlob* err = NULL;
+        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+            if (err) err->lpVtbl->Release(err);
+            return NULL;
+        }
+        HRESULT hr = g.dev->lpVtbl->CreateRootSignature(g.dev, 0, sig->lpVtbl->GetBufferPointer(sig),
+                         sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature, (void**)&g_sblit_rs);
+        sig->lpVtbl->Release(sig);
+        if (FAILED(hr)) { g_sblit_rs = NULL; return NULL; }
+    }
+    ID3DBlob* vs = NULL; ID3DBlob* ps = NULL; ID3DBlob* err = NULL;
+    if (FAILED(D3DCompile(src, sizeof(src) - 1u, "scaled_blit", NULL, NULL, "vs", "vs_5_0", 0, 0, &vs, &err)) ||
+        FAILED(D3DCompile(src, sizeof(src) - 1u, "scaled_blit", NULL, NULL, "ps", "ps_5_0", 0, 0, &ps, &err))) {
+        fprintf(stderr, "[scaled-blit] shader compile failed: %s\n",
+                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
+        if (err) err->lpVtbl->Release(err);
+        if (vs) vs->lpVtbl->Release(vs);
+        return NULL;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = g_sblit_rs;
+    pd.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs); pd.VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
+    pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps); pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = 0xFFFFFFFFu;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = fmt;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState* pso = NULL;
+    HRESULT hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    vs->lpVtbl->Release(vs); ps->lpVtbl->Release(ps);
+    if (FAILED(hr)) { fprintf(stderr, "[scaled-blit] PSO failed hr=0x%08lX\n", (unsigned long)hr); return NULL; }
+    for (int i = 0; i < 4; i++)
+        if (!g_sblit_pso[i].pso) { g_sblit_pso[i].fmt = fmt; g_sblit_pso[i].pso = pso; break; }
+    return pso;
+}
+
+/* Draw source surface rect (sx,sy,sw,sh, host pixels) scaled into the
+ * destination surface rect (dx,dy,dw,dh). Returns 1 when recorded. */
+static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
+                          u32 di, u32 dx, u32 dy, u32 dw, u32 dh)
+{
+    surface_t* s = &g.surfaces[si];
+    surface_t* d = &g.surfaces[di];
+    if (!s->tex || !d->tex || !s->w || !s->h || !dw || !dh) return 0;
+    ID3D12PipelineState* pso = ld_scaled_blit_pso(d->fmt);
+    if (!pso) return 0;
+    u32 slots[SRV_TABLE_SIZE];
+    for (u32 i = 0; i < SRV_TABLE_SIZE; i++) slots[i] = SRV_WHITE;
+    slots[0] = SRV_SURFACE_BASE + si;
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
+    if (!table.ptr) return 0;
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = s->tex;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + di);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    g.list->lpVtbl->SetPipelineState(g.list, pso);
+    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_sblit_rs);
+    const float r[4] = { sx / (float)s->w, sy / (float)s->h,
+                         (sx + sw) / (float)s->w, (sy + sh) / (float)s->h };
+    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, r, 0);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+    D3D12_VIEWPORT vp = { (float)dx, (float)dy, (float)dw, (float)dh, 0.0f, 1.0f };
+    D3D12_RECT sc = { (LONG)dx, (LONG)dy, (LONG)(dx + dw), (LONG)(dy + dh) };
+    g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    ld_surface_note_write(di, LD_SURFACE_WRITE_COPY);
+    { static int n = 0; if (n++ < 4)
+        fprintf(stderr, "[scaled-blit] surf %u (%.0f,%.0f %.0fx%.0f) -> surf %u (%u,%u %ux%u)\n",
+                si, sx, sy, sw, sh, di, dx, dy, dw, dh); }
+    return 1;
+}
+
 int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, u32 dt,
                                u32 dst_loc, u32 dst_abs, u32 dst_pitch,
                                u32 out_x, u32 out_y, u32 out_w, u32 out_h)
 {
-    if (!g.ready || !src_pitch || !dst_pitch || ds != dt || ds < 0x100000u) return 0;
+    if (!g.ready || !src_pitch || !dst_pitch || !ds || !dt) return 0;
+    /* Uneven or fractional factors cannot be a copy; they are drawn. */
+    const int scaled = ds != dt || ds < 0x100000u || (ds & 0xFFFFFu) != 0;
     /* Source surface and the rect's guest position inside it. */
     /* The CLOSEST base at or below the address: surfaces' guest ranges
      * overlap (a stale surface at 0x0 "contains" 0x12804 too), and taking the
@@ -3086,6 +3223,17 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     const u32 slot = surface_get(db->location, db->offset, db->width, db->height, g.surfaces[si].fmt);
     if (slot == LD_INVALID_SURFACE || (int)slot == si) return 0;
     surface_t* dst = &g.surfaces[slot];
+    if (scaled) {
+        /* Source extent in the blit's source units, which match host pixels
+         * for a surface the host renders at its guest size. */
+        u32 w = out_w, h = out_h;
+        if (dx >= dst->w || dy >= dst->h) return 0;
+        if (dx + w > dst->w) w = dst->w - dx;
+        if (dy + h > dst->h) h = dst->h - dy;
+        const float sw = (float)out_w * ((float)ds / 1048576.0f);
+        const float sh = (float)out_h * ((float)dt / 1048576.0f);
+        return ld_scaled_blit((u32)si, (float)gx, (float)gy, sw, sh, slot, dx, dy, w, h);
+    }
     if (dst->fmt != g.surfaces[si].fmt) return 0;
     /* Host source position: guest position over the downsample factor. */
     const u32 k = ds >> 20;                       /* 20.12 fixed -> integer factor */
@@ -6591,7 +6739,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             }
         }
     }
-    const u32 prim = g.rsx.current_primitive;
+    /* A polygon is a convex fan around its first vertex -- what the register-
+     * file engine (rsx_draw_engine.c) and the null backend already make of one.
+     * Left unmapped it was dropped outright: Twisted Metal's legal screens
+     * submit 16-vertex polygons. */
+    const u32 prim = g.rsx.current_primitive == 10u /* POLYGON */
+        ? PRIM_TRIANGLE_FAN : g.rsx.current_primitive;
     rsx_vertex_layout_plan used_layout;
     ld_current_vertex_layout(&used_layout);
 #if defined(YZ_PERF_PROFILE)

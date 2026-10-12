@@ -303,8 +303,36 @@ typedef struct {
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
 static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
 
+/* SPU_PCSAMPLE=<secs>: every <secs>, print image and pc of every context
+ * holding an MFC slot -- i.e. every live SPU that has done DMA. Answers
+ * "which SPU task never returned, and where is it" without a debugger. */
+static DWORD WINAPI spu_pcsample_thread(LPVOID p)
+{
+    const DWORD ms = (DWORD)(uintptr_t)p;
+    for (;;) {
+        Sleep(ms);
+        for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
+            spu_context* c = s_mfc_slots[i].ctx;
+            if (c) fprintf(stderr, "[pcsample] slot=%d img=%d spu=0x%X pc=0x%05X lr=0x%05X"
+                                   " r3=0x%08X r81=0x%08X r84=0x%X r13=0x%08X r14=0x%08X\n",
+                           i, c->image_id, c->spu_id, (unsigned)(c->pc & SPU_LS_MASK),
+                           (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), c->gpr[3]._u32[0],
+                           c->gpr[81]._u32[0], c->gpr[84]._u32[0], c->gpr[13]._u32[0], c->gpr[14]._u32[0]);
+        }
+        fflush(stderr);
+    }
+}
+
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    /* Looked up once. mfc_for runs on every MFC channel access, and with
+     * SPU_PCSAMPLE unset `started` never became 1, so every access paid a
+     * getenv: a tenth of all samples in a Twisted Metal profile. */
+    { static volatile LONG checked = 0;
+      if (!checked && !InterlockedExchange(&checked, 1)) {
+          const char* e = getenv("SPU_PCSAMPLE");
+          if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+      } }
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
         if (s_mfc_slots[i].ctx == ctx)
             return &s_mfc_slots[i].mfc;
@@ -2035,7 +2063,17 @@ static int spu_smc_microstep(spu_context* ctx)
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
-        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+        const uint32_t r = spu_interp_run_until(ctx, pc, ctx->drain_ret_pc);
+        /* The interpreter stops where lifted code resumes (a lifted entry, or the
+         * drain's return point) and hands that pc back. Queue the re-entry, or the
+         * drain sees an empty trampoline and ends the whole run there: Twisted
+         * Metal's WWS job manager takes its stall interrupt at 0xA2C, rejoins its
+         * lifted save loop at 0xA60, and every quantum ended before the handler
+         * read ch25, so the job never loaded. At the return point spu_drain_call
+         * recognises this state and returns as before. */
+        if (!(ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)))
+            g_spu_trampoline_fn = spu_indirect_branch;
+        return r ? 1 : 0;
     }
     { static int _n = 0; if (_n++ < 4)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",

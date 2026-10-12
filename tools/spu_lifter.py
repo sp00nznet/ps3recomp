@@ -1111,11 +1111,11 @@ def main() -> None:
     args = p.parse_args()
 
     if args.auto_functions:
-        from find_spu_functions import detect_functions, parse_elf, pick_text
+        from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
         with open(args.auto_functions, "rb") as f:
             elf_buf = f.read()
         funcs, (text_off, base, size) = detect_functions(elf_buf)
-        data = elf_buf[text_off:text_off + size]
+        data, _ = text_image(elf_buf, parse_elf(elf_buf)["phs"])
         if args.base != 0:
             base = args.base  # caller override
         bounds = funcs

@@ -754,6 +754,9 @@ static u32 gcm_io2ea(u32 io)
     return ((u32)ea_page << 20) | (io & 0xFFFFFu);
 }
 
+/* For the RSX method layer: semaphores aimed at main memory carry IO offsets. */
+u32 gcm_io_offset_to_ea(u32 io) { return gcm_io2ea(io); }
+
 /* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
  * recycle path teleports these when it resets a ring without a JUMP command. */
 unsigned long long ps3_ms_now(void)
@@ -1182,6 +1185,7 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
  * chain that led there rather than raw memory around it. */
 #define GCM_TRACE_N 64
 static u32 s_tr_off[GCM_TRACE_N], s_tr_w[GCM_TRACE_N];
+static u32 s_cf_off[8], s_cf_w[8], s_cf_i;   /* last JUMP/CALL words, for GCM_CIRCLE_DUMP */
 static u32 s_tr_i = 0;
 
 /* A branch we cannot take leaves the walker pointing at whatever it
@@ -1613,6 +1617,35 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_tr_off[s_tr_i % GCM_TRACE_N] = s_fifo_getoff;
         s_tr_w[s_tr_i % GCM_TRACE_N] = w;
         s_tr_i++;
+        if (w && ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u || (w & 3u) == 2u)) {
+            s_cf_off[s_cf_i % 8] = s_fifo_getoff; s_cf_w[s_cf_i % 8] = w; s_cf_i++; }
+        /* GCM_WORD_STATS=<secs>: NOP words vs headers vs jumps/calls/returns
+         * walked -- a frame that is mostly NOPs is reserved space someone
+         * (an SPU job) was supposed to fill. */
+        { static int ws = -1; static unsigned long long nop, hdr, jmp, cal, ret, t0;
+          if (ws < 0) { const char* e = getenv("GCM_WORD_STATS"); ws = e ? atoi(e) : 0; }
+          if (ws > 0) {
+              if (!w && s_fifo_getoff < put) { static int mm = 0;
+                  const u32 alias = s_fifo_getoff + 0x11000000u;
+                  if (mm < 6 && ea != alias && vm_read32(alias)) { mm++;
+                      fprintf(stderr, "[io2ea-mismatch] io=%08X walker_ea=%08X (w=0) alias=%08X w=%08X\n",
+                              s_fifo_getoff, ea, alias, vm_read32(alias)); } }
+              if (!w) nop++;
+              else if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) jmp++;
+              else if ((w & 3u) == 2u) cal++;
+              else if (w == 0x00020000u) ret++;
+              else hdr++;
+              extern unsigned long long ps3_ms_now(void);
+              const unsigned long long now = ps3_ms_now();
+              if (!t0) t0 = now;
+              if (now - t0 >= (unsigned long long)ws * 1000u) {
+                  fprintf(stderr, "[words] nop=%llu hdr=%llu jump=%llu call=%llu ret=%llu get=0x%08X put=0x%08X jumps:",
+                          nop, hdr, jmp, cal, ret, s_fifo_getoff, put);
+                  for (u32 t = 4; t >= 1; t--) { u32 q = (s_cf_i - t) % 8;
+                      fprintf(stderr, " %08X@%08X", s_cf_w[q], s_cf_off[q]); }
+                  fprintf(stderr, "\n");
+                  nop = hdr = jmp = cal = ret = 0; t0 = now;
+              } } }
         u32 type = w >> 29;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
@@ -1678,8 +1711,24 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * park standing -- it only patches a park when it reuses that
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* ...but not at once. Twisted Metal writes a frame AFTER
+                   * its park and then patches the park to release it; jumping
+                   * straight to `put` discarded every in-game frame, so the
+                   * match rendered nothing. Give the title GCM_PARK_WAIT_MS
+                   * (default 100) to patch it before following the head. */
+                  if (put != s_fifo_getoff) {
+                      static u32 park_at = 0xFFFFFFFFu; static unsigned long long park_t0;
+                      static int wait_ms = -1;
+                      if (wait_ms < 0) { const char* e = getenv("GCM_PARK_WAIT_MS"); wait_ms = e ? atoi(e) : 100; }
+                      extern unsigned long long ps3_ms_now(void);
+                      const unsigned long long now = ps3_ms_now();
+                      if (park_at != s_fifo_getoff) { park_at = s_fifo_getoff; park_t0 = now; }
+                      if (now - park_t0 >= (unsigned long long)wait_ms) {
+                          park_at = 0xFFFFFFFFu;
+                          gcm_fifo_dump_around(s_fifo_getoff);
+                          gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+                      }
+                  }
                   break;
               }
               s_fifo_getoff = tgt; }
@@ -1743,7 +1792,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) vm_write32(la, v);
+                    else if (m == 0x6Cu) { vm_write32(la, v);
+                        { static int rn = 0; if (s_sema_offset != 0x400u && rn++ < 40)   /* TEMP */
+                            fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); } }
                     else if (m == 0x68u && vm_read32(la) != v) {
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
@@ -1751,7 +1802,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * its own is the half that unblocks a waiting guest. */
             static int blk = -1;
             if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
-            if (blk) { sem_blocked = 1; break; }
+            if (blk) {
+                { static u32 lo = 0xFFFFFFFFu, lv; static int ln = 0;   /* TEMP: what the RSX waits on */
+                  if ((lo != s_sema_offset || lv != v) && ln++ < 60) { lo = s_sema_offset; lv = v;
+                      fprintf(stderr, "[SEMA-WAIT] get=0x%08X off=0x%X want=0x%08X have=0x%08X\n",
+                              s_fifo_getoff, s_sema_offset, v, vm_read32(la)); } }
+                sem_blocked = 1; break; }
         }
                 }
                 if (sem_blocked) break;
@@ -1843,6 +1899,30 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
                   if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
+                /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
+                 * (subchannel, method) pairs dispatched since the last report --
+                 * what a frame is actually made of when nothing draws. */
+                { static int hs = -1; static u32 cnt[8][0x800]; static unsigned long long t0;
+                  if (hs < 0) { const char* e = getenv("GCM_METHOD_HIST"); hs = e ? atoi(e) : 0; }
+                  if (hs > 0) {
+                      cnt[subch & 7][(m & 0x1FFCu) >> 2]++;
+                      extern unsigned long long ps3_ms_now(void);
+                      const unsigned long long now = ps3_ms_now();
+                      if (!t0) t0 = now;
+                      if (now - t0 >= (unsigned long long)hs * 1000u) {
+                          t0 = now;
+                          fprintf(stderr, "[mhist]");
+                          for (int top = 0; top < 16; top++) {
+                              u32 bs = 0, bm = 0, bc = 0;
+                              for (u32 sc = 0; sc < 8; sc++) for (u32 mi = 0; mi < 0x800; mi++)
+                                  if (cnt[sc][mi] > bc) { bc = cnt[sc][mi]; bs = sc; bm = mi; }
+                              if (!bc) break;
+                              fprintf(stderr, " %u:%04X=%u", bs, bm << 2, bc);
+                              cnt[bs][bm] = 0;
+                          }
+                          fprintf(stderr, "\n");
+                          memset(cnt, 0, sizeof cnt);
+                      } } }
 
                 /* And into the platform-neutral register-file draw engine,
                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
@@ -1942,6 +2022,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   fprintf(stderr, "[cellGcmSys] FIFO walker circling (get=0x%08X, "
                           "put=0x%08X, full budget burned x%d) -- following the "
                           "write head\n", s_fifo_getoff, put, burned);
+              /* What the walker circles in: the words at get, and where the
+               * buffer it is in was jumped/called from (GCM_CIRCLE_DUMP=1). */
+              if (n <= 3 && getenv("GCM_CIRCLE_DUMP"))
+                  for (u32 t = 0; t < 8; t++) {
+                      u32 q = (s_cf_i + t) % 8;
+                      if (s_cf_w[q]) fprintf(stderr, "[circle-jump] at io=%08X w=%08X\n", s_cf_off[q], s_cf_w[q]);
+                  }
+              if (n <= 3 && getenv("GCM_CIRCLE_DUMP"))
+                  for (int k = -8; k <= 24; k++) {
+                      u32 io = s_fifo_getoff + (u32)(k * 4), ea = gcm_io2ea(io);
+                      if (ea) fprintf(stderr, "[circle] %+3d io=%08X ea=%08X w=%08X\n", k, io, ea, vm_read32(ea));
+                  }
               gcm_fifo_resync_why("circling", &s_fifo_getoff, put);
               burned = 0;
           }
@@ -2572,8 +2664,20 @@ static u32 gcm_io_alloc(u32 size)
     if (s_io_alloc_next == 0)
         s_io_alloc_next = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
     if (s_io_alloc_next < 0x100000u) s_io_alloc_next = 0x100000u;
+    /* Skip pages a title mapped itself at a fixed offset. Twisted Metal maps
+     * its command rings at IO 0x0F100000 with cellGcmMapEaIoAddress; the
+     * AddressToOffset auto-maps bumped into that range mid-match, remapped the
+     * ring's pages, and the FIFO walker read every frame from the wrong memory
+     * -- the match presented black frames with no draws. */
+    const u32 pages = (size + 0xFFFFFu) >> 20;
+    for (;;) {
+        u32 p = 0, page = s_io_alloc_next >> 20;
+        while (p < pages && page + p < 65536 && s_ea_address_table[page + p] == 0xFFFF) p++;
+        if (p == pages || page + p >= 65536) break;
+        s_io_alloc_next = (page + p + 1) << 20;   /* past the taken page */
+    }
     u32 io = s_io_alloc_next;
-    s_io_alloc_next += (size + 0xFFFFFu) & ~0xFFFFFu;
+    s_io_alloc_next += pages << 20;
     return io;
 }
 
@@ -2783,6 +2887,9 @@ u32* cellGcmGetLabelAddress(u8 index)
         printf("[cellGcmSys] WARNING: GetLabelAddress index %u out of range\n", index);
         return NULL;
     }
+    { static int n = 0; if (n++ < 32)   /* TEMP */
+        fprintf(stderr, "[cellGcmSys] GetLabelAddress(0x%X) -> 0x%08X\n", index,
+                GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE); }
     return (u32*)(uintptr_t)(GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE);
 }
 
@@ -2959,12 +3066,18 @@ void cellGcmSetDebugOutputLevel(u32 level)
  * -----------------------------------------------------------------------*/
 
 /* Notify data area — similar to report data, 16 bytes per slot */
-static u8 s_notify_data[256 * 16];
 
+/* Notify data lives in the IO page 0xF1 (IO 0x0F100000 + index * 0x40), the
+ * page NV4097_NOTIFY writes {timestamp, 0} into. This returned a HOST pointer,
+ * so the guest wrote its "pending" flags through a truncated address and the
+ * RSX had nothing to clear: Twisted Metal's SpuPostFX thread waits for that
+ * clear, so post-processing never ran and the frame label it releases never
+ * moved. NULL when the title has not mapped the page, as libgcm does. */
 void* cellGcmGetNotifyDataAddress(u32 index)
 {
-    if (index >= 256) return NULL;
-    return &s_notify_data[index * 16];
+    u32 ea = gcm_io2ea(0x0F100000u);
+    if (index >= 256 || !ea) return NULL;
+    return (void*)(uintptr_t)(ea + index * 0x40u);
 }
 
 /* Timestamp location — returns CELL_GCM_LOCATION_LOCAL or MAIN */

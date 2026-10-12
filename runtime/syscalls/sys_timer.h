@@ -52,6 +52,8 @@ typedef struct sys_timer_info {
     int32_t  event_queue_id;   /* connected event queue */
     uint64_t source;           /* event source value */
     uint64_t data1;            /* event data1 */
+    uint64_t data2;            /* event data2 (connect's fifth argument) */
+    uint64_t next_expire;      /* next expiration, us on the timer clock */
 
 #ifdef _WIN32
     HANDLE   timer_handle;

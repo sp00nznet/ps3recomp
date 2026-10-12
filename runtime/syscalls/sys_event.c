@@ -63,6 +63,10 @@ static void write_be32(uint32_t addr, uint32_t val)
     *p = val;
 }
 
+/* Last event pushed to each queue, for EVT_RECV_KICK. */
+static sys_event_t s_last_evt[SYS_EVENT_QUEUE_MAX];
+static int s_have_last_evt[SYS_EVENT_QUEUE_MAX];
+
 static uint64_t bswap64(uint64_t v)
 {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
@@ -471,6 +475,33 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
+    /* EVT_RECV_KICK=<qid>:<ms>: an infinite wait on that queue that sees
+     * nothing for <ms> gets the last event pushed to the queue re-delivered.
+     * For a completion queue whose producer intermittently loses a wakeup:
+     * the waiter re-checks its own state and waits again if it was not done.
+     * ponytail: papers over a lost SPU completion; find the loss to remove it. */
+    static int s_kq = -1; static DWORD s_kms = 0;
+    if (s_kq < 0) { const char* e = getenv("EVT_RECV_KICK"); s_kq = 0;
+        if (e) { s_kq = atoi(e); const char* c = strchr(e, ':'); s_kms = c ? (DWORD)atoi(c + 1) : 500; } }
+    if (timeout_us == 0 && s_kq == (int)queue_id && s_have_last_evt[queue_id - 1]) {
+        while (q->count == 0 && q->active && !q->cancelled) {
+            if (!SleepConditionVariableCS(&q->not_empty, &q->lock, s_kms) && q->count == 0) {
+                sys_event_t evt = s_last_evt[queue_id - 1];
+                LeaveCriticalSection(&q->lock);
+                { static int n = 0; if (n++ < 16)
+                    fprintf(stderr, "[evt] EVT_RECV_KICK: q=%u idle %lu ms -> re-delivered last event\n",
+                            queue_id, (unsigned long)s_kms); }
+                ctx->gpr[4] = evt.source; ctx->gpr[5] = evt.data1;
+                ctx->gpr[6] = evt.data2;  ctx->gpr[7] = evt.data3;
+                if (event_addr) {
+                    uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+                    out[0] = bswap64(evt.source); out[1] = bswap64(evt.data1);
+                    out[2] = bswap64(evt.data2);  out[3] = bswap64(evt.data3);
+                }
+                return CELL_OK;
+            }
+        }
+    }
     if (timeout_us == 0) {
         while (q->count == 0 && q->active && !q->cancelled) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
@@ -694,6 +725,15 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
+    { const int qi = (int)(q - g_sys_event_queues);
+      if (qi >= 0 && qi < SYS_EVENT_QUEUE_MAX) { s_last_evt[qi] = *evt; s_have_last_evt[qi] = 1; } }
+    /* EVT_PUSHLOG=<qid>: log every push to that queue with the host caller, to
+     * find which producer feeds a queue when nothing logs a port_send. */
+    { static int s_q = -1; if (s_q < 0) { const char* e = getenv("EVT_PUSHLOG"); s_q = e ? atoi(e) : 0; }
+      if (s_q && q == &g_sys_event_queues[s_q - 1]) { static int s_n = 0;
+        if (s_n++ < 200) fprintf(stderr, "[evt-push] q=%d src=0x%llX d=0x%llX/0x%llX/0x%llX ra=%p\n",
+                s_q, (unsigned long long)evt->source, (unsigned long long)evt->data1,
+                (unsigned long long)evt->data2, (unsigned long long)evt->data3, __builtin_return_address(0)); } }
     /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
      * how many events are sitting in it unread.
      *

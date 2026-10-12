@@ -878,6 +878,25 @@ extern "C" void ppu_resv_break_store(uint64_t ea)
             c->reserve_addr = PPU_RESV_INVALID;
     }
 }
+/* Break every PPU reservation in ea's 128-byte line, except the calling
+ * thread's own. The Cell reservation granule is the LINE, not the word: an SPU
+ * PUTLLC that rewrites other words of a line must fail a PPU lwarx/stwcx. on
+ * it, and the per-word value-CAS cannot see that. Havok keeps its job queue in
+ * lines both sides update; letting the PPU commit over an SPU update corrupted
+ * the queue into a cycle that an SPU task then walked forever.
+ * Called (via spu_coh_notify_write) for every write to an SPU-reserved line. */
+extern "C" void ppu_resv_break_line(uint32_t ea)
+{
+    const uint32_t line = ea & ~127u;
+    ppu_context* self = g_active_ctx;
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (c && c != self && c->reserve_addr < PPU_RESV_INVALID &&
+            ((uint32_t)c->reserve_addr & ~127u) == line)
+            c->reserve_addr = PPU_RESV_INVALID;
+    }
+}
 static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
 static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
 static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }

@@ -932,6 +932,10 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
+            { extern void spu_taskset_mark_running(uint32_t, uint32_t);
+              spu_taskset_mark_running(taskset_ea, i); }
+            { extern void spu_taskset2_set_exit(uint32_t, uint32_t, int, uint32_t);
+              spu_taskset2_set_exit(taskset_ea, i, 0, 0); }   /* fresh entry for a recycled id */
             spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
                                    (uint64_t)context_ea, task_arg, task_lsp);
             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
@@ -1491,9 +1495,25 @@ static WklPm* spurs_resolve_pm(u32 wid)
     if (r->fn)
         printf("[cellSpurs] wid=%u PM resolved (fp=0x%016llX image=%d)\n",
                wid, (unsigned long long)fp, r->image_id);
-    else
+    else {
         printf("[cellSpurs] wid=%u PM NOT LIFTED (fp=0x%016llX size=%u) -- workload will not run\n",
                wid, (unsigned long long)fp, w->sizePm);
+        /* SPU_DUMP_MISS=<dir>: write the PM exactly as fingerprinted, like the
+         * two miss paths in spu_workload.c. This path refused the workload
+         * before either of those ran, so an unlifted PM was never captured. */
+        const char* dir = getenv("SPU_DUMP_MISS");
+        if (dir && *dir) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/spujob_%016llX_%u.bin",
+                     dir, (unsigned long long)fp, w->sizePm);
+            FILE* f = fopen(path, "wb");
+            if (f) {
+                fwrite(vm_base + (uint32_t)(uintptr_t)w->pm, 1, w->sizePm, f);
+                fclose(f);
+                printf("[cellSpurs] wid=%u PM dumped to %s\n", wid, path);
+            }
+        }
+    }
     return r->fn ? r : NULL;
 }
 

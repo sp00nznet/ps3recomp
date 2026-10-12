@@ -9,6 +9,7 @@
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
@@ -372,6 +373,7 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
 #define TS_TRACK 8
 static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
 static volatile LONG s_ts_lock;
+static _Thread_local int s_ts_held;   /* this thread holds s_ts_lock */
 static uint8_t* ts_running(uint32_t taskset_ea)
 {
     for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
@@ -383,7 +385,7 @@ static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
 
 static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
 {
-    if (!taskset_ea || t >= 128) return;
+    if (!taskset_ea || t >= 128 || s_ts_held) return;   /* held: caller set it */
     ts_lock();
     uint8_t* r = ts_running(taskset_ea);
     uint8_t m = (uint8_t)(0x80u >> (t & 7));
@@ -391,13 +393,56 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
     ts_unlock();
 }
 
+/* For cellSpursCreateTask: mark the slot running BEFORE its ready/enabled
+ * bits go into the taskset, or a task exiting in between starts it too. */
+void spu_taskset_mark_running(uint32_t taskset_ea, uint32_t t)
+{
+    spu_taskset_mark(taskset_ea, t, 1);
+}
+
+/* CellSpursTaskset2 keeps a 16-byte task_exit_code[128] at +0x1980 that the
+     * SPU-side join reads: byte 14 must be 0 (non-zero reads as ESRCH), byte 15 low nibble =
+     * state (2 = exited, 4 = joined), exit code at +8. The SPURS kernel writes
+     * it when a task exits; nothing here did, so a task that joins its workers
+     * (Havok's master SPU task does) retried forever and the PPU waited on it.
+     * Only Taskset2s have the array -- a v1 taskset ends at 0x1900. */
+static uint32_t s_ts2[16]; static int s_n_ts2;
+void spu_taskset2_register(uint32_t ea)
+{
+    for (int i = 0; i < s_n_ts2; i++) if (s_ts2[i] == ea) return;
+    if (s_n_ts2 < 16) s_ts2[s_n_ts2++] = ea;
+}
+static int spu_taskset_is_v2(uint32_t ea)
+{
+    for (int i = 0; i < s_n_ts2; i++) if (s_ts2[i] == ea) return 1;
+    return 0;
+}
+void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint32_t code)
+{
+    extern uint8_t* vm_base;
+    if (task >= 128 || !spu_taskset_is_v2(taskset_ea)) return;
+    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_coh_notify_write(uint32_t);
+    const uint32_t ea = taskset_ea + 0x1980 + 16u * task;
+    uint8_t* e = vm_base + ea;
+    spu_lockline_lock();   /* a joining SPU may hold a reservation on this line */
+    memset(e, 0, 16);
+    if (exited) {
+        e[8] = (uint8_t)(code >> 24); e[9] = (uint8_t)(code >> 16); e[10] = (uint8_t)(code >> 8); e[11] = (uint8_t)code;
+        e[15] = 2;   /* exited, not yet joined; byte 14 must stay 0 or the join reports ESRCH */
+    }
+    spu_coh_notify_write(ea);
+    spu_lockline_unlock();
+}
+
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-    ts_lock();
+    ts_lock(); s_ts_held = 1;
     uint8_t* ts = vm_base + taskset_ea;
     uint8_t* run = ts_running(taskset_ea);
+    if (done_task < 128) spu_taskset2_set_exit(taskset_ea, done_task, 1, 0);
     if (done_task < 128) {
         uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
         ts[0x10 + done_task / 8] &= (uint8_t)~m;
@@ -412,6 +457,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         const uint8_t* ti = ts + 0x80 + 0x30 * t;
         uint32_t elf = ((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) |
                        ((uint32_t)ti[0x16] << 8) | ti[0x17];
+        elf &= ~0xFu;   /* low bits are flags: an SPU-side CreateTask2 stores elf|4 */
         uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
                        ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
         if (!elf) continue;
@@ -424,7 +470,15 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
         spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
     }
-    ts_unlock();
+    s_ts_held = 0; ts_unlock();
+}
+
+/* Start any task that is enabled + ready/pending but not running. The scan
+ * otherwise runs only when a task exits, and a task an SPU creates after the
+ * last exit (Havok's master recreates its workers) was never noticed. */
+void spu_taskset_start_pending(uint32_t taskset_ea)
+{
+    if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu);
 }
 
 static void spu_async_run(spu_async_job* j)
@@ -857,7 +911,28 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                 (unsigned long long)fp, image_id, job_ea);
         fflush(stderr);
     }
+    /* SPU_JOBPROF=<secs>: host time spent per job image, printed every <secs>.
+     * Jobs run synchronously on the pushing thread, so this is frame time. */
+    static int s_prof = -1;
+    if (s_prof < 0) { const char* e = getenv("SPU_JOBPROF"); s_prof = e ? atoi(e) : 0; }
+    struct timespec t0, t1;
+    if (s_prof) timespec_get(&t0, TIME_UTC);
     int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
+    if (s_prof) {
+        static double acc[64], last; static unsigned cnt[64];
+        timespec_get(&t1, TIME_UTC);
+        double now = t1.tv_sec + t1.tv_nsec * 1e-9;
+        unsigned k = (unsigned)image_id & 63;
+        acc[k] += now - (t0.tv_sec + t0.tv_nsec * 1e-9); cnt[k]++;
+        if (now - last >= s_prof) {
+            last = now;
+            for (unsigned i = 0; i < 64; i++) if (cnt[i]) {
+                fprintf(stderr, "[jobprof] image=%u n=%u total=%.2fs avg=%.2fms\n",
+                        i, cnt[i], acc[i], acc[i] * 1e3 / cnt[i]);
+                acc[i] = 0; cnt[i] = 0;
+            }
+        }
+    }
     if (verbose) {
         fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
         fflush(stderr);
@@ -1183,6 +1258,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * tasks that made both run task 1's descriptor. */
     { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
       j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+    /* Mark the task running NOW, not when its thread starts: in that gap another
+     * task's exit saw it ready-but-not-running and started it a second time
+     * (Twisted Metal's level-load inflate tasks each ran twice, concurrently). */
+    spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is
