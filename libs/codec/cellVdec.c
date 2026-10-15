@@ -5,8 +5,8 @@
  * PS3RECOMP_FFMPEG_RUNTIME and the library is present (vdec_ffmpeg.c,
  * ffmpeg_runtime.c): every AU is decoded, pictures are queued in display
  * order and announced with PICOUT, and GetPicture converts them to the
- * requested format. Otherwise this is the callback-only decoder it always
- * was: AUDONE and PICOUT per AU, and a black picture.
+ * requested format. Open fails if no real decoder is available; strict boot
+ * stops with a diagnostic. The legacy callback-only path is not admitted.
  */
 
 #include "cellVdec.h"
@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vdec_ffmpeg.h"
+#include "ps3emu/strict_boot.h"
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
@@ -173,6 +174,13 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
             s_vdec[i].cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
             s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
             s_vdec[i].ff = vdec_ff_open(codec_type);
+            if (!s_vdec[i].ff) {
+                memset(&s_vdec[i], 0, sizeof(VdecSlot));
+                ps3_strict_boot_guard("vdec-decoder-unavailable",
+                    "operation=cellVdecOpen codec=%u callback=0x%08X", codec_type, cb_ea);
+                fprintf(stderr, "[cellVdec] no decoder for codec %u; open failed\n", codec_type);
+                return (s32)CELL_VDEC_ERROR_FATAL;
+            }
             vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellVdec] Open -> handle=%u\n", i);
             if (s_vdec[i].ff)

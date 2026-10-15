@@ -5,7 +5,7 @@
  * queue, pic items); this file turns one access unit into zero or more
  * decoded pictures, and stores a picture into guest memory in the format a
  * title asks for. Without PS3RECOMP_FFMPEG_RUNTIME, or when FFmpeg is not
- * found, vdec_ff_open returns NULL and cellVdec keeps its callback-only path.
+ * found, vdec_ff_open returns NULL and cellVdecOpen fails visibly.
  */
 
 #ifndef PS3RECOMP_VDEC_FFMPEG_H
