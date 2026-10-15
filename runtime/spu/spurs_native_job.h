@@ -12,13 +12,20 @@ typedef enum spurs_native_job_status {
  SPURS_NATIVE_JOB_BUSY,SPURS_NATIVE_JOB_UNQUALIFIED,
  SPURS_NATIVE_JOB_HALTED,SPURS_NATIVE_JOB_STOPPED,
  SPURS_NATIVE_JOB_BAD_RETURN,SPURS_NATIVE_JOB_INPUT_MISMATCH,
- SPURS_NATIVE_JOB_PENDING
+ SPURS_NATIVE_JOB_PENDING,SPURS_NATIVE_JOB_INDIRECT_REJECTED
 } spurs_native_job_status;
+typedef enum spurs_native_indirect_failure {
+ SPURS_NATIVE_INDIRECT_OK=0,SPURS_NATIVE_INDIRECT_CONTEXT,
+ SPURS_NATIVE_INDIRECT_MISALIGNED,SPURS_NATIVE_INDIRECT_RANGE,
+ SPURS_NATIVE_INDIRECT_UNKNOWN,SPURS_NATIVE_INDIRECT_RETURN
+} spurs_native_indirect_failure;
 typedef struct spurs_native_job_result {
  spurs_native_job_status status;
  uint32_t pc,spu_status,stop_code,completed_gets;
  int halt_landing;
  uint32_t completed_puts,completed_transfers;
+ spurs_native_indirect_failure indirect_failure;
+ uint32_t indirect_pc;
 } spurs_native_job_result;
 /* No guest descriptor/image rereads, arbitrary dispatch entry or readiness
  * assertion. Resolution requires a sealed trusted-startup registry. The owner
@@ -41,6 +48,14 @@ spurs_native_job_result spurs_native_job_dispatch(
  * hooks never read guest input or synthesize it. */
 void spurs_native_job_mfc_before(spu_context*,uint32_t command);
 void spurs_native_job_mfc_after(spu_context*,uint32_t command);
+/* Production dispatch/drain only. TLS-bound actual leased context and exact
+ * immutable profile, independent of mutable legacy image/resident IDs.
+ * Indirect returns zero only outside a native frame. Inside it returns one
+ * with the exact host target (NULL for normal sentinel return), or halts.
+ * resume is a nonmutating active-frame query for the drain's continuation path.
+ * It also rejects a foreign context, never authorizing its legacy fallback. */
+int spurs_native_job_indirect(spu_context*,void (**target)(spu_context*));
+int spurs_native_job_resume(spu_context*);
 #ifdef __cplusplus
 }
 #endif

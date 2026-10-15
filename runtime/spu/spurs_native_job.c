@@ -2,6 +2,7 @@
 #include "spurs_native_registry.h"
 #include "ps3emu/strict_boot.h"
 #include <string.h>
+#include <stdio.h>
 extern int spu_run_with_halt(void (*)(spu_context*),spu_context*);
 extern void spu_halt(spu_context*);
 extern int spu_mfc_context_quiescent(spu_context*);
@@ -12,8 +13,45 @@ typedef struct native_frame {
  unsigned completed_puts,completed_transfers;
  int pending;
  int input_mismatch;
+ spurs_native_indirect_failure indirect_failure;
+ uint32_t indirect_pc;
 } native_frame;
 static SPU_CONTEXT_TLS native_frame* active_native;
+static void indirect_reject(native_frame*f,spu_context*ctx,spurs_native_indirect_failure why)
+{
+ f->indirect_failure=why;f->indirect_pc=ctx->pc;
+ fprintf(stderr,"[spurs-native-indirect-rejected] category=%u pc=0x%08X\n",(unsigned)why,(unsigned)ctx->pc);
+ f->context->status=SPU_STATUS_STOPPED_BY_HALT;
+ spu_halt(f->context);
+}
+int spurs_native_job_resume(spu_context*ctx)
+{
+ native_frame*f=active_native;
+ if(!f)return 0;
+ if(f->context!=ctx)indirect_reject(f,ctx,SPURS_NATIVE_INDIRECT_CONTEXT);
+ return 1;
+}
+int spurs_native_job_indirect(spu_context*ctx,void (**target)(spu_context*))
+{
+ native_frame*f=active_native;
+ if(!f)return 0;
+ *target=NULL;
+ if(f->context!=ctx){indirect_reject(f,ctx,SPURS_NATIVE_INDIRECT_CONTEXT);return 1;}
+ uint32_t pc=ctx->pc;
+ if(pc&3){indirect_reject(f,ctx,SPURS_NATIVE_INDIRECT_MISALIGNED);return 1;}
+ if(pc>=SPU_LS_SIZE){indirect_reject(f,ctx,SPURS_NATIVE_INDIRECT_RANGE);return 1;}
+ if(pc==f->profile->layout.return_pc){
+  if(ctx->host_depth!=1){indirect_reject(f,ctx,SPURS_NATIVE_INDIRECT_RETURN);return 1;}
+  g_spu_trampoline_fn=NULL;return 1;
+ }
+ const spurs_native_targets*t=&f->profile->targets;
+ uint32_t lo=0,hi=t->count;
+ while(lo<hi){uint32_t mid=lo+(hi-lo)/2;
+  if(t->entries[mid].pc<pc)lo=mid+1;else hi=mid;
+ }
+ if(lo==t->count||t->entries[lo].pc!=pc){indirect_reject(f,ctx,SPURS_NATIVE_INDIRECT_UNKNOWN);return 1;}
+ *target=t->entries[lo].entry;return 1;
+}
 static void input_reject(native_frame* frame)
 {
  frame->input_mismatch=1;
@@ -72,7 +110,7 @@ static void native_landing(spu_context* ctx)
 spurs_native_job_result spurs_native_job_dispatch(
  const spurs_job_snapshot* snapshot,spurs_owner_token owner,uint32_t worker_index)
 {
- spurs_native_job_result result={SPURS_NATIVE_JOB_INVALID,0,0,0,0,0,0,0};
+ spurs_native_job_result result={0};result.status=SPURS_NATIVE_JOB_INVALID;
  const spurs_native_profile* profile=NULL;
  spurs_native_status resolved=spurs_native_registry_resolve(snapshot,&profile);
  if(resolved!=SPURS_NATIVE_OK){
@@ -115,12 +153,14 @@ spurs_native_job_result spurs_native_job_dispatch(
  ctx->gpr[126]._u32[0]=layout->image;
  uint32_t old_depth=ctx->host_depth,old_drain=ctx->drain_ret_pc,old_steps=ctx->steps;
  ctx->pc=profile->entry_pc;ctx->status=SPU_STATUS_RUNNING;
- native_frame frame={ctx,profile,0,0,0,0,0};active_native=&frame;
+ native_frame frame={0};frame.context=ctx;frame.profile=profile;active_native=&frame;
  result.halt_landing=spu_run_with_halt(native_landing,ctx);
  result.pc=ctx->pc;result.spu_status=ctx->status;result.stop_code=ctx->stop_code;
  result.completed_gets=frame.completed_gets;
  result.completed_puts=frame.completed_puts;result.completed_transfers=frame.completed_transfers;
- if(frame.input_mismatch)result.status=SPURS_NATIVE_JOB_INPUT_MISMATCH;
+ result.indirect_failure=frame.indirect_failure;result.indirect_pc=frame.indirect_pc;
+ if(frame.indirect_failure)result.status=SPURS_NATIVE_JOB_INDIRECT_REJECTED;
+ else if(frame.input_mismatch)result.status=SPURS_NATIVE_JOB_INPUT_MISMATCH;
  else if(result.halt_landing||ctx->status==SPU_STATUS_STOPPED_BY_HALT)result.status=SPURS_NATIVE_JOB_HALTED;
  else if(ctx->status!=SPU_STATUS_RUNNING)result.status=SPURS_NATIVE_JOB_STOPPED;
  else if(ctx->pc!=layout->return_pc||g_spu_trampoline_fn||ctx->host_depth!=1)result.status=SPURS_NATIVE_JOB_BAD_RETURN;

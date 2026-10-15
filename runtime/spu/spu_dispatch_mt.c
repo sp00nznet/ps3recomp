@@ -14,6 +14,7 @@
  * image-23 cri hack, lookup miss diagnostics) falls back to the full resolver.
  */
 #include "spu_context.h"
+#include "spurs_native_job.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -23,6 +24,10 @@ void spu_indirect_branch(spu_context* ctx);               /* full resolver in th
 
 void spu_indirect_branch_mt(spu_context* ctx)
 {
+    /* A native frame owns its exact raw PC and immutable profile targets.
+     * Enter the complete resolver before masking or legacy/global lookup. */
+    if (spurs_native_job_resume(ctx))
+        __attribute__((musttail)) return spu_indirect_branch(ctx);
     uint32_t pc = ctx->pc & SPU_LS_MASK;
     /* PS3_SPU_PCWATCH: attribute silent SPU spins (a task that stops logging
      * but never returns). Each SPU job runs on its own host thread, so a

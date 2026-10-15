@@ -10,6 +10,8 @@ extern "C" {
 #define SPURS_NATIVE_DMA_MAX_STEPS 16u
 #define SPURS_NATIVE_DMA_MAX_BYTES 262144u
 typedef void (*spurs_native_entry)(spu_context*);
+typedef struct spurs_native_target {uint32_t pc;spurs_native_entry entry;} spurs_native_target;
+typedef struct spurs_native_targets {const spurs_native_target *entries;uint32_t count;} spurs_native_targets;
 typedef struct spurs_native_layout {uint32_t image,descriptor,context,context_size,stack,stack_size,return_pc;} spurs_native_layout;
 enum spurs_native_input_kind {SPURS_NATIVE_INPUT_NONE=0,SPURS_NATIVE_INPUT_EXACT_GET=1,SPURS_NATIVE_INPUT_EXACT_GET_PAIR=2,SPURS_NATIVE_INPUT_ORDERED_DMA=3};
 typedef struct spurs_native_input {uint32_t kind,lsa,size,tag;uint64_t ea;uint8_t expected[16];} spurs_native_input;
@@ -20,12 +22,14 @@ typedef struct spurs_native_definition {
  spurs_native_entry entry;uint32_t entry_pc;spurs_native_layout layout;spurs_native_input input;
  const char *source_sha256,*build_sha256;
  spurs_native_dma_sequence dma;
+ spurs_native_targets targets;
 } spurs_native_definition;
 typedef struct spurs_native_profile {
  const uint8_t *image,*descriptor_template;uint32_t image_size,descriptor_size;uint64_t fingerprint;
  spurs_native_entry entry;uint32_t entry_pc;spurs_native_layout layout;spurs_native_input input;
  char source_sha256[65],build_sha256[65];
  spurs_native_dma_sequence dma;uint32_t allocation_size;
+ spurs_native_targets targets;
 } spurs_native_profile;
 typedef enum spurs_native_status {SPURS_NATIVE_OK=0,SPURS_NATIVE_DUPLICATE,
  SPURS_NATIVE_INVALID,SPURS_NATIVE_CONFLICT,SPURS_NATIVE_FULL,SPURS_NATIVE_SEALED,
@@ -52,6 +56,14 @@ typedef enum spurs_native_status {SPURS_NATIVE_OK=0,SPURS_NATIVE_DUPLICATE,
  * descriptor's BE16+0x1E 16-byte units; stack_size remains the requested size.
  * No title is registered automatically; no context/readiness/dispatch is created.
  * Inputs/output pointers refer to stable caller-owned HOST memory. */
+/* Optional exact target table, strictly increasing by aligned absolute LS PC,
+ * within this image. A nonempty table includes entry_pc with the same entry.
+ * Empty means no indirect code targets. No data/sentinel/outside-image entry
+ * is admitted. Registration deep-copies the table and binds it to this exact
+ * image/descriptor/profile; changing it conflicts with an existing profile.
+ * Functions are trusted process-lifetime HOST pointers, not code authentication
+ * or a sandbox. Code versus data classification remains the trusted caller's
+ * obligation. No global registry/wildcard mappings are used by a native frame. */
 spurs_native_status spurs_native_registry_register(const spurs_native_definition*,const spurs_native_profile **out);
 /* Seal succeeds once; repeated calls return SEALED. No unregister/destructor. */
 spurs_native_status spurs_native_registry_seal(void);

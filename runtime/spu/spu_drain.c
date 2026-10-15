@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spurs_native_job.h"
 #include <setjmp.h>
 
 /* See spu_context.h `irq_frame`. */
@@ -59,6 +60,9 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
+    /* Native profiles have their own caller and target contract. Legacy
+     * completion/policy/stack-reset heuristics must not preempt its resolver. */
+    if (spurs_native_job_resume(ctx)) return;
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
@@ -406,9 +410,11 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
     f.prev = 0; f.depth = 0; f.image_id = 0;
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
+        int native_active = spurs_native_job_resume(ctx);
         while (g_spu_trampoline_fn) {
             if (g_spu_trampoline_fn == spu_indirect_branch &&
-                (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
+                (native_active ? ctx->pc == return_pc :
+                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK))) {
                 g_spu_trampoline_fn = 0;
                 SPU_DRAIN_POP_IRQ();
                 return;
@@ -443,9 +449,17 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             }
             fn(ctx);
         }
-        if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
+        if (native_active ? ctx->pc == return_pc :
+            (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
             SPU_DRAIN_POP_IRQ();
             return;
+        }
+        /* Return-shaped targets can be continuations whose host frame was
+         * tail-jumped away. Native frames resolve these before ANY global
+         * probe/restart, preserving exact PC rejection and profile ownership. */
+        if (native_active) {
+            g_spu_trampoline_fn = spu_indirect_branch;
+            continue;
         }
         {
             uint32_t pc = ctx->pc & SPU_LS_MASK;

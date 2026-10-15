@@ -84,30 +84,54 @@ static uint32_t allocation_size(const spurs_native_definition*d)
 }
 static int input_equal(spurs_native_input a,spurs_native_input b)
 {return a.kind==b.kind&&a.lsa==b.lsa&&a.size==b.size&&a.tag==b.tag&&a.ea==b.ea&&!memcmp(a.expected,b.expected,16);}
+static int targets_valid(const spurs_native_definition*d)
+{
+ const spurs_native_targets*t=&d->targets;
+ if(!t->count)return !t->entries;
+ if(!t->entries||t->count>d->image_size/4)return 0;
+ int has_entry=0;
+ for(uint32_t i=0;i<t->count;i++){
+  const spurs_native_target*x=&t->entries[i];
+  if(!x->entry||(x->pc&3)||x->pc<d->layout.image||
+     x->pc-d->layout.image>d->image_size-4||
+     (i&&t->entries[i-1].pc>=x->pc))return 0;
+  if(x->pc==d->entry_pc){if(x->entry!=d->entry)return 0;has_entry=1;}
+ }
+ return has_entry;
+}
+static int targets_equal(spurs_native_targets a,spurs_native_targets b)
+{
+ if(a.count!=b.count)return 0;
+ for(uint32_t i=0;i<a.count;i++)if(a.entries[i].pc!=b.entries[i].pc||a.entries[i].entry!=b.entries[i].entry)return 0;
+ return 1;
+}
 spurs_native_status spurs_native_registry_register(const spurs_native_definition*d,const spurs_native_profile**out)
 {
  if(!d||!out||!d->image||!d->descriptor_template||!d->entry||!sizes(d->image_size,d->descriptor_size)||encoded_size(d->descriptor_template)!=d->image_size||(((uint32_t)d->descriptor_template[28]<<8|d->descriptor_template[29])*16u)!=d->layout.stack_size||!sha_valid(d->source_sha256)||!sha_valid(d->build_sha256))return SPURS_NATIVE_INVALID;
  uint32_t allocation=allocation_size(d);
- if(!allocation||!layout_valid(d->layout,d->image_size,d->descriptor_size,d->entry_pc,allocation)||!input_valid(d->input,d->layout,allocation)||!dma_valid(d->dma,d->input,d->layout,allocation))return SPURS_NATIVE_INVALID;
+ if(!allocation||!layout_valid(d->layout,d->image_size,d->descriptor_size,d->entry_pc,allocation)||!input_valid(d->input,d->layout,allocation)||!dma_valid(d->dma,d->input,d->layout,allocation)||!targets_valid(d))return SPURS_NATIVE_INVALID;
  lock_registry();if(sealed){unlock_registry();return SPURS_NATIVE_SEALED;}
  uint64_t fp=fingerprint(d->image,d->image_size);
  for(uint32_t i=0;i<profile_count;i++){spurs_native_profile*p=&profiles[i];
   if(p->fingerprint!=fp||p->image_size!=d->image_size||p->descriptor_size!=d->descriptor_size||memcmp(p->image,d->image,d->image_size)||memcmp(p->descriptor_template+8,d->descriptor_template+8,d->descriptor_size-8))continue;
-  if(p->entry!=d->entry||p->entry_pc!=d->entry_pc||!layout_equal(p->layout,d->layout)||p->allocation_size!=allocation||!input_equal(p->input,d->input)||!dma_equal(p->dma,d->dma)||strcmp(p->source_sha256,d->source_sha256)||strcmp(p->build_sha256,d->build_sha256)){unlock_registry();return SPURS_NATIVE_CONFLICT;}
+  if(p->entry!=d->entry||p->entry_pc!=d->entry_pc||!layout_equal(p->layout,d->layout)||p->allocation_size!=allocation||!input_equal(p->input,d->input)||!dma_equal(p->dma,d->dma)||!targets_equal(p->targets,d->targets)||strcmp(p->source_sha256,d->source_sha256)||strcmp(p->build_sha256,d->build_sha256)){unlock_registry();return SPURS_NATIVE_CONFLICT;}
   *out=p;unlock_registry();return SPURS_NATIVE_DUPLICATE;
  }
  if(profile_count==SPURS_NATIVE_REGISTRY_LIMIT){unlock_registry();return SPURS_NATIVE_FULL;}
  uint8_t*image=(uint8_t*)malloc(d->image_size),*desc=(uint8_t*)malloc(d->descriptor_size);
  spurs_native_dma_step*steps=NULL;uint8_t*payload=NULL;
+ spurs_native_target*targets=d->targets.count?(spurs_native_target*)malloc(d->targets.count*sizeof*targets):NULL;
  if(d->dma.count){
   uint32_t bytes=0;for(uint32_t i=0;i<d->dma.count;i++)bytes+=d->dma.steps[i].size;
   steps=(spurs_native_dma_step*)malloc(d->dma.count*sizeof*steps);
   payload=(uint8_t*)malloc(bytes);
  }
- if(!image||!desc||(d->dma.count&&(!steps||!payload))){free(image);free(desc);free(steps);free(payload);unlock_registry();return SPURS_NATIVE_NO_MEMORY;}
+ if(!image||!desc||(d->dma.count&&(!steps||!payload))||(d->targets.count&&!targets)){free(image);free(desc);free(steps);free(payload);free(targets);unlock_registry();return SPURS_NATIVE_NO_MEMORY;}
  memcpy(image,d->image,d->image_size);memcpy(desc,d->descriptor_template,d->descriptor_size);memset(desc,0,8);
  if(steps){uint8_t*next=payload;for(uint32_t i=0;i<d->dma.count;i++){steps[i]=d->dma.steps[i];memcpy(next,d->dma.steps[i].expected,steps[i].size);steps[i].expected=next;next+=steps[i].size;}}
+ if(targets)memcpy(targets,d->targets.entries,d->targets.count*sizeof*targets);
  spurs_native_profile*p=&profiles[profile_count];memset(p,0,sizeof*p);p->image=image;p->descriptor_template=desc;p->image_size=d->image_size;p->descriptor_size=d->descriptor_size;p->fingerprint=fp;p->entry=d->entry;p->entry_pc=d->entry_pc;p->layout=d->layout;p->input=d->input;p->dma.steps=steps;p->dma.count=d->dma.count;p->allocation_size=allocation;
+ p->targets.entries=targets;p->targets.count=d->targets.count;
  memcpy(p->source_sha256,d->source_sha256,65);memcpy(p->build_sha256,d->build_sha256,65);++profile_count;*out=p;
  unlock_registry();return SPURS_NATIVE_OK;
 }

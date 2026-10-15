@@ -2096,6 +2096,18 @@ static int spu_smc_microstep(spu_context* ctx)
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    /* Native jobs own an exact immutable target table. Intercept before PC
+     * masking, policy services, resident/global/wildcard dispatch or emulation. */
+    void (*native_target)(spu_context*) = NULL;
+    if (spurs_native_job_indirect(ctx, &native_target)) {
+        if (!native_target) return;
+#if defined(__clang__)
+        __attribute__((musttail)) return native_target(ctx);
+#else
+        native_target(ctx);
+        return;
+#endif
+    }
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
      * Without this, any indirect branch through such a value fails the lookup
