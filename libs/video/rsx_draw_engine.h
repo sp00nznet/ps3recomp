@@ -187,7 +187,8 @@ typedef struct rsx_draw_backend {
                           const rsx_be_sampler_desc* samplers, u32 mask);
     void (*bind_vertex_textures)(void* user, const u32* textures,
                                  const rsx_be_sampler_desc* samplers, u32 mask);
-    void (*set_viewport)(void* user, float x, float y, float w, float h);
+    void (*set_viewport)(void* user, float x, float y, float w, float h,
+                         float min_depth, float max_depth);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
     void (*set_stencil_ref)(void* user, u32 ref);
     /* One draw. `indices` is NULL for a non-indexed one. Everything the

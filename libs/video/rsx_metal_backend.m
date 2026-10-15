@@ -60,6 +60,8 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_msl.h"
 #include "rsx_texture_layout.h"
+#include "ps3emu/strict_boot.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1561,6 +1563,15 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
                         IndexResolver resolve)
 {
     if (!s_ready || !s_verts || !st || count == 0) return;
+    /* The optional vtable renderer retains its [0,1] host viewport and old
+     * zero-scale fallback. Only the dispatch path implements the new mapping. */
+    if (st->clip_min != 0.0f || st->clip_max != 1.0f || st->clip_control != 1u ||
+        st->viewport_scale[2] == 0.0f || !isfinite(st->viewport_scale[2]) ||
+        !isfinite(st->viewport_offset[2])) {
+        ps3_strict_boot_guard("metal-vtable-depth-clip-unsupported", "clip=[%g,%g] control=0x%X",
+                              st->clip_min, st->clip_max, st->clip_control);
+        return;
+    }
     if (s_rec_count >= MTL_MAX_RECORDS) { s_dropped_records++; return; }
 
     MtlRecord* r = &s_records[s_rec_count];
@@ -2106,7 +2117,7 @@ typedef struct {
     int samp[RSX_BE_MAX_TEXTURES];
     u32 vtex[RSX_BE_MAX_VERTEX_TEXTURES];
     int vsamp[RSX_BE_MAX_VERTEX_TEXTURES];
-    float vp[4];
+    float vp[6];
     u32   sc[4];
     u32   stencil_ref;
     float clear_rgba[4];
@@ -2692,11 +2703,13 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
     }
 }
 
-static void eng_set_viewport(void* user, float x, float y, float w, float h)
+static void eng_set_viewport(void* user, float x, float y, float w, float h,
+                             float min_depth, float max_depth)
 {
     (void)user;
     s_eng_pending.vp[0] = x; s_eng_pending.vp[1] = y;
     s_eng_pending.vp[2] = w; s_eng_pending.vp[3] = h;
+    s_eng_pending.vp[4] = min_depth; s_eng_pending.vp[5] = max_depth;
 }
 
 static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
@@ -2778,7 +2791,8 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:p->winding];
     [enc setStencilReferenceValue:r->stencil_ref];
-    MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
+    MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3],
+                       r->vp[4], r->vp[5] };
     [enc setViewport:vp];
     if (r->sc[2] && r->sc[3])
         [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];

@@ -92,6 +92,7 @@ extern "C" {
 #define NV4097_SET_VIEWPORT_VERTICAL           0x00000A04
 #define NV4097_SET_CLIP_MIN                    0x00000394
 #define NV4097_SET_CLIP_MAX                    0x00000398
+#define NV4097_SET_ZMIN_MAX_CONTROL            0x00001D78
 
 /* Scissor */
 #define NV4097_SET_SCISSOR_HORIZONTAL          0x000008C0
@@ -270,6 +271,7 @@ typedef struct rsx_state {
     /* Viewport */
     u32 viewport_x, viewport_y, viewport_w, viewport_h;
     float clip_min, clip_max;
+    u32 clip_control;
 
     /* Scissor */
     u32 scissor_x, scissor_y, scissor_w, scissor_h;

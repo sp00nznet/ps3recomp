@@ -16,6 +16,7 @@
 
 #include "rsx_commands.h"
 #include "rsx_shader_window.h"
+#include "rsx_depth_clip.h"
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -62,6 +63,9 @@ void rsx_state_init(rsx_state* state)
     state->viewport_h = 720;
     state->clip_min = 0.0f;
     state->clip_max = 1.0f;
+    state->clip_control = 1;
+    state->viewport_scale[2] = 0.5f;
+    state->viewport_offset[2] = 0.5f;
 
     /* Default scissor */
     state->scissor_w = 4096;
@@ -415,6 +419,21 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
  * Main method dispatch
  * -----------------------------------------------------------------------*/
 
+static int validate_depth_clip(const rsx_state* state)
+{
+    rsx_depth_clip mapping;
+    if (state->clip_control == 1 &&
+        rsx_depth_clip_build(state->clip_min, state->clip_max,
+                             state->viewport_scale[2], state->viewport_offset[2],
+                             &mapping) == 0) return 0;
+    ps3_strict_boot_guard("rsx-depth-clip-unsupported",
+                         "near=%g far=%g scale=%g offset=%g control=0x%X",
+                         state->clip_min, state->clip_max,
+                         state->viewport_scale[2], state->viewport_offset[2],
+                         state->clip_control);
+    return -1;
+}
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
@@ -499,14 +518,29 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method >= 0x0A20 && method < 0x0A30) {
         u32 f = data; float v; memcpy(&v, &f, 4);
         state->viewport_offset[(method - 0x0A20) >> 2] = v;
+        state->viewport_dirty = 1;
         return 0;
     }
     if (method >= 0x0A30 && method < 0x0A40) {
         u32 f = data; float v; memcpy(&v, &f, 4);
         state->viewport_scale[(method - 0x0A30) >> 2] = v;
+        state->viewport_dirty = 1;
         return 0;
     }
 
+    if (method == NV4097_SET_CLIP_MIN || method == NV4097_SET_CLIP_MAX) {
+        float value;
+        memcpy(&value, &data, sizeof value);
+        if (method == NV4097_SET_CLIP_MIN) state->clip_min = value;
+        else state->clip_max = value;
+        state->viewport_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_ZMIN_MAX_CONTROL) {
+        state->clip_control = data;
+        state->viewport_dirty = 1;
+        return 0;
+    }
     if (method == NV4097_SET_VIEWPORT_HORIZONTAL) {
         state->viewport_x = data & 0xFFFF;
         state->viewport_w = (data >> 16) & 0xFFFF;
@@ -790,6 +824,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
+            if (validate_depth_clip(state)) return -1;
             if (validate_surface_dma(state)) return -1;
             state->primitive_type = data;
             state->in_begin_end = 1;
@@ -842,6 +877,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     if (method == NV4097_DRAW_ARRAYS) {
+        if (validate_depth_clip(state)) return -1;
         if (validate_surface_dma(state)) return -1;
         if (!s_backend || !s_backend->draw_arrays)
             ps3_strict_boot_guard("rsx-missing-draw-backend", "method=0x%04X", method);
@@ -898,6 +934,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_DRAW_INDEX_ARRAY) {
+        if (validate_depth_clip(state)) return -1;
         if (validate_surface_dma(state)) return -1;
         if (!s_backend || !s_backend->draw_indexed)
             ps3_strict_boot_guard("rsx-missing-draw-backend", "method=0x%04X", method);

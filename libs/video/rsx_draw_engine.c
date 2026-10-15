@@ -11,6 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_depth_clip.h"
 #include "rsx_shader_window.h"
 #include "ps3emu/strict_boot.h"
 
@@ -2070,6 +2071,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets) return;
 
+    rsx_dsp_viewport vp;
+    rsx_depth_clip depth_clip;
+    rsx_dsp_get_viewport(&g.rsx, &vp);
+    if (vp.clip_control != 1u ||
+        rsx_depth_clip_build(vp.clip_min, vp.clip_max, vp.scale[2],
+                             vp.translate[2], &depth_clip)) {
+        ps3_strict_boot_guard("rsx-depth-clip-unsupported",
+                              "control=0x%08X clip=[%g,%g] z=[%g,%g]",
+                              vp.clip_control, vp.clip_min, vp.clip_max,
+                              vp.scale[2], vp.translate[2]);
+        return;
+    }
+
     const u32 prim = g.rsx.current_primitive;
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
      * strips and polygons -- is REBUILT into one triangle list through an
@@ -2113,9 +2127,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 target = targets[0];
 
     rsx_dsp_surface sf;
-    rsx_dsp_viewport vp;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    rsx_dsp_get_viewport(&g.rsx, &vp);
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);
 
@@ -2162,11 +2174,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (vp.scale[0] != 0.0f || vp.translate[0] != 0.0f) {
         xf[0] = vp.scale[0] / (W * 0.5f);
         xf[1] = -(vp.scale[1] / (H * 0.5f));
-        xf[2] = vp.scale[2];
         xf[4] = (vp.translate[0] - W * 0.5f) / (W * 0.5f);
         xf[5] = -((vp.translate[1] - H * 0.5f) / (H * 0.5f));
-        xf[6] = vp.translate[2];
     }
+    xf[2] = depth_clip.scale;
+    xf[6] = depth_clip.offset;
     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
     memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
 
@@ -2208,7 +2220,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
-    g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
+    g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H,
+                        depth_clip.min_depth, depth_clip.max_depth);
 
     /* The guest scissor intersected with the surface. The nv40 reset is a
      * full 4096x4096 window and a never-written register reads 0 here, which

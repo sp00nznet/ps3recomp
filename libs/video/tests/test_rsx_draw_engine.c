@@ -196,8 +196,9 @@ static void stub_bind_vtextures(void* u, const u32* tex,
                                 const rsx_be_sampler_desc* smp, u32 mask)
 { (void)u; (void)tex; (void)smp; (void)mask; }
 
-static void stub_viewport(void* u, float x, float y, float w, float h)
-{ (void)u; (void)x; (void)y; (void)w; (void)h; }
+static void stub_viewport(void* u, float x, float y, float w, float h,
+                           float min_depth, float max_depth)
+{ (void)u; (void)x; (void)y; (void)w; (void)h; (void)min_depth; (void)max_depth; }
 
 static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 {

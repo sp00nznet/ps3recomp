@@ -21,6 +21,7 @@
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "rsx_depth_clip.h"
 #include "ps3emu/strict_boot.h"
 #include <stdio.h>
 #include <string.h>
@@ -43,6 +44,15 @@
 #include <initguid.h>
 
 static void strict_gpu_hresult(const char* operation, HRESULT result);
+
+/* Zero-initialization disables D3D12 Z clipping. Every supported guest pipeline
+ * needs homogeneous near/far clipping before the paired viewport mapping. */
+static D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics_pso_defaults(void)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    return pd;
+}
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
@@ -132,6 +142,7 @@ typedef struct {
      * (wave's debug tiles) position quads with this, not with constants --
      * forcing full-target viewports drew every tile window-sized. */
     u32 vp_x, vp_y, vp_w, vp_h;
+    rsx_depth_clip depth_clip; /* shader coefficients and viewport endpoints */
     /* Ordered clear op (offscreen surfaces only; display clears stay the
      * frame-start backbuffer clear). is_clear records also set is_vp so the
      * legacy replay pass skips them. */
@@ -908,7 +919,7 @@ static int init_d3d12(u32 width, u32 height)
                  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
             };
 
-            D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {0};
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = graphics_pso_defaults();
             pso_desc.pRootSignature = s_d3d.root_signature;
             pso_desc.VS.pShaderBytecode = vs_blob->lpVtbl->GetBufferPointer(vs_blob);
             pso_desc.VS.BytecodeLength = vs_blob->lpVtbl->GetBufferSize(vs_blob);
@@ -1002,7 +1013,7 @@ static int init_d3d12(u32 width, u32 height)
                     {"COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                     {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                 };
-                D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = graphics_pso_defaults();
                 pd.pRootSignature = s_d3d.root_signature;
                 pd.VS.pShaderBytecode = vtb->lpVtbl->GetBufferPointer(vtb);
                 pd.VS.BytecodeLength  = vtb->lpVtbl->GetBufferSize(vtb);
@@ -1658,7 +1669,7 @@ static void compile_vp(void)
         il[_e].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
         il[_e].InstanceDataStepRate = 0;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = graphics_pso_defaults();
     pd.pRootSignature = s_d3d.vp_root_sig;
     pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb); pd.VS.BytecodeLength = vb->lpVtbl->GetBufferSize(vb);
     pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb); pd.PS.BytecodeLength = pb->lpVtbl->GetBufferSize(pb);
@@ -2307,7 +2318,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         il[_i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
         il[_i].InstanceDataStepRate = 0;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = graphics_pso_defaults();
     pd.pRootSignature = s_d3d.vp_root_sig;
     pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
     pd.VS.BytecodeLength  = vsb->lpVtbl->GetBufferSize(vsb);
@@ -3076,6 +3087,25 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
 /* Snapshot the VP constant bank + viewport epilogue for one draw into its
  * vp_cb slot. Runs at record time so every draw keeps the constants that
  * were live when the guest issued it. */
+static rsx_depth_clip current_depth_clip(void)
+{
+    rsx_depth_clip mapping = {1, 0, 0, 1};
+    const rsx_state* st = s_d3d.current_rsx_state;
+    if (!st || st->clip_control != 1 ||
+        rsx_depth_clip_build(st->clip_min, st->clip_max,
+                             st->viewport_scale[2], st->viewport_offset[2],
+                             &mapping) != 0) {
+        ps3_strict_boot_guard("d3d12-depth-clip-unsupported", "state=%p", (const void*)st);
+    }
+    return mapping;
+}
+
+static int same_depth_clip(const D3D12DrawRecord* draw)
+{
+    const rsx_depth_clip now = current_depth_clip();
+    return memcmp(&draw->depth_clip, &now, sizeof now) == 0;
+}
+
 static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
@@ -3184,15 +3214,14 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                       c[r*4+0], c[r*4+1], c[r*4+2], c[r*4+3], 10);
       } }
 
-    /* Viewport epilogue (see the render_frame notes this logic came from):
-     * x/y identity, z lane remaps GL clip z when the guest programs one. */
+    /* Normalize guest window depth for host clipping; replay restores the
+     * recorded depth interval with its matching D3D12 viewport. */
     float* vpx = (float*)(dst + RSX_MAX_VERTEX_CONSTANTS * 16);
-    const float* vs_ = st->viewport_scale;
-    const float* vo_ = st->viewport_offset;
     vpx[0] = vpx[1] = vpx[3] = 1.0f;
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
-    if (vs_[2] != 0.0f) { vpx[2] = vs_[2]; vpx[6] = vo_[2]; }
-    else                { vpx[2] = 1.0f;   vpx[6] = 0.0f;   }
+    const rsx_depth_clip depth = dr ? dr->depth_clip : current_depth_clip();
+    vpx[2] = depth.scale;
+    vpx[6] = depth.offset;
     /* DBG_ZOOM=<k> with DBG_CENTER="cx,cy": a debug camera applied in CLIP space,
      * not a framebuffer crop -- the geometry is re-rasterized at full resolution.
      * The shader epilogue already computes
@@ -3223,7 +3252,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     float c00 = c[0];
     int garbage = !(c00 > 0.0f && c00 < 8.0f);
     if (getenv("VP_NOFIXPROJ")) garbage = 0;
-    if ((garbage && uses_c03) || getenv("VP_FIXPROJ")) {
+    if (!ps3_strict_boot_enabled() && ((garbage && uses_c03) || getenv("VP_FIXPROJ"))) {
         { static int _fb = 0; if (_fb++ < 6)
             printf("[VPFB] fallback proj on draw slot %u (c00=%g vs_idx=%d)\n",
                    slot, c00, vs_idx); }
@@ -4614,7 +4643,8 @@ static void render_frame(void)
                 {
                     float tw = (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].w : (float)s_d3d.width;
                     float th = (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].h : (float)s_d3d.height;
-                    D3D12_VIEWPORT dvp = {0, 0, tw, th, 0.0f, 1.0f};
+                    D3D12_VIEWPORT dvp = {0, 0, tw, th,
+                        dr->depth_clip.min_depth, dr->depth_clip.max_depth};
                     if (dr->vp_w >= 2 && dr->vp_h >= 2 &&
                         (float)(dr->vp_x + dr->vp_w) <= tw + 0.5f &&
                         (float)(dr->vp_y + dr->vp_h) <= th + 0.5f) {
@@ -5368,8 +5398,9 @@ static void d3d12_set_render_target(void* ud, const rsx_state* state)
 static void d3d12_set_viewport(void* ud, const rsx_state* state)
 {
     (void)ud;
-    /* TODO: update D3D12 viewport from RSX state */
-    (void)state;
+    /* Applied per draw at replay; retaining the live state here also covers
+     * depth-only state changes without a new render-target binding. */
+    s_d3d.current_rsx_state = state;
 }
 
 /* Our host vertex layout for the fallback path: position (xyz) + color (rgba)
@@ -6099,6 +6130,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->is_vp          = 1;
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->shader_window = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_window : 0;
+        dr->depth_clip = current_depth_clip();
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
@@ -6154,6 +6186,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             }
             return;
         }
+        ps3_strict_boot_guard("d3d12-missing-vertex-program", "primitive=%u", primitive);
         u32 record_offset = s_d3d.vb_offset;
         u32 emitted = upload_quads_from_rsx(first, count);
         if (emitted == 0) return;
@@ -6206,6 +6239,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             if (pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
                 pv->fp_addr == fpnow &&
                 pv->shader_window == (s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_window : 0) &&
+            same_depth_clip(pv) &&
                 primitive == RSX_PRIMITIVE_TRIANGLES &&
                 pv->begin_epoch == (s_d3d.current_rsx_state
                                     ? s_d3d.current_rsx_state->begin_epoch : 0) &&
@@ -6224,6 +6258,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->shader_window = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_window : 0;
+        dr->depth_clip = current_depth_clip();
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
@@ -6277,6 +6312,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         return;
     }
     s_d3d.merge_prev_draw = 0;   /* any other primitive breaks the stream */
+    ps3_strict_boot_guard("d3d12-unsupported-vertex-path", "primitive=%u", primitive);
 
     u32 topo = (u32)rsx_primitive_topology(primitive);
     if (topo == RSX_TOPOLOGY_UNSUPPORTED) {
@@ -6353,6 +6389,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         if (pv->is_vp && pv->topology == RSX_TOPOLOGY_TRIANGLES &&
             pv->fp_addr == fpnow &&
             pv->shader_window == (s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_window : 0) &&
+            same_depth_clip(pv) &&
             pv->begin_epoch == (s_d3d.current_rsx_state
                                 ? s_d3d.current_rsx_state->begin_epoch : 0) &&
             pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
@@ -6370,6 +6407,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->shader_window = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_window : 0;
+        dr->depth_clip = current_depth_clip();
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state);

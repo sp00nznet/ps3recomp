@@ -50,6 +50,8 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "rsx_depth_clip.h"
+#include "ps3emu/strict_boot.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -1392,7 +1394,8 @@ static int vk_ensure_buffer(vk_buffer* b, VkDeviceSize bytes, VkBufferUsageFlags
 
 /* Returns 1 when the draw went through the guest programs (or had nothing to
  * draw), 0 when the caller must use the fixed-function path instead. */
-static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
+static int vk_guest_draw(const rsx_state* st, const rsx_depth_clip* depth_clip,
+                         u32 prim, u32 first, u32 count)
 {
     if (!s_g.on) return 0;
     if (vk_cube_mask(st) || vk_vtex_mask(st)) {
@@ -1428,16 +1431,16 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     if (vk_ensure_buffer(&s_g.vertices, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) return 0;
     memcpy(s_g.vertices.ptr, s_g.cpu, (size_t)bytes);
 
-    /* VPConst: the 512 transform constants, then the viewport epilogue as the
-     * Metal and D3D12 backends write it -- x/y identity, and z remapped from
-     * GL clip space to [0, 1] when the guest programmed a z scale. */
+    /* VPConst: the 512 transform constants, then the viewport epilogue.
+     * Normalize guest window depth into host clip space; the paired host
+     * viewport restores the original guest depth for testing and storage. */
     u8* vpc = (u8*)s_g.ubo.ptr;
     memcpy(vpc, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16u);
     float* vpx = (float*)(vpc + RSX_MAX_VERTEX_CONSTANTS * 16u);
     vpx[0] = vpx[1] = vpx[3] = 1.0f;
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
-    if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
-    else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+    vpx[2] = depth_clip->scale;
+    vpx[6] = depth_clip->offset;
     /* PSConstants: inline constants as host-order bit patterns, then fp_alpha. */
     u8* fpc = (u8*)s_g.ubo.ptr + s_g.ps_off;
     memset(fpc, 0, fp_len);
@@ -1483,7 +1486,8 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
                                   .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    VkViewport vpt = { 0.0f, 0.0f, (float)s_vk.width, (float)s_vk.height, 0.0f, 1.0f };
+    VkViewport vpt = { 0.0f, 0.0f, (float)s_vk.width, (float)s_vk.height,
+                       depth_clip->min_depth, depth_clip->max_depth };
     VkRect2D sc = { { 0, 0 }, { s_vk.width, s_vk.height } };
     pvkCmdSetViewport(s_vk.cmd, 0, 1, &vpt);
     pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
@@ -1502,11 +1506,31 @@ static void vk_draw(u32 prim, u32 first, u32 count)
 {
     const rsx_state* st = s_vk.state;
     if (!st || !s_vk.device || count < 3) return;
-    if (vk_guest_draw(st, prim, first, count)) return;
+    rsx_depth_clip depth_clip;
+    if (st->clip_control != 1u ||
+        rsx_depth_clip_build(st->clip_min, st->clip_max,
+                             st->viewport_scale[2], st->viewport_offset[2],
+                             &depth_clip)) {
+        ps3_strict_boot_guard("rsx-depth-clip-unsupported",
+                              "control=0x%08X clip=[%g,%g] z=[%g,%g]",
+                              st->clip_control, st->clip_min, st->clip_max,
+                              st->viewport_scale[2], st->viewport_offset[2]);
+        return;
+    }
+    if (vk_guest_draw(st, &depth_clip, prim, first, count)) return;
 
     s_vk.cpu_count = 0;
     vk_expand(st, prim, first, count, vk_emit_tri);
     if (!s_vk.cpu_count) return;
+
+    /* The fixed shader consumes clip-space attribute 0 directly. Apply the
+     * same Z mapping on the CPU before that shader runs. Its w==0 fallback
+     * uses one, so use the same W here for the offset term. */
+    for (size_t i = 0; i < s_vk.cpu_count; i++) {
+        vk_vertex* v = &s_vk.cpu_verts[i];
+        const float w = v->pos[3] != 0.0f ? v->pos[3] : 1.0f;
+        v->pos[2] = depth_clip.scale * v->pos[2] + depth_clip.offset * w;
+    }
 
     const VkDeviceSize bytes = (VkDeviceSize)s_vk.cpu_count * sizeof(vk_vertex);
     if (vk_ensure_vertex_buffer(bytes)) return;
@@ -1529,7 +1553,8 @@ static void vk_draw(u32 prim, u32 first, u32 count)
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     /* Whole target, as the null backend's ndc_to_px maps it. */
-    VkViewport vp = { 0.0f, 0.0f, (float)s_vk.width, (float)s_vk.height, 0.0f, 1.0f };
+    VkViewport vp = { 0.0f, 0.0f, (float)s_vk.width, (float)s_vk.height,
+                      depth_clip.min_depth, depth_clip.max_depth };
     VkRect2D sc = { { 0, 0 }, { s_vk.width, s_vk.height } };
     pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
     pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
@@ -2502,7 +2527,7 @@ static struct {
     u32          tex[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
     u32          tex_mask;
-    float        vp[4];
+    float        vp[6];
     u32          sc[4];
     int          have_vp, have_sc;
     u32          stencil_ref;
@@ -2894,10 +2919,12 @@ static void vk_eng_bind_vertex_textures(void* user, const u32* textures,
     (void)user; (void)textures; (void)samplers;
     if (mask && !(s_e2.warned & 8u)) { VK_LOG("engine: vertex textures not supported yet\n"); s_e2.warned |= 8u; }
 }
-static void vk_eng_set_viewport(void* user, float x, float y, float w, float h)
+static void vk_eng_set_viewport(void* user, float x, float y, float w, float h,
+                                float min_depth, float max_depth)
 {
     (void)user;
     s_e2.vp[0] = x; s_e2.vp[1] = y; s_e2.vp[2] = w; s_e2.vp[3] = h; s_e2.have_vp = 1;
+    s_e2.vp[4] = min_depth; s_e2.vp[5] = max_depth;
 }
 static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 {
@@ -3125,6 +3152,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
         vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
+        vp.minDepth = s_e2.vp[4]; vp.maxDepth = s_e2.vp[5];
     }
     VkRect2D sc = { { 0, 0 }, { w, h } };
     if (s_e2.have_sc) {                       /* clamped: Vulkan rejects negative or over-size */

@@ -395,6 +395,31 @@ endif()
 # ---------------------------------------------------------------------------
 # POSIX host harness
 # ---------------------------------------------------------------------------
+if(MINGW)
+    add_executable(test_folklore_depth_clip_d3d12_gpu EXCLUDE_FROM_ALL
+        tests/test_folklore_depth_clip_d3d12_gpu.c runtime/host/host_stubs.c)
+    target_include_directories(test_folklore_depth_clip_d3d12_gpu PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    target_compile_options(test_folklore_depth_clip_d3d12_gpu PRIVATE -UNDEBUG -fms-extensions)
+    target_link_libraries(test_folklore_depth_clip_d3d12_gpu PRIVATE ps3recomp_runtime
+        dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+    target_link_libraries(test_folklore_depth_clip_d3d12_gpu PRIVATE winpthread)
+    set_target_properties(test_folklore_depth_clip_d3d12_gpu PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+if(WIN32)
+    add_executable(test_folklore_depth_clip_d3d12 EXCLUDE_FROM_ALL
+        tests/test_folklore_depth_clip_d3d12.c runtime/host/host_stubs.c)
+    target_include_directories(test_folklore_depth_clip_d3d12 PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    if(MSVC)
+        target_compile_options(test_folklore_depth_clip_d3d12 PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_folklore_depth_clip_d3d12 PRIVATE -UNDEBUG -fms-extensions)
+    endif()
+    target_link_libraries(test_folklore_depth_clip_d3d12 PRIVATE ps3recomp_runtime
+        dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+    set_target_properties(test_folklore_depth_clip_d3d12 PROPERTIES LINKER_LANGUAGE CXX)
+endif()
 # Drives the cellGcm -> RSX -> backend bridge with no lifted game, so a backend
 # can be brought up and regression-tested without a game binary or a recompiler
 # run. Builds on any POSIX host: it picks Metal on Apple and the null backend's
@@ -419,6 +444,13 @@ if(UNIX)
     set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
 
     if(PS3RECOMP_RSX_VULKAN)
+        add_executable(test_folklore_depth_clip_gpu EXCLUDE_FROM_ALL
+            tests/test_folklore_depth_clip_gpu.c runtime/host/host_stubs.c)
+        target_include_directories(test_folklore_depth_clip_gpu PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_folklore_depth_clip_gpu PRIVATE -UNDEBUG)
+        target_link_libraries(test_folklore_depth_clip_gpu PRIVATE ps3recomp_runtime m)
+        set_target_properties(test_folklore_depth_clip_gpu PROPERTIES LINKER_LANGUAGE CXX)
         add_executable(test_folklore_shader_window_gpu EXCLUDE_FROM_ALL
             tests/test_folklore_shader_window_gpu.c runtime/host/host_stubs.c)
         target_include_directories(test_folklore_shader_window_gpu PRIVATE

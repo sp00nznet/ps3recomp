@@ -69,6 +69,9 @@
 #define M_VIEWPORT_VERT         0x0A04
 #define M_VIEWPORT_TRANSLATE    0x0A20
 #define M_VIEWPORT_SCALE        0x0A30
+#define M_CLIP_MIN              0x0394
+#define M_CLIP_MAX              0x0398
+#define M_ZMIN_MAX_CONTROL      0x1D78
 #define M_VP_UPLOAD_INST        0x0B80
 #define M_VTXBUF_OFFSET         0x1680
 #define M_VERTEX_DATA_BASE      0x1738
@@ -171,6 +174,13 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
 
+    /* Ordinary depth clipping reset state: binary32 [0,1], with viewport
+     * Z = 0.5*z + 0.5*w and clipping enabled. Register writes remain raw. */
+    rsx->regs[M_CLIP_MAX >> 2] = 0x3F800000u;
+    rsx->regs[M_ZMIN_MAX_CONTROL >> 2] = 1u;
+    rsx->regs[(M_VIEWPORT_TRANSLATE + 8) >> 2] = 0x3F000000u;
+    rsx->regs[(M_VIEWPORT_SCALE + 8) >> 2] = 0x3F000000u;
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
@@ -191,6 +201,8 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     mark_class(rsx, M_COLOR2_PITCH,      4, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VIEWPORT_HORIZ,    2, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VIEWPORT_TRANSLATE, 8, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_CLIP_MIN, 2, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_ZMIN_MAX_CONTROL, 1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VTXBUF_OFFSET,    16, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VERTEX_DATA_BASE,  2, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_VTXFMT,           16, RSX_DSP_CLASS_STATE);
@@ -492,6 +504,11 @@ void rsx_dsp_get_viewport(const rsx_dispatch* rsx, rsx_dsp_viewport* out)
         memcpy(&out->translate[i], &t, 4);
         memcpy(&out->scale[i], &s, 4);
     }
+    const u32 n = rsx_dsp_reg(rsx, M_CLIP_MIN);
+    const u32 f = rsx_dsp_reg(rsx, M_CLIP_MAX);
+    memcpy(&out->clip_min, &n, 4);
+    memcpy(&out->clip_max, &f, 4);
+    out->clip_control = rsx_dsp_reg(rsx, M_ZMIN_MAX_CONTROL);
 }
 
 void rsx_dsp_get_vertex_attr(const rsx_dispatch* rsx, u32 index, rsx_dsp_vertex_attr* out)

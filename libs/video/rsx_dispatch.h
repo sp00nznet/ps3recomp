@@ -186,6 +186,8 @@ typedef struct rsx_dsp_viewport {
     u32 x, y, w, h;
     float scale[4];      /* VIEWPORT_SCALE x,y,z,w                          */
     float translate[4];  /* VIEWPORT_TRANSLATE x,y,z,w                      */
+    float clip_min, clip_max; /* raw binary32 SET_CLIP_MIN/MAX payloads       */
+    u32 clip_control;    /* SET_ZMIN_MAX_CONTROL; only reset mode 1 handled */
 } rsx_dsp_viewport;
 void rsx_dsp_get_viewport(const rsx_dispatch* rsx, rsx_dsp_viewport* out);
 

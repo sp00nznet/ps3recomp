@@ -28,7 +28,9 @@
  * headless software path -- which is what lets this harness run on Linux,
  * where no real backend exists yet. Both expose the same four entry points
  * plus the same two test hooks, so the body below is backend-agnostic. */
-#if defined(__APPLE__)
+#if defined(PS3RECOMP_HOST_FIXTURE_BACKEND)
+/* A source test may supply the same entry points for an instrumented backend. */
+#elif defined(__APPLE__)
 #  include "rsx_metal_backend.h"
 #  define HOST_BACKEND_NAME     "Metal"
 #  define HOST_BACKEND_GUEST_SHADERS 1
@@ -895,6 +897,10 @@ static void emit_quad_draws(void)
  * overwrite the last one. */
 static void submit_frame(int with_draw)
 {
+    /* Every synthetic pass, including those with a built-in VP, already emits
+     * host-range depth. Do not depend on the old zero-state heuristic. */
+    emit(0x0A38, 0x3F800000u); /* viewport Z scale = 1 */
+    emit(0x0A28, 0u);          /* viewport Z offset = 0 */
     /* The MRT modes clear twice, once per target set, and emit both clears
      * themselves so the display's lands after the offscreen pass rather than
      * in front of it. */
