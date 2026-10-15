@@ -20,6 +20,12 @@
 extern "C" {
 #endif
 
+#if defined(_MSC_VER)
+#define SPU_CONTEXT_TLS __declspec(thread)
+#else
+#define SPU_CONTEXT_TLS __thread
+#endif
+
 /* Portable 16-byte alignment (MSVC __declspec vs GCC/clang __attribute__). */
 #if defined(_MSC_VER)
 #  define SPU_ALIGN16 __declspec(align(16))
@@ -259,6 +265,7 @@ typedef struct spu_context {
     /* MFC tag completion mask and status */
     uint32_t mfc_tag_mask;
     uint32_t mfc_tag_status;
+    int mfc_unowned; /* legacy shared fallback used: teardown/admission unqualified */
 
     /* Atomic reservation state (GETLLAR/PUTLLC lock-line semantics). Multiple
      * SPU kernel threads share a lock-free queue in main memory; PUTLLC must
@@ -275,6 +282,9 @@ typedef struct spu_context {
      * intercepts branches to the two reserved kernel-service addresses below
      * only when this is set. */
     int policy_mode;
+    int spurs_pm_loaded,spurs_pm_image;
+    uint32_t spurs_pm_wid;
+    uint64_t spurs_pm_data;
 
     /* Resident code-overlay image id (0 = none). FMOD's mixer swaps per-DSP
      * plugin code in and out of ONE LS scratch region (e.g. the Compressor

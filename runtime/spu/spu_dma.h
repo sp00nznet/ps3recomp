@@ -1554,7 +1554,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         /* Global count of loadCommands fetches: the per-run claim-vs-stage
          * summary in spurs_policy.c diffs this across a PM run to catch the
          * dispatch that CLAIMS a ticket but never stages its job. */
-        { extern volatile unsigned g_wws_batch_gets; g_wws_batch_gets++; }
+        { extern SPU_CONTEXT_TLS volatile unsigned g_wws_batch_gets; g_wws_batch_gets++; }
         static int _n = 0;
         if (_n++ < 8) {
             const uint8_t* p = spu->ls + 0xC00;

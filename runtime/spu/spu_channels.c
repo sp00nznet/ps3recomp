@@ -308,14 +308,16 @@ static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx)
+        if (s_mfc_slots[i].ctx == ctx){
+            ReleaseSRWLockExclusive(&s_mfc_claim_lock);
             return &s_mfc_slots[i].mfc;
+        }
 
     /* No slot yet: take one. The engine is initialized before the slot is
      * published, so it is never visible to anyone in a half-reset state. */
     mfc_engine* e = NULL;
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
         if (s_mfc_slots[i].ctx != NULL) continue;
         mfc_engine_init(&s_mfc_slots[i].mfc);
@@ -323,6 +325,8 @@ static mfc_engine* mfc_for(spu_context* ctx)
         e = &s_mfc_slots[i].mfc;
     }
     if (!e) {
+        ps3_strict_boot_guard("spu-mfc-context-capacity","capacity=%u",SPU_MAX_CONTEXTS);
+        ctx->mfc_unowned=1;
         /* Out of slots: fall back to a shared engine (correct for single-SPU).
          * Reachable only with more than SPU_MAX_CONTEXTS contexts running at
          * the same time, which is more SPUs than the machine has -- and the
@@ -363,6 +367,23 @@ void spu_mfc_release(spu_context* ctx)
         break;
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+}
+
+/* Caller exclusively owns the context or has closed its owner to new leases.
+ * Inspect actual engine and retained channel/IRQ/list/reservation work without
+ * allocating an engine, clearing state or manufacturing a completion. */
+int spu_mfc_context_quiescent(spu_context*ctx)
+{
+    if(!ctx||ctx->mfc_unowned||ctx->list_stall_mask||ctx->list_stall_stat||ctx->resv_valid||
+       ctx->irq_frame||ctx->irq_saved||ctx->int_enable||ctx->event_status||
+       ctx->ch_out_mbox.count||ctx->ch_out_intr_mbox.count||ctx->ch_in_mbox.count||ctx->rcv_evt_n||
+       ctx->ch_sig_notify[0].count||ctx->ch_sig_notify[1].count)return 0;
+    int idle=1;
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for(int i=0;i<SPU_MAX_CONTEXTS;i++)if(s_mfc_slots[i].ctx==ctx){
+        idle=s_mfc_slots[i].mfc.queue_count==0&&s_mfc_slots[i].mfc.tag_completed==UINT32_MAX;break;
+    }
+    ReleaseSRWLockExclusive(&s_mfc_claim_lock);return idle;
 }
 
 /* ===========================================================================
@@ -2093,13 +2114,13 @@ void spu_indirect_branch(spu_context* ctx)
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
-        extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+        extern SPU_CONTEXT_TLS volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
             g_spurs_pm_exited = 1;
-            { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
-              if (s_t) { static unsigned long _n = 0; unsigned long n = ++_n;
+            { static SPU_CONTEXT_TLS int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (s_t) { static SPU_CONTEXT_TLS unsigned long _n = 0; unsigned long n = ++_n;
                 if (n <= 64 || (n & 0xFFF) == 0)
                     fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X polls=%u)\n",
                             n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
@@ -2108,7 +2129,7 @@ void spu_indirect_branch(spu_context* ctx)
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* cellSpursModulePoll: report "no contention — keep running".
+            /* cellSpursModulePoll: report "no contention â€” keep running".
              * (One virtual SPU per workload here, so nothing ever preempts.) */
             unsigned n = ++g_spurs_pm_polls;
             if (n <= 4 || (n % 4096) == 0)
@@ -2699,7 +2720,7 @@ void spu_indirect_branch(spu_context* ctx)
 }
 
 /* ===========================================================================
- * Execution trace (for §3 validation: diff vs RPCS3 SPU interpreter)
+ * Execution trace (for Â§3 validation: diff vs RPCS3 SPU interpreter)
  *
  * When the lifter is invoked with --trace, every emitted instruction is
  * surrounded by spu_trace_pc(ctx, PC) before execution and spu_trace_rt(

@@ -1,4 +1,4 @@
-/* spurs_policy.c — run a SPURS workload's policy module on a lifted SPU.
+/* spurs_policy.c â€” run a SPURS workload's policy module on a lifted SPU.
  *
  * The real SPURS kernel dispatches a workload by loading its policy module
  * (a raw SPU binary) at LS 0xA00 and entering it with the ABI of
@@ -6,7 +6,7 @@
  *
  *   r0 = return-to-kernel address     r3 = kernel context LS address (0x100)
  *   r1 = stack (the PM re-loads its   r4 = the workload's u64 data (preferred
- *        own initial stack)                doubleword) — e.g. a joblist EA
+ *        own initial stack)                doubleword) â€” e.g. a joblist EA
  *                                     r5 = poll status
  *
  * The SpursKernelContext fields this fills, per the layout RPCS3 documents
@@ -24,6 +24,10 @@
  */
 #include "spu_context.h"
 #include "spu_workload.h"
+#include "spurs_owner_lifetime.h"
+extern int spu_mfc_context_quiescent(spu_context*);
+extern void spu_mfc_release(spu_context*);
+extern void spu_coh_unregister(spu_context*);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,9 +36,9 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (single writer per run; reads are diagnostic). */
-volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
-volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
-volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
+SPU_CONTEXT_TLS volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
+SPU_CONTEXT_TLS volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+SPU_CONTEXT_TLS volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
@@ -44,73 +48,25 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (!entry || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
         return -1;
 
-    /* Reuse one context per thread: this runs per policy dispatch (thousands
-     * per second with the SPURS workload churn live), and a fresh 260KB
-     * calloc/free each time was allocator + page-zeroing churn. The explicit
-     * memset preserves the exact fresh-zero semantics calloc provided. */
-    /* PERSISTENT context per (workload, virtual SPU): a real policy module
-     * stays RESIDENT on its SPU -- its LS carries continuation state between
-     * scheduling quanta (the wwsjob PM caches the last-seen queue line at LS
-     * 0x14B0 and its staging rings at 0x12xx; a freshly zeroed context every
-     * dispatch made it treat every re-entry as first contact and it could
-     * never progress its claim/stage pipeline). Image + context init happen
-     * once; re-entries keep LS and only refresh the entry registers and the
-     * (possibly game-updated) kernel-context fields. */
-    enum { SPURS_PM_MAX_WKL = 16 };
-    static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
-    if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
-    spu_context* ctx = s_pm_ctx[wid][spu_num];
-    int first = 0;
-    /* SPURS_PM_FRESH=1: treat EVERY dispatch as first contact (zeroed LS, image
-     * reloaded). A/B against the persistent default: with persistence, the wwsjob
-     * PM's first entry attaches + claims exactly ONE ticket then yields, and every
-     * RE-entry takes a stale-state path that does NOTHING (LS 0x12A0/0x12C0/0x12F0
-     * job-pipeline slots persist; entry only partially re-inits them) -- LBP's
-     * 10-ticket loading queue stalls at lanes {1,2} forever. Fresh contexts make
-     * each dispatch run the full attach->claim->yield cycle, so repeated kernel
-     * dispatches drain the queue one ticket at a time (the persistent-LS claim
-     * that motivated the cache predates the r4 word0/word1 layout fix). */
-    static int s_fresh = -1;
-    if (s_fresh < 0) s_fresh = getenv("SPURS_PM_FRESH") ? 1 : 0;
-    /* Reset the persistent context when the workload's DATA (queue EA)
-     * changes: the game re-points a wid at a NEW job queue once the old one
-     * drains, and a real SPURS kernel reloads the policy module fresh on a
-     * workload switch. Carrying queue A's LS (header cache 0x14B0, busy
-     * masks 0x1270/0x1280, records) into queue B made the PM see stale
-     * state and claim nothing (observed: LBP's second loading queue sat at
-     * lanes {0,...} while the first drained fine). */
-    static uint64_t s_pm_data[SPURS_PM_MAX_WKL][6];
-    if (!ctx) {
-        ctx = (spu_context*)malloc(sizeof(spu_context));
-        if (!ctx) return -1;
-        s_pm_ctx[wid][spu_num] = ctx;
-        first = 1;
-        /* SPU_CTX_LOG=1: policy-module contexts are PERSISTENT and there is one
-         * per (workload, spu_num) -- a workload with readyCount 8 legitimately
-         * runs on several simulated SPUs, which then contend its lock lines
-         * exactly as real SPUs would. Counting only the job contexts in
-         * spu_lifted_job.h reports "two contexts" for a run that has five, and
-         * makes correct multi-SPU execution look like duplicated state. */
-        { static int s_cl = -1;
-          if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
-          if (s_cl) fprintf(stderr, "[spu-ctx] new POLICY context %p wid=%u spu_num=%u\n",
-                            (void*)ctx, wid, spu_num); }
-        memset(ctx, 0, sizeof(*ctx));
-        spu_context_init(ctx, 0);
-    } else if (s_fresh || s_pm_data[wid][spu_num] != wkl_data) {
-        if (!s_fresh) {
-            static int _n = 0;
-            if (_n++ < 8)
-                fprintf(stderr, "[spurs-pm] wid=%u spu=%u workload data changed "
-                        "0x%llX -> 0x%llX: fresh PM context\n", wid, spu_num,
-                        (unsigned long long)s_pm_data[wid][spu_num],
-                        (unsigned long long)wkl_data);
-        }
-        first = 1;
-        memset(ctx, 0, sizeof(*ctx));
-        spu_context_init(ctx, 0);
+    if(wid>=16||spu_num>=SPURS_OWNER_WORKER_LIMIT)return -1;
+    spurs_owner_token owner={0};spurs_worker_lease lease={0};
+    if(spurs_owner_retain(spurs_ea,&owner)!=SPURS_OWNER_OK)return -1;
+    if(spurs_owner_acquire_worker(owner,spu_num,&lease)!=SPURS_OWNER_OK){spurs_owner_release(owner);return -1;}
+    spu_context*ctx=(spu_context*)lease.context;
+    int first=!ctx->spurs_pm_loaded||ctx->spurs_pm_wid!=wid||ctx->spurs_pm_data!=wkl_data||ctx->spurs_pm_image!=image_id;
+    if(getenv("SPURS_PM_FRESH"))first=1;
+    /* Never clear a live transfer, reservation, mailbox or interrupt to make
+     * a context appear ready. Pending state remains available to its owner. */
+    if(ctx->irq_frame||ctx->irq_saved||ctx->int_enable||ctx->event_status||
+       (first&&!spu_mfc_context_quiescent(ctx))){
+        spurs_owner_release_worker(lease);spurs_owner_release(owner);return -3;
     }
-    s_pm_data[wid][spu_num] = wkl_data;
+    if(first&&ctx->spurs_pm_loaded){
+        void*cv=ctx->ch_wait_cv;void*lock=ctx->ch_wait_lock;u32 id=ctx->spu_id;
+        spu_mfc_release(ctx);spu_coh_unregister(ctx);spu_context_init(ctx,id);
+        ctx->ch_wait_cv=cv;ctx->ch_wait_lock=lock;ctx->spurs_owner_ea=spurs_ea;
+    }
+    ctx->spurs_pm_loaded=1;ctx->spurs_pm_wid=wid;ctx->spurs_pm_data=wkl_data;ctx->spurs_pm_image=image_id;
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
 
@@ -174,9 +130,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * unconditional fprintf+fflush pairs a real fraction of movie playback.
      * Default off; SPURS_PM_TRACE=1 restores them (first 64 + every 4096th
      * so an enabled trace can't flood either). */
-    static int s_trace = -1;
+    static SPU_CONTEXT_TLS int s_trace = -1;
     if (s_trace < 0) s_trace = getenv("SPURS_PM_TRACE") ? 1 : 0;
-    static unsigned long s_runs = 0;
+    static SPU_CONTEXT_TLS unsigned long s_runs = 0;
     unsigned long runno = ++s_runs;
     int log_this = s_trace && (runno <= 64 || (runno & 0xFFF) == 0);
     if (log_this) {
@@ -195,7 +151,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     extern volatile unsigned g_spu_putllc_count;
     extern volatile unsigned g_spu_putllc_sync_hit;
     extern uint32_t g_barrier_sync_watch;
-    static int s_flow = -1;
+    static SPU_CONTEXT_TLS int s_flow = -1;
     if (s_flow < 0) s_flow = getenv("SPURS_PM_FLOW") ? 1 : 0;
     unsigned putllc_before = g_spu_putllc_sync_hit;
     (void)g_spu_putllc_count;
@@ -210,7 +166,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * execute?" on a run that never reaches the barrier at all -- the RPCS3
      * guest dump shows a working SPU has 0x11B0 bound and runJobNum=0, ours
      * has 0x11B0 == 0 and runJobNum == -1. */
-    static int s_flow_all = -1;
+    static SPU_CONTEXT_TLS int s_flow_all = -1;
     if (s_flow_all < 0) s_flow_all = getenv("SPURS_PM_FLOW_ALL") ? 1 : 0;
     int tracing = (s_flow && spu_num == 0 && g_pm_flow_ctx == 0 &&
                    (s_flow_all ||
@@ -221,14 +177,14 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (tracing) {
         g_pm_flow_n = 0; g_pm_flow_ctx = ctx;
         s_flow_arm_ms = ps3_ms_now();
-        { static int _a = 0; if (_a++ < 8) {
+        { static SPU_CONTEXT_TLS int _a = 0; if (_a++ < 8) {
             fprintf(stderr, "[pm-flow] ARM wid=%u spu=%u (watch=0x%08X)\n",
                     wid, spu_num, g_barrier_sync_watch); fflush(stderr); } }
         /* Watchdog: the traced run has been observed to HANG the jobmanager
          * kernel thread (the claim run never returns -> no later dispatch can
          * report). A detached thread dumps the partial trail after 5s; the
          * trail's LAST pc names the looping lifted function. */
-        { static int s_wd_started = 0;
+        { static SPU_CONTEXT_TLS int s_wd_started = 0;
           if (!s_wd_started) { s_wd_started = 1;
             extern void spurs_pm_flow_watchdog_start(void);
             spurs_pm_flow_watchdog_start(); } }
@@ -240,7 +196,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * 0x12E0, storeJobNum@0x12F0) before and after each PM run, plus the pc
      * spu_run_with_halt halted at. Answers: does re-entry advance the pipeline
      * or reset/stall it? Only wid<=1 (jobmanager) traced, first 4000 runs. */
-    static int s_pipe = -1;
+    static SPU_CONTEXT_TLS int s_pipe = -1;
     if (s_pipe < 0) s_pipe = getenv("SPURS_PM_PIPE") ? 1 : 0;
     /* trace ALL workloads (the jobmanager is wid=12, not <=1); 4000-run cap bounds volume */
     int pipe_this = s_pipe && spu_num == 0;
@@ -260,7 +216,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * (observed: 4-job batch, counter=4, lanes {2,1}). Diffing the sync-PUTLLC
      * and 0xC00-GET counters across each run names that dispatch and shows the
      * LS pipeline state it left behind. */
-    static int s_claimlog = -1;
+    static SPU_CONTEXT_TLS int s_claimlog = -1;
     if (s_claimlog < 0) s_claimlog = getenv("SPURS_PM_CLAIMLOG") ? 1 : 0;
     unsigned batch_before = g_wws_batch_gets;
     unsigned claim_before = g_spu_putllc_sync_hit;
@@ -282,7 +238,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         unsigned claims = g_spu_putllc_sync_hit - claim_before;
         unsigned stages = g_wws_batch_gets - batch_before;
         if (claims || stages) {
-            static unsigned s_cl = 0;
+            static SPU_CONTEXT_TLS unsigned s_cl = 0;
             if (s_cl++ < 64) {
                 const uint8_t* L = ctx->ls;
                 #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
@@ -303,7 +259,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         /* PER-WID cap: a shared cap gets exhausted by idle wid=0/1 before the
          * jobmanager (wid=12) ever runs in a long/good run. Give each wid its
          * own budget so wid=12's pipeline is always captured. */
-        static unsigned long s_pn_wid[16] = {0};
+        static SPU_CONTEXT_TLS unsigned long s_pn_wid[16] = {0};
         unsigned long s_pn = ++s_pn_wid[wid & 15];
         if (s_pn < 300) {
             const uint8_t* L = ctx->ls;
@@ -350,7 +306,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 
     if (tracing) {
         g_pm_flow_ctx = 0;
-        static int s_dumps = 0;
+        static SPU_CONTEXT_TLS int s_dumps = 0;
         /* Only dump once the PPU is actually spinning on a job barrier
          * (g_barrier_sync_watch armed by the barrier probe): boot-time idle
          * runs also PUTLLC (queue-check protocol) and would burn the cap. */
@@ -406,7 +362,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
-    return g_spurs_pm_exited ? 0 : -2;
+    int result=g_spurs_pm_exited?0:-2;
+    spurs_owner_release_worker(lease);spurs_owner_release(owner);return result;
 }
 
 /* ---------------------------------------------------------------------------
