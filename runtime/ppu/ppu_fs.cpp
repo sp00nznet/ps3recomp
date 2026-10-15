@@ -170,8 +170,9 @@ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
 
 /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
  * prefixes are stripped; the rest is appended to the root. */
-static void host_path(char* out, size_t cap, const char* guest)
+static void host_path(char* out, size_t cap, const char* guest, bool* truncated=nullptr)
 {
+    if(truncated)*truncated=false;
     /* Explicit cache mount wins over disc-root stripping and asset fallbacks. */
     const char* hdd1 = getenv("PS3_HDD1_ROOT");
     if (hdd1 && *hdd1 && strncmp(guest, "/dev_hdd1", 9) == 0 &&
@@ -181,7 +182,7 @@ static void host_path(char* out, size_t cap, const char* guest)
         const char* tail = guest + 9; if (*tail == '/') ++tail;
         int written = snprintf(out, cap, "%.*s%s%s", (int)n, hdd1,
             *tail && hdd1[n-1] != '/' && hdd1[n-1] != '\\' ? "/" : "", tail);
-        if (written < 0 || (size_t)written >= cap) { if (cap) out[0] = 0; return; }
+        if (written < 0 || (size_t)written >= cap) { if(truncated)*truncated=true; if (cap) out[0] = 0; return; }
         for (char* p = out; *p; ++p) if (*p == '\\') *p = '/';
         return;
     }
@@ -194,7 +195,8 @@ static void host_path(char* out, size_t cap, const char* guest)
     static const char* hdd0_root = nullptr; static int hdd0_init = 0;
     if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
-        snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+        int written=snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+        if(truncated && (written<0 || (size_t)written>=cap))*truncated=true;
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
@@ -207,7 +209,8 @@ static void host_path(char* out, size_t cap, const char* guest)
     if (strncmp(guest, "/dev_flash/", 11) == 0) {
         const char* fw = getenv("PS3_DEV_FLASH");
         if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
-        snprintf(out, cap, "%s/%s", fw, guest + 11);
+        int written=snprintf(out, cap, "%s/%s", fw, guest + 11);
+        if(truncated && (written<0 || (size_t)written>=cap))*truncated=true;
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
@@ -238,8 +241,15 @@ static void host_path(char* out, size_t cap, const char* guest)
         }
     }
     if (rel == guest && guest[0] == '/') rel = guest + 1;   /* strip leading '/' */
-    snprintf(out, cap, "%s/%s", ppu_vfs_root, rel);
+    int written=snprintf(out, cap, "%s/%s", ppu_vfs_root, rel);
+    if(truncated && (written<0 || (size_t)written>=cap))*truncated=true;
     for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+    /* The legacy fallback has a 1024-byte intermediate. Checked mutation
+     * callers must not accept a potentially truncated alternate target. */
+    if(truncated && (*truncated || strlen(out)>=1024)) {
+        *truncated=true;
+        return;
+    }
     ps3_vfs_ps3game_fallback(out, cap);
 }
 
@@ -860,11 +870,30 @@ static void cellFsRmdir(ppu_context* ctx)  {
     ctx->gpr[3] = CELL_OK;
 }
 static void cellFsUnlink(ppu_context* ctx) {
-    if (ps3_strict_fs_enabled()) {
-        char path[1024]; guest_strcpy(path, (uint32_t)ctx->gpr[3], sizeof path);
-        ps3_strict_fs_unimplemented("cellFsUnlink", path);
+    char gpath[1025], hpath[1100];
+    int32_t error=fs_stat_guest_path(gpath,(uint32_t)ctx->gpr[3]);
+    if(!error) {
+        bool truncated=false;
+        host_path(hpath,sizeof hpath,gpath,&truncated);
+        /* Never unlink a partial host name or truncated fallback target. */
+        if(truncated || !hpath[0])
+            error=CELL_FS_STAT_ENAMETOOLONG;
+        else if(ps3_strict_fs_unlink(hpath)!=0) {
+            const int host_error=errno;
+            switch(host_error) {
+            case ENOENT: error=CELL_FS_ENOENT;break;
+            case EISDIR: error=CELL_FS_EISDIR;break;
+            case ENOTDIR: error=CELL_FS_STAT_ENOTDIR;break;
+            case EACCES: error=CELL_FS_STAT_EACCES;break;
+            case EPERM: error=(int32_t)0x80010009u;break;
+            case ENAMETOOLONG: error=CELL_FS_STAT_ENAMETOOLONG;break;
+            case EBUSY: error=(int32_t)0x8001000Au;break;
+            case EROFS: error=(int32_t)0x80010026u;break;
+            default: error=CELL_FS_STAT_EIO;break;
+            }
+        }
     }
-    ctx->gpr[3] = CELL_OK;
+    ctx->gpr[3]=(uint64_t)(int64_t)error;
 }
 static void cellFsFsync(ppu_context* ctx)
 {

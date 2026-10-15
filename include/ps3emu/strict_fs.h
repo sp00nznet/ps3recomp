@@ -7,12 +7,12 @@
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
 #include <direct.h>
 #else
-#include <sys/stat.h>
 #include <unistd.h>
 #endif
 static inline int ps3_strict_fs_readonly(void) {
@@ -145,6 +145,39 @@ static inline FILE* ps3_strict_fs_tmpfile(void) {
 }
 static inline int ps3_strict_fs_remove(const char* path) {
     ps3_strict_fs_mutation("remove",path); return remove(path);
+}
+/* Unlink is file-only: C remove() may delete an empty directory on POSIX.
+ * Keep the same containment checks as the other host mutation wrappers. */
+static inline int ps3_strict_fs_unlink(const char* path) {
+    ps3_strict_fs_mutation("unlink",path);
+#ifdef _WIN32
+    /* The CRT reports EACCES for directories; PS3 reports EISDIR. */
+    struct stat st;
+    if(stat(path,&st)==0 && (st.st_mode&S_IFMT)==S_IFDIR) {errno=EISDIR;return -1;}
+    const int result=_unlink(path);
+    const int unlink_error=errno;
+    if(result!=0 && unlink_error==ENOENT) {
+        /* Windows CRT folds a file used as an ancestor into ENOENT. Only
+         * refine that result when an existing non-directory proves it. */
+        char ancestor[1100];
+        const size_t length=strlen(path);
+        if(length<sizeof ancestor) {
+            memcpy(ancestor,path,length+1);
+            for(size_t i=length;i>0;--i) {
+                if(ancestor[i-1]!='/' && ancestor[i-1]!='\\')continue;
+                ancestor[i-1]=0;
+                if(stat(ancestor,&st)==0) {
+                    if((st.st_mode&S_IFMT)!=S_IFDIR) {errno=ENOTDIR;return result;}
+                    break;
+                }
+            }
+        }
+    }
+    errno=unlink_error;
+    return result;
+#else
+    return unlink(path);
+#endif
 }
 static inline int ps3_strict_fs_rename(const char* from,const char* to) {
     ps3_strict_fs_mutation("rename-source",from); ps3_strict_fs_mutation("rename-destination",to); return rename(from,to);
