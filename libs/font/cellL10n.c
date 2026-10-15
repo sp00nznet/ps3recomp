@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 /*
  * ps3recomp - cellL10n HLE implementation
  *
@@ -10,6 +13,8 @@
 #include "cellL10n.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/memory/guest_byte.h"
+#include "ps3emu/strict_boot.h"
 
 /* ---------------------------------------------------------------------------
  * Internal UTF helpers
@@ -118,7 +123,44 @@ static int encode_utf16(u32 cp, u16* out, u32 max)
  * UTF-8 <-> UTF-16
  * -----------------------------------------------------------------------*/
 
-s32 UTF8toUTF16(const u8* utf8, u32 utf8_len,
+/* Single-character guest ABI verified against RPCS3 4d5def58 cellL10n.cpp.
+ * This reuses the local Unicode codec, not host UTF-16 pointer layout. */
+s32 UTF8toUTF16(const u8* utf8, u16* utf16, u32* utf16_len)
+{
+    uint64_t src=(uintptr_t)utf8,dst=(uintptr_t)utf16,length=(uintptr_t)utf16_len;
+    u8 incoming[4]={0};u16 output[2];u32 cp;
+    if(!vm_base||!ps3_guest_byte_copy(src,&incoming[0],0))goto memory_error;
+    unsigned count=incoming[0]<0x80?1:
+        incoming[0]>=0xC2&&incoming[0]<=0xDF?2:
+        incoming[0]>=0xE0&&incoming[0]<=0xEF?3:
+        incoming[0]>=0xF0&&incoming[0]<=0xF4?4:0;
+    if(!count)return 0;
+    for(unsigned i=1;i<count;i++)
+        if(!ps3_guest_byte_copy(src+i,&incoming[i],0))goto memory_error;
+    int consumed=decode_utf8(incoming,count,&cp);
+    if(!consumed)return 0;
+    int written=encode_utf16(cp,output,2);
+    if(!written)return 0;
+    for(unsigned i=0;i<(unsigned)written*2;i++)
+        if(!ps3_guest_byte_writable(dst+i))goto memory_error;
+    for(unsigned i=0;i<4;i++)
+        if(!ps3_guest_byte_writable(length+i))goto memory_error;
+    for(unsigned i=0;i<(unsigned)written;i++){
+        u8 high=(u8)(output[i]>>8),low=(u8)output[i];
+        if(!ps3_guest_byte_copy(dst+2*i,&high,1)||!ps3_guest_byte_copy(dst+2*i+1,&low,1))goto memory_error;
+    }
+    for(unsigned i=0;i<4;i++){
+        u8 byte=(u8)((u32)written>>(24-8*i));
+        if(!ps3_guest_byte_copy(length+i,&byte,1))goto memory_error;
+    }
+    return consumed;
+memory_error:
+    ps3_strict_boot_guard("l10n-guest-memory","function=UTF8toUTF16 src=0x%llX dst=0x%llX length=0x%llX",
+        (unsigned long long)src,(unsigned long long)dst,(unsigned long long)length);
+    return 0;
+}
+
+static s32 utf8_to_utf16_buffer(const u8* utf8, u32 utf8_len,
                 u16* utf16, u32* utf16_len)
 {
     if (!utf8 || !utf16 || !utf16_len)
@@ -333,7 +375,7 @@ s32 UTF8stoUTF16s(const u8* utf8, u32* utf8_len,
         src_len++;
 
     u32 dst_max = *utf16_len;
-    s32 rc = UTF8toUTF16(utf8, src_len, utf16, &dst_max);
+    s32 rc = utf8_to_utf16_buffer(utf8, src_len, utf16, &dst_max);
     if (rc != CELL_OK) return rc;
 
     /* Null-terminate if space available */
@@ -477,7 +519,7 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
     /* UTF-8 -> UTF-16 */
     if (src_encoding == L10N_UTF8 && dst_encoding == L10N_UTF16) {
         u32 out_len = dst_max / sizeof(u16);
-        s32 rc = UTF8toUTF16((const u8*)src, src_len,
+        s32 rc = utf8_to_utf16_buffer((const u8*)src, src_len,
                              (u16*)dst, &out_len);
         *dst_len = out_len * sizeof(u16);
         return rc;

@@ -62,8 +62,9 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 
 /* UTF-8 <-> UTF-16 */
-s32 UTF8toUTF16(const u8* utf8, u32 utf8_len,
-                u16* utf16, u32* utf16_len);
+/* One character, firmware ABI: output length is write-only UTF-16 units;
+ * returns input bytes consumed, or zero for an illegal sequence. */
+s32 UTF8toUTF16(const u8* utf8, u16* utf16, u32* utf16_len);
 s32 UTF16toUTF8(const u16* utf16, u32 utf16_len,
                 u8* utf8, u32* utf8_len);
 

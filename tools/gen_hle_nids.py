@@ -38,6 +38,11 @@ def scan(c_path):
     for m in DEF_RE.finditer(txt):
         name = m.group(1)
         out.append((compute_nid(name), name))
+    # Explicitly validated non-cell-prefixed firmware exports. Do not publish
+    # every uppercase local codec helper under an assumed guest ABI.
+    if os.path.basename(c_path) == "cellL10n.c":
+        for m in re.finditer(r"^s32\s+(UTF8toUTF16)\s*\([^;]*?\)\s*\{",txt,re.M):
+            out.append((compute_nid(m.group(1)),m.group(1)))
     return out
 
 
