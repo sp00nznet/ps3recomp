@@ -2460,6 +2460,10 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
          * compatibility-only path retains its historical behavior. */
         dispatched=spu_workload_dispatch_job(snapshot.image,snapshot.image_size,snapshot.job_ea,snapshot.descriptor_size);
     }else if(native.status==SPURS_NATIVE_JOB_RETURNED){
+        static atomic_uint native_return_logs;
+        if(atomic_fetch_add_explicit(&native_return_logs,1,memory_order_relaxed)<8)
+            fprintf(stderr,"[spurs-native-job] RETURNED owner=0x%08X worker=0 job=0x%08X fp=0x%016llX pc=0x%05X gets=%u\n",
+                chain->owner.ea,snapshot.job_ea,(unsigned long long)snapshot.fingerprint,native.pc,native.completed_gets);
         dispatched=1;
     }else{
         ps3_strict_boot_guard("spurs-native-job-failed","job=0x%08X status=%u pc=0x%05X spu_status=%u stop=%u gets=%u",
