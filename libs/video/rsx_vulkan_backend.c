@@ -38,7 +38,6 @@
  * with spaces.
  */
 
-#ifndef _WIN32
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -60,7 +59,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
-#include <dlfcn.h>
+#include "rsx_vulkan_loader.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -146,7 +145,7 @@ typedef struct vk_image {
 #define VK_PIPELINE_SLOTS (2 * 2 * 8)   /* ztest x zwrite x compare op */
 
 typedef struct vk_state {
-    void*            lib;
+    rsx_vk_library   lib;
     VkInstance       instance;
     VkPhysicalDevice phys;
     VkDevice         device;
@@ -231,16 +230,14 @@ static vk_state s_vk;
  * -------------------------------------------------------------------------*/
 static int vk_load_library(void)
 {
-    static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
-    for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
-        s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+    char error[512];
+    s_vk.lib = rsx_vk_library_open(error, sizeof error);
     if (!s_vk.lib) {
-        VK_LOG("no Vulkan loader found (dlopen libvulkan.so.1: %s)\n", dlerror());
+        VK_LOG("%s\n", error);
         return -1;
     }
-    pvkGetInstanceProcAddr =
-        (PFN_vkGetInstanceProcAddr)dlsym(s_vk.lib, "vkGetInstanceProcAddr");
-    if (!pvkGetInstanceProcAddr) { VK_LOG("libvulkan has no vkGetInstanceProcAddr\n"); return -1; }
+    pvkGetInstanceProcAddr = rsx_vk_library_get_proc(s_vk.lib, error, sizeof error);
+    if (!pvkGetInstanceProcAddr) { VK_LOG("%s\n", error); return -1; }
 #define LOAD_G(name) \
     if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(VK_NULL_HANDLE, #name))) \
         { VK_LOG("missing global function " #name "\n"); return -1; }
@@ -3331,8 +3328,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (vk_create_render_pass()) return -1;
     if (vk_create_pipeline_objects()) return -1;
     if (vk_guest_init()) {
-        VK_LOG("guest programs: setup failed, fixed-function path only\n");
+        VK_LOG("guest programs: setup failed; refusing fixed-function substitution\n");
         vk_guest_shutdown();
+        return -1;
     }
 
     /* Both targets UNDEFINED -> GENERAL once. Colour starts opaque black so a
@@ -3362,6 +3360,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
+    const char* guest = getenv("PS3RECOMP_VK_GUEST_PROGRAMS");
+    if (guest && guest[0] && guest[0] != '0' && !rsx_hlsl_to_spirv_available()) {
+        VK_LOG("guest programs requested but HLSL/SPIR-V translator is unavailable\n");
+        return -1;
+    }
     memset(&s_vk, 0, sizeof s_vk);
     if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();
@@ -3429,7 +3432,7 @@ void rsx_vulkan_backend_shutdown(void)
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
-    if (s_vk.lib) dlclose(s_vk.lib);
+    rsx_vk_library_close(s_vk.lib);
     free(s_vk.cpu_verts);
     memset(&s_vk, 0, sizeof s_vk);
 }
@@ -3465,4 +3468,4 @@ u32 rsx_vulkan_backend_guest_draws(void)
     return s_vk.eng_active ? rsx_draw_engine_guest_draws() : s_g.last_draws;
 }
 
-#endif /* !_WIN32 */
+
