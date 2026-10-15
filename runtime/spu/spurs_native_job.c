@@ -174,6 +174,9 @@ spurs_native_job_result spurs_native_job_dispatch(
  ctx->gpr[126]._u32[0]=layout->image;
  uint32_t old_depth=ctx->host_depth,old_drain=ctx->drain_ret_pc,old_steps=ctx->steps;
  ctx->pc=profile->entry_pc;ctx->status=SPU_STATUS_RUNNING;
+ /* Older AOT units did not report FP exception updates. Do not claim their
+  * retained FPSCR flags are known; a real FSCRWR establishes complete state. */
+ ctx->fp_status_untracked=1;
  native_frame frame={0};frame.context=ctx;frame.profile=profile;active_native=&frame;
  result.halt_landing=spu_run_with_halt(native_landing,ctx);
  result.pc=ctx->pc;result.spu_status=ctx->status;result.stop_code=ctx->stop_code;

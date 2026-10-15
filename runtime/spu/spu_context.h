@@ -11,6 +11,7 @@
 #define SPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
+#include "spu_fpscr.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -401,6 +402,11 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+    /* Architectural FP control persists with the real worker. Until every
+     * arithmetic helper updates flags, a subsequent FSCRRD must fail visibly
+     * rather than invent a zero exception state. */
+    spu_fpscr fpscr;
+    uint32_t fp_status_untracked;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
