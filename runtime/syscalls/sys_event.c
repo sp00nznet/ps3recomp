@@ -9,6 +9,7 @@
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
 #include <stdlib.h>               /* getenv */
+#include <stddef.h>
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
@@ -25,8 +26,7 @@ sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 
 /* Table lock for allocation */
 #ifdef _WIN32
-static CRITICAL_SECTION s_evt_table_lock;
-static int              s_evt_table_lock_init = 0;
+static SRWLOCK s_evt_table_lock = SRWLOCK_INIT;
 #else
 static pthread_mutex_t  s_evt_table_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
@@ -34,11 +34,7 @@ static pthread_mutex_t  s_evt_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static void evt_table_lock(void)
 {
 #ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
-    EnterCriticalSection(&s_evt_table_lock);
+    AcquireSRWLockExclusive(&s_evt_table_lock);
 #else
     pthread_mutex_lock(&s_evt_table_lock);
 #endif
@@ -47,10 +43,82 @@ static void evt_table_lock(void)
 static void evt_table_unlock(void)
 {
 #ifdef _WIN32
-    LeaveCriticalSection(&s_evt_table_lock);
+    ReleaseSRWLockExclusive(&s_evt_table_lock);
 #else
     pthread_mutex_unlock(&s_evt_table_lock);
 #endif
+}
+
+/* Slot primitives have process lifetime. Only the data prefix is reset on reuse. */
+static unsigned char s_queue_sync_ready[SYS_EVENT_QUEUE_MAX];
+static uint64_t s_queue_generation[SYS_EVENT_QUEUE_MAX];
+static void queue_lock(sys_event_queue_info* q)
+{
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+#endif
+}
+static void queue_unlock(sys_event_queue_info* q)
+{
+#ifdef _WIN32
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_unlock(&q->lock);
+#endif
+}
+static void queue_wake_all(sys_event_queue_info* q)
+{
+#ifdef _WIN32
+    WakeAllConditionVariable(&q->not_empty);
+#else
+    pthread_cond_broadcast(&q->not_empty);
+#endif
+}
+/* Table lock held; success leaves the selected queue locked. */
+static int queue_allocate_locked(void)
+{
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; ++i) {
+        sys_event_queue_info* q = &g_sys_event_queues[i];
+        if (!s_queue_sync_ready[i]) {
+#ifdef _WIN32
+            InitializeCriticalSection(&q->lock);
+            InitializeConditionVariable(&q->not_empty);
+#else
+            if (pthread_mutex_init(&q->lock, NULL)) continue;
+            if (pthread_cond_init(&q->not_empty, NULL)) {
+                pthread_mutex_destroy(&q->lock);
+                continue;
+            }
+#endif
+            s_queue_sync_ready[i] = 1;
+        }
+        queue_lock(q);
+        if (!q->active && !q->spurs_attachments && !q->waiters && !q->destroy_pending) {
+            memset(q, 0, offsetof(sys_event_queue_info, lock));
+            ++s_queue_generation[i];
+            return i;
+        }
+        queue_unlock(q);
+    }
+    return -1;
+}
+/* Validate under table -> queue locks, then retain queue lock for the operation. */
+static sys_event_queue_info* queue_active_locked(uint32_t id, uint64_t generation)
+{
+    sys_event_queue_info* q = NULL;
+    evt_table_lock();
+    if (id && id <= SYS_EVENT_QUEUE_MAX && s_queue_sync_ready[id - 1]) {
+        q = &g_sys_event_queues[id - 1];
+        queue_lock(q);
+        if (!q->active || (generation && generation != s_queue_generation[id - 1])) {
+            queue_unlock(q);
+            q = NULL;
+        }
+    }
+    evt_table_unlock();
+    return q;
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -104,31 +172,16 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
         size = SYS_EVENT_QUEUE_BUF_MAX;
 
     evt_table_lock();
-    int slot = -1;
-    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
-        if (!g_sys_event_queues[i].active) { slot = i; break; }
-    }
+    int slot = queue_allocate_locked();
     if (slot < 0) { evt_table_unlock(); return 0; }
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
     q->active   = 1;
     q->key      = key;
     q->capacity = size;
     q->type     = SYS_PPU_QUEUE;
 
-    /* The waiter primitives MUST be initialised here too. memset+fields is
-     * not enough: a zeroed CRITICAL_SECTION is not a valid one, and the
-     * first EnterCriticalSection on it faults writing near offset 0x24 of a
-     * null internal pointer -- which is exactly how YDKJ's FMOD audio thread
-     * died the moment it was finally given a real queue to block on. */
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock);
-    InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-#endif
+    queue_unlock(q);
 
     evt_table_unlock();
 
@@ -149,17 +202,13 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
     evt_table_lock();
 
-    int slot = -1;
-    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
-        if (!g_sys_event_queues[i].active) { slot = i; break; }
-    }
+    int slot = queue_allocate_locked();
     if (slot < 0) {
         evt_table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
     q->active   = 1;
     q->key      = key;
     q->capacity = size;
@@ -191,19 +240,12 @@ int64_t sys_event_queue_create(ppu_context* ctx)
         memcpy(q->name, attr_raw + 8, 8);
     }
 
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock);
-    InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-#endif
-
     uint32_t queue_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, queue_id);
     }
 
+    queue_unlock(q);
     evt_table_unlock();
     return CELL_OK;
 }
@@ -211,30 +253,66 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 int64_t sys_event_queue_destroy(ppu_context* ctx)
 {
     uint32_t queue_id = LV2_ARG_U32(ctx, 0);
-
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
-
+    uint32_t mode = LV2_ARG_U32(ctx, 1);
+    if (mode > 1) return (int64_t)(int32_t)CELL_EINVAL;
     evt_table_lock();
-
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) {
+    if (!queue_id || queue_id > SYS_EVENT_QUEUE_MAX || !s_queue_sync_ready[queue_id - 1]) {
         evt_table_unlock();
-        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;
     }
-
-#ifdef _WIN32
-    DeleteCriticalSection(&q->lock);
-#else
-    pthread_cond_destroy(&q->not_empty);
-    pthread_mutex_destroy(&q->lock);
-#endif
-
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    queue_lock(q);
+    if (!q->active) {
+        queue_unlock(q); evt_table_unlock();
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;
+    }
+    if (!mode && q->waiters) {
+        queue_unlock(q); evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     q->active = 0;
+    q->cancelled = 1;
+    q->destroy_pending = 1;
+    queue_wake_all(q);
+    queue_unlock(q);
+    evt_table_unlock();
+    /* The SPURS route lock nests outside the event-table lock. */
+    { extern void spurs_event_queue_destroyed(uint32_t); spurs_event_queue_destroyed(queue_id); }
+    evt_table_lock();
+    queue_lock(q);
+    q->destroy_pending = 0;
+    queue_unlock(q);
     evt_table_unlock();
     return CELL_OK;
 }
 
+int sys_event_queue_spurs_acquire(uint32_t queue_id)
+{
+    if (!queue_id || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
+    evt_table_lock();
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    int result = -1;
+    if (q->active && q->spurs_attachments != UINT32_MAX) {
+        ++q->spurs_attachments;
+        result = 0;
+    }
+    evt_table_unlock();
+    return result;
+}
+
+int sys_event_queue_spurs_release(uint32_t queue_id)
+{
+    if (!queue_id || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
+    evt_table_lock();
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    int result = -1;
+    if (q->spurs_attachments) {
+        --q->spurs_attachments;
+        result = 0;
+    }
+    evt_table_unlock();
+    return result;
+}
 /* ---------------------------------------------------------------------------
  * sys_event_queue_receive
  *
@@ -247,42 +325,20 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
  * title that tears its audio down and brings it back never runs again. */
 void sys_event_queue_uncancel_by_id(uint32_t queue_id)
 {
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active || !q->cancelled) return;
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
+    sys_event_queue_info* q = queue_active_locked(queue_id, 0);
+    if (!q) return;
     q->cancelled = 0;
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-    q->cancelled = 0;
-    pthread_mutex_unlock(&q->lock);
-#endif
-    fprintf(stderr, "[evt] queue %u un-cancelled (producer attached again)\n", queue_id);
+    queue_unlock(q);
 }
 
 void sys_event_queue_cancel_by_id(uint32_t queue_id)
 {
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) return;
-
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
+    sys_event_queue_info* q = queue_active_locked(queue_id, 0);
+    if (!q) return;
     q->cancelled = 1;
-    WakeAllConditionVariable(&q->not_empty);   /* every waiter, not one */
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-    q->cancelled = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_mutex_unlock(&q->lock);
-#endif
-    fprintf(stderr, "[evt] queue %u cancelled (producer gone) -- waiters released\n",
-            queue_id);
+    queue_wake_all(q);
+    queue_unlock(q);
 }
-
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
 static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
@@ -349,16 +405,11 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) {
-#ifdef _WIN32
-        SwitchToThread();
-#else
-        sched_yield();
-#endif
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
+    sys_event_queue_info* q = queue_active_locked(queue_id, 0);
+    if (!q) return (int64_t)(int32_t)CELL_ESRCH;
+    uint64_t generation = s_queue_generation[queue_id - 1];
+    int initial_count = q->count;
+    queue_unlock(q);
     /* SPURS bring-up: when a PPU thread is about to block forever for SPU
      * completion (libsre created the taskset correctly but never started its SPU
      * kernel), drive the title's REAL lifted SPU task runtime (image 22 @guest
@@ -387,7 +438,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * then reaches CreateTaskset and the running policy dispatches the cri task.
      * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
     if ((s_ydkj_spurs_ready < 0 ? (s_ydkj_spurs_ready = getenv("YDKJ_SPURS_READY") ? 1 : 0) : s_ydkj_spurs_ready) && (queue_id == 1 || queue_id == 4)
-            && timeout_us == 0 && q->count == 0) {
+            && timeout_us == 0 && initial_count == 0) {
         static int s_fire[8] = {0};
         if (s_fire[queue_id] < 64) {
             s_fire[queue_id]++;
@@ -412,7 +463,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * main thread times out after 30s and the title tears down. Synthesize a
      * completion so the wait returns -> see whether the game then advances to
      * asset load + menu draw (content). Returns immediately with a zero event. */
-    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && initial_count == 0) {
         if (event_addr != 0) {
             uint64_t* out = (uint64_t*)vm_to_host(event_addr);
             out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
@@ -422,7 +473,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
      * blocks forever) so the loader thread proceeds. Tests whether the game's
      * render/draw code is reachable once the completion waits are satisfied. */
-    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && initial_count == 0) {
         static int s_n1 = 0;
         if (s_n1 < 256) { s_n1++;
             if (event_addr != 0) {
@@ -463,101 +514,70 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * ponytail: one attempt per receive, then fall through to the normal wait --
      * no retry loop, so a worker that genuinely produces nothing still blocks
      * rather than spinning. */
-    if (q->count == 0 && timeout_us == 0) {
+    if (initial_count == 0 && timeout_us == 0) {
         extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
         spu_dispatch_frame_by_queue(queue_id, 0);
     }
 
+    q = queue_active_locked(queue_id, generation);
+    if (!q) return (int64_t)(int32_t)CELL_ECANCELED;
+    int timed_out = 0;
 #ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-
-    if (timeout_us == 0) {
-        while (q->count == 0 && q->active && !q->cancelled) {
-            SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
+    /* Keep the existing sub-ms poll policy; real waits count actual sleepers. */
+    ULONGLONG began = GetTickCount64();
+    uint64_t duration = timeout_us / 1000;
+    while (!q->count && q->active && !q->cancelled) {
+        DWORD ms = INFINITE;
+        if (timeout_us) {
+            uint64_t elapsed = GetTickCount64() - began;
+            if (elapsed >= duration) { timed_out = 1; break; }
+            uint64_t remaining = duration - elapsed;
+            ms = remaining >= INFINITE ? INFINITE - 1 : (DWORD)remaining;
         }
-        if (q->count == 0 && q->cancelled) {
-            LeaveCriticalSection(&q->lock);
-            return (int64_t)(int32_t)CELL_ECANCELED;
+        ++q->waiters;
+        BOOL ok = SleepConditionVariableCS(&q->not_empty, &q->lock, ms);
+        DWORD error = ok ? 0 : GetLastError();
+        --q->waiters;
+        if (!ok && error != ERROR_TIMEOUT) {
+            queue_unlock(q);
+            return (int64_t)(int32_t)CELL_EIO;
         }
-    } else if (timeout_us < 1000) {
-        /* Sub-millisecond timeout = the title's non-blocking event poll (it polls
-         * queues 2 & 3 every frame with a 30us timeout). Windows' ~15.6ms timer
-         * granularity inflates even a 1ms SleepConditionVariableCS to ~15ms, so a
-         * naive floor-to-1ms throttled the game's per-frame poll loop ~500x
-         * (each frame ate ~30ms in two polls). Honor the intent: check once and
-         * return ETIMEDOUT immediately if empty -- same result the game already
-         * handles, just without the bogus 15ms stall. */
-        if (q->count == 0 || !q->active) {
-            LeaveCriticalSection(&q->lock);
-            return (int64_t)(int32_t)CELL_ETIMEDOUT;
-        }
-    } else {
-        DWORD ms = (DWORD)(timeout_us / 1000);
-        while (q->count == 0 && q->active && !q->cancelled) {
-            if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
-                if (GetLastError() == ERROR_TIMEOUT) {
-                    LeaveCriticalSection(&q->lock);
-                    return (int64_t)(int32_t)CELL_ETIMEDOUT;
-                }
-            }
+        if (!ok && timeout_us && GetTickCount64() - began >= duration) {
+            timed_out = 1; break;
         }
     }
-
-    if (q->count == 0 && q->cancelled) {
-        LeaveCriticalSection(&q->lock);
-        return (int64_t)(int32_t)CELL_ECANCELED;
-    }
-    if (!q->active || q->count == 0) {
-        LeaveCriticalSection(&q->lock);
-        return (int64_t)(int32_t)CELL_ESRCH;
-    }
-
-    sys_event_t evt = q->buffer[q->head];
-    q->head = (q->head + 1) % q->capacity;
-    q->count--;
-
-    LeaveCriticalSection(&q->lock);
 #else
-    pthread_mutex_lock(&q->lock);
-
-    if (timeout_us == 0) {
-        while (q->count == 0 && q->active && !q->cancelled) {
-            pthread_cond_wait(&q->not_empty, &q->lock);
-        }
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        while (q->count == 0 && q->active && !q->cancelled) {
-            int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
-            if (rc == ETIMEDOUT) {
-                pthread_mutex_unlock(&q->lock);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
+    struct timespec deadline;
+    if (timeout_us) {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += (time_t)(timeout_us / 1000000);
+        deadline.tv_nsec += (long)((timeout_us % 1000000) * 1000);
+        if (deadline.tv_nsec >= 1000000000L) {
+            ++deadline.tv_sec; deadline.tv_nsec -= 1000000000L;
         }
     }
-
-    if (q->count == 0 && q->cancelled) {
-        pthread_mutex_unlock(&q->lock);
+    while (!q->count && q->active && !q->cancelled) {
+        ++q->waiters;
+        int rc = timeout_us ? pthread_cond_timedwait(&q->not_empty, &q->lock, &deadline)
+                            : pthread_cond_wait(&q->not_empty, &q->lock);
+        --q->waiters;
+        if (rc == ETIMEDOUT) { timed_out = 1; break; }
+        if (rc) { queue_unlock(q); return (int64_t)(int32_t)CELL_EIO; }
+    }
+#endif
+    /* Closure wins over timeout and over queued events after a forced destroy. */
+    if (!q->active || (!q->count && q->cancelled)) {
+        queue_unlock(q);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
-    if (!q->active || q->count == 0) {
-        pthread_mutex_unlock(&q->lock);
-        return (int64_t)(int32_t)CELL_ESRCH;
+    if (!q->count) {
+        queue_unlock(q);
+        return (int64_t)(int32_t)(timed_out ? CELL_ETIMEDOUT : CELL_ESRCH);
     }
-
     sys_event_t evt = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
-    q->count--;
-
-    pthread_mutex_unlock(&q->lock);
-#endif
-
+    int remaining_count = --q->count;
+    queue_unlock(q);
     /* lv2 sys_event_queue_receive returns the event in REGISTERS r4..r7
      * (r3=rc, r4=source, r5=data1, r6=data2, r7=data3) -- this is the ABI the
      * caller reads (e.g. the SPURS service func_00C5DAB0 checks r4==source key,
@@ -601,7 +621,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                     queue_id,
                     (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
                     (unsigned long long)evt.data1, (unsigned long long)evt.data2,
-                    (unsigned long long)evt.data3, q->count);
+                    (unsigned long long)evt.data3, remaining_count);
     } }
 
     return CELL_OK;
@@ -617,19 +637,13 @@ int64_t sys_event_queue_tryreceive(ppu_context* ctx)
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active)
+    sys_event_queue_info* q = queue_active_locked(queue_id, 0);
+    if (!q)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     if (max_count <= 0) max_count = 1;
 
     int32_t received = 0;
-
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-#endif
 
     while (received < max_count && q->count > 0) {
         sys_event_t evt = q->buffer[q->head];
@@ -666,18 +680,16 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active)
+    sys_event_queue_info* q = queue_active_locked(queue_id, 0);
+    if (!q)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
-    EnterCriticalSection(&q->lock);
     q->head = 0;
     q->tail = 0;
     q->count = 0;
     LeaveCriticalSection(&q->lock);
 #else
-    pthread_mutex_lock(&q->lock);
     q->head = 0;
     q->tail = 0;
     q->count = 0;
@@ -886,22 +898,26 @@ int64_t sys_event_port_disconnect(ppu_context* ctx)
 }
 
 /* Public helper for non-syscall callers: push an event into a queue by
- * ID. Returns 0 on success, -1 if the queue is unknown/inactive or full. */
+ * ID. Returns 0 on enqueue, -1 when full, -2 for unknown/inactive IDs. */
 int sys_event_queue_push_by_id(uint32_t queue_id,
                                uint64_t source, uint64_t data1,
-                               uint64_t data2,  uint64_t data3)
+                               uint64_t data2, uint64_t data3)
 {
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) return -1;
-    sys_event_t evt;
-    evt.source = source;
-    evt.data1  = data1;
-    evt.data2  = data2;
-    evt.data3  = data3;
-    return event_queue_push(q, &evt);
+    sys_event_queue_info* q = queue_active_locked(queue_id, 0);
+    if (!q) return -2;
+    if (q->count >= q->capacity) { queue_unlock(q); return -1; }
+    sys_event_t evt = { source, data1, data2, data3 };
+    q->buffer[q->tail] = evt;
+    q->tail = (q->tail + 1) % q->capacity;
+    ++q->count;
+#ifdef _WIN32
+    WakeConditionVariable(&q->not_empty);
+#else
+    pthread_cond_signal(&q->not_empty);
+#endif
+    queue_unlock(q);
+    return 0;
 }
-
 /* Public helper: resolve an event queue by its ipc_key (as registered at
  * sys_event_queue_create). Returns the queue_id (1-based) or 0 if none. Used by
  * cellAudio to route the audio-period notify event to the game's queue. */
@@ -1484,16 +1500,8 @@ int64_t sys_event_flag_get(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 void sys_event_init(lv2_syscall_table* tbl)
 {
-    memset(g_sys_event_queues, 0, sizeof(g_sys_event_queues));
-    memset(g_sys_event_ports,  0, sizeof(g_sys_event_ports));
-    memset(g_sys_event_flags,  0, sizeof(g_sys_event_flags));
-
-#ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
-#endif
+    /* Globals start zeroed. Re-registering syscalls must never erase live queues
+     * or their process-lifetime synchronization primitives. No runtime reset. */
 
     /* Event queues */
     lv2_syscall_register(tbl, SYS_EVENT_QUEUE_CREATE,      sys_event_queue_create);

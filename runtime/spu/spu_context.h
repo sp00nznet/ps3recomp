@@ -206,6 +206,7 @@ typedef struct spu_context {
     /* SPU thread identification */
     uint32_t spu_id;
     uint32_t spu_group_id;
+    uint32_t spurs_owner_ea; /* explicit SPURS binding owner;0 = legacy unknown */
 
     /* Active recompiled image for per-context indirect-branch dispatch. SPURS
      * loads kernel/policy/job into overlapping LS addresses at different times,

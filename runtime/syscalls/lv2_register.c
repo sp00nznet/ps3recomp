@@ -1606,12 +1606,9 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
     unsigned code = value >> 24;
     /* No lv2 group: SPU code under SPURS. Only its user events route, through
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
-    extern uint32_t spurs_port_queue(uint32_t port);
-    if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
-        if (code < 128) { static int n; if (n++ < 16)
-            fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
-                    code & 63, spu->image_id, value); }
-        return 0;
+    if (!spu->spu_group_id) {
+        extern int spurs_route_user_event(spu_context*, uint32_t);
+        return code < 128 ? spurs_route_user_event(spu, value) : 0;
     }
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
      * 128 acknowledges the result; 192 is the impatient, no-ack form. */
@@ -1636,9 +1633,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
         uint32_t data = spu_channel_read(&spu->ch_out_mbox);
         unsigned port = code & 63;
         uint32_t queue = 0;
-        if (!spu->spu_group_id) {
-            queue = spurs_port_queue(port);
-        } else {
+        {
             AcquireSRWLockShared(&s_spu_port_lock);
             spu_group_t* group = spu_find_group(spu->spu_group_id);
             if (group) queue = group->user_event_ports[port];

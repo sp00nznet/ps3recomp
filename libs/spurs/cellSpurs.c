@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 /*
  * ps3recomp - cellSpurs HLE implementation
  *
@@ -15,6 +18,11 @@
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_job_snapshot.h"
+#include "spurs_event_ports.h"
+#include "spurs_event_route.h"
+#include "spu_context.h"
+#include "../../runtime/memory/guest_byte.h"
+#include "../../runtime/syscalls/sys_event.h"
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
@@ -635,111 +643,131 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
     return CELL_OK;
 }
 
-/* The lv2 event queues the app attached to SPURS, and the port we handed back.
- * A title may attach more than one (Tokyo Jungle attaches two), so keep them
- * all -- storing a single id let the second attach hide the first. */
-#define MAX_SPURS_QUEUES 8
-#define SPURS_EVENT_PORT 0u
-extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
-                                      uint64_t data1, uint64_t data2, uint64_t data3);
-extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
-extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
 
-static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
-/* WHICH SPURS instance attached each queue. A title with more than one instance
- * -- Tokyo Jungle boots one for its data install and keeps a second for audio --
- * finalises them separately, and cancelling every queue on any Finalize kills
- * the surviving instance's queues too. That reads to the title as "the SPU
- * stopped answering": its sound engine's receives fail with ECANCELED and it
- * tears itself down. Cancel only the queues the instance being finalised owns. */
-static u32 s_spurs_event_queue_owner[MAX_SPURS_QUEUES];
-static int s_spurs_event_queue_n = 0;
+/* All binding mutations, cancellation and actual route delivery share this
+ * lock. Registry lookup alone does not pin a queue through a later push. */
+#ifdef _WIN32
+static SRWLOCK s_spurs_route_lock=SRWLOCK_INIT;
+static void spurs_route_lock(void){AcquireSRWLockExclusive(&s_spurs_route_lock);}
+static void spurs_route_unlock(void){ReleaseSRWLockExclusive(&s_spurs_route_lock);}
+#else
+static pthread_mutex_t s_spurs_route_lock=PTHREAD_MUTEX_INITIALIZER;
+static void spurs_route_lock(void){pthread_mutex_lock(&s_spurs_route_lock);}
+static void spurs_route_unlock(void){pthread_mutex_unlock(&s_spurs_route_lock);}
+#endif
+#define SPURS_EVENT_PORT 0u /* unqualified legacy completion only */
+extern uint32_t g_ps3_sdk_version;
 
-/* Release anyone blocked on the completion queues SPURS attached; see
- * cellSpursFinalize. */
-static void spurs_cancel_attached_queues(u32 spurs_ea)
+static void spurs_cancel_attached_queues(u32 owner)
 {
-    int keep = 0;
-    for (int i = 0; i < s_spurs_event_queue_n; i++) {
-        /* owner 0 means "attached before we tracked owners" -- cancel those on
-         * any finalize, which is the old behaviour and the safe default. */
-        u32 owner = s_spurs_event_queue_owner[i];
-        if (spurs_ea == 0 || owner == 0 || owner == spurs_ea) {
-            sys_event_queue_cancel_by_id(s_spurs_event_queue[i]);
-        } else {
-            s_spurs_event_queue[keep]       = s_spurs_event_queue[i];
-            s_spurs_event_queue_owner[keep] = owner;
-            keep++;
+    if(!owner)return;
+    u32 owned[64],orphaned[64],count=0;
+    spurs_route_lock();
+    for(u32 port=0;port<64;port++)owned[port]=spurs_event_ports_lookup(owner,port);
+    spurs_event_port_status status=spurs_event_ports_clear_owner(owner,orphaned,64,&count);
+    if(status==SPURS_EVENT_PORT_OK){
+        /* Cancel only queues with no other SPURS owner. Keep every binding
+         * pin until cancellation is complete, then release each removed pin. */
+        for(u32 i=0;i<count;i++)sys_event_queue_cancel_by_id(orphaned[i]);
+        for(u32 port=0;port<64;port++)if(owned[port]){
+            if(sys_event_queue_spurs_release(owned[port]))
+                ps3_strict_boot_guard("spurs-event-pin-release","owner=0x%08X queue=%u",owner,owned[port]);
         }
     }
-    s_spurs_event_queue_n = keep;
+    spurs_route_unlock();
 }
-
-/* SPU user-event port -> lv2 queue, for SPU code running under SPURS.
- *
- * A SPURS task signals the PPU with send_event(port, ...) exactly as a raw SPU
- * thread does, but there is no lv2 SPU thread group to hold the port binding,
- * so the lv2 delivery path had nowhere to look and dropped the event -- and
- * with it the ack the SPU then blocks on in SPU_RdInMbox. Havok's SPU task
- * stalls on the first physics step that way (port 2), and the PPU step waits
- * for it forever. */
-static u32 s_spurs_port_queue[64];
 
 uint32_t spurs_port_queue(uint32_t port)
+{return spurs_event_ports_lookup_unique(port);}
+uint32_t spurs_port_queue_for_owner(uint32_t owner,uint32_t port)
+{return spurs_event_ports_lookup(owner,port);}
+
+void spurs_event_queue_destroyed(uint32_t queue)
 {
-    return port < 64 ? s_spurs_port_queue[port] : 0;
+    spurs_route_lock();
+    u32 removed=spurs_event_ports_remove_queue(queue);
+    for(u32 i=0;i<removed;i++)
+        if(sys_event_queue_spurs_release(queue))
+            ps3_strict_boot_guard("spurs-event-pin-release","destroyed queue=%u",queue);
+    spurs_route_unlock();
 }
 
-s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
-                                 s32 isDynamic)
+s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs,u32 queue,u8* port,s32 isDynamic)
 {
-    /* KEEP the queue id. SPURS signals the application through the queue it
-     * attaches here, and this discarded it -- so nothing SPURS ever did could
-     * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
-     * kicks its job chain and then blocks on exactly that receive. */
-    if (queue && s_spurs_event_queue_n < MAX_SPURS_QUEUES) {
-        /* A previous cellSpursFinalize may have cancelled this queue. Attaching
-         * gives it a producer again, so lift that -- otherwise a title that
-         * tears its audio down and brings it back finds every receive failing. */
-        sys_event_queue_uncancel_by_id(queue);
-        int dup = 0;
-        for (int i = 0; i < s_spurs_event_queue_n; i++)
-            if (s_spurs_event_queue[i] == queue) dup = 1;
-        if (!dup) { s_spurs_event_queue_owner[s_spurs_event_queue_n] = (u32)(uintptr_t)spurs;
-                    s_spurs_event_queue[s_spurs_event_queue_n++] = queue; }
+    uintptr_t raw_owner=(uintptr_t)spurs,raw_port=(uintptr_t)port;
+    if(!raw_owner||!raw_port)return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if(raw_owner>UINT32_MAX||raw_owner<0x10000u)return CELL_SPURS_CORE_ERROR_INVAL;
+    if(raw_owner&127u)return CELL_SPURS_CORE_ERROR_ALIGN;
+    u8 requested=0;
+    if(isDynamic){
+        if(!ps3_guest_byte_writable(raw_port))return CELL_SPURS_CORE_ERROR_INVAL;
+    }else{
+        if(!ps3_guest_byte_copy(raw_port,&requested,0)||requested>=64)return CELL_SPURS_CORE_ERROR_INVAL;
+        if(g_ps3_sdk_version>=0x180000u&&requested>15)return CELL_SPURS_CORE_ERROR_PERM;
     }
-
-    if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    u8* port_h = GUEST_PTR(port, u8*);
-
-    /* Static: the caller names the port in *port. Dynamic: pick a free one,
-     * 0x10..0x3F first (the low ports are the ones titles ask for by number),
-     * and hand it back. This used to write 0 either way, so every attach
-     * landed on port 0 and the SPU's real port number routed nowhere. */
-    u32 p = *port_h;
-    if (isDynamic) {
-        p = 64;
-        for (u32 i = 0x10; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
-        for (u32 i = 0; i < 0x10 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
-        if (p == 64) return CELL_SPURS_CORE_ERROR_BUSY;
-        *port_h = (u8)p;
-    } else if (p >= 64) {
+    spurs_route_lock();
+    if(sys_event_queue_spurs_acquire(queue)){
+        spurs_route_unlock();return (s32)CELL_ESRCH;
+    }
+    u32 selected=0;
+    spurs_event_port_status status=spurs_event_ports_attach((u32)raw_owner,queue,requested,isDynamic,&selected);
+    if(status!=SPURS_EVENT_PORT_OK){
+        sys_event_queue_spurs_release(queue);spurs_route_unlock();
+        return status==SPURS_EVENT_PORT_BUSY?CELL_SPURS_CORE_ERROR_BUSY:
+               status==SPURS_EVENT_PORT_FULL?CELL_SPURS_CORE_ERROR_NOMEM:CELL_SPURS_CORE_ERROR_INVAL;
+    }
+    u8 selected_byte=(u8)selected;
+    if(isDynamic&&!ps3_guest_byte_copy(raw_port,&selected_byte,1)){
+        spurs_event_ports_detach((u32)raw_owner,selected);
+        sys_event_queue_spurs_release(queue);spurs_route_unlock();
         return CELL_SPURS_CORE_ERROR_INVAL;
-    } else if (s_spurs_port_queue[p]) {
-        return CELL_SPURS_CORE_ERROR_BUSY;
     }
-    s_spurs_port_queue[p] = queue;
-    printf("[cellSpurs] AttachLv2EventQueue(queue=%u) port=%u%s\n", queue, p,
-           isDynamic ? " (dynamic)" : "");
+    /* A failed attachment never changes this queue's cancellation state. */
+    sys_event_queue_uncancel_by_id(queue);
+    spurs_route_unlock();
+    printf("[cellSpurs] AttachLv2EventQueue(owner=0x%08X queue=%u port=%u%s)\n",
+           (u32)raw_owner,queue,selected,isDynamic?" dynamic":"");
     return CELL_OK;
 }
 
-s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
+s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs,u8 port)
 {
-    if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (port < 64) s_spurs_port_queue[port] = 0;
-    printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
-    return CELL_OK;
+    uintptr_t owner=(uintptr_t)spurs;
+    if(!owner)return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if(owner>UINT32_MAX||owner<0x10000u||port>=64)return CELL_SPURS_CORE_ERROR_INVAL;
+    if(owner&127u)return CELL_SPURS_CORE_ERROR_ALIGN;
+    spurs_route_lock();u32 queue=spurs_event_ports_lookup((u32)owner,port);
+    spurs_event_port_status status=spurs_event_ports_detach((u32)owner,port);
+    if(status==SPURS_EVENT_PORT_OK&&sys_event_queue_spurs_release(queue))
+        ps3_strict_boot_guard("spurs-event-pin-release","owner=0x%08X queue=%u",(u32)owner,queue);
+    spurs_route_unlock();
+    if(status==SPURS_EVENT_PORT_NOT_FOUND)
+        return g_ps3_sdk_version>=0x180000u?CELL_SPURS_CORE_ERROR_SRCH:CELL_OK;
+    return status==SPURS_EVENT_PORT_OK?CELL_OK:CELL_SPURS_CORE_ERROR_INVAL;
+}
+
+int spurs_route_user_event(spu_context* spu,uint32_t value)
+{
+    unsigned code=value>>24,port=code&63;
+    if(!spu||code>=128)return 0;
+    spurs_route_lock();
+    u32 queue=spu->spurs_owner_ea?spurs_event_ports_lookup(spu->spurs_owner_ea,port):
+                                spurs_event_ports_lookup_unique(port);
+    if(!queue){
+        spurs_route_unlock();
+        ps3_strict_boot_guard("spurs-unbound-owner-event","owner=0x%08X port=%u spu=%u value=0x%08X",
+                             spu->spurs_owner_ea,port,spu->spu_id,value);
+        return 0; /* Legacy fallback retains its unconsumed plain mailbox. */
+    }
+    u32 result=CELL_EINVAL;
+    if(spu->ch_out_mbox.count){
+        u32 data=spu_channel_read(&spu->ch_out_mbox);
+        int rc=sys_event_queue_push_by_id(queue,0xFFFFFFFF53505501ull,spu->spu_id,
+                                         ((u64)port<<32)|(value&0xFFFFFFu),data);
+        result=rc==0?CELL_OK:rc==-2?CELL_ENOTCONN:CELL_EBUSY;
+    }
+    if(code<64)spu_channel_write(&spu->ch_in_mbox,result);
+    spurs_route_unlock();return 1;
 }
 
 /* =========================================================================
@@ -2565,6 +2593,8 @@ static u64 spurs_event_data3_probe(void)
 
 static void jc_signal_done(u32 jc_ea, int job_index)
 {
+    ps3_strict_boot_guard("spurs-unqualified-chain-completion",
+                         "chain=0x%08X job=%d",jc_ea,job_index);
     /* Carry the job's mailbox answer in the completion event. On hardware the
      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
      * synthetic payload means the caller reads back zero for whatever it
@@ -2603,8 +2633,13 @@ static void jc_signal_done(u32 jc_ea, int job_index)
         d3 = g_spurs_job_mbox_intr; (void)d3;
         g_spurs_job_mbox_valid = 0;
     }
-    for (int i = 0; i < s_spurs_event_queue_n; i++) {
-        int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
+    u32 queues[SPURS_EVENT_PORT_OWNER_LIMIT*64],queue_count=0;
+    spurs_route_lock();
+    if(spurs_event_ports_snapshot_all(queues,SPURS_EVENT_PORT_OWNER_LIMIT*64,&queue_count)!=SPURS_EVENT_PORT_OK){
+        spurs_route_unlock();return;
+    }
+    for (u32 i = 0; i < queue_count; i++) {
+        int rc = sys_event_queue_push_by_id(queues[i],
                                             SPURS_EVENT_PORT, jc_ea, d2,
                                             d3_probe_valid
                                                 ? spurs_event_data3_probe()
@@ -2613,9 +2648,10 @@ static void jc_signal_done(u32 jc_ea, int job_index)
         if (n++ < 8)
             printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
                    "(data2=%llu rc=%d)\n",
-                   jc_ea, job_index, s_spurs_event_queue[i],
+                   jc_ea, job_index, queues[i],
                    (unsigned long long)d2, rc);
     }
+    spurs_route_unlock();
 }
 
 static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)

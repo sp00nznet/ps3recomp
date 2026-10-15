@@ -64,6 +64,9 @@ typedef struct sys_event_queue_info {
      * and return CELL_ECANCELED instead of waiting for an event that can never
      * arrive; later receives fail the same way rather than re-blocking. */
     int          cancelled;
+    uint32_t     spurs_attachments; /* table lock: pins prevent reuse, not destruction */
+    uint32_t     waiters; /* queue lock: threads inside a real condition wait */
+    int          destroy_pending; /* table + queue locks: unlocked cleanup in flight */
 
 #ifdef _WIN32
     CRITICAL_SECTION lock;
@@ -174,6 +177,13 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id);
 
 /* Undo the above when a producer attaches again. */
 void sys_event_queue_uncancel_by_id(uint32_t queue_id);
+
+/* Internal lifetime references under the table lock, independent of queue type.
+ * Acquire: 0 success, -1 invalid/inactive or overflow. Release also accepts a
+ * closed queue: 0 success, -1 invalid/unbalanced. Each binding owns one pin.
+ * Normal destroy is blocked by waiting consumers, never by these references. */
+int sys_event_queue_spurs_acquire(uint32_t queue_id);
+int sys_event_queue_spurs_release(uint32_t queue_id);
 
 #ifdef __cplusplus
 }
