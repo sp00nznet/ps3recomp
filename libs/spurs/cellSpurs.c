@@ -14,12 +14,14 @@
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+#include "spurs_job_snapshot.h"
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -2321,32 +2323,47 @@ enum {                              /* CellSpursJobHeader (48 B) */
     JH_SIZE          = 0x30,
 };
 
-static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
+static void jc_run_one_job(u64 raw_job_ea, int idx, u32 size_desc)
 {
-    u64 ea_bin_raw = vm_read64(job_ea + JH_EA_BINARY);
-    u32 ea_bin     = (u32)(ea_bin_raw & ~7ull);          /* low 3 bits = flags */
-    u32 size_bin   = ((vm_read32(job_ea + JH_SIZE_BINARY) >> 16) & 0xFFFFu) << 4;
-    u8  job_type   = *(vm_base + job_ea + JH_JOB_TYPE);
-
-    { static int _n = 0;
-      if (_n < 8) {
-          printf("[cellSpurs]   job[%d] @0x%08X eaBinary=0x%08X size=%u type=0x%02X hdr:",
-                 idx, job_ea, ea_bin, size_bin, job_type);
-          for (int o = 0; o < JH_SIZE; o += 4) {
-              if ((o & 15) == 0) printf("\n      +%02X:", o);
-              printf(" %08X", vm_read32(job_ea + o));
-          }
-          printf("\n");
-      }
-      _n++; }
-
-    if (!ea_bin || !size_bin || ea_bin >= 0x10000000u) {
-        ps3_strict_boot_guard("spurs-invalid-job-image", "job=0x%08X binary=0x%08X size=%u", job_ea, ea_bin, size_bin);
-        static int _b = 0;
-        if (_b++ < 4)
-            printf("[cellSpurs]   job[%d]: implausible binary (ea=0x%08X size=%u) -- skipped\n",
-                   idx, ea_bin, size_bin);
+    extern uint32_t ppu_vm_size;
+    spurs_job_snapshot snapshot;
+    spurs_job_snapshot_status status = spurs_job_snapshot_acquire(
+        vm_base, ppu_vm_size ? ppu_vm_size : 0x100000000ull,
+        raw_job_ea, size_desc, &snapshot);
+    if (status != SPURS_JOB_SNAPSHOT_OK) {
+        ps3_strict_boot_guard("spurs-invalid-job-image", "job=0x%016llX descriptor_size=%u reason=%s",
+                              (unsigned long long)raw_job_ea, size_desc, spurs_job_snapshot_status_name(status));
+        fprintf(stderr, "[cellSpurs] job[%d] snapshot rejected job=0x%016llX reason=%s\n",
+                idx, (unsigned long long)raw_job_ea, spurs_job_snapshot_status_name(status));
         return;
+    }
+    /* All decoding and diagnostics use the same owned descriptor. Guest pages
+     * may change after either copy; this is not a quiesced guest epoch. */
+    static atomic_uint logged_jobs;
+    if (atomic_fetch_add_explicit(&logged_jobs, 1, memory_order_relaxed) < 8) {
+        printf("[cellSpurs] checked job[%d] @0x%08X descriptor=%u rawBinary=0x%016llX flags=%u binary=0x%08X size=%u type=0x%02X fp=0x%016llX hdr:",
+               idx, snapshot.job_ea, snapshot.descriptor_size,
+               (unsigned long long)snapshot.raw_binary_ea, snapshot.binary_flags,
+               snapshot.binary_ea, snapshot.image_size, snapshot.descriptor[JH_JOB_TYPE],
+               (unsigned long long)snapshot.fingerprint);
+        for (int o = 0; o < JH_SIZE; o += 4) {
+            if ((o & 15) == 0) printf("\n      +%02X:", o);
+            const uint8_t* p = snapshot.descriptor + o;
+            printf(" %08X", (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]);
+        }
+        printf("\n");
+    }
+    char capture_prefix[4096];
+    spurs_job_capture_status capture = spurs_job_snapshot_capture(
+        &snapshot, capture_prefix, sizeof capture_prefix);
+    if (capture != SPURS_JOB_CAPTURE_DISABLED) {
+        fprintf(stderr, "[spurs-job-capture] status=%s job=0x%08X descriptor_size=%u image_size=%u fp=0x%016llX prefix=%s\n",
+                capture == SPURS_JOB_CAPTURE_WRITTEN ? "written" :
+                capture == SPURS_JOB_CAPTURE_LIMIT ? "limit" : "error",
+                snapshot.job_ea, snapshot.descriptor_size, snapshot.image_size,
+                (unsigned long long)snapshot.fingerprint,
+                capture == SPURS_JOB_CAPTURE_WRITTEN ? capture_prefix : "<none>");
+        fflush(stderr);
     }
     /* A jobchain job is NOT a SPURS task: Sony's jm2 stages the whole working
      * set in local store and enters the job's CRT with r3 = CellSpursJobContext2*
@@ -2355,7 +2372,8 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
      * DMA traffic at all. spu_workload_dispatch_job reproduces jm2's staging.
      * Synchronous by design: a job runs to completion, and the chain's own
      * NEXT/CALL/RET commands are what order them. */
-    spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc);
+    spu_workload_dispatch_job(snapshot.image, snapshot.image_size, snapshot.job_ea, snapshot.descriptor_size);
+    spurs_job_snapshot_release(&snapshot);
 }
 
 /* Walk one chain's command stream. Bounded: a malformed or self-looping stream
@@ -2607,7 +2625,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (cmd != 0 && op == 0) {                    /* JOB */
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
             int idx = jobs++;
-            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
+            jc_run_one_job(cmd & ~7ull, idx, size_desc);
             idle = 0;                    /* real work: the chain is healthy */
             /* Signal per JOB, not per lap. The application waits once for each
              * unit of work it queued -- this title notified the guard 7 times

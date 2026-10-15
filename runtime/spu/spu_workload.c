@@ -864,6 +864,12 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
           } }
         return 0;
     }
+    /* Registration alone does not qualify the legacy guest-pointer staging,
+     * DMA bounds, LS layout or completion ABI for strict execution. The checked
+     * chain snapshot currently qualifies only capture and the registry MISS. */
+    ps3_strict_boot_guard("spurs-unqualified-job-staging",
+                         "fp=0x%016llX image=%d job=0x%08X size=%u",
+                         (unsigned long long)fp, image_id, job_ea, image_size);
     /* Two lines plus two explicit flushes PER JOB. A title running its audio
      * chain does ~1500 jobs/s, so this alone was ~6k writes/s through one FILE
      * lock, and it starved the guest threads competing for that lock badly

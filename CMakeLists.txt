@@ -102,6 +102,9 @@ list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|
 # ---------------------------------------------------------------------------
 # Static library
 # ---------------------------------------------------------------------------
+# Explicit inclusion keeps the checked SPURS job-chain helper in this target.
+list(REMOVE_ITEM RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/spurs_job_snapshot.c")
+list(APPEND RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/spurs_job_snapshot.c")
 add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
