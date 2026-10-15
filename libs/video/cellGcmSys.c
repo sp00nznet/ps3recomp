@@ -1802,7 +1802,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) vm_write32(la, v);
+                    else if (m == 0x6Cu) {
+                        if (rsx_draw_engine_enabled()) rsx_draw_engine_flush();
+                        vm_write32(la, v);
+                    }
                     else if (m == 0x68u && vm_read32(la) != v) {
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
@@ -1907,9 +1910,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
                  * It wants the raw method with its subchannel bits for the
                  * same reason the live engine does, and masks them itself. */
-                { static int eng = -1;
-                  if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                const int engine_active = rsx_draw_engine_enabled();
+                if (engine_active)
+                    rsx_draw_engine_method((subch << 13) | m, vm_read32(dea));
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -1938,7 +1941,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     ps3_strict_boot_guard("rsx-driver-flip-boundary-unimplemented", "method=0x%04X", mfull);
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    rsx_process_method(&s_state, m, vm_read32(dea));
+                    /* The register-file engine already owns rendering above.
+                     * Only shared control-register side effects also visit the
+                     * older processor. Never execute a draw/clear twice. */
+                    if (!engine_active || m == 0x50 || m == 0x1D6C ||
+                        m == 0x1D70 || m == 0x1D74) {
+                        if (engine_active && (m == 0x50 || m == 0x1D70 || m == 0x1D74))
+                            rsx_draw_engine_flush();
+                        rsx_process_method(&s_state, m, vm_read32(dea));
+                    }
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
@@ -1948,6 +1959,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * reports "visible" -- the conservative answer; reading 0
                      * tells the title every queried object is occluded. */
                     if (m == 0x1800) {
+                        ps3_strict_boot_guard("rsx-report-query-unimplemented", "method=0x%04X data=0x%08X", m, vm_read32(dea));
                         const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
                         { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
                         if (idx < CELL_GCM_MAX_REPORT_COUNT) {
