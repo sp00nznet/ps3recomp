@@ -143,15 +143,23 @@ static int msg_offers_to_abort(const char* msg)
 }
 
 static s32 dialog_open_impl(CellMsgDialogType type, const char* msgString,
+                        const char* hostMessage,
                         CellMsgDialogCallback callback, void* userdata,
                         void* extParam)
 {
     (void)extParam;
     const int strict = ps3_strict_boot_enabled();
     char bounded_message[512];
+    /* OpenErrorCode supplies a host-owned string. Keep its bytes local and
+     * bounded; ordinary Open/Open2 still read their message from guest VM. */
+    if (hostMessage) {
+        const char* end = memchr(hostMessage, 0, sizeof(bounded_message));
+        if (!end) return CELL_MSGDIALOG_ERROR_PARAM;
+        memcpy(bounded_message, hostMessage, (size_t)(end - hostMessage) + 1);
+    }
     if (strict) {
         u32 buttons=(type>>4)&7u, cursor=(type>>8)&3u, bars=(type>>12)&3u;
-        if (!dialog_copy_string(msgString,bounded_message,sizeof(bounded_message)) ||
+        if ((!hostMessage && !dialog_copy_string(msgString,bounded_message,sizeof(bounded_message))) ||
             (type&~0x33F7u) || buttons>2u ||
             (buttons==0 && (cursor || bars>2)) ||
             (buttons==1 && (cursor>1 || bars)) ||
@@ -168,7 +176,7 @@ static s32 dialog_open_impl(CellMsgDialogType type, const char* msgString,
         s32 queued=cellSysutilSendSystemCommand(CELL_SYSUTIL_DRAWING_BEGIN,0);
         if (queued<0) return queued;
     }
-    const char* display_message=strict?bounded_message:guest_str(msgString);
+    const char* display_message=(strict || hostMessage)?bounded_message:guest_str(msgString);
     printf("[cellMsgDialog] Open2(type=0x%08X, msg='%s')\n",type,display_message);
 
     if (s_dialog_open) {
@@ -189,7 +197,7 @@ static s32 dialog_open_impl(CellMsgDialogType type, const char* msgString,
     memset(s_progress, 0, sizeof(s_progress));
 
     /* Print the message so developers can see it */
-    if (msgString) {
+    if (msgString || hostMessage) {
         printf("========================================\n");
         printf("[DIALOG] %s\n", display_message);
         printf("========================================\n");
@@ -282,7 +290,7 @@ static s32 dialog_open_impl(CellMsgDialogType type, const char* msgString,
                 else if (e && (e[0] == 'a' || e[0] == 'A')) forced = 2;   /* heuristic */
                 else                                        forced = 0;   /* always YES (default) */
             }
-            int auto_no = (forced == 2) ? msg_offers_to_abort(guest_str(msgString)) : 0;
+            int auto_no = (forced == 2) ? msg_offers_to_abort(display_message) : 0;
             int no_ = (forced == 2) ? auto_no : forced;
             result = no_ ? CELL_MSGDIALOG_BUTTON_NO : CELL_MSGDIALOG_BUTTON_YES;
             printf("[cellMsgDialog] Auto-responding: %s%s\n", no_ ? "NO" : "YES",
@@ -316,8 +324,29 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type,const char* msgString,
                        CellMsgDialogCallback callback,void* userdata,void* extParam)
 {
     DIALOG_LOCK();
-    s32 result=dialog_open_impl(type,msgString,callback,userdata,extParam);
+    s32 result=dialog_open_impl(type,msgString,NULL,callback,userdata,extParam);
     DIALOG_UNLOCK();return result;
+}
+
+/* RPCS3 routes OpenErrorCode through Open2 with an error/OK type. These
+ * original English fallbacks preserve the code but do not reproduce firmware
+ * localization or sound. The message stays host-owned until copied into the
+ * dialog snapshot; no synthetic guest address is used. */
+s32 cellMsgDialogOpenErrorCode(u32 errorCode, CellMsgDialogCallback callback,
+                               void* userdata, void* extParam)
+{
+    char message[128];
+    if (errorCode == 0x80010006u)
+        snprintf(message, sizeof(message), "The file does not exist. (0x%08X)", errorCode);
+    else
+        snprintf(message, sizeof(message), "An error has occurred. (0x%08X)", errorCode);
+
+    DIALOG_LOCK();
+    s32 result = dialog_open_impl(CELL_MSGDIALOG_TYPE_SE_TYPE_ERROR |
+                                  CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK,
+                                  NULL, message, callback, userdata, extParam);
+    DIALOG_UNLOCK();
+    return result;
 }
 
 /* cellMsgDialogOpen -- the pre-3.40 entry point, identical arguments and

@@ -66,6 +66,8 @@ s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
 s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
                         CellMsgDialogCallback callback, void* userdata,
                         void* extParam);
+s32 cellMsgDialogOpenErrorCode(u32 errorCode, CellMsgDialogCallback callback,
+                               void* userdata, void* extParam);
 
 s32 cellMsgDialogClose(float delayMs);
 

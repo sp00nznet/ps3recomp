@@ -303,7 +303,15 @@ static void cellFsOpen(ppu_context* ctx)
         ps3_strict_fs_mutation("open-write", hpath);
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+        const int host_error=errno;
+        char parent[sizeof hpath];snprintf(parent,sizeof parent,"%s",hpath);
+        char* slash=strrchr(parent,'/');if(slash)*slash=0;
+        struct stat parent_stat{};
+        const bool parent_exists=slash && stat(parent,&parent_stat)==0 &&
+            (parent_stat.st_mode&S_IFMT)==S_IFDIR;
+        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' path_ea=0x%08X flags=0x%08X host_flags=0x%08X fd_ea=0x%08X errno=%d parent_directory=%u lr=0x%08X tid=%llu\n",
+            gpath,hpath,(uint32_t)ctx->gpr[3],flags,(unsigned)(oflags|O_BINARY),fd_ptr,host_error,
+            (unsigned)parent_exists,(uint32_t)ctx->lr,(unsigned long long)ctx->thread_id);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)

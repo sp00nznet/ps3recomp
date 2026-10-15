@@ -750,6 +750,7 @@ extern "C" void ppu_hle_init(void)
 {
     ppu_hle_register_all();
     ps3_hle_register_ctx(0x20543730u,"cellMsgDialogClose",ppu_msgdialog_close);
+    ps3_hle_register_ctx(0x3E22CB4Bu,"cellMsgDialogOpenErrorCode",ppu_msgdialog_open_error);
 
     /* The generated registration unit is per-game and easy to leave out: the
      * weak stub above means a build without it links and starts, then fails
