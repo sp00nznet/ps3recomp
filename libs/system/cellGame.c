@@ -480,6 +480,206 @@ static u32 gamedata_le32(const unsigned char* p)
     return (u32)p[0] | ((u32)p[1]<<8) | ((u32)p[2]<<16) | ((u32)p[3]<<24);
 }
 
+static void gamedata_put32(unsigned char* p,u32 v)
+{ p[0]=(u8)v;p[1]=(u8)(v>>8);p[2]=(u8)(v>>16);p[3]=(u8)(v>>24); }
+static void gamedata_put16(unsigned char* p,u32 v)
+{ p[0]=(u8)v;p[1]=(u8)(v>>8); }
+
+typedef struct {
+    const char* key;
+    const unsigned char* value;
+    u32 format,length,maximum;
+} GamedataSfoEntry;
+
+/* Existing entries point into *source until serialization finishes. Reject
+ * malformed tables rather than silently dropping unknown metadata. */
+static s32 gamedata_sfo_load(const char* path, GamedataSfoEntry** entries,
+                             u32* count, unsigned char** source)
+{
+    FILE* f=ps3_strict_fs_fopen(path,"rb");
+    if(!f){if(errno==ENOENT)return 0;return CELL_GAMEDATA_ERROR_ACCESS_ERROR;}
+    if(fseek(f,0,SEEK_END)){fclose(f);return CELL_GAMEDATA_ERROR_BROKEN;}
+    long n=ftell(f);
+    if(n<20||n>1024*1024||fseek(f,0,SEEK_SET)){fclose(f);return CELL_GAMEDATA_ERROR_BROKEN;}
+    unsigned char* d=malloc((size_t)n);
+    if(!d){fclose(f);return CELL_GAMEDATA_ERROR_ACCESS_ERROR;}
+    int read_ok=fread(d,1,(size_t)n,f)==(size_t)n;fclose(f);
+    if(!read_ok||memcmp(d,"\0PSF",4)||gamedata_le32(d+4)!=0x101){free(d);return CELL_GAMEDATA_ERROR_BROKEN;}
+    u32 keys=gamedata_le32(d+8),values=gamedata_le32(d+12),num=gamedata_le32(d+16);
+    if(!num||num>4096||num>((u32)n-20)/16||20+16*num>keys||
+       keys>=values||values>(u32)n||(values&3)) {
+        free(d);return CELL_GAMEDATA_ERROR_BROKEN;
+    }
+    GamedataSfoEntry* e=calloc((size_t)num+25,sizeof *e);
+    if(!e){free(d);return CELL_GAMEDATA_ERROR_ACCESS_ERROR;}
+    int category=0;
+    for(u32 i=0;i<num;++i){
+        const unsigned char* row=d+20+16*i;
+        u32 ko=(u32)row[0]|((u32)row[1]<<8),off=gamedata_le32(row+12);
+        u32 len=gamedata_le32(row+4),max=gamedata_le32(row+8);
+        if(ko>=values-keys||off>(u32)n-values||(off&3)||!max||len>max||max>(u32)n-values-off||
+           !memchr(d+keys+ko,0,values-keys-ko)||!d[keys+ko])goto broken;
+        e[i].key=(const char*)d+keys+ko;e[i].value=d+values+off;
+        e[i].format=(u32)row[2]|((u32)row[3]<<8);e[i].length=len;e[i].maximum=max;
+        if(e[i].format!=0x004&&e[i].format!=0x204&&e[i].format!=0x404)goto broken;
+        if(e[i].format==0x204 && (!len||e[i].value[len-1]||memchr(e[i].value,0,len-1)))goto broken;
+        if(e[i].format==0x404 && (len!=4||max!=4))goto broken;
+        for(u32 j=0;j<i;++j) {
+            if(!strcmp(e[j].key,e[i].key))goto broken;
+            size_t key_a=(size_t)(e[j].key-(const char*)d),key_b=keys+ko;
+            if(key_a<key_b+strlen(e[i].key)+1 && key_b<key_a+strlen(e[j].key)+1)goto broken;
+            size_t value_a=(size_t)(e[j].value-d),value_b=values+off;
+            if(value_a<value_b+max && value_b<value_a+e[j].maximum)goto broken;
+        }
+        if(!strcmp(e[i].key,"CATEGORY"))category=e[i].format==0x204 &&
+            (!strcmp((const char*)e[i].value,"GD")||!strcmp((const char*)e[i].value,"DG"));
+    }
+    if(!category)goto broken;
+    *entries=e;*count=num;*source=d;return 0;
+ broken:
+    free(e);free(d);return CELL_GAMEDATA_ERROR_BROKEN;
+}
+
+static void gamedata_sfo_set(GamedataSfoEntry* e,u32* count,const char* key,
+                              const unsigned char* value,u32 format,u32 length,u32 maximum)
+{
+    int found=0;
+    for(u32 i=0;i<*count;++i)if(!strcmp(e[i].key,key)){
+        e[i].value=value;e[i].format=format;e[i].length=length;e[i].maximum=maximum;found=1;
+    }
+    if(!found){u32 i=(*count)++;e[i].key=key;e[i].value=value;
+        e[i].format=format;e[i].length=length;e[i].maximum=maximum;}
+}
+
+static s32 gamedata_sfo_build(GamedataSfoEntry* e,u32 count,unsigned char** out,size_t* out_len)
+{
+    size_t keys=20+(size_t)count*16,values=keys;
+    for(u32 i=0;i<count;++i){
+        size_t n=strlen(e[i].key)+1;
+        if(values-keys+n>UINT16_MAX||e[i].length>e[i].maximum||e[i].maximum>1024*1024)
+            return CELL_GAMEDATA_ERROR_BROKEN;
+        values+=n;
+    }
+    values=(values+3)&~(size_t)3;
+    size_t end=values;
+    for(u32 i=0;i<count;++i){end=(end+3)&~(size_t)3;end+=e[i].maximum;
+        if(end>1024*1024)return CELL_GAMEDATA_ERROR_BROKEN;}
+    end=(end+3)&~(size_t)3;
+    unsigned char* d=calloc(end?end:1,1);
+    if(!d)return CELL_GAMEDATA_ERROR_ACCESS_ERROR;
+    memcpy(d,"\0PSF",4);gamedata_put32(d+4,0x101);
+    gamedata_put32(d+8,(u32)keys);gamedata_put32(d+12,(u32)values);gamedata_put32(d+16,count);
+    size_t ko=0,pos=values;
+    for(u32 i=0;i<count;++i){
+        unsigned char* row=d+20+16*i;
+        size_t n=strlen(e[i].key)+1;
+        gamedata_put16(row,(u32)ko);gamedata_put16(row+2,e[i].format);
+        gamedata_put32(row+4,e[i].length);gamedata_put32(row+8,e[i].maximum);
+        pos=(pos+3)&~(size_t)3;gamedata_put32(row+12,(u32)(pos-values));
+        memcpy(d+keys+ko,e[i].key,n);ko+=n;
+        memcpy(d+pos,e[i].value,e[i].length);pos+=e[i].maximum;
+    }
+    *out=d;*out_len=end;return 0;
+}
+
+static int gamedata_guest_param(u32 ea,CellGameDataSystemFileParam* out,u32* parental)
+{
+    const uint64_t limit=ppu_vm_size?ppu_vm_size:0x100000000ULL;
+    if(!vm_base||ea<0x10000u||(uint64_t)ea+sizeof *out>limit)return 0;
+#ifdef _WIN32
+    SIZE_T copied=0;
+    if(!ReadProcessMemory(GetCurrentProcess(),vm_base+ea,out,sizeof *out,&copied)||copied!=sizeof *out)return 0;
+#else
+    memcpy(out,vm_base+ea,sizeof *out);
+#endif
+    if(!memchr(out->title,0,sizeof out->title)||!out->title[0]||
+       !memchr(out->titleId,0,sizeof out->titleId)||!out->titleId[0]||
+       !memchr(out->dataVersion,0,sizeof out->dataVersion)||!out->dataVersion[0])return 0;
+    for(u32 i=0;i<20;++i)if(!memchr(out->titleLang[i],0,sizeof out->titleLang[i]))return 0;
+    const unsigned char* p=(const unsigned char*)&out->parentalLevel;
+    *parental=((u32)p[0]<<24)|((u32)p[1]<<16)|((u32)p[2]<<8)|(u32)p[3];
+    return 1;
+}
+
+static int gamedata_ensure_directory(const char* path)
+{
+    char part[1024];size_t len=strlen(path);
+    if(len>=sizeof part)return 0;
+    memcpy(part,path,len+1);
+    for(size_t i=1;i<=len;++i)if(i==len||part[i]=='/'||part[i]=='\\'){
+        char saved=part[i];part[i]=0;
+        if(part[0] && !(i==2&&part[1]==':')){
+            HOST_STAT_T st;
+            if(HOST_STAT(part,&st)){
+                if(errno!=ENOENT||HOST_MKDIR(part))return 0;
+            }else {
+#ifdef _WIN32
+                if(!(st.st_mode&_S_IFDIR))return 0;
+#else
+                if(!S_ISDIR(st.st_mode))return 0;
+#endif
+            }
+        }
+        part[i]=saved;
+    }
+    return 1;
+}
+
+static s32 gamedata_write_param(const char* path,const char* dir,int is_new,u32 guest_param)
+{
+    CellGameDataSystemFileParam param;u32 parental;
+    if(!gamedata_guest_param(guest_param,&param,&parental))return CELL_GAMEDATA_ERROR_PARAM;
+    GamedataSfoEntry* e=NULL;unsigned char *source=NULL,*bytes=NULL;
+    u32 count=0;size_t size=0;s32 status=0;
+    if(is_new){e=calloc(25,sizeof *e);if(!e)return CELL_GAMEDATA_ERROR_ACCESS_ERROR;}
+    else {status=gamedata_sfo_load(path,&e,&count,&source);if(status)return status;
+        if(!source){return CELL_GAMEDATA_ERROR_BROKEN;}}
+    unsigned char integer[4];gamedata_put32(integer,parental);
+    if(is_new)gamedata_sfo_set(e,&count,"CATEGORY",(const unsigned char*)"GD",0x204,3,3);
+    gamedata_sfo_set(e,&count,"TITLE_ID",(const unsigned char*)param.titleId,0x204,(u32)strlen(param.titleId)+1,16);
+    gamedata_sfo_set(e,&count,"TITLE",(const unsigned char*)param.title,0x204,(u32)strlen(param.title)+1,128);
+    gamedata_sfo_set(e,&count,"VERSION",(const unsigned char*)param.dataVersion,0x204,(u32)strlen(param.dataVersion)+1,6);
+    gamedata_sfo_set(e,&count,"PARENTAL_LEVEL",integer,0x404,4,4);
+    char names[20][16];
+    for(u32 i=0;i<20;++i)if(param.titleLang[i][0]){
+        snprintf(names[i],sizeof names[i],"TITLE_%02u",i);
+        gamedata_sfo_set(e,&count,names[i],(const unsigned char*)param.titleLang[i],0x204,
+                         (u32)strlen(param.titleLang[i])+1,128);
+    }
+    status=gamedata_sfo_build(e,count,&bytes,&size);
+    if(status)goto done;
+    if(is_new){
+        char usrdir[1024];int n=snprintf(usrdir,sizeof usrdir,"%s/%s/USRDIR",content_root(),dir);
+        if(n<0||n>=(int)sizeof usrdir){status=CELL_GAMEDATA_ERROR_PARAM;goto done;}
+        if(!gamedata_ensure_directory(usrdir)){status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;goto done;}
+    }
+    char temp[1100];
+#ifdef _WIN32
+    unsigned long pid=GetCurrentProcessId();
+#else
+    unsigned long pid=(unsigned long)getpid();
+#endif
+    static atomic_uint serial=0;
+    unsigned sequence=atomic_fetch_add(&serial,1);
+    int n=snprintf(temp,sizeof temp,"%s.tmp.%lu.%u",path,pid,sequence);
+    if(n<0||n>=(int)sizeof temp){status=CELL_GAMEDATA_ERROR_PARAM;goto done;}
+    HOST_STAT_T existing;
+    if(HOST_STAT(temp,&existing)==0){status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;goto done;}
+    FILE* f=ps3_strict_fs_fopen(temp,"wbx");
+    if(!f){status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;goto done;}
+    size_t wrote=ps3_strict_fs_fwrite(bytes,1,size,f);
+    int closed=fclose(f);
+    if(wrote!=size||closed){ps3_strict_fs_remove(temp);status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;goto done;}
+    /* A new-data check must not overwrite another creator's SFO. Existing
+     * metadata updates need the guarded atomic replacement helper. */
+    int committed=is_new?ps3_strict_fs_commit_new_file(temp,path):ps3_strict_fs_replace_file(temp,path);
+    if(committed){
+        ps3_strict_fs_remove(temp);status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;goto done;
+    }
+ done:
+    free(bytes);free(source);free(e);return status;
+}
+
 /* Read only on-disk metadata. Missing SFO is new data; malformed SFO is broken.
  * Nothing is inferred from the boot title or synthesized as existing data. */
 static s32 gamedata_read_param(const char* path, uint32_t gp, u32* is_new, int hdd)
@@ -590,9 +790,15 @@ static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
     if (result!=0) {status=CELL_GAMEDATA_ERROR_CBRESULT;goto done;}
     if (is_new && !vm_read32(set)) {status=CELL_GAMEDATA_ERROR_PARAM;goto done;}
     if (is_new || vm_read32(set)) {
-        ps3_strict_boot_guard("gamedata-persistence-unimplemented","operation=%s path=%s opd=0x%08X new=%u setParam=0x%08X",tag,path,func_opd,is_new,vm_read32(set));
-        ps3_strict_fs_unimplemented(tag,path);
-        status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;
+        if (hdd) {
+            ps3_strict_boot_guard("gamedata-persistence-unimplemented","operation=%s path=%s opd=0x%08X new=%u setParam=0x%08X",tag,path,func_opd,is_new,vm_read32(set));
+            ps3_strict_fs_unimplemented(tag,path);
+            status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;
+        } else {
+            status=gamedata_write_param(path,dir,(int)is_new,vm_read32(set));
+            printf("[cellGame] %s persistence path=%s new=%u result=0x%08X\n",
+                   tag,path,is_new,(u32)status);
+        }
     }
  done:
     atomic_flag_clear(&gamedata_in_callback);

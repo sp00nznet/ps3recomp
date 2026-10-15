@@ -13,6 +13,7 @@
 #include <direct.h>
 #else
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 static inline int ps3_strict_fs_readonly(void) {
     const char* e=getenv("PS3_STRICT_FS_READONLY"); return e && !strcmp(e,"1");
@@ -116,6 +117,7 @@ static inline void ps3_strict_fs_native_handle(const char* operation,HANDLE hand
 }
 #endif
 static inline void ps3_strict_fs_stream(const char* operation,FILE* stream) {
+    (void)stream;
     if(!ps3_strict_fs_enabled())return;
     if(ps3_strict_fs_readonly())ps3_strict_fs_fail(operation,"<open stream>","readonly-mutation");
 #ifdef _WIN32
@@ -146,6 +148,50 @@ static inline int ps3_strict_fs_remove(const char* path) {
 }
 static inline int ps3_strict_fs_rename(const char* from,const char* to) {
     ps3_strict_fs_mutation("rename-source",from); ps3_strict_fs_mutation("rename-destination",to); return rename(from,to);
+}
+/* A new metadata commit must never replace a competing creator's file. */
+static inline int ps3_strict_fs_commit_new_file(const char* from,const char* to) {
+    ps3_strict_fs_mutation("commit-new-source",from);
+    ps3_strict_fs_mutation("commit-new-destination",to);
+#ifdef _WIN32
+    if(!MoveFileExA(from,to,MOVEFILE_WRITE_THROUGH)) {errno=EACCES;return -1;}
+    return 0;
+#else
+    /* link atomically creates a new name and fails if that name exists.
+     * Unlike renameat2(NOREPLACE), it also works on the tested WSL Q mount.
+     * Write-root mode has already stopped above on unsupported POSIX hosts. */
+    if(link(from,to))return -1;
+    return unlink(from);
+#endif
+}
+/* Atomic sibling replacement for completed metadata files. Windows CRT rename
+ * refuses an existing destination, so validate both names and file identities
+ * before MoveFileEx. This is containment, not a TOCTOU-resistant OS sandbox. */
+static inline int ps3_strict_fs_replace_file(const char* from,const char* to) {
+    ps3_strict_fs_mutation("replace-source",from);
+    ps3_strict_fs_mutation("replace-destination",to);
+#ifdef _WIN32
+    const char* names[2]={from,to};
+    for(int i=0;i<2;i++) {
+        DWORD attr=GetFileAttributesA(names[i]);
+        if(attr==INVALID_FILE_ATTRIBUTES) {
+            if(i==1 && (GetLastError()==ERROR_FILE_NOT_FOUND || GetLastError()==ERROR_PATH_NOT_FOUND))continue;
+            errno=ENOENT;return -1;
+        }
+        if((attr&FILE_ATTRIBUTE_DIRECTORY)||(attr&FILE_ATTRIBUTE_REPARSE_POINT)) {errno=EACCES;return -1;}
+        HANDLE h=CreateFileA(names[i],FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                             NULL,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+        if(h==INVALID_HANDLE_VALUE) {errno=EACCES;return -1;}
+        BY_HANDLE_FILE_INFORMATION info;
+        int ok=GetFileInformationByHandle(h,&info)&&info.nNumberOfLinks==1;
+        CloseHandle(h);
+        if(!ok){errno=EACCES;return -1;}
+    }
+    if(!MoveFileExA(from,to,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) {errno=EACCES;return -1;}
+    return 0;
+#else
+    return rename(from,to);
+#endif
 }
 static inline int ps3_strict_fs_mkdir(const char* path,int mode) {
     if(ps3_strict_fs_readonly())ps3_strict_fs_fail("mkdir",path,"readonly-mutation");

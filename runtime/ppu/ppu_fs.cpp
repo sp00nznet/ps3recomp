@@ -15,6 +15,7 @@
  * through vm_base in big-endian.
  */
 #include "ppu_recomp.h"      /* ppu_context */
+#include "ppu_fs_memory.h"
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
@@ -23,6 +24,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <atomic>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
@@ -55,6 +58,11 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
+#define CELL_FS_STAT_EFAULT       ((int32_t)0x8001000Du)
+#define CELL_FS_STAT_EACCES       ((int32_t)0x80010029u)
+#define CELL_FS_STAT_ENOTDIR      ((int32_t)0x8001002Eu)
+#define CELL_FS_STAT_ENAMETOOLONG ((int32_t)0x80010034u)
+#define CELL_FS_STAT_EIO          ((int32_t)0x8001002Bu)
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
 #define CELL_FS_O_RDONLY     0
@@ -80,6 +88,77 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
         dst[i] = c;
     }
     dst[i] = 0;
+}
+
+/* cellFsStat needs a checked guest span: the low 64 KiB is reserved and the full VM
+ * uses ppu_vm_size == 0 as a sentinel. Querying host pages also catches an
+ * uncommitted/guard page before a raw vm_base read or write on Windows. */
+static ppu_fs_guest_page_preparer fs_guest_page_preparer;
+extern "C" void ppu_fs_set_guest_page_preparer(ppu_fs_guest_page_preparer prepare)
+{
+    fs_guest_page_preparer = prepare;
+}
+
+static bool fs_stat_guest_span(uint32_t ea, size_t length, bool writable)
+{
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ULL;
+    if (!vm_base || ea < 0x10000u || (uint64_t)ea + length > limit) return false;
+#ifdef _WIN32
+    uintptr_t current = (uintptr_t)(vm_base + ea);
+    const uintptr_t end = current + length;
+    if (end < current) return false;
+    while (current < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((const void*)current, &mbi, sizeof mbi)) return false;
+        if (mbi.State == MEM_RESERVE && fs_guest_page_preparer) {
+            const uintptr_t base = (uintptr_t)vm_base;
+            if (current < base || current - base > UINT32_MAX) return false;
+            // Another guest thread may have committed the page since our query.
+            // The final state and protection decide validity, not the hook result.
+            fs_guest_page_preparer((uint32_t)(current - base));
+            if (!VirtualQuery((const void*)current, &mbi, sizeof mbi)) return false;
+        }
+        if (mbi.State != MEM_COMMIT)
+            return false;
+        DWORD protection = mbi.Protect & 0xff;
+        if ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            (writable ? protection != PAGE_READWRITE && protection != PAGE_WRITECOPY &&
+                        protection != PAGE_EXECUTE_READWRITE && protection != PAGE_EXECUTE_WRITECOPY
+                      : protection != PAGE_READONLY && protection != PAGE_READWRITE &&
+                        protection != PAGE_WRITECOPY && protection != PAGE_EXECUTE_READ &&
+                        protection != PAGE_EXECUTE_READWRITE && protection != PAGE_EXECUTE_WRITECOPY))
+            return false;
+        uintptr_t region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= current) return false;
+        current = region_end;
+    }
+#endif
+    return true;
+}
+
+static int32_t fs_stat_guest_path(char* dst, uint32_t ea)
+{
+    if (!ea) return CELL_FS_STAT_EFAULT;
+    // CELL_FS_MAX_FS_PATH_LENGTH permits 1024 bytes plus its terminator.
+    for (size_t i = 0; i <= 1024; ++i) {
+        uint64_t current = (uint64_t)ea + i;
+        if (current > UINT32_MAX || !fs_stat_guest_span((uint32_t)current, 1, false))
+            return CELL_FS_STAT_EFAULT;
+#ifdef _WIN32
+        char c = 0;
+        SIZE_T copied = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), vm_base + current, &c, 1, &copied) || copied != 1)
+            return CELL_FS_STAT_EFAULT;
+#else
+        char c = (char)vm_base[current];
+#endif
+        if (!c) {
+            dst[i] = 0;
+            return i && dst[0] == '/' ? CELL_OK : CELL_FS_ENOENT;
+        }
+        dst[i] = c;
+    }
+    return CELL_FS_STAT_ENAMETOOLONG;
 }
 
 /* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
@@ -577,19 +656,42 @@ static void write_stat(uint32_t sb, uint32_t mode, uint64_t size)
 
 static void cellFsStat(ppu_context* ctx)
 {
-    char gpath[1024], hpath[1100];
-    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    char gpath[1025], hpath[1100];
+    const uint32_t path_ea = (uint32_t)ctx->gpr[3];
     uint32_t sb = (uint32_t)ctx->gpr[4];
+    int32_t error = fs_stat_guest_path(gpath, path_ea);
+    if (!error && !fs_stat_guest_span(sb, 52, true)) error = CELL_FS_STAT_EFAULT;
+    if (error) {
+        static std::atomic<unsigned> invalid_logs{0};
+        if (invalid_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+#ifdef _WIN32
+            unsigned long tid = GetCurrentThreadId();
+#else
+            unsigned long tid = 0;
+#endif
+            fprintf(stderr, "[fs] stat invalid path_ea=0x%08X sb_ea=0x%08X result=0x%08X lr=0x%08X tid=%lu\n",
+                    path_ea, sb, (uint32_t)error, (uint32_t)ctx->lr, tid);
+        }
+        ctx->gpr[3] = (uint64_t)(int64_t)error;
+        return;
+    }
     host_path(hpath, sizeof hpath, gpath);
     struct stat st;
     if (stat(hpath, &st) != 0) {
-        if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+        switch (errno) {
+        case ENOENT: error = CELL_FS_ENOENT; break;
+        case ENOTDIR: error = CELL_FS_STAT_ENOTDIR; break;
+        case EACCES: error = CELL_FS_STAT_EACCES; break;
+        case ENAMETOOLONG: error = CELL_FS_STAT_ENAMETOOLONG; break;
+        default: error = CELL_FS_STAT_EIO; break;
+        }
+        if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> 0x%08X\n", gpath, (uint32_t)error);
+        ctx->gpr[3] = (uint64_t)(int64_t)error; return;
     }
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
-    if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
+    write_stat(sb, mode, (uint64_t)st.st_size);
     if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
     ctx->gpr[3] = CELL_OK;
 }
