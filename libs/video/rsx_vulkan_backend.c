@@ -2544,7 +2544,7 @@ static struct {
 } s_e2;
 
 #define VK_ENG_SAMP_CACHE 64
-static struct { u64 key; VkSampler s; } s_esamp[VK_ENG_SAMP_CACHE];
+static struct { VkSamplerCreateInfo info; VkSampler s; } s_esamp[VK_ENG_SAMP_CACHE];
 static u32 s_esamp_count;
 
 static void vk_eng_drop_framebuffers(void)
@@ -2990,14 +2990,6 @@ static int vk_eng_ensure_indices(VkDeviceSize bytes)
  * stay the guest's 1..8, which vk_gcm_wrap already translates. */
 static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
 {
-    u32 lo, hi;
-    memcpy(&lo, &d->min_lod, 4); memcpy(&hi, &d->max_lod, 4);
-    const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1) | ((u64)d->mip_linear << 2)
-                  | ((u64)d->mip_present << 3) | ((u64)(d->wrap_s & 0xF) << 4)
-                  | ((u64)(d->wrap_t & 0xF) << 8) | ((u64)(d->wrap_r & 0xF) << 12)
-                  | ((u64)(lo >> 16) << 16) | ((u64)(hi >> 16) << 32);
-    for (u32 i = 0; i < s_esamp_count; i++) if (s_esamp[i].key == key) return s_esamp[i].s;
-    if (s_esamp_count >= VK_ENG_SAMP_CACHE) return s_vk.sampler;
     float min_lod = d->min_lod, max_lod = d->mip_present ? d->max_lod : d->min_lod;
     if (max_lod < min_lod) max_lod = min_lod;
     VkSamplerCreateInfo sci = {
@@ -3009,9 +3001,24 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
         .addressModeW = vk_gcm_wrap(d->wrap_r),
         .minLod = min_lod, .maxLod = max_lod,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
+    /* Compare effective creation values, including every LOD bit, without
+     * struct padding or a lossy packed key. Equivalent wraps and disabled/
+     * clamped mip ranges should reuse the same successful sampler. */
+    for (u32 i = 0; i < s_esamp_count; i++) {
+        const VkSamplerCreateInfo* p = &s_esamp[i].info;
+        if (p->magFilter == sci.magFilter && p->minFilter == sci.minFilter &&
+            p->mipmapMode == sci.mipmapMode &&
+            p->addressModeU == sci.addressModeU &&
+            p->addressModeV == sci.addressModeV &&
+            p->addressModeW == sci.addressModeW &&
+            p->minLod == sci.minLod && p->maxLod == sci.maxLod &&
+            p->borderColor == sci.borderColor)
+            return s_esamp[i].s;
+    }
+    if (s_esamp_count >= VK_ENG_SAMP_CACHE) return s_vk.sampler;
     VkSampler smp;
     if (pvkCreateSampler(s_vk.device, &sci, NULL, &smp) != VK_SUCCESS) return s_vk.sampler;
-    s_esamp[s_esamp_count].key = key;
+    s_esamp[s_esamp_count].info = sci;
     s_esamp[s_esamp_count++].s = smp;
     return smp;
 }
