@@ -50,6 +50,7 @@
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
 #include "rsx_depth_clip.h"
+#include "rsx_frame_dump.h"
 #include "ps3emu/strict_boot.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
@@ -1867,12 +1868,8 @@ static void vk_present_window(void)
 
 static void vk_dump_ppm(const unsigned char* rgba)
 {
-    FILE* f = fopen(s_vk.dump_path, "wb");
-    if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); return; }
-    fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height);
-    for (size_t i = 0; i < (size_t)s_vk.width * s_vk.height; i++)
-        fwrite(rgba + i * 4, 1, 3, f);
-    fclose(f);
+    if(rsx_dump_ppm(s_vk.dump_path,rgba,s_vk.width,s_vk.height))
+        VK_LOG("cannot publish complete frame dump %s\n",s_vk.dump_path);
 }
 
 static void vk_cb_present(void* ud, u32 buffer_id)
