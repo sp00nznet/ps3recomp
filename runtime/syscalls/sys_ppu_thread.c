@@ -9,7 +9,7 @@
  * from inside a loop and so called exit 1,435 times in one run, staying alive
  * and holding whatever it held. Arm a jump in the thread proc and unwind to it
  * instead. PS3_NO_THREAD_EXIT_UNWIND=1 restores the old behaviour. */
-#if defined(_WIN32)
+#if defined(_MSC_VER)
 #  define PPU_TLS __declspec(thread)
 #else
 #  define PPU_TLS __thread
