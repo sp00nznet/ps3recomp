@@ -11,6 +11,7 @@
 
 #include <stdlib.h>
 #include "rsx_fp_decompiler.h"
+#include "rsx_shader_window.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -413,6 +414,30 @@ static int fp_export_target(u32 index, int half)
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
 {
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
+}
+
+int rsx_fp_apply_shader_window(char* hlsl, u32 out_size, u32 raw)
+{
+    rsx_shader_window window;
+    if (!hlsl || !out_size || rsx_shader_window_decode(raw, &window)) return -1;
+    u32 length = 0;
+    while (length < out_size && hlsl[length]) length++;
+    if (length == out_size) return -1;
+    char* main = strstr(hlsl, "main(PSInput input)");
+    char* brace = main ? strchr(main, '{') : NULL;
+    if (!brace || strstr(hlsl, "/* RSX shader window */")) return -1;
+    if (window.y_scale == 1.0f && window.x_bias == 0.0f) return 0;
+    char insertion[224];
+    int count = snprintf(insertion, sizeof insertion,
+        "\n    /* RSX shader window */\n"
+        "    input.position.xy = input.position.xy * float2(1.0, %.1f) + float2(%.1f, %.1f);\n",
+        (double)window.y_scale, (double)window.x_bias, (double)window.y_bias);
+    if (count < 0 || (size_t)count >= sizeof insertion ||
+        (u64)length + (u32)count + 1 > out_size) return -1;
+    const size_t offset = (size_t)(brace + 1 - hlsl);
+    memmove(hlsl + offset + count, hlsl + offset, length - offset + 1);
+    memcpy(hlsl + offset, insertion, (size_t)count);
+    return 1;
 }
 
 static int rsx_fp_decompile_internal(

@@ -71,6 +71,13 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
+/* Convert the host's top-origin half-pixel SV_POSITION to guest WPOS at
+ * unit resolution. Applies once to a generated shader; leaves z/w unchanged.
+ * Returns 1 when inserted, 0 for identity, -1 on invalid state/source/capacity.
+ * Callers must include the register in pipeline identity and snapshot it per
+ * deferred draw. This does not implement resolution scaling or MSAA. */
+int rsx_fp_apply_shader_window(char* hlsl, u32 out_size, u32 raw);
+
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
  * shader. D3D12 has no fixed-function alpha test, so the comparison is
  * emitted immediately before the shader's final color return. `func` uses

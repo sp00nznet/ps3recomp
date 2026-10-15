@@ -418,6 +418,16 @@ if(UNIX)
     # C++ driver must do the final link or the standard library goes missing.
     set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
 
+    if(PS3RECOMP_RSX_VULKAN)
+        add_executable(test_folklore_shader_window_gpu EXCLUDE_FROM_ALL
+            tests/test_folklore_shader_window_gpu.c runtime/host/host_stubs.c)
+        target_include_directories(test_folklore_shader_window_gpu PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_folklore_shader_window_gpu PRIVATE -UNDEBUG)
+        target_link_libraries(test_folklore_shader_window_gpu PRIVATE ps3recomp_runtime m)
+        set_target_properties(test_folklore_shader_window_gpu PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
+
     # Guest shader translation, decompilers -> HLSL -> MSL, with no GPU: the
     # regression net for the Metal backend's shader path on every platform.
     if(PS3RECOMP_MSL_TRANSLATION)

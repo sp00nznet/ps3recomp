@@ -872,6 +872,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
+    if (method == NV4097_SET_SHADER_WINDOW) {
+        if (data & ~0x00011FFFu) {
+            ps3_strict_boot_guard("rsx-shader-window-invalid", "data=0x%08X", data);
+            return -1;
+        }
+        state->shader_window = data;
+        state->shader_dirty = 1;
+        return 0;
+    }
     if (method == NV4097_SET_SHADER_CONTROL) {
         { static int _sc=0; if (_sc++ < 12 && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
