@@ -68,9 +68,12 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_O_RDONLY     0
 #define CELL_FS_O_WRONLY     1
 #define CELL_FS_O_RDWR       2
-#define CELL_FS_O_CREAT      0x0200
-#define CELL_FS_O_TRUNC      0x0400
-#define CELL_FS_O_APPEND     0x0100
+/* Guest ABI bits, matching libs/filesystem/cellFs.h and the pinned PS3 ABI.
+ * These are not the host's O_* constants. */
+#define CELL_FS_O_CREAT      000100
+#define CELL_FS_O_EXCL       000200
+#define CELL_FS_O_TRUNC      001000
+#define CELL_FS_O_APPEND     002000
 #define CELL_FS_SEEK_SET     0
 #define CELL_FS_SEEK_CUR     1
 #define CELL_FS_SEEK_END     2
@@ -283,6 +286,7 @@ static void cellFsOpen(ppu_context* ctx)
     int oflags = (acc == CELL_FS_O_RDWR)   ? O_RDWR
                : (acc == CELL_FS_O_WRONLY) ? O_WRONLY : O_RDONLY;
     if (flags & CELL_FS_O_CREAT)  oflags |= O_CREAT;
+    if (flags & CELL_FS_O_EXCL)   oflags |= O_EXCL;
     if (flags & CELL_FS_O_TRUNC)  oflags |= O_TRUNC;
     if (flags & CELL_FS_O_APPEND) oflags |= O_APPEND;
 
@@ -312,7 +316,17 @@ static void cellFsOpen(ppu_context* ctx)
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' path_ea=0x%08X flags=0x%08X host_flags=0x%08X fd_ea=0x%08X errno=%d parent_directory=%u lr=0x%08X tid=%llu\n",
             gpath,hpath,(uint32_t)ctx->gpr[3],flags,(unsigned)(oflags|O_BINARY),fd_ptr,host_error,
             (unsigned)parent_exists,(uint32_t)ctx->lr,(unsigned long long)ctx->thread_id);
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+        int32_t error=CELL_FS_STAT_EIO;
+        switch(host_error) {
+        case ENOENT: error=CELL_FS_ENOENT;break;
+        case EACCES: error=CELL_FS_STAT_EACCES;break;
+        case ENOTDIR: error=CELL_FS_STAT_ENOTDIR;break;
+        case ENAMETOOLONG: error=CELL_FS_STAT_ENAMETOOLONG;break;
+        case EEXIST: error=(int32_t)0x80010014u;break;
+        case EINVAL: error=(int32_t)0x80010002u;break;
+        case ENOSPC: error=(int32_t)0x80010023u;break;
+        }
+        ctx->gpr[3] = (uint64_t)(int64_t)error; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
                         ? ((flags & CELL_FS_O_APPEND) ? "ab+" : "rb+")
