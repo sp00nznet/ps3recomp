@@ -10,6 +10,12 @@
 #include "spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
+static atomic_uint_fast64_t interpreter_fallback_entries;
+uint64_t spu_interpreter_fallback_count(void)
+{
+    return atomic_load_explicit(&interpreter_fallback_entries,memory_order_relaxed);
+}
 
 /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
  * into each generated spu_recomp.h — declared here to stay header-independent. */
@@ -346,6 +352,11 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
 }
 
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    uint64_t count=atomic_fetch_add_explicit(&interpreter_fallback_entries,1,memory_order_relaxed)+1;
+    fprintf(stderr,"[spu-interpreter-fallback] count=%llu pc=0x%05X lr=0x%05X spu=%u\n",
+        (unsigned long long)count,start_lsa,ctx->gpr[0]._u32[0],ctx->spu_id);
+    ps3_strict_boot_guard("spu-interpreter-fallback","count=%llu pc=0x%05X lr=0x%05X spu=%u",
+        (unsigned long long)count,start_lsa,ctx->gpr[0]._u32[0],ctx->spu_id);
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;

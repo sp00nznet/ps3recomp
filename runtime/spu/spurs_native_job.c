@@ -1,6 +1,7 @@
 #include "spurs_native_job.h"
 #include "spurs_native_registry.h"
 #include "spu_dma.h"
+#include "spu_interp.h"
 #include "ps3emu/strict_boot.h"
 #include <string.h>
 #include <stdio.h>
@@ -193,6 +194,9 @@ spurs_native_job_result spurs_native_job_dispatch(
  else if(frame.pending)result.status=SPURS_NATIVE_JOB_INPUT_MISMATCH;
  else if(ctx->event_mask||!spu_mfc_context_quiescent(ctx))result.status=SPURS_NATIVE_JOB_PENDING;
  else result.status=SPURS_NATIVE_JOB_RETURNED;
+ if(getenv("FOLKLORE_AOT_TRACE"))
+  fprintf(stderr,"[spurs-aot-audit] pc=0x%05X lr=0x%05X spu=%u interpreter_entries=%llu status=%u gets=%u puts=%u\n",
+      ctx->pc,ctx->gpr[0]._u32[0],ctx->spu_id,(unsigned long long)spu_interpreter_fallback_count(),(unsigned)result.status,frame.completed_gets,frame.completed_puts);
  active_native=NULL;g_spu_trampoline_fn=NULL;
  ctx->host_depth=old_depth;ctx->drain_ret_pc=old_drain;ctx->steps=old_steps;
 release:
