@@ -190,6 +190,7 @@ extern "C" {
 #define NV4097_SET_DEPTH_FUNC                   0x00000A6C
 #define NV4097_SET_DEPTH_MASK                   0x00000A70
 #define NV4097_SET_STENCIL_TEST_ENABLE          0x00000328
+#define NV4097_SET_STENCIL_MASK                 0x0000032C
 #define NV4097_SET_STENCIL_FUNC                 0x00000330
 #define NV4097_SET_STENCIL_FUNC_REF             0x00000334
 #define NV4097_SET_STENCIL_FUNC_MASK            0x00000338
@@ -293,7 +294,7 @@ typedef struct rsx_state {
 
     /* Stencil */
     int stencil_test_enable;
-    u32 stencil_func, stencil_ref, stencil_mask;
+    u32 stencil_func, stencil_ref, stencil_mask, stencil_write_mask;
     u32 stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
 
     /* Culling */

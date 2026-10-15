@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 static unsigned clears, arrays, indexed, targets;
+static u32 expected_dma_mask=0x1f;
 uint32_t ppu_hle_inject_base;
 void vm_write32(uint32_t address, uint32_t value) { (void)address; (void)value; }
 void ps3_ms(const char* key) { (void)key; }
@@ -15,7 +16,7 @@ static void draw(void* user, u32 prim, u32 first, u32 count)
 static void index_draw(void* user, u32 prim, u32 first, u32 count)
 { (void)user; (void)prim; (void)first; (void)count; ++indexed; }
 static void set_target(void* user, const rsx_state* state)
-{ (void)user; assert(state->surface_dma_set_mask == 0x1f); ++targets; }
+{ (void)user; assert(state->surface_dma_set_mask == expected_dma_mask); ++targets; }
 static const u32 dma_methods[5] = {
     NV4097_SET_CONTEXT_DMA_COLOR_A, NV4097_SET_CONTEXT_DMA_COLOR_B,
     NV4097_SET_CONTEXT_DMA_COLOR_C, NV4097_SET_CONTEXT_DMA_COLOR_D,
@@ -68,12 +69,13 @@ int main(int argc, char** argv)
         assert(rsx_process_method(&state,NV4097_DRAW_INDEX_ARRAY,0)==-1);
         assert(!targets && !clears && !arrays && !indexed);
         /* Rebinding a valid local handle clears the unsupported state. */
+        expected_dma_mask=1u<<slot;
         assert(rsx_process_method(&state,dma_methods[slot],CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER)==0);
         assert(rsx_process_method(&state,NV4097_CLEAR_SURFACE,0xf0)==0 && clears==1);
         return 0;
     }
     if (!strcmp(argv[1], "unknown")) return rsx_process_method(&state, 0x1ffcu, 0xdeadbeefu) == -1 ? 0 : 1;
-    if (!strcmp(argv[1], "clear")) return rsx_process_method(&state, NV4097_CLEAR_SURFACE, 0xf0);
+    if (!strcmp(argv[1], "clear")) return rsx_process_method(&state, NV4097_CLEAR_SURFACE, 0xf0)==-1?0:1;
     if (!strcmp(argv[1], "arrays")) return rsx_process_method(&state, NV4097_DRAW_ARRAYS, 0);
     if (!strcmp(argv[1], "indexed")) return rsx_process_method(&state, NV4097_DRAW_INDEX_ARRAY, 0);
     assert(!strcmp(argv[1], "backend"));

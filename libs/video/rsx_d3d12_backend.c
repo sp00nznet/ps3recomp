@@ -80,6 +80,20 @@ static D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics_pso_defaults(void)
 /* b1 per-draw FP slot: rsx_texscale[4] + rsx_alphatest + fp_k[64]
  * = 69 float4 = 1104 B, rounded to D3D12's 256-byte CBV alignment. */
 #define VP_FPCB_STRIDE    1280
+#define MAX_GUEST_DEPTHS 64
+#define NO_GUEST_DEPTH UINT32_MAX
+typedef struct GuestDepth {
+    ID3D12Resource* resource;
+    ID3D12DescriptorHeap* heap;
+    DXGI_FORMAT format;
+    u32 offset, pitch, width, height, bytes;
+    int depth_initialized;
+} GuestDepth;
+static GuestDepth s_guest_depths[MAX_GUEST_DEPTHS];
+static u32 s_guest_depth_count;
+typedef struct GuestColorRange { u32 offset; u64 end; } GuestColorRange;
+static GuestColorRange s_guest_color_ranges[128];
+static u32 s_guest_color_count;
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
@@ -112,6 +126,7 @@ typedef struct {
         u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
                          * Cube faces sit one whole mip pyramid apart, so this
                          * is what sets the face stride. */
+        u32 location, pitch;
         int cube;       /* SET_TEXTURE_FORMAT bit 2: a cube texture. Sampled
                          * with a 3-component direction, not a 2D uv -- treating
                          * one as 2D is what makes an environment-mapped chrome
@@ -143,6 +158,11 @@ typedef struct {
      * forcing full-target viewports drew every tile window-sized. */
     u32 vp_x, vp_y, vp_w, vp_h;
     rsx_depth_clip depth_clip; /* shader coefficients and viewport endpoints */
+    u32 depth_slot, depth_key, color_target;
+    D3D12_RECT clip_rect;
+    u32 clear_flags;
+    float clear_depth;
+    u8 clear_stencil;
     /* Ordered clear op (offscreen surfaces only; display clears stay the
      * frame-start backbuffer clear). is_clear records also set is_vp so the
      * legacy replay pass skips them. */
@@ -216,6 +236,7 @@ typedef struct {
     u32 blend;              /* packed guest blend key (enable+factors+eq, PSO key) */
     int nrt;                /* bound colour target count (PSO key)       */
     u32 rtfmt;              /* DXGI format of the colour targets (PSO key) */
+    u32 dsvfmt, depth_key;
     int exp32;              /* 32-bit-exports control bit (PSO key)       */
     u32 ucode_hash;         /* FNV-1a of the FP ucode: apps re-patch inline
                              * constants per frame (wave's stamp position/
@@ -364,6 +385,196 @@ typedef struct {
 } D3D12State;
 
 static D3D12State s_d3d;
+
+static void guard_depth_overlap(u32 offset,u64 bytes,const char* operation)
+{
+    if(!ps3_strict_boot_enabled())return;
+    const u64 end=(u64)offset+bytes;
+    for(u32 i=0;i<s_guest_depth_count;++i) {
+        const GuestDepth* d=&s_guest_depths[i];
+        const u64 dend=(u64)d->offset+(u64)(d->height-1)*d->pitch+(u64)d->width*d->bytes;
+        if((u64)offset<dend && (u64)d->offset<end)
+            ps3_strict_boot_guard("d3d12-depth-coherence-unimplemented","operation=%s offset=0x%X depth=0x%X",operation,offset,d->offset);
+    }
+}
+static void guard_surface_shape(const rsx_state* st)
+{
+    if(ps3_strict_boot_enabled() && (st->surface_clip_x || st->surface_clip_y ||
+        ((st->surface_format>>12)&15u) || ((st->surface_format>>8)&15u)!=1u))
+        ps3_strict_boot_guard("d3d12-surface-shape-unimplemented","format=0x%X origin=%u,%u",st->surface_format,st->surface_clip_x,st->surface_clip_y);
+}
+static void record_color_ranges(const rsx_state* st)
+{
+    u32 bytes=0;
+    switch(st->surface_format&31u) {
+    case 1:case 2:case 3:case 10:bytes=2;break;
+    case 4:case 5:case 8:case 13:case 14:case 15:case 16:bytes=4;break;
+    case 9:bytes=1;break;case 11:bytes=8;break;case 12:bytes=16;break;
+    }
+    u32 mask=st->color_target==0?0:st->color_target==1?1:st->color_target==2?2:
+        st->color_target==0x13?3:st->color_target==0x17?7:st->color_target==0x1F?15:0;
+    if(!mask)return;
+    const u32 w=st->surface_clip_w?st->surface_clip_w:s_d3d.width;
+    const u32 h=st->surface_clip_h?st->surface_clip_h:s_d3d.height;
+    for(u32 i=0;i<4;++i)if(mask&(1u<<i)) {
+        u32 off=0;const u32 pitch=st->surface_color_pitch[i];
+        if(!bytes || !w || !h || w>16384 || h>16384 || pitch<(u64)w*bytes || rsx_color_surface_offset(st,i,&off))
+            ps3_strict_boot_guard("d3d12-color-range-unsupported","target=%u pitch=%u size=%ux%u",i,pitch,w,h);
+        const u64 length=(u64)(h-1)*pitch+(u64)w*bytes;
+        if((u64)off+length>256u*1024u*1024u)
+            ps3_strict_boot_guard("d3d12-color-range-unsupported","target=%u offset=0x%X",i,off);
+        guard_depth_overlap(off,length,"color-target");
+        int found=0;for(u32 j=0;j<s_guest_color_count;++j)
+            if(s_guest_color_ranges[j].offset==off && s_guest_color_ranges[j].end==(u64)off+length)found=1;
+        if(!found) {
+            if(s_guest_color_count==128)ps3_strict_boot_guard("d3d12-color-range-capacity","capacity=128");
+            s_guest_color_ranges[s_guest_color_count++]=(GuestColorRange){off,(u64)off+length};
+        }
+    }
+}
+static void guard_texture_depth_overlap(const D3D12DrawRecord* dr,u32 unit)
+{
+    if(!ps3_strict_boot_enabled() || !dr->tex[unit].set || dr->tex[unit].location!=1u || !s_guest_depth_count)return;
+    const u32 fmt=dr->tex[unit].fmt,base=fmt&0x9Fu;
+    if(base!=0x81 && base!=0x85 && base!=0x8B && (base<0x86 || base>0x88))
+        ps3_strict_boot_guard("d3d12-texture-depth-coherence-format","format=0x%X",fmt);
+    /* Check the source footprint before using the legacy u32 layout helpers.
+     * A large linear pitch can wrap their face_bytes to zero. */
+    u32 w=dr->tex[unit].w,h=dr->tex[unit].h;
+    if(!w || !h || w>4096 || h>4096)
+        ps3_strict_boot_guard("d3d12-texture-depth-coherence-range","size=%ux%u",w,h);
+    u32 levels=dr->tex[unit].mips?dr->tex[unit].mips:1;
+    if(levels>RSX_MAX_TEXTURE_LEVELS)levels=RSX_MAX_TEXTURE_LEVELS;
+    u64 bytes=0;
+    for(u32 level=0;level<levels;++level) {
+        u64 row,rows;
+        if(base>=0x86 && base<=0x88) {
+            row=((u64)w+3u)/4u*(base==0x86?8u:16u);
+            rows=((u64)h+3u)/4u;
+        } else {
+            row=(u64)w*(base==0x85?4u:base==0x8B?2u:1u);
+            if(!level && (fmt&0x20u) && dr->tex[unit].pitch>row)row=dr->tex[unit].pitch;
+            rows=h;
+        }
+        bytes+=row*rows;
+        if(w==1 && h==1)break;
+        if(w>1)w>>=1;
+        if(h>1)h>>=1;
+    }
+    if(dr->tex[unit].cube)bytes=((bytes+127u)&~(u64)127u)*6u;
+    if(!bytes || (u64)dr->tex[unit].raw+bytes>256u*1024u*1024u)
+        ps3_strict_boot_guard("d3d12-texture-depth-coherence-range","offset=0x%X bytes=%llu",dr->tex[unit].raw,(unsigned long long)bytes);
+    guard_depth_overlap(dr->tex[unit].raw,bytes,"texture-read");
+}
+
+static u32 guest_depth_get(const rsx_state* st)
+{
+    if (!st) return NO_GUEST_DEPTH;
+    const u32 zfmt = (st->surface_format >> 5) & 7u;
+    if (!zfmt && !st->depth_test_enable && !st->stencil_test_enable) return NO_GUEST_DEPTH;
+    const u32 bytes = zfmt == 1 ? 2u : zfmt == 2 ? 4u : 0u;
+    const u32 w = st->surface_clip_w, h = st->surface_clip_h;
+    guard_surface_shape(st);
+    u32 offset = 0;
+    if (!bytes || !w || !h || w > 16384 || h > 16384 ||
+        st->surface_clip_x || st->surface_clip_y || st->window_offset ||
+        ((st->surface_format >> 12) & 15u) ||
+        st->surface_zeta_pitch < w * bytes || rsx_depth_surface_offset(st, &offset)) {
+        ps3_strict_boot_guard("d3d12-depth-target-unsupported",
+            "format=0x%X offset=0x%X pitch=%u size=%ux%u window=0x%X",
+            st->surface_format, st->surface_zeta_offset, st->surface_zeta_pitch,w,h,st->window_offset);
+        return NO_GUEST_DEPTH;
+    }
+    const u64 end = (u64)offset + (u64)(h - 1) * st->surface_zeta_pitch + (u64)w * bytes;
+    if (end > 256u * 1024u * 1024u) {
+        ps3_strict_boot_guard("d3d12-depth-target-range", "offset=0x%X end=%llu",offset,(unsigned long long)end);
+        return NO_GUEST_DEPTH;
+    }
+    const DXGI_FORMAT format = zfmt == 1 ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_D24_UNORM_S8_UINT;
+    for(u32 i=0;i<s_guest_color_count;++i)
+        if((u64)offset<s_guest_color_ranges[i].end && (u64)s_guest_color_ranges[i].offset<end)
+            ps3_strict_boot_guard("d3d12-depth-coherence-unimplemented","operation=depth-target offset=0x%X color=0x%X",offset,s_guest_color_ranges[i].offset);
+    for(u32 i=0;i<MAX_OFF_RTS;++i)if(s_d3d.off_rt[i].res) {
+        const OffRT* color=&s_d3d.off_rt[i];
+        const u32 bpp=color->dxgi==DXGI_FORMAT_R16G16B16A16_FLOAT?8u:
+            color->dxgi==DXGI_FORMAT_R32G32B32A32_FLOAT?16u:4u;
+        const u64 cend=(u64)color->off+(u64)color->w*color->h*bpp;
+        if((u64)offset<cend && (u64)color->off<end)
+            ps3_strict_boot_guard("d3d12-depth-coherence-unimplemented","operation=depth-target-color-cache offset=0x%X color=0x%X",offset,color->off);
+    }
+    for (u32 i = 0; i < s_guest_depth_count; ++i) {
+        GuestDepth* d = &s_guest_depths[i];
+        if (d->offset == offset && d->pitch == st->surface_zeta_pitch &&
+            d->width == w && d->height == h && d->format == format) return i;
+        const u64 old_end = (u64)d->offset + (u64)(d->height - 1) * d->pitch + (u64)d->width * d->bytes;
+        if ((u64)offset < old_end && (u64)d->offset < end) {
+            ps3_strict_boot_guard("d3d12-depth-target-alias", "offset=0x%X existing=0x%X", offset,d->offset);
+            return NO_GUEST_DEPTH;
+        }
+    }
+    if (s_guest_depth_count == MAX_GUEST_DEPTHS) {
+        ps3_strict_boot_guard("d3d12-depth-target-capacity", "capacity=%u",MAX_GUEST_DEPTHS);
+        return NO_GUEST_DEPTH;
+    }
+    GuestDepth* d = &s_guest_depths[s_guest_depth_count];
+    memset(d,0,sizeof *d);
+    d->offset=offset;d->pitch=st->surface_zeta_pitch;d->width=w;d->height=h;d->bytes=bytes;d->format=format;
+    D3D12_DESCRIPTOR_HEAP_DESC heap={0};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;heap.NumDescriptors=1;
+    HRESULT hr=s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device,&heap,&IID_ID3D12DescriptorHeap,(void**)&d->heap);
+    strict_gpu_hresult("GuestDepthHeap",hr);if(FAILED(hr))return NO_GUEST_DEPTH;
+    D3D12_RESOURCE_DESC desc={0};desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width=w;desc.Height=h;desc.DepthOrArraySize=1;desc.MipLevels=1;desc.Format=format;
+    desc.SampleDesc.Count=1;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_HEAP_PROPERTIES props={0};props.Type=D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_CLEAR_VALUE optimized={0};optimized.Format=format;optimized.DepthStencil.Depth=1.0f;
+    hr=s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device,&props,D3D12_HEAP_FLAG_NONE,
+        &desc,D3D12_RESOURCE_STATE_DEPTH_WRITE,&optimized,&IID_ID3D12Resource,(void**)&d->resource);
+    strict_gpu_hresult("GuestDepthResource",hr);
+    if(FAILED(hr)){d->heap->lpVtbl->Release(d->heap);d->heap=NULL;return NO_GUEST_DEPTH;}
+    D3D12_DEPTH_STENCIL_VIEW_DESC view={0};view.Format=format;view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;d->heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(d->heap,&handle);
+    s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device,d->resource,&view,handle);
+    return s_guest_depth_count++;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE guest_depth_handle(u32 slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE result={0};
+    if(slot<s_guest_depth_count)s_guest_depths[slot].heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_guest_depths[slot].heap,&result);
+    return result;
+}
+static DXGI_FORMAT draw_depth_format(const D3D12DrawRecord* dr)
+{
+    if(!ps3_strict_boot_enabled())return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    return dr->depth_slot<s_guest_depth_count?s_guest_depths[dr->depth_slot].format:DXGI_FORMAT_UNKNOWN;
+}
+static void snapshot_depth_state(D3D12DrawRecord* dr, int need_depth, int draw)
+{
+    const rsx_state* st=s_d3d.current_rsx_state;
+    dr->depth_slot=NO_GUEST_DEPTH;dr->depth_key=0;
+    if(!st)return;
+    dr->color_target=st->color_target;
+    const u32 w=st->surface_clip_w?st->surface_clip_w:s_d3d.width;
+    const u32 h=st->surface_clip_h?st->surface_clip_h:s_d3d.height;
+    const u64 right=(u64)st->scissor_x+st->scissor_w,bottom=(u64)st->scissor_y+st->scissor_h;
+    dr->clip_rect=(D3D12_RECT){(LONG)(st->scissor_x<w?st->scissor_x:w),(LONG)(st->scissor_y<h?st->scissor_y:h),
+                              (LONG)(right<w?right:w),(LONG)(bottom<h?bottom:h)};
+    if(!ps3_strict_boot_enabled())return;
+    guard_surface_shape(st);
+    if(draw || (dr->clear_flags&0xF0u))record_color_ranges(st);
+    if(need_depth)dr->depth_slot=guest_depth_get(st);
+    if(draw && st->stencil_test_enable)ps3_strict_boot_guard("d3d12-stencil-test-unimplemented","operation=draw");
+    if(draw && st->depth_test_enable) {
+        if(st->depth_func<0x200u || st->depth_func>0x207u || dr->depth_slot==NO_GUEST_DEPTH)
+            ps3_strict_boot_guard("d3d12-depth-state-unsupported","func=0x%X slot=%u",st->depth_func,dr->depth_slot);
+        dr->depth_key=1u | (st->depth_mask?2u:0u) | ((st->depth_func-0x200u+1u)<<2);
+    }
+}
+static void snapshot_draw_depth(D3D12DrawRecord* dr)
+{
+    const rsx_state* st=s_d3d.current_rsx_state;
+    snapshot_depth_state(dr,st && (st->depth_test_enable || st->stencil_test_enable),1);
+}
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
@@ -1998,8 +2209,9 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 cube_mask, u32 shader_window)
+                                          u32 cube_mask, u32 shader_window, DXGI_FORMAT dsvfmt, u32 depth_key)
 {
+    if(!ps3_strict_boot_enabled())depth_key=3u|(4u<<2);
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     extern uint8_t* vm_base;
@@ -2049,7 +2261,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask &&
-            s_d3d.vp_fp[i].shader_window == shader_window)
+            s_d3d.vp_fp[i].shader_window == shader_window &&
+            s_d3d.vp_fp[i].dsvfmt == (u32)dsvfmt && s_d3d.vp_fp[i].depth_key == depth_key)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
@@ -2371,10 +2584,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
       if (_cf) cmask = 0xF; }
     for (int _r = 0; _r < nrt; _r++)
         pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
-    pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    pd.DepthStencilState.DepthEnable = TRUE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pd.DSVFormat = dsvfmt;
+    pd.DepthStencilState.DepthEnable = (depth_key & 1u) ? TRUE : FALSE;
+    pd.DepthStencilState.DepthWriteMask = (depth_key & 2u) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = (D3D12_COMPARISON_FUNC)((depth_key & 1u) ? ((depth_key >> 2) & 15u) : 8u);
     pd.DepthStencilState.StencilEnable = FALSE;
     /* DEPTH_OFF=1: drop the depth test for guest-FP draws, so submission order
      * alone decides what is on top. Paired with DRAW_LAST_TEX this puts one
@@ -2405,6 +2618,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     }
     s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
     s_d3d.vp_fp[s_d3d.vp_fp_n].shader_window = shader_window;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].dsvfmt = (u32)dsvfmt;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].depth_key = depth_key;
     s_d3d.vp_fp[s_d3d.vp_fp_n].vs_idx  = vs_idx;
     s_d3d.vp_fp[s_d3d.vp_fp_n].vs_hash = vs_hash;
     s_d3d.vp_fp[s_d3d.vp_fp_n].gen     = s_d3d.vp_gen;
@@ -3103,7 +3318,11 @@ static rsx_depth_clip current_depth_clip(void)
 static int same_depth_clip(const D3D12DrawRecord* draw)
 {
     const rsx_depth_clip now = current_depth_clip();
-    return memcmp(&draw->depth_clip, &now, sizeof now) == 0;
+    D3D12DrawRecord state={0};snapshot_draw_depth(&state);
+    return memcmp(&draw->depth_clip, &now, sizeof now) == 0 &&
+        draw->depth_slot==state.depth_slot && draw->depth_key==state.depth_key &&
+        draw->color_target==state.color_target &&
+        memcmp(&draw->clip_rect,&state.clip_rect,sizeof state.clip_rect)==0;
 }
 
 static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
@@ -3362,6 +3581,9 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     if (!w) w = s_d3d.width;
     if (!h) h = s_d3d.height;
     DXGI_FORMAT want_fmt = rsx_surface_dxgi(rsx_fmt);
+    const u32 memory_bpp=want_fmt==DXGI_FORMAT_R16G16B16A16_FLOAT?8u:
+        want_fmt==DXGI_FORMAT_R32G32B32A32_FLOAT?16u:4u;
+    guard_depth_overlap(off,(u64)w*h*memory_bpp,"offscreen-color-import");
     /* RT_FORCE_RGBA8=1: allocate every offscreen target as R8G8B8A8 rather than
      * its native format. A title whose final composite reads a half-float
      * surface cannot be shown with a plain CopyTextureRegion, and giving it an
@@ -3834,6 +4056,34 @@ static void guest_fb_present(u32 fi)
 }
 
 
+static void replay_guest_clear(const D3D12DrawRecord* dr,D3D12_CPU_DESCRIPTOR_HANDLE display)
+{
+    const D3D12_RECT* rect=&dr->clip_rect;
+    if(rect->left>=rect->right || rect->top>=rect->bottom)return;
+    if(dr->clear_flags&0xF0u) {
+        for(u32 i=0;i<4;++i) {
+            const u32 off=i?dr->rt_mrt[i-1]:dr->rt_off;
+            if(i && !off)break;
+            D3D12_CPU_DESCRIPTOR_HANDLE target=display;
+            if(off) {
+                const int slot=off_rt_find(off);
+                if(slot<0){ps3_strict_boot_guard("d3d12-clear-target-missing","offset=0x%X",off);return;}
+                off_rt_transition(slot,D3D12_RESOURCE_STATE_RENDER_TARGET);target=off_rt_rtv(slot);
+            }
+            s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list,target,dr->cc,1,rect);
+        }
+    }
+    if(dr->clear_flags&3u) {
+        if(dr->depth_slot>=s_guest_depth_count){ps3_strict_boot_guard("d3d12-clear-depth-missing","slot=%u",dr->depth_slot);return;}
+        GuestDepth* depth=&s_guest_depths[dr->depth_slot];
+        D3D12_CPU_DESCRIPTOR_HANDLE target=guest_depth_handle(dr->depth_slot);
+        s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list,target,
+            (D3D12_CLEAR_FLAGS)(dr->clear_flags&3u),dr->clear_depth,dr->clear_stencil,1,rect);
+        if((dr->clear_flags&1u) && rect->left==0 && rect->top==0 &&
+            rect->right==(LONG)depth->width && rect->bottom==(LONG)depth->height)depth->depth_initialized=1;
+    }
+}
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
@@ -4126,6 +4376,7 @@ static void render_frame(void)
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
         if (!dr->is_vp || dr->is_clear) continue;
+        for(u32 unit=0;unit<4;++unit)guard_texture_depth_overlap(dr,unit);
         /* Debug: RTT_VIEWRT=<hex raw offset> makes display draws sample that
          * offscreen RT at t0 (the composite blit then shows it fullscreen). */
         { static const char* vr = (const char*)1;     /* hoisted: this runs per DRAW */
@@ -4303,7 +4554,7 @@ static void render_frame(void)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr), dr->shader_window);
+                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr), dr->shader_window, draw_depth_format(dr), dr->depth_key);
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -4330,12 +4581,14 @@ static void render_frame(void)
     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
 
     /* Clear color and depth */
-    s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
-        s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
-    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(
-        s_d3d.cmd_list, dsv_handle,
-        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-        1.0f, 0, 0, NULL);
+    if(!ps3_strict_boot_enabled()) {
+        s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
+            s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
+        s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(
+            s_d3d.cmd_list, dsv_handle,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+            1.0f, 0, 0, NULL);
+    }
 
     /* Set viewport and scissor */
     D3D12_VIEWPORT viewport = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
@@ -4455,7 +4708,9 @@ static void render_frame(void)
      * float4 attrib0 from vp_vb and the vp_c[] constant bank. */
     if (ps3_strict_boot_enabled() && !s_d3d.vp_ready) {
         for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; ++d)
-            if (s_d3d.draws[d].is_vp)
+            if (s_d3d.draws[d].is_clear)
+                replay_guest_clear(&s_d3d.draws[d],rtv_handle);
+            else if (s_d3d.draws[d].is_vp)
                 ps3_strict_boot_guard("d3d12-record-without-pipeline", "record=%u clear=%d", d, s_d3d.draws[d].is_clear);
     }
     if (s_d3d.vp_ready && s_d3d.draw_count > 0) {
@@ -4508,6 +4763,12 @@ static void render_frame(void)
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
+                if(ps3_strict_boot_enabled() && dr->is_clear) {
+                    replay_guest_clear(dr,rtv_handle);
+                    continue;
+                }
+                if(ps3_strict_boot_enabled() &&
+                    (dr->clip_rect.left>=dr->clip_rect.right || dr->clip_rect.top>=dr->clip_rect.bottom))continue;
                 /* The reduced-viewport passes (this title's reflection, drawn
                  * into a region of the same target) finish here -- snapshot
                  * before the full-screen scene overwrites them. */
@@ -4556,8 +4817,9 @@ static void render_frame(void)
                     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, nrt, rh, FALSE, &dsv_handle);
                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
                     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &sc);
-                    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
-                        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+                    if(!ps3_strict_boot_enabled())
+                        s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
+                            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
                     /* RT_CLEARDBG=2: magenta-clear the surface the DRAWS bind,
                      * at the moment they bind it. The guest's own clears may go
                      * to a different surface entirely (they do here: clears to
@@ -4635,9 +4897,20 @@ static void render_frame(void)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_exp32, dr->cmask, dr->cull,
-                                                dr_cube_mask(dr), dr->shader_window) : NULL;
+                                                dr_cube_mask(dr), dr->shader_window, draw_depth_format(dr), dr->depth_key) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
+                if(ps3_strict_boot_enabled()) {
+                    if(!dpso)ps3_strict_boot_guard("d3d12-guest-pipeline-missing","fp=0x%X",dr->fp_addr);
+                    if(!dr->color_target)ps3_strict_boot_guard("d3d12-depth-only-draw-unimplemented","operation=draw");
+                    D3D12_CPU_DESCRIPTOR_HANDLE rh[4],dh=guest_depth_handle(dr->depth_slot);
+                    UINT nrt=1;rh[0]=cur_rt>=0?off_rt_rtv(cur_rt):rtv_handle;
+                    for(int m=0;m<3 && cur_m[m]>=0;++m)rh[nrt++]=off_rt_rtv(cur_m[m]);
+                    if((dr->depth_key&1u) && dr->depth_slot<s_guest_depth_count && !s_guest_depths[dr->depth_slot].depth_initialized)
+                        ps3_strict_boot_guard("d3d12-depth-initial-contents-unimplemented","slot=%u",dr->depth_slot);
+                    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list,nrt,rh,FALSE,
+                        dr->depth_slot<s_guest_depth_count?&dh:NULL);
+                }
                 /* Per-draw viewport: the guest rect when sane, else the
                  * full target. Scissor tracks the same rect. */
                 {
@@ -4656,6 +4929,7 @@ static void render_frame(void)
                     D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
                                       (LONG)(dvp.TopLeftX + dvp.Width),
                                       (LONG)(dvp.TopLeftY + dvp.Height)};
+                    if(ps3_strict_boot_enabled())dsc=dr->clip_rect;
                     dvp_x = dvp.TopLeftX; dvp_y = dvp.TopLeftY;
                     dvp_w = dvp.Width;    dvp_h = dvp.Height;
                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &dvp);
@@ -5275,9 +5549,14 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     u32 rt = current_rt_off(&rt_w, &rt_h, mrt);
 
     if (ps3_strict_boot_enabled()) {
-        // The ordered record currently implements full color clears only.
-        if (flags != 0xF0u)
-            ps3_strict_boot_guard("d3d12-clear-mask-unimplemented", "flags=0x%08X", flags);
+        const rsx_state* st=s_d3d.current_rsx_state;
+        if(!st)ps3_strict_boot_guard("d3d12-clear-without-surface","flags=0x%X",flags);
+        if((flags&0xF0u) && (flags&0xF0u)!=0xF0u)
+            ps3_strict_boot_guard("d3d12-partial-color-clear-unimplemented","flags=0x%X",flags);
+        if((flags&0xF0u) && st && st->color_target==0)flags&=~0xF0u;
+        if(!flags)return;
+        if((flags&0xF0u) && (st->surface_format&31u)!=8u)
+            ps3_strict_boot_guard("d3d12-clear-color-format-unimplemented","format=0x%X",st->surface_format);
         if (s_d3d.draw_count >= MAX_DRAWS)
             ps3_strict_boot_guard("d3d12-command-capacity", "operation=clear");
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
@@ -5285,7 +5564,9 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
         dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1;
         dr->rt_off = rt; memcpy(dr->rt_mrt, mrt, sizeof(mrt));
         dr->rt_w = rt_w; dr->rt_h = rt_h;
-        dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+        dr->rt_fmt = st->surface_format;
+        dr->clear_flags=flags;dr->clear_depth=depth;dr->clear_stencil=stencil;
+        snapshot_depth_state(dr,(flags&3u)!=0,0);
         memcpy(dr->cc, cc, sizeof(cc));
         return;
     }
@@ -6131,6 +6412,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->shader_window = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_window : 0;
         dr->depth_clip = current_depth_clip();
+        snapshot_draw_depth(dr);
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
@@ -6158,6 +6440,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
+                    dr->tex[_u].location = s_d3d.current_rsx_state ? (s_d3d.current_rsx_state->textures[_u].format & 3u) : 0;
+                    dr->tex[_u].pitch = s_d3d.current_rsx_state ? (s_d3d.current_rsx_state->textures[_u].control3 & 0xFFFFFu) : 0;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                     dr->tex_rt[_u]  = -1;
                 }
@@ -6259,6 +6543,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->shader_window = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_window : 0;
         dr->depth_clip = current_depth_clip();
+        snapshot_draw_depth(dr);
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
@@ -6286,6 +6571,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
+                    dr->tex[_u].location = s_d3d.current_rsx_state ? (s_d3d.current_rsx_state->textures[_u].format & 3u) : 0;
+                    dr->tex[_u].pitch = s_d3d.current_rsx_state ? (s_d3d.current_rsx_state->textures[_u].control3 & 0xFFFFFu) : 0;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                 dr->tex_rt[_u]  = -1;
             }
@@ -6408,6 +6695,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->shader_window = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_window : 0;
         dr->depth_clip = current_depth_clip();
+        snapshot_draw_depth(dr);
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
@@ -6434,6 +6722,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
+                    dr->tex[_u].location = s_d3d.current_rsx_state ? (s_d3d.current_rsx_state->textures[_u].format & 3u) : 0;
+                    dr->tex[_u].pitch = s_d3d.current_rsx_state ? (s_d3d.current_rsx_state->textures[_u].control3 & 0xFFFFFu) : 0;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
             dr->tex_rt[_u]  = -1;
         }
@@ -6694,6 +6984,7 @@ static rsx_backend s_d3d12_backend = {0};
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
     s_successful_presents = 0;
+    s_guest_depth_count=0;s_guest_color_count=0;memset(s_guest_depths,0,sizeof s_guest_depths);
     memset(&s_d3d, 0, sizeof(s_d3d));
     s_d3d.width = width;
     s_d3d.height = height;
@@ -6767,6 +7058,11 @@ void rsx_d3d12_backend_shutdown(void)
     wait_for_gpu();
 
     /* Release D3D12 resources */
+    for(u32 i=0;i<s_guest_depth_count;++i) {
+        if(s_guest_depths[i].resource)s_guest_depths[i].resource->lpVtbl->Release(s_guest_depths[i].resource);
+        if(s_guest_depths[i].heap)s_guest_depths[i].heap->lpVtbl->Release(s_guest_depths[i].heap);
+    }
+    s_guest_depth_count=0;
     if (s_d3d.vertex_buffer) {
         s_d3d.vertex_buffer->lpVtbl->Unmap(s_d3d.vertex_buffer, 0, NULL);
         s_d3d.vertex_buffer->lpVtbl->Release(s_d3d.vertex_buffer);

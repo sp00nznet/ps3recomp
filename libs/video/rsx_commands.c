@@ -72,7 +72,7 @@ void rsx_state_init(rsx_state* state)
     state->scissor_h = 4096;
 
     /* Default depth */
-    state->depth_func = 1; /* LESS */
+    state->depth_func = 0x0201; /* CELL_GCM_LESS */
     state->depth_mask = 1;
 
     /* Default cull */
@@ -86,6 +86,7 @@ void rsx_state_init(rsx_state* state)
     state->stencil_func = 0x0207; /* ALWAYS */
     state->stencil_ref = 0;
     state->stencil_mask = 0xFF;
+    state->stencil_write_mask = 0xFF;
     state->stencil_op_fail = 0x1E00;  /* KEEP */
     state->stencil_op_zfail = 0x1E00; /* KEEP */
     state->stencil_op_zpass = 0x1E00; /* KEEP */
@@ -588,16 +589,49 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
-        if (validate_surface_dma(state)) return -1;
-        if (!s_backend || !s_backend->clear)
-            ps3_strict_boot_guard("rsx-missing-clear-backend", "method=0x%04X", method);
-        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
-        if (s_backend && s_backend->clear) {
-            float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
-            u8 stencil = state->zstencil_clear_value & 0xFF;
-            s_backend->clear(s_backend->userdata, data,
-                           state->color_clear_value, depth, stencil);
+        /* CELL_GCM_CLEAR_M is 0xf3: bits 2 and 3 are not clear channels. */
+        if (data & ~0xf3u) {
+            ps3_strict_boot_guard("rsx-invalid-clear-mask", "method=0x%04X mask=0x%08X", method, data);
+            return -1;
         }
+        if ((data & 2u) && state->stencil_write_mask == 0)
+            data &= ~2u;
+        if (!data) return 0;
+        if (validate_surface_dma(state)) return -1;
+        if (!s_backend || !s_backend->clear) {
+            ps3_strict_boot_guard("rsx-missing-clear-backend", "method=0x%04X", method);
+            return -1;
+        }
+        u32 depth_format = (state->surface_format >> 5) & 7u;
+        if ((data & 2u) && state->stencil_write_mask != 0xffu) {
+            ps3_strict_boot_guard("rsx-partial-stencil-clear-mask",
+                                  "method=0x%04X mask=0x%08X stencil_write_mask=0x%08X",
+                                  method, data, state->stencil_write_mask);
+            return -1;
+        }
+        if ((data & 3u) && depth_format != 1u && depth_format != 2u) {
+            ps3_strict_boot_guard("rsx-unsupported-clear-depth-format",
+                                  "method=0x%04X mask=0x%08X format=%u", method, data, depth_format);
+            return -1;
+        }
+        if ((data & 2u) && depth_format == 1u) {
+            ps3_strict_boot_guard("rsx-stencil-clear-on-z16",
+                                  "method=0x%04X mask=0x%08X", method, data);
+            return -1;
+        }
+        /* CLEAR_SURFACE may precede BEGIN_END. Binding also carries the latest
+         * scissor, including writes since the previous draw or clear. */
+        if (s_backend->set_render_target) {
+            s_backend->set_render_target(s_backend->userdata, state);
+            state->surface_dirty = 0;
+        }
+        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
+        float depth = depth_format == 1u
+            ? (float)(state->zstencil_clear_value & 0xffffu) / 65535.0f
+            : (float)(state->zstencil_clear_value >> 8) / 16777215.0f;
+        u8 stencil = (u8)(state->zstencil_clear_value & 0xffu);
+        s_backend->clear(s_backend->userdata, data,
+                         state->color_clear_value, depth, stencil);
         return 0;
     }
 
@@ -641,6 +675,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     /* Stencil */
+    if (method == NV4097_SET_STENCIL_MASK) {
+        state->stencil_write_mask = data & 0xFFu;
+        state->stencil_dirty = 1;
+        return 0;
+    }
     if (method == NV4097_SET_STENCIL_TEST_ENABLE) {
         state->stencil_test_enable = data ? 1 : 0;
         state->stencil_dirty = 1;
@@ -953,11 +992,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_SET_SCISSOR_HORIZONTAL) {
         state->scissor_x = data & 0xFFFF;
         state->scissor_w = (data >> 16) & 0xFFFF;
+        state->surface_dirty = 1;
         return 0;
     }
     if (method == NV4097_SET_SCISSOR_VERTICAL) {
         state->scissor_y = data & 0xFFFF;
         state->scissor_h = (data >> 16) & 0xFFFF;
+        state->surface_dirty = 1;
         return 0;
     }
 

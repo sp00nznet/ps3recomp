@@ -85,6 +85,9 @@ int main(int argc,char** argv)
     u32 ctx=host_alloc(4,4);
     cellGcmSetupContext(ctx,CMD_SIZE,IO_SIZE,IO_ADDR,host_alloc,host_w32);
     cellGcmSetDisplayBuffer(0,0,5120,1280,720);
+    emit(NV4097_SET_SURFACE_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);
+    emit(NV4097_SET_SURFACE_FORMAT,8u|(1u<<8));
+    emit(NV4097_SET_SURFACE_PITCH_A,5120);
     folklore_depth_program(vm_base+IO_ADDR+FP_OFFSET);
     u8 vp[32];
     rsx_test_vp_mov_out(vp,0,RSX_TEST_VP_SWZ_IDENT,0,0);
