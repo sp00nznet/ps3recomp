@@ -2400,15 +2400,28 @@ static void jc_run_one_job(u64 raw_job_ea, int idx, u32 size_desc)
  * -----------------------------------------------------------------------*/
 
 #define MAX_JOBGUARDS 32
+/* One mutex protects registry lifetime, credits and guest count mirrors.
+ * Notify's release publishes preceding caller writes to a successful wait's
+ * acquire. Guest parameters must stay owned by the consumer until it is done. */
+#ifdef _WIN32
+static SRWLOCK s_jobguard_lock = SRWLOCK_INIT;
+static void jg_lock(void) { AcquireSRWLockExclusive(&s_jobguard_lock); }
+static void jg_unlock(void) { ReleaseSRWLockExclusive(&s_jobguard_lock); }
+#else
+static pthread_mutex_t s_jobguard_lock = PTHREAD_MUTEX_INITIALIZER;
+static void jg_lock(void) { pthread_mutex_lock(&s_jobguard_lock); }
+static void jg_unlock(void) { pthread_mutex_unlock(&s_jobguard_lock); }
+#endif
 static struct {
-    u32 ea;          /* guest CellSpursJobGuard address (128-byte aligned) */
-    u32 count;       /* notifications still outstanding                    */
-    u32 reset;       /* value to restore when autoReset is set             */
-    u32 pending;     /* notifications received, not yet consumed        */
+    u32 ea;
+    u32 count;
+    u32 reset;
+    u64 pending;    /* accumulated credits, never silently wrap */
     u32 auto_reset;
     int active;
 } s_jobguards[MAX_JOBGUARDS];
 
+/* Caller holds s_jobguard_lock exclusively. Slots are never retired here. */
 static int jg_find(u32 ea)
 {
     for (int i = 0; i < MAX_JOBGUARDS; i++)
@@ -2416,99 +2429,101 @@ static int jg_find(u32 ea)
     return -1;
 }
 
-/* cellSpursJobGuardInitialize(CellSpursJobChain* jobChain,
- *                             CellSpursJobGuard* jobGuard,
- *                             u32 notifyCount, u8 requestSpuCount, u8 autoReset)
- * Argument order confirmed against the guest: r3 is the chain (0x02932A80,
- * the handle CreateJobChainWithAttribute registered) and r4 is the guard
- * (0x02932C00, the EA the chain's GUARD command carries). */
 s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
                                 u32 request_spu_count, u32 auto_reset)
 {
     (void)jc_ea; (void)request_spu_count;
     u32 ea = (u32)guard_ea;
     if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-
+    jg_lock();
     int i = jg_find(ea);
     if (i < 0)
         for (i = 0; i < MAX_JOBGUARDS; i++) if (!s_jobguards[i].active) break;
-    if (i >= MAX_JOBGUARDS) return CELL_SPURS_TASK_ERROR_AGAIN;
-
+    if (i >= MAX_JOBGUARDS) {
+        jg_unlock();
+        return CELL_SPURS_TASK_ERROR_AGAIN;
+    }
     s_jobguards[i].ea         = ea;
     s_jobguards[i].count      = notify_count;
     s_jobguards[i].reset      = notify_count;
     s_jobguards[i].pending    = 0;
     s_jobguards[i].auto_reset = auto_reset;
     s_jobguards[i].active     = 1;
-
-    /* Mirror the count into guest memory. The SPU side reads the guard on
-     * hardware; keeping the two consistent costs nothing and makes a guest-side
-     * peek meaningful. */
     vm_write32(ea, notify_count);
-
+    jg_unlock();
     printf("[cellSpurs] JobGuardInitialize(guard=0x%08X chain=0x%08X notify=%u "
            "autoReset=%u)\n", ea, (u32)jc_ea, notify_count, auto_reset);
     return CELL_OK;
 }
 
-/* cellSpursJobGuardNotify(CellSpursJobGuard* jobGuard) -- one argument. */
 s32 cellSpursJobGuardNotify(u64 guard_ea)
 {
     u32 ea = (u32)guard_ea;
+    jg_lock();
     int i = jg_find(ea);
     if (i < 0) {
+        jg_unlock();
         printf("[cellSpurs] JobGuardNotify(0x%08X) -- unknown guard\n", ea);
         return CELL_SPURS_TASK_ERROR_INVAL;
     }
-    /* Count notifications as CREDITS rather than decrementing to a floor of
-     * zero. The guard used to reload its count at the moment the walker
-     * OBSERVED zero, which threw away any notify that arrived while the job
-     * was still running -- the title notified 6 times and the chain completed
-     * 2 laps, so the thread waiting on the other 4 completions never woke. */
-    s_jobguards[i].pending++;
-    { u32 remaining = (s_jobguards[i].pending >= s_jobguards[i].reset)
-                    ? 0u : s_jobguards[i].reset - s_jobguards[i].pending;
-      s_jobguards[i].count = remaining;
-      vm_write32(ea, remaining); }
-    { static int _n = 0;
-      if (_n++ < 8)
-          printf("[cellSpurs] JobGuardNotify(0x%08X) -> %u remaining\n",
-                 ea, s_jobguards[i].count); }
+    if (s_jobguards[i].pending == UINT64_MAX) {
+        jg_unlock();
+        return CELL_SPURS_TASK_ERROR_AGAIN;
+    }
+    ++s_jobguards[i].pending;
+    u32 remaining = s_jobguards[i].pending >= s_jobguards[i].reset
+                  ? 0u : s_jobguards[i].reset - (u32)s_jobguards[i].pending;
+    s_jobguards[i].count = remaining;
+    vm_write32(ea, remaining);
+    { static unsigned logged;
+      if (logged++ < 8)
+          printf("[cellSpurs] JobGuardNotify(0x%08X) -> %u remaining\n", ea, remaining); }
+    jg_unlock();
     return CELL_OK;
 }
 
-/* cellSpursJobGuardReset(CellSpursJobGuard*) -- restore the initial count. */
 s32 cellSpursJobGuardReset(u64 guard_ea)
 {
     u32 ea = (u32)guard_ea;
+    jg_lock();
     int i = jg_find(ea);
-    if (i < 0) return CELL_SPURS_TASK_ERROR_INVAL;
+    if (i < 0) {
+        jg_unlock();
+        return CELL_SPURS_TASK_ERROR_INVAL;
+    }
+    /* Preserve existing Reset semantics: do not discard accumulated credits. */
     s_jobguards[i].count = s_jobguards[i].reset;
     vm_write32(ea, s_jobguards[i].count);
+    jg_unlock();
     return CELL_OK;
 }
 
-/* Wait for a guard to be released. Returns 1 if it opened, 0 on timeout (the
- * chain then gives up this pass rather than spinning the walker thread
- * forever). An unknown guard opens immediately -- a chain guarded by something
- * we never saw initialised must not deadlock the walker. */
+/* Preserve the existing bounded polling/timeout contract. Every predicate and
+ * credit consumption is serialized; no mutex is held while the walker sleeps.
+ * A one-shot guard still stays open after its first release (reset becomes0). */
 static int jg_wait(u32 ea)
 {
-    int i = jg_find(ea);
-    if (i < 0) {
-        ps3_strict_boot_guard("spurs-unknown-job-guard", "guard=0x%08X", ea);
-        return 1;
-    }
-    for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
+    const ULONGLONG started = GetTickCount64();
+    for (;;) {
+        jg_lock();
+        int i = jg_find(ea);
+        if (i < 0) {
+            jg_unlock();
+            ps3_strict_boot_guard("spurs-unknown-job-guard", "guard=0x%08X", ea);
+            return 1;
+        }
         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
-            /* Consume exactly one release worth of credits, so notifies that
-             * arrived during the previous lap still count. */
             s_jobguards[i].pending -= s_jobguards[i].reset;
             if (!s_jobguards[i].auto_reset) s_jobguards[i].reset = 0;
             s_jobguards[i].count = s_jobguards[i].reset;
             vm_write32(ea, s_jobguards[i].count);
+            jg_unlock();
             return 1;
         }
+        jg_unlock();
+        /* Sleep(1) can exceed one millisecond, notably on Windows. Use the
+         * monotonic clock so the intended 20-second bound is elapsed time. */
+        if (GetTickCount64() - started >= 20000ull) break;
 #ifdef _WIN32
         Sleep(1);
 #else
@@ -2519,7 +2534,6 @@ static int jg_wait(u32 ea)
     ps3_strict_boot_guard("spurs-job-guard-timeout", "guard=0x%08X", ea);
     return 0;
 }
-
 /* Tell the application a lap of chain work is done.
  *
  * Timing is the whole point here. The obvious place is after the walk
