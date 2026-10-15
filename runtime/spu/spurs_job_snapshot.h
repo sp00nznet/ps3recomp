@@ -10,6 +10,8 @@ extern "C" {
 #define SPURS_JOB_SNAPSHOT_IMAGE_MAX 262144u
 #define SPURS_JOB_CAPTURE_MAX_COUNT 16u
 #define SPURS_JOB_CAPTURE_MAX_BYTES (16ull * (1024ull + 262144ull + 4ull))
+#define SPURS_JOB_CAPTURE_MAX_SPANS 2u
+#define SPURS_JOB_CAPTURE_MAX_SPAN_BYTES 131072u
 
 typedef enum spurs_job_snapshot_status {
     SPURS_JOB_SNAPSHOT_OK = 0,
@@ -58,7 +60,7 @@ typedef enum spurs_job_capture_status {
 
 /* Reads FOLKLORE_SPU_CAPTURE_DIR. Existing absolute private directory;
  * no mkdir, exclusive creation, no overwrite; maximum 16 attempts/process and
- * bounded descriptor+image+optional four-byte auxiliary total. Writes PREFIX.desc.bin, PREFIX.image.bin,
+ * bounded descriptor+image+optional auxiliary/span total. Writes PREFIX.desc.bin, PREFIX.image.bin,
  * PREFIX.json. Returns complete prefix in out_prefix on success, else empty.
  * Metadata schema version 1 by default, version 2 with auxiliary fields;
  * runtime fingerprint only (launcher adds SHA256).
@@ -68,6 +70,15 @@ typedef enum spurs_job_capture_status {
  * coherence. Invalid/unreadable auxiliary spans fail the whole capture. With
  * DIR unset/empty, no auxiliary parse/read occurs. Mapping must remain valid.
  * No guest pointer follows, native execution or success-result synthesis. */
+/* Alternative to AUX_EA: FOLKLORE_SPU_CAPTURE_SPANS contains1..2 ordered
+ * 0xEA:SIZE entries, comma separated. EA has1..8 hex digits; size is canonical
+ * positive decimal, combined size <=131072; readable guest spans cannot overlap.
+ * Optional FOLKLORE_SPU_CAPTURE_SPANS_INDEX is canonical decimal0..15 and selects
+ * the global attempt ordinal. Nonselected attempts keep schema1 and never read
+ * span memory. Selected attempts write schema3 capture_spans and .span-00/01.bin.
+ * Config/read/write failures consume attempts/reservations; all explicit copies
+ * precede file creation, are separately checked, and promise no coherent epoch.
+ * DIR disabled ignores these variables. No snapshot struct layout changes. */
 spurs_job_capture_status spurs_job_snapshot_capture(
     const spurs_job_snapshot* snapshot, char* out_prefix, uint32_t prefix_capacity);
 
