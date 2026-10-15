@@ -10,6 +10,7 @@
 
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
+#include "rsx_nv3089_truncate.h"
 #include "ps3emu/strict_boot.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
@@ -825,6 +826,7 @@ static struct {
 } s_gcm2d;
 
 static struct {
+    u32 conversion, conversion_set;
     u32 src_dma, dst_surf, fmt, op, clip_pt, clip_sz, out_pt, out_sz;
     u32 ds_dx, dt_dy, in_sz, in_fmt, in_off, in_uv;
 } s_nv3089;
@@ -888,8 +890,84 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
                                 x1 - x0, y1 - y0);
 }
 
+/* Explicit transfers must never inherit the legacy resolver's local fallback
+ * or wrap localAddress+offset before validating the requested byte extent. */
+static int nv3089_resolve_exact(u32 dma,u32 offset,u64 extent,u32* address)
+{
+    const u64 limit=ppu_vm_size?ppu_vm_size:UINT64_C(0x100000000);
+    const u64 end=(u64)offset+extent;
+    if(!extent || end>UINT64_C(0x100000000))return 0;
+    if(dma==0xFEED0000u) {
+        const u64 start=(u64)s_config.localAddress+offset;
+        if(end>s_config.localSize || start<65536u || start+extent>limit ||
+           start+extent>UINT64_C(0x100000000))return 0;
+        *address=(u32)start;return 1;
+    }
+    if(dma!=0xFEED0001u)return 0;
+    u64 first=0;
+    for(u64 cursor=offset;cursor<end;) {
+        const u64 chunk_end=(((cursor>>20)+1)<<20)<end?(((cursor>>20)+1)<<20):end;
+        const IoMapping* mapping=NULL;
+        for(int i=0;i<CELL_GCM_MAX_IO_MAPPINGS;++i) {
+            const IoMapping* m=&s_io_mappings[i];
+            const u64 mapped_end=(u64)m->io+m->size;
+            if(!m->active || !m->size || mapped_end<=cursor || (u64)m->io>=chunk_end)continue;
+            /* Reject ambiguous/partial overlaps instead of choosing one map. */
+            if(mapping || (u64)m->io>cursor || mapped_end<chunk_end ||
+               mapped_end>UINT64_C(0x100000000) || (u64)m->ea+m->size>UINT64_C(0x100000000))return 0;
+            mapping=m;
+        }
+        if(!mapping)return 0;
+        const u64 ea=(u64)mapping->ea+cursor-mapping->io;
+        const u16 ea_page=s_ea_address_table[cursor>>20];
+        if(!ea_page || ea_page==0xFFFFu || (((u64)ea_page<<20)|(cursor&0xFFFFFu))!=ea)return 0;
+        if(cursor==offset)first=ea;
+        if(ea!=first+cursor-offset || first<65536u || first+extent>limit ||
+           first+extent>UINT64_C(0x100000000))return 0;
+        cursor=chunk_end;
+    }
+    *address=(u32)first;return 1;
+}
+
 static void nv3089_blit(void)
 {
+    /* Explicit conversion state must constrain the operation, including the
+     * GPU mirror below. Never accept TRUNCATE and then guess a conversion. */
+    if(s_nv3089.conversion_set) {
+        static unsigned trace_count;
+        if(trace_count++<16)fprintf(stderr,"[NV3089] trigger conversion=%u context=0x%08X src_dma=0x%08X src_offset=0x%08X src_format=%u src_size=0x%08X src_pitch_origin_filter=0x%08X src_uv=0x%08X dst_dma=0x%08X dst_offset=0x%08X dst_format=%u dst_pitch=%u operation=%u out_point=0x%08X out_size=0x%08X clip_point=0x%08X clip_size=0x%08X ds_dx=0x%08X dt_dy=0x%08X\n",
+            s_nv3089.conversion,s_nv3089.dst_surf,s_nv3089.src_dma,s_nv3089.in_off,s_nv3089.fmt,s_nv3089.in_sz,s_nv3089.in_fmt,s_nv3089.in_uv,
+            s_gcm2d.dst_dma,s_gcm2d.dst_offset,s_gcm2d.color_fmt,s_gcm2d.pitch>>16,s_nv3089.op,s_nv3089.out_pt,s_nv3089.out_sz,
+            s_nv3089.clip_pt,s_nv3089.clip_sz,s_nv3089.ds_dx,s_nv3089.dt_dy);
+        const rsx_nv3089_truncate contract={s_nv3089.conversion,s_nv3089.dst_surf,
+            s_nv3089.fmt,s_gcm2d.color_fmt,s_nv3089.op,s_nv3089.ds_dx,s_nv3089.dt_dy,
+            s_nv3089.in_uv,s_nv3089.in_fmt,s_nv3089.in_sz,s_nv3089.out_pt,s_nv3089.out_sz,
+            s_nv3089.clip_pt,s_nv3089.clip_sz,s_gcm2d.pitch>>16};
+        unsigned bpp=0;
+        enum rsx_nv3089_contract result=rsx_nv3089_truncate_check(&contract,&bpp);
+        if((s_nv3089.src_dma!=0xFEED0000u && s_nv3089.src_dma!=0xFEED0001u) ||
+           (s_gcm2d.dst_dma!=0xFEED0000u && s_gcm2d.dst_dma!=0xFEED0001u))result=RSX_NV3089_DMA;
+        if(result==RSX_NV3089_EMPTY)return;
+        if(result==RSX_NV3089_EXACT && bpp!=4 &&
+           (rsx_live_draw_enabled() || rsx_draw_engine_enabled()))result=RSX_NV3089_FORMAT;
+        if(result==RSX_NV3089_EXACT) {
+            const u64 w=s_nv3089.out_sz&65535u,h=s_nv3089.out_sz>>16;
+            const u64 x=s_nv3089.out_pt&65535u,y=s_nv3089.out_pt>>16;
+            const u64 source_extent=(h-1)*(s_nv3089.in_fmt&65535u)+w*bpp;
+            const u64 destination_extent=(y+h-1)*(s_gcm2d.pitch>>16)+(x+w)*bpp;
+            u32 src=0,dst=0;
+            const uint64_t limit=ppu_vm_size?ppu_vm_size:UINT64_C(0x100000000);
+            if(!vm_base || !nv3089_resolve_exact(s_nv3089.src_dma,s_nv3089.in_off,source_extent,&src) ||
+               !nv3089_resolve_exact(s_gcm2d.dst_dma,s_gcm2d.dst_offset,destination_extent,&dst))result=RSX_NV3089_BOUNDS;
+            else result=rsx_nv3089_truncate_spans(&contract,bpp,src,dst,limit);
+        }
+        if(result==RSX_NV3089_EMPTY)return;
+        if(result!=RSX_NV3089_EXACT) {
+            ps3_strict_boot_guard("rsx-unsupported-blit-truncate", "reason=%u mode=%u context=0x%08X src_format=%u dst_format=%u operation=%u",
+                (unsigned)result,s_nv3089.conversion,s_nv3089.dst_surf,s_nv3089.fmt,s_gcm2d.color_fmt,s_nv3089.op);
+            return;
+        }
+    }
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
     u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
@@ -956,7 +1034,7 @@ static void nv3089_blit(void)
        * where a minified surface should be, and the shell that samples the
        * pyramid draws untextured. NV309E_BLIT=0 disables. */
       if (en < 0) { const char* e = getenv("NV309E_BLIT"); en = e ? atoi(e) : 1; }
-      if (en && f == 3 && s_nv309e.active && s_nv309e.offset &&
+      if (en && !s_nv3089.conversion_set && f == 3 && s_nv309e.active && s_nv309e.offset &&
           (1u << l2w) == out_w && (1u << l2h) == out_h) {
         int sl = (s_nv3089.src_dma != 0xFEED0001u);
         u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
@@ -1154,6 +1232,10 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
      * offset, 0x040C in u/v start -- which is also the trigger. */
     if (subch == 6 || subch == 7) {
         switch (method) {
+        case 0x02FC:
+            s_nv3089.conversion=data;s_nv3089.conversion_set=1;
+            if(data!=1)ps3_strict_boot_guard("rsx-unsupported-blit-conversion", "subchannel=%u method=0x02FC mode=%u",subch,data);
+            return;
         case 0x0184: s_nv3089.src_dma   = data; return;
         case 0x0198: s_nv3089.dst_surf  = data; return;
         case 0x0300: s_nv3089.fmt       = data; return;
