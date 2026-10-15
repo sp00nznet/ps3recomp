@@ -938,7 +938,19 @@ static uint64_t guest_be64(uint32_t a)
     return ((uint64_t)guest_be32(a) << 32) | guest_be32(a + 4);
 }
 
-static void cellFsAioInit(ppu_context* ctx)   { ps3_strict_fs_unimplemented("cellFsAioInit", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
+static void cellFsAioInit(ppu_context* ctx)
+{
+    if(ps3_strict_fs_enabled()) {
+        char path[1025];
+        const uint32_t ea=(uint32_t)ctx->gpr[3];
+        const int32_t error=fs_stat_guest_path(path,ea);
+        std::fprintf(stderr,"[fs] aio init path='%s' path_ea=0x%08X path_result=0x%08X lr=0x%08llX tid=%llu\n",
+            error?"<invalid>":path,ea,(uint32_t)error,
+            (unsigned long long)ctx->lr,(unsigned long long)ctx->thread_id);
+        ps3_strict_fs_unimplemented("cellFsAioInit",error?"<invalid>":path);
+    }
+    ctx->gpr[3] = CELL_OK;
+}
 static void cellFsAioFinish(ppu_context* ctx) { ps3_strict_fs_unimplemented("cellFsAioFinish", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
 /* Nothing is ever outstanding, so a cancel has nothing to find. Real cellFs
  * answers CELL_FS_ENOENT for an unknown id and callers treat that as "already
