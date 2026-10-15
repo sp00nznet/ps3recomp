@@ -22,6 +22,7 @@
 #include "spurs_event_route.h"
 #include "spurs_owner_lifetime.h"
 #include "spurs_native_job.h"
+#include "spurs_native_registry.h"
 #include "spu_context.h"
 #include "../../runtime/memory/guest_byte.h"
 #include "../../runtime/syscalls/sys_event.h"
@@ -2434,8 +2435,12 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
         printf("\n");
     }
     char capture_prefix[4096];
-    spurs_job_capture_status capture = spurs_job_snapshot_capture(
-        &snapshot, capture_prefix, sizeof capture_prefix);
+    const spurs_native_profile* known_profile = NULL;
+    const char* capture_unknown = getenv("FOLKLORE_SPU_CAPTURE_UNREGISTERED_ONLY");
+    int skip_known = capture_unknown && !strcmp(capture_unknown,"1") &&
+        spurs_native_registry_resolve(&snapshot,&known_profile)==SPURS_NATIVE_OK;
+    spurs_job_capture_status capture = skip_known ? SPURS_JOB_CAPTURE_DISABLED :
+        spurs_job_snapshot_capture(&snapshot, capture_prefix, sizeof capture_prefix);
     if (capture != SPURS_JOB_CAPTURE_DISABLED) {
         fprintf(stderr, "[spurs-job-capture] status=%s job=0x%08X descriptor_size=%u image_size=%u fp=0x%016llX prefix=%s\n",
                 capture == SPURS_JOB_CAPTURE_WRITTEN ? "written" :
@@ -2461,7 +2466,7 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
         dispatched=spu_workload_dispatch_job(snapshot.image,snapshot.image_size,snapshot.job_ea,snapshot.descriptor_size);
     }else if(native.status==SPURS_NATIVE_JOB_RETURNED){
         static atomic_uint native_return_logs;
-        if(atomic_fetch_add_explicit(&native_return_logs,1,memory_order_relaxed)<8)
+        if(atomic_fetch_add_explicit(&native_return_logs,1,memory_order_relaxed)<8||getenv("FOLKLORE_AOT_TRACE"))
             fprintf(stderr,"[spurs-native-job] RETURNED owner=0x%08X worker=0 job=0x%08X fp=0x%016llX pc=0x%05X gets=%u\n",
                 chain->owner.ea,snapshot.job_ea,(unsigned long long)snapshot.fingerprint,native.pc,native.completed_gets);
         dispatched=1;
