@@ -37,7 +37,7 @@ static int layout_equal(spurs_native_layout a,spurs_native_layout b)
 {return a.image==b.image&&a.descriptor==b.descriptor&&a.context==b.context&&a.context_size==b.context_size&&a.stack==b.stack&&a.stack_size==b.stack_size&&a.return_pc==b.return_pc;}
 static int input_valid(spurs_native_input x,spurs_native_layout l,uint32_t allocation)
 {
- if(x.kind==SPURS_NATIVE_INPUT_ORDERED_DMA){if(x.lsa||x.size||x.tag||x.ea)return 0;for(unsigned i=0;i<16;i++)if(x.expected[i])return 0;return 1;}
+ if(x.kind==SPURS_NATIVE_INPUT_ORDERED_DMA||x.kind==SPURS_NATIVE_INPUT_GUEST_DMA){if(x.lsa||x.size||x.tag||x.ea)return 0;for(unsigned i=0;i<16;i++)if(x.expected[i])return 0;return 1;}
  if(x.kind==SPURS_NATIVE_INPUT_NONE){if(x.lsa||x.size||x.tag||x.ea)return 0;for(unsigned i=0;i<16;i++)if(x.expected[i])return 0;return 1;}
  if((x.kind!=SPURS_NATIVE_INPUT_EXACT_GET&&x.kind!=SPURS_NATIVE_INPUT_EXACT_GET_PAIR)||(x.size!=1&&x.size!=2&&x.size!=4&&x.size!=8&&x.size!=16)||x.tag>=32)return 0;
  if(x.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR&&(x.size==16||!memcmp(x.expected,x.expected+x.size,x.size)))return 0;
@@ -143,12 +143,38 @@ static int snapshot_valid(const spurs_job_snapshot*s)
  if(!s->guest_limit||s->guest_limit>UINT64_C(0x100000000)||(uint64_t)s->binary_ea+s->image_size>s->guest_limit||(uint64_t)s->job_ea+s->descriptor_size>s->guest_limit)return 0;
  return be64(s->descriptor)==s->raw_binary_ea&&encoded_size(s->descriptor)==s->image_size&&fingerprint(s->image,s->image_size)==s->fingerprint;
 }
+static int job_layout(const spurs_native_profile*p,const spurs_job_snapshot*s,spurs_native_profile*out)
+{
+ spurs_native_profile copy=*p;
+ if(p->input.kind==SPURS_NATIVE_INPUT_GUEST_DMA){
+  /* This dispatcher implements the legacy raw type only. Descriptor arguments
+   * remain live data; nonzero type/flags are not treated as a raw entry. */
+  if(s->descriptor_size<=44||s->descriptor[44]||p->descriptor_template[44])return 0;
+  uint32_t stack=((uint32_t)s->descriptor[28]<<8|s->descriptor[29])*16u;
+  uint32_t scratch=((uint32_t)s->descriptor[30]<<8|s->descriptor[31])*16u;
+  uint64_t allocation=((uint64_t)stack+scratch+1023u)&~UINT64_C(1023);
+  if(!allocation||allocation>SPU_LS_SIZE)return 0;
+  copy.layout.stack_size=stack;copy.allocation_size=(uint32_t)allocation;
+  if(!layout_valid(copy.layout,copy.image_size,copy.descriptor_size,copy.entry_pc,copy.allocation_size))return 0;
+ }
+ if(out)*out=copy;
+ return 1;
+}
 spurs_native_status spurs_native_registry_resolve(const spurs_job_snapshot*s,const spurs_native_profile**out)
 {
  if(!out)return SPURS_NATIVE_INVALID;
  lock_registry();if(!sealed){unlock_registry();return SPURS_NATIVE_NOT_SEALED;}
  if(!snapshot_valid(s)){unlock_registry();return SPURS_NATIVE_INVALID;}
  for(uint32_t i=0;i<profile_count;i++){const spurs_native_profile*p=&profiles[i];
-  if(p->fingerprint==s->fingerprint&&p->image_size==s->image_size&&p->descriptor_size==s->descriptor_size&&!memcmp(p->image,s->image,s->image_size)&&!memcmp(p->descriptor_template+8,s->descriptor+8,s->descriptor_size-8)){*out=p;unlock_registry();return SPURS_NATIVE_OK;}}
+  if(p->fingerprint==s->fingerprint&&p->image_size==s->image_size&&p->descriptor_size==s->descriptor_size&&!memcmp(p->image,s->image,s->image_size)&&
+     (p->input.kind==SPURS_NATIVE_INPUT_GUEST_DMA?job_layout(p,s,NULL):!memcmp(p->descriptor_template+8,s->descriptor+8,s->descriptor_size-8))){*out=p;unlock_registry();return SPURS_NATIVE_OK;}}
  unlock_registry();return SPURS_NATIVE_NOT_FOUND;
+}
+spurs_native_status spurs_native_registry_resolve_job(const spurs_job_snapshot*s,spurs_native_profile*out)
+{
+ if(!out)return SPURS_NATIVE_INVALID;
+ const spurs_native_profile*p=NULL;
+ spurs_native_status result=spurs_native_registry_resolve(s,&p);
+ if(result!=SPURS_NATIVE_OK)return result;
+ return job_layout(p,s,out)?SPURS_NATIVE_OK:SPURS_NATIVE_INVALID;
 }

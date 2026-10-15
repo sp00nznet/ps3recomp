@@ -37,6 +37,8 @@ static void transfer(spu_context*c,unsigned index)
  uint32_t ea=index==0?0x50000:index==1?0x51000:0x52000,size=32,tag=2;
  if(is("pair")){size=8;ea=0x50000;}
  if(index==0){
+  if(fault("guest-unsupported"))command=0x44;
+  if(fault("guest-overlay"))lsa=0x8000;
   if(fault("wrong-command"))command=0x20;
   if(fault("wrong-order")){command=0x20;ea=0x51000;}
   if(fault("wrong-ea"))ea+=16;if(fault("wrong-ls"))lsa+=16;
@@ -99,16 +101,16 @@ static void finish(uint32_t ea,spurs_owner_token o)
 }
 static int parse(void)
 {
- static const char*all[]={"ordered","wrong-command","wrong-order","wrong-ea","wrong-ls","wrong-size","wrong-tag","wrong-put-payload","late-get-mismatch","missing-all","missing-last","extra","strict-off","none","pair","pending","busy","stale","nonquiescent"};
+ static const char*all[]={"guest","guest-unsupported","guest-overlay","guest-strict-off","ordered","wrong-command","wrong-order","wrong-ea","wrong-ls","wrong-size","wrong-tag","wrong-put-payload","late-get-mismatch","missing-all","missing-last","extra","strict-off","none","pair","pending","busy","stale","nonquiescent"};
  for(unsigned i=0;i<sizeof all/sizeof*all;i++)if(is(all[i]))return 1;return 0;
 }
 int main(int argc,char**argv)
 {
  if(argc!=2)return 2;mode=argv[1];if(!parse())return 2;
 #ifdef _WIN32
- _putenv_s("PS3_STRICT_BOOT",is("strict-off")?"0":"1");
+ _putenv_s("PS3_STRICT_BOOT",is("strict-off")||is("guest-strict-off")?"0":"1");
 #else
- setenv("PS3_STRICT_BOOT",is("strict-off")?"0":"1",1);
+ setenv("PS3_STRICT_BOOT",is("strict-off")||is("guest-strict-off")?"0":"1",1);
 #endif
  C(vm_base==NULL);vm_base=(uint8_t*)calloc(1,0x100000);C(vm_base);ppu_vm_size=0x100000;
  for(unsigned i=0;i<16;i++)image[i]=(uint8_t)(i+1);
@@ -122,6 +124,7 @@ int main(int argc,char**argv)
  spurs_native_definition d={0};d.image=image;d.descriptor_template=desc;d.image_size=16;d.descriptor_size=128;d.entry=entry;d.entry_pc=0x8000;
  d.layout=(spurs_native_layout){0x8000,0x6000,0x48F0,128,0x20000,0x400,0x3FFF0};d.source_sha256=d.build_sha256=sha;
  if(is("pair")){d.input.kind=SPURS_NATIVE_INPUT_EXACT_GET_PAIR;d.input.lsa=0x20100;d.input.size=8;d.input.tag=2;d.input.ea=0x50000;memcpy(d.input.expected,a,8);memcpy(d.input.expected+8,b,8);}
+ else if(!strncmp(mode,"guest",5)){d.input.kind=SPURS_NATIVE_INPUT_GUEST_DMA;}
  else if(!is("none")){d.input.kind=SPURS_NATIVE_INPUT_ORDERED_DMA;d.dma=(spurs_native_dma_sequence){sequence,3};}
  const spurs_native_profile*p=NULL;C(spurs_native_registry_register(&d,&p)==SPURS_NATIVE_OK&&p&&p->allocation_size==0x800);C(spurs_native_registry_seal()==SPURS_NATIVE_OK);
  /* Invalidate source structures, not payload oracle used by assertions. */
@@ -133,12 +136,12 @@ int main(int argc,char**argv)
  memset(c->ls,0xA5,SPU_LS_SIZE);c->host_depth=7;c->drain_ret_pc=0x1234;c->steps=9;C(spu_mfc_context_quiescent(c));
  if(is("nonquiescent"))spu_channel_write(&c->ch_in_mbox,0xDEADBEEF);
  if(!is("busy"))C(spurs_owner_release_worker(lease)==SPURS_OWNER_OK);
- emit_event=is("ordered")||is("none")||is("pair");uint32_t queue=0;
+ emit_event=is("ordered")||is("none")||is("pair")||is("guest");uint32_t queue=0;
  if(emit_event){queue=sys_event_queue_create_direct(0,1);C(queue);C(cellSpursAttachLv2EventQueue((CellSpurs*)(uintptr_t)0x10000,queue,(uint8_t*)(uintptr_t)0x23000,1)==0);C(vm_base[0x23000]==16);receive(queue,0,worker);}
  spurs_owner_token requested=owner;if(is("stale"))requested.generation++;
  spurs_native_job_result r=spurs_native_job_dispatch(&snap,requested,0);
- int shape=!strncmp(mode,"wrong-",6)&&!is("wrong-put-payload");
- int admission=is("strict-off")||is("busy")||is("stale")||is("nonquiescent");
+ int shape=(!strncmp(mode,"wrong-",6)&&!is("wrong-put-payload"))||is("guest-unsupported")||is("guest-overlay");
+ int admission=is("strict-off")||is("guest-strict-off")||is("busy")||is("stale")||is("nonquiescent");
  int negative=shape||is("wrong-put-payload")||is("late-get-mismatch")||is("missing-all")||is("missing-last")||is("extra");
  spurs_native_job_status want=admission?(is("busy")?SPURS_NATIVE_JOB_BUSY:is("stale")?SPURS_NATIVE_JOB_INVALID:SPURS_NATIVE_JOB_UNQUALIFIED):negative?SPURS_NATIVE_JOB_INPUT_MISMATCH:is("pending")?SPURS_NATIVE_JOB_PENDING:SPURS_NATIVE_JOB_RETURNED;
  C(r.status==want&&entered==(unsigned)!admission);

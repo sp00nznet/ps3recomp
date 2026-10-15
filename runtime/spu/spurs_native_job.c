@@ -1,5 +1,6 @@
 #include "spurs_native_job.h"
 #include "spurs_native_registry.h"
+#include "spu_dma.h"
 #include "ps3emu/strict_boot.h"
 #include <string.h>
 #include <stdio.h>
@@ -54,6 +55,7 @@ int spurs_native_job_indirect(spu_context*ctx,void (**target)(spu_context*))
 }
 static void input_reject(native_frame* frame)
 {
+ fprintf(stderr,"[spurs-native-input-rejected] pc=0x%05X lr=0x%05X spu=%u lsa=0x%05X ea=0x%08X size=%u tag=%u\n",frame->context->pc,frame->context->gpr[0]._u32[0],frame->context->spu_id,frame->context->mfc_lsa,frame->context->mfc_eal,frame->context->mfc_size,frame->context->mfc_tag);
  frame->input_mismatch=1;
  frame->context->status=SPU_STATUS_STOPPED_BY_HALT;
  spu_halt(frame->context);
@@ -64,6 +66,17 @@ void spurs_native_job_mfc_before(spu_context* ctx,uint32_t command)
  if(!f||f->context!=ctx)return;
  const spurs_native_input* in=&f->profile->input;
  if(f->pending){input_reject(f);return;}
+ if(in->kind==SPURS_NATIVE_INPUT_GUEST_DMA){
+  /* Only ordinary commands reach the checked synchronous MFC copy below.
+   * List/atomic/control commands need their own implementation and must not
+   * leave a pending frame or report a transfer which never took place. */
+  if(!mfc_strict_ordinary(command)||ctx->mfc_tag>=32){input_reject(f);return;}
+  /* A GET cannot change the admitted executable image underneath AOT code.
+   * Overlay support must identify and admit a new translation explicitly. */
+  if(mfc_is_get(command)&&ctx->mfc_lsa<f->profile->layout.image+f->profile->image_size&&
+     (uint64_t)ctx->mfc_lsa+ctx->mfc_size>f->profile->layout.image){input_reject(f);return;}
+  f->pending=1;return;
+ }
  if(in->kind==SPURS_NATIVE_INPUT_ORDERED_DMA){
   if(f->completed_transfers>=f->profile->dma.count){input_reject(f);return;}
   const spurs_native_dma_step*s=&f->profile->dma.steps[f->completed_transfers];
@@ -85,6 +98,11 @@ void spurs_native_job_mfc_after(spu_context* ctx,uint32_t command)
  if(!f||f->context!=ctx)return;
  const spurs_native_input* in=&f->profile->input;
  if(!f->pending){input_reject(f);return;}
+ if(in->kind==SPURS_NATIVE_INPUT_GUEST_DMA){
+  f->pending=0;++f->completed_transfers;
+  if(mfc_is_get(command))++f->completed_gets;else ++f->completed_puts;
+  return;
+ }
  if(in->kind==SPURS_NATIVE_INPUT_ORDERED_DMA){
   const spurs_native_dma_step*s=&f->profile->dma.steps[f->completed_transfers];
   if(command!=s->command||memcmp(ctx->ls+s->lsa,s->expected,s->size)){
@@ -111,23 +129,26 @@ spurs_native_job_result spurs_native_job_dispatch(
  const spurs_job_snapshot* snapshot,spurs_owner_token owner,uint32_t worker_index)
 {
  spurs_native_job_result result={0};result.status=SPURS_NATIVE_JOB_INVALID;
- const spurs_native_profile* profile=NULL;
- spurs_native_status resolved=spurs_native_registry_resolve(snapshot,&profile);
+ spurs_native_profile effective;
+ const spurs_native_profile* profile=&effective;
+ spurs_native_status resolved=spurs_native_registry_resolve_job(snapshot,&effective);
  if(resolved!=SPURS_NATIVE_OK){
+  fprintf(stderr,"[spurs-native-admission] registry=%u job=0x%08X owner=0x%08X worker=%u\n",(unsigned)resolved,snapshot?snapshot->job_ea:0,owner.ea,worker_index);
   result.status=resolved==SPURS_NATIVE_NOT_SEALED?SPURS_NATIVE_JOB_REGISTRY_OPEN:
    resolved==SPURS_NATIVE_NOT_FOUND?SPURS_NATIVE_JOB_UNREGISTERED:SPURS_NATIVE_JOB_INVALID;
   return result;
  }
  /* EXACT_GET relies on the strict MFC's checked synchronous copy and fatal
   * transfer errors. Compatibility DMA semantics cannot certify delivered data. */
- if((profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET||profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR||profile->input.kind==SPURS_NATIVE_INPUT_ORDERED_DMA)&&!ps3_strict_boot_enabled()){
+ if((profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET||profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR||profile->input.kind==SPURS_NATIVE_INPUT_ORDERED_DMA||profile->input.kind==SPURS_NATIVE_INPUT_GUEST_DMA)&&!ps3_strict_boot_enabled()){
   result.status=SPURS_NATIVE_JOB_UNQUALIFIED;return result;
  }
  if(active_native||g_spu_trampoline_fn){result.status=SPURS_NATIVE_JOB_BUSY;return result;}
  spurs_worker_lease lease={0};
  spurs_owner_status acquired=spurs_owner_acquire_worker(owner,worker_index,&lease);
  if(acquired!=SPURS_OWNER_OK){result.status=acquired==SPURS_OWNER_BUSY?
-  SPURS_NATIVE_JOB_BUSY:SPURS_NATIVE_JOB_INVALID;return result;}
+  SPURS_NATIVE_JOB_BUSY:SPURS_NATIVE_JOB_INVALID;
+  fprintf(stderr,"[spurs-native-admission] owner_acquire=%u owner=0x%08X generation=%llu worker=%u\n",(unsigned)acquired,owner.ea,(unsigned long long)owner.generation,worker_index);return result;}
  spu_context* ctx=(spu_context*)lease.context;
  if(!ctx||ctx->ls!=ctx->ls_store||ctx->spurs_owner_ea!=owner.ea||
     ctx->spurs_pm_loaded||ctx->policy_mode||ctx->irq_frame||ctx->irq_saved||

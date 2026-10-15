@@ -13,7 +13,7 @@ typedef void (*spurs_native_entry)(spu_context*);
 typedef struct spurs_native_target {uint32_t pc;spurs_native_entry entry;} spurs_native_target;
 typedef struct spurs_native_targets {const spurs_native_target *entries;uint32_t count;} spurs_native_targets;
 typedef struct spurs_native_layout {uint32_t image,descriptor,context,context_size,stack,stack_size,return_pc;} spurs_native_layout;
-enum spurs_native_input_kind {SPURS_NATIVE_INPUT_NONE=0,SPURS_NATIVE_INPUT_EXACT_GET=1,SPURS_NATIVE_INPUT_EXACT_GET_PAIR=2,SPURS_NATIVE_INPUT_ORDERED_DMA=3};
+enum spurs_native_input_kind {SPURS_NATIVE_INPUT_NONE=0,SPURS_NATIVE_INPUT_EXACT_GET=1,SPURS_NATIVE_INPUT_EXACT_GET_PAIR=2,SPURS_NATIVE_INPUT_ORDERED_DMA=3,SPURS_NATIVE_INPUT_GUEST_DMA=4};
 typedef struct spurs_native_input {uint32_t kind,lsa,size,tag;uint64_t ea;uint8_t expected[16];} spurs_native_input;
 typedef struct spurs_native_dma_step {uint32_t command,lsa,size,tag;uint64_t ea;const uint8_t *expected;} spurs_native_dma_step;
 typedef struct spurs_native_dma_sequence {const spurs_native_dma_step *steps;uint32_t count;} spurs_native_dma_sequence;
@@ -51,6 +51,13 @@ typedef enum spurs_native_status {SPURS_NATIVE_OK=0,SPURS_NATIVE_DUPLICATE,
  * size. Registration copies steps and payloads within a 256 KiB budget.
  * GET checks delivered LS bytes; PUT checks LS bytes before the real copy.
  * A failed later step cannot undo earlier real transfers.
+ * GUEST_DMA executes ordinary GET/PUT commands against live guest memory using
+ * strict MFC extent, alignment, permission and copy checks. No captured payload
+ * or fixed transfer sequence is substituted. Legacy input fields and DMA
+ * sequence must be empty. Unknown commands still fail before any transfer.
+ * For this mode image identity admits raw job descriptors of the same size
+ * and type; stack/scratch allocation comes from each owned snapshot. The
+ * checked per-job copy must fit LS without overlapping code/ABI regions.
  * All unused expected bytes must be zero. EA extent must be representable32bit.
  * allocation_size is checked round-up-to-1024 of requested stack plus the
  * descriptor's BE16+0x1E 16-byte units; stack_size remains the requested size.
@@ -73,6 +80,9 @@ spurs_native_status spurs_native_registry_seal(void);
  * Resolution does not establish lease ownership or safe LS staging.
  * OK/DUPLICATE set out; every error leaves out and registry unchanged. */
 spurs_native_status spurs_native_registry_resolve(const spurs_job_snapshot*,const spurs_native_profile **out);
+/* Copy the immutable translation identity and derive checked live raw-job
+ * stack/scratch sizing. Output remains unchanged on any failure. */
+spurs_native_status spurs_native_registry_resolve_job(const spurs_job_snapshot*,spurs_native_profile *out);
 #ifdef __cplusplus
 }
 #endif

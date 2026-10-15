@@ -150,10 +150,29 @@ static void pair_input_contract(void)
  T(spurs_native_registry_resolve(&snap,&out)==SPURS_NATIVE_OK&&out==last);
  T(out->input.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR&&out->input.size==8);
 }
+static void guest_layout(void)
+{
+ spurs_native_definition d=definition();d.input.kind=SPURS_NATIVE_INPUT_GUEST_DMA;
+ desc[44]=0;
+ const spurs_native_profile*p=add(&d);T(spurs_native_registry_seal()==SPURS_NATIVE_OK);
+ spurs_job_snapshot s=snapshot();spurs_native_profile live={0};
+ desc[40]=0xA7;desc[31]=0x41;
+ T(spurs_native_registry_resolve_job(&s,&live)==SPURS_NATIVE_OK);
+ T(live.layout.stack_size==0x1000&&live.allocation_size==0x1800);
+ T(p->allocation_size==0x1000&&p->descriptor_template[31]==0);
+ spurs_native_profile before=live;
+ desc[44]=1;T(spurs_native_registry_resolve_job(&s,&live)==SPURS_NATIVE_NOT_FOUND);
+ T(!memcmp(&before,&live,sizeof live));desc[44]=0;
+ desc[30]=0xFF;desc[31]=0xFF;
+ T(spurs_native_registry_resolve_job(&s,&live)==SPURS_NATIVE_NOT_FOUND);
+ T(!memcmp(&before,&live,sizeof live));
+ desc[30]=desc[31]=0;desc[28]=desc[29]=0;
+ T(spurs_native_registry_resolve_job(&s,&live)==SPURS_NATIVE_NOT_FOUND);
+}
 int main(int argc,char**argv)
 {
  if(argc!=2)return 2;
- if(!strcmp(argv[1],"open-sealed"))open_sealed();else if(!strcmp(argv[1],"exact"))exact();else if(!strcmp(argv[1],"descriptor"))descriptor();
+ if(!strcmp(argv[1],"guest-layout"))guest_layout();else if(!strcmp(argv[1],"open-sealed"))open_sealed();else if(!strcmp(argv[1],"exact"))exact();else if(!strcmp(argv[1],"descriptor"))descriptor();
  else if(!strcmp(argv[1],"immutable-copy"))immutable_copy();else if(!strcmp(argv[1],"invalid-layout"))invalid_layout();else if(!strcmp(argv[1],"duplicate"))duplicate();else if(!strcmp(argv[1],"capacity"))capacity();else if(!strcmp(argv[1],"input-contract"))input_contract();else if(!strcmp(argv[1],"pair-input-contract"))pair_input_contract();else return 2;
  T(executed==0);puts("NATIVE_REGISTRY_PASS");return 0;
 }
