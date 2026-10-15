@@ -540,13 +540,14 @@ class SPULifter:
         # into the next sequential function. Emit a tail-call so the chain isn't
         # truncated (this was silently dropping execution mid-job).
         _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
+        continuation = end & 0x3FFFC
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
-                and end in getattr(self, "func_starts", set())):
+                and continuation in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
+                f"    {{ ctx->pc = 0x{continuation:X}; "
+                f"g_spu_trampoline_fn = {self.prefix}spu_func_{continuation:08X}; return; }}")
         elif self.strict_unsupported and (last_insn is None or last_insn.mnemonic not in _TERMINATORS):
-            pc = last_insn.addr + 4 if last_insn is not None else start
+            pc = (last_insn.addr + 4) & 0x3FFFC if last_insn is not None else start
             func.body_lines.append("    " + self._strict_failure(pc, "missing-continuation"))
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
@@ -866,7 +867,8 @@ class SPULifter:
             tgt = self._branch_target(insn)
             # Link register: preferred word only, other slots ZERO (real HW /
             # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
-            link = f"{g(link_rt)} = spu_link(0x{addr + 4:X});"
+            next_pc = (addr + 4) & 0x3FFFC
+            link = f"{g(link_rt)} = spu_link(0x{next_pc:X});"
             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
             # infinite loop on real SPU (re-sets the link each pass, never
             # advances) -- a trap, NOT a call. Emitting a host call recurses
@@ -885,8 +887,8 @@ class SPULifter:
             # instead of the real caller (observed: SPURS taskset LoadElf's return
             # landed back inside its own clear loop, running it with a stale count).
             # Treat it as: set the link, then fall through to addr+4.
-            if tgt == addr + 4:
-                return f"{link} {self._uncond_branch(addr + 4, func, addr)}"
+            if tgt == next_pc:
+                return f"{link} {self._uncond_branch(next_pc, func, addr)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
                 # Nested host call bracketed by host_depth (so the callee's
@@ -895,7 +897,7 @@ class SPULifter:
                 # + image save/restore (adopt-on-serve cannot leak upward).
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
                         f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+                        f"spu_drain_call(ctx, 0x{next_pc:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
             if self.strict_unsupported:
                 return f"{link} {self._strict_failure(addr, 'unresolved-call-target')}"
             return f"{link} /* TODO spu: brsl unresolved target */;"
@@ -956,11 +958,16 @@ class SPULifter:
             # Indirect call: nested dispatch bracketed like brsl (host_depth +
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
-            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                    f"{{ int32_t _si = (int32_t)ctx->image_id; "
-                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+            next_pc = (addr + 4) & 0x3FFFC
+            return (f"{{ uint32_t _target = {g(tgt_reg)}._u32[0] & 0x3FFFCu; "
+                    f"{g(link_rt)} = spu_link(0x{next_pc:X}); "
+                    # A computed PC getter can target the next instruction
+                    # inside this function; no separate entry is required.
+                    f"{_ied}if (_target != 0x{next_pc:X}u) {{ "
+                    f"int32_t _si = (int32_t)ctx->image_id; "
+                    f"ctx->pc = _target; ctx->host_depth++; "
+                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{next_pc:X}); "
+                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }} }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
@@ -1116,7 +1123,7 @@ def main() -> None:
     p.add_argument("--output", "-o", default=".", help="Output directory")
     p.add_argument("--header-name", default="spu_recomp.h")
     p.add_argument("--source-name", default="spu_recomp.c")
-    p.add_argument("--base", type=lambda x: int(x, 0), default=0,
+    p.add_argument("--base", type=lambda x: int(x, 0), default=None,
                    help="Base local-store address")
     p.add_argument("--offset", type=lambda x: int(x, 0), default=0)
     p.add_argument("--length", type=lambda x: int(x, 0), default=0)
@@ -1171,8 +1178,9 @@ def main() -> None:
             elf_buf = f.read()
         funcs, (text_off, base, size) = detect_functions(elf_buf)
         data = elf_buf[text_off:text_off + size]
-        if args.base != 0:
-            base = args.base  # caller override
+        if args.base is not None and args.base != base:
+            p.error("--auto-functions --base differs from ELF text address; "
+                    "relocated discovery is unsupported (no output written)")
         bounds = funcs
     else:
         with open(args.input, "rb") as f:
@@ -1184,7 +1192,7 @@ def main() -> None:
         # into the wrong instructions -- which is an expensive way to find a
         # missing flag. Use --auto-functions for an ELF, or say --offset/--base
         # explicitly if the raw read is deliberate.
-        if data[:4] == b"ELF" and args.offset == 0 and args.base == 0:
+        if data[:4] == b"ELF" and args.offset == 0 and (args.base is None or args.base == 0):
             p.error("input is an ELF but no --auto-functions/--offset/--base was "
                     "given: it would be lifted as a raw image at base 0, placing "
                     "every function at its FILE OFFSET instead of its local-store "
@@ -1193,7 +1201,7 @@ def main() -> None:
         data = data[args.offset:]
         if args.length:
             data = data[:args.length]
-        base = args.base
+        base = args.base if args.base is not None else 0
 
         if args.functions:
             with open(args.functions) as f:
