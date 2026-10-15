@@ -15,6 +15,7 @@
  */
 
 #include "rsx_commands.h"
+#include "rsx_shader_window.h"
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -873,7 +874,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     if (method == NV4097_SET_SHADER_WINDOW) {
-        if (data & ~0x00011FFFu) {
+        if (!rsx_shader_window_valid(data)) {
             ps3_strict_boot_guard("rsx-shader-window-invalid", "data=0x%08X", data);
             return -1;
         }

@@ -7,10 +7,14 @@
 typedef struct rsx_shader_window {
     float y_scale, x_bias, y_bias;
 } rsx_shader_window;
+static inline int rsx_shader_window_valid(u32 raw)
+{
+    return (raw & ~0x00011FFFu) == 0;
+}
 static inline int rsx_shader_window_decode(u32 raw, rsx_shader_window* out)
 {
     /* Height [0:11]; origin [12:15] and center [16:19] each accept 0 or 1. */
-    if (!out || (raw & ~0x00011FFFu)) return -1;
+    if (!out || !rsx_shader_window_valid(raw)) return -1;
     const int bottom = (raw & 0x1000u) != 0;
     const float center = (raw & 0x10000u) ? -0.5f : 0.0f;
     out->y_scale = bottom ? -1.0f : 1.0f;

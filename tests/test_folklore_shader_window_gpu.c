@@ -6,7 +6,7 @@
 #undef main
 #include "folklore_wpos_program.h"
 #include <assert.h>
-int main(void)
+int main(int argc,char** argv)
 {
     static const u32 windows[]={0x12D0,0x2D0,0x102D0,0x112D0,0x12CF,0x12D0};
     vm_base=host_vm_alloc();assert(vm_base);
@@ -15,6 +15,11 @@ int main(void)
     u32 ctx=host_alloc(4,4);
     cellGcmSetupContext(ctx,CMD_SIZE,IO_SIZE,IO_ADDR,host_alloc,host_w32);
     cellGcmSetDisplayBuffer(0,0,5120,1280,720);
+    if (argc==2 && !strcmp(argv[1],"bad-register")) {
+        emit(NV4097_SET_SHADER_WINDOW,0x2000u);
+        guest_w32(CTRL_ADDR,g_fifo_len);cellGcm_rsx_process_fifo();
+        return 99; /* must stop86 before dispatch stores invalid state */
+    }
     upload_shader_triangle();folklore_wpos_program(vm_base+IO_ADDR+FP_OFFSET);
     for (unsigned i=0;i<sizeof(windows)/sizeof(windows[0]);i++) {
         emit(NV4097_SET_SHADER_WINDOW,windows[i]);submit_frame(3);

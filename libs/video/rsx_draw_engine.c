@@ -11,6 +11,8 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_shader_window.h"
+#include "ps3emu/strict_boot.h"
 
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
@@ -1394,8 +1396,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
-        if (fi > 0 && rsx_fp_apply_shader_window(s_ps_hlsl, sizeof s_ps_hlsl, shader_window) < 0)
+        if (fi > 0 && rsx_fp_apply_shader_window(s_ps_hlsl, sizeof s_ps_hlsl, shader_window) < 0) {
+            ps3_strict_boot_guard("rsx-shader-window-lowering", "window=0x%08X", shader_window);
             fi = -1;
+        }
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
             fi = -1;
@@ -2451,6 +2455,10 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    if (m == 0x1D88u && !rsx_shader_window_valid(arg)) {
+        ps3_strict_boot_guard("rsx-shader-window-invalid", "data=0x%08X", arg);
+        return;
+    }
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 
