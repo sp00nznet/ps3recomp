@@ -23,7 +23,7 @@ void spurs_native_job_mfc_before(spu_context* ctx,uint32_t command)
  native_frame* f=active_native;
  if(!f||f->context!=ctx)return;
  const spurs_native_input* in=&f->profile->input;
- if(in->kind!=SPURS_NATIVE_INPUT_EXACT_GET||f->completed_gets||
+ if((in->kind!=SPURS_NATIVE_INPUT_EXACT_GET&&in->kind!=SPURS_NATIVE_INPUT_EXACT_GET_PAIR)||f->completed_gets||
     command!=MFC_GET_CMD||ctx->mfc_lsa!=in->lsa||
     (((uint64_t)ctx->mfc_eah<<32)|ctx->mfc_eal)!=in->ea||
     ctx->mfc_size!=in->size||ctx->mfc_tag!=in->tag)input_reject(f);
@@ -33,8 +33,9 @@ void spurs_native_job_mfc_after(spu_context* ctx,uint32_t command)
  native_frame* f=active_native;
  if(!f||f->context!=ctx)return;
  const spurs_native_input* in=&f->profile->input;
- if(in->kind!=SPURS_NATIVE_INPUT_EXACT_GET||command!=MFC_GET_CMD||
-    memcmp(ctx->ls+in->lsa,in->expected,in->size))input_reject(f);
+ if((in->kind!=SPURS_NATIVE_INPUT_EXACT_GET&&in->kind!=SPURS_NATIVE_INPUT_EXACT_GET_PAIR)||command!=MFC_GET_CMD||
+    (memcmp(ctx->ls+in->lsa,in->expected,in->size)&&
+     (in->kind!=SPURS_NATIVE_INPUT_EXACT_GET_PAIR||memcmp(ctx->ls+in->lsa,in->expected+in->size,in->size))))input_reject(f);
  ++f->completed_gets;
 }
 static void native_landing(spu_context* ctx)
@@ -58,7 +59,7 @@ spurs_native_job_result spurs_native_job_dispatch(
  }
  /* EXACT_GET relies on the strict MFC's checked synchronous copy and fatal
   * transfer errors. Compatibility DMA semantics cannot certify delivered data. */
- if(profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET&&!ps3_strict_boot_enabled()){
+ if((profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET||profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR)&&!ps3_strict_boot_enabled()){
   result.status=SPURS_NATIVE_JOB_UNQUALIFIED;return result;
  }
  if(active_native||g_spu_trampoline_fn){result.status=SPURS_NATIVE_JOB_BUSY;return result;}
@@ -99,7 +100,7 @@ spurs_native_job_result spurs_native_job_dispatch(
  else if(result.halt_landing||ctx->status==SPU_STATUS_STOPPED_BY_HALT)result.status=SPURS_NATIVE_JOB_HALTED;
  else if(ctx->status!=SPU_STATUS_RUNNING)result.status=SPURS_NATIVE_JOB_STOPPED;
  else if(ctx->pc!=layout->return_pc||g_spu_trampoline_fn||ctx->host_depth!=1)result.status=SPURS_NATIVE_JOB_BAD_RETURN;
- else if(profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET&&frame.completed_gets!=1)result.status=SPURS_NATIVE_JOB_INPUT_MISMATCH;
+ else if((profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET||profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR)&&frame.completed_gets!=1)result.status=SPURS_NATIVE_JOB_INPUT_MISMATCH;
  else if(ctx->event_mask||!spu_mfc_context_quiescent(ctx))result.status=SPURS_NATIVE_JOB_PENDING;
  else result.status=SPURS_NATIVE_JOB_RETURNED;
  active_native=NULL;g_spu_trampoline_fn=NULL;

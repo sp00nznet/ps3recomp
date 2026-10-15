@@ -37,10 +37,12 @@ static int layout_equal(spurs_native_layout a,spurs_native_layout b)
 static int input_valid(spurs_native_input x,spurs_native_layout l)
 {
  if(x.kind==SPURS_NATIVE_INPUT_NONE){if(x.lsa||x.size||x.tag||x.ea)return 0;for(unsigned i=0;i<16;i++)if(x.expected[i])return 0;return 1;}
- if(x.kind!=SPURS_NATIVE_INPUT_EXACT_GET||(x.size!=1&&x.size!=2&&x.size!=4&&x.size!=8&&x.size!=16)||x.tag>=32)return 0;
+ if((x.kind!=SPURS_NATIVE_INPUT_EXACT_GET&&x.kind!=SPURS_NATIVE_INPUT_EXACT_GET_PAIR)||(x.size!=1&&x.size!=2&&x.size!=4&&x.size!=8&&x.size!=16)||x.tag>=32)return 0;
+ if(x.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR&&(x.size==16||!memcmp(x.expected,x.expected+x.size,x.size)))return 0;
  if(x.lsa<l.stack||x.lsa-l.stack>l.stack_size||x.size>l.stack_size-(x.lsa-l.stack)||x.ea<0x10000||x.ea>UINT32_MAX||x.size>UINT64_C(0x100000000)-x.ea)return 0;
  if((x.lsa&(x.size-1))||(x.ea&(x.size-1))||((x.lsa^x.ea)&15))return 0;
- for(unsigned i=x.size;i<16;i++)if(x.expected[i])return 0;return 1;
+ unsigned used=x.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR?2*x.size:x.size;
+ for(unsigned i=used;i<16;i++)if(x.expected[i])return 0;return 1;
 }
 static int input_equal(spurs_native_input a,spurs_native_input b)
 {return a.kind==b.kind&&a.lsa==b.lsa&&a.size==b.size&&a.tag==b.tag&&a.ea==b.ea&&!memcmp(a.expected,b.expected,16);}

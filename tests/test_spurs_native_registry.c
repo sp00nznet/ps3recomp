@@ -96,10 +96,64 @@ static void input_contract(void)
  memset(&d.input,0,sizeof d.input);T(spurs_native_registry_register(&d,&out)==SPURS_NATIVE_CONFLICT&&out==p);
  T(spurs_native_registry_seal()==SPURS_NATIVE_OK);spurs_job_snapshot snap=snapshot();T(spurs_native_registry_resolve(&snap,&out)==SPURS_NATIVE_OK&&out==p&&out->input.kind==SPURS_NATIVE_INPUT_EXACT_GET);
 }
+static void pair_input_contract(void)
+{
+ const spurs_native_profile*last=NULL;
+ for(unsigned n=0;n<4;n++){
+  unsigned size=1u<<n;spurs_native_definition d=definition();desc[63]=(uint8_t)(0xC0+n);
+  d.input.kind=SPURS_NATIVE_INPUT_EXACT_GET_PAIR;d.input.lsa=0x4100;
+  d.input.ea=0x20000;d.input.size=size;d.input.tag=2;
+  for(unsigned i=0;i<size;i++)d.input.expected[i]=(uint8_t)(i+1);
+  memcpy(d.input.expected+size,d.input.expected,size);
+  d.input.expected[2*size-1]^=0x80; /* Equal prefixes, distinct complete payloads. */
+  spurs_native_input good=d.input;
+  const spurs_native_profile*p=add(&d),*out=NULL;last=p;
+  T(p->input.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR&&p->input.size==size);
+  T(!memcmp(p->input.expected,good.expected,16));
+  memset(d.input.expected,0xEE,16); /* Profile owns an independent value copy. */
+  T(!memcmp(p->input.expected,good.expected,16));
+  d.input=good;T(spurs_native_registry_register(&d,&out)==SPURS_NATIVE_DUPLICATE&&out==p);
+  d.input.expected[2*size-1]^=0x40;out=p;
+  T(spurs_native_registry_register(&d,&out)==SPURS_NATIVE_CONFLICT&&out==p);
+  d.input=good;memcpy(d.input.expected,good.expected+size,size);
+  memcpy(d.input.expected+size,good.expected,size);
+  T(spurs_native_registry_register(&d,&out)==SPURS_NATIVE_CONFLICT&&out==p); /* Order binds. */
+  for(unsigned bad=0;bad<12;bad++){
+   d.input=good;
+   switch(bad){
+   case 0:memcpy(d.input.expected+size,d.input.expected,size);break;
+   case 1:d.input.size=16;break;
+   case 2:d.input.size=3;break;
+   case 3:d.input.size=0;break;
+   case 4:d.input.kind=3;break;
+   case 5:d.input.tag=32;break;
+   case 6:d.input.lsa=0x5000;break;
+   case 7:d.input.ea=UINT64_C(0x100020000);break;
+   case 8:d.input.ea=0xFFF0;break;
+   case 9:d.input.lsa++;break; /* Size1 still rejects mismatched low nibble. */
+   case 10:d.input.ea++;break;
+   case 11:if(size==8)continue;d.input.expected[2*size]=1;break;
+   }
+   T(spurs_native_registry_register(&d,&out)==SPURS_NATIVE_INVALID&&out==p);
+   T(!memcmp(p->input.expected,good.expected,16));
+  }
+  d.input=good;d.input.kind=SPURS_NATIVE_INPUT_EXACT_GET;
+  memset(d.input.expected+size,0,16-size);
+  T(spurs_native_registry_register(&d,&out)==SPURS_NATIVE_CONFLICT&&out==p);
+  /* Final representable EA extent is valid, but a different exact shape conflicts. */
+  d.input=good;d.input.ea=UINT64_C(0x100000000)-size;d.input.lsa=0x4110-size;
+  T(spurs_native_registry_register(&d,&out)==SPURS_NATIVE_CONFLICT&&out==p);
+  d.input=good;
+ }
+ T(spurs_native_registry_seal()==SPURS_NATIVE_OK);
+ spurs_job_snapshot snap=snapshot();const spurs_native_profile*out=NULL;
+ T(spurs_native_registry_resolve(&snap,&out)==SPURS_NATIVE_OK&&out==last);
+ T(out->input.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR&&out->input.size==8);
+}
 int main(int argc,char**argv)
 {
  if(argc!=2)return 2;
  if(!strcmp(argv[1],"open-sealed"))open_sealed();else if(!strcmp(argv[1],"exact"))exact();else if(!strcmp(argv[1],"descriptor"))descriptor();
- else if(!strcmp(argv[1],"immutable-copy"))immutable_copy();else if(!strcmp(argv[1],"invalid-layout"))invalid_layout();else if(!strcmp(argv[1],"duplicate"))duplicate();else if(!strcmp(argv[1],"capacity"))capacity();else if(!strcmp(argv[1],"input-contract"))input_contract();else return 2;
+ else if(!strcmp(argv[1],"immutable-copy"))immutable_copy();else if(!strcmp(argv[1],"invalid-layout"))invalid_layout();else if(!strcmp(argv[1],"duplicate"))duplicate();else if(!strcmp(argv[1],"capacity"))capacity();else if(!strcmp(argv[1],"input-contract"))input_contract();else if(!strcmp(argv[1],"pair-input-contract"))pair_input_contract();else return 2;
  T(executed==0);puts("NATIVE_REGISTRY_PASS");return 0;
 }

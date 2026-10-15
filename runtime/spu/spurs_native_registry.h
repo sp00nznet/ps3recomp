@@ -9,7 +9,7 @@ extern "C" {
 #define SPURS_NATIVE_REGISTRY_LIMIT 16u
 typedef void (*spurs_native_entry)(spu_context*);
 typedef struct spurs_native_layout {uint32_t image,descriptor,context,context_size,stack,stack_size,return_pc;} spurs_native_layout;
-enum spurs_native_input_kind {SPURS_NATIVE_INPUT_NONE=0,SPURS_NATIVE_INPUT_EXACT_GET=1};
+enum spurs_native_input_kind {SPURS_NATIVE_INPUT_NONE=0,SPURS_NATIVE_INPUT_EXACT_GET=1,SPURS_NATIVE_INPUT_EXACT_GET_PAIR=2};
 typedef struct spurs_native_input {uint32_t kind,lsa,size,tag;uint64_t ea;uint8_t expected[16];} spurs_native_input;
 typedef struct spurs_native_definition {
  const uint8_t *image,*descriptor_template;uint32_t image_size,descriptor_size;
@@ -33,7 +33,9 @@ typedef enum spurs_native_status {SPURS_NATIVE_OK=0,SPURS_NATIVE_DUPLICATE,
  * NONE requires zero remaining input fields and means caller permits no DMA.
  * EXACT_GET defines exactly one actual GET0x40; caller checks shape and delivered
  * LS bytes after genuine transfer. Registry performs no DMA/OS-readability check.
- * Unused expected bytes must be zero. EA extent must be representable32bit.
+ * EXACT_GET_PAIR admits either of two distinct complete 1/2/4/8-byte payloads,
+ * concatenated in expected; the shape is still exactly one real GET0x40.
+ * All unused expected bytes must be zero. EA extent must be representable32bit.
  * No title is registered automatically; no context/readiness/dispatch is created.
  * Inputs/output pointers refer to stable caller-owned HOST memory. */
 spurs_native_status spurs_native_registry_register(const spurs_native_definition*,const spurs_native_profile **out);
