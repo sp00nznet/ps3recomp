@@ -22,9 +22,23 @@
 #include <stdio.h>
 #include <stdio.h>
 #include "../platform/win32_compat.h"
+#include "ps3emu/strict_boot.h"
+#ifndef _WIN32
+#include <unistd.h>
+#include <errno.h>
+#if defined(__linux__)
+#include <sys/uio.h>
+#endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+#if defined(__linux__) && !defined(__USE_GNU)
+extern ssize_t process_vm_readv(pid_t, const struct iovec*, unsigned long,
+                               const struct iovec*, unsigned long, unsigned long);
+extern ssize_t process_vm_writev(pid_t, const struct iovec*, unsigned long,
+                                const struct iovec*, unsigned long, unsigned long);
 #endif
 
 extern uint8_t* vm_base;
@@ -161,6 +175,129 @@ static inline int mfc_is_fence(uint32_t cmd)
     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
 }
 
+static inline int mfc_strict_ordinary(uint32_t cmd)
+{
+    return cmd == MFC_GET_CMD || cmd == MFC_GETB_CMD || cmd == MFC_GETF_CMD ||
+           cmd == MFC_PUT_CMD || cmd == MFC_PUTB_CMD || cmd == MFC_PUTF_CMD;
+}
+
+/* No demand commit/cache: validate every touched host region and copy through
+ * a fault-reporting OS API. Concurrent remaps/writes are not a coherent epoch;
+ * a partial OS copy is fatal and never completes the tag. */
+static inline int mfc_strict_span(uintptr_t address, uint32_t size, int writing)
+{
+    if (!size || size > UINTPTR_MAX - address) return 0;
+    uintptr_t current = address, end = address + size;
+#ifdef _WIN32
+    while (current < end) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery((void*)current, &info, sizeof info) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+        DWORD p = info.Protect & 0xff;
+        int writable = p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+                       p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+        if (!writable && (writing || (p != PAGE_READONLY && p != PAGE_EXECUTE_READ))) return 0;
+        uintptr_t first = (uintptr_t)info.BaseAddress;
+        if (info.RegionSize > UINTPTR_MAX - first) return 0;
+        uintptr_t next = first + info.RegionSize;
+        if (first > current || next <= current) return 0;
+        current = next;
+    }
+    return 1;
+#elif defined(__linux__)
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[1024];
+    while (current < end && fgets(line, sizeof line, maps)) {
+        unsigned long long first, last; char permissions[5] = {0};
+        if (sscanf(line, "%llx-%llx %4s", &first, &last, permissions) != 3 || last <= current) continue;
+        if (first > current || last > UINTPTR_MAX ||
+            (writing ? permissions[1] != 'w' : permissions[0] != 'r')) break;
+        current = (uintptr_t)(last < end ? last : end);
+    }
+    int okay = current == end;
+    return fclose(maps) == 0 && okay;
+#else
+    (void)current; (void)end; (void)writing; return 0;
+#endif
+}
+
+static inline int mfc_strict_copy(void* local, uintptr_t remote, uint32_t size, int writing)
+{
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    int okay = writing ? WriteProcessMemory(GetCurrentProcess(), (void*)remote, local, size, &copied)
+                       : ReadProcessMemory(GetCurrentProcess(), (void*)remote, local, size, &copied);
+    return okay && copied == size;
+#elif defined(__linux__)
+    struct iovec near_span = {local, size}, far_span = {(void*)remote, size};
+    ssize_t count;
+    do { count = writing ? process_vm_writev(getpid(), &near_span, 1, &far_span, 1, 0)
+                         : process_vm_readv(getpid(), &near_span, 1, &far_span, 1, 0); }
+    while (count < 0 && errno == EINTR);
+    return count == (ssize_t)size;
+#else
+    (void)local; (void)remote; (void)size; (void)writing; return 0;
+#endif
+}
+
+static inline int mfc_strict_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                      uint32_t size, uint32_t cmd)
+{
+    extern uint32_t ppu_vm_size;
+    uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    uintptr_t base = (uintptr_t)vm_base, local = spu ? (uintptr_t)spu->ls : 0;
+    uintptr_t address = 0;
+    const char* reason = "extent-or-shape";
+    int writing = mfc_is_put(cmd);
+    if (!mfc_strict_ordinary(cmd) || !spu || !local || !vm_base || ea < 0x10000ull ||
+        ea > UINT32_MAX || ea > limit || size > limit - ea ||
+        !size || size > MFC_MAX_DMA_SIZE ||
+        !((size == 1 || size == 2 || size == 4 || size == 8) || !(size & 15u)) ||
+        (size < 16 && ((lsa | (uint32_t)ea) & (size - 1u))) ||
+        (size >= 16 && ((lsa | (uint32_t)ea) & 15u)) ||
+        ((lsa ^ (uint32_t)ea) & 15u) || lsa >= SPU_LS_SIZE || size > SPU_LS_SIZE - lsa ||
+        ea > UINTPTR_MAX - base || size > UINTPTR_MAX - (base + (uintptr_t)ea) ||
+        lsa > UINTPTR_MAX - local || size > UINTPTR_MAX - (local + lsa)) goto failed;
+    address = base + (uintptr_t)ea;
+    local += lsa;
+    reason = "host-page-access";
+    if (!mfc_strict_span(address, size, writing) || !mfc_strict_span(local, size, !writing)) goto failed;
+    reason = "os-copy";
+    if (writing) {
+        extern void spu_lockline_lock(void);
+        extern void spu_lockline_unlock(void);
+        extern int spu_coh_is_reserved(uint32_t);
+        extern void spu_coh_notify_write_except(uint32_t, const void*);
+        extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+        extern void (*g_spu_put_hook)(uint32_t, uint32_t);
+        /* Preserve reservation serialization/notification for successful PUTs.
+         * Never invoke hooks or report completion on a failed/partial copy. */
+        spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)local, size, "PUT");
+        spu_lockline_lock();
+        int okay = mfc_strict_copy((void*)local, address, size, 1);
+        if (okay) {
+            uint32_t first = (uint32_t)ea & ~127u;
+            uint32_t last = (uint32_t)(ea + size - 1) & ~127u;
+            for (uint32_t line = first; ; line += 128u) {
+                if (spu_coh_is_reserved(line)) spu_coh_notify_write_except(line, spu);
+                if (line == last) break;
+            }
+        }
+        spu_lockline_unlock();
+        if (!okay) goto failed;
+        if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size);
+    } else {
+        extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+        if (!mfc_strict_copy((void*)local, address, size, 0)) goto failed;
+        spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)local, size);
+    }
+    return 0;
+failed:
+    ps3_strict_boot_guard("spu-mfc-transfer", "reason=%s cmd=0x%X lsa=0x%X ea=0x%016llX size=%u", reason, cmd, lsa, (unsigned long long)ea, size);
+    return -1;
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
@@ -168,6 +305,7 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    if (ps3_strict_boot_enabled()) return mfc_strict_transfer(spu, lsa, ea, size, cmd);
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -865,6 +1003,18 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  */
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
+    if (ps3_strict_boot_enabled() && mfc_strict_ordinary(cmd)) {
+        uint32_t tag = spu->mfc_tag & 31u;
+        mfc->tag_completed &= ~(1u << tag);
+        int result = mfc_do_transfer(spu, spu->mfc_lsa,
+            ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal, spu->mfc_size, cmd);
+        if (result == 0) mfc->tag_completed |= 1u << tag;
+        return result;
+    }
+    if (ps3_strict_boot_enabled() && cmd != MFC_BARRIER_CMD && cmd != MFC_EIEIO_CMD && cmd != MFC_SYNC_CMD) {
+        ps3_strict_boot_guard("spu-mfc-unsupported-command", "cmd=0x%X", cmd);
+        return -1;
+    }
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
