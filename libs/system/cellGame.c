@@ -1,3 +1,5 @@
+#include "ps3emu/strict_fs.h"
+#include "ps3emu/strict_boot.h"
 /*
  * ps3recomp - cellGame HLE implementation
  *
@@ -18,14 +20,14 @@
 #ifdef _WIN32
 #  include <windows.h>
 #  include <direct.h>
-#  define HOST_MKDIR(p) _mkdir(p)
+#  define HOST_MKDIR(p) ps3_strict_fs_mkdir((p), 0755)
 #  define HOST_STAT     _stat64
 #  define HOST_STAT_T   struct __stat64
 #else
 #  include <unistd.h>
 #  include <sys/types.h>
 #  include <sys/statvfs.h>
-#  define HOST_MKDIR(p) mkdir(p, 0755)
+#  define HOST_MKDIR(p) ps3_strict_fs_mkdir((p), 0755)
 #  define HOST_STAT     stat
 #  define HOST_STAT_T   struct stat
 #endif
@@ -238,7 +240,7 @@ void cellGame_set_content_path(const char* path)
 static int sfo_read_string(const char* sfo_path, const char* key,
                            char* out, int out_size)
 {
-    FILE* fp = fopen(sfo_path, "rb");
+    FILE* fp = ps3_strict_fs_fopen(sfo_path, "rb");
     if (!fp) return -1;
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
     if (sz < 0x14 || sz > (1 << 20)) { fclose(fp); return -1; }
@@ -456,134 +458,165 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     return CELL_GAME_RET_NONE;
 }
 
-/* cellGameDataCheckCreate2 (NID 0xC9645C41) -- check/prepare game data, invoking the
- * title's funcStat callback (CellGameDataStatCallback) exactly like firmware so the
- * save/boot state machine advances. Struct layout + behavior cross-referenced against
- * RPCS3 cellGame.cpp. Demon's Souls's DsSaveLoadMan thread calls this; without the
- * callback firing, its game-data check never completes, the sema/SLSession chain
- * stalls, and the cellSaveDataAutoLoad2 (auto-save notice) dialog never appears.
- *
- * funcStat(cbResult, get, set): the title reads `get` (isNewData, free space, params)
- * and writes cbResult->result. We report existing data (isNewData=0) + ample space;
- * DeS's callback returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
-#define GAMEDATA_CB_BASE   0x02520000u   /* guest scratch (distinct from savedata's) */
-#define CELL_GAMEDATA_CBRESULT_OK_CANCEL  1
-#define CELL_GAMEDATA_CBRESULT_OK         0
+/* Guest layout from the pinned RPCS3 cellGame.h. Keep every callback object
+ * disjoint; the old 0xC00 StatGet reservation overlapped its 0x1448-byte body. */
+#define GAMEDATA_CB_BASE 0x02520000u
+_Static_assert(sizeof(CellGameDataSystemFileParam) == 0xB9C, "gamedata param ABI");
+_Static_assert(offsetof(CellGameDataSystemFileParam, titleId) == 0xA80, "gamedata title ID offset");
+_Static_assert(offsetof(CellGameDataSystemFileParam, dataVersion) == 0xA8C, "gamedata version offset");
+_Static_assert(offsetof(CellGameDataSystemFileParam, parentalLevel) == 0xA94, "gamedata parental offset");
+_Static_assert(offsetof(CellGameDataStatGet, gameDataPath) == 0x427, "gamedata path offset");
+_Static_assert(offsetof(CellGameDataStatGet, st_atime_) == 0x848, "gamedata time offset");
+_Static_assert(offsetof(CellGameDataStatGet, getParam) == 0x860, "gamedata param offset");
+_Static_assert(offsetof(CellGameDataStatGet, sizeKB) == 0x13FC, "gamedata size offset");
+_Static_assert(sizeof(CellGameDataStatGet) == 0x1448, "gamedata stat ABI");
+_Static_assert(sizeof(CellGameDataStatSet) == 8, "gamedata set ABI");
+_Static_assert(sizeof(CellGameDataCBResult) == 16, "gamedata result ABI");
+static atomic_flag gamedata_in_callback = ATOMIC_FLAG_INIT;
+extern uint32_t ppu_vm_size;
 
-/* Shared body for the two firmware entry points that hand a title a
- * (CBResult, StatGet, StatSet) triple and run its funcStat callback:
- * cellGameDataCheckCreate2 and cellHddGameCheck. RPCS3 defines
- * CellHddGameStatGet / StatSet / CBResult as plain aliases of the CellGameData
- * ones, so the single layout below is correct for both entry points; only the
- * log tag, the isNewData we report, and the error mapping on a failed callback
- * differ, and those stay with the callers.
- *
- * Returns the callback's cbResult->result (0 when there is no guest caller to
- * run, which both callers treat as success). */
-static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
-                                  uint32_t func_opd, uint32_t is_new_data)
+static u32 gamedata_le32(const unsigned char* p)
 {
-    const char* dir = dir_ea ? (const char*)(vm_base + dir_ea) : "";
-    printf("[cellGame] %s(version=%u dir='%s' funcStat=0x%08X)\n",
-           tag, version, dir, func_opd);
+    return (u32)p[0] | ((u32)p[1]<<8) | ((u32)p[2]<<16) | ((u32)p[3]<<24);
+}
 
-    if (!g_ps3_guest_caller)
-        return CELL_GAMEDATA_CBRESULT_OK;
+/* Read only on-disk metadata. Missing SFO is new data; malformed SFO is broken.
+ * Nothing is inferred from the boot title or synthesized as existing data. */
+static s32 gamedata_read_param(const char* path, uint32_t gp, u32* is_new, int hdd)
+{
+    FILE* f = ps3_strict_fs_fopen(path, "rb");
+    if (!f) {
+        if (errno == ENOENT) { *is_new = 1; return 0; }
+        return CELL_GAMEDATA_ERROR_ACCESS_ERROR;
+    }
+    *is_new = 0;
+    if (fseek(f,0,SEEK_END)) { fclose(f); return CELL_GAMEDATA_ERROR_BROKEN; }
+    long size = ftell(f);
+    if (size < 20 || size > 1024*1024 || fseek(f,0,SEEK_SET)) { fclose(f); return CELL_GAMEDATA_ERROR_BROKEN; }
+    unsigned char* d = malloc((size_t)size);
+    if (!d) { fclose(f); return CELL_GAMEDATA_ERROR_ACCESS_ERROR; }
+    int ok = fread(d,1,(size_t)size,f) == (size_t)size; fclose(f);
+    if (!ok || memcmp(d,"\0PSF",4)) { free(d); return CELL_GAMEDATA_ERROR_BROKEN; }
+    u32 keys=gamedata_le32(d+8), values=gamedata_le32(d+12), count=gamedata_le32(d+16);
+    int category_ok=0, app_ver=0;
+    if (count > ((u32)size-20)/16 || keys > (u32)size || values > (u32)size) ok=0;
+    for (u32 i=0; ok && i<count; ++i) {
+        const unsigned char* e=d+20+i*16;
+        u32 ko=(u32)e[0]|((u32)e[1]<<8), fmt=(u32)e[2]|((u32)e[3]<<8);
+        u32 len=gamedata_le32(e+4), off=gamedata_le32(e+12);
+        if (ko >= (u32)size-keys || off > (u32)size-values || len > (u32)size-values-off) {ok=0;break;}
+        const char* key=(const char*)d+keys+ko;
+        if (!memchr(key,0,(size_t)size-keys-ko)) {ok=0;break;}
+        const unsigned char* value=d+values+off;
+        if (fmt==0x204 && (!len || !memchr(value,0,len))) {ok=0;break;}
+        if (!strcmp(key,"CATEGORY")) {
+            /* Pinned Loader/PSF.h::is_cat_hdd excludes disc/data categories. */
+            const char* cat=(const char*)value;
+            category_ok = fmt==0x204 && (hdd
+                ? strlen(cat)==2 && cat[1]!='D' && strcmp(cat,"DG") && strcmp(cat,"MS")
+                : !strcmp(cat,"GD") || !strcmp(cat,"DG"));
+        }
+        size_t dst=0, cap=0;
+        if (!strcmp(key,"TITLE")) {dst=offsetof(CellGameDataSystemFileParam,title);cap=128;}
+        else if (!strcmp(key,"TITLE_ID")) {dst=offsetof(CellGameDataSystemFileParam,titleId);cap=10;}
+        else if (!strcmp(key,"APP_VER") || (!app_ver && !strcmp(key,"VERSION"))) {
+            dst=offsetof(CellGameDataSystemFileParam,dataVersion);cap=6;
+            if (!strcmp(key,"APP_VER")) app_ver=1;
+        } else for (u32 lang=0;lang<20;++lang) {
+            char name[16];snprintf(name,sizeof name,"TITLE_%02u",lang);
+            if (!strcmp(key,name)) {dst=offsetof(CellGameDataSystemFileParam,titleLang)+lang*128;cap=128;break;}
+        }
+        if (cap) {
+            if (fmt!=0x204) {ok=0;break;}
+            snprintf((char*)vm_base+gp+dst,cap,"%s",(const char*)value);
+        }
+        const char* ints[]={"PARENTAL_LEVEL","ATTRIBUTE","RESOLUTION","SOUND_FORMAT"};
+        for (u32 k=0;k<4;++k) if (!strcmp(key,ints[k]) && (k==0 || hdd)) {
+            if (fmt!=0x404 || len!=4) {ok=0;break;}
+            vm_write32(gp+(u32)offsetof(CellGameDataSystemFileParam,parentalLevel)+k*4,gamedata_le32(value));
+        }
+    }
+    free(d); return ok && category_ok ? 0 : CELL_GAMEDATA_ERROR_BROKEN;
+}
 
-    /* Guest scratch for the 3 callback structs: CBResult(0x18)/StatGet(0xBE8)/StatSet(0x0C). */
-    uint32_t cb  = GAMEDATA_CB_BASE;
-    uint32_t get = cb + 0x20;
-    uint32_t set = get + 0xC00;
-    memset(vm_base + cb, 0, (set + 0x20) - cb);
-
-    /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
-    vm_write32(get + 0x000, (u32)content_free_kb());
-    vm_write32(get + 0x004, is_new_data);                            /* isNewData = 0 (data exists) */
-    snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
-    snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
-    vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
-    vm_write32(get + 0xBA0, 0);                            /* sysSizeKB */
-    /* getParam (CellGameDataSystemFileParam @0x860): title / titleId / dataVersion / attribute. */
-    uint32_t gp = get + 0x860;
-    snprintf((char*)(vm_base + gp + 0x000), 128, "%s", s_title);
-    snprintf((char*)(vm_base + gp + 0xA80), 10,  "%s", dir);        /* titleId = dir (e.g. BLUS30443) */
-    snprintf((char*)(vm_base + gp + 0xA8C), 6,   "%s", s_app_ver);  /* dataVersion */
-    vm_write32(gp + 0xA98, 0);                                      /* attribute = CELL_GAMEDATA_ATTR_NORMAL */
-
-    /* StatSet left zeroed (setParam = NULL: callback chooses whether to modify). */
-
-    g_ps3_guest_caller(func_opd, cb, get, set, 0, 0, 0, 0, 0);
-
-    s32 result = (s32)vm_read32(cb + 0x000);
-    printf("[cellGame] %s: funcStat returned result=%d\n", tag, result);
-    return result;
+static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
+                                  uint32_t func_opd, int hdd)
+{
+    if (version || !vm_base || !dir_ea || !func_opd ||
+        (ppu_vm_size && (uint64_t)dir_ea+32 > ppu_vm_size))
+        return hdd ? CELL_HDDGAME_ERROR_PARAM : CELL_GAMEDATA_ERROR_PARAM;
+    const char* guest_dir=(const char*)vm_base+dir_ea;
+    char dir[32];
+    size_t n=0;
+    while(n<32 && guest_dir[n]) {
+        unsigned char c=(unsigned char)guest_dir[n]; dir[n++]=(char)c;
+        if (!((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='_'||c=='-'))
+            return hdd ? CELL_HDDGAME_ERROR_PARAM : CELL_GAMEDATA_ERROR_PARAM;
+    }
+    if (!n || n==32 || (hdd && n!=9)) return hdd ? CELL_HDDGAME_ERROR_PARAM : CELL_GAMEDATA_ERROR_PARAM;
+    dir[n]=0;
+    printf("[cellGame] %s(version=%u dir='%s' funcStat=0x%08X)\n",tag,version,dir,func_opd);
+    if (!g_ps3_guest_caller) {
+        ps3_strict_boot_guard("gamedata-missing-callback-dispatch", "operation=%s opd=0x%08X",tag,func_opd);
+        ps3_strict_fs_unimplemented(tag,"<missing callback dispatcher>");
+        return hdd ? CELL_HDDGAME_ERROR_CBRESULT : CELL_GAMEDATA_ERROR_CBRESULT;
+    }
+    if (atomic_flag_test_and_set(&gamedata_in_callback)) {
+        ps3_strict_boot_guard("gamedata-concurrent-callback", "operation=%s opd=0x%08X",tag,func_opd);
+        return hdd ? CELL_HDDGAME_ERROR_CBRESULT : CELL_GAMEDATA_ERROR_CBRESULT;
+    }
+    uint32_t cb=GAMEDATA_CB_BASE, get=cb+0x20;
+    uint32_t set=get+(u32)sizeof(CellGameDataStatGet), param=set+(u32)sizeof(CellGameDataStatSet);
+    uint32_t end=param+(u32)sizeof(CellGameDataSystemFileParam);
+    s32 status=0;
+    if (ppu_vm_size && end>ppu_vm_size) {status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;goto done;}
+    memset(vm_base+cb,0,end-cb);
+    char path[1024];
+    int written=snprintf(path,sizeof path,"%s/%s/PARAM.SFO",content_root(),dir);
+    if (written<0 || written>=(int)sizeof path) {status=CELL_GAMEDATA_ERROR_PARAM;goto done;}
+    u32 is_new=0;
+    status=gamedata_read_param(path,get+(u32)offsetof(CellGameDataStatGet,getParam),&is_new,hdd);
+    if (status) goto done;
+    vm_write32(get+(u32)offsetof(CellGameDataStatGet,hddFreeSizeKB),(u32)content_free_kb());
+    vm_write32(get+(u32)offsetof(CellGameDataStatGet,isNewData),is_new);
+    snprintf((char*)vm_base+get+offsetof(CellGameDataStatGet,contentInfoPath),1055,"/dev_hdd0/game/%s",dir);
+    snprintf((char*)vm_base+get+offsetof(CellGameDataStatGet,gameDataPath),1055,"/dev_hdd0/game/%s/USRDIR",dir);
+    vm_write32(get+(u32)offsetof(CellGameDataStatGet,sizeKB),UINT32_MAX);
+    if (hdd) vm_write32(set,param);
+    g_ps3_guest_caller(func_opd,cb,get,set,0,0,0,0,0);
+    s32 result=(s32)vm_read32(cb);
+    printf("[cellGame] %s: isNewData=%u funcStat result=%d setParam=0x%08X\n",tag,is_new,result,vm_read32(set));
+    if (result==1) {status=hdd ? 1 : 0;goto done;}
+    if (result!=0) {status=CELL_GAMEDATA_ERROR_CBRESULT;goto done;}
+    if (is_new && !vm_read32(set)) {status=CELL_GAMEDATA_ERROR_PARAM;goto done;}
+    if (is_new || vm_read32(set)) {
+        ps3_strict_boot_guard("gamedata-persistence-unimplemented","operation=%s path=%s opd=0x%08X new=%u setParam=0x%08X",tag,path,func_opd,is_new,vm_read32(set));
+        ps3_strict_fs_unimplemented(tag,path);
+        status=CELL_GAMEDATA_ERROR_ACCESS_ERROR;
+    }
+ done:
+    atomic_flag_clear(&gamedata_in_callback);
+    if (hdd && ((u32)status&0xffffff00u)==0x8002b600u) status=(s32)((u32)status+0x400u);
+    return status;
 }
 
 s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
                              void* funcStat, u32 container)
 {
-    (void)errDialog; (void)container;
-    uint32_t dir_ea   = (uint32_t)(uintptr_t)dirName;
-    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
-
-    if (version != 0 || !dir_ea || !func_opd)
-        return CELL_GAME_ERROR_PARAM;
-
-    /* We report existing data (isNewData=0) + ample space; DeS's callback
-     * returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
-    s32 result = gamedata_stat_callback("DataCheckCreate2", version, dir_ea,
-                                        func_opd, 0);
-    if (result < 0)
-        return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
-    /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
-    return CELL_OK;
+    (void)errDialog;(void)container;
+    return gamedata_stat_callback("DataCheckCreate2",version,(uint32_t)(uintptr_t)dirName,(uint32_t)(uintptr_t)funcStat,0);
 }
-
-/* cellGameDataCheckCreate -- the pre-3.00 entry point. Same arguments and same
- * behaviour as Create2 (RPCS3 forwards it the same way); the only difference is
- * the size of CellGameDataStatGet in older SDKs, and a title that asks for the
- * smaller one simply ignores the tail of ours.
- *
- * Registering only Create2 meant a title on the older API got the unresolved-NID
- * default, its funcStat callback never fired, and its game-data check never
- * completed. Virtua Fighter 5 calls this once during its load and stops there. */
 s32 cellGameDataCheckCreate(u32 version, const char* dirName, u32 errDialog,
                             void* funcStat, u32 container)
 {
-    printf("[cellGame] DataCheckCreate -> Create2%c", 10);
-    return cellGameDataCheckCreate2(version, dirName, errDialog, funcStat, container);
+    return cellGameDataCheckCreate2(version,dirName,errDialog,funcStat,container);
 }
-
-/* cellHddGameCheck (exported from cellSysutil, not cellGame) -- the HDD-game
- * counterpart of cellGameDataCheckCreate2. Same five arguments, and RPCS3
- * aliases all three callback structs to the CellGameData ones, so it shares
- * gamedata_stat_callback above verbatim; only the return/error codes are the
- * cellHddGame set.
- *
- * This is asynchronous from the title's point of view: firmware runs funcStat
- * and the boot state machine waits on it. An unregistered NID here returns the
- * fake CELL_OK default WITHOUT ever running the callback, so the title waits
- * forever. Rampage World Tour calls this once, loads its entire front-end, then
- * spins in its wait loop polling cellSysutilGetSystemParamInt. */
 s32 cellHddGameCheck(u32 version, const char* dirName, u32 errDialog,
                      void* funcStat, u32 container)
 {
-    (void)errDialog; (void)container;
-    uint32_t dir_ea   = (uint32_t)(uintptr_t)dirName;
-    uint32_t func_opd = (uint32_t)(uintptr_t)funcStat;
-
-    /* Deliberately not rejecting version != 0 the way Create2 does: the HDD-game
-     * API predates that check and launch-window titles pass their own value. */
-    if (!dir_ea || !func_opd)
-        return CELL_HDDGAME_ERROR_PARAM;
-
-    s32 result = gamedata_stat_callback("HddGameCheck", version, dir_ea,
-                                        func_opd, CELL_HDDGAME_ISNEWDATA_EXIST);
-    if (result < 0)
-        return CELL_HDDGAME_ERROR_CBRESULT;
-    return CELL_HDDGAME_RET_OK;
+    (void)errDialog;(void)container;
+    return gamedata_stat_callback("HddGameCheck",version,(uint32_t)(uintptr_t)dirName,(uint32_t)(uintptr_t)funcStat,1);
 }
-
 /* The write side of GetParamString: a title that has just created its game data
  * fills PARAM.SFO in before writing it out. Twisted Metal only reaches this at
  * all once cellGameCreateGameData works, which is why the NID sat unresolved
@@ -735,6 +768,7 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
 
 s32 cellGameDeleteGameData(const char* dirName)
 {
+    ps3_strict_fs_unimplemented("cellGameDeleteGameData", "<guest game-data directory>");
     printf("[cellGame] DeleteGameData(dir='%s')\n", dirName ? dirName : "<null>");
 
     if (!dirName)

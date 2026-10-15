@@ -32,6 +32,7 @@
 
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"
+#include "ppu_strict_boot.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -1208,6 +1209,7 @@ static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
 
 static int vm_oob_report(uint32_t a, uint32_t n)
 {
+    ppu_strict_boot_guard("out-of-bounds-memory", nullptr, "address", a);
     {
         static int logged = 0;
         if (logged < 40) {
@@ -1288,6 +1290,7 @@ static uint32_t g_null_sweep_last = 0;
 static unsigned g_null_sweep_tid = 0;
 static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
 {
+    ppu_strict_boot_guard("null-page-store", g_active_ctx, "address", a);
     static int en = -1;
     if (en < 0) { const char* e = getenv("PS3_NULL_WRITE");
                   en = (e && *e == (char)48) ? 0 : 1; }   /* PS3_NULL_WRITE=0 */
@@ -1506,6 +1509,12 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
  * purpose (a few use page 0 as a scratch constant pool). */
 static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
 {
+    if (ppu_strict_boot_enabled()) {
+        fprintf(stderr, "[strict-memory] read width=%d guest-fn=0x%08X address=0x%08X\n",
+                width, ppu_prof_resolve_host(ra), a);
+        ppu_log_host_chain("null-read");
+    }
+    ppu_strict_boot_guard("null-page-read", g_active_ctx, "address", a);
     static int s_on = -1;
     if (s_on < 0) { const char* e = getenv("PS3_NULL_READ"); s_on = (e && *e == '0') ? 0 : 1; }
     if (!s_on) return;
@@ -2539,6 +2548,9 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
      * unwound to the initial frame (or a not-yet-populated function pointer).
      * Don't treat it as an unresolved call -- just return to the caller. */
     if (addr == 0) {
+        /* There is no context flag distinguishing a valid OS-return sentinel
+         * from a missing callback here. Strict bring-up cannot assume success. */
+        ppu_strict_boot_guard("null-indirect-call", ctx, "target", addr);
         /* Say so. A bctrl to 0 is nearly always a function-pointer table slot
          * that was never populated, and returning quietly turns it into an
          * infinite loop when the caller retries -- which is what it does. This
@@ -2661,6 +2673,13 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
 
     ppu_fn fn = ppu_lookup(addr);
     if (!fn) {
+        /* Stop before OPD-swap recovery, data-pointer no-ops, and repeat-count
+         * suppression. Registration, not a title-specific address heuristic,
+         * determines whether this runtime can dispatch the requested entry. */
+        const char* category = (addr & 3u) ? "misaligned-indirect-call"
+            : (addr >= 0x10000000u && addr < 0x30000000u)
+              ? "data-range-indirect-call" : "unresolved-indirect-call";
+        ppu_strict_boot_guard(category, ctx, "target", addr);
         /* OPD-swap clobber fixup: a malformed memcpy (game func_0036FA74) writes
          * some handler/vtable OPDs as {TOC, func} (code & toc SWAPPED), so lifted
          * code loads ctr = TOC base and r2 = the real function. If ctr is not a
@@ -2683,6 +2702,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * and blow the host stack. Cap the depth, log once, then unwind. */
         static thread_local int s_depth = 0;
         if (s_depth > 4000) {
+            ppu_strict_boot_guard("indirect-recursion-cap", ctx, "depth", s_depth);
             static int warned = 0;
             if (warned++ < 8)
                 fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, s_depth);
@@ -2973,6 +2993,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
  * continue (the result is undefined, but it won't crash the link). */
 extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 {
+    ppu_strict_boot_guard("unlifted-function", ctx, "target", addr);
     (void)ctx;
     static int logged = 0;
     if (logged < 20) {
@@ -3281,6 +3302,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 return;
             }
         }
+        ppu_strict_boot_guard("unregistered-syscall", ctx, "syscall", num);
         static int logged = 0;
         if (logged < 30) {
             fprintf(stderr, "[ppu] lv2_syscall %llu (stub)\n", (unsigned long long)num);
@@ -3356,12 +3378,14 @@ extern "C" uint32_t ppu_load_elf(const char* path)
          * guest VM (ppu_vm_size==0 = unchecked, matching the vm accessors).
          * Skip malformed/oversized segments rather than overflowing the host. */
         if (p_offset > fsz || p_filesz > fsz || p_offset + p_filesz > fsz) {
+            ppu_strict_boot_guard("invalid-elf-file-range", nullptr, "segment", i);
             fprintf(stderr, "[ppu] segment %u file range 0x%llX+0x%llX exceeds ELF (0x%llX), skipped\n",
                     i, (unsigned long long)p_offset, (unsigned long long)p_filesz, (unsigned long long)fsz);
             continue;
         }
         if (ppu_vm_size && (p_vaddr > ppu_vm_size || p_memsz > ppu_vm_size ||
                             p_vaddr + p_memsz > ppu_vm_size)) {
+            ppu_strict_boot_guard("invalid-elf-vm-range", nullptr, "segment", i);
             fprintf(stderr, "[ppu] segment %u vaddr 0x%llX+0x%llX exceeds VM (0x%X), skipped\n",
                     i, (unsigned long long)p_vaddr, (unsigned long long)p_memsz, ppu_vm_size);
             continue;
@@ -3540,9 +3564,11 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
     ppu_opd_resolve((uint32_t)ctx->cia, &code, &toc);
     if (toc) ctx->gpr[2] = toc;
     if (!ctx->gpr[13]) { uint32_t tp = ppu_tls_new_block();
+                         if (!tp) ppu_strict_boot_guard("thread-tls-exhausted", ctx, "entry", code);
                          ctx->gpr[13] = tp ? tp : PPU_TLS_TP; }
     ppu_fn fn = ppu_lookup(code);
     if (!fn) {
+        ppu_strict_boot_guard("unregistered-thread-entry", ctx, "target", code);
         fprintf(stderr, "[ppu] thread entry 0x%08X (cia=0x%08X) not registered\n",
                 code, (uint32_t)ctx->cia);
         return;
@@ -3591,11 +3617,15 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
-    if (!opd_addr) return 0;
+    if (!opd_addr) {
+        ppu_strict_boot_guard("null-guest-callback", g_active_ctx, "opd", opd_addr);
+        return 0;
+    }
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve(opd_addr, &code, &toc);
     ppu_fn fn = ppu_lookup(code);
     if (!fn) {  /* OPD code clobbered? fall back to a captured fixup */
+        ppu_strict_boot_guard("unresolved-guest-callback", g_active_ctx, "target", code);
         for (int i = 0; i < s_opd_fixup_n; i++)
             if (s_opd_fixups[i].opd == opd_addr) {
                 code = s_opd_fixups[i].code; toc = s_opd_fixups[i].toc;
@@ -3654,9 +3684,16 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
                                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                       uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
-    if (!code) return 0;
+    if (!code) {
+        ppu_strict_boot_guard("null-guest-callback", g_active_ctx, "target", code);
+        return 0;
+    }
     ppu_fn fn = ppu_lookup(code);
-    if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
+    if (!fn) {
+        ppu_strict_boot_guard("unresolved-guest-callback", g_active_ctx, "target", code);
+        fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code);
+        return 0;
+    }
 
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
     if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
@@ -3805,6 +3842,13 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
          * an empty boot device before deadlocking on a data.toc it never loaded. */
         ctx.gpr[3] = argc_n;                        /* argc */
         ctx.gpr[4] = argv_base;                     /* argv */
+        /* LV2 entry supplies an envp pointer even for an empty environment.
+         * The CRT copies its terminating NULL, so r5=0 faults at address 4.
+         * Pinned RPCS3 PPUModule.cpp set_args passes argv, envp, envc in r4..r6.
+         * The empty envp slot was already allocated and zeroed above. */
+        ctx.gpr[5] = argv_base + (argc_n + 1u) * 8u;
+        ctx.gpr[6] = 0;
+        ctx.gpr[11] = entry_opd;
         /* Read back: demand-committed pages can swallow a write, and a silently
          * empty argv is hard to recognise from the guest side. */
         for (uint32_t a = 0; a < argc_n; a++) {

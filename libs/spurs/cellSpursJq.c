@@ -8,6 +8,7 @@
  */
 
 #include "cellSpursJq.h"
+#include "ps3emu/strict_boot.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
@@ -149,6 +150,7 @@ static s32 jq_push_host(const u32* jq, const void* job,
     if (q->jobCount >= q->maxJobs)
         return (s32)CELL_SPURS_JQ_ERROR_QUEUE_FULL;
 
+    ps3_strict_boot_guard("spurs-jobqueue-unimplemented-execution", "queue=%u job=0x%llX size=%u tag=%u", slot, (unsigned long long)(uintptr_t)job, jobSize, tag);
     u32 jobId = q->nextJobId++;
     q->jobCount++;
     q->submitCount++;

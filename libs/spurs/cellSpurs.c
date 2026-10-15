@@ -10,6 +10,7 @@
  */
 
 #include "cellSpurs.h"
+#include "ps3emu/strict_boot.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
@@ -1007,6 +1008,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
+                if (!sz) ps3_strict_boot_guard("spurs-invalid-task-image", "elf=0x%llX context=0x%llX", (unsigned long long)(uintptr_t)elf, (unsigned long long)(uintptr_t)context);
                 if (sz)
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
@@ -2339,6 +2341,7 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
       _n++; }
 
     if (!ea_bin || !size_bin || ea_bin >= 0x10000000u) {
+        ps3_strict_boot_guard("spurs-invalid-job-image", "job=0x%08X binary=0x%08X size=%u", job_ea, ea_bin, size_bin);
         static int _b = 0;
         if (_b++ < 4)
             printf("[cellSpurs]   job[%d]: implausible binary (ea=0x%08X size=%u) -- skipped\n",
@@ -2474,7 +2477,10 @@ s32 cellSpursJobGuardReset(u64 guard_ea)
 static int jg_wait(u32 ea)
 {
     int i = jg_find(ea);
-    if (i < 0) return 1;
+    if (i < 0) {
+        ps3_strict_boot_guard("spurs-unknown-job-guard", "guard=0x%08X", ea);
+        return 1;
+    }
     for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
             /* Consume exactly one release worth of credits, so notifies that
@@ -2492,6 +2498,7 @@ static int jg_wait(u32 ea)
 #endif
     }
     printf("[cellSpurs] guard 0x%08X still closed after 20 s -- chain gives up\n", ea);
+    ps3_strict_boot_guard("spurs-job-guard-timeout", "guard=0x%08X", ea);
     return 0;
 }
 
@@ -2635,8 +2642,13 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
          * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
+        /* Only the explicit zero NOP and modeled synchronous barrier are
+         * supported by this fallthrough. Never drop nested jobs or labels. */
+        if (cmd != 0 && op != 2)
+            ps3_strict_boot_guard("spurs-unsupported-chain-command", "chain=0x%08X pc=0x%08X command=0x%016llX", jc_ea, pc, (unsigned long long)cmd);
         pc += 8;
     }
+    ps3_strict_boot_guard("spurs-chain-progress-limit", "chain=0x%08X pc=0x%08X jobs=%d", jc_ea, pc, jobs);
     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
            "job(s) -- malformed?\n",
            jc_ea, jobs);
@@ -2687,16 +2699,23 @@ static s32 jc_start(u64 jc_ea, const char* who)
                    who, (u32)jc_ea, s_jobchains[i].run_count, s_jobchains[i].entry_ea);
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
-        if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
+        if (s_off || !s_jobchains[i].entry_ea) {
+            ps3_strict_boot_guard("spurs-chain-not-executed", "chain=0x%08X entry=0x%08X disabled=%d", (u32)jc_ea, s_jobchains[i].entry_ea, s_off);
+            return CELL_OK;
+        }
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
-            else s_jobchains[i].running = 0;
+            else {
+                ps3_strict_boot_guard("spurs-chain-thread-create-failed", "chain=0x%08X", (u32)jc_ea);
+                s_jobchains[i].running = 0;
+            }
         }
         return CELL_OK;
     }
     printf("[cellSpurs] %s(jc=0x%08X) -- UNKNOWN chain (no Create seen)\n", who, (u32)jc_ea);
+    ps3_strict_boot_guard("spurs-unknown-job-chain", "chain=0x%08X operation=%s", (u32)jc_ea, who);
     return CELL_OK;
 }
 

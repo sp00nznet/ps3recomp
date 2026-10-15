@@ -539,7 +539,8 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
 class PPULifter:
     """Translates PPU instructions into C source."""
 
-    def __init__(self, prefix: str = ""):
+    def __init__(self, prefix: str = "", strict_unsupported: bool = False):
+        self.strict_unsupported = strict_unsupported
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
@@ -3058,7 +3059,18 @@ class PPULifter:
         # Merge high halfword / low halfword (vmrghh, vmrglh — already in vmrg* handler above)
 
         # ------- Default: emit as comment -------
+        if self.strict_unsupported:
+            return self._strict_failure(
+                f"strict unsupported instruction at 0x{insn.addr:08X}: "
+                f"mnemonic={mn} raw=0x{insn.raw:08X}")
         return f"/* TODO: {mn} {insn.operands} */;"
+
+    @staticmethod
+    def _strict_failure(message: str) -> str:
+        # Keep instruction text out of the printf format string.
+        literal = json.dumps(message, ensure_ascii=True)
+        return (f'do {{ fprintf(stderr, "%s\\n", {literal}); '
+                'fflush(stderr); _Exit(86); } while (0);')
 
     def _branch_condition(self, mnemonic: str, ops: list[str]) -> str:
         """Generate a C condition expression for a conditional branch."""
@@ -3263,6 +3275,8 @@ class PPULifter:
         self-contained)."""
         lines = [SOURCE_PREAMBLE.replace('#include "ppu_recomp.h"',
                  f'#include "{getattr(self, "header_name", "ppu_recomp.h")}"')]
+        if self.strict_unsupported:
+            lines.append('#include <stdlib.h> /* _Exit: strict unsupported diagnostics */')
 
         # Emit helper macros
         lines.append("/* Rotate helpers */")
@@ -3445,7 +3459,12 @@ class PPULifter:
             else:
                 print(f"  WARNING: {func.name} has no continuation at "
                       f"0x{func.fallthrough_to:08X}; emitting halt", flush=True)
-                lines.append(f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;")
+                if self.strict_unsupported:
+                    lines.append("        " + self._strict_failure(
+                        f"strict missing continuation 0x{func.fallthrough_to:08X} "
+                        f"from {func.name}"))
+                else:
+                    lines.append(f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;")
 
         lines.append("}")
         lines.append("")
@@ -3992,7 +4011,8 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0):
+                 toc_base=0, strict_unsupported=False):
+    _WORKER_STATE["strict_unsupported"] = strict_unsupported
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4011,7 +4031,8 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
 
 def _worker_lift(task):
     idx0, bounds = task
-    lifter = PPULifter(prefix=_WORKER_STATE.get("prefix", ""))
+    lifter = PPULifter(prefix=_WORKER_STATE.get("prefix", ""),
+                       strict_unsupported=_WORKER_STATE.get("strict_unsupported", False))
     lifter.name_map = _WORKER_STATE["names"]
     # Import stubs must dispatch as ps3_hle_call in workers too, else the literal
     # .lib.stub trampoline (which derefs an unpopulated import table) is lifted as
@@ -4056,7 +4077,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
-                             getattr(lifter, "toc_base", 0)))
+                             getattr(lifter, "toc_base", 0), lifter.strict_unsupported))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -4084,6 +4105,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
 def main() -> None:
     parser = argparse.ArgumentParser(description="PPU to C lifter for PS3 recompilation")
     parser.add_argument("input", help="Input ELF or raw binary")
+    parser.add_argument("--strict-unsupported", action="store_true",
+                        help="emit diagnostic and exit 86 on unsupported instructions or missing continuations")
     parser.add_argument("--output", "-o", default=".", help="Output directory")
     parser.add_argument("--header-name", default="ppu_recomp.h", help="Header file name")
     parser.add_argument("--source-name", default="ppu_recomp.c", help="Source file name")
@@ -4555,7 +4578,7 @@ def main() -> None:
 
     print(f"Lifting {len(func_bounds)} functions...")
 
-    lifter = PPULifter(prefix=args.symbol_prefix)
+    lifter = PPULifter(prefix=args.symbol_prefix, strict_unsupported=args.strict_unsupported)
     lifter.header_name = args.header_name
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has

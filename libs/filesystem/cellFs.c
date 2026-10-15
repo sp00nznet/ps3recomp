@@ -1,3 +1,4 @@
+#include "ps3emu/strict_fs.h"
 /*
  * ps3recomp - cellFs HLE implementation
  *
@@ -15,25 +16,11 @@
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
-/* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
- * to st_atim.tv_sec etc.  They collide with the identically named members of the
- * PS3 CellFsStat struct, so undefine them here; host times are read via the
- * explicit timespec fields in the POSIX branch of the conversion below. */
-#ifdef st_atime
-#  undef st_atime
-#endif
-#ifdef st_mtime
-#  undef st_mtime
-#endif
-#ifdef st_ctime
-#  undef st_ctime
-#endif
-
 #ifdef _WIN32
 #  include <windows.h>
 #  include <io.h>
 #  include <direct.h>
-#  define HOST_MKDIR(p)   _mkdir(p)
+#  define HOST_MKDIR(p)   ps3_strict_fs_mkdir((p), 0755)
 #  define HOST_STAT       _stat64
 #  define HOST_STAT_T     struct __stat64
 #  define HOST_FSTAT      _fstat64
@@ -41,7 +28,7 @@
 #  include <unistd.h>
 #  include <dirent.h>
 #  include <sys/types.h>
-#  define HOST_MKDIR(p)   mkdir(p, 0755)
+#  define HOST_MKDIR(p)   ps3_strict_fs_mkdir((p), 0755)
 #  define HOST_STAT       stat
 #  define HOST_STAT_T     struct stat
 #  define HOST_FSTAT      fstat
@@ -125,6 +112,27 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 
     if (!ps3_path || !host_buf || buf_size == 0)
         return -1;
+
+    /* A supplied cache root overrides registered mappings, including more
+     * specific prefixes, so all three filesystem entry points share one mount. */
+    const char* hdd1 = getenv("PS3_HDD1_ROOT");
+    if (hdd1 && *hdd1 && strncmp(ps3_path, "/dev_hdd1", 9) == 0 &&
+        (ps3_path[9] == '/' || ps3_path[9] == '\0')) {
+        size_t n = strlen(hdd1);
+        while (n > 3 && (hdd1[n-1] == '/' || hdd1[n-1] == '\\')) --n;
+        const char* tail = ps3_path + 9; if (*tail == '/') ++tail;
+        int written = snprintf(host_buf, buf_size, "%.*s%s%s", (int)n, hdd1,
+            *tail && hdd1[n-1] != '/' && hdd1[n-1] != '\\' ? "/" : "", tail);
+        if (written < 0 || (size_t)written >= buf_size) { host_buf[0] = 0; return -1; }
+        for (char* p = host_buf; *p; ++p) {
+#ifdef _WIN32
+            if (*p == '/') *p = '\\';
+#else
+            if (*p == '\\') *p = '/';
+#endif
+        }
+        return 0;
+    }
 
     /* Find longest matching prefix */
     int best = -1;
@@ -228,9 +236,9 @@ static void cellfs_stat_to_be(CellFsStat* sb)
     sb->st_mode    = (s32)ps3_bswap32((u32)sb->st_mode);
     sb->st_uid     = (s32)ps3_bswap32((u32)sb->st_uid);
     sb->st_gid     = (s32)ps3_bswap32((u32)sb->st_gid);
-    sb->st_atime   = (s64)ps3_bswap64((u64)sb->st_atime);
-    sb->st_mtime   = (s64)ps3_bswap64((u64)sb->st_mtime);
-    sb->st_ctime   = (s64)ps3_bswap64((u64)sb->st_ctime);
+    sb->guest_atime = (s64)ps3_bswap64((u64)sb->guest_atime);
+    sb->guest_mtime = (s64)ps3_bswap64((u64)sb->guest_mtime);
+    sb->guest_ctime = (s64)ps3_bswap64((u64)sb->guest_ctime);
     sb->st_size    = ps3_bswap64(sb->st_size);
     sb->st_blksize = ps3_bswap64(sb->st_blksize);
 }
@@ -273,18 +281,18 @@ static void fill_cellfs_stat(CellFsStat* sb, const HOST_STAT_T* hst)
     sb->st_uid   = 0;
     sb->st_gid   = 0;
 #ifdef _WIN32
-    sb->st_atime = (s64)hst->st_atime;
-    sb->st_mtime = (s64)hst->st_mtime;
-    sb->st_ctime = (s64)hst->st_ctime;
+    sb->guest_atime = (s64)hst->st_atime;
+    sb->guest_mtime = (s64)hst->st_mtime;
+    sb->guest_ctime = (s64)hst->st_ctime;
 #elif defined(__APPLE__)
 /* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
-    sb->st_atime = (s64)hst->st_atimespec.tv_sec;
-    sb->st_mtime = (s64)hst->st_mtimespec.tv_sec;
-    sb->st_ctime = (s64)hst->st_ctimespec.tv_sec;
+    sb->guest_atime = (s64)hst->st_atimespec.tv_sec;
+    sb->guest_mtime = (s64)hst->st_mtimespec.tv_sec;
+    sb->guest_ctime = (s64)hst->st_ctimespec.tv_sec;
 #else
-    sb->st_atime = (s64)hst->st_atim.tv_sec;
-    sb->st_mtime = (s64)hst->st_mtim.tv_sec;
-    sb->st_ctime = (s64)hst->st_ctim.tv_sec;
+    sb->guest_atime = (s64)hst->st_atim.tv_sec;
+    sb->guest_mtime = (s64)hst->st_mtim.tv_sec;
+    sb->guest_ctime = (s64)hst->st_ctim.tv_sec;
 #endif
     sb->st_size  = (u64)hst->st_size;
     sb->st_blksize = 4096;
@@ -428,15 +436,15 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     }
 
     const char* mode = flags_to_mode(flags);
-    FILE* fp = fopen(host_path, mode);
+    FILE* fp = ps3_strict_fs_fopen(host_path, mode);
 
     /* If open for read failed and CREAT is set, try creating */
     if (!fp && (flags & CELL_FS_O_CREAT)) {
-        fp = fopen(host_path, "w+b");
+        fp = ps3_strict_fs_fopen(host_path, "w+b");
     }
 
     if (!fp) {
-        printf("[cellFs] Open: fopen('%s', '%s') failed: %s\n", host_path, mode, strerror(errno));
+        printf("[cellFs] Open: ps3_strict_fs_fopen('%s', '%s') failed: %s\n", host_path, mode, strerror(errno));
         if (errno == ENOENT) return (s32)CELL_ENOENT;
         if (errno == EACCES) return (s32)CELL_EPERM;
         return (s32)CELL_ENOENT;
@@ -524,16 +532,20 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 /* NID: 0x1E9B6714 */
 s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
 {
+    if (ps3_strict_fs_readonly()) ps3_strict_fs_fail("cellFsWrite", "<guest descriptor>", "readonly-mutation");
+
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
 
     if (!buf)
         return CELL_EFAULT;
 
+    if (!s_files[fd].host_fp) ps3_strict_fs_unimplemented("cellFsWrite", "<missing stream>");
     u64 bytes_written = 0;
 
     if (s_files[fd].host_fp) {
-        bytes_written = (u64)fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
+        bytes_written = (u64)ps3_strict_fs_fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
+        ps3_strict_fs_stream("descriptor-flush-or-truncate", s_files[fd].host_fp);
         fflush(s_files[fd].host_fp);
     }
 
@@ -645,6 +657,8 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
 /* NID: 0x6D3BB15B */
 s32 cellFsTruncate(const char* path, u64 size)
 {
+    if (ps3_strict_fs_readonly()) ps3_strict_fs_fail("cellFsTruncate", "<guest path>", "readonly-mutation");
+
     printf("[cellFs] Truncate(path='%s', size=%llu)\n", gpath(path) ? gpath(path) : "<null>",
            (unsigned long long)size);
 
@@ -656,17 +670,20 @@ s32 cellFsTruncate(const char* path, u64 size)
         return (s32)CELL_ENOENT;
 
 #ifdef _WIN32
+    ps3_strict_fs_mutation("truncate", host_path);
     HANDLE hFile = CreateFileA(host_path, GENERIC_WRITE, 0, NULL,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
         return (s32)CELL_ENOENT;
 
+    ps3_strict_fs_native_handle("truncate-handle", hFile);
     LARGE_INTEGER li;
     li.QuadPart = (LONGLONG)size;
     SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
     SetEndOfFile(hFile);
     CloseHandle(hFile);
 #else
+    ps3_strict_fs_mutation("truncate", host_path);
     if (truncate(host_path, (off_t)size) != 0)
         return (s32)CELL_ENOENT;
 #endif
@@ -677,12 +694,16 @@ s32 cellFsTruncate(const char* path, u64 size)
 /* NID: 0x82D3AB53 */
 s32 cellFsFtruncate(CellFsFd fd, u64 size)
 {
+
+    if (ps3_strict_fs_readonly()) ps3_strict_fs_fail("cellFsFtruncate", "<guest descriptor>", "readonly-mutation");
     printf("[cellFs] Ftruncate(fd=%d, size=%llu)\n", fd, (unsigned long long)size);
 
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
 
+    if (!s_files[fd].host_fp) ps3_strict_fs_unimplemented("cellFsFtruncate", "<missing stream>");
     if (s_files[fd].host_fp) {
+        ps3_strict_fs_stream("descriptor-flush-or-truncate", s_files[fd].host_fp);
         fflush(s_files[fd].host_fp);
 #ifdef _WIN32
         int file_no = _fileno(s_files[fd].host_fp);
@@ -743,6 +764,7 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
 /* NID: 0x3F61245C */
 s32 cellFsChmod(const char* path, s32 mode)
 {
+    ps3_strict_fs_unimplemented("cellFsChmod", path ? gpath(path) : "<null>");
     printf("[cellFs] Chmod(path='%s', mode=0%o)\n", gpath(path) ? gpath(path) : "<null>", mode);
 
     if (!path)
@@ -933,8 +955,8 @@ s32 cellFsRename(const char* from, const char* to)
 
     ensure_parent_dirs(host_to);
 
-    if (rename(host_from, host_to) != 0) {
-        printf("[cellFs] Rename: rename('%s', '%s') failed: %s\n",
+    if (ps3_strict_fs_rename(host_from, host_to) != 0) {
+        printf("[cellFs] Rename: ps3_strict_fs_rename('%s', '%s') failed: %s\n",
                host_from, host_to, strerror(errno));
         return (s32)CELL_ENOENT;
     }
@@ -954,8 +976,8 @@ s32 cellFsUnlink(const char* path)
     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
-    if (remove(host_path) != 0) {
-        printf("[cellFs] Unlink: remove('%s') failed: %s\n", host_path, strerror(errno));
+    if (ps3_strict_fs_remove(host_path) != 0) {
+        printf("[cellFs] Unlink: ps3_strict_fs_remove('%s') failed: %s\n", host_path, strerror(errno));
         return (s32)CELL_ENOENT;
     }
 

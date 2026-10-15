@@ -57,6 +57,8 @@ extern "C" {
 /* ...and the same question for the depth buffer, which a texture unit coming
  * back to sample it has to agree with. */
 #define NV4097_SET_CONTEXT_DMA_ZETA            0x00000198
+#define NV4097_SET_CONTEXT_DMA_COLOR_C         0x000001B4
+#define NV4097_SET_CONTEXT_DMA_COLOR_D         0x000001B8
 #define CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER 0xFEED0000
 #define CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER  0xFEED0001
 
@@ -248,6 +250,14 @@ typedef struct rsx_state {
     u32 surface_color_pitch[RSX_MAX_RENDER_TARGETS];
     u32 surface_zeta_offset;
     u32 surface_zeta_pitch;
+    /* Raw DMA handles, not offsets or CELL_GCM_LOCATION indices. Pinned
+     * RPCS3 4d5def58 identifies FEED0000=local, FEED0001=main memory.
+     * Current render-target backends support only local attachments.
+     * Mask bits 0..3=A..D, bit4=ZETA; unprogrammed entries preserve existing
+     * implicit-local behavior, without claiming a hardware reset value. */
+    u32 surface_color_dma[RSX_MAX_RENDER_TARGETS];
+    u32 surface_zeta_dma;
+    u32 surface_dma_set_mask;
     u32 surface_clip_x, surface_clip_y;
     u32 surface_clip_w, surface_clip_h;
     u32 color_target;

@@ -25,6 +25,7 @@
  * Global backend
  * -----------------------------------------------------------------------*/
 
+#include "ps3emu/strict_boot.h"
 static rsx_backend* s_backend = NULL;
 
 /* Last NV406E_SET_REFERENCE value seen in the FIFO. The title writes a
@@ -108,6 +109,40 @@ void rsx_state_init(rsx_state* state)
 /* ---------------------------------------------------------------------------
  * Method processing
  * -----------------------------------------------------------------------*/
+
+static int validate_surface_dma_value(u32 method, u32 handle)
+{
+    if (handle == CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER) return 0;
+    ps3_strict_boot_guard(
+        handle == CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER ?
+            "rsx-host-render-target-dma" : "rsx-invalid-render-target-dma",
+        "method=0x%04X data=0x%08X backend=local-render-targets-only", method, handle);
+    return -1; /* Fail closed even if strict diagnostic exits are disabled. */
+}
+
+static int set_surface_dma(rsx_state* state, u32 method, u32 data, unsigned slot)
+{
+    if (slot < RSX_MAX_RENDER_TARGETS) state->surface_color_dma[slot] = data;
+    else state->surface_zeta_dma = data;
+    state->surface_dma_set_mask |= 1u << slot;
+    state->surface_dirty = 1;
+    return validate_surface_dma_value(method, data);
+}
+
+static int validate_surface_dma(const rsx_state* state)
+{
+    static const u32 methods[5] = {
+        NV4097_SET_CONTEXT_DMA_COLOR_A, NV4097_SET_CONTEXT_DMA_COLOR_B,
+        NV4097_SET_CONTEXT_DMA_COLOR_C, NV4097_SET_CONTEXT_DMA_COLOR_D,
+        NV4097_SET_CONTEXT_DMA_ZETA
+    };
+    for (unsigned slot = 0; slot < 5; ++slot) {
+        u32 value = slot < RSX_MAX_RENDER_TARGETS ? state->surface_color_dma[slot] : state->surface_zeta_dma;
+        if ((state->surface_dma_set_mask & (1u << slot)) && validate_surface_dma_value(methods[slot], value))
+            return -1;
+    }
+    return 0;
+}
 
 static int process_surface_method(rsx_state* state, u32 method, u32 data)
 {
@@ -340,6 +375,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
       if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* Independent attachment memory domains, not ignored setup methods. */
+    switch (method) {
+    case NV4097_SET_CONTEXT_DMA_COLOR_A: return set_surface_dma(state, method, data, 0);
+    case NV4097_SET_CONTEXT_DMA_COLOR_B: return set_surface_dma(state, method, data, 1);
+    case NV4097_SET_CONTEXT_DMA_COLOR_C: return set_surface_dma(state, method, data, 2);
+    case NV4097_SET_CONTEXT_DMA_COLOR_D: return set_surface_dma(state, method, data, 3);
+    case NV4097_SET_CONTEXT_DMA_ZETA: return set_surface_dma(state, method, data, 4);
+    default: break;
+    }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
      * buffering). Real hardware DOES this; without it the game's frame-fence
@@ -462,6 +506,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
+        if (validate_surface_dma(state)) return -1;
+        if (!s_backend || !s_backend->clear)
+            ps3_strict_boot_guard("rsx-missing-clear-backend", "method=0x%04X", method);
         { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
@@ -695,6 +742,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
+            if (validate_surface_dma(state)) return -1;
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
@@ -746,6 +794,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     if (method == NV4097_DRAW_ARRAYS) {
+        if (validate_surface_dma(state)) return -1;
+        if (!s_backend || !s_backend->draw_arrays)
+            ps3_strict_boot_guard("rsx-missing-draw-backend", "method=0x%04X", method);
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
         { static int _d=0; if (_d++ < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
@@ -790,6 +841,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_DRAW_INDEX_ARRAY) {
+        if (validate_surface_dma(state)) return -1;
+        if (!s_backend || !s_backend->draw_indexed)
+            ps3_strict_boot_guard("rsx-missing-draw-backend", "method=0x%04X", method);
         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
@@ -826,6 +880,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * The draw engine handles the actual present; suppress the unknown log. */
     if (method == 0xE920 || method == 0xE924) return 0;
 
+    ps3_strict_boot_guard("rsx-unknown-method", "method=0x%04X data=0x%08X", method, data);
     /* Unrecognized method -- log in debug builds */
 #ifndef NDEBUG
     static int s_unknown_count = 0;

@@ -6,6 +6,7 @@
  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
  */
 #include "spu_interp.h"
+#include "ps3emu/strict_boot.h"
 #include "spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -311,6 +312,7 @@ static int spu_step(spu_context* ctx) {
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
                 d.op < SPU_OP_COUNT ? spu_op_name[d.op] : "?", insn, pc);
+        ps3_strict_boot_guard("spu-unsupported-opcode", "image=%d pc=0x%05X opcode=0x%08X", ctx->image_id, pc, insn);
         ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1;
     }
     ctx->pc = next;

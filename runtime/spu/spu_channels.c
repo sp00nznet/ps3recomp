@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "ps3emu/strict_boot.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
@@ -883,6 +884,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
         /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */
+        ps3_strict_boot_guard("spu-unsupported-channel-write", "image=%d pc=0x%05X channel=%u value=0x%08X", ctx->image_id, ctx->pc, channel, v);
         break;
     }
 }
@@ -1019,6 +1021,13 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     else if (channel == SPU_RdEventStat && ctx->event_mask != 0)
         spu_ch_wait(ctx, channel, "rdch");
 
+    if (ps3_strict_boot_enabled() &&
+        (channel == SPU_RdInMbox || channel == SPU_RdSigNotify1 ||
+         channel == SPU_RdSigNotify2 ||
+         (channel == SPU_RdEventStat && ctx->event_mask != 0)) &&
+        !spu_ch_ready(ctx, channel))
+        ps3_strict_boot_guard("spu-empty-channel-read", "image=%d pc=0x%05X channel=%u", ctx->image_id, ctx->pc, channel);
+
     uint32_t v = 0;
 
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
@@ -1076,6 +1085,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     case SPU_RdMachStat:    v = (ctx->status == SPU_STATUS_RUNNING) ? 1 : 0; break;
     case SPU_RdSRR0:        v = ctx->srr0;                              break;
     default:
+        ps3_strict_boot_guard("spu-unsupported-channel-read", "image=%d pc=0x%05X channel=%u", ctx->image_id, ctx->pc, channel);
         v = 0;
         break;
     }
@@ -1274,7 +1284,16 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
      * default of 1 made it enter on spurious interrupts with an empty stat,
      * running IhcLoop on a zero mask (clz(0) -> bogus tagId/ack). */
     case MFC_RdListStallStat: return ctx->list_stall_stat ? 1 : 0;
-    default:                 return 1;  /* default: channel ready */
+    default:
+        /* Preserve known non-blocking register channels, but do not invent
+         * readiness for an unknown channel number in strict bring-up. */
+        if (!channel_is_mfc(channel) && channel != SPU_RdDec &&
+            channel != SPU_RdEventMask && channel != SPU_RdMachStat &&
+            channel != SPU_RdSRR0 && channel != SPU_WrDec &&
+            channel != SPU_WrEventMask && channel != SPU_WrEventAck &&
+            channel != SPU_WrSRR0)
+            ps3_strict_boot_guard("spu-unsupported-channel-count", "image=%d pc=0x%05X channel=%u", ctx->image_id, ctx->pc, channel);
+        return 1;  /* default upstream: channel ready */
     }
 }
 
@@ -1780,6 +1799,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * host thread, so a thread-local count is per task. */
     static _Thread_local int s_exit_seen = 0;
     if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
+        ps3_strict_boot_guard("spu-title-exit-override", "image=%d pc=0x%05X syscall=%u link=0x%05X", ctx->image_id, ctx->pc, num, ctx->gpr[0]._u32[0]);
         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
         { static int _n = 0; if (_n++ < 8)
             fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
@@ -1875,6 +1895,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
     }
     /* EXIT(0, cri bootstrap)/YIELD(1)/POLL(3)/RECV_WKL_FLAG(4):
      * report success and resume (return -> lifted caller continues at its link). */
+    ps3_strict_boot_guard("spu-unsupported-task-syscall", "image=%d pc=0x%05X syscall=%u link=0x%05X", ctx->image_id, ctx->pc, num, ctx->gpr[0]._u32[0]);
     ctx->gpr[3]._u32[0] = 0;
 }
 
@@ -2332,6 +2353,7 @@ void spu_indirect_branch(spu_context* ctx)
               spu_interp_run(ctx, p);
               return;
           } }
+        ps3_strict_boot_guard("spu-unresolved-branch", "image=%d pc=0x%05X link=0x%05X", ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0]);
         spu_halt(ctx);
         return;
     }
@@ -2568,6 +2590,7 @@ void spu_indirect_branch(spu_context* ctx)
         spu_halt(ctx);
         return;
     }
+    ps3_strict_boot_guard("spu-unresolved-branch", "image=%d pc=0x%05X link=0x%05X", ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0]);
     if (ctx->image_id == 2 &&
         ((ctx->pc >= 0x3700 && ctx->pc < 0x3FE80) ||
          (ctx->pc < 0xA00 && ctx->pc != SPURS_PM_EXIT_TO_KERNEL_LS &&

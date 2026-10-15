@@ -49,6 +49,9 @@ int rsx_d3d12_backend_pump_messages(void);
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 
+/* Successful DXGI Present calls only. Caller still needs image/device tests. */
+u64 rsx_d3d12_backend_successful_presents(void);
+
 #ifdef __cplusplus
 }
 #endif

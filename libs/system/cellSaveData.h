@@ -158,9 +158,10 @@ typedef struct CellSaveDataSystemFileParam {
 } CellSaveDataSystemFileParam;
 
 typedef struct CellSaveDataDirStat {
-    s64  st_atime;
-    s64  st_mtime;
-    s64  st_ctime;
+    /* Guest names must not collide with glibc's host stat macros. */
+    s64  guest_atime;
+    s64  guest_mtime;
+    s64  guest_ctime;
     char dirName[CELL_SAVEDATA_DIRNAME_SIZE];
 } CellSaveDataDirStat;
 
@@ -168,9 +169,9 @@ typedef struct CellSaveDataFileStat {
     u32  fileType;
     char reserved1[4];
     u64  st_size;
-    s64  st_atime;
-    s64  st_mtime;
-    s64  st_ctime;
+    s64  guest_atime;
+    s64  guest_mtime;
+    s64  guest_ctime;
     char fileName[CELL_SAVEDATA_FILENAME_SIZE + 3]; /* padded */
     char reserved2[3];
 } CellSaveDataFileStat;

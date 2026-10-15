@@ -75,9 +75,10 @@ typedef struct CellFsStat {
     s32  st_mode;
     s32  st_uid;
     s32  st_gid;
-    s64  st_atime;
-    s64  st_mtime;
-    s64  st_ctime;
+    /* Avoid glibc's st_*time macros without altering guest field offsets. */
+    s64  guest_atime;
+    s64  guest_mtime;
+    s64  guest_ctime;
     u64  st_size;
     u64  st_blksize;
 } CellFsStat;

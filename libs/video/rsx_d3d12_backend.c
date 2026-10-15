@@ -21,6 +21,7 @@
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "ps3emu/strict_boot.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -40,6 +41,8 @@
 
 /* We need these GUIDs — define them here to avoid uuid.lib dependency */
 #include <initguid.h>
+
+static void strict_gpu_hresult(const char* operation, HRESULT result);
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
@@ -765,7 +768,7 @@ static int init_d3d12(u32 width, u32 height)
     if (FAILED(hr)) return -1;
 
     /* Close the command list (it starts in recording state) */
-    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+    strict_gpu_hresult("Close", s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list));
 
     /* Create fence */
     hr = s_d3d.device->lpVtbl->CreateFence(
@@ -1219,15 +1222,23 @@ static int init_d3d12(u32 width, u32 height)
  * Frame sync helpers
  * -----------------------------------------------------------------------*/
 
+static u64 s_successful_presents = 0;
+u64 rsx_d3d12_backend_successful_presents(void) { return s_successful_presents; }
+
+static void strict_gpu_hresult(const char* operation, HRESULT result)
+{
+    if (FAILED(result)) ps3_strict_boot_guard("d3d12-gpu-failure", "operation=%s hresult=0x%08lX", operation, (long)result);
+}
+
 static void wait_for_gpu(void)
 {
     u32 fi = s_d3d.frame_index;
     s_d3d.fence_values[fi]++;
-    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, s_d3d.fence_values[fi]);
+    strict_gpu_hresult("Signal", s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, s_d3d.fence_values[fi]));
 
     if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[fi]) {
-        s_d3d.fence->lpVtbl->SetEventOnCompletion(
-            s_d3d.fence, s_d3d.fence_values[fi], s_d3d.fence_event);
+        strict_gpu_hresult("SetEventOnCompletion", s_d3d.fence->lpVtbl->SetEventOnCompletion(
+            s_d3d.fence, s_d3d.fence_values[fi], s_d3d.fence_event));
         /* NEVER wait unbounded here: this runs on the vblank ticker, which also
          * drives the guest's vblank handlers, the FIFO drain, and the fence
          * publication. A device removal (TDR) leaves the D3D12 fence unsignaled
@@ -1238,8 +1249,14 @@ static void wait_for_gpu(void)
          * carry on (subsequent D3D calls fail visibly but the game keeps
          * running headless). */
         for (int tries = 0; tries < 3; tries++) {
-            if (WaitForSingleObject(s_d3d.fence_event, 2000) != WAIT_TIMEOUT)
+            DWORD wait = WaitForSingleObject(s_d3d.fence_event, 2000);
+            if (wait == WAIT_OBJECT_0) {
+                strict_gpu_hresult("GetDeviceRemovedReason", s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device));
                 return;
+            }
+            if (wait != WAIT_TIMEOUT)
+                ps3_strict_boot_guard("d3d12-gpu-wait-failure", "wait=%lu", (unsigned long)wait);
+            if (wait != WAIT_TIMEOUT) return;
             HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
             printf("[D3D12] wait_for_gpu STUCK %ds: want %llu got %llu removed=0x%08lX\n",
                    2 * (tries + 1),
@@ -1250,20 +1267,25 @@ static void wait_for_gpu(void)
             if (rr != 0 /* S_OK: device still alive, keep waiting a bit */)
                 break;
         }
+        ps3_strict_boot_guard("d3d12-gpu-timeout", "operation=wait_for_gpu");
     }
+    strict_gpu_hresult("GetDeviceRemovedReason", s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device));
 }
 
 static void move_to_next_frame(void)
 {
     u64 current_fence = s_d3d.fence_values[s_d3d.frame_index];
-    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, current_fence);
+    strict_gpu_hresult("Signal", s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_d3d.fence, current_fence));
 
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
 
     if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[s_d3d.frame_index]) {
-        s_d3d.fence->lpVtbl->SetEventOnCompletion(
-            s_d3d.fence, s_d3d.fence_values[s_d3d.frame_index], s_d3d.fence_event);
-        if (WaitForSingleObject(s_d3d.fence_event, 2000) == WAIT_TIMEOUT) {
+        strict_gpu_hresult("SetEventOnCompletion", s_d3d.fence->lpVtbl->SetEventOnCompletion(
+            s_d3d.fence, s_d3d.fence_values[s_d3d.frame_index], s_d3d.fence_event));
+        DWORD wait = WaitForSingleObject(s_d3d.fence_event, 2000);
+        if (wait != WAIT_OBJECT_0)
+            ps3_strict_boot_guard("d3d12-gpu-wait-failure", "operation=move_to_next_frame wait=%lu", (unsigned long)wait);
+        if (wait == WAIT_TIMEOUT) {
             HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
             printf("[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
                    (unsigned long long)s_d3d.fence_values[s_d3d.frame_index],
@@ -1272,6 +1294,7 @@ static void move_to_next_frame(void)
         }
     }
 
+    strict_gpu_hresult("GetDeviceRemovedReason", s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device));
     s_d3d.fence_values[s_d3d.frame_index] = current_fence + 1;
 }
 
@@ -1417,8 +1440,8 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
         return;
 
     wait_for_gpu();
-    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
-    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+    strict_gpu_hresult("AllocatorReset", s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]));
+    strict_gpu_hresult("ListReset", s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL));
 
     D3D12_RESOURCE_BARRIER b = {0};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1457,7 +1480,7 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
     }
 
-    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+    strict_gpu_hresult("Close", s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list));
     ID3D12CommandList* cl[] = { (ID3D12CommandList*)s_d3d.cmd_list };
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cl);
     wait_for_gpu();
@@ -3813,8 +3836,8 @@ static void render_frame(void)
     }
 
     /* Reset command allocator and list */
-    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
-    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+    strict_gpu_hresult("AllocatorReset", s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]));
+    strict_gpu_hresult("ListReset", s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL));
 
     /* Upload the bound font atlas into an R8_UNORM texture and create its SRV.
      * The atlas is a linear 8-bit coverage map, so a straight row copy (no
@@ -4386,6 +4409,11 @@ static void render_frame(void)
 
     /* VP pass: real decompiled vertex program + atlas alpha-test PS. Feeds raw
      * float4 attrib0 from vp_vb and the vp_c[] constant bank. */
+    if (ps3_strict_boot_enabled() && !s_d3d.vp_ready) {
+        for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; ++d)
+            if (s_d3d.draws[d].is_vp)
+                ps3_strict_boot_guard("d3d12-record-without-pipeline", "record=%u clear=%d", d, s_d3d.draws[d].is_clear);
+    }
     if (s_d3d.vp_ready && s_d3d.draw_count > 0) {
         int any = 0;
         for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++)
@@ -4407,6 +4435,7 @@ static void render_frame(void)
             fprintf(stderr, "[VPPASS] records=%u is_vp=%u clears=%u any=%d vpso=%p rootsig=%p\n",
                     s_d3d.draw_count, nvp, nclr, any,
                     (void*)vpso, (void*)s_d3d.vp_root_sig); } }
+        if (any && !vpso) ps3_strict_boot_guard("d3d12-record-without-pipeline", "operation=VP-pass");
         if (any && vpso) {
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
             s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, vpso);
@@ -4912,7 +4941,7 @@ skip_dump_consider: ;
     }
 
     /* Close and execute */
-    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+    strict_gpu_hresult("Close", s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list));
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
 
@@ -5067,8 +5096,12 @@ skip_dump_consider: ;
       } }
 
     /* Present */
-    if (s_present_this_frame)
-        s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
+    if (s_present_this_frame) {
+        HRESULT result = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+        if (result != S_OK)
+            ps3_strict_boot_guard("d3d12-present-failure", "hresult=0x%08lX", (long)result);
+        if (result == S_OK) ++s_successful_presents;
+    }
 
     move_to_next_frame();
 
@@ -5155,7 +5188,7 @@ static void d3d12_present(void* ud, u32 buffer_id)
      * order, in one command list. Empty batches still present (boot/idle). */
     int flip_has_display = (s_d3d.draw_count == 0);
     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
-        if (!s_d3d.draws[_i].is_clear && s_d3d.draws[_i].rt_off == 0) {
+        if ((ps3_strict_boot_enabled() || !s_d3d.draws[_i].is_clear) && s_d3d.draws[_i].rt_off == 0) {
             flip_has_display = 1;
             break;
         }
@@ -5195,6 +5228,22 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 
     u32 rt_w = 0, rt_h = 0, mrt[3] = {0, 0, 0};
     u32 rt = current_rt_off(&rt_w, &rt_h, mrt);
+
+    if (ps3_strict_boot_enabled()) {
+        // The ordered record currently implements full color clears only.
+        if (flags != 0xF0u)
+            ps3_strict_boot_guard("d3d12-clear-mask-unimplemented", "flags=0x%08X", flags);
+        if (s_d3d.draw_count >= MAX_DRAWS)
+            ps3_strict_boot_guard("d3d12-command-capacity", "operation=clear");
+        D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
+        memset(dr, 0, sizeof(*dr));
+        dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1;
+        dr->rt_off = rt; memcpy(dr->rt_mrt, mrt, sizeof(mrt));
+        dr->rt_w = rt_w; dr->rt_h = rt_h;
+        dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+        memcpy(dr->cc, cc, sizeof(cc));
+        return;
+    }
 
     /* An OFFSCREEN clear is just an ordered op in the current frame's pass
      * chain (demosaic clears each effect pass's surface) -- record it, don't
@@ -6582,6 +6631,7 @@ static rsx_backend s_d3d12_backend = {0};
 
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
+    s_successful_presents = 0;
     memset(&s_d3d, 0, sizeof(s_d3d));
     s_d3d.width = width;
     s_d3d.height = height;
@@ -6720,7 +6770,7 @@ void rsx_d3d12_backend_present(void)
     static int s_seen_content = 0;
     int has_display = (s_d3d.draw_count == 0 && !s_seen_content);
     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
-        if (!s_d3d.draws[_i].is_clear && s_d3d.draws[_i].rt_off == 0) {
+        if ((ps3_strict_boot_enabled() || !s_d3d.draws[_i].is_clear) && s_d3d.draws[_i].rt_off == 0) {
             has_display = 1;
             break;
         }
@@ -6801,5 +6851,6 @@ int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
 void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
+u64 rsx_d3d12_backend_successful_presents(void) { return 0; }
 
 #endif /* _WIN32 */

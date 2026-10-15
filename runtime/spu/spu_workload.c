@@ -6,6 +6,7 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
+#include "ps3emu/strict_boot.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
@@ -197,7 +198,10 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea)
 {
-    if (!image || image_size == 0) return 0;
+    if (!image || image_size == 0) {
+        ps3_strict_boot_guard("spu-empty-image", "size=%u args_ea=0x%08X", image_size, args_ea);
+        return 0;
+    }
 
     uint64_t fp = spu_workload_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
@@ -205,6 +209,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
     if (!fn) {
+        ps3_strict_boot_guard("spu-unregistered-image", "fp=0x%016llX size=%u args_ea=0x%08X", (unsigned long long)fp, image_size, args_ea);
         fprintf(stderr,
             "[spu_workload] dispatch MISS fp=0x%016llX size=%u "
             "(no lifted SPU binary registered for this image)\n",
@@ -216,10 +221,14 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
      * the task arg in r3. 256 KB is heap-allocated (too large for the stack,
      * and spu_run_lifted_job already builds a full spu_context on its stack). */
     uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
-    if (!ls) return 0;
+    if (!ls) {
+        ps3_strict_boot_guard("spu-local-store-allocation-failed", "image=%d size=%u", image_id, image_size);
+        return 0;
+    }
 
     uint32_t entry = 0;
     if (!spu_elf_load_to_ls(image, image_size, ls, &entry)) {
+        ps3_strict_boot_guard("spu-invalid-elf-image", "image=%d size=%u", image_id, image_size);
         fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: not a valid SPU ELF\n", (unsigned long long)fp);
         free(ls);
         return 0;
@@ -452,6 +461,8 @@ static void spu_async_run(spu_async_job* j)
     } else {
         ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
     }
+    if (!ls)
+        ps3_strict_boot_guard("spu-async-local-store-allocation-failed", "image=%d args_ea=0x%08X", j->image_id, j->args_ea);
     if (ls) {
         uint32_t entry = 0;
         /* Load the image only on a taskset's FIRST task (or every dispatch when
@@ -460,6 +471,8 @@ static void spu_async_run(spu_async_job* j)
                    ? 1
                    : (did_load = 1, spu_elf_load_to_ls(j->image, j->image_size, ls, &entry));
         if (ts_slot && did_load && loaded) ts_slot->loaded = 1;
+        if (!loaded)
+            ps3_strict_boot_guard("spu-invalid-async-image", "image=%d size=%u", j->image_id, j->image_size);
         if (!loaded)
             fprintf(stderr, "[spu_workload] async image=%d ELF LOAD FAILED\n",
                     j->image_id), fflush(stderr);
@@ -516,6 +529,7 @@ static void spu_async_run(spu_async_job* j)
              * descriptor @0x2FB0. Adopted from JonathanDC64/ps3recomp (aaea4158).
              * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
             if (j->image_id == 22 && !getenv("YDKJ_NO_CRI_CTX")) {
+                ps3_strict_boot_guard("spu-title-context-override", "image=%d args_ea=0x%08X", j->image_id, j->args_ea);
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
@@ -805,7 +819,10 @@ static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); retur
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
 {
-    if (!image || image_size == 0) return 0;
+    if (!image || image_size == 0) {
+        ps3_strict_boot_guard("spu-empty-job-image", "size=%u job=0x%08X", image_size, job_ea);
+        return 0;
+    }
 
     uint64_t fp = spu_workload_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
@@ -816,6 +833,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
         /* Capped: an unlifted job a title dispatches every frame (Tornado
          * Outbreak's Wwise audio jobs) wrote 2 GB of these in three minutes,
          * and the logging itself distorts guest timing. */
+        ps3_strict_boot_guard("spu-unregistered-job-image", "fp=0x%016llX size=%u job=0x%08X", (unsigned long long)fp, image_size, job_ea);
         { static unsigned long long miss_n = 0;
           if (++miss_n <= 32 || miss_n % 100000 == 0)
             fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n",
@@ -1168,7 +1186,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea)
 {
-    if (!image || image_size == 0) return 0;
+    if (!image || image_size == 0) {
+        ps3_strict_boot_guard("spu-empty-async-image", "size=%u args_ea=0x%08X", image_size, args_ea);
+        return 0;
+    }
 
     uint64_t fp = spu_workload_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
@@ -1182,6 +1203,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
          * persistent worker -- could only ever report a fingerprint you had no
          * way to resolve. These blobs are not ELFs in the EBOOT, so this dump
          * is the only place their bytes exist. */
+        ps3_strict_boot_guard("spu-unregistered-async-image", "fp=0x%016llX size=%u args_ea=0x%08X", (unsigned long long)fp, image_size, args_ea);
         { const char* _dir = getenv("SPU_DUMP_MISS");
           if (_dir && *_dir) {
               static uint64_t _seen[64]; static unsigned _nseen = 0;
@@ -1203,7 +1225,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     }
 
     spu_async_job* j = (spu_async_job*)malloc(sizeof(*j));
-    if (!j) return 0;
+    if (!j) {
+        ps3_strict_boot_guard("spu-async-allocation-failed", "image=%d args_ea=0x%08X", image_id, args_ea);
+        return 0;
+    }
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
     /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
@@ -1262,7 +1287,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * process death) the moment the real decode path first executed. */
     HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!th) { free(j); return 0; }
+    if (!th) {
+        ps3_strict_boot_guard("spu-async-thread-create-failed", "image=%d error=%lu", image_id, (unsigned long)GetLastError());
+        free(j); return 0;
+    }
     CloseHandle(th);   /* detached */
 #else
     /* Same 256 MB reservation, for the same reason: pthread stacks are
@@ -1281,7 +1309,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * beats never dispatching at all. */
     if (prc != 0)
         prc = pthread_create(&th, NULL, spu_async_thread, j);
-    if (prc != 0) { free(j); return 0; }
+    if (prc != 0) {
+        ps3_strict_boot_guard("spu-async-thread-create-failed", "image=%d error=%d", image_id, prc);
+        free(j); return 0;
+    }
     pthread_detach(th);
 #endif
     return 1;

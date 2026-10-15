@@ -17,6 +17,7 @@
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
 #include "ppu_recomp.h"   /* ppu_context */
+#include "ppu_strict_boot.h"
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
@@ -150,6 +151,7 @@ extern "C" void flow_spurs_kernel_spawn_postinit(void) {}
  */
 static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 {
+    ppu_strict_boot_guard("unresolved-nid", ctx, "nid", nid);
     enum { CELL_ERROR_ERROR = (int)0x8001003Fu };  /* generic CELL failure */
     static int s_fake = -1;
     if (s_fake < 0) {
@@ -234,6 +236,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * the fn report "launched from tuner", so the caller runs tuner/trace setup that fails
      * with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
     if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
+        ppu_strict_boot_guard("diagnostic-nid-override", ctx, "nid", nid);
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
         static int _tn = 0; if (_tn++ < 3)
             fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
@@ -642,6 +645,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
     ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
     if (!e || !e->handler) {
+        ppu_strict_boot_guard("unresolved-nid", ctx, "nid", nid);
         /* Recorded before the diagnostic paths below, several of which return
          * early. An import moving between resolved and unresolved is exactly the
          * kind of change the gate exists to catch. */
@@ -750,6 +754,7 @@ extern "C" void ppu_hle_init(void)
      * later and somewhere else. Say so here, once, at the point where it is
      * still obvious what to do about it. */
     if (ps3_hle_count() == 0) {
+        ppu_strict_boot_guard("empty-hle-table", nullptr, "handlers", 0);
         fprintf(stderr,
             "\n[ps3] WARNING: no HLE handlers are registered.\n"
             "  ppu_hle_register_all() is the weak do-nothing stub, so every firmware\n"

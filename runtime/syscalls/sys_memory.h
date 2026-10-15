@@ -57,6 +57,7 @@ extern uint32_t                 g_sys_mem_bump_ptr;  /* bump allocator pointer *
 
 /* Syscall handlers */
 int64_t sys_memory_allocate(ppu_context* ctx);
+int64_t sys_memory_allocate_from_container(ppu_context* ctx);
 int64_t sys_memory_free(ppu_context* ctx);
 int64_t sys_memory_get_user_memory_size(ppu_context* ctx);
 int64_t sys_memory_get_page_attribute(ppu_context* ctx);

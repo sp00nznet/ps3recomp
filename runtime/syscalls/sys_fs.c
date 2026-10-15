@@ -1,3 +1,4 @@
+#include "ps3emu/strict_fs.h"
 /*
  * ps3recomp - Filesystem syscalls (implementation)
  */
@@ -124,6 +125,20 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
+    /* Explicit cache mount wins over disc-root stripping and asset fallbacks. */
+    const char* hdd1 = getenv("PS3_HDD1_ROOT");
+    if (hdd1 && *hdd1 && strncmp(ps3_path, "/dev_hdd1", 9) == 0 &&
+        (ps3_path[9] == '/' || ps3_path[9] == '\0')) {
+        if (host_path_size <= 0) return;
+        size_t n = strlen(hdd1);
+        while (n > 3 && (hdd1[n-1] == '/' || hdd1[n-1] == '\\')) --n;
+        const char* tail = ps3_path + 9; if (*tail == '/') ++tail;
+        int written = snprintf(host_path, (size_t)host_path_size, "%.*s%s%s", (int)n, hdd1,
+            *tail && hdd1[n-1] != '/' && hdd1[n-1] != '\\' ? "/" : "", tail);
+        if (written < 0 || written >= host_path_size) { host_path[0] = 0; return; }
+        fs_normalize_sep(host_path);
+        return;
+    }
     /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
      * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
     if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
@@ -367,7 +382,7 @@ int64_t sys_fs_open(ppu_context* ctx)
             mode = "rb";
     }
 
-    FILE* fp = fopen(host_path, mode);
+    FILE* fp = ps3_strict_fs_fopen(host_path, mode);
 
     /* Transient open failures: on Windows an existing, correctly-pathed file can
      * intermittently fail to open (AV/indexer holding a share lock, or momentary
@@ -394,17 +409,17 @@ int64_t sys_fs_open(ppu_context* ctx)
              * and the recovery this exists for never happens. */
             { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
 #endif
-            fp = fopen(host_path, mode);
+            fp = ps3_strict_fs_fopen(host_path, mode);
         }
         if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
     }
 
     /* If CREAT flag set and file doesn't exist, try creating it */
     if (!fp && (flags & CELL_FS_O_CREAT)) {
-        fp = fopen(host_path, "w+b");
+        fp = ps3_strict_fs_fopen(host_path, "w+b");
     }
 
-    /* A DIRECTORY open is not a failure. fopen() cannot open one on Windows,
+    /* A DIRECTORY open is not a failure. ps3_strict_fs_fopen() cannot open one on Windows,
      * but real cellFsOpen answers CELL_EISDIR and titles branch on it -- flOw
      * opens Data/Titles/ (its localisation XML dir) and a generic ENOENT tells
      * it the content is missing rather than "that is a directory".
@@ -521,6 +536,8 @@ int64_t sys_fs_read(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_fs_write(ppu_context* ctx)
 {
+    if (ps3_strict_fs_readonly()) ps3_strict_fs_fail("sys_fs_write", "<guest descriptor>", "readonly-mutation");
+
     int32_t  fd           = LV2_ARG_S32(ctx, 0);
     uint32_t buf_addr     = LV2_ARG_PTR(ctx, 1);
     uint64_t size         = LV2_ARG_U64(ctx, 2);
@@ -529,6 +546,7 @@ int64_t sys_fs_write(ppu_context* ctx)
     int slot = fd - 3;
     if (slot < 0 || slot >= SYS_FS_FD_MAX) {
         /* Invalid fd — pretend write succeeded (CRT stdio uses corrupted fds) */
+        ps3_strict_fs_unimplemented("invalid-descriptor-write", "<invalid fd>");
         if (nwritten_addr != 0)
             write_be64(nwritten_addr, size);
         return CELL_OK;
@@ -536,13 +554,15 @@ int64_t sys_fs_write(ppu_context* ctx)
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
     if (!f->active || !f->fp) {
+        ps3_strict_fs_unimplemented("inactive-descriptor-operation", f->path);
         if (nwritten_addr != 0)
             write_be64(nwritten_addr, size);
         return CELL_OK;
     }
 
     const void* buf = vm_to_host(buf_addr);
-    size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);
+    size_t nwritten = ps3_strict_fs_fwrite(buf, 1, (size_t)size, f->fp);
+    ps3_strict_fs_stream("descriptor-flush-or-truncate", f->fp);
     fflush(f->fp);
 
     if (nwritten_addr != 0) {
@@ -604,6 +624,7 @@ int64_t sys_fs_lseek(ppu_context* ctx)
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
     if (!f->active || !f->fp) {
+        ps3_strict_fs_unimplemented("inactive-descriptor-operation", f->path);
         if (pos_addr)
             write_be64(pos_addr, 0);
         return 0;
@@ -895,9 +916,9 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
 #ifdef _WIN32
-    int rc = _mkdir(host_path);
+    int rc = ps3_strict_fs_mkdir(host_path, 0755);
 #else
-    int rc = mkdir(host_path, 0755);
+    int rc = ps3_strict_fs_mkdir(host_path, 0755);
 #endif
 
     if (rc != 0) {
@@ -936,7 +957,7 @@ int64_t sys_fs_rename(ppu_context* ctx)
     sys_fs_translate_path(old_ps3, old_host, sizeof(old_host));
     sys_fs_translate_path(new_ps3, new_host, sizeof(new_host));
 
-    if (rename(old_host, new_host) != 0)
+    if (ps3_strict_fs_rename(old_host, new_host) != 0)
         return (int64_t)(int32_t)CELL_ENOENT;
 
     return CELL_OK;
@@ -959,9 +980,9 @@ int64_t sys_fs_unlink(ppu_context* ctx)
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
 #ifdef _WIN32
-    if (_unlink(host_path) != 0)
+    if ((ps3_strict_fs_mutation("_unlink", host_path), _unlink(host_path)) != 0)
 #else
-    if (unlink(host_path) != 0)
+    if ((ps3_strict_fs_mutation("unlink", host_path), unlink(host_path)) != 0)
 #endif
         return (int64_t)(int32_t)CELL_ENOENT;
 
@@ -985,9 +1006,9 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
 #ifdef _WIN32
-    if (_rmdir(host_path) != 0)
+    if ((ps3_strict_fs_mutation("_rmdir", host_path), _rmdir(host_path)) != 0)
 #else
-    if (rmdir(host_path) != 0)
+    if ((ps3_strict_fs_mutation("rmdir", host_path), rmdir(host_path)) != 0)
 #endif
         return (int64_t)(int32_t)CELL_ENOENT;
 
@@ -1002,6 +1023,8 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_fs_ftruncate(ppu_context* ctx)
 {
+    if (ps3_strict_fs_readonly()) ps3_strict_fs_fail("sys_fs_ftruncate", "<guest descriptor>", "readonly-mutation");
+
     int32_t  fd   = LV2_ARG_S32(ctx, 0);
     uint64_t size = LV2_ARG_U64(ctx, 1);
 
@@ -1013,6 +1036,7 @@ int64_t sys_fs_ftruncate(ppu_context* ctx)
     if (!f->active || !f->fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
+    ps3_strict_fs_stream("descriptor-flush-or-truncate", f->fp);
     fflush(f->fp);
 
 #ifdef _WIN32

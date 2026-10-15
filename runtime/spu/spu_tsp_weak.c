@@ -9,11 +9,13 @@
  * (Plain definition, not __attribute__((weak)): the runtime lib builds under
  * MSVC, which has no GNU weak attribute.) */
 #include <stdio.h>
+#include "ps3emu/strict_boot.h"
 
 struct spu_context;
 
 void tsp_spu_func_00000A00(struct spu_context* ctx)
 {
+    ps3_strict_boot_guard("spu-missing-taskset-policy", "entry=0x00A00");
     (void)ctx;
     fprintf(stderr, "[spu] tsp_spu_func_00000A00 stub called -- this port "
                     "was built without the ydkj lifted taskset policy module\n");

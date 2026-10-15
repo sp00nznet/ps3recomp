@@ -10,6 +10,7 @@
 
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
+#include "ps3emu/strict_boot.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -188,6 +189,7 @@ static u32 s_flip_handler_opd     = 0;
  * completes (cellGcmTickFlip), not also when it is requested. */
 static int gcm_flipcb_on_tick_only(void)
 {
+    if (ps3_strict_boot_enabled()) return 1;
     static int v = -1;
     if (v < 0) v = getenv("GCM_FLIPCB_ONTICK") ? 1 : 0;
     return v;
@@ -997,6 +999,7 @@ static void nv3089_blit(void)
          * copy from the scene surface to a registered display buffer is the
          * composite this title needs, and is worth telling apart from some
          * incidental small transfer. */
+        ps3_strict_boot_guard("rsx-unsupported-blit-format", "format=0x%08X", f);
         { int _sl = (s_nv3089.src_dma != 0xFEED0001u);
           int _dl = (s_gcm2d.dst_dma  != 0xFEED0001u);
           printf("[NV3089] SKIPPED fmt=0x%X  %ux%u  src=0x%08X(pitch %u,%s) -> dst=0x%08X(pitch %u,%s) at %u,%u%c",
@@ -1098,6 +1101,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x0304: s_gcm2d.pitch      = data; return;
         case 0x030C: s_gcm2d.dst_offset = data; return;
         }
+        ps3_strict_boot_guard("rsx-unknown-2d-method", "subchannel=%u method=0x%04X data=0x%08X", subch, method, data);
         return;
     }
     if (subch == 4 || subch == 5) {         /* NV308A image-from-CPU, or NV309E */
@@ -1135,6 +1139,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
             vm_write32(base + py * dst_pitch + px * 4, data);
             return;
         }
+        ps3_strict_boot_guard("rsx-unknown-2d-method", "subchannel=%u method=0x%04X data=0x%08X", subch, method, data);
         return;
     }
     /* NV3089 "scaled image from memory" -- the blit PSGL uses to move a texture
@@ -1164,9 +1169,11 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x0408: s_nv3089.in_off    = data; return;
         case 0x040C: s_nv3089.in_uv     = data; nv3089_blit(); return;
         }
+        ps3_strict_boot_guard("rsx-unknown-2d-method", "subchannel=%u method=0x%04X data=0x%08X", subch, method, data);
         return;
     }
     /* NV0039 / NV309E: not implemented yet -- log first sightings. */
+    ps3_strict_boot_guard("rsx-unimplemented-2d-engine", "subchannel=%u method=0x%04X data=0x%08X", subch, method, data);
     /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
      * only that SOMETHING was unhandled, not enough to implement it. */
     static int warned = 0, wcap = -1;
@@ -1217,6 +1224,7 @@ static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consu
  * never mapped, while put sat at 0x604. Stop at the bad word and say so. */
 static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
 {
+    ps3_strict_boot_guard("rsx-unmapped-branch", "kind=%s target=0x%08X word=0x%08X", kind, target, word);
     static int n = 0;
     if (n++ < 8)
         fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
@@ -1330,6 +1338,7 @@ static u32 gcm_spu_block_for_put(u32 put)
  * is not, it deadlocks the title. Sweep the skipped range first. */
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    ps3_strict_boot_guard("rsx-fifo-resync", "reason=%s get=0x%08X put=0x%08X", why, *getoff, put);
     static int n = 0;
     if (n++ < 8)
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
@@ -1634,6 +1643,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     while (s_fifo_getoff != put && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
+            ps3_strict_boot_guard("rsx-unmapped-fifo", "get=0x%08X put=0x%08X", s_fifo_getoff, put);
             /* get is sitting on an IO offset with no mapping -- the title
              * branched into a region and then unmapped it, or the offset was
              * never valid. Breaking silently (what this did) leaves get stuck
@@ -1702,7 +1712,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * "Command Buffer Overflow" forever. Past the threshold keep
              * draining -- the intermediate presents are frames we are too far
              * behind to show anyway. No-op for a title that is keeping up. */
-            if (put < s_fifo_getoff ||
+            if (ps3_strict_boot_enabled() || put < s_fifo_getoff ||
                 put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
                 { why = "flip"; break; }
             continue;
@@ -1800,7 +1810,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * its own is the half that unblocks a waiting guest. */
             static int blk = -1;
             if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
-            if (blk) { sem_blocked = 1; break; }
+            if (blk || ps3_strict_boot_enabled()) { sem_blocked = 1; break; }
         }
                 }
                 if (sem_blocked) break;
@@ -1925,6 +1935,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                    ps3_strict_boot_guard("rsx-driver-flip-boundary-unimplemented", "method=0x%04X", mfull);
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
@@ -1953,6 +1964,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
+        ps3_strict_boot_guard("rsx-unknown-fifo-word", "word=0x%08X get=0x%08X", w, s_fifo_getoff);
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
@@ -2080,6 +2092,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
+            ps3_strict_boot_guard("rsx-heuristic-ring-recycle", "context=0x%08X current=0x%08X end=0x%08X", ctx, cur, end);
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
@@ -2362,6 +2375,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
     if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
+        ps3_strict_boot_guard("rsx-heuristic-ring-wrap", "context=0x%08X current=0x%08X end=0x%08X", ctx, cur, end);
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
         return 1;
@@ -2375,6 +2389,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
  * a no-op, GetFlipStatus never cleared, and init timed out into exit(-1). */
 s32 cellGcmSetFlip(void* context, u32 bufferId)
 {
+    if (ps3_strict_boot_enabled()) {
+        u32 ctx = (u32)(uintptr_t)context;
+        if (!gcm_flip_into_fifo(ctx, bufferId))
+            ps3_strict_boot_guard("rsx-flip-enqueue", "context=0x%08X buffer=%u", ctx, bufferId);
+        return gcm_flip_request(bufferId, 1);
+    }
     (void)context;   /* command context — flip is immediate in HLE */
     return cellGcmSetFlipCommand(bufferId);
 }
@@ -2382,6 +2402,7 @@ s32 cellGcmSetFlip(void* context, u32 bufferId)
 /* NID: 0xD01B570F */
 s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue)
 {
+    ps3_strict_boot_guard("rsx-wait-label-unimplemented", "buffer=%u label=%u value=0x%08X", bufferId, labelIndex, labelValue);
     if (labelIndex >= CELL_GCM_MAX_LABEL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
@@ -2395,6 +2416,10 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
 /* NID: 0xA2478CA3 */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 {
+    if (ps3_strict_boot_enabled()) {
+        s32 result = cellGcmSetFlip(ctx, bufferId);
+        return result == CELL_OK ? (s32)bufferId : result;
+    }
     (void)ctx;  /* command buffer context -- not used in HLE */
 
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
@@ -3098,6 +3123,7 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 /* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
+    if (ps3_strict_boot_enabled()) return cellGcmSetFlip(ctx, bufferId);
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
         return gcm_flip_request(bufferId, 1);
     return cellGcmSetFlipCommand(bufferId);

@@ -1,3 +1,4 @@
+#include "ps3emu/strict_fs.h"
 /*
  * ps3recomp - cellFs VFS (sys_fs HLE)
  *
@@ -89,6 +90,19 @@ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
  * prefixes are stripped; the rest is appended to the root. */
 static void host_path(char* out, size_t cap, const char* guest)
 {
+    /* Explicit cache mount wins over disc-root stripping and asset fallbacks. */
+    const char* hdd1 = getenv("PS3_HDD1_ROOT");
+    if (hdd1 && *hdd1 && strncmp(guest, "/dev_hdd1", 9) == 0 &&
+        (guest[9] == '/' || guest[9] == '\0')) {
+        size_t n = strlen(hdd1);
+        while (n > 3 && (hdd1[n-1] == '/' || hdd1[n-1] == '\\')) --n;
+        const char* tail = guest + 9; if (*tail == '/') ++tail;
+        int written = snprintf(out, cap, "%.*s%s%s", (int)n, hdd1,
+            *tail && hdd1[n-1] != '/' && hdd1[n-1] != '\\' ? "/" : "", tail);
+        if (written < 0 || (size_t)written >= cap) { if (cap) out[0] = 0; return; }
+        for (char* p = out; *p; ++p) if (*p == '\\') *p = '/';
+        return;
+    }
     const char* rel = guest;
     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
@@ -181,7 +195,7 @@ static void cellFsOpen(ppu_context* ctx)
       const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
 
-    /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
+    /* ps3_strict_fs_fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
      * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build
      * real open() flags from the access mode (low 2 bits) + the modifiers, then
      * wrap the fd in a FILE* with fdopen() (which neither creates nor truncates
@@ -206,6 +220,8 @@ static void cellFsOpen(ppu_context* ctx)
             return;
         }
     }
+    if ((oflags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0)
+        ps3_strict_fs_mutation("open-write", hpath);
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
@@ -312,8 +328,8 @@ static void cellFsSdataOpen(ppu_context* ctx)
         }
         char dmagic[4] = {0};
         if (dec_sz >= 4) memcpy(dmagic, dec, 4);
-        FILE* tf = tmpfile();
-        if (!tf || fwrite(dec, 1, dec_sz, tf) != dec_sz) {
+        FILE* tf = ps3_strict_fs_tmpfile();
+        if (!tf || ps3_strict_fs_fwrite(dec, 1, dec_sz, tf) != dec_sz) {
             if (tf) fclose(tf); free(dec);
             ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
         }
@@ -443,13 +459,15 @@ static void cellFsRead(ppu_context* ctx)
 
 static void cellFsWrite(ppu_context* ctx)
 {
+    if (ps3_strict_fs_readonly()) ps3_strict_fs_fail("cellFsWrite", "<guest descriptor>", "readonly-mutation");
     int fd          = (int)(uint32_t)ctx->gpr[3];
+
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
-    size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+    size_t n = ps3_strict_fs_fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -651,9 +669,9 @@ static void cellFsClosedir(ppu_context* ctx)
 
 #ifdef _WIN32
 #include <direct.h>
-#define HOST_MKDIR(p) _mkdir(p)
+#define HOST_MKDIR(p) ps3_strict_fs_mkdir((p), 0755)
 #else
-#define HOST_MKDIR(p) mkdir((p), 0777)
+#define HOST_MKDIR(p) ps3_strict_fs_mkdir((p), 0777)
 #endif
 
 /* Create `path` and any missing parent dirs on the host. Returns 0 on
@@ -681,11 +699,24 @@ static void cellFsMkdir(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     host_path(hpath, sizeof hpath, gpath);
     int r = host_mkdir_p(hpath);
+    if (r != 0 && ps3_strict_fs_enabled()) ps3_strict_fs_fail("cellFsMkdir", hpath, "host-mkdir-failed");
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
 }
-static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
-static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+static void cellFsRmdir(ppu_context* ctx)  {
+    if (ps3_strict_fs_enabled()) {
+        char path[1024]; guest_strcpy(path, (uint32_t)ctx->gpr[3], sizeof path);
+        ps3_strict_fs_unimplemented("cellFsRmdir", path);
+    }
+    ctx->gpr[3] = CELL_OK;
+}
+static void cellFsUnlink(ppu_context* ctx) {
+    if (ps3_strict_fs_enabled()) {
+        char path[1024]; guest_strcpy(path, (uint32_t)ctx->gpr[3], sizeof path);
+        ps3_strict_fs_unimplemented("cellFsUnlink", path);
+    }
+    ctx->gpr[3] = CELL_OK;
+}
 static void cellFsFsync(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
@@ -694,7 +725,7 @@ static void cellFsFsync(ppu_context* ctx)
 }
 /* File-area preallocation (LBP cache warm-up spams this): host filesystems
  * grow files on write, so accepting is correct -- no preallocation needed. */
-static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ps3_strict_fs_unimplemented("cellFsAllocateFileAreaWithoutZeroFill", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
 
 /* ---- cellFs AIO -----------------------------------------------------------
  *
@@ -729,12 +760,12 @@ static uint64_t guest_be64(uint32_t a)
     return ((uint64_t)guest_be32(a) << 32) | guest_be32(a + 4);
 }
 
-static void cellFsAioInit(ppu_context* ctx)   { ctx->gpr[3] = CELL_OK; }
-static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+static void cellFsAioInit(ppu_context* ctx)   { ps3_strict_fs_unimplemented("cellFsAioInit", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
+static void cellFsAioFinish(ppu_context* ctx) { ps3_strict_fs_unimplemented("cellFsAioFinish", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
 /* Nothing is ever outstanding, so a cancel has nothing to find. Real cellFs
  * answers CELL_FS_ENOENT for an unknown id and callers treat that as "already
  * done", which is exactly true here. */
-static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+static void cellFsAioCancel(ppu_context* ctx) { ps3_strict_fs_unimplemented("cellFsAioCancel", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
 
 static void cellFsAioRead(ppu_context* ctx)
 {

@@ -1,3 +1,4 @@
+#include "ps3emu/strict_fs.h"
 /*
  * ps3recomp - cellSaveData HLE implementation
  *
@@ -16,32 +17,18 @@
 #include <errno.h>
 #include <time.h>
 
-/* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros (st_atim.tv_sec
- * etc.) that collide with the identically named members of CellSaveData*Stat; undef
- * them so the struct fields resolve, and read host times via the explicit timespec
- * fields in the POSIX branches below. */
-#ifdef st_atime
-#  undef st_atime
-#endif
-#ifdef st_mtime
-#  undef st_mtime
-#endif
-#ifdef st_ctime
-#  undef st_ctime
-#endif
-
 #ifdef _WIN32
 #  include <windows.h>
 #  include <io.h>
 #  include <direct.h>
-#  define HOST_MKDIR(p) _mkdir(p)
+#  define HOST_MKDIR(p) ps3_strict_fs_mkdir((p), 0755)
 #  define HOST_STAT     _stat64
 #  define HOST_STAT_T   struct __stat64
 #else
 #  include <unistd.h>
 #  include <dirent.h>
 #  include <sys/types.h>
-#  define HOST_MKDIR(p) mkdir(p, 0755)
+#  define HOST_MKDIR(p) ps3_strict_fs_mkdir((p), 0755)
 #  define HOST_STAT     stat
 #  define HOST_STAT_T   struct stat
 #endif
@@ -305,9 +292,9 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
     marshal_statget_init(get_ea, is_new, dirName, 0, 0);
     if (input) {
         vm_write32(get_ea, (u32)input->hddFreeSizeKB);
-        vm_write64(get_ea + 8, (u64)input->dir.st_atime);
-        vm_write64(get_ea + 16, (u64)input->dir.st_mtime);
-        vm_write64(get_ea + 24, (u64)input->dir.st_ctime);
+        vm_write64(get_ea + 8, (u64)input->dir.guest_atime);
+        vm_write64(get_ea + 16, (u64)input->dir.guest_mtime);
+        vm_write64(get_ea + 24, (u64)input->dir.guest_ctime);
         memcpy(vm_base + get_ea + 64, &input->getParam, 1552);
         vm_write32(get_ea + 64 + 1280, input->getParam.attribute);
         vm_write32(get_ea + 1616, input->bind);
@@ -322,9 +309,9 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
             const CellSaveDataFileStat* f = input->fileList + i;
             u32 dst = files + i * 56;
             vm_write32(dst, f->fileType); vm_write64(dst + 8, f->st_size);
-            vm_write64(dst + 16, (u64)f->st_atime);
-            vm_write64(dst + 24, (u64)f->st_mtime);
-            vm_write64(dst + 32, (u64)f->st_ctime);
+            vm_write64(dst + 16, (u64)f->guest_atime);
+            vm_write64(dst + 24, (u64)f->guest_mtime);
+            vm_write64(dst + 32, (u64)f->guest_ctime);
             memcpy(vm_base + dst + 40, f->fileName, CELL_SAVEDATA_FILENAME_SIZE);
         }
     }
@@ -532,7 +519,7 @@ static int pfd_has(const char* save_path, const char* name)
 {
     char path[1024], line[64];
     pfd_path(save_path, path, sizeof(path));
-    FILE* fp = fopen(path, "rb");
+    FILE* fp = ps3_strict_fs_fopen(path, "rb");
     if (!fp) return 0;
     int found = 0;
     while (!found && fgets(line, sizeof(line), fp)) {
@@ -548,8 +535,8 @@ static void pfd_add(const char* save_path, const char* name)
     if (pfd_has(save_path, name)) return;
     char path[1024];
     pfd_path(save_path, path, sizeof(path));
-    FILE* fp = fopen(path, "ab");
-    if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
+    FILE* fp = ps3_strict_fs_fopen(path, "ab");
+    if (fp) { ps3_strict_fs_stream("save-metadata", fp); fprintf(fp, "%s\n", name); fclose(fp); }
 }
 
 static u32 savedata_file_type(const char* save_path, const char* name)
@@ -621,18 +608,18 @@ static u32 enumerate_save_files(const char* save_path,
                         CELL_SAVEDATA_FILENAME_SIZE - 1);
                 fileList[count].st_size = (u64)st.st_size;
 #ifdef _WIN32
-                fileList[count].st_atime = (s64)st.st_atime;
-                fileList[count].st_mtime = (s64)st.st_mtime;
-                fileList[count].st_ctime = (s64)st.st_ctime;
+                fileList[count].guest_atime = (s64)st.st_atime;
+                fileList[count].guest_mtime = (s64)st.st_mtime;
+                fileList[count].guest_ctime = (s64)st.st_ctime;
 #elif defined(__APPLE__)
 /* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
-                fileList[count].st_atime = (s64)st.st_atimespec.tv_sec;
-                fileList[count].st_mtime = (s64)st.st_mtimespec.tv_sec;
-                fileList[count].st_ctime = (s64)st.st_ctimespec.tv_sec;
+                fileList[count].guest_atime = (s64)st.st_atimespec.tv_sec;
+                fileList[count].guest_mtime = (s64)st.st_mtimespec.tv_sec;
+                fileList[count].guest_ctime = (s64)st.st_ctimespec.tv_sec;
 #else
-                fileList[count].st_atime = (s64)st.st_atim.tv_sec;
-                fileList[count].st_mtime = (s64)st.st_mtim.tv_sec;
-                fileList[count].st_ctime = (s64)st.st_ctim.tv_sec;
+                fileList[count].guest_atime = (s64)st.st_atim.tv_sec;
+                fileList[count].guest_mtime = (s64)st.st_mtim.tv_sec;
+                fileList[count].guest_ctime = (s64)st.st_ctim.tv_sec;
 #endif
             }
             count++;
@@ -672,7 +659,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 
     switch (set->fileOperation) {
     case CELL_SAVEDATA_FILEOP_READ: {
-        FILE* fp = fopen(file_path, "rb");
+        FILE* fp = ps3_strict_fs_fopen(file_path, "rb");
         if (!fp) {
             printf("[cellSaveData] file read: cannot open '%s'\n", file_path);
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
@@ -701,9 +688,9 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         } else {
             mode = "r+b";
         }
-        FILE* fp = fopen(file_path, mode);
+        FILE* fp = ps3_strict_fs_fopen(file_path, mode);
         if (!fp) {
-            fp = fopen(file_path, "wb");
+            fp = ps3_strict_fs_fopen(file_path, "wb");
         }
         if (!fp) {
             printf("[cellSaveData] file write: cannot open '%s'\n", file_path);
@@ -718,7 +705,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         }
         size_t write_size = (size_t)set->fileSize;
         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
-        size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
+        size_t wrote = ps3_strict_fs_fwrite(set->fileBuf, 1, write_size, fp);
         int failed = wrote != write_size;
         if (fclose(fp) != 0) failed = 1;
         if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
@@ -727,7 +714,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     }
 
     case CELL_SAVEDATA_FILEOP_DELETE:
-        remove(file_path);
+        ps3_strict_fs_remove(file_path);
         return 0;
 
     default:
@@ -748,11 +735,12 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
     }
 #endif
 
-    FILE* fp = fopen(sfo_path, "wb");
+    FILE* fp = ps3_strict_fs_fopen(sfo_path, "wb");
     if (!fp) return;
 
     /* Write a simplified text-based PARAM.SFO for easy debugging.
        Games don't read this directly - our stat callback fills it from here. */
+    ps3_strict_fs_stream("save-metadata", fp);
     fprintf(fp, "TITLE=%s\n", param->title);
     fprintf(fp, "SUB_TITLE=%s\n", param->subTitle);
     fprintf(fp, "DETAIL=%s\n", param->detail);
@@ -775,7 +763,7 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     }
 #endif
 
-    FILE* fp = fopen(sfo_path, "rb");
+    FILE* fp = ps3_strict_fs_fopen(sfo_path, "rb");
     if (!fp) return;
 
     char line[2048];
@@ -849,18 +837,18 @@ static s32 savedata_execute(const char* dirName, int is_save,
         HOST_STAT_T hst;
         if (HOST_STAT(save_path, &hst) == 0) {
 #ifdef _WIN32
-            statGet.dir.st_atime = (s64)hst.st_atime;
-            statGet.dir.st_mtime = (s64)hst.st_mtime;
-            statGet.dir.st_ctime = (s64)hst.st_ctime;
+            statGet.dir.guest_atime = (s64)hst.st_atime;
+            statGet.dir.guest_mtime = (s64)hst.st_mtime;
+            statGet.dir.guest_ctime = (s64)hst.st_ctime;
 #elif defined(__APPLE__)
 /* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
-            statGet.dir.st_atime = (s64)hst.st_atimespec.tv_sec;
-            statGet.dir.st_mtime = (s64)hst.st_mtimespec.tv_sec;
-            statGet.dir.st_ctime = (s64)hst.st_ctimespec.tv_sec;
+            statGet.dir.guest_atime = (s64)hst.st_atimespec.tv_sec;
+            statGet.dir.guest_mtime = (s64)hst.st_mtimespec.tv_sec;
+            statGet.dir.guest_ctime = (s64)hst.st_ctimespec.tv_sec;
 #else
-            statGet.dir.st_atime = (s64)hst.st_atim.tv_sec;
-            statGet.dir.st_mtime = (s64)hst.st_mtim.tv_sec;
-            statGet.dir.st_ctime = (s64)hst.st_ctim.tv_sec;
+            statGet.dir.guest_atime = (s64)hst.st_atim.tv_sec;
+            statGet.dir.guest_mtime = (s64)hst.st_mtim.tv_sec;
+            statGet.dir.guest_ctime = (s64)hst.st_ctim.tv_sec;
 #endif
         }
         read_param_sfo(save_path, &statGet.getParam);
@@ -1259,6 +1247,7 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
 
 s32 cellSaveDataDelete2(u32 container)
 {
+    ps3_strict_fs_unimplemented("cellSaveDataDelete2", "<save selection>");
     printf("[cellSaveData] Delete2(container=%u)\n", container);
 
     /* Without a directory name we can't delete anything meaningful.
@@ -1390,6 +1379,7 @@ s32 cellSaveDataDelete(u32 version, const char* dirName,
     dirName = savedata_host_str(dirName);
     printf("[cellSaveData] Delete(dir='%s', container=%u)\n",
            dirName ? dirName : "<null>", container);
+    ps3_strict_fs_unimplemented("cellSaveDataDelete", dirName);
     return CELL_OK;
 }
 

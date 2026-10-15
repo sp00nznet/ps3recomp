@@ -119,6 +119,40 @@ typedef struct CellGameSetInitParams {
     char reserved1[66];
 } CellGameSetInitParams;
 
+/* Guest ABI layout verified against RPCS3 4d5def5880217135554ed434cd5055cceebe9cc2.
+ * Integer members are big endian in guest memory; use vm_read/write accessors. */
+typedef struct CellGameDataSystemFileParam {
+    char title[128];
+    char titleLang[20][128];
+    char titleId[10];
+    char reserved0[2];
+    char dataVersion[6];
+    char reserved1[2];
+    u32 parentalLevel, attribute, resolution, soundFormat;
+    char reserved2[248];
+} CellGameDataSystemFileParam;
+typedef struct CellGameDataStatGet {
+    s32 hddFreeSizeKB;
+    u32 isNewData;
+    char contentInfoPath[1055];
+    char gameDataPath[1055];
+    char reserved0[2];
+    s64 st_atime_, st_mtime_, st_ctime_;
+    CellGameDataSystemFileParam getParam;
+    s32 sizeKB, sysSizeKB;
+    char reserved1[68];
+} CellGameDataStatGet;
+typedef struct CellGameDataStatSet { u32 setParam, reserved; } CellGameDataStatSet;
+typedef struct CellGameDataCBResult {
+    s32 result, errNeedSizeKB;
+    u32 invalidMsg, reserved;
+} CellGameDataCBResult;
+
+#define CELL_GAMEDATA_ERROR_CBRESULT     ((s32)0x8002b601)
+#define CELL_GAMEDATA_ERROR_ACCESS_ERROR ((s32)0x8002b602)
+#define CELL_GAMEDATA_ERROR_PARAM        ((s32)0x8002b604)
+#define CELL_GAMEDATA_ERROR_BROKEN       ((s32)0x8002b606)
+
 /* ---------------------------------------------------------------------------
  * Configuration (call before game boots)
  * -----------------------------------------------------------------------*/

@@ -51,6 +51,21 @@ static void write_be32(uint32_t addr, uint32_t val)
     *p = val;
 }
 
+static int valid_u32_output(uint32_t addr)
+{
+    if (!VM_READY || !addr || addr > UINT32_MAX - 3 ||
+        !vm_is_valid_addr(addr) || !vm_is_valid_addr(addr + 3)) return 0;
+#ifdef _WIN32
+    for (uint32_t offset = 0; offset <= 3; offset += 3) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery(vm_to_host(addr + offset), &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & PAGE_GUARD) || !(info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) return 0;
+    }
+#endif
+    return 1;
+}
+
 /* ---------------------------------------------------------------------------
  * sys_memory_allocate
  *
@@ -142,16 +157,66 @@ int64_t sys_memory_allocate(ppu_context* ctx)
 int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
-
+    bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
-            s_total_allocated -= g_sys_mem_allocs[i].size;
+            int32_t cid = g_sys_mem_allocs[i].container_id;
+            if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX)
+                g_sys_mem_containers[cid - 1].used_size -= g_sys_mem_allocs[i].size;
+            else
+                s_total_allocated -= g_sys_mem_allocs[i].size;
             g_sys_mem_allocs[i].active = 0;
+            bump_unlock();
             return CELL_OK;
         }
     }
-
+    bump_unlock();
     return (int64_t)(int32_t)CELL_EINVAL;
+}
+
+/* LV2 350: (u64 size, u32 container_id, u64 flags, u32* address).
+ * Verified against RPCS3 4d5def58 lv2.cpp and sys_memory.cpp. The container
+ * owns a budget; this call commits real guest pages and charges that budget
+ * only after commit succeeds. Flat-VM placement uses our existing user pool. */
+int64_t sys_memory_allocate_from_container(ppu_context* ctx)
+{
+    uint64_t size = LV2_ARG_U64(ctx, 0);
+    uint32_t cid = LV2_ARG_U32(ctx, 1);
+    uint64_t flags = LV2_ARG_U64(ctx, 2);
+    uint32_t out = LV2_ARG_PTR(ctx, 3);
+    uint32_t align = (flags == 0 || flags == SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000 :
+                     flags == SYS_MEMORY_PAGE_SIZE_64K ? 0x10000 : 0;
+    if (!size) return (int64_t)(int32_t)CELL_EALIGN;
+    if (!align) return (int64_t)(int32_t)CELL_EINVAL;
+    if (size % align) return (int64_t)(int32_t)CELL_EALIGN;
+    if (!valid_u32_output(out))
+        return (int64_t)(int32_t)CELL_EFAULT;
+    bump_lock();
+    if (!cid || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    sys_mem_container_info* c = &g_sys_mem_containers[cid - 1];
+    if (size > UINT32_MAX || c->used_size > c->total_size || size > c->total_size - c->used_size) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+    uint64_t base = g_sys_mem_bump_ptr ? g_sys_mem_bump_ptr : SYS_MEM_ALLOC_BASE;
+    base = (base + align - 1) & ~((uint64_t)align - 1);
+    int slot = -1;
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++)
+        if (!g_sys_mem_allocs[i].active) { slot = i; break; }
+    if (slot < 0 || base < SYS_MEM_ALLOC_BASE || base + size > SYS_MEM_ALLOC_END) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+    int32_t rc = vm_commit((uint32_t)base, (uint32_t)size);
+    if (rc != CELL_OK) { bump_unlock(); return (int64_t)(int32_t)rc; }
+    sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
+    a->addr = (uint32_t)base; a->size = (uint32_t)size;
+    a->container_id = (int32_t)cid; a->page_size = align; a->active = 1;
+    g_sys_mem_bump_ptr = (uint32_t)(base + size);
+    c->used_size += (uint32_t)size;
+    write_be32(out, (uint32_t)base);
+    bump_unlock();
+    return CELL_OK;
 }
 
 /* ---------------------------------------------------------------------------
@@ -226,24 +291,37 @@ int64_t sys_memory_get_page_attribute(ppu_context* ctx)
 int64_t sys_memory_container_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
-    uint32_t size        = LV2_ARG_U32(ctx, 1);
+    uint64_t requested   = LV2_ARG_U64(ctx, 1) & ~UINT64_C(0xfffff);
+    if (!requested || requested > SYS_MEM_USER_TOTAL)
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    if (!valid_u32_output(id_out_addr))
+        return (int64_t)(int32_t)CELL_EFAULT;
+    uint32_t size = (uint32_t)requested;
+    bump_lock();
+    if (s_total_allocated > SYS_MEM_USER_TOTAL || size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_CONTAINER_MAX; i++) {
         if (!g_sys_mem_containers[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 
     sys_mem_container_info* c = &g_sys_mem_containers[slot];
     c->active     = 1;
     c->total_size = size;
     c->used_size  = 0;
+    s_total_allocated += size;
 
     uint32_t container_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, container_id);
     }
+    bump_unlock();
 
     return CELL_OK;
 }
@@ -261,10 +339,15 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
-    if (!c->active)
+    bump_lock();
+    if (!c->active) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
-
+    }
+    if (c->used_size) { bump_unlock(); return (int64_t)(int32_t)CELL_EBUSY; }
+    s_total_allocated -= c->total_size;
     c->active = 0;
+    bump_unlock();
     return CELL_OK;
 }
 
@@ -276,20 +359,23 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_get_size(ppu_context* ctx)
 {
-    uint32_t container_id = LV2_ARG_U32(ctx, 0);
-    uint32_t out_addr     = LV2_ARG_PTR(ctx, 1);
+    uint32_t out_addr     = LV2_ARG_PTR(ctx, 0);
+    uint32_t container_id = LV2_ARG_U32(ctx, 1);
 
     if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
+    if (out_addr > UINT32_MAX - 7 || !valid_u32_output(out_addr) || !valid_u32_output(out_addr + 4))
+        return (int64_t)(int32_t)CELL_EFAULT;
 
     sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
-    if (!c->active)
+    bump_lock();
+    if (!c->active) {
+        bump_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
-
-    if (out_addr != 0) {
-        write_be32(out_addr + 0, c->total_size);
-        write_be32(out_addr + 4, c->used_size);
     }
+    write_be32(out_addr + 0, c->total_size);
+    write_be32(out_addr + 4, c->total_size - c->used_size);
+    bump_unlock();
 
     return CELL_OK;
 }
@@ -500,6 +586,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
     s_total_allocated  = 0;
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
+    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER, sys_memory_allocate_from_container);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);
     lv2_syscall_register(tbl, SYS_MEMORY_GET_USER_MEMORY_SIZE, sys_memory_get_user_memory_size);
     lv2_syscall_register(tbl, SYS_MEMORY_GET_PAGE_ATTRIBUTE,   sys_memory_get_page_attribute);
@@ -510,6 +597,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MMAPPER_FREE_ADDRESS,        sys_mmapper_free_address);
     lv2_syscall_register(tbl, SYS_MMAPPER_ALLOCATE_SHARED_MEMORY, sys_mmapper_allocate_shared_memory);
     lv2_syscall_register(tbl, SYS_MMAPPER_MAP_SHARED_MEMORY,  sys_mmapper_map_shared_memory);
-    lv2_syscall_register(tbl, 341, sys_mmapper_allocate_memory);
-    lv2_syscall_register(tbl, 342, sys_mmapper_allocate_memory_from_container);
+    /* Retail aliases, not mmapper calls: verified pinned RPCS3 lv2.cpp. */
+    lv2_syscall_register(tbl, 341, sys_memory_container_create);
+    lv2_syscall_register(tbl, 342, sys_memory_container_destroy);
 }
