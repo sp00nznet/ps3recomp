@@ -536,6 +536,7 @@ if(UNIX)
             runtime/ppu/ppu_loader.cpp
             runtime/ppu/ppu_hle.cpp
             runtime/ppu/ppu_fs.cpp
+            runtime/ppu/ppu_fs_aio_engine.cpp
             runtime/ppu/ppu_sysprx.cpp
             "${SMOKE_GEN}/ppu_hle_nids.cpp"
             "${SMOKE_GEN}/ppu_recomp.h"

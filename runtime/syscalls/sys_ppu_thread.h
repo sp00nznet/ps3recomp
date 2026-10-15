@@ -89,6 +89,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx);
  * Call before the first sys_ppu_thread_create so no created thread aliases
  * main (thread_id 0 broke every owner-tracking sync primitive). */
 uint64_t ppu_thread_register_main(void);
+/* Internal host callback worker attachment. Context storage remains stable in
+ * the real thread table. Called only by ppu_callback_worker; bytes include TLS. */
+void* ppu_thread_callback_attach(uint32_t stack_bytes, uint32_t tls_bytes,
+                                 uint32_t* stack_base, uint32_t* tls_base);
+int ppu_thread_callback_detach(void* context);
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

@@ -24,6 +24,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <mutex>
+#include <atomic>
+#include "ppu_callback_worker.h"
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -801,8 +804,10 @@ extern "C" void spu_coh_notify_write(uint32_t addr);
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) */
 #define PPU_RESV_MAX 128
 #define PPU_RESV_INVALID 0x100000000ull   /* out of (uint32_t) ea range */
-static ppu_context* g_resv_ctxs[PPU_RESV_MAX];
-static volatile LONG g_resv_ctx_n = 0;
+/* A claimed slot can be observed before registration finishes. Null remains
+ * safe until the fully initialized stable context is release-published. */
+static std::atomic<ppu_context*> g_resv_ctxs[PPU_RESV_MAX]{};
+static std::atomic<LONG> g_resv_ctx_n{0};
 /* Sharded by address: a single global lock convoyed all stwcx (workers spinning
  * on a descheduled holder -> loader too slow to finish jobs). Shard by the
  * 16-byte-block of ea so unrelated structures never serialize; same-structure
@@ -819,8 +824,8 @@ extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
 extern "C" void ppu_resv_register(ppu_context* c)
 {
     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
-    long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
-    if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
+    long i = g_resv_ctx_n.fetch_add(1,std::memory_order_relaxed);
+    if (i >= 0 && i < PPU_RESV_MAX) g_resv_ctxs[i].store(c,std::memory_order_release);
 }
 /* Where every guest thread is, as a GUEST address.
  *
@@ -847,9 +852,9 @@ extern "C" void ppu_resv_register(ppu_context* c)
  * last DIRECT call site and nothing more. */
 extern "C" void ppu_report_guest_lrs(void)
 {
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = g_resv_ctx_n.load(std::memory_order_acquire); if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
-        ppu_context* c = g_resv_ctxs[i];
+        ppu_context* c = g_resv_ctxs[i].load(std::memory_order_acquire);
         if (!c) continue;
         fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
@@ -872,9 +877,9 @@ extern "C" void ppu_report_guest_lrs(void)
 extern "C" void ppu_resv_break_store(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea & ~3u;
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = g_resv_ctx_n.load(std::memory_order_acquire); if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
-        ppu_context* c = g_resv_ctxs[i];
+        ppu_context* c = g_resv_ctxs[i].load(std::memory_order_acquire);
         if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & ~3u) == a)
             c->reserve_addr = PPU_RESV_INVALID;
     }
@@ -885,9 +890,9 @@ static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
 static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 {
     uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = g_resv_ctx_n.load(std::memory_order_acquire); if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
-        ppu_context* c = g_resv_ctxs[i];
+        ppu_context* c = g_resv_ctxs[i].load(std::memory_order_acquire);
         if (c && c->reserve_addr == a) c->reserve_addr = PPU_RESV_INVALID;
     }
 }
@@ -897,13 +902,13 @@ static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 static inline int resv_diag() { static int v = -1; if (v < 0) v = getenv("RESV_DIAG") ? 1 : 0; return v; }
 static void resv_check_reg(ppu_context* self)
 {
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
-    for (long i = 0; i < n; i++) if (g_resv_ctxs[i] == self) return;
+    long n = g_resv_ctx_n.load(std::memory_order_acquire); if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) if (g_resv_ctxs[i].load(std::memory_order_acquire) == self) return;
     static ppu_context* seen[64]; static long sn = 0;
     for (long i = 0; i < sn; i++) if (seen[i] == self) return;
     if (sn < 64) seen[sn++] = self;
     fprintf(stderr, "[RESV-UNREG] stwcx/stdcx by UNREGISTERED ctx=%p tid=%llu (n_reg=%ld)\n",
-            (void*)self, (unsigned long long)self->thread_id, g_resv_ctx_n);
+            (void*)self, (unsigned long long)self->thread_id, (long)g_resv_ctx_n.load(std::memory_order_acquire));
     fflush(stderr);
 }
 
@@ -3613,10 +3618,286 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* Dedicated host callback workers. The registry owns context storage, so the
+ * reservation registry never retains a pointer to a destroyed host stack. */
+extern "C" void* ppu_thread_callback_attach(uint32_t, uint32_t, uint32_t*, uint32_t*);
+extern "C" int ppu_thread_callback_detach(void*);
+static std::mutex s_callback_mutex;
+static bool s_callback_closed = false;
+static unsigned s_callback_workers = 0;
+static bool s_callback_resv_registered[64] = {};
+struct PpuCallbackWorker {
+    ppu_context* ctx;
+    ppu_context* previous;
+    void (*previous_trampoline)(void*);
+    uint8_t* vm;
+    uint32_t vm_size, stack_base, stack_top, tls;
+    unsigned depth;
+    bool failed;
+};
+static PPU_THREAD_LOCAL PpuCallbackWorker s_callback_worker = {};
+static PPU_THREAD_LOCAL unsigned s_current_callback_depth = 0;
+
+static bool callback_copy_guest(void* dst, uint32_t ea, size_t size)
+{
+    uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    if (!vm_base || ea < 0x10000 || (uint64_t)ea + size > limit) return false;
+    if (!size) return true;
+#ifdef _WIN32
+    SIZE_T done = 0;
+    return ReadProcessMemory(GetCurrentProcess(), vm_base + ea, dst, size, &done) && done == size;
+#else
+    /* A local pipe asks the kernel to read the source: inaccessible mappings
+     * return EFAULT instead of crashing the host. Small writes cannot fill it. */
+    int fds[2];
+    if (pipe(fds) != 0) return false;
+    size_t done = 0;
+    while (done < size) {
+        size_t n = size - done;
+        if (n > 256) n = 256;
+        ssize_t wrote = write(fds[1], vm_base + ea + done, n);
+        if (wrote != (ssize_t)n) break;
+        ssize_t got = read(fds[0], (uint8_t*)dst + done, n);
+        if (got != (ssize_t)n) break;
+        done += n;
+    }
+    close(fds[0]); close(fds[1]);
+    return done == size;
+#endif
+}
+
+extern "C" int ppu_callback_workers_quiesce(void)
+{
+    std::lock_guard<std::mutex> lock(s_callback_mutex);
+    s_callback_closed = true;
+    return s_callback_workers ? -1 : 0;
+}
+extern "C" int ppu_callback_workers_resume(void)
+{
+    std::lock_guard<std::mutex> lock(s_callback_mutex);
+    if (s_callback_workers || !vm_base) return -1;
+    s_callback_closed = false;
+    return 0;
+}
+extern "C" int ppu_callback_worker_enter_with_tls(uint32_t image, uint32_t filesz, uint32_t memsz)
+{
+    std::lock_guard<std::mutex> lock(s_callback_mutex);
+    if (s_callback_closed || s_callback_worker.ctx || g_active_ctx || !vm_base ||
+        !memsz || filesz > memsz) return -1;
+    const uint32_t pg = vm_host_page_size();
+    const uint32_t stack_bytes = (0x100000u + pg - 1) & ~(pg - 1);
+    uint64_t tls_bytes64 = ((uint64_t)memsz + 0x7000u + pg - 1) & ~(uint64_t)(pg - 1);
+    if (tls_bytes64 > UINT32_MAX || tls_bytes64 + stack_bytes > UINT32_MAX) return -1;
+    uint32_t base = 0, tls_base = 0;
+    ppu_context* ctx = (ppu_context*)ppu_thread_callback_attach(stack_bytes, (uint32_t)tls_bytes64,
+                                                               &base, &tls_base);
+    if (!ctx) return -1;
+    if (filesz && (uint64_t)image < (uint64_t)tls_base + tls_bytes64 &&
+        (uint64_t)image + filesz > base) {
+        ppu_thread_callback_detach(ctx); return -1;
+    }
+    /* Initialize the complete owned block, including the ABI thread-pointer
+     * bias, and copy only the ELF's initialization bytes. No live TLS is shared. */
+    memset(vm_base + tls_base, 0, (size_t)tls_bytes64);
+    if (filesz && !callback_copy_guest(vm_base + tls_base, image, filesz)) {
+        ppu_thread_callback_detach(ctx); return -1;
+    }
+    ctx->gpr[1] = ((uint64_t)base + stack_bytes - 0x200u) & ~UINT64_C(15);
+    ctx->gpr[13] = tls_base + 0x7000u;
+    ctx->reserve_addr = PPU_RESV_INVALID;
+    unsigned slot = (unsigned)ctx->thread_id - 1;
+    if (slot >= 64) { ppu_thread_callback_detach(ctx); return -1; }
+    if (!s_callback_resv_registered[slot]) {
+        ppu_resv_register(ctx);
+        bool registered=false;
+        for(unsigned i=0;i<PPU_RESV_MAX;++i)
+            if(g_resv_ctxs[i].load(std::memory_order_acquire)==ctx) {registered=true;break;}
+        if(!registered) {ppu_thread_callback_detach(ctx);return -1;}
+        s_callback_resv_registered[slot] = true;
+    }
+    s_callback_worker = {ctx, g_active_ctx, g_trampoline_fn, vm_base, ppu_vm_size,
+                         base, base + stack_bytes, tls_base + 0x7000u, 0, false};
+    g_active_ctx = ctx;
+    g_trampoline_fn = nullptr;
+    ++s_callback_workers;
+    return 0;
+}
+extern "C" int ppu_callback_worker_enter(void)
+{
+    return ppu_callback_worker_enter_with_tls(g_tls_vaddr, g_tls_filesz, g_tls_memsz);
+}
+extern "C" int ppu_callback_worker_leave(void)
+{
+    std::lock_guard<std::mutex> lock(s_callback_mutex);
+    PpuCallbackWorker& w = s_callback_worker;
+    if (!w.ctx || w.depth || s_current_callback_depth) return -1;
+    g_active_ctx = w.previous;
+    g_trampoline_fn = w.previous_trampoline;
+    if (ppu_thread_callback_detach(w.ctx) != 0) return -1;
+    w = {};
+    --s_callback_workers;
+    return 0;
+}
+extern "C" int ppu_callback_worker_resolve(uint32_t opd, uint32_t* code, uint32_t* toc)
+{
+    std::lock_guard<std::mutex> lock(s_callback_mutex);
+    if ((s_callback_closed && !s_callback_worker.ctx && !s_current_callback_depth) ||
+        !code || !toc || (opd & 3)) return -1;
+    uint8_t bytes[8];
+    if (!callback_copy_guest(bytes, opd, sizeof(bytes))) return -1;
+    uint32_t c = ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+                 ((uint32_t)bytes[2] << 8) | bytes[3];
+    uint32_t t = ((uint32_t)bytes[4] << 24) | ((uint32_t)bytes[5] << 16) |
+                 ((uint32_t)bytes[6] << 8) | bytes[7];
+    if (!c || !ppu_lookup(c)) return -1;
+    *code = c; *toc = t;
+    return 0;
+}
+struct PpuCallbackExit {};
+extern "C" void ppu_callback_worker_guest_exit(void) { throw PpuCallbackExit(); }
+
+/* Reuse the registry context for nested calls. Its parent guest frame lies
+ * above the current SP; reserve a fresh ABI frame below it. Never reset nested
+ * calls to the worker stack top. Restore all parent registers on every exit. */
+struct PpuCallbackFrame {
+    ppu_context saved;
+    ppu_context* active;
+    void (*trampoline)(void*);
+    PpuCallbackWorker& worker;
+    PpuCallbackFrame(PpuCallbackWorker& w) : saved(*w.ctx), active(g_active_ctx),
+        trampoline(g_trampoline_fn), worker(w) { ++w.depth; }
+    ~PpuCallbackFrame() {
+        *worker.ctx = saved;
+        worker.ctx->reserve_addr = PPU_RESV_INVALID;
+        g_active_ctx = active;
+        g_trampoline_fn = trampoline;
+        --worker.depth;
+    }
+};
+static int callback_invoke(PpuCallbackWorker& w, uint32_t code, uint32_t toc,
+                           const uint64_t args[8], uint64_t* result)
+{
+    if (!w.ctx || w.failed || !args || !result || vm_base != w.vm || ppu_vm_size != w.vm_size)
+        return -1;
+    ppu_fn fn = ppu_lookup(code);
+    uint64_t parent_sp = w.depth ? w.ctx->gpr[1] : w.stack_top;
+    if (!fn || parent_sp > w.stack_top || parent_sp < (uint64_t)w.stack_base + 0x400u)
+        return -1;
+    uint64_t copied_args[8];
+    memcpy(copied_args, args, sizeof(copied_args));
+    PpuCallbackFrame frame(w);
+    memset(w.ctx, 0, sizeof(*w.ctx));
+    w.ctx->thread_id = frame.saved.thread_id;
+    w.ctx->gpr[1] = (parent_sp - 0x200u) & ~UINT64_C(15);
+    w.ctx->gpr[2] = toc;
+    w.ctx->gpr[13] = w.tls;
+    w.ctx->cia = code;
+    w.ctx->reserve_addr = PPU_RESV_INVALID;
+    for (unsigned i = 0; i < 8; ++i) w.ctx->gpr[3 + i] = copied_args[i];
+    memset(vm_base + w.ctx->gpr[1], 0, 0x200);
+    g_active_ctx = w.ctx;
+    g_trampoline_fn = nullptr;
+    try {
+        fn(w.ctx);
+        while (g_trampoline_fn) {
+            void (*next)(void*) = g_trampoline_fn;
+            g_trampoline_fn = nullptr;
+            next(w.ctx);
+        }
+        *result = w.ctx->gpr[3];
+        return 0;
+    } catch (...) {
+        w.failed = true;
+        return -1;
+    }
+}
+extern "C" int ppu_callback_worker_call_resolved(uint32_t code, uint32_t toc,
+                                                 const uint64_t args[8], uint64_t* result)
+{
+    return callback_invoke(s_callback_worker, code, toc, args, result);
+}
+extern "C" int ppu_callback_dispatch_active(void)
+{
+    return s_callback_worker.depth || s_current_callback_depth;
+}
+static bool callback_prepare_current_frame(uint32_t ea)
+{
+    uint8_t zeros[512] = {};
+    uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    if (!vm_base || ea < 0x10000 || (uint64_t)ea + sizeof(zeros) > limit) return false;
+#ifdef _WIN32
+    uintptr_t p = (uintptr_t)(vm_base + ea), end = p + sizeof(zeros);
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION m;
+        if (!VirtualQuery((void*)p, &m, sizeof(m)) || m.State != MEM_COMMIT ||
+            (m.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            !(m.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            return false;
+        uintptr_t next = (uintptr_t)m.BaseAddress + m.RegionSize;
+        if (next <= p) return false;
+        p = next;
+    }
+    SIZE_T done = 0;
+    return WriteProcessMemory(GetCurrentProcess(), vm_base + ea, zeros, sizeof(zeros), &done) && done == sizeof(zeros);
+#else
+    int fds[2];
+    if (pipe(fds) != 0) return false;
+    size_t done = 0;
+    while (done < sizeof(zeros)) {
+        if (write(fds[1], zeros, 256) != 256 || read(fds[0], vm_base + ea + done, 256) != 256) break;
+        done += 256;
+    }
+    close(fds[0]); close(fds[1]);
+    return done == sizeof(zeros);
+#endif
+}
+extern "C" int ppu_callback_call_current(ppu_context* caller, uint32_t code, uint32_t toc,
+                                          const uint64_t args[8], uint64_t* result)
+{
+    if (!caller || caller != g_active_ctx || !caller->thread_id || !caller->gpr[13] ||
+        !args || !result || !ppu_lookup(code)) return -1;
+    /* A synchronous callback also holds a VM lease until all restoration is
+     * finished. Quiesce cannot report safe teardown while it is executing. */
+    {
+        std::lock_guard<std::mutex> lock(s_callback_mutex);
+        if (s_callback_closed && !s_callback_worker.ctx && !s_current_callback_depth) return -1;
+        ++s_callback_workers;
+    }
+    struct Lease {
+        ~Lease() { std::lock_guard<std::mutex> lock(s_callback_mutex); --s_callback_workers; }
+    } lease;
+    uint64_t sp = caller->gpr[1];
+    uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    if ((sp & 15) || sp < 0x10400 || sp >= limit ||
+        !callback_prepare_current_frame((uint32_t)(sp - 512))) return -1;
+    PpuCallbackWorker borrowed = {caller, nullptr, nullptr, vm_base, ppu_vm_size,
+                                  0x10000, (uint32_t)sp, (uint32_t)caller->gpr[13], 1, false};
+    struct DepthGuard {
+        DepthGuard() { ++s_current_callback_depth; }
+        ~DepthGuard() { --s_current_callback_depth; }
+    } depth;
+    return callback_invoke(borrowed, code, toc, args, result);
+}
+extern "C" int ppu_callback_worker_call(uint32_t opd, const uint64_t args[8], uint64_t* result)
+{
+    uint32_t code = 0, toc = 0;
+    if (ppu_callback_worker_resolve(opd, &code, &toc) != 0) return -1;
+    return ppu_callback_worker_call_resolved(code, toc, args, result);
+}
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
+    if (s_callback_worker.ctx || s_current_callback_depth) {
+        const uint64_t args[8] = {a0,a1,a2,a3,a4,a5,a6,a7};
+        uint64_t result = 0;
+        uint32_t code = 0, toc = 0;
+        int rc = ppu_callback_worker_resolve(opd_addr, &code, &toc);
+        if (!rc) rc = s_callback_worker.ctx ? ppu_callback_worker_call_resolved(code,toc,args,&result)
+                                            : ppu_callback_call_current(g_active_ctx,code,toc,args,&result);
+        if (rc) { ppu_strict_boot_guard("callback-dispatch-failed",g_active_ctx,"opd",opd_addr); throw PpuCallbackExit(); }
+        return result;
+    }
     if (!opd_addr) {
         ppu_strict_boot_guard("null-guest-callback", g_active_ctx, "opd", opd_addr);
         return 0;
@@ -3684,6 +3965,14 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
                                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                       uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
+    if (s_callback_worker.ctx || s_current_callback_depth) {
+        const uint64_t args[8] = {a0,a1,a2,a3,a4,a5,a6,a7};
+        uint64_t result = 0;
+        int rc = s_callback_worker.ctx ? ppu_callback_worker_call_resolved(code,toc,args,&result)
+                                      : ppu_callback_call_current(g_active_ctx,code,toc,args,&result);
+        if (rc) { ppu_strict_boot_guard("callback-dispatch-failed",g_active_ctx,"code",code); throw PpuCallbackExit(); }
+        return result;
+    }
     if (!code) {
         ppu_strict_boot_guard("null-guest-callback", g_active_ctx, "target", code);
         return 0;
@@ -3725,8 +4014,29 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
 
 extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 
+/* Reservation readers retain registered addresses for the process lifetime.
+ * Give every entry invocation its own bounded stable slot rather than reusing
+ * or destroying a context that another guest/AIO thread can still inspect. */
+static ppu_context s_main_contexts[PPU_RESV_MAX];
+static unsigned s_main_context_count;
+static std::atomic_flag s_main_run_active = ATOMIC_FLAG_INIT;
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
+    if(s_main_run_active.test_and_set(std::memory_order_acquire)) {
+        fprintf(stderr,"[ppu] overlapping/reentrant ppu_run rejected\n");return -1;
+    }
+    struct RestoreMainRun {
+        ppu_context* active=g_active_ctx;
+        ppu_context* main=g_ppu_main_ctx;
+        void (*trampoline)(void*)=g_trampoline_fn;
+        ~RestoreMainRun() {
+            g_active_ctx=active;
+            g_trampoline_fn=trampoline;
+            g_ppu_main_ctx=main;
+            s_main_run_active.clear(std::memory_order_release);
+        }
+    } restore_main_run;
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
      * (stderr); with a redirected block-buffered stdout, printf lines sat in
      * the buffer for minutes and were LOST when the run was killed -- which
@@ -3739,7 +4049,10 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] entry code 0x%08X not registered\n", code); return -1; }
 
-    ppu_context ctx;
+    if(s_main_context_count>=PPU_RESV_MAX || g_resv_ctx_n.load(std::memory_order_acquire)>=PPU_RESV_MAX) {
+        fprintf(stderr,"[ppu] stable main/reservation context capacity exhausted\n");return -1;
+    }
+    ppu_context& ctx=s_main_contexts[s_main_context_count++];
     memset(&ctx, 0, sizeof(ctx));
     ctx.gpr[1] = stack_top;   /* stack pointer */
     ctx.gpr[2] = toc;         /* TOC base (r2) */
@@ -3751,8 +4064,8 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * and concurrently-emitted fences vanished (the boot-loading stall). */
     { extern uint64_t ppu_thread_register_main(void);
       ctx.thread_id = ppu_thread_register_main(); }
-    /* For samplers on other threads (a port's periodic stack dump): the main
-     * thread's context lives on this frame, not in the thread table. */
+    /* Samplers and reservation readers can safely retain this stable address
+     * after entry returns. The published main pointer is scoped to this run. */
     g_ppu_main_ctx = &ctx;
 
     /* PS3 process-entry ABI: the loader hands _start register state the CRT
@@ -3862,7 +4175,14 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     }
     fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, stack_top);
     g_active_ctx = &ctx;
+    g_trampoline_fn = nullptr;
     ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
+    bool registered=false;
+    for(unsigned i=0;i<PPU_RESV_MAX;++i)
+        if(g_resv_ctxs[i].load(std::memory_order_acquire)==&ctx) {registered=true;break;}
+    if(!registered) {
+        fprintf(stderr,"[ppu] main reservation registration failed\n");return -1;
+    }
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
     return 0;

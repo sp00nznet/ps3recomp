@@ -39,6 +39,7 @@ set(PPU_GLUE
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs_aio_engine.cpp"
 )
 
 add_executable(torture

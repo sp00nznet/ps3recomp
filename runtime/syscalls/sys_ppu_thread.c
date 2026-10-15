@@ -16,6 +16,7 @@
 #endif
 static PPU_TLS jmp_buf s_exit_jmp;
 static PPU_TLS int     s_exit_armed = 0;
+static PPU_TLS int     s_callback_slot = -1;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
@@ -44,11 +45,18 @@ static PPU_TLS int     s_exit_armed = 0;
 ppu_thread_info       g_ppu_threads[PPU_THREAD_MAX];
 vm_stack_alloc        g_vm_stack_alloc;
 ppu_thread_entry_fn   g_ppu_thread_entry_trampoline = NULL;
+static int s_callback_owned[PPU_THREAD_MAX]; /* protected by table_lock */
 
 /* Simple mutex for thread table access */
 #ifdef _WIN32
 static CRITICAL_SECTION s_table_lock;
-static int              s_table_lock_init = 0;
+static INIT_ONCE         s_table_lock_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK init_table_lock(PINIT_ONCE once, PVOID parameter, PVOID* context)
+{
+    (void)once; (void)parameter; (void)context;
+    InitializeCriticalSection(&s_table_lock);
+    return TRUE;
+}
 #else
 static pthread_mutex_t  s_table_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
@@ -56,10 +64,7 @@ static pthread_mutex_t  s_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static void table_lock(void)
 {
 #ifdef _WIN32
-    if (!s_table_lock_init) {
-        InitializeCriticalSection(&s_table_lock);
-        s_table_lock_init = 1;
-    }
+    InitOnceExecuteOnce(&s_table_lock_once, init_table_lock, NULL, NULL);
     EnterCriticalSection(&s_table_lock);
 #else
     pthread_mutex_lock(&s_table_lock);
@@ -241,6 +246,80 @@ uint64_t ppu_thread_register_main(void)
     }
     table_unlock();
     return 1;
+}
+
+/* Allocate through the same locked allocator as ordinary guest threads. The
+ * extra TLS bytes belong exclusively to this attachment, above its stack. */
+void* ppu_thread_callback_attach(uint32_t stack_bytes, uint32_t tls_bytes,
+                                 uint32_t* stack_base, uint32_t* tls_base)
+{
+    uint32_t pg = vm_host_page_size();
+    uint64_t total = (uint64_t)stack_bytes + tls_bytes;
+    uint64_t limit = ppu_vm_size ? ppu_vm_size : UINT64_C(0x100000000);
+    if (!vm_base || s_callback_slot >= 0 || !stack_base || !tls_base ||
+        !stack_bytes || !tls_bytes || stack_bytes % pg || tls_bytes % pg ||
+        total > UINT32_MAX - pg) return NULL;
+    table_lock();
+    /* Main must already have its reserved identity; an uninitialized or
+     * synthetic undersized allocator is rejected before touching guest VM. */
+    int slot = find_free_slot();
+    uint32_t allocation = g_vm_stack_alloc.next_addr;
+    if (slot <= 0 || g_ppu_threads[0].state == PPU_THREAD_STATE_FREE ||
+        allocation < 0x10000 || allocation % pg ||
+        (uint64_t)allocation + total + pg > g_vm_stack_alloc.region_end ||
+        (uint64_t)allocation + total + pg > limit) {
+        table_unlock(); return NULL;
+    }
+    /* Commit first so Windows can protect the guard. Failed allocations are
+     * consumed, not handed to a different thread with uncertain protection. */
+    uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, (uint32_t)total);
+    if (!base || vm_commit(allocation, (uint32_t)total + pg) != CELL_OK ||
+        vm_protect(allocation, pg, 0, 0, 0) != CELL_OK) {
+        table_unlock(); return NULL;
+    }
+    ppu_thread_info* t = &g_ppu_threads[slot];
+    memset(t, 0, sizeof(*t));
+    ppu_context_init(&t->ctx);
+    t->ctx.thread_id = (uint64_t)slot + 1;
+    t->stack_addr = base;
+    t->stack_size = stack_bytes;
+    t->tls_addr = (uint64_t)base + stack_bytes + 0x7000;
+    t->priority = 1000;
+    strncpy(t->name, "host-callback", sizeof(t->name) - 1);
+#ifdef _WIN32
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                         &t->host_thread, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        table_unlock(); return NULL;
+    }
+    t->host_tid = GetCurrentThreadId();
+#else
+    t->host_thread = pthread_self();
+#endif
+    t->state = PPU_THREAD_STATE_RUNNING;
+    s_callback_owned[slot] = 1;
+    s_callback_slot = slot;
+    *stack_base = base;
+    *tls_base = base + stack_bytes;
+    table_unlock();
+    return &t->ctx;
+}
+
+int ppu_thread_callback_detach(void* context)
+{
+    if (s_callback_slot < 0 || context != &g_ppu_threads[s_callback_slot].ctx)
+        return -1;
+    table_lock();
+    ppu_thread_info* t = &g_ppu_threads[s_callback_slot];
+    t->ctx.reserve_addr = UINT64_C(0x100000000);
+#ifdef _WIN32
+    CloseHandle(t->host_thread);
+    t->host_thread = NULL;
+#endif
+    t->state = PPU_THREAD_STATE_FREE;
+    s_callback_owned[s_callback_slot] = 0;
+    s_callback_slot = -1;
+    table_unlock();
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -509,6 +588,13 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_ppu_thread_exit(ppu_context* ctx)
 {
+    /* Callback execution is host-owned; guest exit must not free its slot or
+     * longjmp across the C++ callback restoration frames. */
+    extern int ppu_callback_dispatch_active(void);
+    if (s_callback_slot >= 0 || ppu_callback_dispatch_active()) {
+        extern void ppu_callback_worker_guest_exit(void);
+        ppu_callback_worker_guest_exit();
+    }
     uint64_t status = LV2_ARG_U64(ctx, 0);
     uint64_t tid = ctx->thread_id;
     fprintf(stderr, "[SYS] sys_ppu_thread_exit(tid=%llu status=%llu)\n",
@@ -649,6 +735,11 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
     if (!t) {
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
+    if (s_callback_owned[tid - 1]) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EINVAL;
     }
 
     if (t->state == PPU_THREAD_STATE_FINISHED) {
@@ -1285,12 +1376,6 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     /* Clear thread table */
     memset(g_ppu_threads, 0, sizeof(g_ppu_threads));
 
-#ifdef _WIN32
-    if (!s_table_lock_init) {
-        InitializeCriticalSection(&s_table_lock);
-        s_table_lock_init = 1;
-    }
-#endif
 
     lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_EXIT,                sys_ppu_thread_exit);

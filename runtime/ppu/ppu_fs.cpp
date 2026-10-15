@@ -16,6 +16,9 @@
  */
 #include "ppu_recomp.h"      /* ppu_context */
 #include "ppu_fs_memory.h"
+#include "ppu_fs_aio_engine.h"
+#include "ppu_callback_worker.h"
+#include "ppu_strict_boot.h"
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
@@ -26,6 +29,12 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <atomic>
+#include <algorithm>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <limits>
+#include <stdexcept>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
@@ -134,6 +143,23 @@ static bool fs_stat_guest_span(uint32_t ea, size_t length, bool writable)
         uintptr_t region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
         if (region_end <= current) return false;
         current = region_end;
+    }
+#else
+    /* Own-process mapping permissions, including PROT_NONE/readonly pages.
+     * This is a preflight check, not protection against concurrent remapping. */
+    uintptr_t current=(uintptr_t)(vm_base+ea),end=current+length;
+    if(end<current)return false;
+    if(length) {
+        FILE* maps=fopen("/proc/self/maps","r");if(!maps)return false;
+        char line[1024];bool allowed=false;
+        while(fgets(line,sizeof line,maps)) {
+            unsigned long long start=0,stop=0;char permissions[5]={};
+            if(sscanf(line,"%llx-%llx %4s",&start,&stop,permissions)!=3 || stop<=current)continue;
+            if(start>current || permissions[0]!='r' || (writable && permissions[1]!='w'))break;
+            current=(uintptr_t)std::min<uint64_t>(stop,end);
+            if(current==end) {allowed=true;break;}
+        }
+        fclose(maps);if(!allowed)return false;
     }
 #endif
     return true;
@@ -255,19 +281,46 @@ static void host_path(char* out, size_t cap, const char* guest, bool* truncated=
 
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
+/* Shared by sequential operations, descriptor retirement and AIO's absolute
+ * save/read/restore transaction. Accepted AIO retains the original stream even
+ * when the guest closes and reuses its descriptor number. */
+static std::recursive_mutex fs_files_mutex;
+struct FsFile {
+    FILE* stream;
+    uint32_t flags;
+    std::string mount;
+    FsFile(FILE* value,uint32_t mode,std::string identity)
+        :stream(value),flags(mode),mount(std::move(identity)) {}
+    ~FsFile() {if(stream)fclose(stream);}
+};
+static std::shared_ptr<FsFile> g_file_refs[FS_MAX];
 static FILE* g_files[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
-static int fd_alloc_file(FILE* f)
+static std::string fs_mount_identity(const char* guest)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
+    if(!guest || guest[0]!='/')return {};
+    const char* end=strchr(guest+1,'/');
+    const size_t length=end?(size_t)(end-guest):strlen(guest);
+    if(length<2 || length>31)return {};
+    return std::string(guest,length);
+}
+static int fd_alloc_file(FILE* f,const char* guest,uint32_t flags)
+{
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
+    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) {
+        try {g_file_refs[i]=std::make_shared<FsFile>(f,flags,fs_mount_identity(guest));}
+        catch(...) {return -1;}
+        g_files[i]=f;return i;
+    }
     return -1;
 }
 static int fd_alloc_dir(DIR* d)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_dirs[i] = d; return i; }
     return -1;
 }
@@ -275,6 +328,7 @@ static int fd_alloc_dir(DIR* d)
 /* ---- handlers ---- */
 static void cellFsOpen(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t flags  = (uint32_t)ctx->gpr[4];
@@ -348,7 +402,7 @@ static void cellFsOpen(ppu_context* ctx)
         close(hfd);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
-    int fd = fd_alloc_file(f);
+    int fd = fd_alloc_file(f,gpath,flags);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
@@ -392,6 +446,7 @@ static void cellFsOpen(ppu_context* ctx)
  * (gpr[6]) and its size (gpr[7]) are ignored. */
 static void cellFsSdataOpen(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
@@ -446,7 +501,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         }
         free(dec);
         rewind(tf);
-        int fd = fd_alloc_file(tf);
+        int fd = fd_alloc_file(tf,gpath,CELL_FS_O_RDONLY);
         if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
         fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
@@ -456,7 +511,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         ctx->gpr[3] = CELL_OK;
         return;
     }
-    int fd = fd_alloc_file(f);
+    int fd = fd_alloc_file(f,gpath,CELL_FS_O_RDONLY);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
@@ -466,12 +521,19 @@ static void cellFsSdataOpen(ppu_context* ctx)
 
 static void cellFsClose(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
-        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
+        const auto handle=g_file_refs[fd];
+        int result=0;
+        if(handle && (handle->flags&3u)!=CELL_FS_O_RDONLY)result=fflush(handle->stream);
+        g_files[fd] = nullptr; g_fd_usm[fd] = 0;g_file_refs[fd].reset();
+        if(result) {ctx->gpr[3]=(uint64_t)(int64_t)CELL_FS_STAT_EIO;return;}
+    } else {
+        ctx->gpr[3]=(uint64_t)(int64_t)(int32_t)0x8001002Au;return;
     }
     ctx->gpr[3] = CELL_OK;
 }
@@ -500,6 +562,7 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
 
 static void cellFsRead(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     int fd          = (int)(uint32_t)ctx->gpr[3];
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
@@ -570,6 +633,7 @@ static void cellFsRead(ppu_context* ctx)
 
 static void cellFsWrite(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     if (ps3_strict_fs_readonly()) ps3_strict_fs_fail("cellFsWrite", "<guest descriptor>", "readonly-mutation");
     int fd          = (int)(uint32_t)ctx->gpr[3];
 
@@ -635,6 +699,7 @@ static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t bl
 
 static void cellFsFGetBlockSize(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
@@ -669,6 +734,7 @@ static int64_t fs_tell64(FILE* file)
 }
 static void cellFsLseek(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     int fd        = (int)(uint32_t)ctx->gpr[3];
     int64_t off   = (int64_t)ctx->gpr[4];
     uint32_t wh   = (uint32_t)ctx->gpr[5];
@@ -753,6 +819,7 @@ static void cellFsStat(ppu_context* ctx)
 
 static void cellFsFstat(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     int fd      = (int)(uint32_t)ctx->gpr[3];
     uint32_t sb = (uint32_t)ctx->gpr[4];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001002Au; return; }
@@ -783,6 +850,7 @@ static void cellFsFstat(ppu_context* ctx)
 
 static void cellFsOpendir(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[4];
@@ -800,6 +868,7 @@ static void cellFsOpendir(ppu_context* ctx)
 /* CellFsDirent: d_type(1) d_namlen(1) d_name[256]; total 0x102. */
 static void cellFsReaddir(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     int fd          = (int)(uint32_t)ctx->gpr[3];
     uint32_t dirent = (uint32_t)ctx->gpr[4];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[5];
@@ -821,6 +890,7 @@ static void cellFsReaddir(ppu_context* ctx)
 
 static void cellFsClosedir(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (fd >= 0 && fd < FS_MAX && g_dirs[fd]) { closedir(g_dirs[fd]); g_dirs[fd] = nullptr; }
     ctx->gpr[3] = CELL_OK;
@@ -897,6 +967,7 @@ static void cellFsUnlink(ppu_context* ctx) {
 }
 static void cellFsFsync(ppu_context* ctx)
 {
+    std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) fflush(g_files[fd]);
     ctx->gpr[3] = CELL_OK;
@@ -905,92 +976,7 @@ static void cellFsFsync(ppu_context* ctx)
  * grow files on write, so accepting is correct -- no preallocation needed. */
 static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ps3_strict_fs_unimplemented("cellFsAllocateFileAreaWithoutZeroFill", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
 
-/* ---- cellFs AIO -----------------------------------------------------------
- *
- * Scott Pilgrim loads everything through cellFsAioRead: it opens gamedata.fat
- * with cellFsOpen and then never calls cellFsRead again. With the AIO NIDs
- * unresolved, its loader thread submitted requests that nothing ever completed
- * and the whole boot parked -- one open, no reads, and the main thread spinning.
- *
- * CellFsAio, big-endian, 0x28 bytes:
- *   0x00 u32 fd    0x08 u64 offset    0x10 u32 buf    0x18 u64 size    0x20 u64 user_data
- *
- * The completion callback is (CellFsAio* aio, s32 error, s32 id, u64 size).
- *
- * ponytail: the read runs synchronously and the callback fires before the
- * submit call returns. A title that submits, THEN arms the thing the callback
- * signals, would miss it -- move completion to a worker thread if one shows up.
- */
-#ifdef _WIN32
-#  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
-#else
-#  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
-#endif
-
-static uint32_t guest_be32(uint32_t a)
-{
-    if (ppu_vm_size && (uint64_t)a + 4 > ppu_vm_size) return 0;
-    return ((uint32_t)vm_base[a] << 24) | ((uint32_t)vm_base[a+1] << 16) |
-           ((uint32_t)vm_base[a+2] << 8) | (uint32_t)vm_base[a+3];
-}
-static uint64_t guest_be64(uint32_t a)
-{
-    return ((uint64_t)guest_be32(a) << 32) | guest_be32(a + 4);
-}
-
-static void cellFsAioInit(ppu_context* ctx)
-{
-    if(ps3_strict_fs_enabled()) {
-        char path[1025];
-        const uint32_t ea=(uint32_t)ctx->gpr[3];
-        const int32_t error=fs_stat_guest_path(path,ea);
-        fprintf(stderr,"[fs] aio init path='%s' path_ea=0x%08X path_result=0x%08X lr=0x%08llX tid=%llu\n",
-            error?"<invalid>":path,ea,(uint32_t)error,
-            (unsigned long long)ctx->lr,(unsigned long long)ctx->thread_id);
-        ps3_strict_fs_unimplemented("cellFsAioInit",error?"<invalid>":path);
-    }
-    ctx->gpr[3] = CELL_OK;
-}
-static void cellFsAioFinish(ppu_context* ctx) { ps3_strict_fs_unimplemented("cellFsAioFinish", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
-/* Nothing is ever outstanding, so a cancel has nothing to find. Real cellFs
- * answers CELL_FS_ENOENT for an unknown id and callers treat that as "already
- * done", which is exactly true here. */
-static void cellFsAioCancel(ppu_context* ctx) { ps3_strict_fs_unimplemented("cellFsAioCancel", "<guest filesystem operation>"); ctx->gpr[3] = CELL_OK; }
-
-static void cellFsAioRead(ppu_context* ctx)
-{
-    uint32_t aio    = (uint32_t)ctx->gpr[3];
-    uint32_t id_ptr = (uint32_t)ctx->gpr[4];
-    uint32_t cb_opd = (uint32_t)ctx->gpr[5];
-
-    int      fd     = (int)guest_be32(aio + 0x00);
-    uint64_t offset = guest_be64(aio + 0x08);
-    uint32_t buf    = guest_be32(aio + 0x10);
-    uint64_t size   = guest_be64(aio + 0x18);
-
-    static int32_t s_next_id = 1;
-    int32_t id = s_next_id++;
-    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
-
-    size_t n = 0;
-    int32_t err = CELL_FS_ENOENT;
-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
-        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
-        fs_prefault(buf, size);
-        /* AIO reads are absolute -- they do not disturb the fd's own file
-         * position, and the guest interleaves them freely across threads. */
-        if (HOST_FSEEK64(g_files[fd], offset) == 0)
-            n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
-        err = CELL_OK;
-    }
-    if (getenv("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
-                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
-
-    ctx->gpr[3] = CELL_OK;
-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
-}
+#include "ppu_fs_aio_bridge.h"
 
 extern "C" void ppu_fs_register(void)
 {
@@ -1022,4 +1008,5 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(0x9F951810u, "cellFsAioFinish", cellFsAioFinish);
     ps3_hle_register_ctx(0xC1C507E7u, "cellFsAioRead",   cellFsAioRead);
     ps3_hle_register_ctx(0x7F13FC8Cu, "cellFsAioCancel", cellFsAioCancel);
+    ps3_hle_register_ctx(0x0E2939E5u, "cellFsAioWrite", cellFsAioWrite);
 }
