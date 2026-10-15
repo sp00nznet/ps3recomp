@@ -21,7 +21,7 @@ extern "C" {
 
 #define CELL_PAD_MAX_PORT_NUM       7
 #define CELL_PAD_MAX_CODES          64
-#define CELL_MAX_PADS               CELL_PAD_MAX_PORT_NUM
+#define CELL_MAX_PADS               127
 
 /* Button bitmask constants (digital buttons, in button[2] low word) */
 #define CELL_PAD_CTRL_SELECT        (1 << 0)
@@ -70,8 +70,8 @@ extern "C" {
 /* Standard data lengths */
 #define CELL_PAD_LEN_NO_CHANGE          0
 #define CELL_PAD_LEN_CHANGE_DEFAULT     8
-#define CELL_PAD_LEN_CHANGE_PRESS_ON    24
-#define CELL_PAD_LEN_CHANGE_SENSOR_ON   28
+#define CELL_PAD_LEN_CHANGE_PRESS_ON    20
+#define CELL_PAD_LEN_CHANGE_SENSOR_ON   24
 
 /* Pressure-sensitive button offsets in button[] array */
 #define CELL_PAD_BTN_OFFSET_DIGITAL1    2
@@ -187,6 +187,9 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info);
 s32 cellPadSetPortSetting(u32 port_no, u32 port_setting);
 s32 cellPadInfoPressMode(u32 port_no);
 s32 cellPadSetPressMode(u32 port_no, u32 mode);
+/* NID: 0x78200559 / 0xBE5BE3BA */
+s32 cellPadInfoSensorMode(u32 port_no);
+s32 cellPadSetSensorMode(u32 port_no, u32 mode);
 
 /* NID: 0x578E3C98 */
 s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info);

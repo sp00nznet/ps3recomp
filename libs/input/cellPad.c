@@ -615,9 +615,9 @@ skip_inject: ;
 
     /* Determine data length based on port settings */
     s32 len = CELL_PAD_LEN_CHANGE_DEFAULT;
-    if (setting & CELL_PAD_SETTING_SENSOR_ON)
-        len = CELL_PAD_LEN_CHANGE_SENSOR_ON;
-    else if (setting & CELL_PAD_SETTING_PRESS_ON)
+    /* Neither host backend supplies motion samples. A requested SENSOR_ON
+     * setting cannot turn an ordinary input report into sensor data. */
+    if (setting & CELL_PAD_SETTING_PRESS_ON)
         len = CELL_PAD_LEN_CHANGE_PRESS_ON;
 
     data->len = len;
@@ -833,14 +833,7 @@ skip_inject: ;
                 data->button[pm[k].off] = 255;
     }
 
-    /* Sensor data (only meaningful if SENSOR_ON) */
-    if (setting & CELL_PAD_SETTING_SENSOR_ON) {
-        /* Default sensor values: accelerometer at rest (512 = 1g center) */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399; /* gravity */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
-    }
+    /* Unused sensor words remain zero and are outside the reported length. */
     }  /* end connected block */
 
 emit:
@@ -1013,7 +1006,6 @@ s32 cellPadGetInfo2(CellPadInfo2* info_guest)
             info->port_setting[i]      = s_port_setting[i];
             info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
                                        | CELL_PAD_CAPABILITY_PRESS_MODE
-                                       | CELL_PAD_CAPABILITY_SENSOR_MODE
                                        | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
                                        | CELL_PAD_CAPABILITY_ACTUATOR;
             info->device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
@@ -1068,7 +1060,6 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
             info->port_setting[i]      = s_port_setting[i];
             info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
                                        | CELL_PAD_CAPABILITY_PRESS_MODE
-                                       | CELL_PAD_CAPABILITY_SENSOR_MODE
                                        | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
                                        | CELL_PAD_CAPABILITY_ACTUATOR;
             info->device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
@@ -1140,6 +1131,39 @@ s32 cellPadSetPressMode(u32 port_no, u32 mode)
     return CELL_OK;
 }
 
+/* Sensor API behavior follows RPCS3 cellPad.cpp at
+ * 4d5def5880217135554ed434cd5055cceebe9cc2 (GPL-2.0-only).
+ * XInput and our current SDL backend expose no motion samples. Report that
+ * capability honestly until a real sensor backend is implemented. */
+s32 cellPadInfoSensorMode(u32 port_no)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_MAX_PADS)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (port_no >= s_max_connect || port_no >= PAD_MAX_HOST_PORTS)
+        return CELL_PAD_ERROR_NO_DEVICE;
+    pad_poll_backend();
+    pad_backend_lock();
+    int connected = s_host_state[port_no].connected;
+    pad_backend_unlock();
+    if (!connected)
+        return CELL_PAD_ERROR_NO_DEVICE;
+    return 0;
+}
+
+s32 cellPadSetSensorMode(u32 port_no, u32 mode)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_MAX_PADS || mode > 1)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    /* The SDK ignores valid slots outside the seven physical ports. */
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_OK;
+    return CELL_PAD_ERROR_UNSUPPORTED_GAMEPAD;
+}
+
 s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
 {
     if (!s_pad_initialized)
@@ -1155,7 +1179,6 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
     /* Report standard DualShock 3 capabilities */
     vm_write32(info_ea, CELL_PAD_CAPABILITY_PS3_CONFORMITY
                         | CELL_PAD_CAPABILITY_PRESS_MODE
-                        | CELL_PAD_CAPABILITY_SENSOR_MODE
                         | CELL_PAD_CAPABILITY_HP_ANALOG_STICK
                         | CELL_PAD_CAPABILITY_ACTUATOR);
 

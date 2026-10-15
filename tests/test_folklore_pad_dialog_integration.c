@@ -65,16 +65,38 @@ static void fresh(void) { now_ms+=5;read_pad(); }
 int main(void)
 {
     uint8_t memory[0x20000]={0};vm_base=memory;
+    check((u32)cellPadInfoSensorMode(0)==0x80121104,"sensor query before init");
+    check((u32)cellPadSetSensorMode(0,1)==0x80121104,"sensor set before init");
     check(cellPadInit(1)==0,"pad initializes");
+    check(cellPadInfoSensorMode(0)==0,"XInput reports no motion capability");
+    check((u32)cellPadInfoSensorMode(1)==0x80121107,"unconfigured port has no device");
+    check((u32)cellPadInfoSensorMode(126)==0x80121107,"last valid slot has no device");
+    check((u32)cellPadInfoSensorMode(127)==0x80121102,"out of range sensor port");
+    check((u32)cellPadSetSensorMode(0,2)==0x80121102,"invalid sensor mode");
+    check((u32)cellPadSetSensorMode(127,0)==0x80121102,"out of range set port");
+    check((u32)cellPadSetSensorMode(0,1)==0x80121108,"cannot enable absent sensors");
+    check((u32)cellPadSetSensorMode(0,0)==0x80121108,"unsupported sensor setter also rejects disable");
+    check(cellPadSetSensorMode(7,1)==0 && cellPadSetSensorMode(126,0)==0,
+          "valid slots above physical ports are ignored by setter");
+    check(cellPadGetInfo2((CellPadInfo2*)(uintptr_t)0x11000)==0 &&
+          !(vm_read32(0x11000+offsetof(CellPadInfo2,device_capability))&CELL_PAD_CAPABILITY_SENSOR_MODE),
+          "Info2 does not advertise sensors");
+    check(cellPadPeriphGetInfo((CellPadPeriphInfo*)(uintptr_t)0x12000)==0 &&
+          !(vm_read32(0x12000+offsetof(CellPadPeriphInfo,device_capability))&CELL_PAD_CAPABILITY_SENSOR_MODE),
+          "peripheral info does not advertise sensors");
+    check(cellPadGetCapabilityInfo(0,(CellPadCapabilityInfo*)(uintptr_t)0x13000)==0 &&
+          !(vm_read32(0x13000)&CELL_PAD_CAPABILITY_SENSOR_MODE),"capability info agrees");
     check(cellPadSetPortSetting(0,CELL_PAD_SETTING_PRESS_ON|CELL_PAD_SETTING_SENSOR_ON)==0,
-          "pressure and sensors enabled");
+          "port setting request accepted");
     pad.wButtons=XINPUT_GAMEPAD_START;fresh();
+    check(vm_read32(0x10000)==20 && word(CELL_PAD_BTN_OFFSET_SENSOR_X)==0,
+          "unsupported sensor request cannot fabricate a motion report");
     check(word(CELL_PAD_BTN_OFFSET_DIGITAL1)&CELL_PAD_CTRL_START,"ordinary START reaches guest");
     input_epoch=1;input_active=1;fresh();
     check(word(CELL_PAD_BTN_OFFSET_DIGITAL1)==0 && word(CELL_PAD_BTN_OFFSET_DIGITAL2)==0,
           "active dialog blocks actual packed digital report");
     check(word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X)==128 &&
-          word(CELL_PAD_BTN_OFFSET_SENSOR_X)==512,"neutral stick and sensor rest retained");
+          word(CELL_PAD_BTN_OFFSET_SENSOR_X)==0,"neutral stick and unused sensor words retained");
     input_active=0;fresh();
     check(word(CELL_PAD_BTN_OFFSET_DIGITAL1)==0,"held activation key remains blocked");
     pad.wButtons=0;pad.bLeftTrigger=8;pad.bRightTrigger=7;fresh();
