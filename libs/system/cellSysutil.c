@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "ps3emu/strict_boot.h"
 
 /* Guest-memory stores — out-params from the recompiled title are guest VM
  * addresses, not host pointers. */
@@ -40,75 +41,120 @@ typedef struct {
 
 static SysutilCallbackSlot s_callbacks[CELL_SYSUTIL_MAX_CALLBACKS];
 
-/* ---------------------------------------------------------------------------
- * Sysutil event queue.
- *
- * The OS would deliver events asynchronously (XMB open/close, drawing
- * begin/end, save-data complete, etc.). Games drain them by calling
- * cellSysutilCheckCallback periodically. We accept queued events from
- * the host side via cellSysutilQueueEvent() and drain them here.
- * -----------------------------------------------------------------------*/
+/* Sysutil notifications and one-shot completions share an ordered queue.
+ * Enqueue captures each callback's OPD and arguments, so later registration
+ * changes cannot alter a pending notification. */
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_callback_lock = SRWLOCK_INIT;
+#define CALLBACK_LOCK() AcquireSRWLockExclusive(&s_callback_lock)
+#define CALLBACK_UNLOCK() ReleaseSRWLockExclusive(&s_callback_lock)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define CALLBACK_TLS __declspec(thread)
+#else
+#define CALLBACK_TLS _Thread_local
+#endif
+#else
+#include <pthread.h>
+static pthread_mutex_t s_callback_lock = PTHREAD_MUTEX_INITIALIZER;
+#define CALLBACK_LOCK() pthread_mutex_lock(&s_callback_lock)
+#define CALLBACK_UNLOCK() pthread_mutex_unlock(&s_callback_lock)
+#define CALLBACK_TLS _Thread_local
+#endif
 
-typedef struct {
-    int      slot;
-    uint32_t status;
-    uint32_t param;
-} SysutilEvent;
+typedef struct DeferredCallback {
+    struct DeferredCallback* next;
+    u32 opd;
+    u64 args[8];
+} DeferredCallback;
+static DeferredCallback* s_callback_head;
+static DeferredCallback* s_callback_tail;
+static int s_drawing_started;
+static int s_callback_draining;
 
-#define SYSUTIL_EVENT_QUEUE_SIZE 32
-static SysutilEvent s_event_queue[SYSUTIL_EVENT_QUEUE_SIZE];
-static int          s_event_head = 0;  /* next read */
-static int          s_event_tail = 0;  /* next write */
+static void append_callback_locked(DeferredCallback* first, DeferredCallback* last)
+{
+    if (s_callback_tail) s_callback_tail->next = first;
+    else s_callback_head = first;
+    s_callback_tail = last;
+}
+
+static DeferredCallback* make_sysutil_callback(const SysutilCallbackSlot* slot,
+                                                u64 status, u64 param)
+{
+    DeferredCallback* item = malloc(sizeof(*item));
+    if (!item) return NULL;
+    item->next = NULL;
+    item->opd = slot->guest_opd;
+    memset(item->args, 0, sizeof(item->args));
+    item->args[0] = status;
+    item->args[1] = param;
+    item->args[2] = slot->userdata;
+    return item;
+}
+
+/* Internal HLE helper, not a firmware export. A broadcast is admitted in full
+ * or not at all if allocation fails. Return the number of captured slots. */
+s32 cellSysutilSendSystemCommand(u64 status, u64 param)
+{
+    DeferredCallback* first = NULL;
+    DeferredCallback* last = NULL;
+    s32 count = 0;
+    CALLBACK_LOCK();
+    if (status==CELL_SYSUTIL_DRAWING_BEGIN && s_drawing_started) {
+        CALLBACK_UNLOCK();return (s32)0x8002B105u;
+    }
+    if (status==CELL_SYSUTIL_DRAWING_END && !s_drawing_started) {
+        CALLBACK_UNLOCK();return -1;
+    }
+    for (int i = 0; i < CELL_SYSUTIL_MAX_CALLBACKS; ++i) {
+        if (!s_callbacks[i].registered || !s_callbacks[i].guest_opd) continue;
+        DeferredCallback* item = make_sysutil_callback(&s_callbacks[i], status, param);
+        if (!item) {
+            while (first) {
+                DeferredCallback* next = first->next;
+                free(first);
+                first = next;
+            }
+            CALLBACK_UNLOCK();
+            return (s32)CELL_ENOMEM;
+        }
+        if (last) last->next = item;
+        else first = item;
+        last = item;
+        ++count;
+    }
+    if (first) append_callback_locked(first, last);
+    if(status==CELL_SYSUTIL_DRAWING_BEGIN)s_drawing_started=1;
+    if(status==CELL_SYSUTIL_DRAWING_END)s_drawing_started=0;
+    CALLBACK_UNLOCK();
+    return count;
+}
 
 void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
 {
-    int next = (s_event_tail + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
-    if (next == s_event_head) {
-        printf("[cellSysutil] event queue full — dropping status=0x%X\n", status);
-        return;
+    if (slot < 0 || slot >= CELL_SYSUTIL_MAX_CALLBACKS) return;
+    CALLBACK_LOCK();
+    if (s_callbacks[slot].registered && s_callbacks[slot].guest_opd) {
+        DeferredCallback* item = make_sysutil_callback(&s_callbacks[slot], status, param);
+        if (item) append_callback_locked(item, item);
+        else {
+            ps3_strict_boot_guard("sysutil-event-allocation-failed","status=0x%X",status);
+            fprintf(stderr, "[cellSysutil] event enqueue failed: status=0x%X (out of memory)\n", status);
+        }
     }
-    s_event_queue[s_event_tail].slot   = slot;
-    s_event_queue[s_event_tail].status = status;
-    s_event_queue[s_event_tail].param  = param;
-    s_event_tail = next;
+    CALLBACK_UNLOCK();
 }
-
-/* Dialog and other one-shot completions carry their own OPD, rather than a
- * registered sysutil slot. Detach one batch before invoking guest code so a
- * callback may safely enqueue another completion for the next poll. */
-#ifdef _WIN32
-#include <windows.h>
-static SRWLOCK s_completion_lock = SRWLOCK_INIT;
-#define COMPLETION_LOCK() AcquireSRWLockExclusive(&s_completion_lock)
-#define COMPLETION_UNLOCK() ReleaseSRWLockExclusive(&s_completion_lock)
-#define COMPLETION_TLS __declspec(thread)
-#else
-#include <pthread.h>
-static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
-#define COMPLETION_LOCK() pthread_mutex_lock(&s_completion_lock)
-#define COMPLETION_UNLOCK() pthread_mutex_unlock(&s_completion_lock)
-#define COMPLETION_TLS _Thread_local
-#endif
-
-typedef struct GuestCompletion {
-    struct GuestCompletion* next;
-    u32 opd;
-    u64 args[8];
-} GuestCompletion;
-static GuestCompletion* s_completion_head;
-static GuestCompletion* s_completion_tail;
 
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
 {
     if (!opd) return CELL_OK;
-    GuestCompletion* item = malloc(sizeof(*item));
+    DeferredCallback* item = malloc(sizeof(*item));
     if (!item) return (s32)CELL_ENOMEM;
     item->next = NULL; item->opd = opd; memcpy(item->args, args, sizeof(item->args));
-    COMPLETION_LOCK();
-    if (s_completion_tail) s_completion_tail->next = item;
-    else s_completion_head = item;
-    s_completion_tail = item;
-    COMPLETION_UNLOCK();
+    CALLBACK_LOCK();
+    append_callback_locked(item, item);
+    CALLBACK_UNLOCK();
     return CELL_OK;
 }
 
@@ -118,22 +164,25 @@ s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
     return cellSysutilQueueGuestCallbackArgs(opd, args);
 }
 
-static void drain_guest_completions(void)
+static void drain_guest_callbacks(void)
 {
-    static COMPLETION_TLS int draining;
+    static CALLBACK_TLS int draining;
     if (draining || !g_ps3_guest_caller) return;
     draining = 1;
-    COMPLETION_LOCK();
-    GuestCompletion* item = s_completion_head;
-    s_completion_head = s_completion_tail = NULL;
-    COMPLETION_UNLOCK();
+    CALLBACK_LOCK();
+    if (s_callback_draining) {CALLBACK_UNLOCK();draining=0;return;}
+    s_callback_draining=1;
+    DeferredCallback* item = s_callback_head;
+    s_callback_head = s_callback_tail = NULL;
+    CALLBACK_UNLOCK();
     while (item) {
-        GuestCompletion* next = item->next;
+        DeferredCallback* next = item->next;
         g_ps3_guest_caller(item->opd, item->args[0], item->args[1], item->args[2],
             item->args[3], item->args[4], item->args[5], item->args[6], item->args[7]);
         free(item);
         item = next;
     }
+    CALLBACK_LOCK();s_callback_draining=0;CALLBACK_UNLOCK();
     draining = 0;
 }
 
@@ -163,11 +212,13 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
     if (slot < 0 || slot >= CELL_SYSUTIL_MAX_CALLBACKS)
         return CELL_SYSUTIL_ERROR_NUM;
 
+    CALLBACK_LOCK();
     if (func_addr == 0) {
         /* Treat as Unregister — matches observed game behaviour. */
         s_callbacks[slot].guest_opd  = 0;
         s_callbacks[slot].userdata   = 0;
         s_callbacks[slot].registered = 0;
+        CALLBACK_UNLOCK();
         return CELL_OK;
     }
 
@@ -175,6 +226,7 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
     s_callbacks[slot].userdata   = userdata_addr;
     s_callbacks[slot].registered = 1;
 
+    CALLBACK_UNLOCK();
     return CELL_OK;
 }
 
@@ -185,10 +237,12 @@ s32 cellSysutilUnregisterCallback(s32 slot)
     if (slot < 0 || slot >= CELL_SYSUTIL_MAX_CALLBACKS)
         return CELL_SYSUTIL_ERROR_NUM;
 
+    CALLBACK_LOCK();
     s_callbacks[slot].guest_opd  = 0;
     s_callbacks[slot].userdata   = 0;
     s_callbacks[slot].registered = 0;
 
+    CALLBACK_UNLOCK();
     return CELL_OK;
 }
 
@@ -207,9 +261,9 @@ s32 cellSysutilCheckCallback(void)
     /* Turn psnr replies and pushes into queued NP callbacks first, so this
      * same poll delivers them. A no-op when no psnr server is configured. */
     { extern void np_psnr_pump(void); np_psnr_pump(); }
-    drain_guest_completions();
+    drain_guest_callbacks();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
-     * drain_guest_completions() above, deferring a dialog answer to this poll
+     * drain_guest_callbacks() above, deferring a dialog answer to this poll
      * instead of pumping it separately. #156 branched before #155 landed, so its
      * context still names the old call. */
     {
@@ -217,31 +271,6 @@ s32 cellSysutilCheckCallback(void)
           s_pump_seen = 1;
           printf("[cellSysutil] CheckCallback: the title pumps sysutil%c", 10);
       }
-    }
-    /* Drain the event queue, dispatching each event into guest code via
-     * the registered ps3_guest_caller hook. Standard PS3 sysutil callback
-     * signature is:
-     *   void cb(uint64_t status, uint64_t param, void* userdata)
-     * which maps to PPC r3=status, r4=param, r5=userdata; r6 is unused.
-     *
-     * Stops when the queue empties OR when no guest caller is installed
-     * (in which case we drop pending events to avoid stalling).
-     */
-    while (s_event_head != s_event_tail) {
-        SysutilEvent e = s_event_queue[s_event_head];
-        s_event_head = (s_event_head + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
-
-        if (e.slot < 0 || e.slot >= CELL_SYSUTIL_MAX_CALLBACKS) continue;
-        if (!s_callbacks[e.slot].registered) continue;
-        if (!s_callbacks[e.slot].guest_opd) continue;
-
-        if (g_ps3_guest_caller) {
-            g_ps3_guest_caller(s_callbacks[e.slot].guest_opd,
-                               (uint64_t)e.status,
-                               (uint64_t)e.param,
-                               (uint64_t)s_callbacks[e.slot].userdata,
-                               0, 0, 0, 0, 0);
-        }
     }
     return CELL_OK;
 }

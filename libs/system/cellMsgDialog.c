@@ -8,11 +8,13 @@
 #include "cellMsgDialog.h"
 #include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/strict_boot.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>   /* tolower: the yes/no auto-answer heuristic */
+#include <math.h>
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX too */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 
@@ -22,11 +24,36 @@
  * opened its data-install prompt, and calling s_callback as a host function
  * pointer would jump into the middle of guest memory. */
 extern uint8_t* vm_base;
+extern uint32_t ppu_vm_size;
+
+#ifdef _WIN32
+static SRWLOCK s_dialog_lock = SRWLOCK_INIT;
+#define DIALOG_LOCK() AcquireSRWLockExclusive(&s_dialog_lock)
+#define DIALOG_UNLOCK() ReleaseSRWLockExclusive(&s_dialog_lock)
+#else
+#include <pthread.h>
+static pthread_mutex_t s_dialog_lock = PTHREAD_MUTEX_INITIALIZER;
+#define DIALOG_LOCK() pthread_mutex_lock(&s_dialog_lock)
+#define DIALOG_UNLOCK() pthread_mutex_unlock(&s_dialog_lock)
+#endif
 
 static const char* guest_str(const void* p)
 {
     uint32_t ea = (uint32_t)(uintptr_t)p;
     return (ea && vm_base) ? (const char*)(vm_base + ea) : "<null>";
+}
+
+static int dialog_copy_string(const void* p,char* output,size_t capacity)
+{
+    u32 ea=(u32)(uintptr_t)p;
+    const uint64_t limit=ppu_vm_size?ppu_vm_size:0x100000000ull;
+    size_t available=ea<limit?(size_t)((limit-ea)<capacity?limit-ea:capacity):0;
+    if(!ea || !vm_base || !available)return 0;
+    const char* source=(const char*)vm_base+ea;
+    const char* end=memchr(source,0,available);
+    if(!end)return 0;
+    size_t length=(size_t)(end-source);
+    memcpy(output,source,length);output[length]=0;return 1;
 }
 
 /* Do not run a completion before Open2 returns: games establish their
@@ -46,6 +73,8 @@ static int                   s_dialog_open = 0;
 static CellMsgDialogCallback s_callback    = NULL;
 static void*                 s_userdata    = NULL;
 static CellMsgDialogType     s_type        = 0;
+static uint64_t              s_close_deadline;
+static int                  s_close_pending;
 
 /* Deadline for auto-dismissing a no-button dialog; 0 = not armed.
  *
@@ -109,12 +138,30 @@ static int msg_offers_to_abort(const char* msg)
     return 0;
 }
 
-s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
+static s32 dialog_open_impl(CellMsgDialogType type, const char* msgString,
                         CellMsgDialogCallback callback, void* userdata,
                         void* extParam)
 {
-    printf("[cellMsgDialog] Open2(type=0x%08X, msg='%s')\n",
-           type, guest_str(msgString));
+    (void)extParam;
+    const int strict = ps3_strict_boot_enabled();
+    char bounded_message[512];
+    if (strict) {
+        u32 buttons=(type>>4)&7u, cursor=(type>>8)&3u, bars=(type>>12)&3u;
+        if (!dialog_copy_string(msgString,bounded_message,sizeof(bounded_message)) ||
+            (type&~0x33F7u) || buttons>2u ||
+            (buttons==0 && (cursor || bars>2)) ||
+            (buttons==1 && (cursor>1 || bars)) ||
+            (buttons==2 && (cursor || bars))) return CELL_MSGDIALOG_ERROR_PARAM;
+        if (s_dialog_open) return (s32)0x8002B105u;
+        if (buttons) {
+            ps3_strict_boot_guard("msgdialog-user-input-unimplemented","type=0x%X",type);
+            return (s32)CELL_ENOSYS;
+        }
+        s32 queued=cellSysutilSendSystemCommand(CELL_SYSUTIL_DRAWING_BEGIN,0);
+        if (queued<0) return queued;
+    }
+    const char* display_message=strict?bounded_message:guest_str(msgString);
+    printf("[cellMsgDialog] Open2(type=0x%08X, msg='%s')\n",type,display_message);
 
     if (s_dialog_open) {
         printf("[cellMsgDialog] WARNING: dialog already open, closing previous\n");
@@ -124,12 +171,13 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     s_callback    = callback;
     s_userdata    = userdata;
     s_type        = type;
+    s_close_pending=0;
     memset(s_progress, 0, sizeof(s_progress));
 
     /* Print the message so developers can see it */
     if (msgString) {
         printf("========================================\n");
-        printf("[DIALOG] %s\n", guest_str(msgString));
+        printf("[DIALOG] %s\n", display_message);
         printf("========================================\n");
     }
 
@@ -169,7 +217,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
      * stall behind it is understood. */
     static int nobutton_waits = -1;
     if (nobutton_waits < 0) nobutton_waits = getenv("MSGDIALOG_NOBUTTON_WAITS") ? 1 : 0;
-    int stays_open = has_progress ||
+    int stays_open = strict || has_progress ||
                      (nobutton_waits &&
                       button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE);
 
@@ -243,11 +291,19 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     } else {
         printf("[cellMsgDialog] %s dialog opened (waits for Close/Abort)\n",
                has_progress ? "Progress bar" : "No-button");
-        s_nobutton_deadline = (!has_progress && nobutton_grace_ms())
+        s_nobutton_deadline = (!strict && !has_progress && nobutton_grace_ms())
             ? GetTickCount64() + nobutton_grace_ms() : 0;
     }
 
     return CELL_OK;
+}
+
+s32 cellMsgDialogOpen2(CellMsgDialogType type,const char* msgString,
+                       CellMsgDialogCallback callback,void* userdata,void* extParam)
+{
+    DIALOG_LOCK();
+    s32 result=dialog_open_impl(type,msgString,callback,userdata,extParam);
+    DIALOG_UNLOCK();return result;
 }
 
 /* cellMsgDialogOpen -- the pre-3.40 entry point, identical arguments and
@@ -262,12 +318,38 @@ s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
     return cellMsgDialogOpen2(type, msgString, callback, userdata, extParam);
 }
 
-s32 cellMsgDialogClose(float delayMs)
+static s32 finish_strict_dialog(int callback)
+{
+    s32 queued=cellSysutilSendSystemCommand(CELL_SYSUTIL_DRAWING_END,0);
+    if (queued<0) {
+        ps3_strict_boot_guard("msgdialog-end-allocation-failed","error=0x%X",(u32)queued);
+        return queued;
+    }
+    s_dialog_open=0;s_nobutton_deadline=0;s_close_pending=0;
+    CellMsgDialogCallback cb=s_callback;s_callback=NULL;
+    if (callback && cb) {
+        s32 result=queue_dialog_callback(cb,CELL_MSGDIALOG_BUTTON_NONE,s_userdata);
+        if (result<0) ps3_strict_boot_guard("msgdialog-completion-allocation-failed","error=0x%X",(u32)result);
+        return result;
+    }
+    return CELL_OK;
+}
+
+static s32 dialog_close_impl(float delayMs)
 {
     printf("[cellMsgDialog] Close(delay=%.1f ms)\n", delayMs);
 
     if (!s_dialog_open) {
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+    }
+    if (ps3_strict_boot_enabled()) {
+        if (!isfinite(delayMs)) return CELL_MSGDIALOG_ERROR_PARAM;
+        if (delayMs<=0) return finish_strict_dialog(1);
+        double milliseconds=ceil((double)delayMs);
+        uint64_t now=GetTickCount64();
+        if (milliseconds>=0x1p64 || milliseconds>(double)(UINT64_MAX-now)) return CELL_MSGDIALOG_ERROR_PARAM;
+        s_close_deadline=now+(uint64_t)milliseconds;s_close_pending=1;
+        return CELL_OK;
     }
 
     s_dialog_open = 0;
@@ -282,10 +364,16 @@ s32 cellMsgDialogClose(float delayMs)
     return CELL_OK;
 }
 
-s32 cellMsgDialogAbort(void)
+s32 cellMsgDialogClose(float delayMs)
+{
+    DIALOG_LOCK();s32 result=dialog_close_impl(delayMs);DIALOG_UNLOCK();return result;
+}
+
+static s32 dialog_abort_impl(void)
 {
     printf("[cellMsgDialog] Abort()\n");
 
+    if (ps3_strict_boot_enabled()) return s_dialog_open?finish_strict_dialog(0):CELL_OK;
     if (!s_dialog_open) {
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
     }
@@ -302,31 +390,42 @@ s32 cellMsgDialogAbort(void)
     return CELL_OK;
 }
 
-s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString)
+s32 cellMsgDialogAbort(void)
 {
+    DIALOG_LOCK();s32 result=dialog_abort_impl();DIALOG_UNLOCK();return result;
+}
+
+static s32 dialog_progress_message_impl(u32 progressBarIndex, const char* msgString)
+{
+    char bounded[64];
+    const int strict=ps3_strict_boot_enabled();
+    if(strict && !dialog_copy_string(msgString,bounded,sizeof(bounded)))return CELL_MSGDIALOG_ERROR_PARAM;
     if (progressBarIndex >= MAX_PROGRESS_BARS)
         return CELL_MSGDIALOG_ERROR_PARAM;
-
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+    if(ps3_strict_boot_enabled() && progressBarIndex>=((s_type>>12)&3u))
+        return CELL_MSGDIALOG_ERROR_PARAM;
 
     if (msgString) {
-        strncpy(s_progress[progressBarIndex].message, GUEST_PTR(msgString, const char*),
+        const char* message=strict?bounded:GUEST_PTR(msgString,const char*);
+        strncpy(s_progress[progressBarIndex].message, message,
                 sizeof(s_progress[progressBarIndex].message) - 1);
         s_progress[progressBarIndex].message[sizeof(s_progress[progressBarIndex].message) - 1] = '\0';
-        printf("[cellMsgDialog] ProgressBar[%u] msg='%s'\n", progressBarIndex, guest_str(msgString));
+        printf("[cellMsgDialog] ProgressBar[%u] msg='%s'\n", progressBarIndex, message);
     }
 
     return CELL_OK;
 }
 
-s32 cellMsgDialogProgressBarReset(u32 progressBarIndex)
+static s32 dialog_progress_reset_impl(u32 progressBarIndex)
 {
     if (progressBarIndex >= MAX_PROGRESS_BARS)
         return CELL_MSGDIALOG_ERROR_PARAM;
-
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+    if(ps3_strict_boot_enabled() && progressBarIndex>=((s_type>>12)&3u))
+        return CELL_MSGDIALOG_ERROR_PARAM;
 
     s_progress[progressBarIndex].value = 0;
     printf("[cellMsgDialog] ProgressBar[%u] reset to 0%%\n", progressBarIndex);
@@ -334,17 +433,17 @@ s32 cellMsgDialogProgressBarReset(u32 progressBarIndex)
     return CELL_OK;
 }
 
-s32 cellMsgDialogProgressBarInc(u32 progressBarIndex, u32 delta)
+static s32 dialog_progress_inc_impl(u32 progressBarIndex, u32 delta)
 {
     if (progressBarIndex >= MAX_PROGRESS_BARS)
         return CELL_MSGDIALOG_ERROR_PARAM;
-
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+    if(ps3_strict_boot_enabled() && progressBarIndex>=((s_type>>12)&3u))
+        return CELL_MSGDIALOG_ERROR_PARAM;
 
-    s_progress[progressBarIndex].value += delta;
-    if (s_progress[progressBarIndex].value > 100)
-        s_progress[progressBarIndex].value = 100;
+    uint64_t sum=(uint64_t)s_progress[progressBarIndex].value+delta;
+    s_progress[progressBarIndex].value=sum>100?100:(u32)sum;
 
     printf("[cellMsgDialog] ProgressBar[%u] = %u%%\n",
            progressBarIndex, s_progress[progressBarIndex].value);
@@ -352,12 +451,30 @@ s32 cellMsgDialogProgressBarInc(u32 progressBarIndex, u32 delta)
     return CELL_OK;
 }
 
+s32 cellMsgDialogProgressBarSetMsg(u32 index,const char* message)
+{
+    DIALOG_LOCK();s32 result=dialog_progress_message_impl(index,message);DIALOG_UNLOCK();return result;
+}
+s32 cellMsgDialogProgressBarReset(u32 index)
+{
+    DIALOG_LOCK();s32 result=dialog_progress_reset_impl(index);DIALOG_UNLOCK();return result;
+}
+s32 cellMsgDialogProgressBarInc(u32 index,u32 delta)
+{
+    DIALOG_LOCK();s32 result=dialog_progress_inc_impl(index,delta);DIALOG_UNLOCK();return result;
+}
+
 
 /* Called from cellSysutilCheckCallback each time the title polls sysutil.
  * Dismisses a no-button dialog the title has left open past its grace period;
  * see s_nobutton_deadline for why this cannot be decided at open time. */
-void cellMsgDialog_tick(void)
+static void dialog_tick_impl(void)
 {
+    if (ps3_strict_boot_enabled()) {
+        if (s_dialog_open && s_close_pending && GetTickCount64()>=s_close_deadline)
+            (void)finish_strict_dialog(1);
+        return;
+    }
     if (!s_dialog_open || !s_nobutton_deadline) return;
     if (GetTickCount64() < s_nobutton_deadline) return;
     s_nobutton_deadline = 0;
@@ -369,4 +486,9 @@ void cellMsgDialog_tick(void)
         s_callback = NULL;
         queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
     }
+}
+
+void cellMsgDialog_tick(void)
+{
+    DIALOG_LOCK();dialog_tick_impl();DIALOG_UNLOCK();
 }

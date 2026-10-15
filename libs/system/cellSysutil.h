@@ -103,13 +103,14 @@ typedef void (*CellSysutilCallback)(u64 status, u64 param, void* userdata);
 s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userdata);
 s32 cellSysutilUnregisterCallback(s32 slot);
 s32 cellSysutilCheckCallback(void);
-s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
-s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
 
 /* Internal HLE completion queue, delivered by the guest's next callback poll. */
 s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
 /* Copy eight guest register arguments into the deferred completion queue. */
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
+/* Queue one command for every callback registered at enqueue time. Returns
+ * the number queued, or CELL_ENOMEM. Internal HLE helper, not a firmware NID. */
+s32 cellSysutilSendSystemCommand(u64 status, u64 param);
 
 /* Host-side helper: queue a sysutil event to be delivered to the game's
  * registered callback at the next cellSysutilCheckCallback poll. status

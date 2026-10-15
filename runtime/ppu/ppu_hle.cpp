@@ -18,6 +18,7 @@
  */
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ppu_strict_boot.h"
+#include "ppu_msgdialog_abi.h"
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
@@ -748,6 +749,7 @@ extern "C" void ppu_hle_register_all(void) {}
 extern "C" void ppu_hle_init(void)
 {
     ppu_hle_register_all();
+    ps3_hle_register_ctx(0x20543730u,"cellMsgDialogClose",ppu_msgdialog_close);
 
     /* The generated registration unit is per-game and easy to leave out: the
      * weak stub above means a build without it links and starts, then fails
