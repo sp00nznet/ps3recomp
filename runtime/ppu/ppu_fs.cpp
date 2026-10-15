@@ -640,19 +640,42 @@ static void cellFsGetBlockSize(ppu_context* ctx)
     fs_report_block_size(ctx, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
 }
 
+static int fs_seek64(FILE* file,int64_t offset,int origin)
+{
+#ifdef _WIN32
+    return _fseeki64(file,offset,origin);
+#else
+    static_assert(sizeof(off_t)>=8,"64-bit guest file offsets require a 64-bit host off_t");
+    return fseeko(file,(off_t)offset,origin);
+#endif
+}
+static int64_t fs_tell64(FILE* file)
+{
+#ifdef _WIN32
+    return _ftelli64(file);
+#else
+    return (int64_t)ftello(file);
+#endif
+}
 static void cellFsLseek(ppu_context* ctx)
 {
     int fd        = (int)(uint32_t)ctx->gpr[3];
     int64_t off   = (int64_t)ctx->gpr[4];
     uint32_t wh   = (uint32_t)ctx->gpr[5];
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001002Au; return; }
+    if(wh>2) {ctx->gpr[3]=(uint64_t)(int64_t)(int32_t)0x80010002u;return;}
+    if(!fs_stat_guest_span(pos_ptr,8,true)) {ctx->gpr[3]=(uint64_t)(int64_t)CELL_FS_STAT_EFAULT;return;}
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    fseek(g_files[fd], (long)off, worigin);
-    long p = ftell(g_files[fd]);
-    if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
+    if(fs_seek64(g_files[fd],off,worigin)) {
+        const int32_t error=errno==EINVAL?(int32_t)0x80010002u:CELL_FS_STAT_EIO;
+        ctx->gpr[3]=(uint64_t)(int64_t)error;return;
+    }
+    const int64_t p=fs_tell64(g_files[fd]);
+    if(p<0) {ctx->gpr[3]=(uint64_t)(int64_t)CELL_FS_STAT_EIO;return;}
+    vm_write64(pos_ptr,(uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -722,13 +745,15 @@ static void cellFsFstat(ppu_context* ctx)
 {
     int fd      = (int)(uint32_t)ctx->gpr[3];
     uint32_t sb = (uint32_t)ctx->gpr[4];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001002Au; return; }
+    if(!fs_stat_guest_span(sb,52,true)) {ctx->gpr[3]=(uint64_t)(int64_t)CELL_FS_STAT_EFAULT;return;}
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    long cur = ftell(g_files[fd]);
-    fseek(g_files[fd], 0, SEEK_END);
-    long sz = ftell(g_files[fd]);
-    fseek(g_files[fd], cur, SEEK_SET);
+    const int64_t cur=fs_tell64(g_files[fd]);
+    if(cur<0 || fs_seek64(g_files[fd],0,SEEK_END)) {ctx->gpr[3]=(uint64_t)(int64_t)CELL_FS_STAT_EIO;return;}
+    int64_t sz=fs_tell64(g_files[fd]);
+    const int restored=fs_seek64(g_files[fd],cur,SEEK_SET);
+    if(sz<0 || restored) {ctx->gpr[3]=(uint64_t)(int64_t)CELL_FS_STAT_EIO;return;}
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -737,12 +762,12 @@ static void cellFsFstat(ppu_context* ctx)
     { const char* cap = getenv("FS_FSTAT_CAP");
       const char* only = getenv("FS_FSTAT_CAP_PATH");
       if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
-      if (cap) { long c = strtol(cap, 0, 0);
+      if (cap) { int64_t c = strtoll(cap, 0, 0);
           if (c > 0 && sz > c) {
-              fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
+              fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, (long long)c);
               sz = c; } } }
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
     ctx->gpr[3] = CELL_OK;
 }
 
