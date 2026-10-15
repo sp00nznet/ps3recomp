@@ -37,6 +37,8 @@ extern "C" {
  * Naming: NV4097_SET_* for 3D methods, NV3062_SET_* for 2D methods
  * -----------------------------------------------------------------------*/
 
+#define NV4097_NO_OPERATION 0x0100
+
 /* Surface / render target configuration (real NV4097 numbering -- RPCS3 /
  * nouveau. The original table here was shuffled: only COLOR_AOFFSET was
  * right, so SET_SURFACE_COLOR_TARGET (MRT selection) was never decoded and

@@ -443,6 +443,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
       if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* NV4097 method NOP, distinct from a FIFO control-flow encoding. Its data
+     * word is discarded, with no flush, notification or wait side effect. */
+    if (method == NV4097_NO_OPERATION) return 0;
     /* Independent attachment memory domains, not ignored setup methods. */
     switch (method) {
     case NV4097_SET_CONTEXT_DMA_COLOR_A: return set_surface_dma(state, method, data, 0);
