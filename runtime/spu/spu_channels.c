@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "spurs_native_job.h"
 #include "ps3emu/strict_boot.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
@@ -828,11 +829,13 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     if (channel_is_mfc(channel)) {
+        if(channel==MFC_Cmd)spurs_native_job_mfc_before(ctx,v);
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
             return;
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
+        if(channel==MFC_Cmd)spurs_native_job_mfc_after(ctx,v);
         /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
          * DMA completes synchronously, so the instant the program arms tag
          * notification (MFC_WrTagUpdate with a non-zero mode = any/all), the

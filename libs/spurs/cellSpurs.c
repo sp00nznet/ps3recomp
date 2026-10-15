@@ -21,6 +21,7 @@
 #include "spurs_event_ports.h"
 #include "spurs_event_route.h"
 #include "spurs_owner_lifetime.h"
+#include "spurs_native_job.h"
 #include "spu_context.h"
 #include "../../runtime/memory/guest_byte.h"
 #include "../../runtime/syscalls/sys_event.h"
@@ -2402,7 +2403,7 @@ enum {                              /* CellSpursJobHeader (48 B) */
     JH_SIZE          = 0x30,
 };
 
-static int jc_run_one_job(u64 raw_job_ea, int idx, u32 size_desc)
+static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 size_desc)
 {
     extern uint32_t ppu_vm_size;
     spurs_job_snapshot snapshot;
@@ -2444,14 +2445,26 @@ static int jc_run_one_job(u64 raw_job_ea, int idx, u32 size_desc)
                 capture == SPURS_JOB_CAPTURE_WRITTEN ? capture_prefix : "<none>");
         fflush(stderr);
     }
-    /* A jobchain job is NOT a SPURS task: Sony's jm2 stages the whole working
-     * set in local store and enters the job's CRT with r3 = CellSpursJobContext2*
-     * and r4 = the job descriptor, both LS pointers. Dispatching it on the task
-     * ABI (arg EA in r3) left it reading a zeroed context and parking with no
-     * DMA traffic at all. spu_workload_dispatch_job reproduces jm2's staging.
-     * Synchronous by design: a job runs to completion, and the chain's own
-     * NEXT/CALL/RET commands are what order them. */
-    int dispatched=spu_workload_dispatch_job(snapshot.image,snapshot.image_size,snapshot.job_ea,snapshot.descriptor_size);
+    /* Native profiles consume the complete owned snapshot on an actual worker
+     * of this retained chain owner. This first scheduler policy supports one
+     * worker only; job index is never fabricated into an SPU identity. */
+    if(spurs_inst_nspus(chain->owner.ea)!=1){
+        ps3_strict_boot_guard("spurs-native-job-worker-policy","owner=0x%08X requires_one_worker=1",chain->owner.ea);
+        spurs_job_snapshot_release(&snapshot);return 0;
+    }
+    spurs_native_job_result native=spurs_native_job_dispatch(&snapshot,chain->owner,0);
+    int dispatched=0;
+    if(native.status==SPURS_NATIVE_JOB_UNREGISTERED||native.status==SPURS_NATIVE_JOB_REGISTRY_OPEN){
+        /* Preserve existing MISS/HIT strict stops. In strict mode this legacy
+         * function terminates before guest-pointer staging can execute. The
+         * compatibility-only path retains its historical behavior. */
+        dispatched=spu_workload_dispatch_job(snapshot.image,snapshot.image_size,snapshot.job_ea,snapshot.descriptor_size);
+    }else if(native.status==SPURS_NATIVE_JOB_RETURNED){
+        dispatched=1;
+    }else{
+        ps3_strict_boot_guard("spurs-native-job-failed","job=0x%08X status=%u pc=0x%05X spu_status=%u stop=%u gets=%u",
+            snapshot.job_ea,(unsigned)native.status,native.pc,native.spu_status,native.stop_code,native.completed_gets);
+    }
     spurs_job_snapshot_release(&snapshot);
     return dispatched==1;
 }
@@ -2717,7 +2730,7 @@ static s32 jc_execute(struct SpursChain*c)
         u64 cmd=vm_read64(pc);u32 op=(u32)(cmd&7),ext=(u32)(cmd&127);
         if(cmd&&op==0){
             extern u32 g_spurs_job_ls_handle;g_spurs_job_ls_handle=c->jc_ea;
-            if(!jc_run_one_job(cmd&~7ull,(int)jobs,c->size_desc))return CELL_SPURS_TASK_ERROR_STAT;
+            if(!jc_run_one_job(c,cmd&~7ull,(int)jobs,c->size_desc))return CELL_SPURS_TASK_ERROR_STAT;
             ++jobs;idle=0;pc+=8;continue; /* Only the job's real protocol emits events. */
         }
         if(op==1||op==3||op==4){

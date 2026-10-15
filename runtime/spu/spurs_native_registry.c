@@ -1,0 +1,81 @@
+#include "spurs_native_registry.h"
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+static SRWLOCK registry_lock=SRWLOCK_INIT;
+static void lock_registry(void){AcquireSRWLockExclusive(&registry_lock);}
+static void unlock_registry(void){ReleaseSRWLockExclusive(&registry_lock);}
+#else
+#include <pthread.h>
+static pthread_mutex_t registry_lock=PTHREAD_MUTEX_INITIALIZER;
+static void lock_registry(void){pthread_mutex_lock(&registry_lock);}
+static void unlock_registry(void){pthread_mutex_unlock(&registry_lock);}
+#endif
+static spurs_native_profile profiles[SPURS_NATIVE_REGISTRY_LIMIT];
+static uint32_t profile_count;static int sealed;
+static uint64_t fingerprint(const uint8_t*p,uint32_t size)
+{uint64_t h=UINT64_C(1469598103934665603);for(uint32_t i=0;i<size;i++){h^=p[i];h*=UINT64_C(1099511628211);}return h;}
+static uint32_t encoded_size(const uint8_t*d){return ((uint32_t)d[8]<<8|d[9])*16u;}
+static uint64_t be64(const uint8_t*p){uint64_t n=0;for(unsigned i=0;i<8;i++)n=n<<8|p[i];return n;}
+static int sizes(uint32_t image,uint32_t desc)
+{return image&&image<=SPURS_JOB_SNAPSHOT_IMAGE_MAX&&!(image&15)&&desc>=SPURS_JOB_SNAPSHOT_DESC_MIN&&desc<=SPURS_JOB_SNAPSHOT_DESC_MAX&&!(desc&15);}
+static int sha_valid(const char*p)
+{if(!p)return 0;for(unsigned i=0;i<64;i++){char c=p[i];if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F')))return 0;}return p[64]==0;}
+typedef struct span {uint32_t start,size;} span;
+static int layout_valid(spurs_native_layout l,uint32_t size,uint32_t desc,uint32_t entry)
+{
+ if((l.image|l.descriptor|l.context|l.stack|l.stack_size)&15||l.context_size!=128||l.stack_size<48||(l.return_pc&3)||(entry&3))return 0;
+ span v[5]={{l.image,size},{l.descriptor,desc},{l.context,128},{l.stack,l.stack_size},{l.return_pc,4}};
+ for(unsigned i=0;i<5;i++){if(!v[i].size||v[i].start>=SPU_LS_SIZE||v[i].size>SPU_LS_SIZE-v[i].start)return 0;
+  for(unsigned j=0;j<i;j++)if(v[i].start<v[j].start+v[j].size&&v[j].start<v[i].start+v[i].size)return 0;}
+ return entry>=l.image&&entry-l.image<size;
+}
+static int layout_equal(spurs_native_layout a,spurs_native_layout b)
+{return a.image==b.image&&a.descriptor==b.descriptor&&a.context==b.context&&a.context_size==b.context_size&&a.stack==b.stack&&a.stack_size==b.stack_size&&a.return_pc==b.return_pc;}
+static int input_valid(spurs_native_input x,spurs_native_layout l)
+{
+ if(x.kind==SPURS_NATIVE_INPUT_NONE){if(x.lsa||x.size||x.tag||x.ea)return 0;for(unsigned i=0;i<16;i++)if(x.expected[i])return 0;return 1;}
+ if(x.kind!=SPURS_NATIVE_INPUT_EXACT_GET||(x.size!=1&&x.size!=2&&x.size!=4&&x.size!=8&&x.size!=16)||x.tag>=32)return 0;
+ if(x.lsa<l.stack||x.lsa-l.stack>l.stack_size||x.size>l.stack_size-(x.lsa-l.stack)||x.ea<0x10000||x.ea>UINT32_MAX||x.size>UINT64_C(0x100000000)-x.ea)return 0;
+ if((x.lsa&(x.size-1))||(x.ea&(x.size-1))||((x.lsa^x.ea)&15))return 0;
+ for(unsigned i=x.size;i<16;i++)if(x.expected[i])return 0;return 1;
+}
+static int input_equal(spurs_native_input a,spurs_native_input b)
+{return a.kind==b.kind&&a.lsa==b.lsa&&a.size==b.size&&a.tag==b.tag&&a.ea==b.ea&&!memcmp(a.expected,b.expected,16);}
+spurs_native_status spurs_native_registry_register(const spurs_native_definition*d,const spurs_native_profile**out)
+{
+ if(!d||!out||!d->image||!d->descriptor_template||!d->entry||!sizes(d->image_size,d->descriptor_size)||encoded_size(d->descriptor_template)!=d->image_size||(((uint32_t)d->descriptor_template[28]<<8|d->descriptor_template[29])*16u)!=d->layout.stack_size||!sha_valid(d->source_sha256)||!sha_valid(d->build_sha256)||!layout_valid(d->layout,d->image_size,d->descriptor_size,d->entry_pc)||!input_valid(d->input,d->layout))return SPURS_NATIVE_INVALID;
+ lock_registry();if(sealed){unlock_registry();return SPURS_NATIVE_SEALED;}
+ uint64_t fp=fingerprint(d->image,d->image_size);
+ for(uint32_t i=0;i<profile_count;i++){spurs_native_profile*p=&profiles[i];
+  if(p->fingerprint!=fp||p->image_size!=d->image_size||p->descriptor_size!=d->descriptor_size||memcmp(p->image,d->image,d->image_size)||memcmp(p->descriptor_template+8,d->descriptor_template+8,d->descriptor_size-8))continue;
+  if(p->entry!=d->entry||p->entry_pc!=d->entry_pc||!layout_equal(p->layout,d->layout)||!input_equal(p->input,d->input)||strcmp(p->source_sha256,d->source_sha256)||strcmp(p->build_sha256,d->build_sha256)){unlock_registry();return SPURS_NATIVE_CONFLICT;}
+  *out=p;unlock_registry();return SPURS_NATIVE_DUPLICATE;
+ }
+ if(profile_count==SPURS_NATIVE_REGISTRY_LIMIT){unlock_registry();return SPURS_NATIVE_FULL;}
+ uint8_t*image=(uint8_t*)malloc(d->image_size),*desc=(uint8_t*)malloc(d->descriptor_size);
+ if(!image||!desc){free(image);free(desc);unlock_registry();return SPURS_NATIVE_NO_MEMORY;}
+ memcpy(image,d->image,d->image_size);memcpy(desc,d->descriptor_template,d->descriptor_size);memset(desc,0,8);
+ spurs_native_profile*p=&profiles[profile_count];memset(p,0,sizeof*p);p->image=image;p->descriptor_template=desc;p->image_size=d->image_size;p->descriptor_size=d->descriptor_size;p->fingerprint=fp;p->entry=d->entry;p->entry_pc=d->entry_pc;p->layout=d->layout;p->input=d->input;
+ memcpy(p->source_sha256,d->source_sha256,65);memcpy(p->build_sha256,d->build_sha256,65);++profile_count;*out=p;
+ unlock_registry();return SPURS_NATIVE_OK;
+}
+spurs_native_status spurs_native_registry_seal(void)
+{lock_registry();if(sealed){unlock_registry();return SPURS_NATIVE_SEALED;}sealed=1;unlock_registry();return SPURS_NATIVE_OK;}
+static int snapshot_valid(const spurs_job_snapshot*s)
+{
+ if(!s||!s->image||!s->descriptor||!sizes(s->image_size,s->descriptor_size)||s->binary_flags||s->raw_binary_ea!=s->binary_ea||s->binary_ea<0x10000||(s->binary_ea&15)||s->job_ea<0x10000||(s->job_ea&15))return 0;
+ if(!s->guest_limit||s->guest_limit>UINT64_C(0x100000000)||(uint64_t)s->binary_ea+s->image_size>s->guest_limit||(uint64_t)s->job_ea+s->descriptor_size>s->guest_limit)return 0;
+ return be64(s->descriptor)==s->raw_binary_ea&&encoded_size(s->descriptor)==s->image_size&&fingerprint(s->image,s->image_size)==s->fingerprint;
+}
+spurs_native_status spurs_native_registry_resolve(const spurs_job_snapshot*s,const spurs_native_profile**out)
+{
+ if(!out)return SPURS_NATIVE_INVALID;
+ lock_registry();if(!sealed){unlock_registry();return SPURS_NATIVE_NOT_SEALED;}
+ if(!snapshot_valid(s)){unlock_registry();return SPURS_NATIVE_INVALID;}
+ for(uint32_t i=0;i<profile_count;i++){const spurs_native_profile*p=&profiles[i];
+  if(p->fingerprint==s->fingerprint&&p->image_size==s->image_size&&p->descriptor_size==s->descriptor_size&&!memcmp(p->image,s->image,s->image_size)&&!memcmp(p->descriptor_template+8,s->descriptor+8,s->descriptor_size-8)){*out=p;unlock_registry();return SPURS_NATIVE_OK;}}
+ unlock_registry();return SPURS_NATIVE_NOT_FOUND;
+}
