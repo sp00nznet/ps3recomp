@@ -76,6 +76,7 @@ extern "C" {
 #define NV4097_SET_SURFACE_PITCH_D             0x00000284
 #define NV4097_SET_SURFACE_COLOR_COFFSET       0x00000288
 #define NV4097_SET_SURFACE_COLOR_DOFFSET       0x0000028C
+#define NV4097_SET_WINDOW_OFFSET               0x000002B8
 
 /* SET_SURFACE_COLOR_TARGET values */
 #define CELL_GCM_SURFACE_TARGET_NONE  0x00
@@ -258,6 +259,9 @@ typedef struct rsx_state {
     u32 surface_color_dma[RSX_MAX_RENDER_TARGETS];
     u32 surface_zeta_dma;
     u32 surface_dma_set_mask;
+    /* Raster origin: x in bits0..15, y in bits16..31. Applied to attachment
+     * byte addresses, not added to viewport/scissor coordinates. */
+    u32 window_offset;
     u32 surface_clip_x, surface_clip_y;
     u32 surface_clip_w, surface_clip_h;
     u32 color_target;
@@ -393,6 +397,12 @@ typedef struct rsx_state {
 
 /* Initialize RSX state to defaults */
 void rsx_state_init(rsx_state* state);
+
+/* Resolve a raster origin against the programmed attachment base/pitch/format.
+ * Returns -1 on unknown format, missing row pitch or32-bit overflow. Output is
+ * unchanged on failure. Raw guest registers remain unchanged. */
+int rsx_color_surface_offset(const rsx_state* state, u32 target, u32* offset);
+int rsx_depth_surface_offset(const rsx_state* state, u32* offset);
 
 /* Process a single NV47xx method call.
  * method: register address (e.g., NV4097_SET_BLEND_ENABLE)

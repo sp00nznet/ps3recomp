@@ -6,6 +6,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 static inline int ps3_strict_boot_enabled(void)
 {
@@ -18,12 +23,26 @@ static inline void ps3_strict_boot_guard(const char* category,
 {
     va_list args;
     if (!ps3_strict_boot_enabled()) return;
-    fprintf(stderr, "[strict-boot] FATAL category=%s ", category);
+    char record[4096];
+    int prefix = snprintf(record, sizeof(record), "\n[strict-boot] FATAL category=%s ", category);
+    size_t used = prefix > 0 && prefix < (int)sizeof(record) ? (size_t)prefix : 0;
     va_start(args, format);
-    vfprintf(stderr, format, args);
+    int message = vsnprintf(record + used, sizeof(record) - used, format, args);
     va_end(args);
-    fprintf(stderr, " exit=86\n");
+    if (message > 0) used += (size_t)message < sizeof(record) - used ? (size_t)message : sizeof(record) - used - 1;
+    /* Reserve the fatal terminator even when a path or message is oversized. */
+    static const char end[] = " exit=86\n";
+    if (used > sizeof(record) - sizeof(end)) used = sizeof(record) - sizeof(end);
+    memcpy(record + used, end, sizeof(end) - 1);
+    used += sizeof(end) - 1;
     fflush(NULL);
+    /* One OS write prevents other guest threads' stdout from splitting the
+     * category and its values into separate log fragments. */
+#ifdef _WIN32
+    (void)_write(_fileno(stderr), record, (unsigned)used);
+#else
+    (void)write(STDERR_FILENO, record, used);
+#endif
     _Exit(86);
 }
 #endif

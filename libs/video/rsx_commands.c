@@ -144,6 +144,44 @@ static int validate_surface_dma(const rsx_state* state)
     return 0;
 }
 
+static int raster_offset(const rsx_state* state, u32 base, u32 pitch,
+                         unsigned texel_bytes, u32* result)
+{
+    if (!state || !result) return -1;
+    u32 x = state->window_offset & 0xffffu, y = state->window_offset >> 16;
+    if (!x && !y) { *result = base; return 0; }
+    if (!texel_bytes || (y && !pitch)) return -1;
+    u64 address = (u64)base + (u64)y * pitch + (u64)x * texel_bytes;
+    if (address > UINT32_MAX) return -1;
+    *result = (u32)address;
+    return 0;
+}
+
+int rsx_color_surface_offset(const rsx_state* state, u32 target, u32* result)
+{
+    if (!state || target >= RSX_MAX_RENDER_TARGETS || !result) return -1;
+    unsigned bytes = 0;
+    switch (state->surface_format & 31u) {
+    case 1: case 2: case 3: case 10: bytes = 2; break;
+    case 4: case 5: case 8: case 13: case 14: case 15: case 16: bytes = 4; break;
+    case 9: bytes = 1; break;
+    case 11: bytes = 8; break;
+    case 12: bytes = 16; break;
+    default: break;
+    }
+    return raster_offset(state, state->surface_color_offset[target],
+                         state->surface_color_pitch[target], bytes, result);
+}
+
+int rsx_depth_surface_offset(const rsx_state* state, u32* result)
+{
+    if (!state || !result) return -1;
+    u32 format = (state->surface_format >> 5) & 7u;
+    unsigned bytes = format == 1 ? 2 : format == 2 ? 4 : 0;
+    return raster_offset(state, state->surface_zeta_offset,
+                         state->surface_zeta_pitch, bytes, result);
+}
+
 static int process_surface_method(rsx_state* state, u32 method, u32 data)
 {
     switch (method) {
@@ -196,18 +234,27 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         return 0;
     case NV4097_SET_SURFACE_PITCH_A:
         state->surface_color_pitch[0] = data;
+        state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_PITCH_B:
         state->surface_color_pitch[1] = data;
+        state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_PITCH_C:
         state->surface_color_pitch[2] = data;
+        state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_PITCH_D:
         state->surface_color_pitch[3] = data;
+        state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_PITCH_Z:
         state->surface_zeta_pitch = data;
+        state->surface_dirty = 1;
+        return 0;
+    case NV4097_SET_WINDOW_OFFSET:
+        state->window_offset = data;
+        state->surface_dirty = 1;
         return 0;
     default:
         return -1;
@@ -417,7 +464,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
         return 0;
       } }
-    if ((method >= 0x200 && method <= 0x23C) ||
+    if (method == NV4097_SET_WINDOW_OFFSET || (method >= 0x200 && method <= 0x23C) ||
         (method >= 0x280 && method <= 0x28C))
         return process_surface_method(state, method, data);
 

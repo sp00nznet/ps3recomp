@@ -3234,6 +3234,15 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
  * offset is the same buffer (surface and texture registers share the offset
  * space; location bits differ but one title doesn't alias local vs main at
  * one offset), which sidesteps guessing the surface's context DMA location. */
+static u32 resolved_color_offset(const rsx_state* state, u32 target)
+{
+    u32 offset;
+    if (rsx_color_surface_offset(state, target, &offset) == 0) return offset;
+    fprintf(stderr, "[strict-boot] FATAL category=rsx-invalid-raster-offset target=%u window=0x%08X exit=86\n", target, state->window_offset);
+    fflush(NULL);
+    _Exit(86);
+}
+
 static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
 {
     extern int cellGcmOffsetIsDisplay(u32 offset);
@@ -3245,11 +3254,11 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
     /* SET_SURFACE_COLOR_TARGET: 1 = A, 2 = B, 0x13 = MRT1 (A+B),
      * 0x17 = MRT2 (A+B+C), 0x1F = MRT3 (A+B+C+D). */
     int sel = (st->color_target == 2) ? 1 : 0;
-    u32 raw = st->surface_color_offset[sel];
+    u32 raw = resolved_color_offset(st, (u32)sel);
     if (out_mrt) {
-        if (st->color_target >= 0x13) out_mrt[0] = st->surface_color_offset[1];
-        if (st->color_target >= 0x17) out_mrt[1] = st->surface_color_offset[2];
-        if (st->color_target >= 0x1F) out_mrt[2] = st->surface_color_offset[3];
+        if (st->color_target >= 0x13) out_mrt[0] = resolved_color_offset(st, 1);
+        if (st->color_target >= 0x17) out_mrt[1] = resolved_color_offset(st, 2);
+        if (st->color_target >= 0x1F) out_mrt[2] = resolved_color_offset(st, 3);
     }
     { static int _rs = -1; if (_rs < 0) _rs = getenv("RT_SEQDBG") ? 1 : 0;
       static u32 _last = 0; static int _n2 = 0;
@@ -5336,6 +5345,9 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 static void d3d12_set_render_target(void* ud, const rsx_state* state)
 {
     (void)ud;
+    if (state->window_offset && ((state->surface_format >> 5) & 7u) &&
+        (state->depth_test_enable || state->depth_mask || state->stencil_test_enable))
+        ps3_strict_boot_guard("d3d12-window-depth-binding-unimplemented", "window=0x%08X", state->window_offset);
     s_d3d.current_rsx_state = state;
     /* Log only the first few; set_render_target is called every frame and
      * floods the log otherwise. */
