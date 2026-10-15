@@ -212,6 +212,7 @@ typedef struct vk_state {
     u32              clear_argb;
     u32              last_center;
     u32              presented;
+    u64              successful_window_presents;
     const char*      dump_path;
     u32              dump_every;       /* write every nth presented frame */
 } vk_state;
@@ -1844,7 +1845,9 @@ static void vk_present_window(void)
     if (pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (window) failed\n"); return;
     }
-    pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
+    if (pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        VK_LOG("vkWaitForFences (window) failed\n"); return;
+    }
 
     VkPresentInfoKHR pi = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -1852,6 +1855,12 @@ static void vk_present_window(void)
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
     r = pvkQueuePresentKHR(s_vk.queue, &pi);
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+        s_vk.successful_window_presents++;
+        if (s_vk.successful_window_presents <= 4)
+            VK_LOG("window present %llu accepted (VkResult %d)\n",
+                   (unsigned long long)s_vk.successful_window_presents, (int)r);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
@@ -3453,6 +3462,16 @@ void rsx_vulkan_backend_present(void)
 {
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
+}
+
+u64 rsx_vulkan_backend_successful_presents(void)
+{
+    return s_vk.successful_window_presents;
+}
+
+int rsx_vulkan_backend_window_active(void)
+{
+    return s_vk.windowed && s_vk.swapchain;
 }
 
 u32 rsx_vulkan_backend_debug_color(void) { return s_vk.clear_argb; }

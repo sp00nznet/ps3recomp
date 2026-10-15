@@ -75,6 +75,12 @@ int  rsx_vulkan_backend_pump_messages(void);
 /* Read the frame back to host memory (and to PS3RECOMP_VK_DUMP if set). */
 void rsx_vulkan_backend_present(void);
 
+/* Successful window submissions only (VK_SUCCESS or VK_SUBOPTIMAL_KHR).
+ * Headless readbacks and failed presents never increment this counter.
+ * These queries are called by the backend's owning render thread. */
+u64 rsx_vulkan_backend_successful_presents(void);
+int rsx_vulkan_backend_window_active(void);
+
 /* The clear colour most recently set through the command stream, ARGB8888. */
 u32  rsx_vulkan_backend_debug_color(void);
 
