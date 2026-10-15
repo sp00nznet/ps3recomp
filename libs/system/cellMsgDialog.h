@@ -77,6 +77,27 @@ s32 cellMsgDialogProgressBarReset(u32 progressBarIndex);
 
 s32 cellMsgDialogProgressBarInc(u32 progressBarIndex, u32 delta);
 
+/* Host-only interface. No guest pointers leave the service. The generation
+ * binds input to one admitted dialog, so queued input cannot answer a later
+ * dialog. Respond only queues completion; guest entry stays on sysutil polls. */
+typedef struct Ps3MsgDialogHostState {
+    u64 generation;
+    u32 open;
+    u32 type;
+    char message[512];
+    struct { u32 value; char message[64]; } progress[2];
+} Ps3MsgDialogHostState;
+
+s32 ps3_msgdialog_host_enable(int enabled);
+/* Detach atomically during host teardown, aborting any notice without a
+ * button completion. No new button dialog may slip between abort and detach. */
+s32 ps3_msgdialog_host_shutdown(void);
+/* Input backends use the epoch to suppress a held activation key even if
+ * they did not poll while the dialog was visible. */
+int ps3_msgdialog_host_input_state(u64* epoch);
+int ps3_msgdialog_host_snapshot(Ps3MsgDialogHostState* output);
+s32 ps3_msgdialog_host_respond(u64 generation, s32 result);
+
 #ifdef __cplusplus
 }
 #endif

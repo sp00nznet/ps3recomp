@@ -1,8 +1,8 @@
 /*
  * ps3recomp - cellMsgDialog HLE implementation
  *
- * Prints dialog messages to stdout and queues callbacks for sysutil polling.
- * No actual UI is rendered.
+ * Owns dialog state and queues callbacks for sysutil polling. An optional
+ * host presenter consumes copied snapshots and submits generation-bound input.
  */
 
 #include "cellMsgDialog.h"
@@ -75,6 +75,10 @@ static void*                 s_userdata    = NULL;
 static CellMsgDialogType     s_type        = 0;
 static uint64_t              s_close_deadline;
 static int                  s_close_pending;
+static int                  s_host_enabled;
+static u64                  s_generation;
+static u64                  s_input_epoch;
+static char                 s_message[512];
 
 /* Deadline for auto-dismissing a no-button dialog; 0 = not armed.
  *
@@ -153,8 +157,12 @@ static s32 dialog_open_impl(CellMsgDialogType type, const char* msgString,
             (buttons==1 && (cursor>1 || bars)) ||
             (buttons==2 && (cursor || bars))) return CELL_MSGDIALOG_ERROR_PARAM;
         if (s_dialog_open) return (s32)0x8002B105u;
-        if (buttons) {
+        if (buttons && !s_host_enabled) {
             ps3_strict_boot_guard("msgdialog-user-input-unimplemented","type=0x%X",type);
+            return (s32)CELL_ENOSYS;
+        }
+        if (s_generation==UINT64_MAX) {
+            ps3_strict_boot_guard("msgdialog-generation-exhausted","generation limit reached");
             return (s32)CELL_ENOSYS;
         }
         s32 queued=cellSysutilSendSystemCommand(CELL_SYSUTIL_DRAWING_BEGIN,0);
@@ -172,6 +180,12 @@ static s32 dialog_open_impl(CellMsgDialogType type, const char* msgString,
     s_userdata    = userdata;
     s_type        = type;
     s_close_pending=0;
+    if(strict) {
+        ++s_generation;
+        if(s_host_enabled)++s_input_epoch;
+        memset(s_message,0,sizeof(s_message));
+        memcpy(s_message,bounded_message,strlen(bounded_message)+1);
+    }
     memset(s_progress, 0, sizeof(s_progress));
 
     /* Print the message so developers can see it */
@@ -318,7 +332,7 @@ s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
     return cellMsgDialogOpen2(type, msgString, callback, userdata, extParam);
 }
 
-static s32 finish_strict_dialog(int callback)
+static s32 finish_strict_dialog_result(int callback,s32 button)
 {
     s32 queued=cellSysutilSendSystemCommand(CELL_SYSUTIL_DRAWING_END,0);
     if (queued<0) {
@@ -328,11 +342,83 @@ static s32 finish_strict_dialog(int callback)
     s_dialog_open=0;s_nobutton_deadline=0;s_close_pending=0;
     CellMsgDialogCallback cb=s_callback;s_callback=NULL;
     if (callback && cb) {
-        s32 result=queue_dialog_callback(cb,CELL_MSGDIALOG_BUTTON_NONE,s_userdata);
+        s32 result=queue_dialog_callback(cb,button,s_userdata);
         if (result<0) ps3_strict_boot_guard("msgdialog-completion-allocation-failed","error=0x%X",(u32)result);
         return result;
     }
     return CELL_OK;
+}
+
+static s32 finish_strict_dialog(int callback)
+{
+    return finish_strict_dialog_result(callback,CELL_MSGDIALOG_BUTTON_NONE);
+}
+
+s32 ps3_msgdialog_host_enable(int enabled)
+{
+    DIALOG_LOCK();
+    s32 result=CELL_OK;
+    if(enabled!=0 && enabled!=1) result=CELL_MSGDIALOG_ERROR_PARAM;
+    else if(s_dialog_open) result=(s32)0x8002B105u;
+    else s_host_enabled=enabled;
+    DIALOG_UNLOCK();return result;
+}
+
+s32 ps3_msgdialog_host_shutdown(void)
+{
+    DIALOG_LOCK();
+    s32 result=s_dialog_open?finish_strict_dialog(0):CELL_OK;
+    if(result==CELL_OK)s_host_enabled=0;
+    DIALOG_UNLOCK();return result;
+}
+
+int ps3_msgdialog_host_input_state(u64* epoch)
+{
+    DIALOG_LOCK();
+    if(epoch)*epoch=s_input_epoch;
+    int captured=ps3_strict_boot_enabled() && s_host_enabled && s_dialog_open;
+    DIALOG_UNLOCK();return captured;
+}
+
+int ps3_msgdialog_host_snapshot(Ps3MsgDialogHostState* output)
+{
+    if(!output)return 0;
+    DIALOG_LOCK();
+    memset(output,0,sizeof(*output));
+    int available=s_host_enabled && ps3_strict_boot_enabled();
+    if(available) {
+        output->generation=s_generation;
+        output->open=s_dialog_open;
+        output->type=s_type;
+        memcpy(output->message,s_message,sizeof(output->message));
+        for(unsigned i=0;i<MAX_PROGRESS_BARS;++i) {
+            output->progress[i].value=s_progress[i].value;
+            memcpy(output->progress[i].message,s_progress[i].message,63);
+        }
+    }
+    DIALOG_UNLOCK();return available;
+}
+
+s32 ps3_msgdialog_host_respond(u64 generation,s32 result)
+{
+    DIALOG_LOCK();
+    s32 status=CELL_OK;
+    if(!s_host_enabled || !ps3_strict_boot_enabled()) status=(s32)CELL_ENOSYS;
+    else if(!s_dialog_open || generation!=s_generation)
+        status=CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+    else {
+        u32 buttons=(s_type>>4)&7u;
+        int valid=(result==CELL_MSGDIALOG_BUTTON_ESCAPE && !(s_type&0x80u)) ||
+            (result==CELL_MSGDIALOG_BUTTON_OK && (buttons==1u || buttons==2u)) ||
+            (result==CELL_MSGDIALOG_BUTTON_NO && buttons==1u);
+        if(!valid)status=CELL_MSGDIALOG_ERROR_PARAM;
+        else {
+            printf("[cellMsgDialog] Host input generation=%llu result=%d\n",
+                (unsigned long long)generation,result);
+            status=finish_strict_dialog_result(1,result);
+        }
+    }
+    DIALOG_UNLOCK();return status;
 }
 
 static s32 dialog_close_impl(float delayMs)

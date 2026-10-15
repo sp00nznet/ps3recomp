@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
+#include "pad_dialog_filter.h"
+#include "../system/cellMsgDialog.h"
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
@@ -40,7 +43,9 @@
   #endif
   #include <windows.h>
   #include <xinput.h>
-  #pragma comment(lib, "xinput.lib")
+  #ifdef _MSC_VER
+    #pragma comment(lib, "xinput.lib")
+  #endif
 #endif
 
 #if PAD_BACKEND_SDL2
@@ -81,6 +86,32 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+/* Backend sweeps and the paired raw-state/serial gate snapshot share a lock.
+ * Gate decisions have a separate lock, always taken after the backend lock. */
+static PadDialogFilter s_dialog_filter[PAD_MAX_HOST_PORTS];
+static atomic_flag s_dialog_filter_lock = ATOMIC_FLAG_INIT;
+static atomic_flag s_backend_poll_lock = ATOMIC_FLAG_INIT;
+static atomic_uint_fast64_t s_completed_poll = 0;
+
+static void pad_dialog_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_dialog_filter_lock,memory_order_acquire)) {}
+}
+
+static void pad_dialog_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_dialog_filter_lock,memory_order_release);
+}
+
+static void pad_backend_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_backend_poll_lock,memory_order_acquire)) {}
+}
+
+static void pad_backend_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_backend_poll_lock,memory_order_release);
+}
 
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -423,11 +454,15 @@ static unsigned long long pad_now_ms(void)
 
 static void pad_poll_backend(void)
 {
-    /* Benign race: two threads may poll in the same tick. That costs one extra
-     * sweep, never a missed or stale-forever read. */
+    /* Serialize backend writes with the input-gate's host snapshot. A serial
+     * may only describe the state from that same completed sweep. */
     static unsigned long long s_last_ms = 0;
+    pad_backend_lock();
     unsigned long long now = pad_now_ms();
-    if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) return;
+    if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) {
+        pad_backend_unlock();
+        return;
+    }
     s_last_ms = now;
     /* A real pad streams reports at roughly this rate whether or not anything
      * changed, and libpad buffers them; a fresh sweep is a fresh report for
@@ -442,6 +477,8 @@ static void pad_poll_backend(void)
 #ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
+    atomic_fetch_add_explicit(&s_completed_poll,1,memory_order_release);
+    pad_backend_unlock();
 }
 
 /* ---------------------------------------------------------------------------
@@ -515,6 +552,7 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     /* Build in a local host struct, then copy to guest memory big-endian. */
     CellPadData _d; CellPadData* data = &_d;
     memset(data, 0, sizeof(CellPadData));
+    int report_assembled=0;
 
     /* Poll fresh state */
     pad_poll_backend();
@@ -556,9 +594,11 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
         /* Delay past init, then a single clean pulse every ~180 calls (press 15, release 165). */
         if (_pc > delay) {
             long ph = (_pc - delay) % 180;
+            pad_backend_lock();
             if (ph < 15) s_host_state[port_no].buttons |= btn;
             else         s_host_state[port_no].buttons &= ~btn;
             s_host_state[port_no].connected = 1;
+            pad_backend_unlock();
         }
     }
 skip_inject: ;
@@ -581,6 +621,7 @@ skip_inject: ;
         len = CELL_PAD_LEN_CHANGE_PRESS_ON;
 
     data->len = len;
+    report_assembled=1;
     /* button[0] is reserved and 0 on hardware; button[1] carries the pad mode
      * in its high nibble (0x7) and len/2 in its low one. GH3 drops any packet
      * whose button[0] is non-zero -- with len (8) there, every press was
@@ -714,9 +755,13 @@ skip_inject: ;
                  sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
-                  hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
-                  hs->connected = 1; }
+      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) {
+          pad_backend_lock();
+          hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+          hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
+          hs->connected = 1;
+          pad_backend_unlock();
+      }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
        * deflections instead of holding one. Guessing a single stick position and
        * re-running costs ~5 minutes a try; a sweep answers "can input move the
@@ -736,9 +781,11 @@ skip_inject: ;
             if (!t0) t0 = clock();
             long el = (long)((double)(clock() - t0) / (double)CLOCKS_PER_SEC);
             int k = (int)((el / (sw > 0 ? sw : 1)) % 9);
+            pad_backend_lock();
             hs->analog_lx = steps[k][0]; hs->analog_ly = steps[k][1];
             hs->analog_rx = steps[k][2]; hs->analog_ry = steps[k][3];
             hs->connected = 1;
+            pad_backend_unlock();
             { static int lastk = -1;
               if (k != lastk) { lastk = k;
                 fprintf(stderr, "[PADSWEEP] step %d: l=(%u,%u) r=(%u,%u)%c", k,
@@ -797,6 +844,60 @@ skip_inject: ;
     }  /* end connected block */
 
 emit:
+    /* All pad sources have now contributed to the local report. The host
+     * dialog owns controller and keyboard input; after it closes, keep each
+     * port neutral until a later completed backend poll sees every control
+     * released. Suppress values only: preserve connection, report length,
+     * report drain, mode byte and sensor-at-rest semantics. */
+    if (port_no < PAD_MAX_HOST_PORTS) {
+        PadDialogRaw raw = {0};
+        raw.stick[0]=raw.stick[1]=raw.stick[2]=raw.stick[3]=128;
+        raw.buttons=(u16)(data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |
+                  (data->button[CELL_PAD_BTN_OFFSET_DIGITAL2]<<8));
+        PadHostState host;
+        uint64_t serial;
+        pad_backend_lock();
+        host=s_host_state[port_no];
+        serial=(uint64_t)atomic_load_explicit(&s_completed_poll,memory_order_relaxed);
+        if (host.connected) {
+            raw.buttons |= host.buttons;
+            raw.stick[0]=host.analog_lx; raw.stick[1]=host.analog_ly;
+            raw.stick[2]=host.analog_rx; raw.stick[3]=host.analog_ry;
+            raw.trigger[0]=host.trigger_l2; raw.trigger[1]=host.trigger_r2;
+        }
+        /* The local report may have been assembled before this later locked
+         * host sample. Conservatively keep any older digital/analog input as
+         * held, so a newer poll cannot validate an older neutral report. */
+        if (report_assembled) {
+            for (unsigned i=CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X;
+                 i<=CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y;++i)
+                if (data->button[i]<120 || data->button[i]>136) raw.pressure=1;
+        }
+        /* L2/R2 are analog trigger levels, including resting noise. Their
+         * release threshold is evaluated separately in raw.trigger. */
+        for (unsigned i=CELL_PAD_BTN_OFFSET_PRESS_RIGHT;
+             i<=CELL_PAD_BTN_OFFSET_PRESS_R1;++i)
+            if (data->button[i]) raw.pressure=1;
+        if(data->button[CELL_PAD_BTN_OFFSET_PRESS_L2]>8 ||
+           data->button[CELL_PAD_BTN_OFFSET_PRESS_R2]>8)raw.pressure=1;
+        u64 epoch=0;
+        int active=ps3_msgdialog_host_input_state(&epoch);
+        pad_dialog_lock();
+        int suppressed=pad_dialog_filter_step(&s_dialog_filter[port_no],
+                                                active,epoch,serial,&raw);
+        pad_dialog_unlock();
+        pad_backend_unlock();
+        if (suppressed) {
+            data->button[CELL_PAD_BTN_OFFSET_DIGITAL1]=0;
+            data->button[CELL_PAD_BTN_OFFSET_DIGITAL2]=0;
+            data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X]=128;
+            data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y]=128;
+            data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]=128;
+            data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]=128;
+            for (unsigned i=CELL_PAD_BTN_OFFSET_PRESS_RIGHT;
+                 i<=CELL_PAD_BTN_OFFSET_PRESS_R2;++i) data->button[i]=0;
+        }
+    }
     /* A non-zero len means "here is a CHANGE packet" -- the constant is literally
      * named CELL_PAD_LEN_CHANGE_DEFAULT. Hardware reports len = 0 once the port
      * has nothing new, and titles DRAIN on that: The Simpsons Arcade Game's
