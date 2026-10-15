@@ -944,7 +944,7 @@ static void cellFsAioInit(ppu_context* ctx)
         char path[1025];
         const uint32_t ea=(uint32_t)ctx->gpr[3];
         const int32_t error=fs_stat_guest_path(path,ea);
-        std::fprintf(stderr,"[fs] aio init path='%s' path_ea=0x%08X path_result=0x%08X lr=0x%08llX tid=%llu\n",
+        fprintf(stderr,"[fs] aio init path='%s' path_ea=0x%08X path_result=0x%08X lr=0x%08llX tid=%llu\n",
             error?"<invalid>":path,ea,(uint32_t)error,
             (unsigned long long)ctx->lr,(unsigned long long)ctx->thread_id);
         ps3_strict_fs_unimplemented("cellFsAioInit",error?"<invalid>":path);
