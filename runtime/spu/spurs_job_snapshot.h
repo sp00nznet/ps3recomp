@@ -9,7 +9,7 @@ extern "C" {
 #define SPURS_JOB_SNAPSHOT_DESC_MAX 1024u
 #define SPURS_JOB_SNAPSHOT_IMAGE_MAX 262144u
 #define SPURS_JOB_CAPTURE_MAX_COUNT 16u
-#define SPURS_JOB_CAPTURE_MAX_BYTES (16ull * (1024ull + 262144ull))
+#define SPURS_JOB_CAPTURE_MAX_BYTES (16ull * (1024ull + 262144ull + 4ull))
 
 typedef enum spurs_job_snapshot_status {
     SPURS_JOB_SNAPSHOT_OK = 0,
@@ -32,6 +32,9 @@ typedef struct spurs_job_snapshot {
     uint64_t fingerprint;
     uint8_t* descriptor;
     uint8_t* image;
+    /* Non-owning mapping provenance, valid through capture. Never serialized. */
+    const void* guest_base;
+    uint64_t guest_limit;
 } spurs_job_snapshot;
 
 /* Explicit guest limit in bytes, <= 4 GiB. base NULL permits identity mapping.
@@ -53,11 +56,17 @@ typedef enum spurs_job_capture_status {
     SPURS_JOB_CAPTURE_ERROR
 } spurs_job_capture_status;
 
-/* Reads FOLKLORE_SPU_CAPTURE_DIR only. Existing absolute private directory;
+/* Reads FOLKLORE_SPU_CAPTURE_DIR. Existing absolute private directory;
  * no mkdir, exclusive creation, no overwrite; maximum 16 attempts/process and
- * bounded descriptor+image total. Writes PREFIX.desc.bin, PREFIX.image.bin,
+ * bounded descriptor+image+optional four-byte auxiliary total. Writes PREFIX.desc.bin, PREFIX.image.bin,
  * PREFIX.json. Returns complete prefix in out_prefix on success, else empty.
- * Metadata schema version 1, runtime fingerprint only (launcher adds SHA256).
+ * Metadata schema version 1 by default, version 2 with auxiliary fields;
+ * runtime fingerprint only (launcher adds SHA256).
+ * Optional FOLKLORE_SPU_CAPTURE_AUX_EA must be 0x followed by 1..8 hex digits.
+ * With capture enabled, copies exactly four bytes using acquire's guest mapping
+ * and writes PREFIX.aux.bin plus auxiliary_* metadata. Separate copy, no epoch
+ * coherence. Invalid/unreadable auxiliary spans fail the whole capture. With
+ * DIR unset/empty, no auxiliary parse/read occurs. Mapping must remain valid.
  * No guest pointer follows, native execution or success-result synthesis. */
 spurs_job_capture_status spurs_job_snapshot_capture(
     const spurs_job_snapshot* snapshot, char* out_prefix, uint32_t prefix_capacity);

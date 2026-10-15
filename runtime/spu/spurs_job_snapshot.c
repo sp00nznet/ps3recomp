@@ -120,6 +120,8 @@ spurs_job_snapshot_status spurs_job_snapshot_acquire(
         out->fingerprint ^= out->image[i];
         out->fingerprint *= 1099511628211ull;
     }
+    out->guest_base = base;
+    out->guest_limit = guest_limit;
     return SPURS_JOB_SNAPSHOT_OK;
 failed:
     spurs_job_snapshot_release(out);
@@ -144,6 +146,25 @@ const char* spurs_job_snapshot_status_name(spurs_job_snapshot_status status)
 static atomic_flag capture_lock = ATOMIC_FLAG_INIT;
 static unsigned capture_attempts;
 static uint64_t capture_bytes;
+
+static int auxiliary_ea_parse(const char* text, uint32_t* ea)
+{
+    if (!text || text[0] != '0' || text[1] != 'x') return 0;
+    uint32_t value = 0;
+    unsigned digits = 0;
+    for (const char* p = text + 2; *p; ++p) {
+        unsigned nibble;
+        if (*p >= '0' && *p <= '9') nibble = (unsigned)(*p - '0');
+        else if (*p >= 'a' && *p <= 'f') nibble = (unsigned)(*p - 'a') + 10;
+        else if (*p >= 'A' && *p <= 'F') nibble = (unsigned)(*p - 'A') + 10;
+        else return 0;
+        if (++digits > 8) return 0;
+        value = (value << 4) | nibble;
+    }
+    if (!digits) return 0;
+    *ea = value;
+    return 1;
+}
 
 static int exclusive_write(const char* path, const void* data, uint32_t size, int* created)
 {
@@ -198,8 +219,11 @@ spurs_job_capture_status spurs_job_snapshot_capture(
     if (directory[0] != '/' || lstat(directory, &info) || !S_ISDIR(info.st_mode))
         return SPURS_JOB_CAPTURE_ERROR;
 #endif
+    const char* auxiliary_env = getenv("FOLKLORE_SPU_CAPTURE_AUX_EA");
+    int auxiliary_enabled = auxiliary_env && *auxiliary_env;
+    uint32_t auxiliary_ea = 0;
     while (atomic_flag_test_and_set_explicit(&capture_lock, memory_order_acquire)) { }
-    uint64_t bytes = (uint64_t)s->descriptor_size + s->image_size;
+    uint64_t bytes = (uint64_t)s->descriptor_size + s->image_size + (auxiliary_enabled ? 4u : 0u);
     if (capture_attempts >= SPURS_JOB_CAPTURE_MAX_COUNT ||
         bytes > SPURS_JOB_CAPTURE_MAX_BYTES - capture_bytes) {
         atomic_flag_clear_explicit(&capture_lock, memory_order_release);
@@ -208,7 +232,13 @@ spurs_job_capture_status spurs_job_snapshot_capture(
     unsigned index = capture_attempts++;
     capture_bytes += bytes; /* Failed attempts consume their reservation too. */
     atomic_flag_clear_explicit(&capture_lock, memory_order_release);
-    char leaf[128], prefix[4096], descriptor_path[4096], image_path[4096], metadata_path[4096];
+    if (auxiliary_enabled && !auxiliary_ea_parse(auxiliary_env, &auxiliary_ea))
+        return SPURS_JOB_CAPTURE_ERROR;
+    uint8_t auxiliary[4];
+    if (auxiliary_enabled && !checked_read(s->guest_base, s->guest_limit,
+                                           auxiliary_ea, sizeof auxiliary, auxiliary))
+        return SPURS_JOB_CAPTURE_ERROR;
+    char leaf[128], prefix[4096], descriptor_path[4096], image_path[4096], metadata_path[4096], auxiliary_path[4096];
     int n = snprintf(leaf, sizeof leaf, "spurs-job-%08X-%016llX-%02u", s->job_ea,
                      (unsigned long long)s->fingerprint, index);
     if (n < 0 || (size_t)n >= sizeof leaf) return SPURS_JOB_CAPTURE_ERROR;
@@ -216,25 +246,36 @@ spurs_job_capture_status spurs_job_snapshot_capture(
     if (n < 0 || (size_t)n >= sizeof prefix || (uint32_t)n >= capacity) return SPURS_JOB_CAPTURE_ERROR;
     if (snprintf(descriptor_path, sizeof descriptor_path, "%s.desc.bin", prefix) >= (int)sizeof descriptor_path ||
         snprintf(image_path, sizeof image_path, "%s.image.bin", prefix) >= (int)sizeof image_path ||
+        snprintf(auxiliary_path, sizeof auxiliary_path, "%s.aux.bin", prefix) >= (int)sizeof auxiliary_path ||
         snprintf(metadata_path, sizeof metadata_path, "%s.json", prefix) >= (int)sizeof metadata_path)
         return SPURS_JOB_CAPTURE_ERROR;
+    char auxiliary_metadata[512] = {0};
+    if (auxiliary_enabled) {
+        n = snprintf(auxiliary_metadata, sizeof auxiliary_metadata,
+            ",\n  \"auxiliary_ea\": \"0x%08X\",\n  \"auxiliary_size\": 4,\n"
+            "  \"auxiliary_file\": \"%s.aux.bin\",\n"
+            "  \"auxiliary_consistency\": \"separate checked copy; guest not quiesced\"", auxiliary_ea, leaf);
+        if (n < 0 || (size_t)n >= sizeof auxiliary_metadata) return SPURS_JOB_CAPTURE_ERROR;
+    }
     char metadata[2048];
     n = snprintf(metadata, sizeof metadata,
-        "{\n  \"schema_version\": 1,\n  \"job_ea\": \"0x%08X\",\n  \"descriptor_size\": %u,\n"
+        "{\n  \"schema_version\": %u,\n  \"job_ea\": \"0x%08X\",\n  \"descriptor_size\": %u,\n"
         "  \"raw_binary_ea\": \"0x%016llX\",\n  \"binary_flags\": %u,\n  \"binary_ea\": \"0x%08X\",\n"
         "  \"image_size\": %u,\n  \"runtime_fingerprint\": \"0x%016llX\",\n"
         "  \"fingerprint_seed\": \"1469598103934665603\",\n"
         "  \"descriptor_file\": \"%s.desc.bin\",\n  \"image_file\": \"%s.image.bin\",\n"
-        "  \"snapshot_consistency\": \"separate checked copies; guest not quiesced\"\n}\n",
-        s->job_ea, s->descriptor_size, (unsigned long long)s->raw_binary_ea, s->binary_flags,
-        s->binary_ea, s->image_size, (unsigned long long)s->fingerprint, leaf, leaf);
+        "  \"snapshot_consistency\": \"separate checked copies; guest not quiesced\"%s\n}\n",
+        auxiliary_enabled ? 2u : 1u, s->job_ea, s->descriptor_size, (unsigned long long)s->raw_binary_ea, s->binary_flags,
+        s->binary_ea, s->image_size, (unsigned long long)s->fingerprint, leaf, leaf, auxiliary_metadata);
     if (n < 0 || (size_t)n >= sizeof metadata) return SPURS_JOB_CAPTURE_ERROR;
-    int desc_created = 0, image_created = 0, meta_created = 0;
+    int desc_created = 0, image_created = 0, meta_created = 0, aux_created = 0;
     if (!exclusive_write(descriptor_path, s->descriptor, s->descriptor_size, &desc_created) ||
         !exclusive_write(image_path, s->image, s->image_size, &image_created) ||
+        (auxiliary_enabled && !exclusive_write(auxiliary_path, auxiliary, sizeof auxiliary, &aux_created)) ||
         !exclusive_write(metadata_path, metadata, (uint32_t)n, &meta_created)) {
         /* Only remove files this attempt exclusively created. Never overwrite. */
         if (meta_created) (void)remove(metadata_path);
+        if (aux_created) (void)remove(auxiliary_path);
         if (image_created) (void)remove(image_path);
         if (desc_created) (void)remove(descriptor_path);
         return SPURS_JOB_CAPTURE_ERROR;
