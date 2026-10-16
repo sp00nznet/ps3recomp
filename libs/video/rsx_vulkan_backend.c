@@ -158,6 +158,9 @@ typedef struct vk_state {
     VkPhysicalDeviceMemoryProperties memprops;
 
     u32              width, height;
+    int              fxaa_enabled;
+    u64              fxaa_frames;
+    VkImage          display_image;
     vk_image         color;           /* R8G8B8A8_UNORM                 */
     vk_image         depth;           /* D32_SFLOAT or fallback         */
     VkFormat         depth_format;
@@ -539,6 +542,8 @@ static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayo
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
+
+#include "rsx_vulkan_fxaa.inc"
 
 /* ---------------------------------------------------------------------------
  * Texture unit 0
@@ -1859,7 +1864,7 @@ static void vk_present_window(void)
     }
 
     if (vk_begin()) return;
-    vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(s_vk.display_image ? s_vk.display_image : s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1876,7 +1881,7 @@ static void vk_present_window(void)
         .dstOffsets = { { 0, 0, 0 },
                         { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
     };
-    pvkCmdBlitImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
+    pvkCmdBlitImage(s_vk.cmd, s_vk.display_image ? s_vk.display_image : s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     1, &blit, VK_FILTER_LINEAR);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1930,13 +1935,23 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     (void)ud; (void)buffer_id;
     if (!s_vk.device) return;
 
+    VkImage display = s_vk.color.img;
+    if (s_vk.fxaa_enabled) {
+        if (vk_fxaa_apply(&display)) {
+            ps3_strict_boot_guard("vulkan-fxaa", "requested FXAA pass failed");
+            return;
+        }
+        if (++s_vk.fxaa_frames <= 4)
+            VK_LOG("FXAA frame %llu filtered at %ux%u\n", (unsigned long long)s_vk.fxaa_frames, s_vk.width, s_vk.height);
+    }
+    s_vk.display_image = display;
     if (vk_begin()) return;
-    vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(display, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkBufferImageCopy region = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageExtent = { s_vk.width, s_vk.height, 1 },
     };
-    pvkCmdCopyImageToBuffer(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
+    pvkCmdCopyImageToBuffer(s_vk.cmd, display, VK_IMAGE_LAYOUT_GENERAL,
                             s_vk.readback.buf, 1, &region);
     VkBufferMemoryBarrier host = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -3552,7 +3567,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (vk_pick_depth_format()) return -1;
     if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (s_vk.fxaa_enabled ? VK_IMAGE_USAGE_SAMPLED_BIT : 0), VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
     if (vk_create_image(&s_vk.depth, s_vk.depth_format, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, s_vk.depth_aspect)) return -1;
@@ -3602,11 +3617,23 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
         VK_LOG("guest programs requested but HLSL/SPIR-V translator is unavailable\n");
         return -1;
     }
+    const char* aa = getenv("PS3RECOMP_ANTIALIASING");
+    if (aa && strcmp(aa, "off") && strcmp(aa, "fxaa")) {
+        VK_LOG("PS3RECOMP_ANTIALIASING must be off or fxaa\n");
+        return -1;
+    }
     memset(&s_vk, 0, sizeof s_vk);
+    s_vk.fxaa_enabled = aa && !strcmp(aa, "fxaa");
     if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();
         return -1;
     }
+    if (s_vk.fxaa_enabled && vk_fxaa_init()) {
+        VK_LOG("requested FXAA setup failed\n");
+        rsx_vulkan_backend_shutdown();
+        return -1;
+    }
+    VK_LOG("anti-aliasing: %s\n", s_vk.fxaa_enabled ? "FXAA3.11 quality29 RGB-luma" : "off");
     /* One path at a time: the FIFO walker feeds both the rsx_state vtable
      * and the register-file engine, so registering both would record every
      * draw twice (the rule the Metal backend's init follows).
@@ -3662,6 +3689,7 @@ void rsx_vulkan_backend_shutdown(void)
         for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) vk_destroy_image(&s_vk.tex[u]);
         vk_destroy_image(&s_vk.dummy);
         vk_destroy_image(&s_vk.depth);
+        vk_fxaa_shutdown();
         vk_destroy_image(&s_vk.color);
         vk_destroy_buffer(&s_vk.vertices);
         vk_destroy_buffer(&s_vk.readback);
