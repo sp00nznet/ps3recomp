@@ -1763,6 +1763,21 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 continue;
             }
         }
+        /* A feedback draw reads the completed contents before it writes.
+         * Preserve those pixels in a separate texture, rather than sampling
+         * an active attachment or uploading its stale guest-memory backing. */
+        if (own && surface_at >= 0 && zsrc < 0) {
+            if (!eng_surface_to_guest((u32)surface_at)) {
+                ps3_strict_boot_guard("rsx-feedback-readback",
+                    "location=%u offset=0x%08X format=%u",
+                    t.location, t.offset, (u32)g.surfaces[surface_at].fmt);
+                continue;
+            }
+            textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                           t.width, t.height, t.mipmaps, t.pitch,
+                                           (int)t.cubemap, t.remap & 0xFFFFu);
+            continue;
+        }
         if (sampled >= 0 && zsrc < 0 &&
             g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
             eng_format_reinterprets_rgba8(base_fmt) &&

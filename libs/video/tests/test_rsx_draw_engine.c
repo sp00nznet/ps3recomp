@@ -94,6 +94,8 @@ typedef struct {
     u32 last_released;
     float last_clear_depth;
     int n_depth_readback;
+    int n_color_readback;
+    u8 uploaded_pixel[4];
 } StubState;
 
 static StubState stub;
@@ -126,6 +128,7 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
     (void)u; (void)t; (void)face; (void)mip; (void)w; (void)h;
     (void)src; (void)row; (void)rows;
     stub.n_texture_upload++;
+    if (src && row >= 4 && rows) memcpy(stub.uploaded_pixel, src, 4);
 }
 
 static void stub_release(void* u, u32 handle)
@@ -258,6 +261,7 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                           void* out, u32 pitch)
 {
     (void)u; (void)s; (void)x; (void)y;
+    stub.n_color_readback++;
     for (u32 r = 0; r < h; r++)
         for (u32 c = 0; c < w; c++)
             memcpy((u8*)out + (size_t)r * pitch + c * 4u, g_stub_pixel, 4);
@@ -473,6 +477,7 @@ static void test_surface_aliasing(void)
 {
     printf("-- surface aliasing\n");
     engine_up();
+    m(M_COLOR_A_PITCH, 1024u);
 
     /* Render into a surface in MAIN memory, then sample a texture unit bound
      * at the same offset in the same context: the unit must read the live
@@ -503,6 +508,17 @@ static void test_surface_aliasing(void)
     draw_triangle();
     CHECK(stub.bound_tex[0] != surface,
           "a unit naming its own render target does not alias it");
+    CHECK(stub.n_color_readback == 1 &&
+          memcmp(stub.uploaded_pixel, g_stub_pixel, 4) == 0,
+          "feedback uploads the latest rendered pixels, not stale guest bytes");
+    const u32 first_feedback = stub.bound_tex[0];
+    g_stub_pixel[0] = 0x77;
+    draw_triangle();
+    CHECK(stub.n_color_readback == 2 &&
+          stub.bound_tex[0] != first_feedback &&
+          stub.uploaded_pixel[0] == 0x77,
+          "a second feedback draw refreshes its copy within the same frame");
+    g_stub_pixel[0] = 0x11;
 
     /* The same offset in the other context DMA is a different object. */
     m(M_COLOR_A_OFFSET, 0x90000u);
@@ -521,6 +537,10 @@ static void test_mrt_set(void)
 {
     printf("-- MRT set\n");
     engine_up();
+    m(M_COLOR_A_PITCH, 1024u);
+    m(0x0210, 1024u); /* color B pitch */
+    m(0x0280, 1024u); /* color C pitch */
+    m(0x0284, 1024u); /* color D pitch */
 
     /* Targets B, C and D alongside the A engine_up declared, then MRT3 --
      * the way a deferred pass declares its G-buffer. */
@@ -1233,6 +1253,15 @@ static void test_multisample_seed(void)
               "seeded %u-sample pixels honor padded guest pitch and ARGB conversion",samples);
         CHECK(memcmp(bytes,original,32*storage_h)==0,"seeding leaves guest bytes unchanged");
         draw_triangle();CHECK(g_written.n==1,"reusing seeded surface does not overwrite GPU content");
+        bind_texture_unit(RSX_LOCATION_MAIN,0x60000);
+        m(M_TEX_UNIT+0x18,(6u<<16)|storage_h);
+        m(0x1840,32u); /* texture control3: linear pitch */
+        draw_triangle();
+        CHECK(stub.n_color_readback==1&&stub.bound_tex[0]!=stub.bound_rt[0]&&
+              memcmp(stub.uploaded_pixel,g_stub_pixel,4)==0,
+              "%u-sample feedback uploads expanded rendered pixels",samples);
+        CHECK(bytes[24]==0xEE&&bytes[31]==0xEE&&bytes[32+24]==0xEE,
+              "%u-sample feedback preserves guest row padding",samples);
         engine_down();
     }
 }
