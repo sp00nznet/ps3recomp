@@ -1,0 +1,5 @@
+inc/** -text
+src/** -text
+license.txt -text
+NOTICES.txt -text
+UPSTREAM-README.md -text

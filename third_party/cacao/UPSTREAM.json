@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/GPUOpen-Effects/FidelityFX-CACAO",
+  "commit": "0ddca95e6714727a252ead345591ca8f2598f261",
+  "license": "MIT; AMD and Intel notices preserved in source",
+  "files": {
+    "inc/ffx_cacao.h": "3f2443a921f1a2d3f15460371bd192448327f38f4bc18aa3501a3238ab31ec8b",
+    "inc/ffx_cacao_impl.h": "8d18a5502b312ffb2a5fa24b45b3d3b3b6433fd544a8fe02a20c5d4787bd2d44",
+    "src/build_shaders_dxil.bat": "4522f10146393eb667047f56f4d1640e0bfde80a24e29e69639029344516ab17",
+    "src/build_shaders_spirv.bat": "56c768cafc3dcf593b52ad23bf8cbaafd8e5df8453f78e6367ebecace10fc23b",
+    "src/ffx_cacao.cpp": "d6e8f3283d8dc23d6da2d63713a1c2e92b56229fa0c67a2fa38b9bd56d515dd5",
+    "src/ffx_cacao.hlsl": "be6d1085192bd0c40091082d745eded3f68902253927baa1e4948d7c3ab990b3",
+    "src/ffx_cacao_bindings.hlsl": "d5c9f29e68017a7e0e4cfd04fc2441ed377dcee20fed9201874ac4870c09f01f",
+    "src/ffx_cacao_defines.h": "778bd2a80bc6806c17223a7b9980a6e2f79b56ea2ec4362bce12057e03e437d0",
+    "src/ffx_cacao_impl.cpp": "319da315a39512a1ddf9c4841aaabab0c3a623f1418a1be146dc401f748449f6",
+    "license.txt": "1bed2f55030780f264c71e69ce14734e50c60f4d36bbb9c20ef1c98df451d7d8",
+    "NOTICES.txt": "326e389fe0f4767e0d7a0bb3ee6014c6adfa1eae64d7db56ad9ed3af53ad5c9e",
+    "UPSTREAM-README.md": "d8d66871b54d185a1b4c6a44bf125cb7b0c07ab9abd13a12a6d316777ce66e06"
+  }
+}
