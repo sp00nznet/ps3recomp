@@ -457,7 +457,14 @@ static void apply_affinity(pthread_t pt, DWORD_PTR mask)
     cpu_set_t set; CPU_ZERO(&set);
     for (unsigned i = 0; i < 8 * sizeof mask && i < CPU_SETSIZE; i++)
         if (mask & ((DWORD_PTR)1 << i)) CPU_SET(i, &set);
+#if defined(__ANDROID__)
+    /* Bionic provides the kernel-thread ID instead of pthread_setaffinity_np.
+     * Never pass a failed lookup as pid=0, which would target the caller. */
+    const pid_t tid = pthread_gettid_np(pt);
+    if (tid > 0) sched_setaffinity(tid, sizeof set, &set);
+#else
     pthread_setaffinity_np(pt, sizeof set, &set);
+#endif
 #else
     /* Apple Silicon has no thread affinity; QoS (above) is the lever there. */
     (void)pt; (void)mask;
