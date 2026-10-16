@@ -260,12 +260,14 @@ static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.
 /* One pixel of a surface, in the R,G,B,A order rsx_texture_decode produces:
  * the readback hook has to put those back into the guest's A8R8G8B8. */
 static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
+static int g_capture_draw_count;
 
 static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                           void* out, u32 pitch)
 {
     (void)u; (void)s; (void)x; (void)y;
     stub.n_color_readback++;
+    if (g_capture_draw_count) g_stub_pixel[0] = (u8)stub.n_draw;
     for (u32 r = 0; r < h; r++)
         for (u32 c = 0; c < w; c++)
             memcpy((u8*)out + (size_t)r * pitch + c * 4u, g_stub_pixel, 4);
@@ -1386,6 +1388,17 @@ int main(int argc, char** argv)
         draw_triangle();
         rsx_draw_engine_present();
         CHECK(stub.n_draw==3,"capture retains all three backend draws");
+        engine_down();free(vm_base);return g_failures ? 1 : 0;
+    }
+    if(argc==2 && !strcmp(argv[1],"--check-draw-images")) {
+        engine_up(); draw_triangle(); rsx_draw_engine_present();
+        g_capture_draw_count=1;
+        draw_triangle();
+        draw_triangle();
+        rsx_draw_engine_present();
+        draw_triangle();
+        rsx_draw_engine_present();
+        CHECK(stub.n_draw==4,"image capture retains every backend draw");
         engine_down();free(vm_base);return g_failures ? 1 : 0;
     }
 

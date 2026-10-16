@@ -1881,6 +1881,10 @@ static u32 sink_bind_vertex_textures(
  * RSX_ENGINE_PASS_DUMP_MAX passes (default 64). RSX_ENGINE_PASS_DUMP_DRAWS=1
  * also writes one line per draw to <dir>/draws.txt: its pipeline, colour
  * mask, blend, depth state and the textures it samples.
+ * RSX_ENGINE_PASS_DUMP_IMAGES_PASS=<index> additionally reads back colour
+ * targets after each of the first128 draws in that pass. Disabled by default,
+ * bounded to16MiB per image and256MiB per capture; this deliberately stalls
+ * the GPU and is for diagnosis, never performance measurements.
  * RSX_ENGINE_PASS_DUMP_TRIGGER=<file> instead waits for an explicit file
  * created after an observed scene, then starts at the next frame boundary.
  *
@@ -1901,6 +1905,7 @@ static struct {
     u32 n_targets, targets[RSX_BE_MAX_COLOR_TARGETS], zslot;
     u32 draws, clears;
     u64 geometry_bytes;
+    u64 image_bytes;
     char first[2048];
 } s_pd;
 
@@ -2007,6 +2012,33 @@ static void pd_write_surface(u32 slot, const char* path)
     }
     free(raw);
     free(rgb);
+}
+
+/* Capture after the real draw, without skipping or substituting any draw. */
+static void pd_draw_images(void)
+{
+    if (s_pd.state != 2 || !s_pd.open || !s_pd.draws || s_pd.draws > 128u) return;
+    const char* selected = getenv("RSX_ENGINE_PASS_DUMP_IMAGES_PASS");
+    if (!selected || !*selected) return;
+    /* Parse a bounded decimal index, rejecting signs and trailing garbage. */
+    u32 pass = 0;
+    for (const char* p = selected; *p; ++p) {
+        if (*p < '0' || *p > '9' || pass > 100000u) return;
+        pass = pass * 10u + (u32)(*p - '0');
+    }
+    if (pass != s_pd.pass) return;
+    for (u32 k = 0; k < s_pd.n_targets; ++k) {
+        const eng_surface* surface = &g.surfaces[s_pd.targets[k]];
+        const u64 bytes = (u64)surface->w * surface->h * 3u;
+        if (!bytes || bytes > 16u * 1024u * 1024u ||
+            s_pd.image_bytes + bytes > 256u * 1024u * 1024u) continue;
+        char path[1024];
+        const int n = snprintf(path, sizeof path, "%s/pass%03u_draw%03u_t%u.ppm",
+                               s_pd.dir, s_pd.pass, s_pd.draws - 1u, k);
+        if (n < 0 || (size_t)n >= sizeof path) continue;
+        pd_write_surface(s_pd.targets[k], path);
+        s_pd.image_bytes += bytes;
+    }
 }
 
 /* A depth target to a greyscale PPM, stretched from its smallest to its
@@ -2517,6 +2549,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.zdepths[zslot].had_write = 1;
         eng_zdepth_wrote(zslot, &sf);
     }
+    pd_draw_images();
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
