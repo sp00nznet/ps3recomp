@@ -742,9 +742,10 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
  */
 #define SPINLOCK_BE1  0x01000000u          /* be32(1) */
 
-static inline volatile long* spin_word(uint32_t ea)
+static inline volatile LONG* spin_word(uint32_t ea)
 {
-    return (volatile long*)(vm_base + ea);
+    /* LONG stays 32-bit on LP64 hosts, unlike native long. */
+    return (volatile LONG*)(vm_base + ea);
 }
 
 /* Test-and-set, not compare-and-swap: writing "locked" over an already-locked
@@ -752,7 +753,7 @@ static inline volatile long* spin_word(uint32_t ea)
  * Exchange is the one RMW the POSIX shim in win32_compat.h already provides. */
 static inline int spin_try(uint32_t ea)
 {
-    return _InterlockedExchange(spin_word(ea), (long)SPINLOCK_BE1) == 0;
+    return _InterlockedExchange(spin_word(ea), (LONG)SPINLOCK_BE1) == 0;
 }
 
 static void sys_spinlock_initialize(ppu_context* ctx)
