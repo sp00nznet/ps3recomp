@@ -41,12 +41,19 @@ static int ps3_guest_byte_writable(uint64_t ea)
 {uintptr_t a;return ps3_guest_byte_address(ea,&a)&&ps3_guest_byte_permission(a,1);}
 static int ps3_guest_byte_copy(uint64_t ea,uint8_t*value,int writing)
 {
- uintptr_t a;if(!value||!ps3_guest_byte_address(ea,&a)||!ps3_guest_byte_permission(a,writing))return 0;
+ uintptr_t a;if(!value||!ps3_guest_byte_address(ea,&a))return 0;
+#if !defined(__linux__) || defined(_WIN32)
+ if(!ps3_guest_byte_permission(a,writing))return 0;
+#endif
 #ifdef _WIN32
  SIZE_T n=0;
  return (writing?WriteProcessMemory(GetCurrentProcess(),(void*)a,value,1,&n):
                  ReadProcessMemory(GetCurrentProcess(),(void*)a,value,1,&n))&&n==1;
 #elif defined(__linux__)
+ /* The kernel checks the current mapping and requested read/write permission
+  * during process_vm_*v. A /proc/self/maps scan for every byte is redundant
+  * here and cannot prevent a concurrent permission change. Keep the separate
+  * permission query for callers that only preflight, without copying. */
  struct iovec local={value,1},remote={(void*)a,1};ssize_t n;
  do{n=writing?process_vm_writev(getpid(),&local,1,&remote,1,0):process_vm_readv(getpid(),&local,1,&remote,1,0);}while(n<0&&errno==EINTR);
  return n==1;
