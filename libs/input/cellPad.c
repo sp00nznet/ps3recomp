@@ -93,6 +93,7 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 static PadStickMotion s_stick_motion[PAD_MAX_HOST_PORTS];
 static int s_stick_mapped[PAD_MAX_HOST_PORTS];
+static int s_keyboard_source;
 /* Explicit opt-in: off (default), fallback (non-motion devices), force.
  * This generates sensor reports only; capture still runs entirely in-game. */
 static int s_stick_mode;
@@ -542,8 +543,9 @@ static unsigned long long pad_now_ms(void)
 
 /* Backend lock held. Keyboard uses the existing W (R1) + Up binding, so
  * both platforms retain their existing focus-loss and key-release handling. */
-static void pad_poll_stick_motion(unsigned long long now, int keyboard)
+static void pad_poll_stick_motion(int keyboard)
 {
+    s_keyboard_source = keyboard;
     for (int i = 0; i < PAD_MAX_HOST_PORTS; ++i) {
         PadHostState* hs = &s_host_state[i];
         int physical = 0;
@@ -552,20 +554,16 @@ static void pad_poll_stick_motion(unsigned long long now, int keyboard)
 #endif
         int active = hs->connected && s_stick_mode &&
                      (!physical || s_stick_mode == 2);
-        unsigned y = keyboard && i == 0 ? hs->analog_ly : hs->analog_ry;
-        uint16_t mapped[4];
-        int valid = pad_stick_motion_update(&s_stick_motion[i], !!active,
-            !!(s_port_setting[i] & CELL_PAD_SETTING_SENSOR_ON),
-            !!(hs->buttons & CELL_PAD_CTRL_R1), y, now, mapped);
         s_stick_mapped[i] = !!active;
         if (active) {
             hs->motion_capable = 1;
-            hs->motion_valid = valid;
-            memcpy(hs->motion, mapped, sizeof(mapped));
+            hs->motion_valid = 0;
+            memset(hs->motion, 0, sizeof(hs->motion));
         } else if (!physical) {
             hs->motion_capable = hs->motion_valid = 0;
             memset(hs->motion, 0, sizeof(hs->motion));
         }
+        if (!active) pad_stick_motion_reset(&s_stick_motion[i]);
     }
 }
 
@@ -597,7 +595,7 @@ static void pad_poll_backend(void)
 #else
     if (keyboard) pad_poll_window_keyboard();
 #endif
-    pad_poll_stick_motion(now, keyboard);
+    pad_poll_stick_motion(keyboard);
     atomic_fetch_add_explicit(&s_completed_poll,1,memory_order_release);
     pad_backend_unlock();
 }
@@ -947,6 +945,25 @@ skip_inject: ;
         data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y]=file_sticks[3];
     }
 
+    /* Map the finalized ordinary buttons/sticks, including PAD_FILE. This
+     * shares the same waveform and guest sensor API as physical stick input.
+     * No game state or capture result is read or written here. */
+    pad_backend_lock();
+    if (s_stick_mapped[port_no]) {
+        u16 buttons = (u16)(data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |
+                           (data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8));
+        unsigned axis = s_keyboard_source && port_no == 0 && !file_sticks_active
+            ? CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y : CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y;
+        hs->motion_valid = pad_stick_motion_update(&s_stick_motion[port_no],1,
+            !!(setting & CELL_PAD_SETTING_SENSOR_ON),!!(buttons & CELL_PAD_CTRL_R1),
+            data->button[axis],pad_now_ms(),hs->motion);
+        if (hs->motion_valid) {
+            len = CELL_PAD_LEN_CHANGE_SENSOR_ON;
+            data->len = len;
+            data->button[1] = (u16)(0x70 | ((len / 2) & 0xF));
+        }
+    }
+    pad_backend_unlock();
     /* Pressure-sensitive buttons (only meaningful if PRESS_ON) */
     if (setting & CELL_PAD_SETTING_PRESS_ON) {
         data->button[CELL_PAD_BTN_OFFSET_PRESS_RIGHT]    = hs->press_right;
@@ -984,7 +1001,7 @@ skip_inject: ;
                 data->button[pm[k].off] = 255;
     }
 
-    /* Only timestamped physical samples extend the report to sensor length. */
+    /* Valid physical or explicitly mapped samples extend to sensor length. */
     if (len == CELL_PAD_LEN_CHANGE_SENSOR_ON)
         for (unsigned i=0;i<4;++i)
             data->button[CELL_PAD_BTN_OFFSET_SENSOR_X+i]=hs->motion[i];

@@ -29,8 +29,21 @@ static void mapping(const char* value)
     setenv("PS3RECOMP_CAPTURE_MAPPING",value,1);
 #endif
 }
-int main(void)
+static const char* pad_path;
+static void file_input(unsigned mask,unsigned ry)
 {
+    FILE* f=fopen(pad_path,"wb");CHECK(f!=NULL);
+    if(f){fprintf(f,"%u 1 128 128 128 %u\n",mask,ry);fclose(f);}
+}
+int main(int argc,char** argv)
+{
+    if(argc!=2)return 2;
+    pad_path=argv[1];file_input(0,128);
+#ifdef _WIN32
+    _putenv_s("PAD_FILE",pad_path);
+#else
+    setenv("PAD_FILE",pad_path,1);
+#endif
     static uint8_t memory[0x20000];vm_base=memory;
     fixture.capable=0;
     mapping("off");CHECK(cellPadInit(1)==0);sample();
@@ -52,6 +65,11 @@ int main(void)
     for(int i=0;i<4;i++)sample();CHECK(word(21)==738);
     for(int i=0;i<4;i++)sample();CHECK(word(21)==399);
     for(int i=0;i<20;i++){sample();CHECK(word(21)==399);}
+    fixture_buttons=0;fixture_axes[SDL_CONTROLLER_AXIS_RIGHTY]=0;sample();
+    file_input(CELL_PAD_CTRL_R1,128);sample();CHECK(word(21)==399);
+    file_input(CELL_PAD_CTRL_R1,0);sample();CHECK(word(21)==60);
+    sample();CHECK(word(21)==399); /* expired file returns to live released R1 */
+    fixture_buttons=1u<<SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;
     fixture_axes[SDL_CONTROLLER_AXIS_RIGHTY]=0;sample();
     fixture_axes[SDL_CONTROLLER_AXIS_RIGHTY]=-32768;sample();CHECK(word(21)==60);
     CHECK(cellPadSetSensorMode(0,0)==0);sample();CHECK(length()==8&&word(21)==0);
@@ -82,5 +100,6 @@ int main(void)
     mapping("invalid");fixture.attached=1;fixture.capable=0;advance();CHECK(cellPadInit(1)==0);sample();
     CHECK(cellPadInfoSensorMode(0)==0);CHECK(cellPadEnd()==0);
     printf("stick motion guest integration: %d checks, %d failures\n",checks,failures);
+    remove(pad_path);
     return failures?1:0;
 }
