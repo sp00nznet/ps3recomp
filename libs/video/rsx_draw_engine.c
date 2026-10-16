@@ -60,6 +60,7 @@ extern u32 ppu_vm_size;
 #define ENG_VP_CB_BYTES    ((RSX_DSP_NUM_CONSTANTS + 2) * 16u)
 #define ENG_FP_MAX_BYTES   0x10000u
 
+#define M_RT_FORMAT           0x0208
 #define M_ALPHA_TEST_ENABLE   0x0304
 #define M_ALPHA_FUNC          0x0308
 #define M_ALPHA_REF           0x030C
@@ -1964,6 +1965,49 @@ static void pd_close_pass(void)
     }
 }
 
+/* One bounded state snapshot per captured pass. Together with its generated
+ * shaders this makes copy-pass viewport and texture-coordinate mistakes
+ * distinguishable from geometry or texture-content corruption. */
+static void pd_first_draw_state(u32 pipeline)
+{
+    if (s_pd.state != 2 || s_pd.pass >= s_pd.max_passes) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/pass%03u_state.txt", s_pd.dir, s_pd.pass);
+    FILE* f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "[rsx engine] cannot open pass state %s\n", path); return; }
+    rsx_dsp_viewport vp;
+    rsx_dsp_get_viewport(&g.rsx, &vp);
+    fprintf(f, "pass %u pipeline %u surface_format_raw %08X viewport %u %u %u %u\n",
+            s_pd.pass, pipeline, rsx_dsp_reg(&g.rsx, M_RT_FORMAT), vp.x, vp.y, vp.w, vp.h);
+    fprintf(f, "scale %.9g %.9g %.9g %.9g\ntranslate %.9g %.9g %.9g %.9g\n",
+            vp.scale[0], vp.scale[1], vp.scale[2], vp.scale[3],
+            vp.translate[0], vp.translate[1], vp.translate[2], vp.translate[3]);
+    fprintf(f, "scissor_raw %08X %08X vertices %u stride %u attributes %u\n",
+            rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL),
+            dc.n_verts, dc.layout.stride, dc.layout.count);
+    for (u32 v = 0; v < dc.n_verts && v < 4; ++v) {
+        for (u32 a = 0; a < dc.layout.count && a < RSX_DSP_NUM_VERTEX_ATTR; ++a) {
+            if ((a + 1) * 16u > dc.layout.stride) break;
+            float value[4];
+            memcpy(value, dc.verts + (size_t)v * dc.layout.stride + a * 16u, sizeof value);
+            fprintf(f, "vertex %u attr %u %.9g %.9g %.9g %.9g\n", v, dc.layout.attrs[a],
+                    value[0], value[1], value[2], value[3]);
+        }
+    }
+    /* The prepared host constant block is exactly what this draw will bind,
+     * including the viewport epilogue after the 512 guest float4 constants. */
+    for (u32 i = 0; i < RSX_DSP_NUM_CONSTANTS + 2u; ++i) {
+        float value[4];
+        memcpy(value, g.vp_cb + i * 16u, sizeof value);
+        fprintf(f, "vp_constant %u %.9g %.9g %.9g %.9g\n", i,
+                value[0], value[1], value[2], value[3]);
+    }
+    fprintf(f, "end-state\n");
+    const int failed = ferror(f);
+    const int closed = fclose(f);
+    if (failed || closed) fprintf(stderr, "[rsx engine] incomplete pass state %s\n", path);
+}
+
 /* A draw (or, with rs NULL, a clear) into this target set: close the pass
  * when the set changed, and describe the first draw of a new one. */
 static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
@@ -2006,6 +2050,7 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
         fprintf(s_pd.draws_log, "\n");
     }
     if (s_pd.draws++) return;
+    pd_first_draw_state(pipeline);
 
     rsx_dsp_surface sf;
     rsx_dsp_viewport vp;
