@@ -148,6 +148,53 @@ end:
     free(pixels);free(baseline);return result;
 }
 
+/* Analytic fullscreen triangle, both index orders and both front-face modes.
+ * The production HLSL compiler flips Y; forward input therefore has positive
+ * Vulkan signed area (CCW). Check rendered pixels, not just enum mapping. */
+static int cull_self_test(void)
+{
+    static const float vertices[12]={-1,-1,.25f,1,3,-1,.25f,1,-1,3,.25f,1};
+    static const float constants[514*4]={0};
+    static const char plain[]="float4 main(float4 p:ATTR0):SV_Position{return p;}";
+    const float clear[4]={1,0,1,1};
+    const u32 modes[4]={0,0x404,0x405,0x408};
+    u32 rt=vk_eng_color_target_create(NULL,RSX_BE_FMT_R8G8B8A8,64,64,NULL,0);
+    u32 z=vk_eng_depth_target_create(NULL,64,64);
+    u8 pixels[64*64*4];unsigned checks=0;
+    if(!rt || !z)return 0;
+    for(unsigned reverse=0;reverse<2;reverse++)
+    for(unsigned cw=0;cw<2;cw++)
+    for(unsigned m=0;m<4;m++) {
+        u32 indices[3]={0,reverse?2:1,reverse?1:2};
+        capture c={0};c.h[4]=3;c.h[5]=16;c.h[6]=3;
+        c.h[24]=m!=0;c.h[25]=m?modes[m]:0x405;c.h[26]=cw?0x900:0x901;
+        c.h[30]=sizeof constants;c.vertices=vertices;c.indices=indices;c.constants=constants;
+        rsx_vertex_layout_plan_init(&c.layout,1);
+        u32 pipe=pipeline(&c,plain,0,0);if(!pipe)return 0;
+        vk_eng_clear_color(NULL,rt,clear);
+        vk_eng_bind_targets(NULL,&rt,1,z);
+        vk_eng_set_viewport(NULL,0,0,64,64,0,1);vk_eng_set_scissor(NULL,0,0,64,64);
+        draw(&c,pipe);memset(pixels,0x55,sizeof pixels);
+        vk_eng_readback(NULL,rt,0,0,64,64,pixels,64*4);
+        const int front=reverse==cw;
+        const int visible=m==0 || (m==1 && !front) || (m==2 && front);
+        unsigned covered=0,bad=0;
+        for(unsigned p=0;p<64*64;p++) {
+            const u8* v=pixels+p*4;
+            int green=v[0]==0 && v[1]==255 && v[2]==0 && v[3]==255;
+            int magenta=v[0]==255 && v[1]==0 && v[2]==255 && v[3]==255;
+            covered+=green;bad+=!green&&!magenta;
+        }
+        vk_eng_pipeline_release(NULL,pipe);
+        if(bad || covered!=(visible?4096u:0u)) {
+            fprintf(stderr,"Cull failure reverse=%u cw=%u mode=%x covered=%u expected=%u unexpected=%u\n",
+                    reverse,cw,modes[m],covered,visible?4096:0,bad);return 0;
+        }
+        checks++;
+    }
+    printf("Cull self-test: %u rendered orientation/mode cases passed\n",checks);return 1;
+}
+
 int main(int argc,char** argv)
 {
     capture a={0},b={0};char* avs=NULL;char* bvs=NULL;int result=1,inited=0;
@@ -156,17 +203,19 @@ int main(int argc,char** argv)
         if(ok)puts("FGM1v2 validated; no Vulkan initialized");return ok?0:2;
     }
     int self=argc==2 && !strcmp(argv[1],"--self-test");
-    if(!self && (argc!=7 || strcmp(argv[1],"--replay"))) {
-        fprintf(stderr,"Use --validate capture | --self-test | --replay depth.bin color.bin depth.hlsl color.hlsl output-prefix\n");return 2;
+    int cull=argc==2 && !strcmp(argv[1],"--cull-self-test");
+    if(!self && !cull && (argc!=7 || strcmp(argv[1],"--replay"))) {
+        fprintf(stderr,"Use --validate capture | --self-test | --cull-self-test | --replay depth.bin color.bin depth.hlsl color.hlsl output-prefix\n");return 2;
     }
-    if(!self) {
+    if(!self && !cull) {
         if(strlen(argv[6])>900 || !capture_load(&a,argv[2]) || !capture_load(&b,argv[3]))goto end;
         avs=shader_load(argv[4]);bvs=shader_load(argv[5]);if(!avs || !bvs)goto end;
     }
     SDL_SetMainReady();
-    if(rsx_vulkan_backend_init(self?64:1280,self?64:720,"Position replay diagnostic"))goto end;
+    if(rsx_vulkan_backend_init((self||cull)?64:1280,(self||cull)?64:720,"Position replay diagnostic"))goto end;
     inited=1;
-    if(self) {
+    if(cull)result=cull_self_test()?0:1;
+    else if(self) {
         static const float vertices[12]={-1,-1,.25f,1,3,-1,.25f,1,-1,3,.25f,1};
         static const float constants[514*4]={0};
         static const char plain[]="float4 main(float4 p:ATTR0):SV_Position{return p;}";

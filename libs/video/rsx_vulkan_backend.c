@@ -2943,8 +2943,9 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 samples)
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
         .polygonMode = VK_POLYGON_MODE_FILL,
         .cullMode = !rs->cull_enable ? VK_CULL_MODE_NONE
-                  : (rs->cull_face == 0x0404u || rs->cull_face == 0x0408u) ? VK_CULL_MODE_FRONT_BIT
-                                                                           : VK_CULL_MODE_BACK_BIT,
+                  : rs->cull_face == 0x0408u ? VK_CULL_MODE_FRONT_AND_BACK
+                  : rs->cull_face == 0x0404u ? VK_CULL_MODE_FRONT_BIT
+                                           : VK_CULL_MODE_BACK_BIT,
         .frontFace = (rs->front_face == 0x0901u) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                                  : VK_FRONT_FACE_CLOCKWISE,
         .lineWidth = 1.0f };
