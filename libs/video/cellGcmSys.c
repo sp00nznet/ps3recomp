@@ -2455,6 +2455,22 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
     const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+    if (ps3_strict_boot_enabled()) {
+        const u32 begin = vm_read32(ctx);
+        /* The firmware checks space for the flip command, not a guessed
+         * distance from the end of a title-owned ring. A near-end position
+         * does not authorize overwriting current or inserting a JUMP.
+         * Reference: RPCS3 4d5def58 gcmSetPrepareFlip (GPL-2.0).
+         * Keep eight bytes reserved as in that API. Our existing internal
+         * flip marker consumes one word; the guest still owns refill. */
+        if ((begin | cur | end) & 3u || begin > cur || cur > end ||
+            end - cur <= 8 || gcm_ea2io(cur) == 0xFFFFFFFFu ||
+            gcm_ea2io(cur + 3) == 0xFFFFFFFFu)
+            return 0;
+        vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+        vm_write32(ctx + 8, cur + 4);
+        return 1;
+    }
     /* Never near the end: those bytes are the title's reserve before its
      * ring wraps, and the recycle above keys on them. */
     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
