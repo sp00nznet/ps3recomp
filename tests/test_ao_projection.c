@@ -74,6 +74,45 @@ int main(void) {
         CHECK(!rsx_ao_projection_extract(m,scale,offset,16.f/9,&q));CHECK(q.near_z==123);m[r][c]=keep;
     }
     m[2][0]+=.01f;CHECK(!rsx_ao_projection_extract(m,scale,offset,16.f/9,&q));
+    /* Uniformly scaled and translated model matrices retain the camera. */
+    const float models[]={.01f,.5f,1,3,10,100};
+    for(unsigned k=0;k<sizeof(models)/sizeof(models[0]);++k) {
+        float s=models[k], a=1.02f,b=-2.02f,t=13.5f;
+        float model[4][4]={{1.2f*s,0,0,7},{0,1.2f*s,0,-4},
+                         {0,0,a*s,a*t+b},{0,0,s,t}};
+        CHECK(rsx_ao_projection_extract(model,scale,offset,1,&q));
+        CHECK(fabs(q.matrix[0][0]-1.2f)<1e-6);
+        CHECK(fabs(q.matrix[1][1]-1.2f)<1e-6);
+        CHECK(fabs(q.depth_b-b*.5)<2e-6);
+        model[0][1]=.2f*s;
+        CHECK(!rsx_ao_projection_extract(model,scale,offset,1,&q)); /* shear */
+        model[0][1]=0;model[0][0]*=2;
+        CHECK(!rsx_ao_projection_extract(model,scale,offset,1,&q)); /* unequal scale */
+    }
+    float effective[8], normalized[8]={1,1,.5f,0,0,0,.5f,0};
+    for(unsigned i=0;i<20;++i) {
+        float lo=i*.04f, hi=.9f;
+        normalized[2]=.5f/(hi-lo);normalized[6]=(.5f-lo)/(hi-lo);
+        CHECK(rsx_ao_viewport_transform(normalized,lo,hi,effective));
+        CHECK(fabs(effective[2]-.5f)<1e-6 && fabs(effective[6]-.5f)<1e-6);
+        for(unsigned d=0;d<11;++d) {
+            float clip=d*.2f-1;
+            float backend=(normalized[2]*clip+normalized[6])*(hi-lo)+lo;
+            CHECK(fabs(backend-(effective[2]*clip+effective[6]))<1e-6);
+        }
+    }
+    normalized[2]=10;normalized[6]=-9;
+    CHECK(rsx_ao_viewport_transform(normalized,.95f,1,effective));
+    CHECK(fabs(effective[2]-.5f)<1e-6 && fabs(effective[6]-.5f)<1e-6);
+    const float invalid[][2]={{-1,1},{0,2},{1,0},{.5f,.5f},{0,NAN},{NAN,1}};
+    for(unsigned i=0;i<6;++i) {
+        effective[0]=123;
+        CHECK(!rsx_ao_viewport_transform(normalized,invalid[i][0],invalid[i][1],effective));
+        CHECK(effective[0]==123);
+    }
+    CHECK(!rsx_ao_viewport_transform(NULL,0,1,effective));
+    CHECK(!rsx_ao_viewport_transform(normalized,0,1,NULL));
+    normalized[3]=NAN;CHECK(!rsx_ao_viewport_transform(normalized,0,1,effective));
     float simple[4][4]={{1,0,0,0},{0,1,0,0},{0,0,1,-2},{0,0,1,0}};
     CHECK(rsx_ao_projection_extract(simple,scale,offset,1,&q));CHECK(isinf(q.far_z));
     simple[2][3]=2;CHECK(!rsx_ao_projection_extract(simple,scale,offset,1,&q));

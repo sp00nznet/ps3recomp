@@ -60,8 +60,28 @@ static inline double rsx_ao_dot3(const float *a, const float *b)
     return (double)a[0]*b[0]+(double)a[1]*b[1]+(double)a[2]*b[2];
 }
 
-/* Combined world-to-clip rows, followed by the actual shader viewport fixup.
- * Only rigid, centered, forward perspective views are admitted initially.
+/* Compose shader depth normalization with the backend viewport depth range.
+ * A restricted clip interval changes clipping, not the depth stored by the
+ * paired transforms. Never treat the shader's normalized Z as stored depth. */
+static inline int rsx_ao_viewport_transform(const float normalized[8],
+                                  float minimum, float maximum, float effective[8])
+{
+    float value[8];
+    if (!normalized || !effective || !isfinite(minimum) || !isfinite(maximum) ||
+        minimum < 0 || maximum > 1 || !(maximum - minimum > 0.000001f)) return 0;
+    for (unsigned i=0;i<8;++i) if (!isfinite(normalized[i])) return 0;
+    memcpy(value,normalized,sizeof(value));
+    value[2]=normalized[2]*(maximum-minimum);
+    value[6]=normalized[6]*(maximum-minimum)+minimum;
+    if (!isfinite(value[2]) || !isfinite(value[6])) return 0;
+    memcpy(effective,value,sizeof(value));
+    return 1;
+}
+
+/* Combined world-to-clip rows, followed by the effective stored-depth fixup.
+ * Centered forward perspective views with rigid or uniformly scaled model
+ * transforms are admitted. The spatial row lengths contain the model scale;
+ * dividing their ratios removes it without rescaling world-space depth B.
  * Aspect must describe logical pixels, not expanded MSAA storage dimensions. */
 static inline int rsx_ao_projection_extract(const float m[4][4], const float scale[3],
                                    const float offset[3], float aspect,
@@ -79,18 +99,18 @@ static inline int rsx_ao_projection_extract(const float m[4][4], const float sca
         fabs(scale[2]-.5)>1e-5 || fabs(offset[2]-.5)>1e-5) return 0;
     xx=rsx_ao_dot3(m[0],m[0]); yy=rsx_ao_dot3(m[1],m[1]);
     ww=rsx_ao_dot3(m[3],m[3]);
-    if (xx<1e-8 || yy<1e-8 || fabs(ww-1)>1e-3) return 0;
-    sx=sqrt(xx); sy=sqrt(yy);
-    if (fabs(rsx_ao_dot3(m[0],m[1]))>1e-4*sx*sy ||
-        fabs(rsx_ao_dot3(m[0],m[3]))>1e-4*sx ||
-        fabs(rsx_ao_dot3(m[1],m[3]))>1e-4*sy ||
+    if (xx<1e-12 || yy<1e-12 || ww<1e-12) return 0;
+    sx=sqrt(xx/ww); sy=sqrt(yy/ww);
+    if (fabs(rsx_ao_dot3(m[0],m[1]))>1e-4*sqrt(xx*yy) ||
+        fabs(rsx_ao_dot3(m[0],m[3]))>1e-4*sqrt(xx*ww) ||
+        fabs(rsx_ao_dot3(m[1],m[3]))>1e-4*sqrt(yy*ww) ||
         fabs(sy/sx-aspect)>1e-3*aspect) return 0;
     a=rsx_ao_dot3(m[2],m[3])/ww;
     b=m[2][3]-a*m[3][3];
     for (unsigned i=0;i<3;++i) {
         double e=m[2][i]-a*m[3][i]; residual+=e*e;
     }
-    if (residual>1e-10 || a<1 || b>=-1e-8 || sx>1000 || sy>1000) return 0;
+    if (residual>1e-10*ww || a<1 || b>=-1e-8 || sx>1000 || sy>1000) return 0;
     memset(&candidate,0,sizeof(candidate));
     candidate.depth_a=(float)(.5*a+.5);
     candidate.depth_b=(float)(.5*b);

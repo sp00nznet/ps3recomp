@@ -17,6 +17,7 @@
 #ifdef PS3RECOMP_RSX_CACAO
 #include "rsx_ao_depth_state.h"
 #include "rsx_ao_position_program.h"
+#include "rsx_ao_position_dataflow.h"
 #endif
 #include "rsx_shader_window.h"
 #include "rsx_surface_layout.h"
@@ -1228,15 +1229,35 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
 #ifdef PS3RECOMP_RSX_CACAO
 static void eng_ao_depth_draw(u32 zslot, const eng_pipeline* pipeline,
                              const float xf[8], u32 width, u32 height,
-                             int full_depth_range)
+                             float minimum_depth, float maximum_depth)
 {
     rsx_ao_projection projection;
     int known=0;
-    if (pipeline && pipeline->position_known && full_depth_range && height) {
-        float m[4][4];
-        for (u32 row=0;row<4;++row)
-            memcpy(m[row],g.vp_cb+pipeline->position_rows[row]*16u,16);
-        known=rsx_ao_projection_extract(m,xf,xf+4,(float)width/height,&projection);
+    float effective[8];
+    if (pipeline && height &&
+        rsx_ao_viewport_transform(xf,minimum_depth,maximum_depth,effective)) {
+        u16 rows[4];
+        int position_known=pipeline->position_known;
+        if (position_known) memcpy(rows,pipeline->position_rows,sizeof(rows));
+        else {
+            /* Cached static recognition cannot prove a constant-dependent
+             * neutral offset. Recheck the current program and constants for
+             * this draw; never cache a result across constant changes. */
+            const u32 start=rsx_dsp_vp_start(&g.rsx);
+            if (start<RSX_DSP_VP_INSTR) {
+                const u8* program=(const u8*)(g.rsx.vp+start*4);
+                const u32 instructions=rsx_vp_program_size_instrs(
+                    program,(RSX_DSP_VP_INSTR-start)*16u);
+                position_known=rsx_ao_position_dataflow_rows(program,instructions*16u,
+                    (const float (*)[4])g.vp_cb,rows);
+            }
+        }
+        if (position_known) {
+            float m[4][4];
+            for (u32 row=0;row<4;++row) memcpy(m[row],g.vp_cb+rows[row]*16u,16);
+            known=rsx_ao_projection_extract(m,effective,effective+4,
+                                           (float)width/height,&projection);
+        }
     }
     rsx_ao_depth_write(&g.zdepths[zslot].ao,g.frames,
         g.zdepths[zslot].depth_serial,width,height,known ? &projection : NULL);
@@ -2361,10 +2382,15 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
         return;
     }
     if (s_pd.draws_log) {
+        rsx_dsp_viewport capture_vp;
+        rsx_dsp_get_viewport(&g.rsx,&capture_vp);
         fprintf(s_pd.draws_log, "pass %03u draw %u: pipe %u cmask %08X blend %u %X/%X"
                 " dt %u dw %u df %X at %u aac %08X |", s_pd.pass, s_pd.draws, pipeline, rs->color_mask,
                 rs->blend_enable, rs->sf_rgb, rs->df_rgb, rs->depth_test, rs->depth_write,
                 rs->depth_func, rs->alpha_test_enable, rsx_dsp_reg(&g.rsx, 0x1D7C));
+        fprintf(s_pd.draws_log," clip_depth %.9g %.9g window_z %.9g %.9g |",
+                capture_vp.clip_min,capture_vp.clip_max,
+                capture_vp.scale[2],capture_vp.translate[2]);
         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
             if (!(tex_mask & (1u << u))) continue;
             rsx_dsp_texture t;
@@ -2671,7 +2697,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         eng_zdepth_wrote(zslot, &sf);
 #ifdef PS3RECOMP_RSX_CACAO
         eng_ao_depth_draw(zslot,pipeline_metadata,xf,rt->raster_w,rt->raster_h,
-            depth_clip.min_depth==0.0f && depth_clip.max_depth==1.0f);
+            depth_clip.min_depth,depth_clip.max_depth);
 #endif
     }
     pd_draw_images();
