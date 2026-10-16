@@ -2124,6 +2124,8 @@ static int vk_eng_init(void* user, u32 width, u32 height)
 
 static u32 vk_eng_expand_samples(u32 surface);
 static void vk_eng_expansion_shutdown(void);
+static int vk_eng_pack_samples(u32 surface, u32 expanded);
+static void vk_eng_pack_shutdown(void);
 
 static void vk_eng_release(void* user, u32 handle)
 {
@@ -2155,6 +2157,7 @@ static void vk_eng_shutdown(void* user)
 {
     vk_eng2_shutdown(user);
     vk_eng_expansion_shutdown();
+    vk_eng_pack_shutdown();
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
 }
 
@@ -2336,7 +2339,20 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
     (void)user;
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (o && o->samples > 1) {
-        ps3_strict_boot_guard("vulkan-msaa-write", "individual-sample upload is not implemented");
+        const u32 expanded = vk_eng_expand_samples(surface);
+        vk_eng_obj* dst = vk_eng_get(expanded, VK_ENG_TEXTURE);
+        if (!dst || o->fmt != VK_FORMAT_R8G8B8A8_UNORM || !rows || !w || !h ||
+            x > dst->w || w > dst->w-x || y > dst->h || h > dst->h-y ||
+            (size_t)w*o->bpp > row_bytes) {
+            ps3_strict_boot_guard("vulkan-msaa-write", "invalid individual-sample upload surface=%u", surface);
+            return;
+        }
+        /* Expand first so a partial transfer retains every untouched sample.
+         * Cache invalidation prevents failed uploads from becoming texture data. */
+        o->expansion_valid = 0;
+        if (vk_eng_upload_region(dst->im.img,0,0,x,y,w,h,(size_t)w*o->bpp,h,rows,row_bytes) ||
+            !vk_eng_pack_samples(surface,expanded))
+            ps3_strict_boot_guard("vulkan-msaa-write", "individual-sample upload failed surface=%u", surface);
         return;
     }
     if (!o || o->fmt != VK_FORMAT_R8G8B8A8_UNORM) return;   /* rows are R,G,B,A */
@@ -2976,6 +2992,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 samples)
 }
 
 #include "rsx_vulkan_msaa.inc"
+#include "rsx_vulkan_msaa_upload.inc"
 
 static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pipeline = pipeline; }
 

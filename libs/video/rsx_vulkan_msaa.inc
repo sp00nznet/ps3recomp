@@ -101,7 +101,7 @@ static u32 vk_eng_expand_samples(u32 surface)
         if (!hd) goto fail;
         vk_eng_obj* dst=&s_eobj[hd];
         if (vk_create_image(&dst->im,format,w,h,
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                 VK_IMAGE_ASPECT_COLOR_BIT)) {
             vk_destroy_image(&dst->im); memset(dst,0,sizeof *dst); goto fail;
         }
