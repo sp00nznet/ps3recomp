@@ -85,6 +85,22 @@ static void table_unlock(void)
 static int find_free_slot(void)
 {
     for (int i = 0; i < PPU_THREAD_MAX; i++) {
+        ppu_thread_info* t = &g_ppu_threads[i];
+        /* Detached guest threads still need host resources reaped. FINISHED is
+         * published only by the final epilogue, after guest/TLS cleanup. */
+        if (t->state == PPU_THREAD_STATE_FINISHED && !t->joinable &&
+            !s_callback_owned[i]) {
+#ifdef _WIN32
+            WaitForSingleObject(t->host_thread, INFINITE);
+            CloseHandle(t->host_thread);
+            CloseHandle(t->finish_event);
+#else
+            pthread_join(t->host_thread, NULL);
+            pthread_mutex_destroy(&t->finish_mutex);
+            pthread_cond_destroy(&t->finish_cond);
+#endif
+            t->state = PPU_THREAD_STATE_FREE;
+        }
         if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE)
             return i;
     }
@@ -176,23 +192,19 @@ static void* ppu_host_thread_proc(void* param)
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
 
-    if (info->state == PPU_THREAD_STATE_DETACHED) {
-        /* Detached threads self-clean */
-        info->state = PPU_THREAD_STATE_FREE;
-    } else {
-        info->state = PPU_THREAD_STATE_FINISHED;
-    }
-    table_unlock();
+    info->state = PPU_THREAD_STATE_FINISHED;
 
     /* Signal anyone waiting for join */
 #ifdef _WIN32
     SetEvent(info->finish_event);
+    table_unlock();
     return 0;
 #else
     pthread_mutex_lock(&info->finish_mutex);
     info->finished = 1;
     pthread_cond_signal(&info->finish_cond);
     pthread_mutex_unlock(&info->finish_mutex);
+    table_unlock();
     return NULL;
 #endif
 }
@@ -413,7 +425,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint64_t arg          = LV2_ARG_U64(ctx, 2);
     int32_t  priority     = LV2_ARG_S32(ctx, 3);
     uint32_t stack_size   = LV2_ARG_U32(ctx, 4);
-    /* uint64_t flags     = LV2_ARG_U64(ctx, 5); */
+    uint64_t flags       = LV2_ARG_U64(ctx, 5);
     uint32_t name_addr    = LV2_ARG_PTR(ctx, 6);
 
     if (stack_size == 0) stack_size = VM_PPU_STACK_SIZE;
@@ -450,7 +462,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
     t->state      = PPU_THREAD_STATE_RUNNING;
     t->priority   = priority;
-    t->joinable   = 1;
+    t->joinable   = (flags & 1u) != 0;
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     t->entry_addr = entry;
@@ -610,20 +622,7 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     ppu_thread_info* t = find_thread(tid);
     if (t) {
         t->exit_status = (int64_t)status;
-        if (t->state == PPU_THREAD_STATE_DETACHED) {
-            t->state = PPU_THREAD_STATE_FREE;
-        } else {
-            t->state = PPU_THREAD_STATE_FINISHED;
-        }
-
-#ifdef _WIN32
-        SetEvent(t->finish_event);
-#else
-        pthread_mutex_lock(&t->finish_mutex);
-        t->finished = 1;
-        pthread_cond_signal(&t->finish_cond);
-        pthread_mutex_unlock(&t->finish_mutex);
-#endif
+        /* Completion is published after the exit unwind and TLS cleanup. */
     }
     table_unlock();
 
@@ -664,6 +663,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     /* Wait for completion */
 #ifdef _WIN32
     WaitForSingleObject(t->finish_event, INFINITE);
+    WaitForSingleObject(t->host_thread, INFINITE);
 #else
     pthread_mutex_lock(&t->finish_mutex);
     while (!t->finished) {
@@ -748,13 +748,19 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
     }
 
+    if (!t->joinable) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+
     if (t->state == PPU_THREAD_STATE_FINISHED) {
         /* Already finished, free it */
 #ifdef _WIN32
+        WaitForSingleObject(t->host_thread, INFINITE);
         CloseHandle(t->host_thread);
         CloseHandle(t->finish_event);
 #else
-        pthread_detach(t->host_thread);
+        pthread_join(t->host_thread, NULL);
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
 #endif
@@ -762,9 +768,6 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
     } else {
         t->state = PPU_THREAD_STATE_DETACHED;
         t->joinable = 0;
-#ifndef _WIN32
-        pthread_detach(t->host_thread);
-#endif
     }
 
     table_unlock();
