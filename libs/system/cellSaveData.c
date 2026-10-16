@@ -39,6 +39,28 @@
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 
+s32 cellSaveData_set_root(const char* host_root)
+{
+    if (!host_root || !*host_root) return CELL_SAVEDATA_ERROR_PARAM;
+    size_t length = strlen(host_root);
+    if (length >= sizeof s_save_root) return CELL_SAVEDATA_ERROR_PARAM;
+#ifdef _WIN32
+    if (length < 3 || !((host_root[0] >= 'A' && host_root[0] <= 'Z') ||
+                       (host_root[0] >= 'a' && host_root[0] <= 'z')) ||
+        host_root[1] != ':' || (host_root[2] != '/' && host_root[2] != '\\'))
+        return CELL_SAVEDATA_ERROR_PARAM;
+    const size_t minimum = 3;
+#else
+    if (host_root[0] != '/') return CELL_SAVEDATA_ERROR_PARAM;
+    const size_t minimum = 1;
+#endif
+    while (length > minimum && (host_root[length-1] == '/' || host_root[length-1] == '\\'))
+        --length;
+    memcpy(s_save_root, host_root, length);
+    s_save_root[length] = 0;
+    return CELL_OK;
+}
+
 /* Ensure directory (and parents) exist */
 static void ensure_dirs(const char* path)
 {

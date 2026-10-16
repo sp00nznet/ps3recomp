@@ -16,6 +16,9 @@ extern "C" {
 
 /* Configure committed callback scratch before guest execution. */
 s32 cellSaveData_set_scratch_region(u32 base, u32 size);
+/* Configure the absolute host savedata directory before guest execution.
+ * Every later write still passes through the filesystem containment guard. */
+s32 cellSaveData_set_root(const char* host_root);
 
 /* ---------------------------------------------------------------------------
  * Constants
