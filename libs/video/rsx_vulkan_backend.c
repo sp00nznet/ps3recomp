@@ -1701,6 +1701,18 @@ static void vk_window_open(const char* title)
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;
     }
+#if !defined(_WIN32) || defined(PS3RECOMP_PAD_USE_SDL2)
+    /* SDL2-compat delegates to SDL3, whose subsystem initialization belongs
+     * to the video thread. Do this before event pumping/guest execution can
+     * race cellPadInit. The existing input backend borrows this process-wide
+     * controller reference; WasInit avoids adding refs when windows reopen. */
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER) &&
+        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+        VK_LOG("window disabled: SDL controller init failed: %s\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return;
+    }
+#endif
     Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
     if (vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
