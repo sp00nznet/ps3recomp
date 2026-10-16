@@ -62,6 +62,22 @@ int main(void)
     CHECK(vm_base!=MAP_FAILED);
     memset(s_io_address_table,0xFF,sizeof(s_io_address_table));
     s_io_address_table[0]=0;s_io_address_table[1]=1;
+    setenv("GCM_REFILL_PACKET_TIMING","1",1);
+    const u32 unchanged_drain=atomic_load(&g_gcm_fifo_drained_ea);
+    const u64 packet_before=atomic_load(&s_drain_packet_count);
+    gcm_packet_diag_enter(begin,0x00041808);
+    CHECK(atomic_load(&s_packet_diag_active)==1 && atomic_load(&s_packet_diag_enter_ns)>0);
+    CHECK(atomic_load(&s_packet_diag_arg_valid)==0 && atomic_load(&s_packet_diag_return_ns)==0);
+    gcm_packet_diag_argument(0,0x1808,0); /* END's zero payload is valid data. */
+    CHECK(atomic_load(&s_packet_diag_arg_valid)==1 && atomic_load(&s_packet_diag_arg)==0);
+    CHECK(atomic_load(&s_packet_diag_method)==0x1808);
+    gcm_packet_diag_return();
+    const u64 returned=atomic_load(&s_packet_diag_return_ns);
+    CHECK(returned>=atomic_load(&s_packet_diag_enter_ns) && atomic_load(&s_packet_diag_active)==0);
+    CHECK(atomic_load(&s_packet_diag_return_count)==packet_before+1);
+    gcm_packet_diag_return(); /* post-loop break handling is idempotent. */
+    CHECK(atomic_load(&s_packet_diag_return_ns)==returned);
+    CHECK(atomic_load(&g_gcm_fifo_drained_ea)==unchanged_drain);
     prepare();atomic_store(&g_gcm_fifo_drained_ea,begin);
     pthread_t reader;CHECK(!pthread_create(&reader,NULL,consume,NULL));
     cellGcm_fifo_recycle(ctx);CHECK(!pthread_join(reader,NULL));

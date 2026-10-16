@@ -318,6 +318,63 @@ static _Atomic u32 s_drain_packet_ea = 0, s_drain_packet_word = 0;
 static _Atomic u64 s_drain_packet_count = 0;
 static _Atomic u32 s_drain_semaphore_address = 0;
 static _Atomic u32 s_drain_semaphore_expected = 0, s_drain_semaphore_actual = 0;
+/* Opt-in attempt timing. A returned attempt can be a parked jump or blocked
+ * semaphore; it is not proof of command consumption or guest completion. */
+static _Atomic u32 s_packet_diag_epoch = 0, s_packet_diag_active = 0;
+static _Atomic u32 s_packet_diag_arg = 0, s_packet_diag_arg_valid = 0;
+static _Atomic u32 s_packet_diag_arg_index = 0, s_packet_diag_method = 0;
+static _Atomic u64 s_packet_diag_enter_ns = 0, s_packet_diag_return_ns = 0;
+static _Atomic u64 s_packet_diag_last_return_ns = 0, s_packet_diag_return_count = 0;
+static int gcm_packet_timing_enabled(void)
+{
+    static int enabled = -1; /* FIFO owner only; snapshot does not initialize. */
+    if (enabled < 0) {
+        const char* value = getenv("GCM_REFILL_PACKET_TIMING");
+        enabled = value && !strcmp(value, "1");
+    }
+    return enabled;
+}
+static void gcm_packet_diag_enter(u32 ea, u32 word)
+{
+    const int timing = gcm_packet_timing_enabled();
+    if (timing) atomic_fetch_add_explicit(&s_packet_diag_epoch, 1, memory_order_seq_cst);
+    atomic_store_explicit(&s_drain_packet_ea, ea, memory_order_relaxed);
+    atomic_store_explicit(&s_drain_packet_word, word, memory_order_relaxed);
+    atomic_store_explicit(&s_drain_semaphore_address, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_drain_packet_count, 1, memory_order_relaxed);
+    if (!timing) return;
+    atomic_store_explicit(&s_packet_diag_active, 1, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_arg_valid, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_arg, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_arg_index, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_method, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_enter_ns, get_timestamp_ns(), memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_return_ns, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_packet_diag_epoch, 1, memory_order_seq_cst);
+}
+static void gcm_packet_diag_argument(u32 index, u32 method, u32 argument)
+{
+    if (!gcm_packet_timing_enabled()) return;
+    atomic_fetch_add_explicit(&s_packet_diag_epoch, 1, memory_order_seq_cst);
+    atomic_store_explicit(&s_packet_diag_arg_index, index, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_method, method, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_arg, argument, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_arg_valid, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_packet_diag_epoch, 1, memory_order_seq_cst);
+}
+static void gcm_packet_diag_return(void)
+{
+    if (!gcm_packet_timing_enabled() ||
+        !atomic_load_explicit(&s_packet_diag_active, memory_order_relaxed)) return;
+    const u64 now = get_timestamp_ns();
+    atomic_fetch_add_explicit(&s_packet_diag_epoch, 1, memory_order_seq_cst);
+    atomic_store_explicit(&s_packet_diag_return_ns, now, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_last_return_ns, now, memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_return_count,
+        atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed), memory_order_relaxed);
+    atomic_store_explicit(&s_packet_diag_active, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_packet_diag_epoch, 1, memory_order_seq_cst);
+}
 void cellGcmSetHostRendererPhase(u32 phase)
 {
     atomic_store_explicit(&s_host_renderer_phase, phase, memory_order_relaxed);
@@ -1787,7 +1844,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
-    while (s_fifo_getoff != put && budget-- > 0) {
+    /* Iteration expression covers every continue; the post-loop call covers
+     * break. Both only record an attempt returning, never publish FIFO GET. */
+    for (; s_fifo_getoff != put && budget-- > 0; gcm_packet_diag_return()) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             ps3_strict_boot_guard("rsx-unmapped-fifo", "get=0x%08X put=0x%08X", s_fifo_getoff, put);
@@ -1812,10 +1871,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
-        atomic_store_explicit(&s_drain_packet_ea, ea, memory_order_relaxed);
-        atomic_store_explicit(&s_drain_packet_word, w, memory_order_relaxed);
-        atomic_store_explicit(&s_drain_semaphore_address, 0, memory_order_relaxed);
-        atomic_fetch_add_explicit(&s_drain_packet_count, 1, memory_order_relaxed);
+        gcm_packet_diag_enter(ea, w);
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */
@@ -1949,6 +2005,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (!dea) break;
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
+                    gcm_packet_diag_argument(i, (subch << 13) | m, v);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
@@ -1980,6 +2037,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                if (gcm_packet_timing_enabled())
+                    gcm_packet_diag_argument(i, (subch << 13) | m, vm_read32(dea));
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
@@ -2136,6 +2195,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
+    gcm_packet_diag_return();
     /* Walker watchdog. Everything above recovers from a *recognised* stall --
      * a branch we cannot take, a park the title abandoned. A walker that stops
      * for any other reason simply freezes `get` for the rest of the run and
@@ -2347,15 +2407,36 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
         if (drained != previous) { previous = drained; progressed = now; }
         if ((drained == begin) == at_begin) break;
         if (!suspended && (now - progressed >= UINT64_C(5000000000) || now - started >= UINT64_C(30000000000))) {
-            fprintf(stderr, "[rsx-refill-sample] host_phase=%u packets_at_wait=%llu packets_now=%llu packet_ea=0x%08X word=0x%08X semaphore=0x%08X expected=0x%08X actual=0x%08X\n",
+            /* Never wait for this diagnostic snapshot. A concurrent metadata
+             * update is labelled incoherent, not retried. The epoch does not
+             * claim coherence with independently sampled renderer/semaphore state. */
+            const u32 epoch = atomic_load_explicit(&s_packet_diag_epoch, memory_order_seq_cst);
+            const u64 entered = atomic_load_explicit(&s_packet_diag_enter_ns, memory_order_relaxed);
+            const u64 returned = atomic_load_explicit(&s_packet_diag_return_ns, memory_order_relaxed);
+            const u64 last_return = atomic_load_explicit(&s_packet_diag_last_return_ns, memory_order_relaxed);
+            const u64 return_count = atomic_load_explicit(&s_packet_diag_return_count, memory_order_relaxed);
+            const u64 packet_count = atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed);
+            const u32 packet_ea = atomic_load_explicit(&s_drain_packet_ea, memory_order_relaxed);
+            const u32 packet_word = atomic_load_explicit(&s_drain_packet_word, memory_order_relaxed);
+            const u32 active = atomic_load_explicit(&s_packet_diag_active, memory_order_relaxed);
+            const u32 arg_valid = atomic_load_explicit(&s_packet_diag_arg_valid, memory_order_relaxed);
+            const u32 arg_index = atomic_load_explicit(&s_packet_diag_arg_index, memory_order_relaxed);
+            const u32 method = atomic_load_explicit(&s_packet_diag_method, memory_order_relaxed);
+            const u32 arg = atomic_load_explicit(&s_packet_diag_arg, memory_order_relaxed);
+            atomic_thread_fence(memory_order_seq_cst);
+            const u32 epoch_after = atomic_load_explicit(&s_packet_diag_epoch, memory_order_seq_cst);
+            const u64 diag_sampled = get_timestamp_ns();
+            fprintf(stderr, "[rsx-refill-sample] host_phase=%u packets_at_wait=%llu packets_now=%llu packet_ea=0x%08X word=0x%08X semaphore=0x%08X expected=0x%08X actual=0x%08X packet_timing=%u diag_coherent=%u arg_valid=%u arg_index=%u method=0x%04X arg=0x%08X packet_enter_ns=%llu packet_return_ns=%llu last_return_ns=%llu returned_packets=%llu attempt_active=%u sample_ns=%llu\n",
                 atomic_load_explicit(&s_host_renderer_phase, memory_order_relaxed),
                 (unsigned long long)packets_started,
-                (unsigned long long)atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed),
-                atomic_load_explicit(&s_drain_packet_ea, memory_order_relaxed),
-                atomic_load_explicit(&s_drain_packet_word, memory_order_relaxed),
+                (unsigned long long)packet_count, packet_ea, packet_word,
                 atomic_load_explicit(&s_drain_semaphore_address, memory_order_relaxed),
                 atomic_load_explicit(&s_drain_semaphore_expected, memory_order_relaxed),
-                atomic_load_explicit(&s_drain_semaphore_actual, memory_order_relaxed));
+                atomic_load_explicit(&s_drain_semaphore_actual, memory_order_relaxed),
+                entered != 0, entered != 0 && epoch == epoch_after && !(epoch & 1u), arg_valid, arg_index, method, arg,
+                (unsigned long long)entered, (unsigned long long)returned,
+                (unsigned long long)last_return, (unsigned long long)return_count,
+                active, (unsigned long long)diag_sampled);
             ps3_strict_boot_guard("rsx-refill-drain-stalled", "context=0x%08X begin=0x%08X current=0x%08X drained=0x%08X await_begin=%d elapsed_ms=%llu idle_ms=%llu", ctx_ea, begin, current, drained, at_begin, (unsigned long long)((now-started)/1000000), (unsigned long long)((now-progressed)/1000000));
         }
     }
