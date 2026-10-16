@@ -54,6 +54,30 @@ static void* restore_without_progress(void* unused)
     cellGcmSetHostPresentationSuspended(0);
     return NULL;
 }
+static void* consume_one_long_batch(void* unused)
+{
+    (void)unused;
+    /* The real FIFO publishes its drained cursor after a batch, not after
+     * each command. Completed packets inside that batch are still progress. */
+    for(unsigned i=0;i<12;i++) {
+        usleep(500000);
+        CHECK(vm_read32(ctx+8)==current);
+        gcm_packet_diag_enter(begin+4+i*4,0);
+        gcm_packet_diag_return();
+    }
+    atomic_store_explicit(&g_gcm_fifo_drained_ea,begin,memory_order_release);
+    return NULL;
+}
+static void* cycle_without_drain(void* unused)
+{
+    (void)unused;
+    for(;;) {
+        usleep(100000);
+        gcm_packet_diag_enter(begin+4,0);
+        gcm_packet_diag_return();
+    }
+    return NULL;
+}
 int main(void)
 {
     setenv("PS3_STRICT_BOOT","1",1);
@@ -84,6 +108,10 @@ int main(void)
     CHECK(vm_read32(ctx+8)==begin);
     CHECK(vm_read32(current)==(0x20000000u|begin));
     CHECK(vm_read32(GCM_CONTROL_GUEST_ADDR)==begin);
+    prepare();
+    CHECK(!pthread_create(&reader,NULL,consume_one_long_batch,NULL));
+    cellGcm_fifo_recycle(ctx);CHECK(!pthread_join(reader,NULL));
+    CHECK(vm_read32(ctx+8)==begin);
     prepare();cellGcmSetHostPresentationSuspended(1);
     CHECK(!pthread_create(&reader,NULL,restore_and_consume,NULL));
     cellGcm_fifo_recycle(ctx);CHECK(!pthread_join(reader,NULL));
@@ -102,7 +130,18 @@ int main(void)
     CHECK(waitpid(child,&status,0)==child);
     CHECK(WIFEXITED(status)&&WEXITSTATUS(status)==86);
     CHECK(vm_read32(ctx+8)==current);
+    prepare();
+    const u64 cycle_started=get_timestamp_ns();
+    child=fork();CHECK(child>=0);
+    if(!child) {
+        CHECK(!pthread_create(&reader,NULL,cycle_without_drain,NULL));
+        cellGcm_fifo_recycle(ctx);_Exit(99);
+    }
+    CHECK(waitpid(child,&status,0)==child);
+    CHECK(WIFEXITED(status)&&WEXITSTATUS(status)==86);
+    CHECK(get_timestamp_ns()-cycle_started>=UINT64_C(30000000000));
+    CHECK(vm_read32(ctx+8)==current);
     munmap(vm_base,ppu_vm_size);
-    puts("strict refill: delayed drain and six-second host suspension preserve unread commands; ordinary and resumed stalls exit86 without rewind");
+    puts("strict refill: delayed/batched drain and suspension preserve unread commands; stalled readers and endless packet cycles exit86 without rewind");
     return 0;
 }

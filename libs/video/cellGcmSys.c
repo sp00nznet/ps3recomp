@@ -2390,6 +2390,7 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
     u64 sampled = started;
     u32 previous = atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire);
     const u64 packets_started = atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed);
+    u64 previous_packets = packets_started;
     int spins = 0;
     while ((previous == begin) != at_begin) {
         Sleep(1); ++spins;
@@ -2405,6 +2406,13 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
         }
         sampled = now;
         if (drained != previous) { previous = drained; progressed = now; }
+        /* The published drain cursor changes only when a FIFO batch returns.
+         * Advancing to another packet within that batch also proves activity.
+         * This resets only the idle deadline: the absolute 30s deadline still
+         * rejects endless command cycles, and neither observation acknowledges
+         * the ring or allows its unread storage to be reused. */
+        const u64 packets = atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed);
+        if (packets != previous_packets) { previous_packets = packets; progressed = now; }
         if ((drained == begin) == at_begin) break;
         if (!suspended && (now - progressed >= UINT64_C(5000000000) || now - started >= UINT64_C(30000000000))) {
             /* Never wait for this diagnostic snapshot. A concurrent metadata
