@@ -113,6 +113,7 @@ int main(void)
     CHECK(!(s_port_setting[0]&CELL_PAD_SETTING_SENSOR_ON));
     fixture.disable_fail=0;CHECK(cellPadSetSensorMode(0,1)==0);
     fixture.attached=0;read_pad();CHECK(length()!=24&&word(20)==0);
+    CHECK(word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X)==128&&word(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y)==128);
     CHECK(cellPadInfoSensorMode(0)!=1);
     CHECK(cellPadGetCapabilityInfo(0,(CellPadCapabilityInfo*)(uintptr_t)0x13000)==0);
     CHECK(!(vm_read32(0x13000)&CELL_PAD_CAPABILITY_SENSOR_MODE));

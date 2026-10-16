@@ -339,6 +339,8 @@ static void pad_poll_sdl2(void)
         SDL_GameController* gc = s_sdl_controllers[i];
         if (!gc || !SDL_GameControllerGetAttached(gc)) {
             memset(&s_host_state[i],0,sizeof(s_host_state[i]));
+            s_host_state[i].analog_lx=s_host_state[i].analog_ly=128;
+            s_host_state[i].analog_rx=s_host_state[i].analog_ry=128;
             memset(&s_sdl_motion[i],0,sizeof(s_sdl_motion[i]));
             if (gc) {
                 SDL_GameControllerClose(gc);
