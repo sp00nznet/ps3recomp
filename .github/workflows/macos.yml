@@ -396,6 +396,23 @@ jobs:
             -lpthread -lm
           /tmp/test_spu_taskset_wake
 
+      # The host setting or consuming a task's signal bit against an SPU commit
+      # to the same word. The read was outside the lock-line lock, so a commit
+      # between the read and the write was lost and that task never woke.
+      - name: Run the SPURS signalled-bit atomicity test
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spurs_signalled_atomic \
+            runtime/spu/tests/test_spurs_signalled_atomic.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spurs_signalled_atomic
+
       # A thread group starting its threads on their image's LIFTED code. This
       # is the path a real title needs and the one that used to be missing: the
       # group's threads completed instantly with status 0, the group reported a

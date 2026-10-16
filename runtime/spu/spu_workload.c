@@ -1002,18 +1002,49 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
     return n;
 }
 
+/* Set or clear a task's bit in the guest `signalled` bitset from a host thread.
+ *
+ * SPU tasks update this same line with GETLLAR/PUTLLC (a task signalling
+ * another, or a barrier releasing its waiters), and those commits are
+ * serialised by the lock-line lock, not by s_sig_lock. vm_write32 takes that
+ * lock for the store, but the vm_read32 before it was outside it, so an SPU
+ * commit landing between the read and the write was overwritten with the stale
+ * word. Twisted Metal's post-FX barrier lost a wake exactly so: the releaser set
+ * task 4's bit, task 3's thread cleared its own bit from a word read just
+ * before, task 4 slept forever and the frame label stopped advancing after two
+ * frames. Do the whole read-modify-write under the lock, as a PPU atomic would,
+ * and drop every reservation on the line. */
+static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
+{
+    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_coh_notify_write(uint32_t);
+    extern uint8_t* vm_base;
+    /* Raw guest bytes, not vm_read32/vm_write32: vm_write32 takes the lock-line
+     * lock itself when an SPU has the line reserved, and the lock does not
+     * nest. */
+    const uint32_t word = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
+    const uint32_t mask = (1u << 31) >> (taskId % 32u);
+    uint8_t* p = vm_base + word;
+    spu_lockline_lock();
+    uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    v = set ? (v | mask) : (v & ~mask);
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+    spu_coh_notify_write(word);
+    spu_lockline_unlock();
+}
+
 /* Deliver a signal to a task (callable from any PPU/host thread). */
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return;
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    spu_signalled_update(taskset_ea, taskId, 1);
     WakeAllConditionVariable(&s_sig_cv);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    spu_signalled_update(taskset_ea, taskId, 1);
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
@@ -1143,7 +1174,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
@@ -1157,7 +1188,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
     if (drained) { static int _d = 0; if (_d++ < 24)
