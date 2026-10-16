@@ -371,6 +371,21 @@ int main(void)
             prog,sizeof prog,CTRL_32BIT,0,&shadow,hlsl,64,NULL)<0);
     }
 
+    {
+        u8 prog[16]={0};
+        put_word(prog,OPC(0x7F)|OUTMASK_ALL|END);
+        put_word(prog+4,T_INPUT|SWZ_IDENT|EXEC_ALWAYS);
+        check_true("unknown_required_opcode_rejected",rsx_fp_decompile(
+            prog,sizeof prog,CTRL_32BIT,hlsl,sizeof hlsl)<0);
+        put_word(prog,OPC(0x01)|END);
+        put_word(prog+8,1u<<31);
+        check_true("unsupported_subroutine_rejected",rsx_fp_decompile(
+            prog,sizeof prog,CTRL_32BIT,hlsl,sizeof hlsl)<0);
+        put_word(prog,OPC(0x02)|END);
+        check_true("malformed_flow_rejected",rsx_fp_decompile(
+            prog,sizeof prog,CTRL_32BIT,hlsl,sizeof hlsl)<0);
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

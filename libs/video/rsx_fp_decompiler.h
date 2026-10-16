@@ -58,9 +58,9 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
  * `float4 main(PSInput input) : SV_TARGET`, matching the backend's
  * placeholder PSInput { float4 position : SV_POSITION; float4 col : COLOR; }.
  *
- * Texture sampling and full input plumbing are partial — see the doc's
- * "Integration TODO". Unhandled opcodes emit a comment and a safe default so
- * the shader still compiles.
+ * Texture sampling and full input plumbing are partial. Unhandled opcodes,
+ * malformed structured flow and unsupported subroutines return -1; callers
+ * must not compile the diagnostic output as a usable shader.
  *
  *   ctrl : the NV4097_SET_SHADER_CONTROL word (reg 0x1D60) for this program.
  *          Bit 0x40 (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) selects the

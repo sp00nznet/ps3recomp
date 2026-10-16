@@ -667,7 +667,8 @@ static int rsx_vp_decompile_impl(
         "}\n");
 
     (void)n_cond_skipped;
-    (void)n_flow_skipped;
-    if (o.overflow) return -1;
+    /* A compiled shader must not silently omit a required instruction.
+     * The draw engine reports a visible required-pipeline failure. */
+    if (o.overflow || n_flow_skipped) return -1;
     return instrs;
 }

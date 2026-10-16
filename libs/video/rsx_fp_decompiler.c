@@ -611,7 +611,7 @@ static int rsx_fp_decompile_internal(
             case 0x04: /* REP */
                 if (n_blk == FP_MAX_BLOCKS || end_at <= off) {
                     out_puts(&o, "    /* TODO: malformed flow-control op skipped */\n");
-                    break;
+                    return -1;
                 }
                 if (opcode == 0x02) {
                     const u32 else_at = (w2 & 0x7FFFFFFFu) << 2;
@@ -638,7 +638,7 @@ static int rsx_fp_decompile_internal(
                 break;
             default:   /* CAL / RET: no subroutine support yet */
                 out_puts(&o, "    /* TODO: CAL/RET flow-control op skipped */\n");
-                break;
+                return -1;
             }
             if (w0 & FP_END) break;
             continue;
@@ -769,8 +769,7 @@ static int rsx_fp_decompile_internal(
             out_puts(&o, "    /* TODO: unhandled FP opcode ");
             out_puts(&o, rsx_fp_opcode_name(opcode));
             out_puts(&o, " */\n");
-            handled = 0;
-            break;
+            return -1;
         }
 
         int has_dest = !(w0 & FP_OUT_NONE);

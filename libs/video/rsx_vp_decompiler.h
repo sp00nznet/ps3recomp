@@ -42,7 +42,8 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
  *   max_bytes: safety bound.
  *   out      : caller buffer for generated HLSL (NUL-terminated).
  *   out_size : size of out in bytes.
- * Returns instruction count (>=0), or -1 on error (null args / overflow).
+ * Returns instruction count (>=0), or -1 on invalid arguments, overflow or
+ * unsupported required instructions. Error output is diagnostic only.
  * Emits `VSOutput main(VSInput input)`: 16 float4 inputs (ATTR0..15), a
  * `cbuffer VPConst : register(b0)` with 512 vec4 constants + vp_posscale/
  * vp_posoffset (the RSX viewport transform mapped to D3D clip space; the
