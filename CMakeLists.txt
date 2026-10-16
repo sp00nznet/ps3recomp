@@ -541,6 +541,20 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
                 winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
         endif()
         set_target_properties(test_vulkan_msaa_gpu PROPERTIES LINKER_LANGUAGE CXX)
+        if(PS3RECOMP_RSX_CACAO)
+            add_executable(test_vulkan_ao_gpu EXCLUDE_FROM_ALL
+                tests/test_vulkan_ao_gpu.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+            target_compile_definitions(test_vulkan_ao_gpu PRIVATE PS3RECOMP_RSX_CACAO)
+            target_include_directories(test_vulkan_ao_gpu PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cacao/inc" "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+            target_link_libraries(test_vulkan_ao_gpu PRIVATE ps3recomp_runtime m SDL2::SDL2)
+            if(WIN32)
+                target_link_libraries(test_vulkan_ao_gpu PRIVATE
+                    winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+            endif()
+            set_target_properties(test_vulkan_ao_gpu PROPERTIES LINKER_LANGUAGE CXX)
+        endif()
         add_executable(test_rsx_resolution_scale EXCLUDE_FROM_ALL
             libs/video/rsx_resolution_scale.c libs/video/tests/test_rsx_resolution_scale.c)
         target_include_directories(test_rsx_resolution_scale PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")

@@ -53,6 +53,11 @@
 #include "rsx_vulkan_anisotropy.h"
 #include "rsx_depth_clip.h"
 #include "rsx_frame_dump.h"
+#ifdef PS3RECOMP_RSX_CACAO
+#define FFX_CACAO_ENABLE_VULKAN
+#include "ffx_cacao_impl.h"
+#include "rsx_cacao_dispatch.h"
+#endif
 #include "ps3emu/strict_boot.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
@@ -205,6 +210,9 @@ typedef struct vk_state {
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              alpha_to_one_ok; /* alphaToOne enabled when supported */
     int              anisotropy_ok;
+#ifdef PS3RECOMP_RSX_CACAO
+    int              cacao_api_ok, cacao_device_ok;
+#endif
     float            max_anisotropy;
     u32              anisotropy_override; /* Immutable for this device lifetime. */
     u32              max_dim;         /* maxImageDimension2D of the device  */
@@ -2159,6 +2167,9 @@ static u32 vk_eng_expand_samples(u32 surface);
 static void vk_eng_expansion_shutdown(void);
 static int vk_eng_pack_samples(u32 surface, u32 expanded);
 static void vk_eng_pack_shutdown(void);
+#ifdef PS3RECOMP_RSX_CACAO
+static void vk_eng_cacao_shutdown(void);
+#endif
 
 static void vk_eng_release(void* user, u32 handle)
 {
@@ -2188,6 +2199,9 @@ static void vk_eng_release(void* user, u32 handle)
 
 static void vk_eng_shutdown(void* user)
 {
+#ifdef PS3RECOMP_RSX_CACAO
+    vk_eng_cacao_shutdown();
+#endif
     vk_eng2_shutdown(user);
     vk_eng_expansion_shutdown();
     vk_eng_pack_shutdown();
@@ -3103,6 +3117,10 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 samples)
 
 #include "rsx_vulkan_msaa.inc"
 #include "rsx_vulkan_msaa_upload.inc"
+#ifdef PS3RECOMP_RSX_CACAO
+#include "rsx_vulkan_ao_pass.inc"
+#include "rsx_vulkan_cacao.inc"
+#endif
 
 static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pipeline = pipeline; }
 
@@ -3522,6 +3540,17 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                               .apiVersion = VK_API_VERSION_1_0 };
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                 .pApplicationInfo = &app };
+#ifdef PS3RECOMP_RSX_CACAO
+    /* Keep the existing Vulkan1.0 path available on older loaders. CACAO's
+     * validated shader pack targets1.1 and is disabled when unavailable. */
+    PFN_vkEnumerateInstanceVersion enum_version=(PFN_vkEnumerateInstanceVersion)
+        pvkGetInstanceProcAddr(VK_NULL_HANDLE,"vkEnumerateInstanceVersion");
+    u32 loader_version=VK_API_VERSION_1_0;
+    if (enum_version && enum_version(&loader_version)==VK_SUCCESS &&
+        loader_version>=VK_API_VERSION_1_1) {
+        app.apiVersion=VK_API_VERSION_1_1;s_vk.cacao_api_ok=1;
+    }
+#endif
     if (s_vk.windowed) {
         ci.enabledExtensionCount   = s_vk.inst_ext_count;
         ci.ppEnabledExtensionNames = s_vk.inst_exts;
@@ -3566,6 +3595,22 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.alpha_to_one_ok = have.alphaToOne ? 1 : 0;
     want.samplerAnisotropy = have.samplerAnisotropy;
     s_vk.anisotropy_ok = have.samplerAnisotropy ? 1 : 0;
+#ifdef PS3RECOMP_RSX_CACAO
+    VkPhysicalDeviceProperties cacao_properties;
+    pvkGetPhysicalDeviceProperties(s_vk.phys,&cacao_properties);
+    u32 cacao_family_count=0;
+    pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys,&cacao_family_count,NULL);
+    VkQueueFamilyProperties* cacao_families=cacao_family_count && cacao_family_count<=1024
+        ? (VkQueueFamilyProperties*)calloc(cacao_family_count,sizeof(*cacao_families)):NULL;
+    if (cacao_families) {
+        pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys,&cacao_family_count,cacao_families);
+        s_vk.cacao_device_ok=s_vk.cacao_api_ok && cacao_properties.apiVersion>=VK_API_VERSION_1_1 &&
+            have.shaderStorageImageExtendedFormats && s_vk.queue_family<cacao_family_count &&
+            (cacao_families[s_vk.queue_family].queueFlags&VK_QUEUE_COMPUTE_BIT);
+        free(cacao_families);
+    }
+    want.shaderStorageImageExtendedFormats=s_vk.cacao_device_ok ? VK_TRUE : VK_FALSE;
+#endif
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
