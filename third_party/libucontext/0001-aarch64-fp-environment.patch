@@ -1,0 +1,42 @@
+--- a/arch/aarch64/getcontext.S
++++ b/arch/aarch64/getcontext.S
+@@ -36,6 +36,11 @@
+ 	str	xzr, [x0, #PSTATE_OFFSET]
+ 
+ 	add x2, x0, #FPSIMD_CONTEXT_OFFSET
++	/* x3 is already saved; capture control/status before switching. */
++	mrs x3, fpsr
++	str w3, [x2, #8]
++	mrs x3, fpcr
++	str w3, [x2, #12]
+ 	stp q8, q9,   [x2, #144]
+ 	stp q10, q11, [x2, #176]
+ 	stp q12, q13, [x2, #208]
+--- a/arch/aarch64/swapcontext.S
++++ b/arch/aarch64/swapcontext.S
+@@ -50,6 +50,11 @@
+ 	str	xzr, [x0, #PSTATE_OFFSET]
+ 
+ 	add x2, x0, #FPSIMD_CONTEXT_OFFSET
++	/* x3 is already saved; capture control/status before switching. */
++	mrs x3, fpsr
++	str w3, [x2, #8]
++	mrs x3, fpcr
++	str w3, [x2, #12]
+ 	stp q8, q9,   [x2, #144]
+ 	stp q10, q11, [x2, #176]
+ 	stp q12, q13, [x2, #208]
+--- a/arch/aarch64/setcontext.S
++++ b/arch/aarch64/setcontext.S
+@@ -34,6 +34,11 @@
+ 	mov	sp, x2
+ 
+ 	add x2, x0, #FPSIMD_CONTEXT_OFFSET
++	/* Restore the context-specific floating-point environment. */
++	ldr w3, [x2, #8]
++	msr fpsr, x3
++	ldr w3, [x2, #12]
++	msr fpcr, x3
+ 	ldp q8, q9,   [x2, #144]
+ 	ldp q10, q11, [x2, #176]
+ 	ldp q12, q13, [x2, #208]

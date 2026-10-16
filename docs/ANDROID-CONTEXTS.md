@@ -6,6 +6,13 @@ by the cooperative fiber implementation. Android builds require upstream
 [libucontext](https://github.com/kaniini/libucontext), pinned here to commit
 `49e671dd52ff6791295d8161ad3b6da7dc5f6f9d`.
 
+Apply `third_party/libucontext/0001-aarch64-fp-environment.patch` before
+building. Upstream saves the callee-saved vector registers but omits FPCR and
+FPSR. The patch captures those registers in getcontext/swapcontext and restores
+them in setcontext, using the existing FPSIMD control/status slots. It does not
+change context layout, signal-mask handling or stack-switch logic. Preserve the
+upstream license supplied alongside the patch.
+
 Build the ARM64 static libraries with `ARCH=aarch64`, `FREESTANDING=no`,
 `EXPORT_UNPREFIXED=no`, and `BUILD_POSIX=yes`, using the Android NDK compiler
 and archiver. Retain upstream LICENSE with the installed dependency. Use the
@@ -28,3 +35,7 @@ NDK r30/API26 builds of both libraries and the actual cellFiber switching
 fixture link successfully. The unchanged Linux fixture passes. ARM64 execution,
 floating-point environment behavior and physical Android acceptance are still
 pending; compilation is not evidence that those runtime requirements pass.
+The patched library also compiles with NDK layout assertions for the FPSIMD
+base, FPSR, FPCR and vector offsets. Disassembly confirms the expected register
+reads and writes in all three context routines. Device execution must still
+verify the independent floating-point environment regression fixture.

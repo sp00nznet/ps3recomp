@@ -1,0 +1,26 @@
+{
+  "upstream": "https://github.com/kaniini/libucontext",
+  "commit": "49e671dd52ff6791295d8161ad3b6da7dc5f6f9d",
+  "patch": "0001-aarch64-fp-environment.patch",
+  "patch_sha256": "3ebbf89c56a87682b6f081d241dac6ce7645c1cde2cfc2eebc552640d36a4411",
+  "files": {
+    "arch/aarch64/getcontext.S": {
+      "original_sha256": "e2aea70b628449504860be83bc02251400e6e2ae4179a4e582671be23416e2fb",
+      "original_lf_sha256": "112c3c07532f384efb797ed3fcd2636226c91f3bf55ee3206029019568d8f75e",
+      "patched_lf_sha256": "3ac7bec7e688d21eb71db8bbedad9d9c7743e68fbfc0890fb9b715250e6611d2"
+    },
+    "arch/aarch64/swapcontext.S": {
+      "original_sha256": "392a72cea87c7e12c652a6da25073632da8fffb8a0ef986a007b85537d60a5f5",
+      "original_lf_sha256": "b6932ec66bcc77020c34bb2b315fc3caedb2929eb0cacab96a4f1e589111e6ce",
+      "patched_lf_sha256": "2c7bd9828f1fa7b6fc98a033f4be0279a9fba2124cc9ce25925dbc0925a45558"
+    },
+    "arch/aarch64/setcontext.S": {
+      "original_sha256": "8aa19df4138640c1aba58134d7c28df98d731c27d262a38b51b3fa9dc041328e",
+      "original_lf_sha256": "4c42b3b072d028cee794fc0ad4c703270a82e25672e33d7b6fed81dd7344a4bc",
+      "patched_lf_sha256": "b40e8e8b2b4f5e33eaa0cb712c1b3f559e9c7148daad96391968da307d0e21f5"
+    }
+  },
+  "reason": "Save and restore FPCR/FPSR with each AArch64 native cooperative context.",
+  "layout": "Bionic asm/sigcontext.h fpsimd_context: fpsr offset8, fpcr offset12; build recipe asserts layout.",
+  "runtime_tested": false
+}
