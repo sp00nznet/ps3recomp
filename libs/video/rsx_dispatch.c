@@ -173,6 +173,8 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * as numbering oracle). Seeded so a raw register read is trustworthy for
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+    /* RSX reset sample mask: all samples enabled, alpha controls disabled. */
+    rsx->regs[0x1D7C >> 2] = 0xFFFF0000u;
 
     /* Ordinary depth clipping reset state: binary32 [0,1], with viewport
      * Z = 0.5*z + 0.5*w and clipping enabled. Register writes remain raw. */

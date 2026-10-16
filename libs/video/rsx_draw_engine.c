@@ -255,6 +255,7 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->alpha_test_enable = rsx_dsp_reg(rsx, M_ALPHA_TEST_ENABLE) & 1;
     rs->alpha_func   = rsx_dsp_reg(rsx, M_ALPHA_FUNC);
     rs->alpha_ref_raw = rsx_dsp_reg(rsx, M_ALPHA_REF);
+    rs->antialias_control = rsx_dsp_reg(rsx, 0x1D7C);
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(rsx, &sf);
     rs->alpha_ref_format = sf.color_format;
@@ -300,6 +301,7 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
      * (rsx_live_draw.c:3151-3185). */
     ENG_HASH_FIELD(alpha_test_enable);
     ENG_HASH_FIELD(alpha_func);
+    ENG_HASH_FIELD(antialias_control);
     ENG_HASH_FIELD(blend_enable);
     ENG_HASH_FIELD(sf_rgb);
     ENG_HASH_FIELD(df_rgb);

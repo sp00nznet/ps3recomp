@@ -195,6 +195,7 @@ typedef struct vk_state {
      * additionally blits the frame into the window's swapchain. */
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
+    int              alpha_to_one_ok; /* alphaToOne enabled when supported */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     SDL_Window*      window;
@@ -2947,9 +2948,21 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 samples)
         .frontFace = (rs->front_face == 0x0901u) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                                  : VK_FRONT_FACE_CLOCKWISE,
         .lineWidth = 1.0f };
+    /* Same raw control mapping as pinned RPCS3 graphics_pipeline_state.
+     * The MSAA enable bit does not change the attachment's sample count. */
+    const VkSampleMask sample_mask = rs->antialias_control >> 16;
+    const VkBool32 alpha_coverage = (rs->antialias_control & 0x10u) != 0;
+    const VkBool32 alpha_one = (rs->antialias_control & 0x100u) != 0;
+    if (alpha_one && !s_vk.alpha_to_one_ok) {
+        ps3_strict_boot_guard("vulkan-alpha-to-one", "required device feature unavailable");
+        return VK_NULL_HANDLE;
+    }
     VkPipelineMultisampleStateCreateInfo ms = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = (VkSampleCountFlagBits)samples };
+        .rasterizationSamples = (VkSampleCountFlagBits)samples,
+        .pSampleMask = &sample_mask,
+        .alphaToCoverageEnable = alpha_coverage,
+        .alphaToOneEnable = alpha_one };
     VkStencilOpState front = vk_gcm_stencil_face(rs->s_func, rs->s_fail, rs->s_zfail, rs->s_zpass,
                                                  rs->s_func_mask, rs->s_write_mask);
     VkStencilOpState back = rs->stencil_two_sided
@@ -3454,6 +3467,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     pvkGetPhysicalDeviceFeatures(s_vk.phys, &have);
     want.textureCompressionBC = have.textureCompressionBC;
     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
+    want.alphaToOne = have.alphaToOne;
+    s_vk.alpha_to_one_ok = have.alphaToOne ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,

@@ -84,6 +84,7 @@ typedef struct {
     u32 bound_rt[RSX_BE_MAX_COLOR_TARGETS];
     u32 bound_rt_count;
     u32 pipeline_rt_count;
+    u32 pipeline_antialias_control;
     u32 bound_surface, bound_depth, bound_pipeline;
     u32 draw_vertices, draw_indices, draw_stride;
     float draw_first_vertex[4];   /* ATTR0 of the first vertex handed over */
@@ -181,6 +182,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     if (stub.force_pipeline_failure) return 0;
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
+    stub.pipeline_antialias_control = rs->antialias_control;
     return stub_handle();
 }
 
@@ -692,6 +694,12 @@ static void test_pipeline_key(void)
     b = a; b.rt_fp16 = 1;
     CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
           "so is an FP16 render target");
+    const u32 coverage_controls[] = {0x10u, 0x100u, 0x00010000u};
+    for (u32 i=0;i<3;++i) {
+        b=a;b.antialias_control=coverage_controls[i];
+        CHECK(rsx_draw_engine_hash_render_state(&b,1469598103934665603ull)!=base,
+              "coverage control bit %08X participates in pipeline identity",coverage_controls[i]);
+    }
 
     /* And through the engine: transform constants change every draw of every
      * frame, and must not multiply pipelines. */
@@ -714,6 +722,17 @@ static void test_pipeline_key(void)
     CHECK(stub.n_pipeline_create == 1 && stub.stencil_ref == 0x7Fu,
           "nor does the stencil reference, which reaches the encoder (%u)",
           stub.stencil_ref);
+    CHECK(stub.pipeline_antialias_control==0xFFFF0000u,
+          "reset enables every sample and disables alpha coverage controls");
+    m(0x1D7C,0xFFFF0111u);draw_triangle();
+    CHECK(stub.n_pipeline_create==2&&stub.pipeline_antialias_control==0xFFFF0111u,
+          "guest coverage and alpha-to-one controls create a distinct pipeline");
+    m(0x1D7C,0x00010111u);draw_triangle();
+    CHECK(stub.n_pipeline_create==3&&stub.pipeline_antialias_control==0x00010111u,
+          "guest sample mask reaches a distinct backend pipeline");
+    m(0x1D7C,0xFFFF0111u);draw_triangle();
+    CHECK(stub.n_pipeline_create==3,
+          "restoring coverage controls reuses the matching pipeline");
 
     engine_down();
 }

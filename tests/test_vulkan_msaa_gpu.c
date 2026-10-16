@@ -21,6 +21,7 @@ int main(void)
     static const char fs[]="float4 main():SV_Target0{return float4(1,0,0,1);}";
     rsx_vertex_layout_plan layout={0};layout.count=1;layout.stride=16;layout.attrs[0]=0;
     rsx_be_render_state state={0};state.color_mask=0x01010101u;
+    state.antialias_control=0xFFFF0001u;
     state.depth_test=1;state.depth_write=1;state.depth_func=0x201;
     u32 pipeline=vk_eng_pipeline_create(NULL,vs,fs,&state,&layout,16,RSX_BE_FMT_R8G8B8A8,1);
     CHECK(pipeline!=0);

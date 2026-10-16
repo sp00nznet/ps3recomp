@@ -75,6 +75,7 @@ typedef struct rsx_be_sampler_desc {
  * not baked into the pipeline, and so is not part of the pipeline key. */
 typedef struct rsx_be_render_state {
     u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
+    u32 antialias_control;          /* NV4097 0x1D7C: coverage, alpha, mask */
     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
