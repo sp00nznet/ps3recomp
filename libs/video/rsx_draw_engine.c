@@ -617,7 +617,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
  * vtable path's target_for binds by. Resolution stops at the first member
  * that cannot be created, as that path stops at the first gap. Returns how
  * many were resolved, or 0. */
-static int eng_sample_layout(const rsx_dsp_surface* sf, rsx_surface_layout* out)
+static int eng_sample_layout(const rsx_dsp_surface* sf, rsx_surface_layout* out, int depth_used)
 {
     memset(out, 0, sizeof *out);
     out->width = sf->clip_w ? sf->clip_w : g.width;
@@ -633,14 +633,14 @@ static int eng_sample_layout(const rsx_dsp_surface* sf, rsx_surface_layout* out)
                     sf->color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16 ? 8u : 0u;
     if (sf->raster_type != 1 || !rsx_surface_layout_compute(sf->antialias,
             out->width, out->height, bpp, sf->color_pitch, mask,
-            sf->depth_format == 1 ? 2u : 4u, sf->zeta_pitch, sf->zeta_pitch != 0, out)) {
+            sf->depth_format == 1 ? 2u : 4u, sf->zeta_pitch, depth_used, out)) {
         ps3_strict_boot_guard("rsx-msaa-layout", "unsupported layout aa=%u clip=%ux%u", sf->antialias, sf->clip_w, sf->clip_h);
         return 0;
     }
     return 1;
 }
 
-static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
+static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS], int depth_used)
 {
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
@@ -649,7 +649,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
     const rsx_be_format fmt = eng_surface_format(sf.color_format);
     rsx_surface_layout sample_layout;
-    if (!eng_sample_layout(&sf, &sample_layout)) return 0;
+    if (!eng_sample_layout(&sf, &sample_layout, depth_used)) return 0;
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
                                       sample_layout.width, sample_layout.height, fmt, sample_layout.samples,sf.color_pitch[sel]);
     if (first == ENG_INVALID) return 0;
@@ -806,7 +806,9 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
 static u32 eng_current_surface(void)
 {
     u32 slots[RSX_BE_MAX_COLOR_TARGETS];
-    return eng_current_target_set(slots) ? slots[0] : ENG_INVALID;
+    const int depth_used = (rsx_dsp_reg(&g.rsx,M_DEPTH_TEST_ENABLE) |
+                            rsx_dsp_reg(&g.rsx,M_STENCIL_TEST_ENABLE)) & 1u;
+    return eng_current_target_set(slots,depth_used) ? slots[0] : ENG_INVALID;
 }
 
 /* ---- per-zeta depth ------------------------------------------------------ */
@@ -2054,11 +2056,13 @@ static void pd_first_draw_state(u32 pipeline)
     const u32 bpp = sf.color_format == 8 ? 4u :
                     sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16 ? 8u : 0u;
     rsx_surface_layout sample_layout;
+    const int depth_used = (rsx_dsp_reg(&g.rsx,M_DEPTH_TEST_ENABLE) |
+                            rsx_dsp_reg(&g.rsx,M_STENCIL_TEST_ENABLE)) & 1u;
     if (sf.raster_type == 1 && rsx_surface_layout_compute(sf.antialias,
             sf.clip_w, sf.clip_h, bpp, sf.color_pitch, color_mask,
-            sf.depth_format == 1 ? 2u : 4u, sf.zeta_pitch, sf.zeta_pitch != 0,
+            sf.depth_format == 1 ? 2u : 4u, sf.zeta_pitch, depth_used,
             &sample_layout)) {
-        fprintf(f, "sample_layout aa %u samples %u grid %ux%u logical %ux%u storage %ux%u (diagnostic; backend sample support unchanged)\n",
+        fprintf(f, "sample_layout aa %u samples %u grid %ux%u logical %ux%u storage %ux%u (active attachment pitch bounds)\n",
                 sf.antialias, sample_layout.samples, sample_layout.samples_x, sample_layout.samples_y,
                 sample_layout.width, sample_layout.height,
                 sample_layout.storage_width, sample_layout.storage_height);
@@ -2266,7 +2270,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
-    const u32 n_targets = eng_current_target_set(targets);
+    const u32 n_targets = eng_current_target_set(targets,rs.depth_test || rs.stencil_enable);
     if (!n_targets) return;
     const u32 target = targets[0];
 
@@ -2414,7 +2418,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     (void)user; (void)r;
     if (!g.ready) return;
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
-    const u32 n_targets = eng_current_target_set(targets);
+    const u32 n_targets = eng_current_target_set(targets,(mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) != 0);
     if (!n_targets) return;
     if (pd_capturing()) {
         rsx_dsp_surface zs;

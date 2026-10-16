@@ -1166,6 +1166,7 @@ static void test_color_read_as_float(void)
 static void test_multisample_layout(void)
 {
     engine_up();
+    m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);
     m(M_SURFACE_FORMAT,0x090B3148u);
     m(M_SURFACE_CLIP_H,2560u<<16);m(M_SURFACE_CLIP_V,720u<<16);
     m(M_COLOR_A_PITCH,10240);m(M_ZETA_PITCH,10240);
@@ -1175,6 +1176,16 @@ static void test_multisample_layout(void)
           "pitch bounds logical raster and viewport to1280x720, not sample storage width");
     const int creates=stub.n_color_create;
     draw_triangle();CHECK(stub.n_color_create==creates,"unchanged multisample target is reused");
+    /* Prologue post-pass: zeta is unused but retains a64-byte dummy pitch.
+     * Depth writes alone cannot make it an active depth attachment. */
+    m(M_DEPTH_TEST,0);m(0x0A70u,1);m(M_ZETA_PITCH,64);
+    draw_triangle();
+    CHECK(stub.n_color_create==creates&&last_viewport_w==1280,
+          "inactive depth pitch cannot shrink or replace the live scene target");
+    m(M_DEPTH_TEST,1);m(M_CLEAR_BUFFERS,0xF0u);
+    CHECK(stub.n_color_create==creates,
+          "color-only clear ignores depth pitch even when depth testing is enabled");
+    m(M_ZETA_PITCH,10240);
     m(M_SURFACE_FORMAT,0x090B4148u);draw_triangle();
     CHECK(msaa_color_samples==4&&msaa_depth_samples==4&&stub.n_color_create==creates+1,
           "changing sample count reallocates matching color and depth resources");
@@ -1183,10 +1194,21 @@ static void test_multisample_layout(void)
     engine_down();
 }
 
+static void test_active_depth_layout(void)
+{
+    engine_up();m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);m(M_SURFACE_FORMAT,0x090B3148u);
+    m(M_SURFACE_CLIP_H,2560u<<16);m(M_SURFACE_CLIP_V,720u<<16);
+    m(M_COLOR_A_PITCH,10240);m(M_ZETA_PITCH,5120);m(M_DEPTH_TEST,1);
+    draw_triangle();CHECK(msaa_color_w==640&&last_viewport_w==640,
+                         "an active depth attachment still bounds raster extent");
+    engine_down();
+}
+
 static void test_multisample_seed(void)
 {
     for (u32 samples=2;samples<=4;samples+=2) {
         engine_up();memset(&g_written,0,sizeof g_written);
+        m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);
         const u32 storage_h=samples==4?4:2;
         u8* bytes=vm_base+0x60000;memset(bytes,0xEE,32*storage_h);
         for(u32 y=0;y<storage_h;++y) for(u32 x=0;x<6;++x) {
@@ -1243,6 +1265,7 @@ int main(void)
     test_color_read_as_float();
     test_multisample_layout();
     test_multisample_seed();
+    test_active_depth_layout();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
