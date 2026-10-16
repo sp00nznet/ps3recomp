@@ -15,6 +15,10 @@
 #else
 #include <unistd.h>
 #include "ps3emu/strict_fs_posix.h"
+#ifdef __ANDROID__
+#include <fcntl.h>
+#include <sys/syscall.h>
+#endif
 #endif
 static inline int ps3_strict_fs_readonly(void) {
     const char* e=getenv("PS3_STRICT_FS_READONLY"); return e && !strcmp(e,"1");
@@ -192,6 +196,11 @@ static inline int ps3_strict_fs_commit_new_file(const char* from,const char* to)
 #ifdef _WIN32
     if(!MoveFileExA(from,to,MOVEFILE_WRITE_THROUGH)) {errno=EACCES;return -1;}
     return 0;
+#elif defined(__ANDROID__)
+    /* Android app policy forbids hard links, including within private storage.
+     * Use the kernel's atomic no-replace rename without the API 30 libc symbol
+     * so API 26 builds remain loadable. Unsupported kernels fail closed. */
+    return (int)syscall(SYS_renameat2,AT_FDCWD,from,AT_FDCWD,to,RENAME_NOREPLACE);
 #else
     /* link atomically creates a new name and fails if that name exists.
      * Unlike renameat2(NOREPLACE), it also works on the tested WSL Q mount.
