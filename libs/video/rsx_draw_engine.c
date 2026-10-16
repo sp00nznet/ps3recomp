@@ -1207,6 +1207,8 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
     out->wrap_s = (u8)(wrap & 0xFu);
     out->wrap_t = (u8)((wrap >> 8) & 0xFu);
     out->wrap_r = (u8)((wrap >> 16) & 0xFu);
+    out->anisotropy_code = (u8)((control0 >> 4) & 7u);
+    out->vertex_sampler = 0;
     out->min_lod = (float)((control0 >> 19) & 0xFFFu) / 256.0f;
     out->max_lod = out->mip_present ? (float)((control0 >> 7) & 0xFFFu) / 256.0f
                                     : 0.0f;
@@ -1852,6 +1854,8 @@ static u32 sink_bind_vertex_textures(
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
         eng_decode_sampler(vt.filter, vt.wrap, vt.control0, &samplers[u]);
+        samplers[u].anisotropy_code = 0; /* Vertex texture control has no max-aniso field. */
+        samplers[u].vertex_sampler = 1;
         /* A vertex unit has no crossbar, so its remap is the identity. */
         textures[u] = eng_texture_slot(vt.location, vt.offset, vt.format,
                                        vt.width, vt.height, vt.mipmaps,

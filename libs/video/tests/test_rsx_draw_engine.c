@@ -81,6 +81,7 @@ typedef struct {
 
     /* the last draw's bindings */
     u32 bound_tex[RSX_BE_MAX_TEXTURES];
+    rsx_be_sampler_desc bound_samplers[RSX_BE_MAX_TEXTURES];
     u32 bound_mask;
     u32 bound_rt[RSX_BE_MAX_COLOR_TARGETS];
     u32 bound_rt_count;
@@ -208,6 +209,7 @@ static void stub_bind_textures(void* u, const u32* tex,
 {
     (void)u; (void)smp;
     memcpy(stub.bound_tex, tex, sizeof stub.bound_tex);
+    memcpy(stub.bound_samplers, smp, sizeof stub.bound_samplers);
     stub.bound_mask = mask;
 }
 
@@ -601,6 +603,21 @@ static void test_mrt_set(void)
 }
 
 /* ---- 3. the texture cache ------------------------------------------------ */
+
+static void test_anisotropy_decode(void)
+{
+    printf("-- guest anisotropy decode\n");
+    engine_up();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    memset(vm_base + TEX_OFFSET, 0x11, 4 * 4 * 4);
+    for (u32 code = 0; code < 8; ++code) {
+        m(M_TEX_UNIT + 0x0C, 0x80000000u | (code << 4));
+        draw_triangle();
+        CHECK(stub.bound_samplers[0].anisotropy_code == code && !stub.bound_samplers[0].vertex_sampler,
+              "fragment texture retains guest max-aniso encoding %u", code);
+    }
+    engine_down();
+}
 
 static void test_texture_cache(void)
 {
@@ -1406,6 +1423,7 @@ int main(int argc, char** argv)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_anisotropy_decode();
     test_pipeline_key();
     test_restart_expansion();
     test_indexed_draws();

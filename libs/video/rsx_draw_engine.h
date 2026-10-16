@@ -65,6 +65,7 @@ typedef enum {
 typedef struct rsx_be_sampler_desc {
     u8  min_linear, mag_linear, mip_linear, mip_present;
     u8  wrap_s, wrap_t, wrap_r;
+    u8  anisotropy_code, vertex_sampler;
     float min_lod, max_lod;
 } rsx_be_sampler_desc;
 

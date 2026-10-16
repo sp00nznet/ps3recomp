@@ -50,6 +50,7 @@
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
 #include "rsx_resolution_scale.h"
+#include "rsx_vulkan_anisotropy.h"
 #include "rsx_depth_clip.h"
 #include "rsx_frame_dump.h"
 #include "ps3emu/strict_boot.h"
@@ -198,6 +199,9 @@ typedef struct vk_state {
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              alpha_to_one_ok; /* alphaToOne enabled when supported */
+    int              anisotropy_ok;
+    float            max_anisotropy;
+    u32              anisotropy_override; /* Immutable for this device lifetime. */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     SDL_Window*      window;
@@ -374,6 +378,7 @@ static int vk_pick_device(void)
     /* Vulkan guarantees 4096; the engine's targets and textures may use what
      * the device really has (a title's 4608-wide target on RADV). */
     s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
+    s_vk.max_anisotropy = p.limits.maxSamplerAnisotropy;
     VK_LOG("using device %d: %s\n", best, p.deviceName);
     return 0;
 }
@@ -627,7 +632,8 @@ static VkSampler vk_unit_sampler(const rsx_texture_state* t)
     const u32 minf = (t->filter >> 16) & 7u, magf = (t->filter >> 24) & 7u;
     const u32 lod  = (t->control0 >> 7) & 0xFFFFFFu;       /* max then min LOD */
     const u64 key  = (u64)minf | ((u64)magf << 3)
-                   | ((u64)(t->address & 0x000F0F0Fu) << 6) | ((u64)lod << 26);
+                   | ((u64)(t->address & 0x000F0F0Fu) << 6) | ((u64)lod << 26)
+                   | ((u64)((t->control0 >> 4) & 7u) << 50);
     for (u32 i = 0; i < s_vk.samp_count; i++)
         if (s_vk.samp_cache[i].key == key) return s_vk.samp_cache[i].s;
     if (s_vk.samp_count >= VK_SAMPLER_CACHE) return VK_NULL_HANDLE;
@@ -649,6 +655,8 @@ static VkSampler vk_unit_sampler(const rsx_texture_state* t)
         .minLod = min_lod, .maxLod = max_lod,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
     };
+    rsx_vk_anisotropy_apply(&sci, (t->control0 >> 4) & 7u, s_vk.anisotropy_override,
+                             s_vk.anisotropy_ok, s_vk.max_anisotropy, 1);
     VkSampler smp = VK_NULL_HANDLE;
     if (pvkCreateSampler(s_vk.device, &sci, NULL, &smp) != VK_SUCCESS) return VK_NULL_HANDLE;
     s_vk.samp_cache[s_vk.samp_count].key = key;
@@ -3194,6 +3202,9 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
         .addressModeW = vk_gcm_wrap(d->wrap_r),
         .minLod = min_lod, .maxLod = max_lod,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
+    rsx_vk_anisotropy_apply(&sci, d->vertex_sampler ? 0u : d->anisotropy_code,
+                             s_vk.anisotropy_override, s_vk.anisotropy_ok,
+                             s_vk.max_anisotropy, !d->vertex_sampler);
     /* Compare effective creation values, including every LOD bit, without
      * struct padding or a lossy packed key. Equivalent wraps and disabled/
      * clamped mip ranges should reuse the same successful sampler. */
@@ -3205,6 +3216,7 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
             p->addressModeV == sci.addressModeV &&
             p->addressModeW == sci.addressModeW &&
             p->minLod == sci.minLod && p->maxLod == sci.maxLod &&
+            p->anisotropyEnable == sci.anisotropyEnable && p->maxAnisotropy == sci.maxAnisotropy &&
             p->borderColor == sci.borderColor)
             return s_esamp[i].s;
     }
@@ -3447,6 +3459,10 @@ static rsx_backend s_vulkan_backend = {
  * -------------------------------------------------------------------------*/
 static int vk_init_all(u32 width, u32 height, const char* title)
 {
+    if (!rsx_vk_anisotropy_parse_override(getenv("PS3RECOMP_ANISOTROPY"), &s_vk.anisotropy_override)) {
+        VK_LOG("PS3RECOMP_ANISOTROPY must be auto,0,1,2,4,8 or16\n");
+        return -1;
+    }
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
@@ -3506,6 +3522,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
     want.alphaToOne = have.alphaToOne;
     s_vk.alpha_to_one_ok = have.alphaToOne ? 1 : 0;
+    want.samplerAnisotropy = have.samplerAnisotropy;
+    s_vk.anisotropy_ok = have.samplerAnisotropy ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
@@ -3513,6 +3531,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                                .pEnabledFeatures = &want };
     VK_CHECK(pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device), "vkCreateDevice");
     if (vk_load_device_functions()) return -1;
+    VK_LOG("anisotropy: supported=%d device_limit=%g override=%u (0=guest,1=off)\n",
+           s_vk.anisotropy_ok, (double)s_vk.max_anisotropy, s_vk.anisotropy_override);
     if (s_vk.windowed && vk_load_wsi_device_functions())
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);

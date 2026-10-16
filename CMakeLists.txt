@@ -49,7 +49,7 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Windows/Linux/Android)" OFF)
-list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_(backend|anisotropy)\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
     if(APPLE)
         message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN does not support Apple hosts yet")
@@ -61,6 +61,7 @@ if(PS3RECOMP_RSX_VULKAN)
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_anisotropy.c")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 endif()
@@ -513,6 +514,11 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
             libs/video/rsx_resolution_scale.c libs/video/tests/test_rsx_resolution_scale.c)
         target_include_directories(test_rsx_resolution_scale PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
         target_link_libraries(test_rsx_resolution_scale PRIVATE m)
+        add_executable(test_rsx_vulkan_anisotropy EXCLUDE_FROM_ALL
+            libs/video/rsx_vulkan_anisotropy.c libs/video/tests/test_rsx_vulkan_anisotropy.c)
+        target_include_directories(test_rsx_vulkan_anisotropy PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_compile_options(test_rsx_vulkan_anisotropy PRIVATE -Wall -Wextra -Werror)
+        target_link_libraries(test_rsx_vulkan_anisotropy PRIVATE m)
         add_executable(test_rsx_vulkan_resolution EXCLUDE_FROM_ALL libs/video/tests/test_rsx_vulkan_resolution.c)
         add_executable(test_vulkan_resolution_gpu EXCLUDE_FROM_ALL
             tests/test_vulkan_resolution_gpu.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
@@ -526,6 +532,17 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
                 winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
         endif()
         set_target_properties(test_vulkan_resolution_gpu PROPERTIES LINKER_LANGUAGE CXX)
+        add_executable(test_vulkan_anisotropy_backend EXCLUDE_FROM_ALL
+            tests/test_vulkan_anisotropy_backend.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_vulkan_anisotropy_backend PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_link_libraries(test_vulkan_anisotropy_backend PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(test_vulkan_anisotropy_backend PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_vulkan_anisotropy_backend PROPERTIES LINKER_LANGUAGE CXX)
         add_executable(test_vulkan_coverage_gpu EXCLUDE_FROM_ALL
             tests/test_vulkan_coverage_gpu.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
         target_include_directories(test_vulkan_coverage_gpu PRIVATE
