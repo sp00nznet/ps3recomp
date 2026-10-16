@@ -35,6 +35,11 @@ static void   ff_close(ff_lib l) { dlclose(l); }
 #elif defined(__APPLE__)
 #define FF_AVCODEC_NAME "libavcodec." FF_MAJ_C ".dylib"
 #define FF_AVUTIL_NAME  "libavutil." FF_MAJ_U ".dylib"
+#elif defined(__ANDROID__)
+/* Android packages native libraries by their unversioned .so names. FFmpeg's
+ * Android target uses these SONAMEs; ff_load still checks both ABI majors. */
+#define FF_AVCODEC_NAME "libavcodec.so"
+#define FF_AVUTIL_NAME  "libavutil.so"
 #else
 #define FF_AVCODEC_NAME "libavcodec.so." FF_MAJ_C
 #define FF_AVUTIL_NAME  "libavutil.so." FF_MAJ_U
