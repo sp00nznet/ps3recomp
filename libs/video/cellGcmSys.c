@@ -1304,9 +1304,9 @@ static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consu
  * a title spinning on ctrl->ref waits forever with no indication why. Tokyo
  * Jungle did exactly this -- get left the 1 MB ring for IO 0x00F00000, which it
  * never mapped, while put sat at 0x604. Stop at the bad word and say so. */
-static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word, u32 get, u32 put)
 {
-    ps3_strict_boot_guard("rsx-unmapped-branch", "kind=%s target=0x%08X word=0x%08X", kind, target, word);
+    ps3_strict_boot_guard("rsx-unmapped-branch", "kind=%s target=0x%08X word=0x%08X get=0x%08X put=0x%08X", kind, target, word, get, put);
     static int n = 0;
     if (n++ < 8)
         fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
@@ -1805,7 +1805,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_bad_branch("JUMP", tgt, w, s_fifo_getoff, put); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
                * catches up, and overwrites it when the next segment is
@@ -1828,7 +1828,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_bad_branch("CALL", tgt, w, s_fifo_getoff, put); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
