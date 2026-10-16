@@ -311,6 +311,17 @@ _Atomic u32 g_gcm_fifo_drained_ea = 0;
 /* Only the owning host renderer reports suspension. This does not acknowledge
  * guest flips or permit the producer to reuse unread command storage. */
 static _Atomic int s_host_presentation_suspended = 0;
+/* Read-only diagnostic samples. They never publish GET, complete a command,
+ * release a semaphore, or extend the strict refill deadline. */
+static _Atomic u32 s_host_renderer_phase = 0;
+static _Atomic u32 s_drain_packet_ea = 0, s_drain_packet_word = 0;
+static _Atomic u64 s_drain_packet_count = 0;
+static _Atomic u32 s_drain_semaphore_address = 0;
+static _Atomic u32 s_drain_semaphore_expected = 0, s_drain_semaphore_actual = 0;
+void cellGcmSetHostRendererPhase(u32 phase)
+{
+    atomic_store_explicit(&s_host_renderer_phase, phase, memory_order_relaxed);
+}
 void cellGcmSetHostPresentationSuspended(int suspended)
 {
     atomic_store_explicit(&s_host_presentation_suspended, suspended != 0, memory_order_release);
@@ -1801,6 +1812,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
+        atomic_store_explicit(&s_drain_packet_ea, ea, memory_order_relaxed);
+        atomic_store_explicit(&s_drain_packet_word, w, memory_order_relaxed);
+        atomic_store_explicit(&s_drain_semaphore_address, 0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_drain_packet_count, 1, memory_order_relaxed);
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */
@@ -1949,7 +1964,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * its own is the half that unblocks a waiting guest. */
             static int blk = -1;
             if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
-            if (blk || ps3_strict_boot_enabled()) { sem_blocked = 1; break; }
+            if (blk || ps3_strict_boot_enabled()) {
+                atomic_store_explicit(&s_drain_semaphore_address, la, memory_order_relaxed);
+                atomic_store_explicit(&s_drain_semaphore_expected, v, memory_order_relaxed);
+                atomic_store_explicit(&s_drain_semaphore_actual, vm_read32(la), memory_order_relaxed);
+                sem_blocked = 1; break;
+            }
         }
                 }
                 if (sem_blocked) break;
@@ -2309,6 +2329,7 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
     u64 progressed = started;
     u64 sampled = started;
     u32 previous = atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire);
+    const u64 packets_started = atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed);
     int spins = 0;
     while ((previous == begin) != at_begin) {
         Sleep(1); ++spins;
@@ -2325,8 +2346,18 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
         sampled = now;
         if (drained != previous) { previous = drained; progressed = now; }
         if ((drained == begin) == at_begin) break;
-        if (!suspended && (now - progressed >= UINT64_C(5000000000) || now - started >= UINT64_C(30000000000)))
+        if (!suspended && (now - progressed >= UINT64_C(5000000000) || now - started >= UINT64_C(30000000000))) {
+            fprintf(stderr, "[rsx-refill-sample] host_phase=%u packets_at_wait=%llu packets_now=%llu packet_ea=0x%08X word=0x%08X semaphore=0x%08X expected=0x%08X actual=0x%08X\n",
+                atomic_load_explicit(&s_host_renderer_phase, memory_order_relaxed),
+                (unsigned long long)packets_started,
+                (unsigned long long)atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed),
+                atomic_load_explicit(&s_drain_packet_ea, memory_order_relaxed),
+                atomic_load_explicit(&s_drain_packet_word, memory_order_relaxed),
+                atomic_load_explicit(&s_drain_semaphore_address, memory_order_relaxed),
+                atomic_load_explicit(&s_drain_semaphore_expected, memory_order_relaxed),
+                atomic_load_explicit(&s_drain_semaphore_actual, memory_order_relaxed));
             ps3_strict_boot_guard("rsx-refill-drain-stalled", "context=0x%08X begin=0x%08X current=0x%08X drained=0x%08X await_begin=%d elapsed_ms=%llu idle_ms=%llu", ctx_ea, begin, current, drained, at_begin, (unsigned long long)((now-started)/1000000), (unsigned long long)((now-progressed)/1000000));
+        }
     }
     return spins;
 }

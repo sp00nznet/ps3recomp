@@ -289,6 +289,9 @@ void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
 /* Host presentation suspension only; never completes a guest flip. */
 void cellGcmSetHostPresentationSuspended(int suspended);
+/* Diagnostic only: 0 stopped, 1 dialogs, 2 window pump, 3 FIFO, 4 present,
+ * 5 flip/vblank completion, 6 pacing. No guest state is changed. */
+void cellGcmSetHostRendererPhase(u32 phase);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
