@@ -2360,20 +2360,22 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
     vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
 }
 
-static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-                            void* out, u32 out_pitch)
+static int vk_eng_readback_rows(u32 surface, u32 x, u32 y, u32 w, u32 h,
+                               void* out, u32 out_pitch)
 {
-    (void)user;
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (!o) o = vk_eng_get(surface, VK_ENG_TEXTURE);
     if (o && o->samples > 1) o = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
-    if (!o || !out || !out_pitch || !w || !h || x + w > o->w || y + h > o->h) return;
+    if (!o || !out || !w || !h || !o->bpp || o->block ||
+        x > o->w || w > o->w-x || y > o->h || h > o->h-y ||
+        (size_t)w*o->bpp > out_pitch) return -1;
     const size_t tight = (size_t)w * o->bpp;
     vk_buffer st = {0};
     if (vk_create_host_buffer(&st, (VkDeviceSize)tight * h, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
-        vk_destroy_buffer(&st); return;
+        vk_destroy_buffer(&st); return -1;
     }
-    if (!vk_begin()) {
+    int rc = vk_begin();
+    if (!rc) {
         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
@@ -2388,13 +2390,24 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
         };
         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                               0, 0, NULL, 1, &hb, 0, NULL);
-        if (!vk_submit_and_wait()) {
+        rc = vk_submit_and_wait();
+        if (!rc) {
             vk_invalidate(&st);
             for (u32 row = 0; row < h; row++)
                 memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)st.ptr + (size_t)row * tight, tight);
         }
     }
     vk_destroy_buffer(&st);
+    return rc ? -1 : 0;
+}
+
+static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                            void* out, u32 out_pitch)
+{
+    (void)user;
+    if (vk_eng_readback_rows(surface,x,y,w,h,out,out_pitch))
+        ps3_strict_boot_guard("vulkan-readback", "color copy failed surface=%u region=%u,%u,%u,%u pitch=%u",
+                              surface,x,y,w,h,out_pitch);
 }
 
 /* ---- E3: textures ---------------------------------------------------------
@@ -2573,8 +2586,7 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
         const u32 expanded = vk_eng_expand_samples(depth);
         vk_eng_obj* image = vk_eng_get(expanded, VK_ENG_TEXTURE);
         if (!image || !out || out_pitch < (size_t)w * 4u || x > image->w || w > image->w-x || y > image->h || h > image->h-y) return -1;
-        vk_eng_readback(user, expanded, x, y, w, h, out, out_pitch);
-        return 0;
+        return vk_eng_readback_rows(expanded,x,y,w,h,out,out_pitch);
     }
     if (!z || !out || !w || !h || x + w > z->w || y + h > z->h ||
         out_pitch < w * 4u || (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&

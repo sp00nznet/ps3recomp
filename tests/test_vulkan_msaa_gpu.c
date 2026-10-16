@@ -7,6 +7,11 @@
 uint8_t* vm_base;
 static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); return 1; } } while(0)
+static VKAPI_ATTR VkResult VKAPI_CALL reject_begin(VkCommandBuffer command,
+                                                   const VkCommandBufferBeginInfo* info)
+{
+    (void)command;(void)info;return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
 
 int main(void)
 {
@@ -55,6 +60,21 @@ int main(void)
         vk_eng_readback(NULL,color,0,0,w,h,pixels,w*4);
         CHECK(vk_eng_depth_readback(NULL,depth,0,0,w,h,depths,w*4)==0);
         for(unsigned i=0;i<w*h;++i) { CHECK(pixels[i*4]==0&&pixels[i*4+1]==255&&pixels[i*4+2]==0);CHECK(fabsf(depths[i]-.75f)<1e-5f); }
+        /* A failed GPU readback must not report success or touch the output.
+         * Both expansions are cached here, isolating failure to the copy. */
+        {
+            uint8_t untouched[sizeof pixels];memset(untouched,0xA7,sizeof untouched);
+            memcpy(pixels,untouched,sizeof pixels);
+            CHECK(vk_eng_readback_rows(color,0,0,w,h,pixels,w*4-1)!=0);
+            CHECK(vk_eng_readback_rows(color,UINT32_MAX,0,w,h,pixels,w*4)!=0);
+            PFN_vkBeginCommandBuffer saved=pvkBeginCommandBuffer;
+            pvkBeginCommandBuffer=reject_begin;
+            const int color_rc=vk_eng_readback_rows(color,0,0,w,h,pixels,w*4);
+            const int depth_rc=vk_eng_depth_readback(NULL,depth,0,0,w,h,(float*)pixels,w*4);
+            pvkBeginCommandBuffer=saved;
+            CHECK(color_rc!=0);CHECK(depth_rc!=0);
+            CHECK(memcmp(pixels,untouched,sizeof pixels)==0);
+        }
         if(count>1) {
             uint8_t expected[sizeof pixels];
             for(unsigned y=0;y<h;++y) for(unsigned x=0;x<w;++x) {
