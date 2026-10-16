@@ -1349,6 +1349,14 @@ int main(int argc, char** argv)
         fprintf(stderr,"required pipeline failure returned instead of stopping\n");
         engine_down();free(vm_base);return 1;
     }
+    if(argc==2 && !strcmp(argv[1],"--check-geometry-capture")) {
+        engine_up(); draw_triangle(); rsx_draw_engine_present();
+        m(M_BEGIN_END,RSX_PRIMITIVE_TRIANGLE_STRIP);
+        m(M_DRAW_ARRAYS,2u<<24);m(M_BEGIN_END,0);
+        rsx_draw_engine_present();
+        CHECK(stub.n_draw==2,"capture retains both backend draws");
+        engine_down();free(vm_base);return g_failures ? 1 : 0;
+    }
 
     test_surface_set();
     test_surface_aliasing();

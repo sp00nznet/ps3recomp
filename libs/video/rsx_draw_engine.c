@@ -1901,6 +1901,7 @@ static struct {
     int open;
     u32 n_targets, targets[RSX_BE_MAX_COLOR_TARGETS], zslot;
     u32 draws, clears;
+    u64 geometry_bytes;
     char first[2048];
 } s_pd;
 
@@ -2145,8 +2146,46 @@ static void pd_first_draw_state(u32 pipeline)
 
 /* A draw (or, with rs NULL, a clear) into this target set: close the pass
  * when the set changed, and describe the first draw of a new one. */
+/* Optional private first-draw geometry for diagnosing visible mesh holes.
+ * FGM1 is 32 little-endian u32 words, followed by packed host float4 vertex
+ * attributes and expanded u32 indices. Supported target CPUs are little
+ * endian. Attribute IDs occupy words8..23; words24..28 describe culling and
+ * source reference/cut counts. No guest state is changed or synthesized. */
+static void pd_geometry(const rsx_be_render_state* rs, u32 topology,
+                        int indexed, u32 draw_count)
+{
+    const char* enabled = getenv("RSX_ENGINE_PASS_DUMP_GEOMETRY");
+    if (!enabled || strcmp(enabled, "1")) return;
+    const u32 count = indexed ? draw_count : 0;
+    const u64 vb = (u64)dc.n_verts * dc.layout.stride;
+    const u64 ib = (u64)count * sizeof(u32);
+    const u64 bytes = 128u + vb + ib;
+    if (!dc.verts || (count && !g.indices) || bytes > 4u * 1024u * 1024u ||
+        bytes + s_pd.geometry_bytes > 64u * 1024u * 1024u) {
+        fprintf(stderr, "[rsx engine] geometry capture skipped pass %u: bounded size/input check\n", s_pd.pass);
+        return;
+    }
+    u32 header[32] = {0x314D4746u, 1u, g.rsx.current_primitive, topology,
+                      dc.n_verts, dc.layout.stride, count, dc.layout.count};
+    for (u32 a = 0; a < dc.layout.count && a < 16u; a++) header[8u+a] = dc.layout.attrs[a];
+    header[24]=rs->cull_enable; header[25]=rs->cull_face; header[26]=rs->front_face;
+    header[27]=dc.n_source_refs; header[28]=dc.n_cuts;
+    char path[1024];
+    const int n = snprintf(path, sizeof path, "%s/pass%03u_geometry.bin", s_pd.dir, s_pd.pass);
+    if (n < 0 || (size_t)n >= sizeof path) return;
+    FILE* f = fopen(path,"wb");
+    if (!f) { fprintf(stderr,"[rsx engine] cannot open geometry capture %s\n",path); return; }
+    const int complete = fwrite(header,1,sizeof header,f)==sizeof header &&
+                         fwrite(dc.verts,1,(size_t)vb,f)==vb &&
+                         (!ib || fwrite(g.indices,1,(size_t)ib,f)==ib);
+    const int closed = fclose(f);
+    s_pd.geometry_bytes += bytes;
+    if (!complete || closed) fprintf(stderr,"[rsx engine] incomplete geometry capture %s\n",path);
+}
+
 static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
-                    const rsx_be_render_state* rs, u32 pipeline, u32 tex_mask)
+                    const rsx_be_render_state* rs, u32 pipeline, u32 tex_mask,
+                    u32 topology, int indexed, u32 draw_count)
 {
     if (!pd_capturing()) return;
     int same = s_pd.open && s_pd.n_targets == n_targets && s_pd.zslot == zslot;
@@ -2186,6 +2225,7 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
     }
     if (s_pd.draws++) return;
     pd_first_draw_state(pipeline);
+    pd_geometry(rs, topology, indexed, draw_count);
 
     rsx_dsp_surface sf;
     rsx_dsp_viewport vp;
@@ -2399,7 +2439,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
       alpha[1] = alpha[2] = alpha[3] = 0.0f; }
 
-    pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
+    pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask,
+            (u32)topology, indexed, n_draw);
 
     /* The depth attachment is cleared the first time it is bound, so a title
      * that never clears its shadow zeta still tests against something. */
@@ -2477,7 +2518,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         pd_note(targets, n_targets,
                 eng_zdepth_get(zs.zeta_location, zs.zeta_offset,
                     g.surfaces[targets[0]].raster_w, g.surfaces[targets[0]].raster_h, g.surfaces[targets[0]].samples),
-                NULL, 0, 0);
+                NULL, 0, 0, 0, 0, 0);
     }
 
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G |
