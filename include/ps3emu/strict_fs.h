@@ -1,4 +1,4 @@
-/* Windows guest-I/O containment for diagnostic runs. Not an OS sandbox and
+/* Host guest-I/O containment for diagnostic runs. Not an OS sandbox and
  * not resistant to concurrent filesystem substitution (TOCTOU). */
 #ifndef PS3EMU_STRICT_FS_H
 #define PS3EMU_STRICT_FS_H
@@ -14,6 +14,7 @@
 #include <direct.h>
 #else
 #include <unistd.h>
+#include "ps3emu/strict_fs_posix.h"
 #endif
 static inline int ps3_strict_fs_readonly(void) {
     const char* e=getenv("PS3_STRICT_FS_READONLY"); return e && !strcmp(e,"1");
@@ -100,7 +101,8 @@ static inline void ps3_strict_fs_mutation(const char* operation,const char* path
     if(!ps3_strict_fs_canonical(path,canonical_path,0))ps3_strict_fs_fail(operation,path,"invalid-path-or-reparse");
     if(!ps3_strict_fs_within(canonical_path,canonical_root))ps3_strict_fs_fail(operation,path,"outside-write-root");
 #else
-    ps3_strict_fs_fail(operation,path,"write-root-mode-unsupported-platform");
+    const char* reason=ps3_strict_fs_posix_path(root,path);
+    if(reason)ps3_strict_fs_fail(operation,path,reason);
 #endif
 }
 static inline void ps3_strict_fs_unimplemented(const char* operation,const char* path) {
@@ -129,7 +131,8 @@ static inline void ps3_strict_fs_stream(const char* operation,FILE* stream) {
     if(!GetFileInformationByHandle((HANDLE)raw,&info)||info.nNumberOfLinks!=1)ps3_strict_fs_fail(operation,path,"ambiguous-file-links");
     ps3_strict_fs_mutation(operation,path);
 #else
-    ps3_strict_fs_fail(operation,NULL,"write-root-mode-unsupported-platform");
+    const char* reason=ps3_strict_fs_posix_stream(ps3_strict_fs_root(),stream);
+    if(reason)ps3_strict_fs_fail(operation,NULL,reason);
 #endif
 }
 static inline FILE* ps3_strict_fs_fopen(const char* path,const char* mode) {
@@ -192,7 +195,8 @@ static inline int ps3_strict_fs_commit_new_file(const char* from,const char* to)
 #else
     /* link atomically creates a new name and fails if that name exists.
      * Unlike renameat2(NOREPLACE), it also works on the tested WSL Q mount.
-     * Write-root mode has already stopped above on unsupported POSIX hosts. */
+     * Both names have been validated above. The temporary second link is
+     * removed directly here, without passing through the single-link guard. */
     if(link(from,to))return -1;
     return unlink(from);
 #endif
@@ -235,6 +239,13 @@ static inline int ps3_strict_fs_mkdir(const char* path,int mode) {
         /* Returning EEXIST here makes ancestor checks mutation-free even when
          * the existing ancestor is outside the configured write root. */
         if(ps3_strict_fs_canonical(checked,canonical,1) && (GetFileAttributesA(canonical)&FILE_ATTRIBUTE_DIRECTORY)) {errno=EEXIST;return -1;}
+    }
+#else
+    if(ps3_strict_fs_root()) {
+        char checked[PS3_STRICT_FS_POSIX_CAP];
+        /* Existing safe ancestors need no mutation even outside the root. */
+        if(!ps3_strict_fs_posix_syntax(path,checked) &&
+           !ps3_strict_fs_posix_walk(checked,1,1)) {errno=EEXIST;return -1;}
     }
 #endif
     ps3_strict_fs_mutation("mkdir",path);
