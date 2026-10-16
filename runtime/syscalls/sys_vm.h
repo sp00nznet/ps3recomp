@@ -35,8 +35,8 @@ extern "C" {
 
 /* Guest address window handed out by sys_vm_memory_map. A process may hold
  * at most 256 MB of sys_vm mappings, so one 256 MB window suffices. */
-#define SYS_VM_REGION_BASE  0x60000000u
-#define SYS_VM_REGION_END   0x70000000u
+#define SYS_VM_REGION_BASE  VM_SYS_VM_BASE
+#define SYS_VM_REGION_END   (VM_SYS_VM_BASE + VM_SYS_VM_SIZE)
 
 /* Granularity rules (also enforced by callers: the Yakuza binary rounds
  * vsize up to a 32 MB multiple and psize up to a 64 KB multiple itself). */

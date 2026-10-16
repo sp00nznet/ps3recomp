@@ -795,12 +795,12 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
 
-    /* Keep audio outside sys_memory (0x40000000..0x50000000), the HLE heap
-     * (0x50000000..0x58000000), and sys_vm (0x60000000..0x70000000).
-     * Reserve two 1-MB pages per port so reopening reuses its own storage. */
-    u32 guest_buf = 0x58000000u + (u32)found * 0x200000u;
+    /* Each port reuses its own two pages in the runtime-owned audio window. */
+    _Static_assert(CELL_AUDIO_PORT_MAX * VM_AUDIO_PORT_SIZE <= VM_AUDIO_SIZE,
+                   "Audio port storage exceeds its reserved VM window");
+    u32 guest_buf = VM_AUDIO_BASE + (u32)found * VM_AUDIO_PORT_SIZE;
     u32 guest_ridx = guest_buf + 0x100000u;
-    if (vm_commit(guest_buf, 0x200000u) != CELL_OK) {
+    if (vm_commit(guest_buf, VM_AUDIO_PORT_SIZE) != CELL_OK) {
         port->in_use = 0;
         mutex_unlock(&s_audio_mutex);
         return CELL_AUDIO_ERROR_AUDIOSYSTEM;

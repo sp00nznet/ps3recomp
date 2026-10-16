@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
 #include <stdio.h>
@@ -858,8 +859,8 @@ s32 sys_heap_destroy_heap(sys_heap_t heap)
  *   user-12  magic (so free() can tell our blocks from a foreign pointer)
  * The free-list link lives at the raw block start, which is dead space while
  * the block is free. */
-#define YZ_HEAP_BASE 0x50000000u
-#define YZ_HEAP_END  0x58000000u
+#define YZ_HEAP_BASE VM_HLE_HEAP_BASE
+#define YZ_HEAP_END  (VM_HLE_HEAP_BASE + VM_HLE_HEAP_SIZE)
 #define YZ_HEAP_MAGIC 0x595A4850u        /* 'YZHP' */
 #define YZ_BINS 32
 static u32 s_heap_bump = 0;

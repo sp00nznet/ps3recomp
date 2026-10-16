@@ -1195,7 +1195,7 @@ extern "C" uint32_t ppu_vm_size = 0;
  * the free window just below the mmapper region (0x11000000) and above any
  * game's high data segments, so it doesn't collide with the static image. */
 static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
-#define PPU_TLS_IMG   0x10F00000u
+#define PPU_TLS_IMG   VM_PPU_TLS_BASE
 #define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
 
 #ifdef _WIN32
@@ -3024,6 +3024,8 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 
 /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
 extern "C" int lv2_try_syscall(ppu_context* ctx);
+extern "C" int64_t sys_mmapper_allocate_address(ppu_context* ctx);
+extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out);
 
 /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
  * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
@@ -3101,16 +3103,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     }
     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
                    * u64 alignment, u32* alloc_addr) -> reserve guest VA range */
-        static uint32_t s_next_va = 0x11000000u;   /* just past the loaded image */
-        uint32_t size  = (uint32_t)ctx->gpr[3];
-        uint32_t align = (uint32_t)ctx->gpr[5];
-        uint32_t out   = (uint32_t)ctx->gpr[6];
-        if (align < 0x100000u) align = 0x100000u;   /* 1 MB min */
-        s_next_va = (s_next_va + align - 1) & ~(align - 1);
-        uint32_t va = s_next_va;
-        s_next_va += (size + 0xFFFFFu) & ~0xFFFFFu;
-        if (out) vm_write32(out, va);
-        ctx->gpr[3] = 0;
+        int64_t rc = sys_mmapper_allocate_address(ctx);
+        ctx->gpr[3] = (uint64_t)rc;
         return;
     }
     case 337: {   /* sys_mmapper_search_and_map(u32 start_addr, u32 mem_id,
@@ -3123,20 +3117,14 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         uint32_t start  = (uint32_t)ctx->gpr[3];
         uint32_t mem_id = (uint32_t)ctx->gpr[4];
         uint32_t outp   = (uint32_t)ctx->gpr[6];
-        static uint32_t s_map_next = 0;
-        if (!s_map_next) s_map_next = start ? start : 0x11000000u;
         uint32_t size = ps3_mmapper_block_size(mem_id);
         if (!size) size = 0x100000u;
-        uint32_t va = s_map_next;
-        s_map_next = (s_map_next + size + 0xFFFFFu) & ~0xFFFFFu;
-        /* MAP the block, don't just name it. This handed back an address into
-         * MEM_RESERVE, so the page only ever came into existence if the PPU
-         * happened to touch it first (the boot harness commits on fault; a
-         * port with its own main() does not even do that). An SPU-written
-         * output buffer is the case that breaks: the SPU is the FIRST writer,
-         * its DMA guard sees an uncommitted EA and skips the transfer, and the
-         * job's results are silently dropped. */
-        vm_commit(va, size);
+        uint32_t va = 0;
+        int64_t rc = sys_mmapper_search_map_address(start, size, &va);
+        if (rc != CELL_OK) {
+            ctx->gpr[3] = (uint64_t)rc;
+            return;
+        }
         if (outp) vm_write32(outp, va);
         ctx->gpr[3] = 0;
         return;
@@ -3349,10 +3337,19 @@ static uint16_t be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); 
 static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
 static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32(p + 4); }
 
-/* Loaded image ranges remain live while the entry stack is constructed. BSS is
- * included: putting arguments in a zero-filled segment corrupts the image too. */
+/* Loaded image ranges remain live during entry-stack construction and later
+ * allocations. BSS is owned too, even though it has no file-backed bytes. */
 struct ppu_image_range { uint64_t begin, end; };
 static std::vector<ppu_image_range> g_ppu_image_ranges;
+extern "C" void sys_memory_set_image_query(uint64_t (*query)(uint64_t, uint64_t));
+
+static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
+{
+    uint64_t next = addr;
+    for (const auto& r : g_ppu_image_ranges)
+        if (addr < r.end && r.begin < end && r.end > next) next = r.end;
+    return next;
+}
 
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
@@ -3375,6 +3372,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     uint16_t phnum = be16(file + 56);
 
     g_ppu_image_ranges.clear();
+    sys_memory_set_image_query(ppu_image_overlap_end);
     int loaded = 0;
     for (uint16_t i = 0; i < phnum; i++) {
         uint64_t ph_off = phoff + (uint64_t)i * phentsize;

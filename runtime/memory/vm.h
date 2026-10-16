@@ -50,6 +50,19 @@ extern "C" {
 
 #define VM_PPU_STACK_SIZE   0x00100000u      /* 1 MB default PPU stack */
 
+/* Loader-owned main/worker TLS images. User allocations must skip this window. */
+#define VM_PPU_TLS_BASE     0x10F00000u
+#define VM_PPU_TLS_SIZE     0x00100000u
+
+/* Dedicated guest windows owned by runtime allocators, not LV2 mmapper. */
+#define VM_HLE_HEAP_BASE    0x50000000u
+#define VM_HLE_HEAP_SIZE    0x08000000u
+#define VM_AUDIO_BASE       0x58000000u
+#define VM_AUDIO_PORT_SIZE  0x00200000u
+#define VM_AUDIO_SIZE       0x01000000u
+#define VM_SYS_VM_BASE      0x60000000u
+#define VM_SYS_VM_SIZE      0x10000000u
+
 /* Home for guest-visible structures the RUNTIME injects -- the GCM label window,
  * the control register (put/get/ref) and the IO<->EA offset tables. These must
  * NOT sit inside main memory, because that is where the title's own allocator
@@ -72,7 +85,8 @@ extern "C" {
  * So it is a variable, not a constant: a port that knows its title's memory map
  * assigns ppu_hle_inject_base before it runs any guest code, and everything
  * derived from VM_HLE_INJECT_BASE follows. The default is the historical value.
- * The window needs 0x8000 bytes and the title only ever learns these addresses
+ * The window includes RSX reports, codec scratch and the 24-bit semaphore area;
+ * reserve 16 MB. The title only ever learns these addresses
  * through cellGcmGetLabelAddress / cellGcmGetControlRegister /
  * cellGcmGetOffsetTable, so it is free to move. */
 #ifdef __cplusplus
@@ -83,6 +97,7 @@ extern uint32_t ppu_hle_inject_base;
 }
 #endif
 #define VM_HLE_INJECT_BASE  ppu_hle_inject_base
+#define VM_HLE_INJECT_SIZE  0x01000000u
 
 #define VM_PAGE_SIZE        0x00001000u      /* 4 KB: the GUEST page size */
 

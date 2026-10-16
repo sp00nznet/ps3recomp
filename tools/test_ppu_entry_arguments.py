@@ -34,13 +34,16 @@ def main():
         tmp = Path(tmp)
         (tmp/'ppu_recomp.h').write_text(stub_header())
         binary = tmp/'test'
+        memory = tmp/'memory.o'
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-c',
+                        str(ROOT/'runtime/syscalls/sys_memory.c'), '-o', str(memory)], check=True)
         flags = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-ldl']
         subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1',
                         '-ffunction-sections', '-fdata-sections',
                         '-I'+str(tmp), '-I'+str(ROOT/'include'), '-I'+str(ROOT/'runtime/platform'),
                         str(ROOT/'runtime/ppu/ppu_loader.cpp'),
                         str(ROOT/'runtime/ppu/tests/test_ppu_entry_arguments.cpp'),
-                        *flags, '-o', str(binary)], check=True)
+                        str(memory), *flags, '-o', str(binary)], check=True)
         env = {k: v for k,v in os.environ.items() if not k.startswith(('PPU_', 'PS3_', 'PS3RECOMP_', 'SPU_'))}
         env['PS3_BOOT_PATH'] = '/dev_bdvd/PS3_GAME/USRDIR/bin/test.self'
         for label, extras, bad_stack in [('single', False, False), ('multiple', True, False), ('image-stack-overlap', False, True)]:

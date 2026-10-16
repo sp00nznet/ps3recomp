@@ -64,9 +64,17 @@ int64_t sys_memory_container_create(ppu_context* ctx);
 int64_t sys_memory_container_destroy(ppu_context* ctx);
 int64_t sys_memory_container_get_size(ppu_context* ctx);
 int64_t sys_mmapper_allocate_address(ppu_context* ctx);
+int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out);
 int64_t sys_mmapper_free_address(ppu_context* ctx);
 int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx);
 int64_t sys_mmapper_map_shared_memory(ppu_context* ctx);
+
+/* Optional loader-owned image query: return addr unchanged when [addr, end)
+ * is clear, otherwise the greatest exclusive end of an overlapping PT_LOAD.
+ * Install before guest threads start. The callback and its ranges must outlive
+ * allocations; sys_memory_init preserves it because ELF loading precedes LV2
+ * initialization in the boot harness. NULL restores the no-loader behavior. */
+void sys_memory_set_image_query(uint64_t (*query)(uint64_t addr, uint64_t end));
 
 /* Registration */
 void sys_memory_init(lv2_syscall_table* tbl);
