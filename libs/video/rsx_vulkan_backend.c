@@ -49,6 +49,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "rsx_resolution_scale.h"
 #include "rsx_depth_clip.h"
 #include "rsx_frame_dump.h"
 #include "ps3emu/strict_boot.h"
@@ -1975,7 +1976,8 @@ typedef struct vk_eng_obj {
     u8       kind;
     VkFormat fmt;
     u32      bpp;                    /* bytes per texel, 0 for depth     */
-    u32      w, h;
+    u32      w, h;                 /* physical image extent */
+    u32      scale, grid_x, grid_y; /* guest raster scale and expanded sample grid */
     u32      samples, expanded;
     int      expansion_valid;
     vk_image im;                     /* a VIEW owns only im.view            */
@@ -2079,11 +2081,6 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
     return vk_eng_upload_region(img, layer, mip, 0, 0, w, h, tight, rows, src, row_bytes);
 }
 
-static int vk_eng_upload(VkImage img, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
-                         const void* src, u32 row_bytes)
-{
-    return vk_eng_upload_rows(img, layer, mip, w, h, (size_t)w * bpp, h, src, row_bytes);
-}
 
 /* NV4097 TEXTURE_CONTROL1 crossbar as a Vulkan component mapping: the shared
  * rsx_texture_component_remap() gives, in A,R,G,B order, which uploaded
@@ -2120,12 +2117,15 @@ static int vk_eng_make_view(VkImage img, VkFormat fmt, u32 levels, VkComponentMa
     return pvkCreateImageView(s_vk.device, &vci, NULL, out) == VK_SUCCESS ? 0 : -1;
 }
 
+
+#include "rsx_vulkan_resolution.inc"
+
 static int vk_eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
     memset(s_eobj, 0, sizeof s_eobj);
     memset(&s_eng_bound, 0, sizeof s_eng_bound);
-    return s_vk.device ? 0 : -1;
+    return s_vk.device ? vk_eng_resolution_config() : -1;
 }
 
 static u32 vk_eng_expand_samples(u32 surface);
@@ -2176,6 +2176,8 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
                                       const void* seed, u32 seed_row_bytes)
 {
     (void)user;
+    const u32 guest_w=w,guest_h=h;
+    if (vk_eng_scale_extent(&w,&h,1)) return 0;
     u32 bpp;
     const VkFormat vf = vk_eng_format(fmt, &bpp);
     /* Only formats the E2 passes are built for (vk_eng_rt_index). */
@@ -2192,7 +2194,7 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
                         VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im); return 0;
     }
-    o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h;
+    o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h; o->scale=s_render_scale;
     /* UNDEFINED -> GENERAL, then the guest's own bytes when the engine could
      * resolve them, else transparent black so the contents are defined. */
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
@@ -2201,15 +2203,16 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
     if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
-    if (seed && seed_row_bytes)
-        vk_eng_upload(o->im.img, 0, 0, w, h, bpp, seed, seed_row_bytes);
+    if (seed && seed_row_bytes && vk_eng_scaled_write(hd,o,0,0,guest_w,guest_h,seed,seed_row_bytes)) {
+        vk_eng_release(user,hd); return 0;
+    }
     return hd;
 }
 
 static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
 {
     (void)user;
-    if (!w || !h || w > vk_max_dim() || h > vk_max_dim()) return 0;
+    if (vk_eng_scale_extent(&w,&h,1)) return 0;
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
@@ -2219,7 +2222,7 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
                         s_vk.depth_aspect)) {
         vk_destroy_image(&o->im); return 0;
     }
-    o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h;
+    o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h; o->scale=s_render_scale;
     /* Far plane, for the reason the display depth starts there. */
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -2232,7 +2235,7 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
 
 static u32 vk_eng_target_multisample(void* user, rsx_be_format fmt, u32 w, u32 h, u32 samples, int depth)
 {
-    if ((samples != 2 && samples != 4) || !w || !h || w > vk_max_dim()/2u || h > vk_max_dim()/(samples > 2 ? 2u : 1u)) return 0;
+    if ((samples != 2 && samples != 4) || vk_eng_scale_extent(&w,&h,samples)) return 0;
     u32 bpp = 0;
     const VkFormat vf = depth ? s_vk.depth_format : vk_eng_format(fmt, &bpp);
     if (!depth && vk_eng_rt_index(vf) < 0) return 0;
@@ -2246,7 +2249,7 @@ static u32 vk_eng_target_multisample(void* user, rsx_be_format fmt, u32 w, u32 h
         vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
     }
     o->kind = depth ? VK_ENG_DEPTH : VK_ENG_COLOR;
-    o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h; o->samples = samples;
+    o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h; o->scale=s_render_scale; o->samples = samples;
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkImageSubresourceRange range = {aspect, 0, 1, 0, 1};
@@ -2348,7 +2351,7 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
         const u32 expanded = vk_eng_expand_samples(surface);
         vk_eng_obj* dst = vk_eng_get(expanded, VK_ENG_TEXTURE);
         if (!dst || o->fmt != VK_FORMAT_R8G8B8A8_UNORM || !rows || !w || !h ||
-            x > dst->w || w > dst->w-x || y > dst->h || h > dst->h-y ||
+            x > dst->w/(dst->scale?dst->scale:1u) || y > dst->h/(dst->scale?dst->scale:1u) ||
             (size_t)w*o->bpp > row_bytes) {
             ps3_strict_boot_guard("vulkan-msaa-write", "invalid individual-sample upload surface=%u", surface);
             return;
@@ -2356,17 +2359,17 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
         /* Expand first so a partial transfer retains every untouched sample.
          * Cache invalidation prevents failed uploads from becoming texture data. */
         o->expansion_valid = 0;
-        if (vk_eng_upload_region(dst->im.img,0,0,x,y,w,h,(size_t)w*o->bpp,h,rows,row_bytes) ||
+        if (vk_eng_scaled_write(expanded,dst,x,y,w,h,rows,row_bytes) ||
             !vk_eng_pack_samples(surface,expanded))
             ps3_strict_boot_guard("vulkan-msaa-write", "individual-sample upload failed surface=%u", surface);
         return;
     }
     if (!o || o->fmt != VK_FORMAT_R8G8B8A8_UNORM) return;   /* rows are R,G,B,A */
-    if (!rows || !w || !h || x + w > o->w || y + h > o->h) return;
-    vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
+    if (vk_eng_scaled_write(surface,o,x,y,w,h,rows,row_bytes))
+        ps3_strict_boot_guard("vulkan-scaled-write","color upload failed surface=%u",surface);
 }
 
-static int vk_eng_readback_rows(u32 surface, u32 x, u32 y, u32 w, u32 h,
+static int vk_eng_readback_rows_raw(u32 surface, u32 x, u32 y, u32 w, u32 h,
                                void* out, u32 out_pitch)
 {
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
@@ -2405,6 +2408,14 @@ static int vk_eng_readback_rows(u32 surface, u32 x, u32 y, u32 w, u32 h,
     }
     vk_destroy_buffer(&st);
     return rc ? -1 : 0;
+}
+
+static int vk_eng_readback_rows(u32 surface,u32 x,u32 y,u32 w,u32 h,void* out,u32 pitch)
+{
+    vk_eng_obj* o=vk_eng_get(surface,VK_ENG_COLOR);
+    if (!o) o=vk_eng_get(surface,VK_ENG_TEXTURE);
+    if (o && o->samples>1) { surface=vk_eng_expand_samples(surface);o=vk_eng_get(surface,VK_ENG_TEXTURE); }
+    return o ? vk_eng_scaled_read(surface,o,o->bpp,x,y,w,h,out,pitch,vk_eng_readback_rows_raw) : -1;
 }
 
 static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
@@ -2505,6 +2516,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     }
     o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
+    o->scale=t->scale;o->grid_x=t->grid_x;o->grid_y=t->grid_y;
     return hd;
 }
 /* ---- E4: depth snapshots --------------------------------------------------
@@ -2529,6 +2541,9 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
                                   (int)s_vk.depth_format); warned_fmt = 1; }
         return 0;
     }
+    const u32 scale=z->scale?z->scale:1u;
+    if (w>UINT32_MAX/scale || h>UINT32_MAX/scale) return 0;
+    w*=scale;h*=scale;
     if (w > z->w) w = z->w;
     if (h > z->h) h = z->h;
     if (!w || !h) return 0;
@@ -2546,7 +2561,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
                             VK_IMAGE_ASPECT_COLOR_BIT)) {
             vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
         }
-        t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = w; t->h = h;
+        t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = w; t->h = h; t->scale=scale;
         z = vk_eng_get(depth, VK_ENG_DEPTH);          /* same slot; reload for clarity */
         z->surface = snap;
         if (vk_begin()) return 0;
@@ -2583,17 +2598,10 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 }
 /* The depth aspect of a D32_SFLOAT target copies out as 32-bit floats, which
  * is what the engine asks for; other depth formats report failure. */
-static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
-                                 float* out, u32 out_pitch)
+static int vk_eng_depth_readback_raw(u32 depth, u32 x, u32 y, u32 w, u32 h,
+                                 void* out, u32 out_pitch)
 {
-    (void)user;
     vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
-    if (z && z->samples > 1) {
-        const u32 expanded = vk_eng_expand_samples(depth);
-        vk_eng_obj* image = vk_eng_get(expanded, VK_ENG_TEXTURE);
-        if (!image || !out || out_pitch < (size_t)w * 4u || x > image->w || w > image->w-x || y > image->h || h > image->h-y) return -1;
-        return vk_eng_readback_rows(expanded,x,y,w,h,out,out_pitch);
-    }
     if (!z || !out || !w || !h || x + w > z->w || y + h > z->h ||
         out_pitch < w * 4u || (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
                                   s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT))
@@ -2629,6 +2637,14 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
     vk_destroy_buffer(&st);
     return rc ? -1 : 0;
 }
+static int vk_eng_depth_readback(void* user,u32 depth,u32 x,u32 y,u32 w,u32 h,float* out,u32 pitch)
+{
+    (void)user;
+    vk_eng_obj* z=vk_eng_get(depth,VK_ENG_DEPTH);
+    if (z && z->samples>1) return vk_eng_readback_rows(vk_eng_expand_samples(depth),x,y,w,h,out,pitch);
+    return z ? vk_eng_scaled_read(depth,z,4,x,y,w,h,out,pitch,vk_eng_depth_readback_raw) : -1;
+}
+
 /* ---- E2: pipelines and draws ---------------------------------------------
  * A pipeline handle carries the two translated modules and the render state
  * the engine keyed it on. Topology is not part of that key (Metal sets it on
@@ -2880,7 +2896,20 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
     if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
-    if (vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs)) {
+    char* scaled_ps=NULL;
+    if (s_render_scale!=1) {
+        const size_t length=strlen(ps_hlsl);
+        if (length>UINT32_MAX-512u) { pvkDestroyShaderModule(s_vk.device,P->vs,NULL); memset(P,0,sizeof *P);return 0; }
+        scaled_ps=(char*)malloc(length+512u);
+        if (!scaled_ps) { pvkDestroyShaderModule(s_vk.device,P->vs,NULL); memset(P,0,sizeof *P);return 0; }
+        memcpy(scaled_ps,ps_hlsl,length+1u);
+        if (rsx_fp_apply_resolution_scale(scaled_ps,(u32)length+512u,1,1,s_render_scale,s_render_scale)<0) {
+            free(scaled_ps);pvkDestroyShaderModule(s_vk.device,P->vs,NULL);memset(P,0,sizeof *P);return 0;
+        }
+    }
+    const int ps_failed=vk_eng_translate(scaled_ps?scaled_ps:ps_hlsl,RSX_SHADER_STAGE_FRAGMENT,&P->fs);
+    free(scaled_ps);
+    if (ps_failed) {
         pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
     }
     P->rs = *rs;
@@ -3086,13 +3115,14 @@ static void vk_eng_set_viewport(void* user, float x, float y, float w, float h,
                                 float min_depth, float max_depth)
 {
     (void)user;
-    s_e2.vp[0] = x; s_e2.vp[1] = y; s_e2.vp[2] = w; s_e2.vp[3] = h; s_e2.have_vp = 1;
+    s_e2.vp[0] = x*s_render_scale; s_e2.vp[1] = y*s_render_scale; s_e2.vp[2] = w*s_render_scale; s_e2.vp[3] = h*s_render_scale; s_e2.have_vp = 1;
     s_e2.vp[4] = min_depth; s_e2.vp[5] = max_depth;
 }
 static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 {
     (void)user;
-    s_e2.sc[0] = x; s_e2.sc[1] = y; s_e2.sc[2] = w; s_e2.sc[3] = h; s_e2.have_sc = 1;
+    s_e2.sc[0] = x>UINT32_MAX/s_render_scale?UINT32_MAX:x*s_render_scale; s_e2.sc[1] = y>UINT32_MAX/s_render_scale?UINT32_MAX:y*s_render_scale;
+    s_e2.sc[2] = w>UINT32_MAX/s_render_scale?UINT32_MAX:w*s_render_scale; s_e2.sc[3] = h>UINT32_MAX/s_render_scale?UINT32_MAX:h*s_render_scale; s_e2.have_sc = 1;
 }
 static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
 
@@ -3339,7 +3369,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkRect2D sc = { { 0, 0 }, { w, h } };
     if (s_e2.have_sc) {                       /* clamped: Vulkan rejects negative or over-size */
         u32 x0 = s_e2.sc[0] < w ? s_e2.sc[0] : w, y0 = s_e2.sc[1] < h ? s_e2.sc[1] : h;
-        u32 x1 = s_e2.sc[0] + s_e2.sc[2], y1 = s_e2.sc[1] + s_e2.sc[3];
+        u32 x1 = s_e2.sc[0]>w || s_e2.sc[2]>w-s_e2.sc[0] ? w : s_e2.sc[0]+s_e2.sc[2];
+        u32 y1 = s_e2.sc[1]>h || s_e2.sc[3]>h-s_e2.sc[1] ? h : s_e2.sc[1]+s_e2.sc[3];
         if (x1 > w) x1 = w;
         if (y1 > h) y1 = h;
         sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
