@@ -3888,7 +3888,10 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
-    if (s_callback_worker.ctx || s_current_callback_depth) {
+    /* A first synchronous callback on a guest thread must borrow that
+     * thread's checked frame and TLS too. The legacy scratch address below
+     * is identical across host threads even though its variable is TLS. */
+    if (s_callback_worker.ctx || s_current_callback_depth || g_active_ctx) {
         const uint64_t args[8] = {a0,a1,a2,a3,a4,a5,a6,a7};
         uint64_t result = 0;
         uint32_t code = 0, toc = 0;
@@ -3965,7 +3968,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
                                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                       uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
-    if (s_callback_worker.ctx || s_current_callback_depth) {
+    if (s_callback_worker.ctx || s_current_callback_depth || g_active_ctx) {
         const uint64_t args[8] = {a0,a1,a2,a3,a4,a5,a6,a7};
         uint64_t result = 0;
         int rc = s_callback_worker.ctx ? ppu_callback_worker_call_resolved(code,toc,args,&result)
