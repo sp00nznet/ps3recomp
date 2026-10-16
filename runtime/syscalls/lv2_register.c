@@ -13,6 +13,7 @@
 #include <stdlib.h>   /* calloc, free */
 #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
+#include "lv2_lock_line.h"
 #include "sys_ppu_thread.h"
 #include "sys_mutex.h"
 #include "sys_cond.h"
@@ -2264,32 +2265,24 @@ static int64_t sys_process_get_sdk_version_handler(ppu_context* ctx)
  * The number has been in lv2_syscall_table.h since it was written and nothing
  * ever registered a handler for it.
  *
- * Contract from RPCS3's sys_process.cpp, mapped onto this runtime's guest
- * layout: the flags must be non-zero and contain only the two SPU bits, or
- * EINVAL; main memory, the sys_memory window and RSX local memory are
- * reservation-capable; PPU stacks and sys_vm regions are not, and answer
- * EPERM; anything outside those is EINVAL. */
+ * Contract from RPCS3's sys_process.cpp
+ * (process_is_spu_lock_line_reservation_address), classified by the guest
+ * address segment: the flags must be non-zero and contain only the two SPU
+ * bits, or EINVAL; the main-memory (0x0/0x1), user-64K (0x2), RSX-local
+ * (0xC) and RawSPU-MMIO (0xE) segments are reservation-capable; private
+ * SPU MMIO (0xF) refuses RawSPU with EPERM; the PPU stack segment (0xD) and
+ * sys_vm mappings answer EPERM; holes in a mapped sys_vm region and
+ * anything unmapped answer EINVAL. The old window checks stopped at the
+ * 256 MB VM_MAIN window (0x00010000..0x1000FFFF) and answered EINVAL for
+ * the rest of segment 0x1 -- mapped, reservation-capable memory -- which
+ * SPURS's own validation then turned into a spurious
+ * CELL_SPURS_CORE_ERROR_PERM.
+ *
+ * The classification lives in lv2_lock_line.c, where tests/syscalls can
+ * reach it without linking this file's syscall layer. */
 static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx)
 {
-    uint32_t addr  = (uint32_t)ctx->gpr[3];
-    uint64_t flags = ctx->gpr[4];
-    int64_t  rc;
-
-    if (!flags || (flags & ~0x3ull)) {
-        rc = (int64_t)(int32_t)CELL_EINVAL;
-    } else if (addr >= VM_MAIN_MEM_BASE && addr < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE) {
-        rc = 0;                                   /* main memory */
-    } else if (addr >= 0x40000000u && addr < 0x50000000u) {
-        rc = 0;                                   /* sys_memory window */
-    } else if (addr >= 0xC0000000u && addr < 0xD0000000u) {
-        rc = 0;                                   /* RSX local memory */
-    } else if (addr >= 0xD0000000u && addr < 0xE0000000u) {
-        rc = (int64_t)(int32_t)CELL_EPERM;        /* PPU stack area */
-    } else if (addr >= SYS_VM_REGION_BASE && addr < SYS_VM_REGION_END) {
-        rc = (int64_t)(int32_t)CELL_EPERM;        /* sys_vm memory */
-    } else {
-        rc = (int64_t)(int32_t)CELL_EINVAL;       /* unmapped */
-    }
+    const int64_t rc = lv2_spu_lock_line_classify((uint32_t)ctx->gpr[3], ctx->gpr[4]);
 
     ctx->gpr[3] = (uint64_t)rc;
     return rc;
