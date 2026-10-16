@@ -435,6 +435,20 @@ static void samp_hit(uint32_t g)
 static uint32_t samp_lookup(uintptr_t rip)
 {
     if (!s_samp_map || !s_samp_n) return 0;
+    if (getenv("PS3_SAMPLE_EXACT")) {
+        DWORD64 image = 0;
+        RUNTIME_FUNCTION* entry = RtlLookupFunctionEntry((DWORD64)rip, &image, NULL);
+        if (!entry) return 0;
+        uintptr_t start = (uintptr_t)(image + entry->BeginAddress);
+        uint64_t lo = 0, hi = s_samp_n;
+        while (lo < hi) {
+            uint64_t mid = (lo + hi) / 2;
+            if (s_samp_map[mid].h < start) lo = mid + 1; else hi = mid;
+        }
+        if (lo == s_samp_n || s_samp_map[lo].h != start) return 0;
+        if (lo + 1 < s_samp_n && s_samp_map[lo + 1].h == start) return 0;
+        return s_samp_map[lo].spu ? (0x80000000u | s_samp_map[lo].g) : s_samp_map[lo].g;
+    }
     uint64_t lo = 0, hi = s_samp_n;
     while (lo < hi) { uint64_t mid = (lo + hi) / 2;
                       if (s_samp_map[mid].h <= rip) lo = mid + 1; else hi = mid; }
@@ -647,6 +661,12 @@ static DWORD WINAPI samp_thread(LPVOID p)
     unsigned ei = 0;
     unsigned long long next_report = t0 + early[0];
     samp_build_map();
+    if (getenv("PS3_SAMPLE_EXACT")) {
+        uint32_t known = s_samp_n ? samp_lookup(s_samp_map[0].h) : 0;
+        uint32_t host = samp_lookup((uintptr_t)&ps3_sampler_start);
+        fprintf(stderr, "[samp] exact unwind attribution: known=0x%08X expected=0x%08X host=0x%08X; missing/folded entries remain unclassified\n",
+                known, s_samp_n ? s_samp_map[0].g : 0, host);
+    }
     for (;;) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
