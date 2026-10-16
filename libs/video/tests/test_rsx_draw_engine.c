@@ -1353,8 +1353,10 @@ int main(int argc, char** argv)
         engine_up(); draw_triangle(); rsx_draw_engine_present();
         m(M_BEGIN_END,RSX_PRIMITIVE_TRIANGLE_STRIP);
         m(M_DRAW_ARRAYS,2u<<24);m(M_BEGIN_END,0);
+        m(M_VP_UPLOAD_CONST_ID,0);m(M_VP_UPLOAD_CONST,0x42280000u); /* 42.0f */
+        draw_triangle();
         rsx_draw_engine_present();
-        CHECK(stub.n_draw==2,"capture retains both backend draws");
+        CHECK(stub.n_draw==3,"capture retains all three backend draws");
         engine_down();free(vm_base);return g_failures ? 1 : 0;
     }
 

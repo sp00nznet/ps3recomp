@@ -2148,36 +2148,50 @@ static void pd_first_draw_state(u32 pipeline)
  * when the set changed, and describe the first draw of a new one. */
 /* Optional private first-draw geometry for diagnosing visible mesh holes.
  * FGM1 is 32 little-endian u32 words, followed by packed host float4 vertex
- * attributes and expanded u32 indices. Supported target CPUs are little
+ * attributes and expanded u32 indices. Version2 appends the exact VP/FP
+ * constant buffers; words29..31 hold pipeline ID and their byte lengths.
+ * Supported target CPUs are little
  * endian. Attribute IDs occupy words8..23; words24..28 describe culling and
  * source reference/cut counts. No guest state is changed or synthesized. */
 static void pd_geometry(const rsx_be_render_state* rs, u32 topology,
-                        int indexed, u32 draw_count)
+                        int indexed, u32 draw_count, u32 draw, u32 pipeline)
 {
     const char* enabled = getenv("RSX_ENGINE_PASS_DUMP_GEOMETRY");
     if (!enabled || strcmp(enabled, "1")) return;
+    if (draw) {
+        const char* all = getenv("RSX_ENGINE_PASS_DUMP_GEOMETRY_ALL");
+        const char* selected = getenv("RSX_ENGINE_PASS_DUMP_GEOMETRY_PASS");
+        const u32 pass = selected ? (u32)strtoul(selected,NULL,0) : 0;
+        if (!all || strcmp(all,"1") || s_pd.pass != pass || draw >= 128u) return;
+    }
     const u32 count = indexed ? draw_count : 0;
     const u64 vb = (u64)dc.n_verts * dc.layout.stride;
     const u64 ib = (u64)count * sizeof(u32);
-    const u64 bytes = 128u + vb + ib;
+    const u32 ps_bytes = ((g.fp_constants.count ? g.fp_constants.count : 1u) + 1u) * 16u;
+    const u64 bytes = 128u + vb + ib + ENG_VP_CB_BYTES + ps_bytes;
     if (!dc.verts || (count && !g.indices) || bytes > 4u * 1024u * 1024u ||
+        !g.fp_cb || ps_bytes > g.fp_cb_cap ||
         bytes + s_pd.geometry_bytes > 64u * 1024u * 1024u) {
         fprintf(stderr, "[rsx engine] geometry capture skipped pass %u: bounded size/input check\n", s_pd.pass);
         return;
     }
-    u32 header[32] = {0x314D4746u, 1u, g.rsx.current_primitive, topology,
+    u32 header[32] = {0x314D4746u, 2u, g.rsx.current_primitive, topology,
                       dc.n_verts, dc.layout.stride, count, dc.layout.count};
     for (u32 a = 0; a < dc.layout.count && a < 16u; a++) header[8u+a] = dc.layout.attrs[a];
     header[24]=rs->cull_enable; header[25]=rs->cull_face; header[26]=rs->front_face;
     header[27]=dc.n_source_refs; header[28]=dc.n_cuts;
+    header[29]=pipeline;header[30]=ENG_VP_CB_BYTES;header[31]=ps_bytes;
     char path[1024];
-    const int n = snprintf(path, sizeof path, "%s/pass%03u_geometry.bin", s_pd.dir, s_pd.pass);
+    const int n = draw ? snprintf(path,sizeof path,"%s/pass%03u_draw%03u_geometry.bin",s_pd.dir,s_pd.pass,draw)
+                       : snprintf(path,sizeof path,"%s/pass%03u_geometry.bin",s_pd.dir,s_pd.pass);
     if (n < 0 || (size_t)n >= sizeof path) return;
     FILE* f = fopen(path,"wb");
     if (!f) { fprintf(stderr,"[rsx engine] cannot open geometry capture %s\n",path); return; }
     const int complete = fwrite(header,1,sizeof header,f)==sizeof header &&
                          fwrite(dc.verts,1,(size_t)vb,f)==vb &&
-                         (!ib || fwrite(g.indices,1,(size_t)ib,f)==ib);
+                         (!ib || fwrite(g.indices,1,(size_t)ib,f)==ib) &&
+                         fwrite(g.vp_cb,1,ENG_VP_CB_BYTES,f)==ENG_VP_CB_BYTES &&
+                         fwrite(g.fp_cb,1,ps_bytes,f)==ps_bytes;
     const int closed = fclose(f);
     s_pd.geometry_bytes += bytes;
     if (!complete || closed) fprintf(stderr,"[rsx engine] incomplete geometry capture %s\n",path);
@@ -2223,9 +2237,10 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
         }
         fprintf(s_pd.draws_log, "\n");
     }
-    if (s_pd.draws++) return;
+    const u32 draw = s_pd.draws++;
+    pd_geometry(rs, topology, indexed, draw_count, draw, pipeline);
+    if (draw) return;
     pd_first_draw_state(pipeline);
-    pd_geometry(rs, topology, indexed, draw_count);
 
     rsx_dsp_surface sf;
     rsx_dsp_viewport vp;
