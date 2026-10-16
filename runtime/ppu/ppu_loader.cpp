@@ -682,7 +682,8 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     if (GetThreadContext(h, &c)) {
                         s_samp_total++;
                         uint32_t g = samp_lookup((uintptr_t)c.Rip);
-                        if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
+                        if (!g && s_samp_main > 0 && !getenv("PS3_SAMPLE_EXACT"))
+                            g = samp_stack_guest(h, &c);
                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
                                  samp_tid2(te.th32ThreadID, 1, 0); }
                         else { int nt = samp_mod_hit((uintptr_t)c.Rip);
