@@ -274,7 +274,7 @@ static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
 }
 
 /* The last rectangle pushed into a colour target, and its first pixel. */
-static struct { int n; u32 surface, x, y, w, h; u8 first[4]; } g_written;
+static struct { int n; u32 surface, x, y, w, h, row_bytes; u8 first[4], last[4]; } g_written;
 
 static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                              const void* rows, u32 row_bytes)
@@ -283,7 +283,9 @@ static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
     g_written.n++;
     g_written.surface = s; g_written.x = x; g_written.y = y;
     g_written.w = w; g_written.h = h;
+    g_written.row_bytes = row_bytes;
     memcpy(g_written.first, rows, 4);
+    memcpy(g_written.last,(const u8*)rows+(size_t)(h-1)*row_bytes+(w-1)*4,4);
 }
 
 static const rsx_draw_backend g_stub_backend = {
@@ -1181,6 +1183,36 @@ static void test_multisample_layout(void)
     engine_down();
 }
 
+static void test_multisample_seed(void)
+{
+    for (u32 samples=2;samples<=4;samples+=2) {
+        engine_up();memset(&g_written,0,sizeof g_written);
+        const u32 storage_h=samples==4?4:2;
+        u8* bytes=vm_base+0x60000;memset(bytes,0xEE,32*storage_h);
+        for(u32 y=0;y<storage_h;++y) for(u32 x=0;x<6;++x) {
+            u8* p=bytes+y*32+x*4;p[0]=0x80;p[1]=(u8)(11+x);
+            p[2]=(u8)(21+y);p[3]=(u8)(31+x+y);
+        }
+        u8 original[128];memcpy(original,bytes,32*storage_h);
+        m(M_CONTEXT_DMA_COLOR_A,DMA_MAIN);m(M_COLOR_A_OFFSET,0x60000);
+        m(M_SURFACE_FORMAT,samples==4?0x090B4148u:0x090B3148u);
+        m(M_SURFACE_CLIP_H,3u<<16);m(M_SURFACE_CLIP_V,2u<<16);
+        m(M_COLOR_A_PITCH,32);m(M_ZETA_PITCH,32);
+        draw_triangle();
+        CHECK(msaa_color_w==3&&msaa_color_h==2&&msaa_color_samples==samples,
+              "seeded %u-sample surface retains logical attachment dimensions",samples);
+        CHECK(g_written.n==1&&g_written.surface==stub.bound_rt[0]&&g_written.w==6&&
+              g_written.h==storage_h&&g_written.row_bytes==24,
+              "seeded %u-sample surface uploads full expanded storage",samples);
+        CHECK(g_written.first[0]==11&&g_written.first[1]==21&&g_written.first[2]==31&&g_written.first[3]==0x80&&
+              g_written.last[0]==16&&g_written.last[1]==20+storage_h&&g_written.last[2]==35+storage_h&&g_written.last[3]==0x80,
+              "seeded %u-sample pixels honor padded guest pitch and ARGB conversion",samples);
+        CHECK(memcmp(bytes,original,32*storage_h)==0,"seeding leaves guest bytes unchanged");
+        draw_triangle();CHECK(g_written.n==1,"reusing seeded surface does not overwrite GPU content");
+        engine_down();
+    }
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1210,6 +1242,7 @@ int main(void)
     test_depth_read_as_color();
     test_color_read_as_float();
     test_multisample_layout();
+    test_multisample_seed();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

@@ -500,7 +500,7 @@ static rsx_be_format eng_surface_format(u32 color_format)
  * to. Returns the staging pointer, or NULL when the bytes are unreadable or
  * the format is not one the decoder handles. */
 static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
-                                    rsx_be_format fmt, u32* out_row_bytes)
+                                    rsx_be_format fmt, u32 pitch, u32* out_row_bytes)
 {
     *out_row_bytes = 0;
     if (fmt != RSX_BE_FMT_R8G8B8A8) return NULL;
@@ -515,19 +515,26 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
         (!s_guest_reader && !cellGcmResolveIO(offset))) return NULL;
     rsx_tex_layout tl;
     /* A8R8G8B8 with the LN bit: a surface is linear, never swizzled. */
-    rsx_texture_layout(0x85u | 0x20u, w, h, &tl);
+    rsx_texture_layout(0x85u | 0x20u, w, 1, &tl);
     if (!tl.face_bytes || !tl.dst_row_bytes) return NULL;
-    const u8* src = eng_guest_ptr(NULL, location, offset, tl.face_bytes);
+    if (!pitch) pitch = tl.face_bytes;
+    if (pitch < tl.face_bytes) return NULL;
+    const u64 span = (u64)pitch * (h-1u) + tl.face_bytes;
+    const u64 decoded_bytes = (u64)tl.dst_row_bytes * h;
+    if (span > UINT32_MAX || decoded_bytes > UINT32_MAX) return NULL;
+    const u8* src = eng_guest_ptr(NULL, location, offset, (u32)span);
     if (!src) return NULL;
-    const u32 bytes = tl.dst_row_bytes * tl.rows;
+    const u32 bytes = (u32)decoded_bytes;
     if (g.tex_staging_cap < bytes) {
         u8* n = (u8*)realloc(g.tex_staging, bytes);
         if (!n) return NULL;
         g.tex_staging = n;
         g.tex_staging_cap = bytes;
     }
-    rsx_texture_decode(g.tex_staging, tl.dst_row_bytes, src, w, h, &tl,
-                       rsx_texture_argb_is_rgba());
+    for (u32 y=0;y<h;++y)
+        rsx_texture_decode(g.tex_staging+(size_t)y*tl.dst_row_bytes,
+                           tl.dst_row_bytes,src+(size_t)y*pitch,w,1,&tl,
+                           rsx_texture_argb_is_rgba());
     *out_row_bytes = tl.dst_row_bytes;
     return g.tex_staging;
 }
@@ -536,7 +543,7 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690). */
 static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
-                          rsx_be_format want_fmt, u32 samples)
+                          rsx_be_format want_fmt, u32 samples, u32 pitch)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
@@ -571,9 +578,10 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
 
     u32 seed_row = 0;
     const void* seed = eng_surface_seed(location, offset, want_w, want_h,
-                                        want_fmt, &seed_row);
-    if (samples > 1 && (seed || !g.be->color_target_create_multisample)) {
-        ps3_strict_boot_guard("rsx-msaa-create", "unsupported seeded or backend multisample color target");
+                                        want_fmt, pitch, &seed_row);
+    if (samples > 1 && (!g.be->color_target_create_multisample ||
+                       (seed && !g.be->color_target_write))) {
+        ps3_strict_boot_guard("rsx-msaa-create", "backend lacks multisample color creation or sample upload");
         return ENG_INVALID;
     }
     const u32 handle = samples > 1
@@ -583,6 +591,9 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         ps3_strict_boot_guard("rsx-msaa-create", "multisample color allocation failed samples=%u", samples);
     if (!handle)
         return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
+
+    if (samples > 1 && seed)
+        g.be->color_target_write(g.be->user,handle,0,0,want_w,want_h,seed,seed_row);
 
     eng_surface* s = &g.surfaces[slot];
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
@@ -640,7 +651,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     rsx_surface_layout sample_layout;
     if (!eng_sample_layout(&sf, &sample_layout)) return 0;
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
-                                      sample_layout.width, sample_layout.height, fmt, sample_layout.samples);
+                                      sample_layout.width, sample_layout.height, fmt, sample_layout.samples,sf.color_pitch[sel]);
     if (first == ENG_INVALID) return 0;
     g.surfaces[first].pitch = sf.color_pitch[sel];
     slots[0] = first;
@@ -654,7 +665,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
         if (sf.color_target < mrt_from[i]) break;
         const u32 slot = eng_surface_get(sf.color_location[i + 1],
                                          sf.color_offset[i + 1],
-                                         sample_layout.width, sample_layout.height, fmt, sample_layout.samples);
+                                         sample_layout.width, sample_layout.height, fmt, sample_layout.samples,sf.color_pitch[i+1]);
         if (slot == ENG_INVALID) break;
         g.surfaces[slot].pitch = sf.color_pitch[i + 1];
         /* A set naming one buffer twice would attach the same target twice,
