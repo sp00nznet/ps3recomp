@@ -16,6 +16,7 @@
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+#include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -1536,11 +1537,19 @@ void cellGcm_ref_on_poll(void)
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
 }
 
+static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
+
 void cellGcm_rsx_process_fifo(void)
 {
+    const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+    if (ft_t0) {
+        const uint64_t t1 = ps3_ft_now();
+        if (t1 - ft_t0 >= ps3_ft_min_ns())
+            ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
+    }
 }
 
 static void gcm_rsx_process_fifo_unlocked(void)
@@ -1712,6 +1721,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
                   fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
                           flips, 10); }
+            if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
+                               ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
@@ -1843,6 +1854,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+                    /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
+                    if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
+                        ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
+                        s_ft_sema_t0 = 0;
+                    }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) vm_write32(la, v);
                     else if (m == 0x68u && vm_read32(la) != v) {
@@ -1852,7 +1868,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * its own is the half that unblocks a waiting guest. */
             static int blk = -1;
             if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
-            if (blk) { sem_blocked = 1; break; }
+            if (blk) {
+                if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                sem_blocked = 1; break;
+            }
         }
                 }
                 if (sem_blocked) break;
@@ -2387,6 +2406,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_last_flip_time = get_timestamp_ns();
+    if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
+                       ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
 
     /* Invoke via OPD resolution, not a raw call into guest code.
      *

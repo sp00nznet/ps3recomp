@@ -22,6 +22,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <stddef.h>
 #include "sys_ppu_thread.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
+#include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
@@ -234,6 +235,7 @@ uint64_t ppu_thread_register_main(void)
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
+        ps3_ft_name(1, "main");
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else
@@ -377,6 +379,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         const char* name = (const char*)vm_to_host(name_addr);
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
+        ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
     /* Create synchronization for join */
@@ -1183,6 +1186,7 @@ int64_t sys_ppu_thread_rename(ppu_context* ctx)
         const char* name = (const char*)vm_to_host(name_addr);
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
+        ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
     table_unlock();

@@ -34,6 +34,7 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -3055,11 +3056,19 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * A thread blocked in a syscall shows no in-flight HLE (syscalls do not go
      * through ps3_hle_call) and a stale CTR, so without this a wedged thread is
      * just "somewhere in ntdll". Cleared on every exit path by the guard. */
+    /* It also closes the PS3_FTRACE span: how long this thread sat in the
+     * syscall, and at which guest call site (lr at entry). */
     struct _ScGuard {
-        ppu_context* c;
+        ppu_context* c; uint64_t num, t0; uint32_t lr;
         ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0; }
-    } _sg{ ctx };
+                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
+                      if (PS3_FT_ON() && t0) {
+                          const uint64_t t1 = ps3_ft_now();
+                          if (num == 141) ps3_ft_usleep(t, lr, t0, t1);   /* sys_timer_usleep */
+                          else if (t1 - t0 >= ps3_ft_min_ns())
+                              ps3_ft_span(PS3_FT_SYSCALL, t, (uint32_t)num, lr, t0, t1);
+                      } }
+    } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall

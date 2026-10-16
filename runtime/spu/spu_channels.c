@@ -17,6 +17,7 @@
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+#include "ps3emu/ps3_ftrace.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -956,10 +957,31 @@ void spu_ch_wake(spu_context* ctx)
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
 }
 
+/* PS3_FTRACE: when this SPU thread last left a blocking wait. The time between
+ * two waits is a busy span, tagged with the lifted image and the SPURS workload
+ * id the kernel keeps at LS 0x1DC (SpursKernelContext.wklCurrentId) when it
+ * goes idle. Waits shorter than PS3_FTRACE_MIN_US do not split a busy span. */
+static __thread uint64_t t_ft_busy0;
+
+static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
+{
+    const uint64_t t1 = ps3_ft_now();
+    if (t1 - t0 < ps3_ft_min_ns()) return;
+    if (t_ft_busy0 && t0 > t_ft_busy0) {
+        const uint8_t* w = ctx->ls + 0x1DC;
+        ps3_ft_span(PS3_FT_SPU_BUSY, ctx->spu_id, (uint32_t)ctx->image_id,
+                    ((uint32_t)w[0] << 24) | ((uint32_t)w[1] << 16) | ((uint32_t)w[2] << 8) | w[3],
+                    t_ft_busy0, t0);
+    }
+    ps3_ft_span(PS3_FT_SPU_WAIT, ctx->spu_id, channel, ctx->pc & SPU_LS_MASK, t0, t1);
+    t_ft_busy0 = t1;
+}
+
 /* Block the calling SPU host thread until `channel` is readable. */
 static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 {
     if (!yz_ch_block() || spu_ch_ready(ctx, channel)) return;
+    const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
 
     { static unsigned long bn = 0; unsigned long n = ++bn;
       if (n <= 50 || (n % 512) == 0)
@@ -989,6 +1011,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
         }
     }
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
+    if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);
     ctx->status = SPU_STATUS_RUNNING;
 }
 
