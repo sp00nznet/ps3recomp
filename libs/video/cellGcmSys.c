@@ -2136,7 +2136,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea) {
+    if (s_gcm_ctx_out_ea && ps3_strict_boot_enabled()) {
+        const u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+        const u32 begin = ctx ? vm_read32(ctx) : 0;
+        const u32 end = ctx ? vm_read32(ctx + 4) : 0;
+        const u32 cur = ctx ? vm_read32(ctx + 8) : 0;
+        /* current==end is a full buffer, not an overrun. Only the producer's
+         * reserve callback may refill it. The consumer must never rewrite
+         * the context or skip queued commands to accommodate a full cursor. */
+        if (begin && end > begin && cur > end)
+            ps3_strict_boot_guard("rsx-producer-overrun", "context=0x%08X current=0x%08X end=0x%08X", ctx, cur, end);
+    }
+    if (s_gcm_ctx_out_ea && !ps3_strict_boot_enabled()) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
