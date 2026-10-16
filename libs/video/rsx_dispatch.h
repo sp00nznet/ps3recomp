@@ -165,11 +165,12 @@ u32  rsx_dsp_clear_zstencil(const rsx_dispatch* rsx);
 
 /* Surface (render target) state */
 typedef struct rsx_dsp_surface {
-    u32 color_format;    /* SURFACE_FORMAT color field (5 = A8R8G8B8)      */
+    u32 color_format;    /* SURFACE_FORMAT color field (8 = A8R8G8B8)      */
 /* SET_SURFACE_FORMAT colour field: FP16 RGBA, the HDR target format. */
 #define RSX_SURFACE_FMT_F_W16Z16Y16X16 0xB
     u32 depth_format;
     u32 raster_type;     /* 1 = pitch (linear), 2 = swizzle                */
+    u32 antialias;       /* 0 = one sample, 3 = two, 4/5 = four           */
     u32 clip_x, clip_y, clip_w, clip_h;
     u32 color_offset[4];
     u32 color_pitch[4];

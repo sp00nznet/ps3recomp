@@ -13,6 +13,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_depth_clip.h"
 #include "rsx_shader_window.h"
+#include "rsx_surface_layout.h"
 #include "ps3emu/strict_boot.h"
 
 #include "rsx_fp_decompiler.h"
@@ -1979,6 +1980,25 @@ static void pd_first_draw_state(u32 pipeline)
     rsx_dsp_get_viewport(&g.rsx, &vp);
     fprintf(f, "pass %u pipeline %u surface_format_raw %08X viewport %u %u %u %u\n",
             s_pd.pass, pipeline, rsx_dsp_reg(&g.rsx, M_RT_FORMAT), vp.x, vp.y, vp.w, vp.h);
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    u32 color_mask = sf.color_target == CELL_GCM_SURFACE_TARGET_0 ? 1u :
+                     sf.color_target == CELL_GCM_SURFACE_TARGET_1 ? 2u :
+                     sf.color_target == CELL_GCM_SURFACE_TARGET_MRT1 ? 3u :
+                     sf.color_target == CELL_GCM_SURFACE_TARGET_MRT2 ? 7u :
+                     sf.color_target == CELL_GCM_SURFACE_TARGET_MRT3 ? 15u : 0u;
+    const u32 bpp = sf.color_format == 8 ? 4u :
+                    sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16 ? 8u : 0u;
+    rsx_surface_layout sample_layout;
+    if (sf.raster_type == 1 && rsx_surface_layout_compute(sf.antialias,
+            sf.clip_w, sf.clip_h, bpp, sf.color_pitch, color_mask,
+            sf.depth_format == 1 ? 2u : 4u, sf.zeta_pitch, sf.zeta_pitch != 0,
+            &sample_layout)) {
+        fprintf(f, "sample_layout aa %u samples %u grid %ux%u logical %ux%u storage %ux%u (diagnostic; backend sample support unchanged)\n",
+                sf.antialias, sample_layout.samples, sample_layout.samples_x, sample_layout.samples_y,
+                sample_layout.width, sample_layout.height,
+                sample_layout.storage_width, sample_layout.storage_height);
+    }
     fprintf(f, "scale %.9g %.9g %.9g %.9g\ntranslate %.9g %.9g %.9g %.9g\n",
             vp.scale[0], vp.scale[1], vp.scale[2], vp.scale[3],
             vp.translate[0], vp.translate[1], vp.translate[2], vp.translate[3]);

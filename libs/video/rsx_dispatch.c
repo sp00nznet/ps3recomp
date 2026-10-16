@@ -464,6 +464,7 @@ void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
     out->color_format = fmt & 0x1F;
     out->depth_format = (fmt >> 5) & 7;
     out->raster_type  = (fmt >> 8) & 0xF;
+    out->antialias    = (fmt >> 12) & 0xF;
 
     const u32 h = rsx_dsp_reg(rsx, M_RT_HORIZ);
     const u32 v = rsx_dsp_reg(rsx, M_RT_VERT);
