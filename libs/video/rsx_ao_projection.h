@@ -14,7 +14,7 @@ typedef struct rsx_ao_projection {
     float near_z, far_z; /* far_z is infinity for an infinite far plane. */
 } rsx_ao_projection;
 
-static uint32_t rsx_ao_word(const unsigned char *p)
+static inline uint32_t rsx_ao_word(const unsigned char *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1]<<8) |
            ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
@@ -23,7 +23,7 @@ static uint32_t rsx_ao_word(const unsigned char *p)
 /* Accept only four independent DP4(v0, cN) writes to position xyzw.
  * The constants may occur in any instruction order. No side effects accepted.
  * Output indices are committed only on complete success. */
-static int rsx_ao_position_rows(const void *program, size_t bytes, uint16_t rows[4])
+static inline int rsx_ao_position_rows(const void *program, size_t bytes, uint16_t rows[4])
 {
     const unsigned char *p = (const unsigned char *)program;
     uint16_t candidate[4];
@@ -55,7 +55,7 @@ static int rsx_ao_position_rows(const void *program, size_t bytes, uint16_t rows
     return 1;
 }
 
-static double rsx_ao_dot3(const float *a, const float *b)
+static inline double rsx_ao_dot3(const float *a, const float *b)
 {
     return (double)a[0]*b[0]+(double)a[1]*b[1]+(double)a[2]*b[2];
 }
@@ -63,7 +63,7 @@ static double rsx_ao_dot3(const float *a, const float *b)
 /* Combined world-to-clip rows, followed by the actual shader viewport fixup.
  * Only rigid, centered, forward perspective views are admitted initially.
  * Aspect must describe logical pixels, not expanded MSAA storage dimensions. */
-static int rsx_ao_projection_extract(const float m[4][4], const float scale[3],
+static inline int rsx_ao_projection_extract(const float m[4][4], const float scale[3],
                                    const float offset[3], float aspect,
                                    rsx_ao_projection *out)
 {

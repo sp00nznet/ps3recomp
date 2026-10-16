@@ -14,6 +14,10 @@
 #include "rsx_draw_batches.h"
 #include "rsx_depth_clip.h"
 #include "rsx_capture_depth.h"
+#ifdef PS3RECOMP_RSX_CACAO
+#include "rsx_ao_depth_state.h"
+#include "rsx_ao_position_program.h"
+#endif
 #include "rsx_shader_window.h"
 #include "rsx_surface_layout.h"
 #include "ps3emu/strict_boot.h"
@@ -117,6 +121,9 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+#ifdef PS3RECOMP_RSX_CACAO
+    rsx_ao_depth_state ao;
+#endif
 } eng_zdepth;
 
 typedef struct {
@@ -132,6 +139,10 @@ typedef struct {
     u32 handle;
     u8 fixed;
     u16 tex_used;           /* units the pixel program samples */
+#ifdef PS3RECOMP_RSX_CACAO
+    u16 position_rows[4];
+    u8 position_known;
+#endif
 } eng_pipeline;
 
 
@@ -772,6 +783,19 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
 
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
+#ifdef PS3RECOMP_RSX_CACAO
+    if (g.ready && pitch && w && h) {
+        const u64 begin=offset, end=begin+(u64)(h-1u)*pitch+(u64)w*4u;
+        for (u32 i=0;i<g.n_zdepths;++i) {
+            eng_zdepth* z=&g.zdepths[i];
+            const u64 zend=(u64)z->offset+(u64)z->pitch*z->h;
+            if (z->handle && z->location==location && z->pitch &&
+                begin<zend && end>z->offset) {
+                z->ao.blocked=1;z->ao.armed=0;
+            }
+        }
+    }
+#endif
     if (!g.ready || !g.be->color_target_write || !pitch || !w || !h) return;
     u32 x = 0, y = 0;
     const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
@@ -872,6 +896,9 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h, u32 samp
     z->snapshot_valid = 0;
     z->depth_serial = 0;
     z->guest_dirty = 0;
+#ifdef PS3RECOMP_RSX_CACAO
+    memset(&z->ao,0,sizeof(z->ao));
+#endif
     if (slot == g.n_zdepths) g.n_zdepths++;
     return slot;
 }
@@ -1174,12 +1201,31 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
 {
     eng_zdepth* z = &g.zdepths[slot];
     z->depth_serial = ++g.write_serial;
+    z->snapshot_valid = 0;
     z->guest_dirty = 1;
     z->zfmt = sf->depth_format;
     z->pitch = sf->zeta_pitch;
     z->used_w = z->samples > 1 ? z->w : (sf->clip_w ? sf->clip_w : g.width);
     z->used_h = z->samples > 1 ? z->h : (sf->clip_h ? sf->clip_h : g.height);
 }
+
+#ifdef PS3RECOMP_RSX_CACAO
+static void eng_ao_depth_draw(u32 zslot, const eng_pipeline* pipeline,
+                             const float xf[8], u32 width, u32 height,
+                             int full_depth_range)
+{
+    rsx_ao_projection projection;
+    int known=0;
+    if (pipeline && pipeline->position_known && full_depth_range && height) {
+        float m[4][4];
+        for (u32 row=0;row<4;++row)
+            memcpy(m[row],g.vp_cb+pipeline->position_rows[row]*16u,16);
+        known=rsx_ao_projection_extract(m,xf,xf+4,(float)width/height,&projection);
+    }
+    rsx_ao_depth_write(&g.zdepths[zslot].ao,g.frames,
+        g.zdepths[zslot].depth_serial,width,height,known ? &projection : NULL);
+}
+#endif
 
 static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
 {
@@ -1422,10 +1468,11 @@ static u32 eng_sampled_units(const char* ps)
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
-                            u32* out_tex_used)
+                            u32* out_tex_used, const eng_pipeline** out_metadata)
 {
     *out_fixed = 1;
     *out_tex_used = 0;
+    *out_metadata = NULL;
     const u8* vp_uc = NULL;
     const u8* fp_uc = NULL;
     u32 vp_instrs = 0, fp_size = 0;
@@ -1479,6 +1526,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (g.pipelines[i].key == key) {
             *out_fixed = g.pipelines[i].fixed;
             *out_tex_used = g.pipelines[i].tex_used;
+            *out_metadata = &g.pipelines[i];
             return g.pipelines[i].handle;
         }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
@@ -1525,6 +1573,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             if ((f = fopen(path, "w"))) { fputs(s_vs_hlsl, f); fclose(f); }
             snprintf(path, sizeof path, "%s/pipe%u.ps.hlsl", dir, handle);
             if ((f = fopen(path, "w"))) { fputs(s_ps_hlsl, f); fclose(f); }
+            if (!fixed && vp_uc && vp_instrs && vp_instrs<=RSX_DSP_VP_INSTR) {
+                snprintf(path,sizeof path,"%s/pipe%u.vp.bin",dir,handle);
+                if ((f=fopen(path,"wb"))) { fwrite(vp_uc,16,vp_instrs,f);fclose(f); }
+            }
             if (!fixed && fp_uc && fp_size) {
                 u32 fp_loc = 0;
                 const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
@@ -1551,6 +1603,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].tex_used =
         (u16)(fixed ? 0xFFFFu : eng_sampled_units(s_ps_hlsl));
     *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
+#ifdef PS3RECOMP_RSX_CACAO
+    g.pipelines[g.n_pipelines].position_known = (u8)(!fixed &&
+        rsx_ao_position_program_rows(vp_uc,vp_instrs*16u,
+                                     g.pipelines[g.n_pipelines].position_rows));
+#endif
+    *out_metadata = &g.pipelines[g.n_pipelines];
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
@@ -2118,6 +2176,13 @@ static void pd_close_pass(void)
         const eng_zdepth* z = &g.zdepths[s_pd.zslot];
         fprintf(s_pd.index, " | zeta 0x%08X p%u depth %.9g..%.9g (%ux%u, written %ux%u)",
                 z->offset, z->pitch, lo, hi, z->w, z->h, z->used_w, z->used_h);
+#ifdef PS3RECOMP_RSX_CACAO
+        fprintf(s_pd.index," | ao-camera usable %d draws %u accepted %u unknown %u conflicts %u frame %u logical %ux%u projection %.9g %.9g %.9g %.9g",
+            rsx_ao_depth_usable(&z->ao,g.frames,z->depth_serial),z->ao.draws,
+            z->ao.accepted,z->ao.unknown,z->ao.conflicts,z->ao.frame,z->ao.width,z->ao.height,
+            z->ao.projection.matrix[0][0],z->ao.projection.matrix[1][1],
+            z->ao.projection.depth_a,z->ao.projection.depth_b);
+#endif
     }
     fprintf(s_pd.index, " |%s\n", s_pd.first);
     fflush(s_pd.index);
@@ -2440,9 +2505,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* Strict execution must expose an unavailable required pipeline. */
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
+    const eng_pipeline* pipeline_metadata = NULL;
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
-                                          n_targets, &pipeline_is_fixed, &tex_used);
+                                          n_targets, &pipeline_is_fixed, &tex_used,
+                                          &pipeline_metadata);
     if (!pipeline) {
         u32 fp_location=0;
         const u32 fp_offset=rsx_dsp_fragment_program(&g.rsx,&fp_location);
@@ -2521,6 +2588,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                   1.0f, 0);
         g.zdepths[zslot].cleared = 1;
         g.zdepths[zslot].had_write = 0;
+#ifdef PS3RECOMP_RSX_CACAO
+        rsx_ao_depth_clear(&g.zdepths[zslot].ao,g.frames,1.0f,
+                          g.zdepths[zslot].depth_serial);
+#endif
     }
 
     u32 handles[RSX_BE_MAX_COLOR_TARGETS];
@@ -2572,6 +2643,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
         g.zdepths[zslot].had_write = 1;
         eng_zdepth_wrote(zslot, &sf);
+#ifdef PS3RECOMP_RSX_CACAO
+        eng_ao_depth_draw(zslot,pipeline_metadata,xf,rt->raster_w,rt->raster_h,
+            depth_clip.min_depth==0.0f && depth_clip.max_depth==1.0f);
+#endif
     }
     pd_draw_images();
 }
@@ -2638,6 +2713,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             g.zdepths[zslot].had_write = 0;
             g.zdepths[zslot].snapshot_valid = 0;
             eng_zdepth_wrote(zslot, &sf);
+#ifdef PS3RECOMP_RSX_CACAO
+            rsx_ao_depth_clear(&g.zdepths[zslot].ao,g.frames,depth,
+                              g.zdepths[zslot].depth_serial);
+#endif
         }
     }
 }
