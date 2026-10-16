@@ -2,6 +2,9 @@
 // Actual public CACAO Vulkan library, synthetic inputs, no Folklore data.
 #include <vulkan/vulkan.h>
 #include "ffx_cacao_impl.h"
+#ifdef RSX_CACAO_DYNAMIC_DISPATCH
+#include "rsx_cacao_dispatch.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -38,6 +41,9 @@ struct Device {
     uint32_t family = 0;
     ~Device() {
         if (device) { vkDeviceWaitIdle(device); if (pool) vkDestroyCommandPool(device,pool,nullptr); vkDestroyDevice(device,nullptr); }
+#ifdef RSX_CACAO_DYNAMIC_DISPATCH
+        rsx_cacao_dispatch_reset();
+#endif
         if (messenger) {
             auto destroy = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(instance,"vkDestroyDebugUtilsMessengerEXT"));
             if (destroy) destroy(instance,messenger,nullptr);
@@ -79,6 +85,9 @@ struct Device {
         float priority=1; VkDeviceQueueCreateInfo qi={}; qi.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO; qi.queueFamilyIndex=family; qi.queueCount=1; qi.pQueuePriorities=&priority;
         VkDeviceCreateInfo dc={}; dc.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO; dc.queueCreateInfoCount=1; dc.pQueueCreateInfos=&qi; dc.pEnabledFeatures=&enabled;
         VK(vkCreateDevice(physical,&dc,nullptr,&device)); vkGetDeviceQueue(device,family,0,&queue);
+#ifdef RSX_CACAO_DYNAMIC_DISPATCH
+        check(rsx_cacao_dispatch_bind(instance,device,vkGetInstanceProcAddr)!=0,"CACAO dynamic dispatch");
+#endif
         VkCommandPoolCreateInfo pc={}; pc.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO; pc.queueFamilyIndex=family; pc.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         VK(vkCreateCommandPool(device,&pc,nullptr,&pool)); VkCommandBufferAllocateInfo ca={}; ca.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO; ca.commandPool=pool; ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount=1;
         VK(vkAllocateCommandBuffers(device,&ca,&command));

@@ -49,7 +49,23 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Windows/Linux/Android)" OFF)
+option(PS3RECOMP_RSX_CACAO "Build the optional CACAO Vulkan component" OFF)
+set(PS3RECOMP_CACAO_SHADER_DIR "" CACHE PATH "Output directory from tools/build_cacao_shaders.py")
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_(backend|anisotropy)\\.c$")
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_cacao_dispatch\\.c$")
+if(PS3RECOMP_RSX_CACAO)
+    if(NOT PS3RECOMP_RSX_VULKAN)
+        message(FATAL_ERROR "PS3RECOMP_RSX_CACAO requires PS3RECOMP_RSX_VULKAN")
+    endif()
+    if(NOT EXISTS "${PS3RECOMP_CACAO_SHADER_DIR}/manifest.json" OR
+       NOT IS_DIRECTORY "${PS3RECOMP_CACAO_SHADER_DIR}/PrecompiledShadersSPIRV")
+        message(FATAL_ERROR "Generate CACAO shaders with tools/build_cacao_shaders.py and set PS3RECOMP_CACAO_SHADER_DIR")
+    endif()
+    list(APPEND HLE_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_cacao_dispatch.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_cacao_impl.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cacao/src/ffx_cacao.cpp")
+endif()
 if(PS3RECOMP_RSX_VULKAN)
     if(APPLE)
         message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN does not support Apple hosts yet")
@@ -202,6 +218,12 @@ endif()
 
 if(PS3RECOMP_RSX_VULKAN)
     target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+    if(PS3RECOMP_RSX_CACAO)
+        target_include_directories(ps3recomp_runtime PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cacao/inc"
+            "${PS3RECOMP_CACAO_SHADER_DIR}")
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_RSX_CACAO)
+    endif()
     if(WIN32)
         find_package(SDL2 REQUIRED)
         if(TARGET SDL2::SDL2)
