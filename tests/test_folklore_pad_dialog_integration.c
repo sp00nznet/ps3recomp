@@ -62,8 +62,15 @@ static void read_pad(void)
 static u16 word(unsigned index) { return vm_read16(0x10004+index*2); }
 static void fresh(void) { now_ms+=5;read_pad(); }
 
-int main(void)
+static void write_input(const char* path,const char* command)
 {
+    FILE* f=fopen(path,"wb");check(f!=NULL,"owned pad input file opens");
+    if(f){fputs(command,f);fclose(f);}
+}
+int main(int argc,char** argv)
+{
+    const char* input_file=argc==2?argv[1]:NULL;
+    if(input_file){write_input(input_file,"");_putenv_s("PAD_FILE",input_file);}
     uint8_t memory[0x20000]={0};vm_base=memory;
     check((u32)cellPadInfoSensorMode(0)==0x80121104,"sensor query before init");
     check((u32)cellPadSetSensorMode(0,1)==0x80121104,"sensor set before init");
@@ -122,6 +129,23 @@ int main(void)
     if(poll_thread)CloseHandle(poll_thread);
     if(poll_started)CloseHandle(poll_started);
     if(poll_done)CloseHandle(poll_done);
+    if(input_file) {
+        pad.wButtons=0;fresh();fresh();
+        write_input(input_file,"0 2 128 0 255 128");fresh();
+        check(word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y)==0 &&
+              word(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X)==255,"file axes reach actual guest report");
+        fresh();check(word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y)==0,"stick hold lasts requested polls");
+        fresh();check(word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y)==128 &&
+                      word(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X)==128,"expired axes return to host without latching");
+        write_input(input_file,"0 2 128 256 128 128");fresh();
+        check(word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y)==128,"out-of-range axis rejected");
+        write_input(input_file,"0 2 128 0 128");fresh();
+        check(word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y)==128,"partial axis command rejected");
+        write_input(input_file,"0x4000 2");fresh();
+        check(word(CELL_PAD_BTN_OFFSET_DIGITAL2)&0x40,"legacy file button command still works");
+        fresh();fresh();check(word(CELL_PAD_BTN_OFFSET_DIGITAL2)==0,"legacy button releases");
+        remove(input_file);
+    }
     cellPadEnd();
     printf("pad dialog report integration: %s\n",errors?"FAIL":"PASS");
     return errors?1:0;

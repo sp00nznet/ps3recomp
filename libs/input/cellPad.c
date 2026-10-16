@@ -710,9 +710,15 @@ skip_inject: ;
      *   echo 0x4000 > pad.txt    # CROSS
      *   echo 0x0040 4 > pad.txt  # DOWN for 4 polls (menus auto-repeat a
      *                            # long hold; the default is 40)
+     *   echo 0 60 128 0 128 128 > pad.txt # left stick up for 60 polls
+     * Optional axes are lx,ly,rx,ry, each 0..255. They affect only this
+     * report, so expiration returns to live host input without a stuck axis.
      */
+    int file_sticks_active = 0;
+    u8 file_sticks[4] = {128,128,128,128};
     { static int s_pf = -1; static char pf_path[512];
       static unsigned held_mask = 0; static int held_n = 0;
+      static int held_sticks = 0; static u8 held_axes[4];
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
                       s_pf = (e && *e) ? 1 : 0;
                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
@@ -722,17 +728,23 @@ skip_inject: ;
               if (f) {
                   char buf[64]; buf[0] = 0;
                   if (fgets(buf, sizeof buf, f)) {
-                      char* rest;
-                      unsigned m = (unsigned)strtoul(buf, &rest, 0);
-                      int n = (int)strtol(rest, 0, 0);
-                      if (m) { held_mask = m; held_n = n > 0 ? n : 40;
-                               printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
+                      int m=0,n=40,a=128,b=128,c=128,d=128; char extra;
+                      int fields=sscanf(buf,"%i %i %i %i %i %i %c",&m,&n,&a,&b,&c,&d,&extra);
+                      if ((fields==1 || fields==2 || fields==6) && m>=0 && m<=0xFFFF &&
+                          n>0 && n<=600 && (m || fields==6) &&
+                          a>=0 && a<=255 && b>=0 && b<=255 && c>=0 && c<=255 && d>=0 && d<=255) {
+                          held_mask=(unsigned)m;held_n=n;held_sticks=fields==6;
+                          held_axes[0]=(u8)a;held_axes[1]=(u8)b;held_axes[2]=(u8)c;held_axes[3]=(u8)d;
+                          printf("[cellPad] PAD_FILE press 0x%04X polls=%d sticks=%d axes=%d,%d,%d,%d\n",m,n,held_sticks,a,b,c,d);
+                          fflush(stdout);
+                      }
                   }
                   fclose(f);
                   if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
           if (held_n > 0) { held_n--;
+              if (held_sticks) { file_sticks_active=1;memcpy(file_sticks,held_axes,sizeof(file_sticks)); }
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
       } }
@@ -795,6 +807,12 @@ skip_inject: ;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]  = hs->analog_ly;
+    if (file_sticks_active) {
+        data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]=file_sticks[0];
+        data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]=file_sticks[1];
+        data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X]=file_sticks[2];
+        data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y]=file_sticks[3];
+    }
 
     /* Pressure-sensitive buttons (only meaningful if PRESS_ON) */
     if (setting & CELL_PAD_SETTING_PRESS_ON) {
