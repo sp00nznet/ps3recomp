@@ -161,7 +161,8 @@ target_include_directories(ps3recomp_runtime PRIVATE
 # Platform-specific link libraries
 if(PS3RECOMP_PAD_USE_SDL2)
     find_package(SDL2 2.26 REQUIRED)
-    set_property(SOURCE libs/input/cellPad.c APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_PAD_USE_SDL2=1)
+    set_property(SOURCE libs/input/cellPad.c libs/video/rsx_vulkan_backend.c
+        APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_PAD_USE_SDL2=1)
     if(TARGET SDL2::SDL2)
         target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
     else()
