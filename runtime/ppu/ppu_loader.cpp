@@ -679,7 +679,12 @@ static DWORD WINAPI samp_thread(LPVOID p)
                 if (!h) continue;
                 if (SuspendThread(h) != (DWORD)-1) {
                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
-                    if (GetThreadContext(h, &c)) {
+                    BOOL captured = GetThreadContext(h, &c);
+                    /* The target may own CRT, loader or unwind-table locks.
+                     * Resume before environment/symbol/module lookups. Exact
+                     * mode uses only the copied RIP and never scans its stack. */
+                    ResumeThread(h);
+                    if (captured) {
                         s_samp_total++;
                         uint32_t g = samp_lookup((uintptr_t)c.Rip);
                         if (!g && s_samp_main > 0 && !getenv("PS3_SAMPLE_EXACT"))
@@ -690,7 +695,6 @@ static DWORD WINAPI samp_thread(LPVOID p)
                                if (!nt) samp_rva_hit((uintptr_t)c.Rip);
                                samp_tid2(te.th32ThreadID, 0, nt); }
                     }
-                    ResumeThread(h);
                 }
                 CloseHandle(h);
             } while (Thread32Next(snap, &te));
