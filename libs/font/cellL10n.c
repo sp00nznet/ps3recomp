@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../runtime/memory/guest_byte.h"
+#include "../../runtime/memory/guest_span.h"
 #include "ps3emu/strict_boot.h"
 
 /* ---------------------------------------------------------------------------
@@ -141,10 +142,8 @@ s32 UTF8toUTF16(const u8* utf8, u16* utf16, u32* utf16_len)
     if(!consumed)return 0;
     int written=encode_utf16(cp,output,2);
     if(!written)return 0;
-    for(unsigned i=0;i<(unsigned)written*2;i++)
-        if(!ps3_guest_byte_writable(dst+i))goto memory_error;
-    for(unsigned i=0;i<4;i++)
-        if(!ps3_guest_byte_writable(length+i))goto memory_error;
+    if(!ps3_guest_span_writable(dst,(unsigned)written*2)||
+       !ps3_guest_span_writable(length,4))goto memory_error;
     for(unsigned i=0;i<(unsigned)written;i++){
         u8 high=(u8)(output[i]>>8),low=(u8)output[i];
         if(!ps3_guest_byte_copy(dst+2*i,&high,1)||!ps3_guest_byte_copy(dst+2*i+1,&low,1))goto memory_error;
