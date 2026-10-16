@@ -2225,9 +2225,9 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
     }
     if (s_pd.draws_log) {
         fprintf(s_pd.draws_log, "pass %03u draw %u: pipe %u cmask %08X blend %u %X/%X"
-                " dt %u dw %u at %u aac %08X |", s_pd.pass, s_pd.draws, pipeline, rs->color_mask,
+                " dt %u dw %u df %X at %u aac %08X |", s_pd.pass, s_pd.draws, pipeline, rs->color_mask,
                 rs->blend_enable, rs->sf_rgb, rs->df_rgb, rs->depth_test, rs->depth_write,
-                rs->alpha_test_enable, rsx_dsp_reg(&g.rsx, 0x1D7C));
+                rs->depth_func, rs->alpha_test_enable, rsx_dsp_reg(&g.rsx, 0x1D7C));
         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
             if (!(tex_mask & (1u << u))) continue;
             rsx_dsp_texture t;
