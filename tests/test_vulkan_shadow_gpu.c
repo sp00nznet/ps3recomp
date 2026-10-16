@@ -27,7 +27,7 @@ uint8_t* vm_base;
 #define SHADOW_BIND_TEXTURES(texs,samps,n) vk_eng_bind_textures(NULL,(texs),(samps),(n))
 #endif
 #ifndef SHADOW_COLOR_CREATE
-#define SHADOW_COLOR_CREATE(w,h) vk_eng_color_multisample(NULL,RSX_BE_FMT_R8G8B8A8,(w),(h),1)
+#define SHADOW_COLOR_CREATE(w,h) vk_eng_color_target_create(NULL,RSX_BE_FMT_R8G8B8A8,(w),(h),NULL,0)
 #endif
 
 /* Guest wrap codes (SET_TEXTURE_ADDRESS). */
