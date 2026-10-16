@@ -219,6 +219,11 @@ typedef struct rsx_draw_backend {
      * DEPTH16); left NULL, such a texture reads guest memory as it is. */
     int  (*depth_readback)(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                            float* out, u32 out_pitch);
+    /* Optional multisample attachments. Dimensions are logical pixels;
+     * sampling/readback exposes the expanded 2x1 or 2x2 individual-sample
+     * storage, never an averaged resolve. No single-sample fallback. */
+    u32 (*color_target_create_multisample)(void*, rsx_be_format, u32, u32, u32);
+    u32 (*depth_target_create_multisample)(void*, u32, u32, u32);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

@@ -94,7 +94,8 @@ extern u32 ppu_vm_size;
 
 typedef struct {
     u32 location, offset;
-    u32 w, h;
+    u32 w, h;             /* expanded guest sample storage */
+    u32 raster_w, raster_h, samples;
     u32 pitch;              /* guest bytes per row, from SET_SURFACE_PITCH */
     rsx_be_format fmt;
     u32 handle;
@@ -104,7 +105,8 @@ typedef struct {
 
 typedef struct {
     u32 location, offset;
-    u32 w, h;
+    u32 w, h;             /* expanded guest sample storage */
+    u32 raster_w, raster_h, samples;
     u32 handle;
     u32 snapshot;          /* sampleable copy, or 0                        */
     int cleared;
@@ -534,16 +536,19 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690). */
 static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
-                          rsx_be_format want_fmt)
+                          rsx_be_format want_fmt, u32 samples)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
 
+    const u32 raster_w = want_w, raster_h = want_h;
+    want_w *= samples > 1 ? 2u : 1u;
+    want_h *= samples > 2 ? 2u : 1u;
     u32 slot = ENG_MAX_SURFACES;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
             if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
-                g.surfaces[i].fmt == want_fmt)
+                g.surfaces[i].fmt == want_fmt && g.surfaces[i].samples == samples)
                 return i;
             slot = i;
             break;
@@ -567,8 +572,15 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     u32 seed_row = 0;
     const void* seed = eng_surface_seed(location, offset, want_w, want_h,
                                         want_fmt, &seed_row);
-    const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
-                                                 want_w, want_h, seed, seed_row);
+    if (samples > 1 && (seed || !g.be->color_target_create_multisample)) {
+        ps3_strict_boot_guard("rsx-msaa-create", "unsupported seeded or backend multisample color target");
+        return ENG_INVALID;
+    }
+    const u32 handle = samples > 1
+        ? g.be->color_target_create_multisample(g.be->user, want_fmt, raster_w, raster_h, samples)
+        : g.be->color_target_create(g.be->user, want_fmt, want_w, want_h, seed, seed_row);
+    if (!handle && samples > 1)
+        ps3_strict_boot_guard("rsx-msaa-create", "multisample color allocation failed samples=%u", samples);
     if (!handle)
         return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 
@@ -576,6 +588,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
+    s->raster_w = raster_w; s->raster_h = raster_h; s->samples = samples;
     s->handle = handle;
     s->color_serial = 0;
     s->guest_dirty = 0;
@@ -593,6 +606,29 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
  * vtable path's target_for binds by. Resolution stops at the first member
  * that cannot be created, as that path stops at the first gap. Returns how
  * many were resolved, or 0. */
+static int eng_sample_layout(const rsx_dsp_surface* sf, rsx_surface_layout* out)
+{
+    memset(out, 0, sizeof *out);
+    out->width = sf->clip_w ? sf->clip_w : g.width;
+    out->height = sf->clip_h ? sf->clip_h : g.height;
+    out->samples = 1;
+    if (!sf->antialias) return 1;
+    const u32 mask = sf->color_target == CELL_GCM_SURFACE_TARGET_0 ? 1u :
+                     sf->color_target == CELL_GCM_SURFACE_TARGET_1 ? 2u :
+                     sf->color_target == CELL_GCM_SURFACE_TARGET_MRT1 ? 3u :
+                     sf->color_target == CELL_GCM_SURFACE_TARGET_MRT2 ? 7u :
+                     sf->color_target == CELL_GCM_SURFACE_TARGET_MRT3 ? 15u : 0u;
+    const u32 bpp = sf->color_format == 8 ? 4u :
+                    sf->color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16 ? 8u : 0u;
+    if (sf->raster_type != 1 || !rsx_surface_layout_compute(sf->antialias,
+            out->width, out->height, bpp, sf->color_pitch, mask,
+            sf->depth_format == 1 ? 2u : 4u, sf->zeta_pitch, sf->zeta_pitch != 0, out)) {
+        ps3_strict_boot_guard("rsx-msaa-layout", "unsupported layout aa=%u clip=%ux%u", sf->antialias, sf->clip_w, sf->clip_h);
+        return 0;
+    }
+    return 1;
+}
+
 static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
 {
     rsx_dsp_surface sf;
@@ -601,8 +637,10 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
      * A, and the MRT selectors add B, C and D on top of it. */
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
     const rsx_be_format fmt = eng_surface_format(sf.color_format);
+    rsx_surface_layout sample_layout;
+    if (!eng_sample_layout(&sf, &sample_layout)) return 0;
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
-                                      sf.clip_w, sf.clip_h, fmt);
+                                      sample_layout.width, sample_layout.height, fmt, sample_layout.samples);
     if (first == ENG_INVALID) return 0;
     g.surfaces[first].pitch = sf.color_pitch[sel];
     slots[0] = first;
@@ -616,7 +654,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
         if (sf.color_target < mrt_from[i]) break;
         const u32 slot = eng_surface_get(sf.color_location[i + 1],
                                          sf.color_offset[i + 1],
-                                         sf.clip_w, sf.clip_h, fmt);
+                                         sample_layout.width, sample_layout.height, fmt, sample_layout.samples);
         if (slot == ENG_INVALID) break;
         g.surfaces[slot].pitch = sf.color_pitch[i + 1];
         /* A set naming one buffer twice would attach the same target twice,
@@ -765,13 +803,15 @@ static u32 eng_current_surface(void)
 /* One depth target per guest zeta address. Sharing a single resource across a
  * title's shadow, scene and post passes cross-contaminates later depth tests;
  * upstream's ef3271b records that as "the black player-character mass". */
-static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h, u32 samples)
 {
     /* The attachment must cover the whole canvas: an early pass declaring a
      * smaller clip than the live viewport otherwise gets a target the host
      * API rejects when a later, larger pass binds it. */
-    u32 want_w = rt_w > g.width ? rt_w : g.width;
-    u32 want_h = rt_h > g.height ? rt_h : g.height;
+    const u32 raster_w = samples > 1 ? rt_w : (rt_w > g.width ? rt_w : g.width);
+    const u32 raster_h = samples > 1 ? rt_h : (rt_h > g.height ? rt_h : g.height);
+    u32 want_w = raster_w * (samples > 1 ? 2u : 1u);
+    u32 want_h = raster_h * (samples > 2 ? 2u : 1u);
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM)
         return ENG_INVALID;
 
@@ -779,10 +819,12 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     for (u32 i = 0; i < g.n_zdepths; i++) {
         eng_zdepth* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
-            if (z->w >= want_w && z->h >= want_h) return i;
+            if (z->w >= want_w && z->h >= want_h && z->samples == samples) return i;
             slot = i;
-            if (want_w < z->w) want_w = z->w;
-            if (want_h < z->h) want_h = z->h;
+            if (samples == 1 && z->samples == 1) {
+                if (want_w < z->w) want_w = z->w;
+                if (want_h < z->h) want_h = z->h;
+            }
             break;
         }
     }
@@ -791,7 +833,15 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         slot = g.n_zdepths;
     }
 
-    const u32 handle = g.be->depth_target_create(g.be->user, want_w, want_h);
+    if (samples > 1 && !g.be->depth_target_create_multisample) {
+        ps3_strict_boot_guard("rsx-msaa-create", "backend has no multisample depth target");
+        return ENG_INVALID;
+    }
+    const u32 handle = samples > 1
+        ? g.be->depth_target_create_multisample(g.be->user, raster_w, raster_h, samples)
+        : g.be->depth_target_create(g.be->user, want_w, want_h);
+    if (!handle && samples > 1)
+        ps3_strict_boot_guard("rsx-msaa-create", "multisample depth allocation failed samples=%u", samples);
     if (!handle)
         return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
@@ -799,6 +849,9 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
+    z->raster_w = samples > 1 ? raster_w : want_w;
+    z->raster_h = samples > 1 ? raster_h : want_h;
+    z->samples = samples;
     z->handle = handle;
     z->snapshot = 0;
     z->cleared = 0;
@@ -1111,8 +1164,8 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
     z->guest_dirty = 1;
     z->zfmt = sf->depth_format;
     z->pitch = sf->zeta_pitch;
-    z->used_w = sf->clip_w ? sf->clip_w : g.width;
-    z->used_h = sf->clip_h ? sf->clip_h : g.height;
+    z->used_w = z->samples > 1 ? z->w : (sf->clip_w ? sf->clip_w : g.width);
+    z->used_h = z->samples > 1 ? z->h : (sf->clip_h ? sf->clip_h : g.height);
 }
 
 static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
@@ -2208,8 +2261,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
+    const eng_surface* rt = &g.surfaces[target];
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
-                                     sf.clip_w, sf.clip_h);
+                                     rt->raster_w, rt->raster_h, rt->samples);
 
     /* A guest program pair that will not translate has no fallback: the draw
      * is dropped, as the reference engine drops it. Substituting the built-in
@@ -2248,8 +2302,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* The transform constant block, then the viewport epilogue the vertex
      * program's tail multiplies by: RSX window coordinates mapped into the
      * host's clip space (rsx_live_draw.c:6143-6156). */
-    const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
-    const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;
+    const float W = (float)rt->raster_w;
+    const float H = (float)rt->raster_h;
     float xf[8] = { 1, 1, 1, 0, 0, 0, 0, 0 };
     if (vp.scale[0] != 0.0f || vp.translate[0] != 0.0f) {
         xf[0] = vp.scale[0] / (W * 0.5f);
@@ -2355,7 +2409,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         rsx_dsp_surface zs;
         rsx_dsp_get_surface(&g.rsx, &zs);
         pd_note(targets, n_targets,
-                eng_zdepth_get(zs.zeta_location, zs.zeta_offset, zs.clip_w, zs.clip_h),
+                eng_zdepth_get(zs.zeta_location, zs.zeta_offset,
+                    g.surfaces[targets[0]].raster_w, g.surfaces[targets[0]].raster_h, g.surfaces[targets[0]].samples),
                 NULL, 0, 0);
     }
 
@@ -2378,8 +2433,9 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         rsx_dsp_surface sf;
         rsx_dsp_get_surface(&g.rsx, &sf);
+        const eng_surface* rt = &g.surfaces[targets[0]];
         const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
-                                         sf.clip_w, sf.clip_h);
+                                         rt->raster_w, rt->raster_h, rt->samples);
         if (zslot == ENG_INVALID) return;
         u32 flags = 0;
         if (mask & RSX_CLEAR_DEPTH)   flags |= RSX_BE_CLEAR_DEPTH;

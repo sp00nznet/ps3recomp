@@ -20,6 +20,8 @@
 #include <string.h>
 
 static int g_failures;
+static u32 msaa_color_w, msaa_color_h, msaa_color_samples, msaa_depth_samples;
+static float last_viewport_w, last_viewport_h;
 
 #define CHECK(cond, ...)                                                      \
     do {                                                                      \
@@ -154,6 +156,14 @@ static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
 static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
 
+static u32 stub_color_msaa(void* u, rsx_be_format fmt, u32 w, u32 h, u32 samples)
+{
+    msaa_color_w=w;msaa_color_h=h;msaa_color_samples=samples;
+    return stub_color_create(u,fmt,w,h,NULL,0);
+}
+static u32 stub_depth_msaa(void* u, u32 w, u32 h, u32 samples)
+{ msaa_depth_samples=samples;return stub_depth_create(u,w,h); }
+
 static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
 { (void)u; (void)d; (void)w; (void)h; stub.n_depth_snapshot++; return stub_handle(); }
 
@@ -198,7 +208,7 @@ static void stub_bind_vtextures(void* u, const u32* tex,
 
 static void stub_viewport(void* u, float x, float y, float w, float h,
                            float min_depth, float max_depth)
-{ (void)u; (void)x; (void)y; (void)w; (void)h; (void)min_depth; (void)max_depth; }
+{ (void)u; (void)x; (void)y; (void)min_depth; (void)max_depth; last_viewport_w=w;last_viewport_h=h; }
 
 static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 {
@@ -308,6 +318,8 @@ static const rsx_draw_backend g_stub_backend = {
     .present = stub_present,
     .readback = stub_readback,
     .depth_readback = stub_depth_readback,
+    .color_target_create_multisample = stub_color_msaa,
+    .depth_target_create_multisample = stub_depth_msaa,
 };
 
 /* ---- driving the engine -------------------------------------------------- */
@@ -1149,6 +1161,26 @@ static void test_color_read_as_float(void)
     engine_down();
 }
 
+static void test_multisample_layout(void)
+{
+    engine_up();
+    m(M_SURFACE_FORMAT,0x090B3148u);
+    m(M_SURFACE_CLIP_H,2560u<<16);m(M_SURFACE_CLIP_V,720u<<16);
+    m(M_COLOR_A_PITCH,10240);m(M_ZETA_PITCH,10240);
+    draw_triangle();
+    CHECK(msaa_color_samples==2&&msaa_depth_samples==2,"two-sample color and depth use native attachment hooks");
+    CHECK(msaa_color_w==1280&&msaa_color_h==720&&last_viewport_w==1280&&last_viewport_h==720,
+          "pitch bounds logical raster and viewport to1280x720, not sample storage width");
+    const int creates=stub.n_color_create;
+    draw_triangle();CHECK(stub.n_color_create==creates,"unchanged multisample target is reused");
+    m(M_SURFACE_FORMAT,0x090B4148u);draw_triangle();
+    CHECK(msaa_color_samples==4&&msaa_depth_samples==4&&stub.n_color_create==creates+1,
+          "changing sample count reallocates matching color and depth resources");
+    m(M_SURFACE_FORMAT,0x090B0148u);draw_triangle();
+    CHECK(last_viewport_w==2560&&last_viewport_h==720,"single-sample transition restores logical2560 width");
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1177,6 +1209,7 @@ int main(void)
     test_depth_clear_value();
     test_depth_read_as_color();
     test_color_read_as_float();
+    test_multisample_layout();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

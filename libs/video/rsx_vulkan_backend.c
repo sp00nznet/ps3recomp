@@ -388,14 +388,14 @@ static int vk_find_memory_type(u32 type_bits, VkMemoryPropertyFlags want, u32* o
     return -1;
 }
 
-static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
-                                  VkImageUsageFlags usage, VkImageAspectFlags aspect)
+static int vk_create_image_levels_samples(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
+                                  VkImageUsageFlags usage, VkImageAspectFlags aspect, u32 samples)
 {
     if (!levels) levels = 1;
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
         .format = fmt, .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
@@ -418,6 +418,12 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 
     };
     VK_CHECK(pvkCreateImageView(s_vk.device, &vci, NULL, &im->view), "vkCreateImageView");
     return 0;
+}
+
+static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
+                                  VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    return vk_create_image_levels_samples(im, fmt, w, h, levels, usage, aspect, 1);
 }
 
 static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
@@ -1964,6 +1970,8 @@ typedef struct vk_eng_obj {
     VkFormat fmt;
     u32      bpp;                    /* bytes per texel, 0 for depth     */
     u32      w, h;
+    u32      samples, expanded;
+    int      expansion_valid;
     vk_image im;                     /* a VIEW owns only im.view            */
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
@@ -2114,6 +2122,9 @@ static int vk_eng_init(void* user, u32 width, u32 height)
     return s_vk.device ? 0 : -1;
 }
 
+static u32 vk_eng_expand_samples(u32 surface);
+static void vk_eng_expansion_shutdown(void);
+
 static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
@@ -2131,6 +2142,11 @@ static void vk_eng_release(void* user, u32 handle)
     }
     if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
+    if (s_eobj[handle].expanded) {
+        const u32 expanded = s_eobj[handle].expanded;
+        s_eobj[handle].expanded = 0;
+        vk_eng_release(user, expanded);
+    }
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
@@ -2138,6 +2154,7 @@ static void vk_eng_release(void* user, u32 handle)
 static void vk_eng_shutdown(void* user)
 {
     vk_eng2_shutdown(user);
+    vk_eng_expansion_shutdown();
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
 }
 
@@ -2204,6 +2221,42 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
     return hd;
 }
 
+static u32 vk_eng_target_multisample(void* user, rsx_be_format fmt, u32 w, u32 h, u32 samples, int depth)
+{
+    if ((samples != 2 && samples != 4) || !w || !h || w > vk_max_dim()/2u || h > vk_max_dim()/(samples > 2 ? 2u : 1u)) return 0;
+    u32 bpp = 0;
+    const VkFormat vf = depth ? s_vk.depth_format : vk_eng_format(fmt, &bpp);
+    if (!depth && vk_eng_rt_index(vf) < 0) return 0;
+    const u32 hd = vk_eng_alloc();
+    if (!hd) return 0;
+    vk_eng_obj* o = &s_eobj[hd];
+    const VkImageAspectFlags aspect = depth ? s_vk.depth_aspect : VK_IMAGE_ASPECT_COLOR_BIT;
+    if (vk_create_image_levels_samples(&o->im, vf, w, h, 1,
+            (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, aspect, samples)) {
+        vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
+    }
+    o->kind = depth ? VK_ENG_DEPTH : VK_ENG_COLOR;
+    o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h; o->samples = samples;
+    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    vk_barrier_image(o->im.img, aspect, VK_IMAGE_LAYOUT_UNDEFINED);
+    VkImageSubresourceRange range = {aspect, 0, 1, 0, 1};
+    if (depth) {
+        VkClearDepthStencilValue far_plane = {1.0f, 0};
+        pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &range);
+    } else {
+        VkClearColorValue zero = { .float32 = {0,0,0,0} };
+        pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+    }
+    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    VK_LOG("engine: native %u-sample %s attachment %ux%u\n", samples, depth ? "depth" : "color", w, h);
+    return hd;
+}
+static u32 vk_eng_color_multisample(void* user, rsx_be_format fmt, u32 w, u32 h, u32 samples)
+{ return vk_eng_target_multisample(user, fmt, w, h, samples, 0); }
+static u32 vk_eng_depth_multisample(void* user, u32 w, u32 h, u32 samples)
+{ return vk_eng_target_multisample(user, RSX_BE_FMT_R8G8B8A8, w, h, samples, 1); }
+
 static void vk_eng_bind_targets(void* user, const u32* surfaces, u32 count, u32 depth)
 {
     (void)user;
@@ -2224,6 +2277,7 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
                        (u32)(rgba[2] * 255.0f + 0.5f);
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (!o || vk_begin()) return;
+    o->expansion_valid = 0;
     VkClearColorValue v;
     memcpy(v.float32, rgba, sizeof v.float32);
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -2241,6 +2295,7 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     if (flags & RSX_BE_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!o || !aspect || vk_begin()) return;
+    o->expansion_valid = 0;
     VkClearDepthStencilValue d = { depth_value, stencil };
     VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
@@ -2254,6 +2309,7 @@ static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    if (o && o->samples > 1) o = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
     if (o && !vk_begin()) {
         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -2279,6 +2335,10 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
 {
     (void)user;
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    if (o && o->samples > 1) {
+        ps3_strict_boot_guard("vulkan-msaa-write", "individual-sample upload is not implemented");
+        return;
+    }
     if (!o || o->fmt != VK_FORMAT_R8G8B8A8_UNORM) return;   /* rows are R,G,B,A */
     if (!rows || !w || !h || x + w > o->w || y + h > o->h) return;
     vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
@@ -2289,6 +2349,8 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
 {
     (void)user;
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!o) o = vk_eng_get(surface, VK_ENG_TEXTURE);
+    if (o && o->samples > 1) o = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
     if (!o || !out || !out_pitch || !w || !h || x + w > o->w || y + h > o->h) return;
     const size_t tight = (size_t)w * o->bpp;
     vk_buffer st = {0};
@@ -2392,6 +2454,10 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     (void)user;
     vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
     if (!t) return 0;
+    if (t->samples > 1) {
+        t = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
+        if (!t) { ps3_strict_boot_guard("vulkan-msaa-expand", "color sample expansion failed"); return 0; }
+    }
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
         if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
             s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format)
@@ -2420,6 +2486,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 {
     vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
     if (!z) return 0;
+    if (z->samples > 1) return vk_eng_expand_samples(depth);
     if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
         s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
         static int warned_fmt;
@@ -2486,6 +2553,13 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
 {
     (void)user;
     vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
+    if (z && z->samples > 1) {
+        const u32 expanded = vk_eng_expand_samples(depth);
+        vk_eng_obj* image = vk_eng_get(expanded, VK_ENG_TEXTURE);
+        if (!image || !out || out_pitch < (size_t)w * 4u || x > image->w || w > image->w-x || y > image->h || h > image->h-y) return -1;
+        vk_eng_readback(user, expanded, x, y, w, h, out, out_pitch);
+        return 0;
+    }
     if (!z || !out || !w || !h || x + w > z->w || y + h > z->h ||
         out_pitch < w * 4u || (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
                                   s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT))
@@ -2546,17 +2620,17 @@ typedef struct vk_eng_pipe {
     u32                 nslots, stride, rt_count;
     VkFormat            rt_fmt;          /* picks the render pass it is built against */
     u32                 cube_mask;       /* TextureCube units: the split set layout */
-    VkPipeline          variant[VK_ENG_TOPOLOGIES];
+    VkPipeline          variant[3][VK_ENG_TOPOLOGIES];
 } vk_eng_pipe;
 
 static vk_eng_pipe s_epipe[VK_ENG_MAX_PIPE];
 
 static struct {
-    VkRenderPass rp[VK_ENG_RT_FORMATS][RSX_BE_MAX_COLOR_TARGETS + 1]; /* by format, colour count */
+    VkRenderPass rp[3][VK_ENG_RT_FORMATS][RSX_BE_MAX_COLOR_TARGETS + 1]; /* by format, colour count */
     struct { u32 key[RSX_BE_MAX_COLOR_TARGETS + 1]; VkFramebuffer fb; } fb[VK_ENG_FB_CACHE];
     u32          fb_count;
     vk_image     scratch_depth;                          /* when no zeta is bound */
-    u32          scratch_w, scratch_h;
+    u32          scratch_w, scratch_h, scratch_samples;
     u32          pipeline;
     u32          vs_bytes, ps_bytes;
     u32          tex[RSX_BE_MAX_TEXTURES];
@@ -2592,17 +2666,18 @@ static void vk_eng_drop_framebuffers(void)
 /* The render pass for `n` colour attachments of format `cf` plus depth,
  * LOAD/STORE in GENERAL like the vtable path's: clears are separate
  * operations. An MRT set shares target A's format (engine contract). */
-static VkRenderPass vk_eng_render_pass(VkFormat cf, u32 n)
+static VkRenderPass vk_eng_render_pass(VkFormat cf, u32 n, u32 samples)
 {
+    const u32 si = samples == 4 ? 2u : samples == 2 ? 1u : 0u;
     const int fi = vk_eng_rt_index(cf);
     if (fi < 0 || n < 1 || n > RSX_BE_MAX_COLOR_TARGETS) return VK_NULL_HANDLE;
-    if (s_e2.rp[fi][n]) return s_e2.rp[fi][n];
+    if (s_e2.rp[si][fi][n]) return s_e2.rp[si][fi][n];
     VkAttachmentDescription att[RSX_BE_MAX_COLOR_TARGETS + 1];
     VkAttachmentReference   cref[RSX_BE_MAX_COLOR_TARGETS];
     for (u32 i = 0; i <= n; i++) {
         att[i] = (VkAttachmentDescription){
             .format = (i < n) ? cf : s_vk.depth_format,
-            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .samples = (VkSampleCountFlagBits)samples,
             .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             /* Stencil lives across draws like depth does (a title writes it in
              * one pass and tests it in the next); ignored for colour and for
@@ -2619,9 +2694,9 @@ static VkRenderPass vk_eng_render_pass(VkFormat cf, u32 n)
     VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
                                    .attachmentCount = n + 1, .pAttachments = att,
                                    .subpassCount = 1, .pSubpasses = &sub };
-    if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_e2.rp[fi][n]) != VK_SUCCESS)
-        s_e2.rp[fi][n] = VK_NULL_HANDLE;
-    return s_e2.rp[fi][n];
+    if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_e2.rp[si][fi][n]) != VK_SUCCESS)
+        s_e2.rp[si][fi][n] = VK_NULL_HANDLE;
+    return s_e2.rp[si][fi][n];
 }
 
 /* Tables carried from the Metal backend, itself copied from the D3D12 live
@@ -2789,22 +2864,24 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     (void)user;
     if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
     vk_eng_pipe* P = &s_epipe[pipeline - 1];
-    for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
-        if (P->variant[t]) pvkDestroyPipeline(s_vk.device, P->variant[t], NULL);
+    for (u32 si = 0; si < 3; si++)
+        for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
+            if (P->variant[si][t]) pvkDestroyPipeline(s_vk.device, P->variant[si][t], NULL);
     if (P->vs) pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
     if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
     memset(P, 0, sizeof *P);
     if (s_e2.pipeline == pipeline) s_e2.pipeline = 0;
 }
 
-static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 samples)
 {
+    const u32 si = samples == 4 ? 2u : samples == 2 ? 1u : 0u;
     static const VkPrimitiveTopology topo[VK_ENG_TOPOLOGIES] = {
         VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
         VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
-    if (P->variant[topo_idx]) return P->variant[topo_idx];
-    VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, P->rt_count);
+    if (P->variant[si][topo_idx]) return P->variant[si][topo_idx];
+    VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, P->rt_count, samples);
     if (!rp || P->nslots > VK_GUEST_ATTRS) return VK_NULL_HANDLE;
     const VkPipelineLayout layout = P->cube_mask ? vk_eng_split_layout() : s_g.pipe_layout;
     if (!layout) return VK_NULL_HANDLE;
@@ -2844,7 +2921,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+        .rasterizationSamples = (VkSampleCountFlagBits)samples };
     VkStencilOpState front = vk_gcm_stencil_face(rs->s_func, rs->s_fail, rs->s_zfail, rs->s_zpass,
                                                  rs->s_func_mask, rs->s_write_mask);
     VkStencilOpState back = rs->stencil_two_sided
@@ -2891,12 +2968,14 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = layout, .renderPass = rp, .subpass = 0 };
     if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
-                                   &P->variant[topo_idx]) != VK_SUCCESS) {
+                                   &P->variant[si][topo_idx]) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
-        P->variant[topo_idx] = VK_NULL_HANDLE;
+        P->variant[si][topo_idx] = VK_NULL_HANDLE;
     }
-    return P->variant[topo_idx];
+    return P->variant[si][topo_idx];
 }
+
+#include "rsx_vulkan_msaa.inc"
 
 static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pipeline = pipeline; }
 
@@ -2904,9 +2983,10 @@ static void vk_eng2_shutdown(void* user)
 {
     for (u32 i = 1; i <= VK_ENG_MAX_PIPE; i++) vk_eng_pipeline_release(user, i);
     vk_eng_drop_framebuffers();
-    for (u32 f = 0; f < VK_ENG_RT_FORMATS; f++)
-        for (u32 n = 0; n <= RSX_BE_MAX_COLOR_TARGETS; n++)
-            if (s_e2.rp[f][n]) pvkDestroyRenderPass(s_vk.device, s_e2.rp[f][n], NULL);
+    for (u32 si = 0; si < 3; si++)
+        for (u32 f = 0; f < VK_ENG_RT_FORMATS; f++)
+            for (u32 n = 0; n <= RSX_BE_MAX_COLOR_TARGETS; n++)
+                if (s_e2.rp[si][f][n]) pvkDestroyRenderPass(s_vk.device, s_e2.rp[si][f][n], NULL);
     vk_destroy_image(&s_e2.scratch_depth);
     vk_destroy_buffer(&s_e2.indices);
     if (s_e2.split_pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_e2.split_pipe_layout, NULL);
@@ -2992,22 +3072,22 @@ static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, V
 
 /* Depth when the draw names no zeta: one scratch image, grown as needed and
  * cleared to the far plane when (re)created. Key 0xFFFFFFFF in the cache. */
-static VkImageView vk_eng_scratch_depth(u32 w, u32 h)
+static VkImageView vk_eng_scratch_depth(u32 w, u32 h, u32 samples)
 {
-    if (s_e2.scratch_depth.view && s_e2.scratch_w >= w && s_e2.scratch_h >= h)
+    if (s_e2.scratch_depth.view && s_e2.scratch_w >= w && s_e2.scratch_h >= h && s_e2.scratch_samples == samples)
         return s_e2.scratch_depth.view;
     vk_eng_drop_framebuffers();
     vk_destroy_image(&s_e2.scratch_depth);
-    if (vk_create_image(&s_e2.scratch_depth, s_vk.depth_format, w, h,
+    if (vk_create_image_levels_samples(&s_e2.scratch_depth, s_vk.depth_format, w, h, 1,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        s_vk.depth_aspect) || vk_begin())
+                        s_vk.depth_aspect, samples) || vk_begin())
         return VK_NULL_HANDLE;
     vk_barrier_image(s_e2.scratch_depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
     VkImageSubresourceRange r = { s_vk.depth_aspect, 0, 1, 0, 1 };
     pvkCmdClearDepthStencilImage(s_vk.cmd, s_e2.scratch_depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
     if (vk_submit_and_wait()) return VK_NULL_HANDLE;
-    s_e2.scratch_w = w; s_e2.scratch_h = h;
+    s_e2.scratch_w = w; s_e2.scratch_h = h; s_e2.scratch_samples = samples;
     return s_e2.scratch_depth.view;
 }
 
@@ -3161,15 +3241,27 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         return;
     }
     const u32 w = rt0->w, h = rt0->h;
+    const u32 samples = rt0->samples ? rt0->samples : 1u;
+    for (u32 i = 1; i < n; ++i) {
+        const vk_eng_obj* other = &s_eobj[s_eng_bound.rt[i]];
+        if ((other->samples ? other->samples : 1u) != samples) {
+            ps3_strict_boot_guard("vulkan-msaa-mrt", "attachment sample counts differ"); return;
+        }
+    }
     vk_eng_obj* zo = vk_eng_get(s_eng_bound.depth, VK_ENG_DEPTH);
-    VkImageView dview = (zo && zo->w >= w && zo->h >= h) ? zo->im.view : vk_eng_scratch_depth(w, h);
+    VkImageView dview = (zo && zo->w >= w && zo->h >= h && (zo->samples ? zo->samples : 1u) == samples) ? zo->im.view : vk_eng_scratch_depth(w, h, samples);
     if (!dview) return;
     const u32 dkey = (zo && dview == zo->im.view) ? s_eng_bound.depth : 0xFFFFFFFFu;
 
-    VkPipeline pipe = vk_eng_variant(P, (u32)topology - 1u);
-    VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, n);
+    VkPipeline pipe = vk_eng_variant(P, (u32)topology - 1u, samples);
+    VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, n, samples);
     VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
-    if (!pipe || !rp || !fb) return;
+    if (!pipe || !rp || !fb) {
+        if (samples > 1) ps3_strict_boot_guard("vulkan-msaa-pipeline", "multisample pipeline/framebuffer failed");
+        return;
+    }
+    for (u32 i = 0; i < n; ++i) s_eobj[s_eng_bound.rt[i]].expansion_valid = 0;
+    if (zo) zo->expansion_valid = 0;
 
     const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
     if (vk_ensure_vertex_buffer(vbytes)) return;
@@ -3255,6 +3347,8 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
+    .color_target_create_multisample = vk_eng_color_multisample,
+    .depth_target_create_multisample = vk_eng_depth_multisample,
 };
 
 static rsx_backend s_vulkan_backend = {
