@@ -139,22 +139,31 @@ static ppu_fs_aio::Result fs_aio_host_read(const std::shared_ptr<FsFile>& file,
 static void cellFsAioRead(ppu_context* ctx)
 {
     const uint32_t request=(uint32_t)ctx->gpr[3],id_pointer=(uint32_t)ctx->gpr[4],callback=(uint32_t)ctx->gpr[5];
-    auto reject=[&](int32_t error){ctx->gpr[3]=(uint64_t)(int64_t)error;};
+    auto reject=[&](int32_t error,const char* reason){
+        if(error) {
+            static std::atomic<unsigned> failures{0};
+            if(failures.fetch_add(1)<16)
+                fprintf(stderr,"[fs] aio reject reason=%s error=0x%08X request=0x%08X id_pointer=0x%08X callback=0x%08X lr=0x%08X tid=%llu\n",
+                    reason,(uint32_t)error,request,id_pointer,callback,(uint32_t)ctx->lr,
+                    (unsigned long long)ctx->thread_id);
+        }
+        ctx->gpr[3]=(uint64_t)(int64_t)error;
+    };
     if(!fs_stat_guest_span(request,0x28,false) || !fs_stat_guest_span(id_pointer,4,true) ||
-       !fs_stat_guest_span(callback,8,false)) {reject(CELL_FS_STAT_EFAULT);return;}
+       !fs_stat_guest_span(callback,8,false)) {reject(CELL_FS_STAT_EFAULT,"guest-arguments");return;}
     const int fd=(int)(int32_t)vm_read32(request);
     const uint64_t offset=vm_read64(request+8),size=vm_read64(request+0x18);
     const uint32_t buffer=vm_read32(request+0x10);
-    if(size>SIZE_MAX || offset>INT64_MAX || size>(uint64_t)INT64_MAX-offset) {reject((int32_t)0x80010002u);return;}
-    if(size && !fs_stat_guest_span(buffer,(size_t)size,true)) {reject(CELL_FS_STAT_EFAULT);return;}
+    if(size>SIZE_MAX || offset>INT64_MAX || size>(uint64_t)INT64_MAX-offset) {reject((int32_t)0x80010002u,"size-or-offset");return;}
+    if(size && !fs_stat_guest_span(buffer,(size_t)size,true)) {reject(CELL_FS_STAT_EFAULT,"destination");return;}
     uint32_t code=0,toc=0;
-    if(ppu_callback_worker_resolve(callback,&code,&toc)!=0) {reject(CELL_FS_STAT_EFAULT);return;}
+    if(ppu_callback_worker_resolve(callback,&code,&toc)!=0) {reject(CELL_FS_STAT_EFAULT,"callback");return;}
     std::shared_ptr<FsFile> file;
     {
         std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
         if(fd>=3 && fd<FS_MAX)file=g_file_refs[fd];
     }
-    if(!file || (file->flags&3u)==CELL_FS_O_WRONLY) {reject((int32_t)0x8001002Au);return;}
+    if(!file || (file->flags&3u)==CELL_FS_O_WRONLY) {reject((int32_t)0x8001002Au,"file-descriptor");return;}
     uint8_t* const memory=vm_base;const uint32_t vm_size=ppu_vm_size;
     const auto submission=fs_aio_engine().submit(file->mount,
         [file,memory,vm_size,buffer,offset,size] {return fs_aio_host_read(file,memory,vm_size,buffer,offset,size);},
@@ -184,7 +193,7 @@ static void cellFsAioRead(ppu_context* ctx)
     static std::atomic<unsigned> count{0};
     if(count.fetch_add(1)<16)fprintf(stderr,"[fs] aio submit fd=%d mount='%s' offset=%llu bytes=%llu id=%d result=0x%08X lr=0x%08X\n",
         fd,file->mount.c_str(),(unsigned long long)offset,(unsigned long long)size,submission.id,(uint32_t)error,(uint32_t)ctx->lr);
-    reject(error);
+    reject(error,"submission");
 }
 static void cellFsAioWrite(ppu_context* ctx)
 {
