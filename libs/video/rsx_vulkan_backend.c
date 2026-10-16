@@ -214,6 +214,8 @@ typedef struct vk_state {
     u32              last_center;
     u32              presented;
     u64              successful_window_presents;
+    int              swapchain_dirty;
+    int              present_deferred;
     const char*      dump_path;
     u32              dump_every;       /* write every nth presented frame */
 } vk_state;
@@ -1654,6 +1656,8 @@ static void vk_window_drop(const char* why)
     s_vk.sem_acquire = VK_NULL_HANDLE;
     s_vk.sc_count = 0;
     s_vk.windowed = 0;
+    s_vk.swapchain_dirty = 0;
+    s_vk.present_deferred = 0;
 }
 
 static void vk_window_open(const char* title)
@@ -1695,6 +1699,21 @@ static int vk_create_swapchain(void)
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(pvkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_vk.phys, s_vk.surface, &caps),
              "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    /* Zero extent is a temporary window state, not a lost device. Preserve
+     * the old swapchain and retry after the event loop observes restoration.
+     * Check before clamping: a minimum extent must not hide a zero drawable. */
+    VkExtent2D ext = caps.currentExtent;
+    if (ext.width == 0xFFFFFFFFu) {
+        int w = 0, hh = 0;
+        SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &hh);
+        if (w <= 0 || hh <= 0) return 1;
+        ext.width = (u32)w; ext.height = (u32)hh;
+        if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
+        if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
+        if (ext.width  > caps.maxImageExtent.width)  ext.width  = caps.maxImageExtent.width;
+        if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
+    }
+    if (!ext.width || !ext.height) return 1;
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         VK_LOG("swapchain images cannot be blit destinations\n"); return -1;
     }
@@ -1723,18 +1742,6 @@ static int vk_create_swapchain(void)
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
         VK_LOG("swapchain format %d cannot be a blit destination\n", (int)fmt.format); return -1;
     }
-
-    VkExtent2D ext = caps.currentExtent;
-    if (ext.width == 0xFFFFFFFFu) {
-        int w = 0, hh = 0;
-        SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &hh);
-        ext.width = (u32)w; ext.height = (u32)hh;
-        if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
-        if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
-        if (ext.width  > caps.maxImageExtent.width)  ext.width  = caps.maxImageExtent.width;
-        if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
-    }
-    if (!ext.width || !ext.height) { VK_LOG("window has no drawable area\n"); return -1; }
 
     u32 count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
@@ -1788,8 +1795,33 @@ static int vk_create_swapchain(void)
 
 static void vk_swapchain_lost(void)
 {
-    pvkDeviceWaitIdle(s_vk.device);
-    if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
+    s_vk.swapchain_dirty = 1;
+    s_vk.present_deferred = 1;
+    if (pvkDeviceWaitIdle(s_vk.device) != VK_SUCCESS) {
+        vk_window_drop("device wait failed during swapchain recreation"); return;
+    }
+    int result = vk_create_swapchain();
+    if (result < 0) vk_window_drop("the swapchain could not be recreated");
+    else if (!result) s_vk.swapchain_dirty = 0;
+}
+
+/* Do not consume another engine frame while a prior guest flip is waiting for
+ * the host window. The caller keeps pumping events and retains that flip. */
+static int vk_prepare_window_present(void)
+{
+    s_vk.present_deferred = 0;
+    if (!s_vk.windowed) return 1;
+    if (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) {
+        s_vk.swapchain_dirty = 1;
+        s_vk.present_deferred = 1;
+        return 0;
+    }
+    if (s_vk.swapchain_dirty || !s_vk.swapchain) {
+        vk_swapchain_lost();
+        if (!s_vk.windowed || s_vk.swapchain_dirty) return 0;
+        s_vk.present_deferred = 0;
+    }
+    return 1;
 }
 
 /* Blit the offscreen target into the next swapchain image and present it. */
@@ -3357,9 +3389,13 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 
     if (s_vk.windowed) {
         VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-        if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
-            vk_create_swapchain())
+        if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS)
             vk_window_drop("the swapchain could not be created");
+        else {
+            int result = vk_create_swapchain();
+            if (result < 0) vk_window_drop("the swapchain could not be created");
+            else if (result > 0) s_vk.swapchain_dirty = s_vk.present_deferred = 1;
+        }
     }
     return 0;
 }
@@ -3408,7 +3444,8 @@ void rsx_vulkan_backend_shutdown(void)
         const Uint32 end = SDL_GetTicks() + (Uint32)(s_vk.hold_seconds * 1000.0);
         while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
-            vk_present_window();         /* FIFO: paced by the display */
+            if (vk_prepare_window_present()) vk_present_window();
+            else SDL_Delay(10);
         }
     }
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
@@ -3457,6 +3494,7 @@ int rsx_vulkan_backend_pump_messages(void)
 
 void rsx_vulkan_backend_present(void)
 {
+    if (!vk_prepare_window_present()) return;
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
 }
@@ -3468,7 +3506,12 @@ u64 rsx_vulkan_backend_successful_presents(void)
 
 int rsx_vulkan_backend_window_active(void)
 {
-    return s_vk.windowed && s_vk.swapchain;
+    return s_vk.windowed && s_vk.surface && s_vk.sem_acquire;
+}
+
+int rsx_vulkan_backend_present_deferred(void)
+{
+    return s_vk.windowed && s_vk.present_deferred;
 }
 
 u32 rsx_vulkan_backend_debug_color(void) { return s_vk.clear_argb; }
