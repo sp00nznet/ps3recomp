@@ -1527,8 +1527,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     eng_shadow_state(&shadow);
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
+    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0) {
+        fprintf(stderr,"[rsx engine] pipeline unavailable: stage=fragment-constants fp_bytes=%u cached=%u\n",fp_size,g.n_pipelines);
         return 0;
+    }
 
     /* Identity: the vertex program's own bytes, the fragment program's
      * STRUCTURE (its inline constants are hoisted into the buffered block, so
@@ -1542,7 +1544,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     } else {
         key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-        if (!key) return 0;
+        if (!key) {
+            fprintf(stderr,"[rsx engine] pipeline unavailable: stage=fragment-identity fp_bytes=%u cached=%u\n",fp_size,g.n_pipelines);
+            return 0;
+        }
         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&shader_window, sizeof shader_window, key);
@@ -1567,7 +1572,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             *out_metadata = &g.pipelines[i];
             return g.pipelines[i].handle;
         }
-    if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
+    if (g.n_pipelines >= ENG_MAX_PIPELINES) {
+        fprintf(stderr,"[rsx engine] pipeline unavailable: stage=cache-capacity cached=%u limit=%u\n",g.n_pipelines,ENG_MAX_PIPELINES);
+        return 0;
+    }
 
     u32 handle = 0;
     int vi = 1, fi = 1;
@@ -1597,6 +1605,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
+    if (!handle)
+        fprintf(stderr,"[rsx engine] pipeline unavailable: stage=%s vp_result=%d fp_result=%d fp_bytes=%u constants=%u cached=%u\n",
+                vi<=0?"vertex-lowering":fi<=0?"fragment-lowering":"backend-create",vi,fi,fp_size,nconst,g.n_pipelines);
     /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
      * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one
      * RSX_ENGINE_PASS_DUMP's index names, and a guest fragment program's own

@@ -1713,6 +1713,15 @@ static void vk_window_open(const char* title)
         return;
     }
 #endif
+#if !defined(_WIN32) || defined(PS3RECOMP_AUDIO_USE_SDL2)
+    /* cellAudio also borrows its SDL subsystem reference for process life.
+     * Keep its initialization out of the guest thread for the same reason. */
+    if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        VK_LOG("window disabled: SDL audio init failed: %s\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return;
+    }
+#endif
     Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
     if (vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
