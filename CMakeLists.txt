@@ -112,6 +112,15 @@ add_library(ps3recomp_runtime STATIC
     ${RUNTIME_SOURCES}
 )
 
+if(ANDROID)
+    find_path(PS3RECOMP_UCONTEXT_INCLUDE_DIR libucontext/libucontext.h REQUIRED)
+    find_library(PS3RECOMP_UCONTEXT_POSIX_LIBRARY NAMES ucontext_posix REQUIRED)
+    find_library(PS3RECOMP_UCONTEXT_LIBRARY NAMES ucontext REQUIRED)
+    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_UCONTEXT_INCLUDE_DIR}")
+    target_link_libraries(ps3recomp_runtime PRIVATE
+        "${PS3RECOMP_UCONTEXT_POSIX_LIBRARY}" "${PS3RECOMP_UCONTEXT_LIBRARY}")
+endif()
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )

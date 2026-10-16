@@ -23,7 +23,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
-#include <ucontext.h>
+#include "../../runtime/platform/ps3_ucontext.h"
 
 #if defined(__APPLE__)
 /* getcontext() points uc_mcontext at ucontext_t's own __mcontext_data member
@@ -226,7 +226,12 @@ s32 cellFiberPpuCreateFiber(CellFiber* fiber, CellFiberEntry entry,
     f->context.uc_stack.ss_size = f->stack_size;
     f->context.uc_link = &s_scheduler_context;
     makecontext(&f->context, (void (*)(void))fiber_trampoline, 2,
+#ifdef __ANDROID__
+                /* libucontext's AArch64 varargs implementation reads words. */
+                (unsigned long)(idx & 0xFFFF), (unsigned long)(idx >> 16));
+#else
                 (int)(idx & 0xFFFF), (int)(idx >> 16));
+#endif
 #endif
 
     vm_write32((u32)(uintptr_t)fiber, (u32)idx);
