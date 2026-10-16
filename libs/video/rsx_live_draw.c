@@ -338,6 +338,9 @@ typedef struct {
     ID3D12RootSignature*       rootsig_x;
     ID3D12RootSignature*       depth_snapshot_rootsig;
     ID3D12PipelineState*       depth_snapshot_pso;
+    ID3D12RootSignature*       downsample_rootsig;
+    ID3D12PipelineState*       downsample_pso[4];
+    DXGI_FORMAT                downsample_fmt[4];
     psocache_t                 psos[MAX_PSOS];
     u32                        n_psos;
     shader_blob_cache_t        vs_blobs;
@@ -3051,11 +3054,135 @@ int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
  * ponytail: scanout alias, not a real scaled copy -- a title that samples the
  * resolved buffer as a texture still sees black; add a draw-based scaled blit
  * then. */
-/* The copy half of a scaled resolve, done on the GPU. The source is a live
- * surface the host renders at display size although the guest laid it out
- * supersampled (Tornado Outbreak: pitch 10240 = 2560 guest pixels, host
- * surface 1280x720), so a ds x dt guest downsample is a 1:1 copy in host
- * pixels. Each tile lands in a live surface at the display buffer it writes
+/* A k x k box-filter downsample from one live surface into another, drawn as
+ * a full-viewport triangle over the destination rect: a resolve cannot be a
+ * CopyTextureRegion once the source holds its samples (an antialiased target
+ * is kept at its sample resolution, rsx_dispatch.h). Pipelines are made on
+ * first use, one per render-target format. Returns 1 when drawn. */
+static int ld_downsample(u32 si, u32 sx, u32 sy, u32 k,
+                         u32 di, u32 dx, u32 dy, u32 w, u32 h)
+{
+    const DXGI_FORMAT fmt = g.surfaces[di].fmt;
+    ID3D12PipelineState* pso = NULL;
+    u32 n = 0;
+    for (; n < 4 && g.downsample_pso[n]; n++)
+        if (g.downsample_fmt[n] == fmt) { pso = g.downsample_pso[n]; break; }
+    if (!pso) {
+        if (n == 4) return 0;
+        static const char src[] =
+            "Texture2D<float4> s : register(t0);\n"
+            "cbuffer c : register(b0) { int2 so; int2 dorg; int k; };\n"
+            "float4 vs(uint id : SV_VertexID) : SV_Position {\n"
+            "    float2 t = float2((id << 1) & 2, id & 2);\n"
+            "    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+            "}\n"
+            "float4 ps(float4 p : SV_Position) : SV_Target {\n"
+            "    int2 b = so + (int2(p.xy) - dorg) * k;\n"
+            "    float4 a = 0;\n"
+            "    for (int y = 0; y < k; y++)\n"
+            "        for (int x = 0; x < k; x++) a += s.Load(int3(b + int2(x, y), 0));\n"
+            "    return a / (k * k);\n"
+            "}\n";
+        ID3DBlob *vsb = NULL, *psb = NULL, *err = NULL;
+        HRESULT hr = D3DCompile(src, sizeof(src) - 1u, "ld_downsample", NULL, NULL,
+                                "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsb, &err);
+        if (err) { err->lpVtbl->Release(err); err = NULL; }
+        if (SUCCEEDED(hr))
+            hr = D3DCompile(src, sizeof(src) - 1u, "ld_downsample", NULL, NULL,
+                            "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psb, &err);
+        if (err) { err->lpVtbl->Release(err); err = NULL; }
+        if (SUCCEEDED(hr) && !g.downsample_rootsig) {
+            D3D12_DESCRIPTOR_RANGE range = {0};
+            range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            range.NumDescriptors = 1;
+            D3D12_ROOT_PARAMETER rp[2] = {0};
+            rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rp[0].Constants.Num32BitValues = 5;
+            rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[1].DescriptorTable.NumDescriptorRanges = 1;
+            rp[1].DescriptorTable.pDescriptorRanges = &range;
+            rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            D3D12_ROOT_SIGNATURE_DESC rsd = {0};
+            rsd.NumParameters = 2; rsd.pParameters = rp;
+            ID3DBlob* sig = NULL;
+            hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+            if (err) err->lpVtbl->Release(err);
+            if (SUCCEEDED(hr)) {
+                hr = g.dev->lpVtbl->CreateRootSignature(g.dev, 0, sig->lpVtbl->GetBufferPointer(sig),
+                        sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature,
+                        (void**)&g.downsample_rootsig);
+                sig->lpVtbl->Release(sig);
+            }
+        }
+        if (SUCCEEDED(hr)) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+            pd.pRootSignature = g.downsample_rootsig;
+            pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
+            pd.VS.BytecodeLength = vsb->lpVtbl->GetBufferSize(vsb);
+            pd.PS.pShaderBytecode = psb->lpVtbl->GetBufferPointer(psb);
+            pd.PS.BytecodeLength = psb->lpVtbl->GetBufferSize(psb);
+            pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            pd.SampleMask = 0xFFFFFFFFu;
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            pd.NumRenderTargets = 1;
+            pd.RTVFormats[0] = fmt;
+            pd.SampleDesc.Count = 1;
+            hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd,
+                    &IID_ID3D12PipelineState, (void**)&pso);
+        }
+        if (vsb) vsb->lpVtbl->Release(vsb);
+        if (psb) psb->lpVtbl->Release(psb);
+        if (FAILED(hr) || !pso) {
+            static u32 fail_logs = 0;
+            if (fail_logs++ < 8)
+                fprintf(stderr, "[live-draw] downsample pipeline for format %u failed hr=0x%08lX\n",
+                        (unsigned)fmt, (unsigned long)hr);
+            return 0;
+        }
+        g.downsample_pso[n] = pso; g.downsample_fmt[n] = fmt;
+    }
+    u32 slots[SRV_TABLE_SIZE];
+    for (u32 i = 0; i < SRV_TABLE_SIZE; i++) slots[i] = SRV_WHITE;
+    slots[0] = SRV_SURFACE_BASE + si;
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
+    if (!table.ptr) return 0;
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g.surfaces[si].tex;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + di);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    g.list->lpVtbl->SetPipelineState(g.list, pso);
+    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.downsample_rootsig);
+    const u32 c[5] = {sx, sy, dx, dy, k};
+    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 5, c, 0);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+    const D3D12_VIEWPORT vp = {(float)dx, (float)dy, (float)w, (float)h, 0.0f, 1.0f};
+    const D3D12_RECT sc = {(LONG)dx, (LONG)dy, (LONG)(dx + w), (LONG)(dy + h)};
+    g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+    return 1;
+}
+
+/* The copy half of a scaled resolve, done on the GPU. The host surface holds
+ * the guest's grid 1:1 -- an antialiased target is kept at its sample
+ * resolution (Tornado Outbreak: pitch 10240 = 2560 guest pixels, host surface
+ * 2560x1440) -- so the guest position is the host position and a ds x dt
+ * resolve is a k x k box downsample. Each tile lands in a live surface at the display buffer it writes
  * into, so the flip presents a snapshot taken at resolve time -- presenting
  * the source live (the alias below) showed whatever the title rendered into
  * it next, and the menu flickered to black on two frames in three.
@@ -3094,15 +3221,20 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     if (slot == LD_INVALID_SURFACE || (int)slot == si) return 0;
     surface_t* dst = &g.surfaces[slot];
     if (dst->fmt != g.surfaces[si].fmt) return 0;
-    /* Host source position: guest position over the downsample factor. */
     const u32 k = ds >> 20;                       /* 20.12 fixed -> integer factor */
-    u32 sx = gx / (k ? k : 1), sy = gy / (k ? k : 1);
+    const u32 sx = gx, sy = gy;
     u32 w = out_w, h = out_h;
     if (dx >= dst->w || dy >= dst->h || sx >= g.surfaces[si].w || sy >= g.surfaces[si].h) return 0;
     if (dx + w > dst->w) w = dst->w - dx;
     if (dy + h > dst->h) h = dst->h - dy;
-    if (sx + w > g.surfaces[si].w) w = g.surfaces[si].w - sx;
-    if (sy + h > g.surfaces[si].h) h = g.surfaces[si].h - sy;
+    if (sx + w * k > g.surfaces[si].w) w = (g.surfaces[si].w - sx) / k;
+    if (sy + h * k > g.surfaces[si].h) h = (g.surfaces[si].h - sy) / k;
+    if (!w || !h) return 0;
+    if (k > 1) {
+        if (!ld_downsample((u32)si, sx, sy, k, slot, dx, dy, w, h)) return 0;
+        ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
+        return 1;
+    }
     ID3D12Resource* s = g.surfaces[si].tex;
     D3D12_RESOURCE_BARRIER b[2] = {0};
     for (int q = 0; q < 2; q++) {
@@ -10079,6 +10211,10 @@ void rsx_live_draw_shutdown(void)
     if (g.ps_cb) g.ps_cb->lpVtbl->Release(g.ps_cb);
     if (g.depth_snapshot_pso)
         g.depth_snapshot_pso->lpVtbl->Release(g.depth_snapshot_pso);
+    for (u32 i = 0; i < 4; i++)
+        if (g.downsample_pso[i]) g.downsample_pso[i]->lpVtbl->Release(g.downsample_pso[i]);
+    if (g.downsample_rootsig)
+        g.downsample_rootsig->lpVtbl->Release(g.downsample_rootsig);
     if (g.depth_snapshot_rootsig)
         g.depth_snapshot_rootsig->lpVtbl->Release(
             g.depth_snapshot_rootsig);

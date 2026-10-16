@@ -313,6 +313,7 @@ def run_port(port, build=True, shots=False):
 
     env = dict(penv)
     env["PS3_MILESTONE_OUT"] = log
+    env.setdefault("PS3_MUTE", "1")     # silent at the device; the title's audio path is unchanged
 
     # --shots: run the port the way its README documents instead of headless,
     # and keep the frames. The default gate run is deliberately headless on the

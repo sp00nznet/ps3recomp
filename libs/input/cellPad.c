@@ -19,6 +19,19 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
+/* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
+ * wall-clock seconds. A loaded machine runs a title at a third of its usual
+ * frame rate, and a wall-clock schedule then presses START on the logos; a
+ * flip schedule replays the same screens however slow the run is. */
+extern u32 cellGcm_flip_request_count(void);
+static double pad_clock(unsigned long long t0_ms)
+{
+    static int flips = -1;
+    if (flips < 0) { const char* e = getenv("PAD_CLOCK"); flips = e && !strcmp(e, "flips"); }
+    return flips ? (double)cellGcm_flip_request_count()
+                 : (double)(GetTickCount64() - t0_ms) / 1000.0;
+}
+
 /* ---------------------------------------------------------------------------
  * Backend selection
  * -----------------------------------------------------------------------*/
@@ -610,7 +623,7 @@ skip_inject: ;
       } }
 
     /* PAD_SCRIPT="<sec>:<mask>,<sec>:<mask>,..." -- press a NAMED button at a
-     * given wall-clock second, each held ~250 ms. PAD_AUTOPRESS only pulses
+     * given wall-clock second (or flip, under PAD_CLOCK=flips), each held ~250 ms. PAD_AUTOPRESS only pulses
      * CROSS and START, which is enough to clear a "press start" screen but not
      * to navigate a menu: You Don't Know Jack needs DOWN to move off its name
      * field before CROSS means anything. Masks are CELL_PAD_CTRL_* packed as
@@ -618,7 +631,7 @@ skip_inject: ;
      * LEFT 0x0080, RIGHT 0x0020, CROSS 0x4000, CIRCLE 0x2000, TRIANGLE 0x1000.
      * Legit input simulation on the same footing as PAD_AUTOPRESS/PAD_STICK. */
     { static int s_sc = -1;
-      static struct { double t; unsigned mask; } ev[32]; static int n_ev = 0;
+      static struct { double t; unsigned mask; } ev[256]; static int n_ev = 0;
       static unsigned long long t0 = 0;   /* not ULONGLONG: this builds on POSIX too */
       if (s_sc < 0) {
           s_sc = 0;
@@ -626,32 +639,33 @@ skip_inject: ;
           if (e && *e) {
               s_sc = 1; t0 = GetTickCount64();
               const char* p = e;
-              while (*p && n_ev < 32) {
+              while (*p && n_ev < 256) {
                   double t = strtod(p, (char**)&p);
                   if (*p == ':') p++;
                   unsigned m = (unsigned)strtoul(p, (char**)&p, 0);
                   ev[n_ev].t = t; ev[n_ev].mask = m; n_ev++;
                   while (*p == ',' || *p == ' ') p++;
               }
-              printf("[cellPad] PAD_SCRIPT: %d event(s)\n", n_ev);
+              printf("[cellPad] PAD_SCRIPT: %d event(s)%s\n", n_ev,
+                     *p ? " -- TRUNCATED at 256, the rest are ignored" : "");
           }
       }
       if (s_sc && port_no == 0) {
-          double now = (double)(GetTickCount64() - t0) / 1000.0;
+          double now = pad_clock(t0);
           /* Latch, do not window. A fixed time window is missed whenever the
            * title stops polling the pad for longer than the window (it does
            * exactly that on a loading screen), so the press silently never
            * happens. Fire on the first poll at or after the event time and
            * hold it for a fixed number of polls, which is what a real press
            * looks like regardless of poll rate. */
-          static int fired[32], held[32];
+          static int fired[256], held[256];
           for (int i = 0; i < n_ev; i++) {
               if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = 40; }
               if (held[i] > 0) {
                   held[i]--;
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
-                  static int said[32];
+                  static int said[256];
                   if (!said[i]) { said[i] = 1;
                       printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
               }
@@ -714,7 +728,7 @@ skip_inject: ;
                  sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+      if (s_st && pad_clock(s_t0) >= s_from && pad_clock(s_t0) < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
