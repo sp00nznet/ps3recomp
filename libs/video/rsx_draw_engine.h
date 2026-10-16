@@ -226,6 +226,13 @@ typedef struct rsx_draw_backend {
      * storage, never an averaged resolve. No single-sample fallback. */
     u32 (*color_target_create_multisample)(void*, rsx_be_format, u32, u32, u32);
     u32 (*depth_target_create_multisample)(void*, u32, u32, u32);
+    /* Optional private world-color replacement. The engine qualifies the
+     * current camera/depth and compositor before calling. Return0 keeps the
+     * original texture. Never modify guest color/depth images or handles. */
+    u32 (*ambient_occlusion)(void* user, u32 color, u32 depth,
+                             u32 logical_w, u32 logical_h,
+                             const float projection[16], u32 remap,
+                             u32 rsx_format, float radius, float strength);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

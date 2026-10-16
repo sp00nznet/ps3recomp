@@ -106,6 +106,9 @@ typedef struct {
     u32 handle;
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
+#ifdef PS3RECOMP_RSX_CACAO
+    int ao_invalidated;     /* external guest writes break scene association */
+#endif
 } eng_surface;
 
 typedef struct {
@@ -176,6 +179,10 @@ static struct {
     u32 last_present_surface;
     u32 last_flip_buffer;
     u64 write_serial;       /* orders colour and depth writes to one address */
+#ifdef PS3RECOMP_RSX_CACAO
+    int ao_enabled, ao_logged;
+    float ao_radius, ao_strength;
+#endif
 
     /* staging: decoded texture levels, the constant blocks, the index list */
     u8* tex_staging;
@@ -614,6 +621,9 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->handle = handle;
     s->color_serial = 0;
     s->guest_dirty = 0;
+#ifdef PS3RECOMP_RSX_CACAO
+    s->ao_invalidated=0;
+#endif
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (logs++ < 16)
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
@@ -786,6 +796,12 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
 #ifdef PS3RECOMP_RSX_CACAO
     if (g.ready && pitch && w && h) {
         const u64 begin=offset, end=begin+(u64)(h-1u)*pitch+(u64)w*4u;
+        for (u32 i=0;i<g.n_surfaces;++i) {
+            eng_surface* s=&g.surfaces[i];
+            const u64 send=(u64)s->offset+(u64)s->pitch*s->h;
+            if (s->handle && s->location==location && s->pitch && begin<send && end>s->offset)
+                s->ao_invalidated=1;
+        }
         for (u32 i=0;i<g.n_zdepths;++i) {
             eng_zdepth* z=&g.zdepths[i];
             const u64 zend=(u64)z->offset+(u64)z->pitch*z->h;
@@ -1225,6 +1241,7 @@ static void eng_ao_depth_draw(u32 zslot, const eng_pipeline* pipeline,
     rsx_ao_depth_write(&g.zdepths[zslot].ao,g.frames,
         g.zdepths[zslot].depth_serial,width,height,known ? &projection : NULL);
 }
+#include "rsx_ao_compositor.inc"
 #endif
 
 static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
@@ -2533,6 +2550,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                             textures, samplers);
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
+#ifdef PS3RECOMP_RSX_CACAO
+    if (g.ao_enabled && !pipeline_is_fixed && !vtex_mask) {
+        rsx_dsp_texture color_tex,depth_tex;
+        rsx_dsp_get_texture(&g.rsx,0,&color_tex);
+        rsx_dsp_get_texture(&g.rsx,1,&depth_tex);
+        textures[0]=eng_ao_composite(targets,n_targets,zslot,&rs,tex_mask,
+                                     &color_tex,&depth_tex,textures[0]);
+    }
+#endif
 
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) return;
@@ -2682,6 +2708,9 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         for (u32 i = 0; i < n_targets; i++)
             g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
         eng_surfaces_wrote(targets, n_targets);
+#ifdef PS3RECOMP_RSX_CACAO
+        for(u32 i=0;i<n_targets;++i)g.surfaces[targets[i]].ao_invalidated=0;
+#endif
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         rsx_dsp_surface sf;
@@ -2819,6 +2848,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
+#ifdef PS3RECOMP_RSX_CACAO
+    eng_ao_configure();
+#endif
     /* Display buffers the title registered before the backend came up. */
     cellGcm_replay_display_buffers_to_engine();
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",

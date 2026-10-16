@@ -542,6 +542,15 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
         endif()
         set_target_properties(test_vulkan_msaa_gpu PROPERTIES LINKER_LANGUAGE CXX)
         if(PS3RECOMP_RSX_CACAO)
+            if(NOT WIN32)
+                add_executable(test_ao_composite_engine EXCLUDE_FROM_ALL tests/test_ao_composite_engine.c)
+                target_include_directories(test_ao_composite_engine PRIVATE
+                    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+                target_compile_options(test_ao_composite_engine PRIVATE -ffunction-sections -fdata-sections)
+                target_link_options(test_ao_composite_engine PRIVATE -Wl,--gc-sections)
+                target_link_libraries(test_ao_composite_engine PRIVATE m)
+            endif()
             add_executable(test_vulkan_ao_gpu EXCLUDE_FROM_ALL
                 tests/test_vulkan_ao_gpu.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
             target_compile_definitions(test_vulkan_ao_gpu PRIVATE PS3RECOMP_RSX_CACAO)

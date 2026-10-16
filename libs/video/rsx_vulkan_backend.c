@@ -3500,6 +3500,9 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .color_target_write   = vk_eng_color_target_write,
     .color_target_create_multisample = vk_eng_color_multisample,
     .depth_target_create_multisample = vk_eng_depth_multisample,
+#ifdef PS3RECOMP_RSX_CACAO
+    .ambient_occlusion = vk_eng_cacao_world,
+#endif
 };
 
 static rsx_backend s_vulkan_backend = {
