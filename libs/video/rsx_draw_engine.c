@@ -1768,12 +1768,15 @@ static u32 sink_bind_vertex_textures(
  * RSX_ENGINE_PASS_DUMP_MAX passes (default 64). RSX_ENGINE_PASS_DUMP_DRAWS=1
  * also writes one line per draw to <dir>/draws.txt: its pipeline, colour
  * mask, blend, depth state and the textures it samples.
+ * RSX_ENGINE_PASS_DUMP_TRIGGER=<file> instead waits for an explicit file
+ * created after an observed scene, then starts at the next frame boundary.
  *
  * The question it answers is which pass of a multi-pass frame first comes out
  * wrong. */
 static struct {
     int state;              /* 0 unread, 1 waiting, 2 capturing, 3 done/off */
     const char* dir;
+    const char* trigger;
     u32 min_draws;
     u32 after_s;
     u32 max_passes;
@@ -1806,6 +1809,8 @@ static int pd_capturing(void)
 {
     if (s_pd.state == 0) {
         s_pd.dir = getenv("RSX_ENGINE_PASS_DUMP");
+        s_pd.trigger = getenv("RSX_ENGINE_PASS_DUMP_TRIGGER");
+        if (s_pd.trigger && !*s_pd.trigger) s_pd.trigger = NULL;
         const char* m = getenv("RSX_ENGINE_PASS_DUMP_MINDRAWS");
         s_pd.min_draws = m ? (u32)strtoul(m, NULL, 0) : 1u;
         const char* a = getenv("RSX_ENGINE_PASS_DUMP_AFTER");
@@ -1815,7 +1820,7 @@ static int pd_capturing(void)
         s_pd.start = time(NULL);
         s_pd.state = (s_pd.dir && *s_pd.dir) ? 1 : 3;
     }
-    if (s_pd.state == 1 && s_pd.after_s &&
+    if (s_pd.state == 1 && !s_pd.trigger && s_pd.after_s &&
         difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
         fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
     return s_pd.state == 2;
@@ -2048,7 +2053,17 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
 static void pd_present(u32 presented)
 {
     if (s_pd.state == 0) pd_capturing();
-    if (s_pd.state == 1 && !s_pd.after_s && g.guest_draws >= s_pd.min_draws) {
+    if (s_pd.state == 1 && s_pd.trigger) {
+        FILE* trigger = fopen(s_pd.trigger, "rb");
+        if (trigger) {
+            fclose(trigger);
+            if (pd_open_index())
+                fprintf(s_pd.index, "explicit trigger: frame %u after %u guest draws\n",
+                        g.frames + 1, g.guest_draws);
+        }
+        return;
+    }
+    if (s_pd.state == 1 && !s_pd.trigger && !s_pd.after_s && g.guest_draws >= s_pd.min_draws) {
         if (pd_open_index())
             fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
                     g.frames + 1, g.guest_draws);
