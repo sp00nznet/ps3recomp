@@ -186,6 +186,12 @@ static inline int mfc_strict_ordinary(uint32_t cmd)
  * a partial OS copy is fatal and never completes the tag. */
 static inline int mfc_strict_span(uintptr_t address, uint32_t size, int writing)
 {
+#if defined(__ANDROID__) && defined(__aarch64__)
+    /* Android tags heap pointers in the top byte. /proc/self/maps contains
+     * untagged virtual addresses. Normalize only this lookup, retaining the
+     * original pointer for the OS copy and allocator/tag checks. */
+    address &= UINT64_C(0x00ffffffffffffff);
+#endif
     if (!size || size > UINTPTR_MAX - address) return 0;
     uintptr_t current = address, end = address + size;
 #ifdef _WIN32
