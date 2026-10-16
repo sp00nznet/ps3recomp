@@ -123,6 +123,7 @@ static void pad_backend_unlock(void)
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
 static PadMotionSDL s_sdl_motion[PAD_MAX_HOST_PORTS];
+static SDL_JoystickID s_sdl_instance[PAD_MAX_HOST_PORTS];
 #endif
 
 /* Keyboard fallback for port 0.
@@ -325,17 +326,60 @@ static u8 pad_sdl_trigger_to_u8(int raw)
     return (u8)val;
 }
 
+/* SDL joystick indices include unmapped devices (notably Android's phone
+ * accelerometer). Guest ports contain only mapped game controllers. Reuse by
+ * instance ID so hotplug/index changes never open the same pad twice. */
+static void pad_refresh_sdl2(void)
+{
+    SDL_GameController* next[PAD_MAX_HOST_PORTS] = {0};
+    PadMotionSDL motion[PAD_MAX_HOST_PORTS] = {0};
+    SDL_JoystickID instance[PAD_MAX_HOST_PORTS] = {0};
+    int port = 0;
+    SDL_LockJoysticks();
+    const int count = SDL_NumJoysticks();
+    for (int device = 0; device < count && port < PAD_MAX_HOST_PORTS; ++device) {
+        if (!SDL_IsGameController(device)) continue;
+        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(device);
+        if (id < 0) continue;
+        int duplicate = 0;
+        for (int j = 0; j < port; ++j) if (instance[j] == id) duplicate = 1;
+        if (duplicate) continue;
+        for (int j = 0; j < PAD_MAX_HOST_PORTS; ++j) {
+            if (s_sdl_controllers[j] && s_sdl_instance[j] == id &&
+                SDL_GameControllerGetAttached(s_sdl_controllers[j])) {
+                next[port] = s_sdl_controllers[j];
+                motion[port] = s_sdl_motion[j];
+                if (j != port) {
+                    /* Sensor requests belong to guest ports, not a previous
+                     * position in SDL's changing device list. */
+                    pad_motion_sdl_set_enabled(&motion[port],next[port],0);
+                }
+                s_sdl_controllers[j] = NULL;
+                break;
+            }
+        }
+        if (!next[port]) next[port] = SDL_GameControllerOpen(device);
+        if (!next[port]) continue;
+        instance[port++] = id;
+    }
+    for (int j = 0; j < PAD_MAX_HOST_PORTS; ++j) {
+        if (s_sdl_controllers[j]) {
+            pad_motion_sdl_set_enabled(&s_sdl_motion[j],s_sdl_controllers[j],0);
+            SDL_GameControllerClose(s_sdl_controllers[j]);
+        }
+    }
+    memcpy(s_sdl_controllers,next,sizeof(next));
+    memcpy(s_sdl_motion,motion,sizeof(motion));
+    memcpy(s_sdl_instance,instance,sizeof(instance));
+    SDL_UnlockJoysticks();
+}
+
 static void pad_poll_sdl2(void)
 {
     SDL_GameControllerUpdate();
+    pad_refresh_sdl2();
 
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        if (!s_sdl_controllers[i]) {
-            /* Try to open newly connected controllers */
-            if (SDL_IsGameController(i)) {
-                s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-            }
-        }
 
         SDL_GameController* gc = s_sdl_controllers[i];
         if (!gc || !SDL_GameControllerGetAttached(gc)) {
@@ -419,13 +463,8 @@ static void pad_init_backend(void)
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
     memset(s_sdl_motion,0,sizeof(s_sdl_motion));
 
-    /* Open any controllers already connected */
-    int num = SDL_NumJoysticks();
-    for (int i = 0; i < num && i < PAD_MAX_HOST_PORTS; i++) {
-        if (SDL_IsGameController(i)) {
-            s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-        }
-    }
+    memset(s_sdl_instance,0,sizeof(s_sdl_instance));
+    pad_refresh_sdl2();
 }
 
 static void pad_shutdown_backend(void)

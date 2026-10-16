@@ -29,14 +29,17 @@ static SDL_bool fixture_enabled(SDL_GameController* p,SDL_SensorType t)
 static int sensor(SDL_GameController* p,SDL_SensorType t,Uint64* ts,float* values,int n)
 { if(!fixture_enabled(p,t)||n!=3||fixture.read_fail)return -1;*ts=fixture.ts;memcpy(values,t==SDL_SENSOR_GYRO?fixture.gyro:fixture.accel,3*sizeof(float));return 0; }
 static void update(void) {}
-static SDL_bool is_controller(int i) { return i==0&&fixture.attached; }
-static SDL_GameController* open_controller(int i) { return is_controller(i)?controller():NULL; }
-static void close_controller(SDL_GameController* p) { (void)p; }
+static int leading_unmapped, fixture_opens, fixture_closes, fixture_open_fail;
+static SDL_JoystickID fixture_instance = 42;
+static SDL_bool is_controller(int i) { return i==leading_unmapped&&fixture.attached; }
+static SDL_JoystickID device_instance(int i) { return is_controller(i)?fixture_instance:-1; }
+static SDL_GameController* open_controller(int i) { if(!is_controller(i)||fixture_open_fail)return NULL; ++fixture_opens;return controller(); }
+static void close_controller(SDL_GameController* p) { (void)p;++fixture_closes; }
 static Uint8 button(SDL_GameController* p,SDL_GameControllerButton b) { (void)p;(void)b;return 0; }
 static Sint16 axis(SDL_GameController* p,SDL_GameControllerAxis a) { (void)p;(void)a;return 0; }
 static Uint32 was_init(Uint32 flags) { return flags; }
 static int init(Uint32 flags) { (void)flags;return 0; }
-static int joysticks(void) { return fixture.attached; }
+static int joysticks(void) { return leading_unmapped+fixture.attached; }
 static int rumble(SDL_GameController* p,Uint16 a,Uint16 b,Uint32 t) { (void)p;(void)a;(void)b;(void)t;return 0; }
 #define SDL_GameControllerGetAttached attached
 #define SDL_GameControllerHasSensor capable
@@ -52,6 +55,9 @@ static int rumble(SDL_GameController* p,Uint16 a,Uint16 b,Uint32 t) { (void)p;(v
 #define SDL_WasInit was_init
 #define SDL_InitSubSystem init
 #define SDL_NumJoysticks joysticks
+#define SDL_JoystickGetDeviceInstanceID device_instance
+#define SDL_LockJoysticks update
+#define SDL_UnlockJoysticks update
 #define SDL_GameControllerRumble rumble
 #include "../libs/input/cellPad.c"
 uint8_t* vm_base;
