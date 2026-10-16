@@ -311,6 +311,8 @@ def test_spilled_table_base():
     check('indexed stack write rejected', discover(prefix + [stdx] + tail, mem), None)
     stdx_alias = (31 << 26) | (6 << 21) | (8 << 16) | (9 << 11) | (149 << 1)
     check('indexed write through possible alias rejected', discover(prefix + [stdx_alias] + tail, mem), None)
+    check('displacement write through possible alias rejected',
+          discover(prefix + [w_std(6, 8, 0)] + tail, mem), None)
 
 
 if __name__ == "__main__":
