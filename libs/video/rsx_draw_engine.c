@@ -13,6 +13,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_draw_batches.h"
 #include "rsx_depth_clip.h"
+#include "rsx_capture_depth.h"
 #include "rsx_shader_window.h"
 #include "rsx_surface_layout.h"
 #include "ps3emu/strict_boot.h"
@@ -1891,6 +1892,9 @@ static u32 sink_bind_vertex_textures(
  * the GPU and is for diagnosis, never performance measurements.
  * RSX_ENGINE_PASS_DUMP_TRIGGER=<file> instead waits for an explicit file
  * created after an observed scene, then starts at the next frame boundary.
+ * RSX_ENGINE_PASS_DUMP_DEPTH_RAW=1 also preserves original readback float
+ * samples in passNNN_z.f32le (16MiB/file, 256MiB/capture). Dimensions, layout
+ * and depth range remain in the pass/state records. This is not a timing run.
  *
  * The question it answers is which pass of a multi-pass frame first comes out
  * wrong. */
@@ -1910,6 +1914,7 @@ static struct {
     u32 draws, clears;
     u64 geometry_bytes;
     u64 image_bytes;
+    u64 depth_bytes;
     char first[2048];
 } s_pd;
 
@@ -2060,6 +2065,21 @@ static void pd_write_depth(u32 zslot, const char* path, float* lo_out, float* hi
     if (f) {
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, d, w * 4u) == 0) {
+            const char* raw=getenv("RSX_ENGINE_PASS_DUMP_DEPTH_RAW");
+            if(raw && !strcmp(raw,"1")) {
+                const u64 bytes=(u64)w*h*4u;
+                if(bytes<=RSX_CAPTURE_DEPTH_MAX_BYTES &&
+                   s_pd.depth_bytes+bytes<=256u*1024u*1024u) {
+                    s_pd.depth_bytes+=bytes; /* Charge failed/partial writes too. */
+                    char raw_path[1024];
+                    int length=snprintf(raw_path,sizeof(raw_path),"%s/pass%03u_z.f32le",s_pd.dir,s_pd.pass);
+                    FILE* output=length>0 && (size_t)length<sizeof(raw_path)?fopen(raw_path,"wb"):NULL;
+                    int ok=output && !rsx_capture_depth_write(output,d,(size_t)w*h);
+                    if(output && fclose(output))ok=0;
+                    fprintf(s_pd.index," | rawdepth %s pass%03u_z.f32le f32le image-y0-first %ux%u",
+                            ok?"written":"failed",s_pd.pass,w,h);
+                } else fprintf(s_pd.index," | rawdepth skipped-budget");
+            }
             float lo = 1.0f, hi = 0.0f;
             for (size_t i = 0; i < (size_t)w * h; i++) {
                 if (d[i] < lo) lo = d[i];
