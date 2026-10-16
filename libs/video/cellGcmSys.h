@@ -283,6 +283,8 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
  * title-screen state machine from the VBlank handler. */
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
+/* Host presentation suspension only; never completes a guest flip. */
+void cellGcmSetHostPresentationSuspended(int suspended);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);

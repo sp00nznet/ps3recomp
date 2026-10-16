@@ -308,6 +308,13 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
  * wait for the RSX to catch up before recycling the ring (else the frame's
  * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
 _Atomic u32 g_gcm_fifo_drained_ea = 0;
+/* Only the owning host renderer reports suspension. This does not acknowledge
+ * guest flips or permit the producer to reuse unread command storage. */
+static _Atomic int s_host_presentation_suspended = 0;
+void cellGcmSetHostPresentationSuspended(int suspended)
+{
+    atomic_store_explicit(&s_host_presentation_suspended, suspended != 0, memory_order_release);
+}
 
 /* The guest variable cellGcmInit's ctx_out pointed at -- the title's own
  * gCellGcmCurrentContext. A title that switches to a command buffer of its own
@@ -2251,17 +2258,27 @@ static u32 gcm_ea2io(u32 ea)
 
 static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begin)
 {
-    const u64 started = get_timestamp_ns();
+    u64 started = get_timestamp_ns();
     u64 progressed = started;
+    u64 sampled = started;
     u32 previous = atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire);
     int spins = 0;
     while ((previous == begin) != at_begin) {
         Sleep(1); ++spins;
         const u32 drained = atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire);
         const u64 now = get_timestamp_ns();
+        const int suspended = atomic_load_explicit(&s_host_presentation_suspended, memory_order_acquire);
+        if (suspended) {
+            /* The renderer deliberately retains a flip while its host window
+             * is minimized. Exclude only that explicit paused time from both
+             * deadlines; normal stalled-drain checks resume on restoration. */
+            started += now - sampled;
+            progressed += now - sampled;
+        }
+        sampled = now;
         if (drained != previous) { previous = drained; progressed = now; }
         if ((drained == begin) == at_begin) break;
-        if (now - progressed >= UINT64_C(5000000000) || now - started >= UINT64_C(30000000000))
+        if (!suspended && (now - progressed >= UINT64_C(5000000000) || now - started >= UINT64_C(30000000000)))
             ps3_strict_boot_guard("rsx-refill-drain-stalled", "context=0x%08X begin=0x%08X current=0x%08X drained=0x%08X await_begin=%d elapsed_ms=%llu idle_ms=%llu", ctx_ea, begin, current, drained, at_begin, (unsigned long long)((now-started)/1000000), (unsigned long long)((now-progressed)/1000000));
     }
     return spins;
