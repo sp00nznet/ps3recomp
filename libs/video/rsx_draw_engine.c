@@ -2280,16 +2280,20 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      rt->raster_w, rt->raster_h, rt->samples);
 
-    /* A guest program pair that will not translate has no fallback: the draw
-     * is dropped, as the reference engine drops it. Substituting the built-in
-     * program would draw the geometry in the wrong colours, which is harder to
-     * see than a missing object and hides the translation failure. */
+    /* Strict execution must expose an unavailable required pipeline. */
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used);
-    if (!pipeline) return;
+    if (!pipeline) {
+        u32 fp_location=0;
+        const u32 fp_offset=rsx_dsp_fragment_program(&g.rsx,&fp_location);
+        ps3_strict_boot_guard("rsx-pipeline-unavailable",
+            "fp_location=%u fp_offset=0x%08X vertices=%u elements=%u attributes=0x%08X targets=%u",
+            fp_location,fp_offset,dc.n_verts,n_draw,layout.mask,n_targets);
+        return;
+    }
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */

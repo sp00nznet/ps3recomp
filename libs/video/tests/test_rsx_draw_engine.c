@@ -74,6 +74,7 @@ typedef struct {
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
+    int force_pipeline_failure;
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
 
@@ -174,6 +175,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
 {
     (void)u; (void)rs; (void)layout; (void)stride; (void)rt;
     if (!vs || !ps || !*vs || !*ps) return 0;
+    if (stub.force_pipeline_failure) return 0;
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
     return stub_handle();
@@ -1235,7 +1237,7 @@ static void test_multisample_seed(void)
     }
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
     if (!vm_base) { printf("[FAIL] guest memory\n"); return 1; }
@@ -1245,6 +1247,12 @@ int main(void)
     for (u32 i = 0; i < 3 * 4; i++) {
         u8* p = vm_base + VTX_OFFSET + i * 4;
         p[0] = 0x3F; p[1] = 0x80; p[2] = 0; p[3] = 0;    /* 1.0f big-endian */
+    }
+
+    if(argc==2 && !strcmp(argv[1],"--check-pipeline-failure")) {
+        engine_up();stub.force_pipeline_failure=1;draw_triangle();
+        fprintf(stderr,"required pipeline failure returned instead of stopping\n");
+        engine_down();free(vm_base);return 1;
     }
 
     test_surface_set();
