@@ -57,6 +57,25 @@ typedef struct {
 
 static VdecSlot s_vdec[MAX_VDEC];
 
+/* Opt-in, bounded observations of real decoder/callback progress. No queue
+ * changes or guest callbacks are added by tracing. Each host thread owns its
+ * counters so diagnostics do not introduce another shared counter race. */
+static void vdec_trace(unsigned phase, CellVdecHandle handle, u32 detail)
+{
+    static _Thread_local u32 calls[6];
+    static const char* names[] = {"notify-enter", "notify-return", "busy",
+                                "queued", "get-item", "get-picture"};
+    const char* enabled = getenv("PS3_VDEC_TRACE");
+    if (!enabled || !*enabled || *enabled == '0' || phase >= 6 || handle >= MAX_VDEC)
+        return;
+    const u32 n = ++calls[phase];
+    if (n > 24 && (n & (n - 1))) return;
+    const VdecSlot* v = &s_vdec[handle];
+    fprintf(stderr, "[vdec-trace] phase=%s thread=%p n=%u handle=%u detail=0x%08X au=%u head=%u count=%u cb=0x%08X arg=0x%08X caller=%d\n",
+        names[phase], (void*)calls, n, handle, detail, v->auCount,
+        v->qHead, v->qCount, v->cbFunc, v->cbArg, g_ps3_guest_caller != NULL);
+}
+
 /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
  * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
  * to call it as a host function pointer, which crashes the first time a
@@ -67,9 +86,11 @@ static void vdec_notify(CellVdecHandle handle, u32 msg_type, s32 msg_data)
 {
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return;
     const VdecSlot* v = &s_vdec[handle];
+    vdec_trace(0, handle, msg_type);
     if (!v->cbFunc || !g_ps3_guest_caller) return;
     g_ps3_guest_caller(v->cbFunc, (u64)handle, (u64)msg_type,
                        (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
+    vdec_trace(1, handle, msg_type);
 }
 
 /* ---------------------------------------------------------------------------
@@ -114,6 +135,7 @@ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
     q->item.height    = (u16)pic->height;
     v->qCount++;
     v->newPics++;
+    vdec_trace(3, (CellVdecHandle)(v - s_vdec), pic->token);
 }
 
 /* PICOUT for each picture the last decoder call queued. */
@@ -272,8 +294,10 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
            (unsigned long long)au.pts);
 
     if (v->ff) {
-        if (v->qCount >= VDEC_BUSY_AT)
+        if (v->qCount >= VDEC_BUSY_AT) {
+            vdec_trace(2, handle, au.startAddr);
             return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
+        }
         v->auCount++;
         v->aus[v->auCount % VDEC_AU_RING] = au;
         v->newPics = 0;
@@ -378,6 +402,7 @@ static void vdec_write_pic_type(CellVdecHandle handle, const VdecPic* q)
 s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
 {
     u32 out = (u32)(uintptr_t)picItem;
+    vdec_trace(4, handle, out);
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !out)
         return (s32)CELL_VDEC_ERROR_ARG;
     const VdecSlot* v = &s_vdec[handle];
@@ -422,6 +447,7 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
 s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
 {
     u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
+    vdec_trace(5, handle, dst);
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
