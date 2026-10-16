@@ -1265,6 +1265,32 @@ static u32 eng_cube_mask(void)
     return mask;
 }
 
+static void eng_shadow_state(rsx_fp_shadow_state* out)
+{
+    memset(out, 0, sizeof *out);
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const u32 fmt = t.format & ~(RSX_TEX_FMT_LINEAR | RSX_TEX_FMT_UNNORM);
+        const u32 compare = (t.wrap >> 28) & 15u;
+        /* RPCS3 RSXThread::get_current_fragment_program_state: depth formats
+         * compare for zfunc 1..6 when alpha kill is disabled. NEVER/ALWAYS
+         * select ordinary sampling. This is shader state, not sampler state. */
+        if (!t.enabled || !t.width || !t.height || fmt < 0x90u || fmt > 0x93u ||
+            (t.control0 & 4u) || compare == 0u || compare >= 7u) continue;
+        const u32 bit = 1u << u;
+        rsx_be_sampler_desc sampler;
+        eng_decode_sampler(t.filter, t.wrap, t.control0, &sampler);
+        out->mask |= bit;
+        out->compare[u] = compare;
+        if (t.cubemap || t.dimension != 2u || t.mipmaps > 1u)
+            out->unsupported_mask |= bit;
+        if (t.format & RSX_TEX_FMT_UNNORM) out->unnorm_mask |= bit;
+        if (sampler.min_linear) out->min_linear_mask |= bit;
+        if (sampler.mag_linear) out->mag_linear_mask |= bit;
+    }
+}
+
 /* Are both of the guest's own programs resident? One answer, used by the
  * layout and by the pipeline, because they must not disagree: the built-in
  * program declares all sixteen inputs, so narrowing the layout for it would
@@ -1412,6 +1438,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 vtex_mask = eng_vtex_mask();
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
     const u32 unnorm_mask = eng_unnorm_units(unnorm_dim);
+    rsx_fp_shadow_state shadow;
+    eng_shadow_state(&shadow);
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1435,6 +1463,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&shader_window, sizeof shader_window, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+        key = eng_fnv1a(&shadow, sizeof shadow, key);
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
     }
@@ -1464,7 +1493,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
-        fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
+        fi = rsx_fp_decompile_shadow_ex(fp_uc, fp_size, fp_ctrl, cube_mask, &shadow,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rsx_fp_apply_shader_window(s_ps_hlsl, sizeof s_ps_hlsl, shader_window) < 0) {
@@ -2192,9 +2221,9 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
                 break;
             }
         at += (size_t)snprintf(s_pd.first + at, sizeof s_pd.first - at,
-            " t%u %u:0x%08X f%02X %ux%u p%u%s r%04X zf%u %s", u, t.location, t.offset,
+            " t%u %u:0x%08X f%02X %ux%u p%u%s r%04X zf%u c0%08X fl%08X dim%u mip%u %s", u, t.location, t.offset,
             t.format & 0xFFu, t.width, t.height, t.pitch, t.cubemap ? " cube" : "",
-            t.remap & 0xFFFFu, t.wrap >> 28, src);
+            t.remap & 0xFFFFu, t.wrap >> 28, t.control0, t.filter, t.dimension, t.mipmaps, src);
     }
 }
 

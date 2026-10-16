@@ -327,6 +327,50 @@ int main(void)
         check("large_program_return", backend_hlsl, "return (_o == _o) ? _o");
     }
 
+    /* Depth comparison retains z/w and changes shader identity without
+     * affecting ordinary sampling or applying texel-coordinate scaling twice. */
+    {
+        u8 prog[16] = {0};
+        char ordinary[16384];
+        rsx_fp_shadow_state shadow = {0};
+        put_word(prog, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(3) | END);
+        put_word(prog+4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        check_true("ordinary_buffered_tex", rsx_fp_decompile_buffered_ex(
+            prog, sizeof prog, CTRL_32BIT, 0, ordinary, sizeof ordinary, NULL) == 1);
+        check_true("empty_shadow_config", rsx_fp_decompile_shadow_ex(
+            prog, sizeof prog, CTRL_32BIT, 0, &shadow, hlsl, sizeof hlsl, NULL) == 1 &&
+            strcmp(ordinary,hlsl)==0);
+        shadow.mask=1u<<3; shadow.compare[3]=3; shadow.unnorm_mask=1u<<3;
+        shadow.min_linear_mask=1u<<3;
+        check_true("shadow_tex", rsx_fp_decompile_shadow_ex(
+            prog, sizeof prog, CTRL_32BIT, 0, &shadow, hlsl, sizeof hlsl, NULL)==1);
+        check("shadow_resource_argument",hlsl,"rsx_shadow_sample(rsx_tex[3], rsx_samp[3],");
+        check("shadow_flags",hlsl,", 3u, 0u, 1u, 1u, 0u)");
+        const u32 dim[16][2]={{0}};
+        check_true("shadow_not_scaled_twice",rsx_fp_apply_unnorm_scale(
+            hlsl,sizeof hlsl,1u<<3,dim,0)==0);
+        put_word(prog, OPC(0x18) | OUTMASK_ALL | INSRC(4) | TEXU(3) | END);
+        check_true("shadow_projective",rsx_fp_decompile_shadow_ex(
+            prog,sizeof prog,CTRL_32BIT,1u<<2,&shadow,hlsl,sizeof hlsl,NULL)==1);
+        check("shadow_mixed_resource_bank",hlsl,"rsx_shadow_sample(rsx_tex3, rsx_samp[3],");
+        check("shadow_projected_flags",hlsl,", 3u, 1u, 1u, 1u, 0u)");
+        shadow.unsupported_mask=1u<<3;
+        check_true("shadow_unsupported_layout_rejected",rsx_fp_decompile_shadow_ex(
+            prog,sizeof prog,CTRL_32BIT,0,&shadow,hlsl,sizeof hlsl,NULL)<0);
+        shadow.unsupported_mask=0;
+        check_true("shadow_cube_rejected",rsx_fp_decompile_shadow_ex(
+            prog,sizeof prog,CTRL_32BIT,1u<<3,&shadow,hlsl,sizeof hlsl,NULL)<0);
+        const u32 unsupported_ops[]={0x19,0x31,0x2F};
+        for(u32 i=0;i<3;i++) {
+            put_word(prog,OPC(unsupported_ops[i])|OUTMASK_ALL|TEXU(3)|END);
+            check_true("shadow_explicit_lod_or_grad_rejected",rsx_fp_decompile_shadow_ex(
+                prog,sizeof prog,CTRL_32BIT,0,&shadow,hlsl,sizeof hlsl,NULL)<0);
+        }
+        put_word(prog,OPC(0x17)|OUTMASK_ALL|TEXU(3)|END);
+        check_true("shadow_capacity_checked",rsx_fp_decompile_shadow_ex(
+            prog,sizeof prog,CTRL_32BIT,0,&shadow,hlsl,64,NULL)<0);
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

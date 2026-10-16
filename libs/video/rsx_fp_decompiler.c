@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_window.h"
+#include "rsx_shadow_sampling.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -442,7 +443,8 @@ int rsx_fp_apply_shader_window(char* hlsl, u32 out_size, u32 raw)
 
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    int buffered, char* out, u32 out_size, u32* out_constant_count)
+    int buffered, const rsx_fp_shadow_state* shadow,
+    char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
 
@@ -513,6 +515,14 @@ static int rsx_fp_decompile_internal(
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
         int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
+        const int shadow_sample = shadow && ((shadow->mask >> tex_unit) & 1u);
+        if (!is_branch && shadow_sample &&
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXD ||
+             opcode == OP_TXB || opcode == OP_TXL)) {
+            if (((shadow->unsupported_mask | tex_cube_mask) >> tex_unit) & 1u ||
+                shadow->compare[tex_unit] > 7u ||
+                (opcode != OP_TEX && opcode != OP_TXP)) return -1;
+        }
 
         /* Execution condition (exec_if) + condition-code write (set_cond).
          * Faithful to RPCS3 FragmentProgramDecompiler {GetRawCond, AddCodeCond,
@@ -697,7 +707,22 @@ static int rsx_fp_decompile_internal(
         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
-            if ((tex_cube_mask >> tex_unit) & 1u)
+        case OP_TXP:
+            if (shadow_sample) {
+                char tn[32];
+                snprintf(tn, sizeof tn, tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+                snprintf(rhs, sizeof rhs,
+                         "rsx_shadow_sample(%s, rsx_samp[%u], %s, %uu, %uu, %uu, %uu, %uu)",
+                         tn, tex_unit, a, shadow->compare[tex_unit], opcode == OP_TXP,
+                         (shadow->unnorm_mask >> tex_unit) & 1u,
+                         (shadow->min_linear_mask >> tex_unit) & 1u,
+                         (shadow->mag_linear_mask >> tex_unit) & 1u);
+            } else if (opcode == OP_TXP && !((tex_cube_mask >> tex_unit) & 1u)) {
+                char tn[32];
+                snprintf(tn, sizeof tn, tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+                snprintf(rhs, sizeof rhs, "%s.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
+                         tn, tex_unit, a, a);
+            } else if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Cubemap: sample with the full 3-component direction vector. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
@@ -707,21 +732,6 @@ static int rsx_fp_decompile_internal(
             else
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
-            break;
-        case OP_TXP:
-            if ((tex_cube_mask >> tex_unit) & 1u)
-                /* Projective divide is meaningless for a cube lookup; sample
-                 * the direction directly. */
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_cube_mask)
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                         tex_unit, tex_unit, a, a);
-            else
-                snprintf(rhs, sizeof(rhs),
-                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
-                         tex_unit, tex_unit, a, a);
             break;
         case OP_TXB: case OP_TXL: {
             /* Biased / explicit-LOD sample; bias or LOD is src1.x (RPCS3
@@ -902,7 +912,7 @@ static int rsx_fp_decompile_internal(
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. Built here, in front of
      * the body, now that the return type is known. */
-    char preamble[2048];
+    char preamble[2048 + sizeof rsx_shadow_hlsl];
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
     out_puts(&p,
@@ -940,6 +950,7 @@ static int rsx_fp_decompile_internal(
             buffered_constant_count ? buffered_constant_count : 1u);
         out_puts(&p, constants_decl);
     }
+    if (shadow && shadow->mask) out_puts(&p, rsx_shadow_hlsl);
     if (targets == 1) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
@@ -965,7 +976,7 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, NULL, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -973,8 +984,17 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
+        ucode, max_bytes, ctrl, tex_cube_mask, 1, NULL, out, out_size,
         out_constant_count);
+}
+
+int rsx_fp_decompile_shadow_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const rsx_fp_shadow_state* shadow,
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+                                    1, shadow, out, out_size, out_constant_count);
 }
 
 static float fp_half_to_float(u16 h)

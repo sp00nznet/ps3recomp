@@ -128,6 +128,18 @@ int rsx_fp_decompile_buffered_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     char* out, u32 out_size, u32* out_constant_count);
 
+/* Software depth comparison over the backend's R32_FLOAT snapshots. All
+ * fields are shader identity. Unsupported dimensions/mips fail only when
+ * sampled, rather than silently treating a shadow lookup as raw depth. */
+typedef struct rsx_fp_shadow_state {
+    u32 mask, unsupported_mask, unnorm_mask, min_linear_mask, mag_linear_mask;
+    u32 compare[16];
+} rsx_fp_shadow_state;
+int rsx_fp_decompile_shadow_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const rsx_fp_shadow_state* shadow,
+    char* out, u32 out_size, u32* out_constant_count);
+
 /* Extract the exact runtime inline-CONST payload. Returns the slot count on
  * success or -1 for an unterminated/truncated/oversized program. */
 int rsx_fp_collect_constants(

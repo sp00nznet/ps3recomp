@@ -74,6 +74,7 @@ typedef struct {
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
+    char last_ps[16384];
     int force_pipeline_failure;
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
@@ -181,6 +182,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     if (!vs || !ps || !*vs || !*ps) return 0;
     if (stub.force_pipeline_failure) return 0;
     stub.n_pipeline_create++;
+    snprintf(stub.last_ps, sizeof stub.last_ps, "%s", ps);
     stub.pipeline_rt_count = rt_count;
     stub.pipeline_antialias_control = rs->antialias_control;
     return stub_handle();
@@ -1285,6 +1287,51 @@ static void test_multisample_seed(void)
     }
 }
 
+static void fp_word(u8* p, u32 word)
+{
+    const u32 swapped=(word<<16)|(word>>16);
+    p[0]=(u8)(swapped>>24);p[1]=(u8)(swapped>>16);
+    p[2]=(u8)(swapped>>8);p[3]=(u8)swapped;
+}
+
+static void test_shadow_pipeline(void)
+{
+    engine_up();
+    /* A resident one-instruction vertex program and TEX r0, input.tc0. The
+     * stub observes generated shader and cache identity without GPU work. */
+    m(0x1E9C,0);m(0x0B80,0);m(0x0B84,0);m(0x0B88,0);m(0x0B8C,1);
+    m(0x1EA0,0);
+    u8* fp=vm_base+0x30000;
+    memset(fp,0,16);
+    fp_word(fp,(0x17u<<24)|(0xFu<<9)|(4u<<13)|1u);
+    fp_word(fp+4,1u|(1u<<11)|(2u<<13)|(3u<<15)|(7u<<18));
+    m(0x08E4,0x30002u);m(0x1D60,0x40u);
+    bind_texture_unit(RSX_LOCATION_MAIN,TEX_OFFSET);
+    m(M_TEX_UNIT+4,2u|(2u<<4)|(0xB0u<<8)|(1u<<16));
+    m(M_TEX_UNIT+8,0x10010101u);
+    m(M_TEX_UNIT+0x14,0x01010000u);
+    draw_triangle();
+    CHECK(strstr(stub.last_ps,"rsx_shadow_sample(rsx_tex[0], rsx_samp[0],")!=NULL,
+          "depth zfunc LESS emits comparison and retains sampled binding");
+    CHECK(stub.bound_tex[0]!=0 && stub.bound_mask==1u,"shadow sampler unit is bound");
+    const int initial=stub.n_pipeline_create;
+    m(M_TEX_UNIT+8,0x30010101u);draw_triangle();
+    CHECK(stub.n_pipeline_create==initial+1&&strstr(stub.last_ps,", 3u, 0u, 0u, 0u, 0u)"),
+          "shadow compare function changes pipeline identity");
+    m(M_TEX_UNIT+0x14,0x02020000u);draw_triangle();
+    CHECK(stub.n_pipeline_create==initial+2&&strstr(stub.last_ps,", 3u, 0u, 0u, 1u, 1u)"),
+          "shadow min and mag filter change shader identity");
+    m(M_TEX_UNIT+0x0C,0x80000004u);draw_triangle();
+    CHECK(stub.n_pipeline_create==initial+3&&!strstr(stub.last_ps,"rsx_shadow_sample"),
+          "alpha kill disables shadow comparison");
+    m(M_TEX_UNIT+0x0C,0x80000000u);
+    m(M_TEX_UNIT+8,0x70010101u);draw_triangle();
+    CHECK(!strstr(stub.last_ps,"rsx_shadow_sample"),"zfunc ALWAYS retains raw depth sampling");
+    m(M_TEX_UNIT+8,0x30010101u);draw_triangle();
+    CHECK(stub.n_pipeline_create==initial+3,"returning to prior comparison reuses cached pipeline");
+    engine_down();
+}
+
 int main(int argc, char** argv)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1322,6 +1369,7 @@ int main(int argc, char** argv)
     test_multisample_layout();
     test_multisample_seed();
     test_active_depth_layout();
+    test_shadow_pipeline();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
