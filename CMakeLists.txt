@@ -20,6 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
+option(PS3RECOMP_PAD_USE_SDL2 "Use SDL2 controller input on Windows, including physical motion sensors" OFF)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -132,6 +133,16 @@ target_include_directories(ps3recomp_runtime PRIVATE
 )
 
 # Platform-specific link libraries
+if(PS3RECOMP_PAD_USE_SDL2)
+    find_package(SDL2 2.26 REQUIRED)
+    set_property(SOURCE libs/input/cellPad.c APPEND PROPERTY COMPILE_DEFINITIONS PS3RECOMP_PAD_USE_SDL2=1)
+    if(TARGET SDL2::SDL2)
+        target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
+    else()
+        target_include_directories(ps3recomp_runtime PRIVATE ${SDL2_INCLUDE_DIRS})
+        target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
+    endif()
+endif()
 if(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
         ws2_32      # Winsock for network modules
@@ -143,7 +154,7 @@ else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
     # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
-    find_package(SDL2 QUIET)
+    find_package(SDL2 2.26 QUIET)
     if(SDL2_FOUND)
         if(TARGET SDL2::SDL2)
             target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
