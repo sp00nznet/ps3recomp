@@ -39,7 +39,7 @@
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 
-s32 cellSaveData_set_root(const char* host_root)
+s32 ps3_savedata_set_root(const char* host_root)
 {
     if (!host_root || !*host_root) return CELL_SAVEDATA_ERROR_PARAM;
     size_t length = strlen(host_root);

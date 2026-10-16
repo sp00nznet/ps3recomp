@@ -18,16 +18,16 @@ void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context
 int main(int argc, char** argv)
 {
     assert(argc == 2);
-    assert(cellSaveData_set_root(argv[1]) == CELL_OK);
+    assert(ps3_savedata_set_root(argv[1]) == CELL_OK);
     char before[1024]; strcpy(before, s_save_root);
-    assert(cellSaveData_set_root(NULL) == CELL_SAVEDATA_ERROR_PARAM);
-    assert(cellSaveData_set_root("relative/savedata") == CELL_SAVEDATA_ERROR_PARAM);
+    assert(ps3_savedata_set_root(NULL) == CELL_SAVEDATA_ERROR_PARAM);
+    assert(ps3_savedata_set_root("relative/savedata") == CELL_SAVEDATA_ERROR_PARAM);
     char oversized[1025]; memset(oversized, 'x', sizeof oversized); oversized[1024] = 0;
-    assert(cellSaveData_set_root(oversized) == CELL_SAVEDATA_ERROR_PARAM);
+    assert(ps3_savedata_set_root(oversized) == CELL_SAVEDATA_ERROR_PARAM);
     assert(strcmp(before, s_save_root) == 0);
     char trailing[1024]; assert(strlen(before) + 2 < sizeof trailing);
     snprintf(trailing, sizeof trailing, "%s/", before);
-    assert(cellSaveData_set_root(trailing) == CELL_OK);
+    assert(ps3_savedata_set_root(trailing) == CELL_OK);
     assert(strcmp(before, s_save_root) == 0);
     ensure_dirs(s_save_root);
     assert(dir_exists(s_save_root));
