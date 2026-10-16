@@ -11,6 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_draw_batches.h"
 #include "rsx_depth_clip.h"
 #include "rsx_shader_window.h"
 #include "rsx_surface_layout.h"
@@ -47,7 +48,6 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
-#define ENG_MAX_BATCHES    256
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
 /* Guest textures larger than this are a misdecoded register, not an image;
@@ -133,7 +133,6 @@ typedef struct {
     u16 tex_used;           /* units the pixel program samples */
 } eng_pipeline;
 
-typedef struct { u32 first, count; } eng_batch;
 
 typedef struct {
     u32 location, offset, pitch, width, height;
@@ -184,10 +183,8 @@ static char s_ps_hlsl[256 * 1024];
 
 /* The draw accumulator: one BEGIN_END group's batches, references and cuts. */
 static struct {
-    eng_batch arr[ENG_MAX_BATCHES];
-    u32 n_arr;
-    eng_batch idx[ENG_MAX_BATCHES];
-    u32 n_idx;
+    rsx_draw_batch_list arr;
+    rsx_draw_batch_list idx;
     u32 n_packets;
 
     rsx_vertex_ref* refs;
@@ -1560,7 +1557,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
 static void dc_reset(void)
 {
-    dc.n_arr = dc.n_idx = dc.n_packets = 0;
+    rsx_draw_batch_clear(&dc.arr);
+    rsx_draw_batch_clear(&dc.idx);
+    dc.n_packets = 0;
     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
     dc.refs_remapped = 0;
     dc.fetch_ok = 1;
@@ -1614,11 +1613,11 @@ static int dc_reserve_indices(u32 count)
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
-    for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
-        for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
-            if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
+    for (u32 b = 0; b < dc.arr.count && dc.fetch_ok; b++)
+        for (u32 i = 0; i < dc.arr.data[b].count && dc.fetch_ok; i++)
+            if (!dc_push_ref(dc.arr.data[b].first + i, 0)) dc.fetch_ok = 0;
 
-    if (dc.n_idx && dc.fetch_ok) {
+    if (dc.idx.count && dc.fetch_ok) {
         const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
         rsx_dsp_index_array ia;
         rsx_dsp_get_index_array(&g.rsx, &ia);
@@ -1629,8 +1628,8 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
          * rsx_dsp location enum: 0 selects local memory. */
         const u32 ia_loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
 
-        for (u32 b = 0; b < dc.n_idx && dc.fetch_ok; b++) {
-            const u32 first = dc.idx[b].first, count = dc.idx[b].count;
+        for (u32 b = 0; b < dc.idx.count && dc.fetch_ok; b++) {
+            const u32 first = dc.idx.data[b].first, count = dc.idx.data[b].count;
             const u64 start = (u64)ia.offset + (u64)first * esz;
             const u64 bytes = (u64)count * esz;
             const u8* run = NULL;
@@ -1698,10 +1697,10 @@ static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 c
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
-    dc.arr[dc.n_arr].first = first;
-    dc.arr[dc.n_arr].count = count;
-    dc.n_arr++;
+    if (dc.fetch_ok && !rsx_draw_batch_push(&dc.arr, first, count)) {
+        dc.fetch_ok = 0;
+        ps3_strict_boot_guard("rsx-draw-array-batches", "first=%u count=%u batches=%u",first,count,dc.arr.count);
+    }
 }
 
 /* INLINE_ARRAY delivers one finished stream rather than a (first, count)
@@ -1716,20 +1715,20 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
     dc.inl = data;
     dc.inl_bytes = bytes;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
-    dc.arr[dc.n_arr].first = 0;
-    dc.arr[dc.n_arr].count = bytes / stride;
-    dc.n_arr++;
+    if (dc.fetch_ok && !rsx_draw_batch_push(&dc.arr, 0, bytes / stride)) {
+        dc.fetch_ok = 0;
+        ps3_strict_boot_guard("rsx-draw-inline-batches", "bytes=%u stride=%u batches=%u",bytes,stride,dc.arr.count);
+    }
 }
 
 static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_idx >= ENG_MAX_BATCHES) return;
-    dc.idx[dc.n_idx].first = first;
-    dc.idx[dc.n_idx].count = count;
-    dc.n_idx++;
+    if (dc.fetch_ok && !rsx_draw_batch_push(&dc.idx, first, count)) {
+        dc.fetch_ok = 0;
+        ps3_strict_boot_guard("rsx-draw-index-batches", "first=%u count=%u batches=%u",first,count,dc.idx.count);
+    }
 }
 
 /* Which texture units this draw binds, and from where: a unit naming a
@@ -2708,6 +2707,8 @@ void rsx_draw_engine_shutdown(void)
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);
     free(dc.refs); free(dc.cuts); free(dc.verts);
+    rsx_draw_batch_destroy(&dc.arr);
+    rsx_draw_batch_destroy(&dc.idx);
     rsx_vertex_remap_destroy(&dc.ref_remap);
     memset(&dc, 0, sizeof dc);
     free(g.tex_staging); free(g.vp_cb); free(g.fp_cb); free(g.indices);

@@ -478,6 +478,8 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
         target_link_options(test_gcm_wait_flip PRIVATE -Wl,--gc-sections)
         target_link_libraries(test_gcm_wait_flip PRIVATE m)
 
+        add_executable(test_rsx_draw_batches EXCLUDE_FROM_ALL libs/video/tests/test_draw_batches.c)
+        target_compile_options(test_rsx_draw_batches PRIVATE -Wall -Wextra -Werror)
         add_executable(test_rsx_draw_engine EXCLUDE_FROM_ALL libs/video/tests/test_rsx_draw_engine.c)
         target_include_directories(test_rsx_draw_engine PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/include")

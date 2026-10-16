@@ -934,6 +934,35 @@ static void test_indexed_draws(void)
 
 /* ---- 7. the guest scissor ------------------------------------------------ */
 
+/* Large BEGIN_END groups must retain every method packet. Folklore terrain
+ * exceeded the former256-batch accumulator and silently lost geometry. */
+static void test_large_batch_groups(void)
+{
+    engine_up();
+    m(M_BEGIN_END,RSX_PRIMITIVE_TRIANGLES);
+    for(u32 i=0;i<1025;i++)m(M_DRAW_ARRAYS,2u<<24);
+    m(M_BEGIN_END,0);
+    CHECK(stub.n_draw==1 && stub.draw_indices==3075 && stub.draw_vertices==3,
+          "all1025 array batches reach backend (%u indices)",stub.draw_indices);
+    draw_triangle();
+    CHECK(stub.n_draw==2 && stub.draw_vertices==3 && stub.draw_indices==0,
+          "new BEGIN_END clears prior batch group");
+    engine_down();
+
+    engine_up();
+    const u32 offset=0x30000,total=258u*256u;
+    for(u32 i=0;i<total;i++) {
+        vm_base[offset+i*2]=0;vm_base[offset+i*2+1]=(u8)(i%3);
+    }
+    m(0x181C,offset);m(0x1820,0x11); /* main memory,16-bit indices */
+    m(M_BEGIN_END,RSX_PRIMITIVE_TRIANGLES);
+    for(u32 i=0;i<258;i++)m(0x1824,(255u<<24)|(i*256u));
+    m(M_BEGIN_END,0);
+    CHECK(stub.n_draw==1 && stub.draw_indices==total && stub.draw_vertices==3,
+          "all258 full index batches reach backend (%u of%u indices)",stub.draw_indices,total);
+    engine_down();
+}
+
 static void test_scissor(void)
 {
     printf("-- scissor\n");
@@ -1367,6 +1396,7 @@ int main(int argc, char** argv)
     test_pipeline_key();
     test_restart_expansion();
     test_indexed_draws();
+    test_large_batch_groups();
     test_scissor();
     test_readback();
     test_custom_guest_mapping();
