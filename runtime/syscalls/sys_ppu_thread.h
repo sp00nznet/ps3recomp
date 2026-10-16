@@ -79,6 +79,8 @@ extern vm_stack_alloc g_vm_stack_alloc;
 
 /* Callback to invoke recompiled code - must be set by the runtime */
 extern ppu_thread_entry_fn g_ppu_thread_entry_trampoline;
+/* Called once after all guest frames, including interrupt re-entry, end. */
+extern ppu_thread_entry_fn g_ppu_thread_cleanup_trampoline;
 
 /* ---------------------------------------------------------------------------
  * Syscall handlers

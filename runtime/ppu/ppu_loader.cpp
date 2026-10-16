@@ -3548,44 +3548,31 @@ extern "C" int ppu_opd_resolve(uint32_t opd, uint32_t* code, uint32_t* toc)
  * way the main entry does and dispatch into the recompiled function, draining
  * the tail-call trampoline chain so the thread body fully runs. */
 extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
-/* Carve a fresh TLS block for one guest thread, or 0 when there is no room
- * (then the caller shares the main block, which is what every thread used to
- * do).
- *
- * Every sys_ppu_thread_create'd thread used to get r13 = PPU_TLS_TP -- the
- * MAIN thread's block -- so nothing the guest keeps in __thread storage was
- * actually per-thread. It reads as "TLS works" because the accesses resolve
- * and the memory is there; what breaks is any thread-local that means
- * something, and the worst case is a thread-local LOCK.
- *
- * Guitar Hero III keeps its allocator context in one: a flag at TLS+8 and a
- * pointer at TLS+0xC, set on entry to an allocation and cleared on exit. With
- * one shared block, thread 2 clears the flag and writes -1 to the pointer
- * while thread 1 is inside the allocator. Thread 1 then reads its own context
- * as null, every allocation on it returns 0, and the caller memsets the null
- * buffer -- see [null-write]. One shared word, and the title cannot allocate.
- *
- * The PRX path (sys_initialize_tls in ppu_sysprx.cpp) has always done this per
- * block; this is the same thing for the static path.
- *
- * ponytail: bump allocator, never freed. A thread's block is dead once it
- * exits, but the window holds dozens and titles create their threads at boot
- * and keep them. Reuse a free list if a title ever churns threads. */
-static uint32_t ppu_tls_new_block(void)
+extern "C" void (*g_ppu_thread_cleanup_trampoline)(ppu_context*);
+#include "ppu_tls_pool.h"
+static ppu_tls_pool s_thread_tls_pool;
+
+/* Private initialized storage for each live thread. Reuse only after the
+ * host-thread epilogue has observed the end of all guest execution. */
+static uint32_t ppu_tls_new_block(ppu_context* ctx)
 {
     if (!g_tls_memsz) return 0;                 /* no PT_TLS: nothing to copy */
-    uint32_t total = (g_tls_memsz + 0x7000u + 0xFFFu) & ~0xFFFu;
+    uint64_t total64 = ((uint64_t)g_tls_memsz + 0x7000u + 0xFFFu) & ~0xFFFull;
+    if (total64 > UINT32_MAX || g_tls_filesz > g_tls_memsz) return 0;
+    uint32_t total = (uint32_t)total64;
     uint32_t lim   = 0x11000000u;               /* same bound the main block uses */
     if (ppu_vm_size && ppu_vm_size < lim) lim = ppu_vm_size;
-    /* Threads are created concurrently, so hand out offsets atomically. */
-    static uint32_t s_bump = 0;
-    uint32_t off  = __atomic_fetch_add(&s_bump, total, __ATOMIC_RELAXED);
-    uint32_t base = PPU_TLS_IMG + total + off;  /* main block occupies the first */
-    if (base + total > lim) return 0;           /* out of room: share, as before */
+    uint32_t base = s_thread_tls_pool.acquire((uintptr_t)ctx, PPU_TLS_IMG, total, lim);
+    if (!base) return 0;
+    memset(vm_base + base, 0, total);
     if (g_tls_filesz) memcpy(vm_base + base, vm_base + g_tls_vaddr, g_tls_filesz);
-    if (g_tls_memsz > g_tls_filesz)
-        memset(vm_base + base + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
     return base + 0x7000u;                      /* TLS data at r13 - 0x7000 */
+}
+
+static void ppu_thread_tls_cleanup(ppu_context* ctx)
+{
+    uint32_t base = s_thread_tls_pool.release((uintptr_t)ctx);
+    if (base && ctx->gpr[13] == base + 0x7000u) ctx->gpr[13] = 0;
 }
 
 static void ppu_thread_entry_trampoline(ppu_context* ctx)
@@ -3593,7 +3580,7 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve((uint32_t)ctx->cia, &code, &toc);
     if (toc) ctx->gpr[2] = toc;
-    if (!ctx->gpr[13]) { uint32_t tp = ppu_tls_new_block();
+    if (!ctx->gpr[13]) { uint32_t tp = ppu_tls_new_block(ctx);
                          if (!tp) ppu_strict_boot_guard("thread-tls-exhausted", ctx, "entry", code);
                          ctx->gpr[13] = tp ? tp : PPU_TLS_TP; }
     ppu_fn fn = ppu_lookup(code);
@@ -3621,6 +3608,7 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
 extern "C" void ppu_install_thread_trampoline(void)
 {
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
+    g_ppu_thread_cleanup_trampoline = ppu_thread_tls_cleanup;
 }
 
 /* Call a guest function by OPD with up to 4 integer args, on a private scratch
@@ -4072,6 +4060,7 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     setvbuf(stdout, NULL, _IONBF, 0);
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
+    g_ppu_thread_cleanup_trampoline = ppu_thread_tls_cleanup;
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve(entry_opd, &code, &toc);
     ppu_fn fn = ppu_lookup(code);

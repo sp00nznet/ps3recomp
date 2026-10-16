@@ -45,6 +45,7 @@ static PPU_TLS int     s_callback_slot = -1;
 ppu_thread_info       g_ppu_threads[PPU_THREAD_MAX];
 vm_stack_alloc        g_vm_stack_alloc;
 ppu_thread_entry_fn   g_ppu_thread_entry_trampoline = NULL;
+ppu_thread_entry_fn   g_ppu_thread_cleanup_trampoline = NULL;
 static int s_callback_owned[PPU_THREAD_MAX]; /* protected by table_lock */
 
 /* Simple mutex for thread table access */
@@ -165,6 +166,11 @@ static void* ppu_host_thread_proc(void* param)
         fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
                 (unsigned long long)info->ctx.thread_id);
     }
+
+    /* sys_ppu_thread_exit longjmps here, bypassing C++ entry-frame destructors.
+     * Reclaim runtime-owned TLS only after the complete guest lifetime ends. */
+    if (g_ppu_thread_cleanup_trampoline)
+        g_ppu_thread_cleanup_trampoline(&info->ctx);
 
     /* Mark as finished */
     table_lock();
