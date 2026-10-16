@@ -307,7 +307,7 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
 /* EA the ticker's RSX drain has consumed up to. Exposed so the wrap callback can
  * wait for the RSX to catch up before recycling the ring (else the frame's
  * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
-volatile u32 g_gcm_fifo_drained_ea = 0;
+_Atomic u32 g_gcm_fifo_drained_ea = 0;
 
 /* The guest variable cellGcmInit's ctx_out pointed at -- the title's own
  * gCellGcmCurrentContext. A title that switches to a command buffer of its own
@@ -2215,7 +2215,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
     }
 
-    g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
+    atomic_store_explicit(&g_gcm_fifo_drained_ea, gcm_io2ea(s_fifo_getoff), memory_order_release);
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
      * a title uses to avoid overwriting commands the GPU has not read. It exists
@@ -2249,6 +2249,24 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
+static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begin)
+{
+    const u64 started = get_timestamp_ns();
+    u64 progressed = started;
+    u32 previous = atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire);
+    int spins = 0;
+    while ((previous == begin) != at_begin) {
+        Sleep(1); ++spins;
+        const u32 drained = atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire);
+        const u64 now = get_timestamp_ns();
+        if (drained != previous) { previous = drained; progressed = now; }
+        if ((drained == begin) == at_begin) break;
+        if (now - progressed >= UINT64_C(5000000000) || now - started >= UINT64_C(30000000000))
+            ps3_strict_boot_guard("rsx-refill-drain-stalled", "context=0x%08X begin=0x%08X current=0x%08X drained=0x%08X await_begin=%d elapsed_ms=%llu idle_ms=%llu", ctx_ea, begin, current, drained, at_begin, (unsigned long long)((now-started)/1000000), (unsigned long long)((now-progressed)/1000000));
+    }
+    return spins;
+}
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
@@ -2273,6 +2291,12 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * consumes the tail, follows the jump, and idles at begin; then it's safe
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
+    if (ps3_strict_boot_enabled()) {
+        const u32 end = vm_read32(ctx_ea + 4);
+        if ((begin | current | end) & 3u || end <= begin || current > end ||
+            io_begin == 0xFFFFFFFFu || gcm_ea2io(current) == 0xFFFFFFFFu)
+            ps3_strict_boot_guard("rsx-refill-context", "context=0x%08X begin=0x%08X current=0x%08X end=0x%08X", ctx_ea, begin, current, end);
+    }
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -2280,14 +2304,28 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
          * may observe the new `put`, find `get` != `put`, and read the old
          * word at `current` before the jump lands there. */
         atomic_thread_fence(memory_order_release);
+        /* If GET still equals begin, publishing begin would make a full ring
+         * look empty and its old acknowledgement could permit overwrite.
+         * First expose the existing tail until the reader leaves begin. */
+        if (ps3_strict_boot_enabled() &&
+            atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire) == begin) {
+            vm_write32(GCM_CONTROL_GUEST_ADDR, gcm_ea2io(current));
+            (void)gcm_wait_refill_drain(ctx_ea, begin, current, 0);
+        }
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
     }
 
-    /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
-     * no commands are lost; a stalled ticker degrades to dropped commands. */
+    /* Strict refill cannot expose unread storage to the producer. A moving
+     * renderer may take more than two seconds to drain a backlog, especially
+     * with frame readback enabled. Watch actual consumer progress and preserve
+     * the cursor on a stalled drain instead of silently dropping commands. */
     int spins = 0;
-    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
-    if (spins >= 2000) {
+    if (ps3_strict_boot_enabled()) {
+        spins = gcm_wait_refill_drain(ctx_ea, begin, current, 1);
+    } else {
+        while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
+    }
+    if (!ps3_strict_boot_enabled() && spins >= 2000) {
         static int warned = 0;
         if (warned++ < 4)
             printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X)\n",
