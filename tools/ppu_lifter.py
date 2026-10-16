@@ -3682,6 +3682,45 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             out.append(seg[k]); k -= 1
         out.reverse()
         return out
+    def _spilled_base(load, history):
+        """Trace an unchanged r1-relative 64-bit spill to its original load.
+
+        Reject overlapping writes, calls and stack movement. This only recovers
+        an immutable TOC-derived table pointer; it does not infer case code.
+        """
+        p = [x.strip() for x in load.operands.split(',')]
+        if load.mnemonic != 'ld' or len(p) != 2 or not p[1].endswith('(r1)'):
+            return None
+        offset = mem_disp(p[1])
+        if offset is None:
+            return None
+        before = [x for x in history if x.addr < load.addr]
+        for k in range(len(before) - 1, -1, -1):
+            x = before[k]; a = [v.strip() for v in x.operands.split(',')]
+            if x.mnemonic in ('bl', 'bctrl', 'blrl'):
+                return None
+            if a and a[0] == 'r1' and not x.mnemonic.startswith(('st', 'cmp')):
+                return None
+            if x.mnemonic.endswith('u') and any('(r1)' in v for v in a):
+                return None
+            if x.mnemonic.startswith('st') and len(a) == 2 and a[1].endswith('(r1)'):
+                start = mem_disp(a[1])
+                width = {'std': 8, 'stw': 4, 'sth': 2, 'stb': 1}.get(x.mnemonic)
+                if width is None or start is None:
+                    return None
+                if start < offset + 8 and offset < start + width:
+                    if x.mnemonic != 'std' or start != offset:
+                        return None
+                    source = a[0]
+                    for original in reversed(before[:k]):
+                        b = [v.strip() for v in original.operands.split(',')]
+                        if original.mnemonic in ('bl', 'bctrl', 'blrl'):
+                            return None
+                        if b and b[0] == source and not original.mnemonic.startswith(('st', 'lf', 'cmp')):
+                            return original if original.mnemonic in ('lwz', 'ld') else None
+                    return None
+        return None
+
     for i in range(n):
         if all_insns[i].mnemonic != 'bctr':
             continue
@@ -3814,8 +3853,18 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # window the result is unchanged.
             for w in reversed(win_cand):
                 a = [x.strip() for x in w.operands.split(',')]
-                if not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf')):
+                if (not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf'))
+                        or w.mnemonic in ('mtctr', 'mtlr', 'mtxer')):
                     continue                    # not a GPR def: a store READS it; ppu_disasm names lfs/lfd's FPR target rN
+                if (w.mnemonic == 'add' and len(a) == 3 and a[0] == rC
+                        and w.addr > lwzx.addr and cand in a[1:] and r_val in a[1:]):
+                    continue  # the final table-base + loaded-offset may reuse the base register
+                if w.mnemonic == 'ld' and len(a) == 2 and a[1].endswith('(r1)'):
+                    original = _spilled_base(w, win_cand)
+                    if original is None:
+                        break
+                    w = original
+                    a = [x.strip() for x in w.operands.split(',')]
                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
                     disp = mem_disp(a[1]); r_base = cand
                     base_is_ld = (w.mnemonic == 'ld')

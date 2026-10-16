@@ -258,6 +258,7 @@ def main() -> int:
     test_const_base_no_table()
     test_const_base_needs_constant()
     test_multi_toc_prefers_targets_near_the_dispatcher()
+    test_spilled_table_base()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1
@@ -288,6 +289,24 @@ def test_const_base_needs_constant():
     mem = {base: w_blr(), TOC + 8: base}
     got = discover([w_lwz(8, 2, 8), w_add(8, 8, 7), w_mtctr(8), w_bctr()], mem)
     check("non-constant base is not a constant-base jump", got, None)
+
+
+def test_spilled_table_base():
+    table, global_base = 0x11000, 0x210000
+    mem = {TOC + 16: global_base, global_base + 8: table,
+           table: 0x100, table + 4: 0x200, table + 8: 0xFFFFFFFF}
+    prefix = [w_lwz(30, 2, 16), w_lwz(5, 30, 8), w_std(5, 1, -64)]
+    tail = [w_ld(7, 1, -64), w_cmplwi(0, 3, 2), w_slwi(9, 3, 2),
+            w_lwzx(0, 9, 7), w_add(7, 0, 7), w_mtctr(7), w_bctr()]
+    check('two-level pointer spilled to stack', discover(prefix + tail, mem), [0x11100, 0x11200])
+    check('overlapping partial spill overwrite rejected',
+          discover(prefix + [((36 << 26) | (6 << 21) | (1 << 16) | ((-60) & 0xFFFF))] + tail, mem), None)
+    check('changed spill source rejected',
+          discover(prefix[:2] + [w_li(5, 0), prefix[2]] + tail, mem), None)
+    check('stack movement between spill and reload rejected',
+          discover(prefix + [w_stdu(1, 1, -256)] + tail, mem), None)
+    check('call between spill and reload rejected',
+          discover(prefix + [(18 << 26) | 1 | 4] + tail, mem), None)
 
 
 if __name__ == "__main__":
