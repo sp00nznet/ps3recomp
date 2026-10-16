@@ -17,6 +17,7 @@
 #include "ppu_recomp.h"      /* ppu_context */
 #include "ppu_fs_memory.h"
 #include "ppu_fs_aio_engine.h"
+#include "ppu_fs_mount_identity.h"
 #include "ppu_callback_worker.h"
 #include "ppu_strict_boot.h"
 #include "../../libs/filesystem/edat.h"
@@ -302,17 +303,13 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir 
 
 static std::string fs_mount_identity(const char* guest)
 {
-    if(!guest || guest[0]!='/')return {};
-    const char* end=strchr(guest+1,'/');
-    const size_t length=end?(size_t)(end-guest):strlen(guest);
-    if(length<2 || length>31)return {};
-    return std::string(guest,length);
+    return ppu_fs_mount_identity(guest);
 }
 static int fd_alloc_file(FILE* f,const char* guest,uint32_t flags)
 {
     std::lock_guard<std::recursive_mutex> lock(fs_files_mutex);
     for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) {
-        try {g_file_refs[i]=std::make_shared<FsFile>(f,flags,fs_mount_identity(guest));}
+        try {g_file_refs[i]=std::make_shared<FsFile>(f,flags,ppu_fs_file_mount_identity(guest));}
         catch(...) {return -1;}
         g_files[i]=f;return i;
     }
