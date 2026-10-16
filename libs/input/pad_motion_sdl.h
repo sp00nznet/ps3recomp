@@ -23,7 +23,9 @@
  * No other SDL function is called.
  *
  * sample[0..2]: accelerometer X/Y/Z, sample[3]: gyroscope Y; 0..1023, 512 centre.
- * timestamp: later of the two SDL sensor timestamps (SDL microseconds).
+ * timestamp: later of the two SDL sensor timestamps (SDL microseconds), or
+ * zero when the driver supplies no timestamps. SDL explicitly allows zero:
+ * https://wiki.libsdl.org/SDL2/SDL_GameControllerGetSensorDataWithTimestamp
  */
 #ifndef PAD_MOTION_SDL_H
 #define PAD_MOTION_SDL_H
@@ -164,9 +166,8 @@ static inline int pad_motion_sdl_poll(PadMotionSDL* state, SDL_GameController* g
         return 0;
     if (PAD_MOTION_GET_DATA(gc, SDL_SENSOR_GYRO, &gyro_ts, gyro, 3) != 0)
         return 0;
-    /* A zero timestamp is unproven startup data. */
-    if (accel_ts == 0 || gyro_ts == 0)
-        return 0;
+    /* A successful read may have timestamp zero (SDL2-compat on Steam Deck).
+     * Preserve that unavailable metadata; never manufacture a timestamp. */
     for (i = 0; i < 3; ++i)
         if (!isfinite(accel[i]) || !isfinite(gyro[i]))
             return 0;

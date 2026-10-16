@@ -18,7 +18,7 @@ int main(void)
     CHECK(word(20)==512&&word(21)==399&&word(22)==512&&word(23)==635);
     CHECK(memory[0x10004+21*2]==1&&memory[0x10005+21*2]==0x8f);
     fixture.read_fail=1;read_pad();CHECK(length()==8&&word(20)==0&&word(23)==0);
-    fixture.read_fail=0;fixture.ts=0;read_pad();CHECK(length()==8&&word(21)==0);
+    fixture.read_fail=0;fixture.ts=0;read_pad();CHECK(length()==24&&word(21)==399);
     fixture.ts=1234;read_pad();CHECK(length()==24&&word(21)==399);
     dialog=1;epoch=1;read_pad();CHECK(length()==0&&word(21)==0);
     dialog=0;read_pad();read_pad();CHECK(length()==24&&word(21)==399);

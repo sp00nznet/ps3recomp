@@ -353,13 +353,17 @@ static void test_timestamps(void)
 
     setup_valid(&p, &s);
     p.ts[FAKE_ACCEL] = 0;
-    CHECK(pad_motion_sdl_poll(&s, gc_of(&p)) == 0);
-    CHECK(state_clear(&s) && s.enabled == 1);
+    CHECK(pad_motion_sdl_poll(&s, gc_of(&p)) == 1);
+    CHECK(s.valid && s.enabled && sample_is(&s,512,399,512,512));
     p.ts[FAKE_ACCEL] = 300;
     p.ts[FAKE_GYRO] = 0;
-    CHECK(pad_motion_sdl_poll(&s, gc_of(&p)) == 0);
-    CHECK(state_clear(&s) && s.enabled == 1);
+    CHECK(pad_motion_sdl_poll(&s, gc_of(&p)) == 1);
+    CHECK(s.valid && s.enabled && s.timestamp==300);
+    p.ts[FAKE_ACCEL] = 0;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==1);
+    CHECK(s.valid && s.timestamp==0 && sample_is(&s,512,399,512,512));
 
+    p.ts[FAKE_ACCEL] = 300;
     p.ts[FAKE_GYRO] = 200;
     CHECK(pad_motion_sdl_poll(&s, gc_of(&p)) == 1);
     CHECK(s.timestamp == 300);
