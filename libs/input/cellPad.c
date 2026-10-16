@@ -19,6 +19,7 @@
 #include <stdatomic.h>
 #include "pad_dialog_filter.h"
 #include "pad_keyboard_bridge.h"
+#include "pad_stick_motion.h"
 #include "../system/cellMsgDialog.h"
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
@@ -90,6 +91,11 @@ static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+static PadStickMotion s_stick_motion[PAD_MAX_HOST_PORTS];
+static int s_stick_mapped[PAD_MAX_HOST_PORTS];
+/* Explicit opt-in: off (default), fallback (non-motion devices), force.
+ * This generates sensor reports only; capture still runs entirely in-game. */
+static int s_stick_mode;
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
 /* Backend sweeps and the paired raw-state/serial gate snapshot share a lock.
@@ -368,6 +374,9 @@ static void pad_refresh_sdl2(void)
             SDL_GameControllerClose(s_sdl_controllers[j]);
         }
     }
+    for (int j = 0; j < PAD_MAX_HOST_PORTS; ++j)
+        if (s_sdl_instance[j] != instance[j])
+            pad_stick_motion_reset(&s_stick_motion[j]);
     memcpy(s_sdl_controllers,next,sizeof(next));
     memcpy(s_sdl_motion,motion,sizeof(motion));
     memcpy(s_sdl_instance,instance,sizeof(instance));
@@ -531,6 +540,35 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* Backend lock held. Keyboard uses the existing W (R1) + Up binding, so
+ * both platforms retain their existing focus-loss and key-release handling. */
+static void pad_poll_stick_motion(unsigned long long now, int keyboard)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; ++i) {
+        PadHostState* hs = &s_host_state[i];
+        int physical = 0;
+#if PAD_BACKEND_SDL2
+        physical = pad_motion_sdl_capable(s_sdl_controllers[i]);
+#endif
+        int active = hs->connected && s_stick_mode &&
+                     (!physical || s_stick_mode == 2);
+        unsigned y = keyboard && i == 0 ? hs->analog_ly : hs->analog_ry;
+        uint16_t mapped[4];
+        int valid = pad_stick_motion_update(&s_stick_motion[i], !!active,
+            !!(s_port_setting[i] & CELL_PAD_SETTING_SENSOR_ON),
+            !!(hs->buttons & CELL_PAD_CTRL_R1), y, now, mapped);
+        s_stick_mapped[i] = !!active;
+        if (active) {
+            hs->motion_capable = 1;
+            hs->motion_valid = valid;
+            memcpy(hs->motion, mapped, sizeof(mapped));
+        } else if (!physical) {
+            hs->motion_capable = hs->motion_valid = 0;
+            memset(hs->motion, 0, sizeof(hs->motion));
+        }
+    }
+}
+
 static void pad_poll_backend(void)
 {
     /* Serialize backend writes with the input-gate's host snapshot. A serial
@@ -553,11 +591,13 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
+    int keyboard = !s_host_state[0].connected;
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    if (keyboard) pad_poll_keyboard();
 #else
-    if (!s_host_state[0].connected) pad_poll_window_keyboard();
+    if (keyboard) pad_poll_window_keyboard();
 #endif
+    pad_poll_stick_motion(now, keyboard);
     atomic_fetch_add_explicit(&s_completed_poll,1,memory_order_release);
     pad_backend_unlock();
 }
@@ -584,6 +624,15 @@ s32 cellPadInit(u32 max_connect)
     s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
     memset(s_port_setting, 0, sizeof(s_port_setting));
     memset(s_host_state, 0, sizeof(s_host_state));
+    memset(s_stick_motion, 0, sizeof(s_stick_motion));
+    memset(s_stick_mapped, 0, sizeof(s_stick_mapped));
+    const char* mapping = getenv("PS3RECOMP_CAPTURE_MAPPING");
+    s_stick_mode = mapping && !strcmp(mapping,"fallback") ? 1 :
+                   mapping && !strcmp(mapping,"force") ? 2 : 0;
+    if (mapping && strcmp(mapping,"off") && !s_stick_mode)
+        fprintf(stderr,"[cellPad] Unknown capture mapping '%s'; mapping disabled\n",mapping);
+    if (s_stick_mode)
+        printf("[cellPad] Optional capture motion mapping: %s (R1 + right-stick up; keyboard W + Up)\n",mapping);
 
     pad_init_backend();
 
@@ -1216,7 +1265,7 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
     pad_poll_backend();
     pad_backend_lock();
 #if PAD_BACKEND_SDL2
-    if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].motion_capable) {
+    if (port_no < PAD_MAX_HOST_PORTS && !s_stick_mapped[port_no] && s_host_state[port_no].motion_capable) {
         int ok=pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],
                                         !!(port_setting & CELL_PAD_SETTING_SENSOR_ON));
         s_host_state[port_no].motion_valid=0;
@@ -1227,6 +1276,10 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
         }
     }
 #endif
+    if (port_no < PAD_MAX_HOST_PORTS && s_stick_mapped[port_no]) {
+        pad_stick_motion_reset(&s_stick_motion[port_no]);
+        s_host_state[port_no].motion_valid = 0;
+    }
     s_port_setting[port_no] = port_setting;
     pad_backend_unlock();
     return CELL_OK;
@@ -1269,8 +1322,8 @@ s32 cellPadSetPressMode(u32 port_no, u32 mode)
 
 /* Sensor API behavior follows RPCS3 cellPad.cpp at
  * 4d5def5880217135554ed434cd5055cceebe9cc2 (GPL-2.0-only).
- * SDL capability requires both physical sensors. XInput and keyboard input
- * cannot provide motion samples and do not advertise sensor support. */
+ * SDL capability requires both physical sensors unless the optional input
+ * mapping is explicitly enabled. Mapped reports use the same guest ABI. */
 s32 cellPadInfoSensorMode(u32 port_no)
 {
     if (!s_pad_initialized)
@@ -1298,9 +1351,17 @@ s32 cellPadSetSensorMode(u32 port_no, u32 mode)
     /* The SDK ignores valid slots outside the seven physical ports. */
     if (port_no >= CELL_PAD_MAX_PORT_NUM)
         return CELL_OK;
-#if PAD_BACKEND_SDL2
     pad_poll_backend();
     pad_backend_lock();
+    if (port_no < PAD_MAX_HOST_PORTS && s_stick_mapped[port_no]) {
+        pad_stick_motion_reset(&s_stick_motion[port_no]);
+        s_host_state[port_no].motion_valid = 0;
+        if (mode) s_port_setting[port_no] |= CELL_PAD_SETTING_SENSOR_ON;
+        else s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_SENSOR_ON;
+        pad_backend_unlock();
+        return CELL_OK;
+    }
+#if PAD_BACKEND_SDL2
     if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].motion_capable) {
         int ok=pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],(int)mode);
         s_host_state[port_no].motion_valid=0;
@@ -1313,8 +1374,8 @@ s32 cellPadSetSensorMode(u32 port_no, u32 mode)
         pad_backend_unlock();
         return ok ? CELL_OK : CELL_PAD_ERROR_UNSUPPORTED_GAMEPAD;
     }
-    pad_backend_unlock();
 #endif
+    pad_backend_unlock();
     return CELL_PAD_ERROR_UNSUPPORTED_GAMEPAD;
 }
 

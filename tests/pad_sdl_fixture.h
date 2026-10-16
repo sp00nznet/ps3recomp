@@ -35,8 +35,10 @@ static SDL_bool is_controller(int i) { return i==leading_unmapped&&fixture.attac
 static SDL_JoystickID device_instance(int i) { return is_controller(i)?fixture_instance:-1; }
 static SDL_GameController* open_controller(int i) { if(!is_controller(i)||fixture_open_fail)return NULL; ++fixture_opens;return controller(); }
 static void close_controller(SDL_GameController* p) { (void)p;++fixture_closes; }
-static Uint8 button(SDL_GameController* p,SDL_GameControllerButton b) { (void)p;(void)b;return 0; }
-static Sint16 axis(SDL_GameController* p,SDL_GameControllerAxis a) { (void)p;(void)a;return 0; }
+static uint32_t fixture_buttons;
+static Sint16 fixture_axes[SDL_CONTROLLER_AXIS_MAX];
+static Uint8 button(SDL_GameController* p,SDL_GameControllerButton b) { (void)p;return !!(fixture_buttons & (1u << b)); }
+static Sint16 axis(SDL_GameController* p,SDL_GameControllerAxis a) { (void)p;return fixture_axes[a]; }
 static Uint32 was_init(Uint32 flags) { return flags; }
 static int init(Uint32 flags) { (void)flags;return 0; }
 static int joysticks(void) { return leading_unmapped+fixture.attached; }
