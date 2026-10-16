@@ -18,6 +18,7 @@
 #include <math.h>
 #include <stdatomic.h>
 #include "pad_dialog_filter.h"
+#include "pad_keyboard_bridge.h"
 #include "../system/cellMsgDialog.h"
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
@@ -440,6 +441,26 @@ static void pad_shutdown_backend(void)
 
 #endif /* PAD_BACKEND_SDL2 */
 
+#ifndef _WIN32
+/* Linux uses window events, never desktop-wide key queries. The cache is
+ * published by the renderer's UI thread; no SDL event pumping occurs here. */
+static void pad_poll_window_keyboard(void)
+{
+    static int off=-1;
+    if (off<0) off=getenv("PAD_NO_KEYBOARD")?1:0;
+    if (off) return;
+    PadHostState* hs=&s_host_state[0];
+    memset(hs,0,sizeof(*hs));
+    hs->connected=1;
+    hs->buttons=(u16)ps3_pad_keyboard_read();
+    hs->analog_lx=(hs->buttons&CELL_PAD_CTRL_LEFT)?0:(hs->buttons&CELL_PAD_CTRL_RIGHT)?255:128;
+    hs->analog_ly=(hs->buttons&CELL_PAD_CTRL_UP)?0:(hs->buttons&CELL_PAD_CTRL_DOWN)?255:128;
+    hs->analog_rx=hs->analog_ry=128;
+    hs->trigger_l2=(hs->buttons&CELL_PAD_CTRL_L2)?255:0;
+    hs->trigger_r2=(hs->buttons&CELL_PAD_CTRL_R2)?255:0;
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * Poll dispatcher
  * -----------------------------------------------------------------------*/
@@ -495,6 +516,8 @@ static void pad_poll_backend(void)
 #endif
 #ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
+#else
+    if (!s_host_state[0].connected) pad_poll_window_keyboard();
 #endif
     atomic_fetch_add_explicit(&s_completed_poll,1,memory_order_release);
     pad_backend_unlock();

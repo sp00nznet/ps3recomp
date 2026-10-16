@@ -59,6 +59,7 @@
  * opens the optional window. Same include style as those two. */
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
+#include "../input/pad_keyboard_sdl_events.h"
 
 #include "rsx_vulkan_loader.h"
 #include <stddef.h>
@@ -1654,6 +1655,7 @@ static void vk_window_drop(const char* why)
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
     if (s_vk.window) {
+        ps3_pad_keyboard_detach();
         SDL_DestroyWindow(s_vk.window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     }
@@ -1686,6 +1688,9 @@ static void vk_window_open(const char* title)
         vk_window_drop(why);
         return;
     }
+    ps3_pad_keyboard_attach(SDL_GetWindowID(s_vk.window));
+    ps3_pad_keyboard_focus(SDL_GetWindowID(s_vk.window),
+                           !!(SDL_GetWindowFlags(s_vk.window)&SDL_WINDOW_INPUT_FOCUS));
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
         !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
@@ -3625,6 +3630,7 @@ int rsx_vulkan_backend_pump_messages(void)
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        ps3_pad_keyboard_sdl_event(&e,SDL_GetWindowID(s_vk.window));
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
     }
