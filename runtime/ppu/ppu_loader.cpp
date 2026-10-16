@@ -663,7 +663,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
     samp_build_map();
     if (getenv("PS3_SAMPLE_EXACT")) {
         uint32_t known = s_samp_n ? samp_lookup(s_samp_map[0].h) : 0;
-        uint32_t host = samp_lookup((uintptr_t)&ps3_sampler_start);
+        uint32_t host = samp_lookup((uintptr_t)&samp_lookup);
         fprintf(stderr, "[samp] exact unwind attribution: known=0x%08X expected=0x%08X host=0x%08X; missing/folded entries remain unclassified\n",
                 known, s_samp_n ? s_samp_map[0].g : 0, host);
     }
