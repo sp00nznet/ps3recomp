@@ -595,25 +595,68 @@ void cellGcmSetFlipMode(u32 mode)
     s_flip_mode = mode;
 }
 
-/* NID: 0xC44D8F34 */
-void cellGcmSetWaitFlip(void)
+static GcmHostContextCallback s_context_callback;
+static u32 gcm_ea2io(u32 ea);
+
+void gcm_set_host_context_callback(GcmHostContextCallback callback)
 {
-    /* Block until the pending flip completes (the present thread marks it done
-     * via cellGcmTickFlip, ~once per display refresh). This throttles the title
-     * to vsync; without it the guest loops unthrottled and many frames batch
-     * into a single host present -> the console text stacks/duplicates. */
-#ifdef _WIN32
-    __declspec(dllimport) void __stdcall Sleep(unsigned long);
-#endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
-        Sleep(1);
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    s_context_callback = callback;
 }
 
-/* NID: 0xDF6476BD. The same wait without libgcm's command-buffer space check;
- * this HLE writes no command, so it is the same call. GH3 makes it ~36 times
- * a boot and got a faked CELL_OK (no wait at all) before this was registered. */
-void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
+static void gcm_wait_flip_error(u32 ctx, const char* reason)
+{
+    ps3_strict_boot_guard("rsx-wait-flip-context", "context=0x%08X reason=%s", ctx, reason);
+    fprintf(stderr, "[cellGcmSys] WaitFlip rejected context=0x%08X: %s\n", ctx, reason);
+}
+
+static int gcm_wait_flip_bounds(u32 ctx, u32* current, u32* end)
+{
+    if (!vm_base || !ctx || (ctx & 3u) || (u64)ctx + 16u > ppu_vm_size) return 0;
+    const u32 begin = vm_read32(ctx);
+    *end = vm_read32(ctx + 4);
+    *current = vm_read32(ctx + 8);
+    return !((begin | *current | *end) & 3u) && begin <= *current &&
+           *current <= *end && *end <= ppu_vm_size;
+}
+
+/* RPCS3 4d5def58 cellGcmSys.cpp:683 (GPL-2.0): enqueue a GPU semaphore
+ * acquire; this API does not sleep the PPU or complete a pending flip.
+ * Safe refill uses the guest callback and its result, then reloads the cursor. */
+static void gcm_wait_flip(void* context, int safe)
+{
+    const uintptr_t raw = (uintptr_t)context;
+    const u32 ctx = (u32)raw;
+    u32 cur, end;
+    if (raw > UINT32_MAX || !gcm_wait_flip_bounds(ctx, &cur, &end)) {
+        gcm_wait_flip_error(ctx, "invalid bounds/alignment"); return;
+    }
+    if (end - cur < 12u) {
+        const u32 opd = vm_read32(ctx + 12);
+        if (!safe || !opd || !s_context_callback) {
+            gcm_wait_flip_error(ctx, "insufficient space or missing callback"); return;
+        }
+        const s32 result = s_context_callback(opd, ctx, 8);
+        if (result) {
+            fprintf(stderr, "[cellGcmSys] WaitFlip callback failed context=0x%08X result=0x%08X\n", ctx, (u32)result);
+            return;
+        }
+        if (!gcm_wait_flip_bounds(ctx, &cur, &end) || end - cur < 12u) {
+            gcm_wait_flip_error(ctx, "callback returned without valid space"); return;
+        }
+    }
+    if (gcm_ea2io(cur) == 0xFFFFFFFFu || gcm_ea2io(cur + 11u) == 0xFFFFFFFFu) {
+        gcm_wait_flip_error(ctx, "unmapped command buffer"); return;
+    }
+    vm_write32(cur, 0x00080064u); /* two incrementing NV406E method values */
+    vm_write32(cur + 4, 0x10u);  /* semaphore offset */
+    vm_write32(cur + 8, 0u);     /* acquire value */
+    vm_write32(ctx + 8, cur + 12u);
+}
+
+/* NID: 0x983FB9AA */
+void cellGcmSetWaitFlip(void* context) { gcm_wait_flip(context, 1); }
+/* NID: 0xDF6476BD */
+void cellGcmSetWaitFlipUnsafe(void* context) { gcm_wait_flip(context, 0); }
 
 /* NID: 0x51C9D62B */
 void cellGcmResetFlipStatus(void)
@@ -752,6 +795,10 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
+    /* Completion of an actual host present releases the flip semaphore.
+     * RPCS3 sys_rsx.cpp 0xFEC clears the entire 16-byte label at offset0x10. */
+    for (u32 offset = 0x10u; offset < 0x20u; offset += 4u)
+        vm_write32(GCM_LABEL_GUEST_BASE + offset, 0);
     if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
         GCM_PENDING_SET(2);
 }

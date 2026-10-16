@@ -472,6 +472,12 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
     set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
 
     if(PS3RECOMP_RSX_VULKAN)
+        add_executable(test_gcm_wait_flip EXCLUDE_FROM_ALL tests/test_gcm_wait_flip.c tests/gcm_wait_link_stubs.c)
+        target_include_directories(test_gcm_wait_flip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_options(test_gcm_wait_flip PRIVATE -ffunction-sections -fdata-sections)
+        target_link_options(test_gcm_wait_flip PRIVATE -Wl,--gc-sections)
+        target_link_libraries(test_gcm_wait_flip PRIVATE m)
+
         add_executable(test_rsx_draw_engine EXCLUDE_FROM_ALL libs/video/tests/test_rsx_draw_engine.c)
         target_include_directories(test_rsx_draw_engine PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/include")

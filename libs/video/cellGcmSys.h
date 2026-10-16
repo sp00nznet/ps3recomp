@@ -229,8 +229,12 @@ u32 cellGcmGetCurrentField(void);
 void cellGcmSetFlipMode(u32 mode);
 
 /* NID: 0xC44D8F34 */
-void cellGcmSetWaitFlip(void);
-void cellGcmSetWaitFlipUnsafe(void);
+void cellGcmSetWaitFlip(void* context);
+void cellGcmSetWaitFlipUnsafe(void* context);
+/* Host-only synchronous dispatch for context->callback(context, count).
+ * Install before guest execution; the return value is the guest's s32. */
+typedef s32 (*GcmHostContextCallback)(u32 opd, u32 context, u32 count);
+void gcm_set_host_context_callback(GcmHostContextCallback callback);
 u32 cellGcmGetReport(u32 type, u32 index);
 
 /* NID: 0x51C9D62B */
