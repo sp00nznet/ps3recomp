@@ -3703,6 +3703,8 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                 return None
             if x.mnemonic.endswith('u') and any('(r1)' in v for v in a):
                 return None
+            if x.mnemonic.startswith('st') and (len(a) != 2 or x.mnemonic not in ('std', 'stw', 'sth', 'stb', 'stfd', 'stfs')):
+                return None  # indexed/unknown stores may alias the spill slot
             if x.mnemonic.startswith('st') and len(a) == 2 and a[1].endswith('(r1)'):
                 start = mem_disp(a[1])
                 width = {'std': 8, 'stw': 4, 'sth': 2, 'stb': 1}.get(x.mnemonic)

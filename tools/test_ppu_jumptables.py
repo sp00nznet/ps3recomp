@@ -307,6 +307,10 @@ def test_spilled_table_base():
           discover(prefix + [w_stdu(1, 1, -256)] + tail, mem), None)
     check('call between spill and reload rejected',
           discover(prefix + [(18 << 26) | 1 | 4] + tail, mem), None)
+    stdx = (31 << 26) | (6 << 21) | (1 << 16) | (9 << 11) | (149 << 1)
+    check('indexed stack write rejected', discover(prefix + [stdx] + tail, mem), None)
+    stdx_alias = (31 << 26) | (6 << 21) | (8 << 16) | (9 << 11) | (149 << 1)
+    check('indexed write through possible alias rejected', discover(prefix + [stdx_alias] + tail, mem), None)
 
 
 if __name__ == "__main__":
