@@ -23,8 +23,8 @@ hashes, compiles for Vulkan 1.0, validates SPIR-V and checks descriptors, push
 offsets and capabilities. tests/test_fsr1_constants.c checks pixel-center
 mapping, sharpness and rejection behavior.
 
-This is a compiled renderer component. Vulkan resource/pass integration,
-settings, safe resize/fallback behavior and GPU/gameplay quality/performance
-tests are still pending. No FSR menu option or runtime path is enabled yet.
+The Vulkan draw-engine display path now applies EASU and RCAS to the original
+guest display surface before enlargement. Set PS3RECOMP_UPSCALER=fsr1 to opt in;
+off is the default. See docs/VULKAN-FSR1.md for fallbacks and validation limits.
 FSR 1 is spatial reconstruction. It does not provide temporal reconstruction
 or replace the separate motion-vector/depth work needed for DLSS.

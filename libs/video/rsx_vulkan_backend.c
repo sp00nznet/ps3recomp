@@ -160,6 +160,8 @@ typedef struct vk_state {
     u32              width, height;
     int              fxaa_enabled;
     u64              fxaa_frames;
+    int              fsr1_enabled, fsr1_failed, fsr1_scale_fallback;
+    u64              fsr1_frames;
     VkImage          display_image;
     vk_image         color;           /* R8G8B8A8_UNORM                 */
     vk_image         depth;           /* D32_SFLOAT or fallback         */
@@ -544,6 +546,7 @@ static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayo
 }
 
 #include "rsx_vulkan_fxaa.inc"
+#include "rsx_vulkan_fsr1.inc"
 
 /* ---------------------------------------------------------------------------
  * Texture unit 0
@@ -1855,6 +1858,7 @@ static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
 
+    VkImage display = s_vk.display_image ? s_vk.display_image : s_vk.color.img;
     u32 idx = 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
@@ -1864,7 +1868,7 @@ static void vk_present_window(void)
     }
 
     if (vk_begin()) return;
-    vk_barrier_image(s_vk.display_image ? s_vk.display_image : s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(display, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1881,7 +1885,7 @@ static void vk_present_window(void)
         .dstOffsets = { { 0, 0, 0 },
                         { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
     };
-    pvkCmdBlitImage(s_vk.cmd, s_vk.display_image ? s_vk.display_image : s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
+    pvkCmdBlitImage(s_vk.cmd, display, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     1, &blit, VK_FILTER_LINEAR);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2345,18 +2349,41 @@ static void vk_eng_present(void* user, u32 surface)
     (void)user;
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (o && o->samples > 1) o = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
+    VkImage display = o ? o->im.img : VK_NULL_HANDLE;
+    u32 display_width = o ? o->w : 0, display_height = o ? o->h : 0;
+    if (o && s_vk.fsr1_enabled && !s_vk.fsr1_failed) {
+        if (s_vk.width < o->w || s_vk.height < o->h ||
+            (o->fmt != VK_FORMAT_R8G8B8A8_UNORM && o->fmt != VK_FORMAT_B8G8R8A8_UNORM)) {
+            if (!s_vk.fsr1_scale_fallback)
+                VK_LOG("FSR1 bypass: downscale or non-display-UNORM source; using ordinary display blit\n");
+            s_vk.fsr1_scale_fallback = 1;
+        } else {
+            s_vk.fsr1_scale_fallback = 0;
+            if (vk_fsr1_apply(&o->im, o->w, o->h, s_vk.width, s_vk.height, 0.2f, &display)) {
+                s_vk.fsr1_failed = 1;
+                VK_LOG("FSR1 unavailable: using ordinary display blit for this session\n");
+            } else {
+                display_width = s_vk.width;
+                display_height = s_vk.height;
+                if (++s_vk.fsr1_frames <= 4)
+                    VK_LOG("FSR1 EASU+RCAS frame %llu: guest %ux%u to display %ux%u\n",
+                        (unsigned long long)s_vk.fsr1_frames, o->w, o->h,
+                        display_width, display_height);
+            }
+        }
+    }
     if (o && !vk_begin()) {
-        vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(display, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkImageBlit blit = {
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->w, (int32_t)o->h, 1 } },
+            .srcOffsets = { { 0, 0, 0 }, { (int32_t)display_width, (int32_t)display_height, 1 } },
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
         };
-        pvkCmdBlitImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
+        pvkCmdBlitImage(s_vk.cmd, display, VK_IMAGE_LAYOUT_GENERAL,
                         s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                        (o->w == s_vk.width && o->h == s_vk.height) ? VK_FILTER_NEAREST
+                        (display_width == s_vk.width && display_height == s_vk.height) ? VK_FILTER_NEAREST
                                                                     : VK_FILTER_LINEAR);
         vk_submit_and_wait();
     }
@@ -3567,7 +3594,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (vk_pick_depth_format()) return -1;
     if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (s_vk.fxaa_enabled ? VK_IMAGE_USAGE_SAMPLED_BIT : 0), VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | ((s_vk.fxaa_enabled || s_vk.fsr1_enabled) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0), VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
     if (vk_create_image(&s_vk.depth, s_vk.depth_format, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, s_vk.depth_aspect)) return -1;
@@ -3622,7 +3649,13 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
         VK_LOG("PS3RECOMP_ANTIALIASING must be off or fxaa\n");
         return -1;
     }
+    const char* upscaler = getenv("PS3RECOMP_UPSCALER");
+    if (upscaler && strcmp(upscaler, "off") && strcmp(upscaler, "fsr1")) {
+        VK_LOG("PS3RECOMP_UPSCALER must be off or fsr1\n");
+        return -1;
+    }
     memset(&s_vk, 0, sizeof s_vk);
+    s_vk.fsr1_enabled = upscaler && !strcmp(upscaler, "fsr1");
     s_vk.fxaa_enabled = aa && !strcmp(aa, "fxaa");
     if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();
@@ -3650,6 +3683,9 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
     else
         rsx_set_backend(&s_vulkan_backend);
     VK_LOG("%s path\n", s_vk.eng_active ? "register-file draw engine" : "vtable");
+    if (s_vk.fsr1_enabled)
+        VK_LOG("FSR1: %s\n", s_vk.eng_active ? "guest display EASU+RCAS, before optional FXAA" :
+               "requested but bypassed on diagnostic vtable path; requires draw engine");
     VK_LOG("offscreen target %ux%u ready, depth format %d (%s)\n",
            s_vk.width, s_vk.height, (int)s_vk.depth_format, title ? title : "");
     return 0;
@@ -3689,6 +3725,7 @@ void rsx_vulkan_backend_shutdown(void)
         for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) vk_destroy_image(&s_vk.tex[u]);
         vk_destroy_image(&s_vk.dummy);
         vk_destroy_image(&s_vk.depth);
+        vk_fsr1_shutdown();
         vk_fxaa_shutdown();
         vk_destroy_image(&s_vk.color);
         vk_destroy_buffer(&s_vk.vertices);
