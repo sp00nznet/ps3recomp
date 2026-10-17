@@ -94,7 +94,7 @@
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
-    X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) \
+    X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
@@ -1910,6 +1910,7 @@ typedef struct vk_eng_obj {
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
+    u8       snapshot;               /* COLOR: a feedback copy, never a target */
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -2056,6 +2057,8 @@ static int vk_eng_init(void* user, u32 width, u32 height)
     return s_vk.device ? 0 : -1;
 }
 
+static void vk_eng_snapshot_recycle(vk_eng_obj* o);
+
 static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
@@ -2071,16 +2074,26 @@ static void vk_eng_release(void* user, u32 handle)
         s_eobj[handle].surface = 0;
         if (vk_eng_get(snap, VK_ENG_TEXTURE)) vk_eng_release(user, snap);
     }
+    if (s_eobj[handle].kind == VK_ENG_COLOR && s_eobj[handle].snapshot) {
+        /* Never an attachment, so no framebuffer names it; the image goes
+         * back to the pool for the next feedback draw. */
+        vk_eng_snapshot_recycle(&s_eobj[handle]);
+        memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
+        return;
+    }
     if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
 
+static void vk_eng_snapshot_pool_drain(void);
+
 static void vk_eng_shutdown(void* user)
 {
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
+    vk_eng_snapshot_pool_drain();
 }
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
@@ -2348,6 +2361,86 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
     return hd;
 }
+/* ---- colour feedback snapshots ---------------------------------------------
+ * A draw that samples a colour target it is also writing (in-place deferred
+ * lighting: read the albedo, write the lit colour over it) gets a copy of
+ * that target taken just before it. The engine asks for one per such draw
+ * (rsx_draw_backend.color_snapshot) and releases the previous one; without
+ * this hook it falls back to the guest-memory bytes at the target's address,
+ * which hold whatever was last stored there -- for Twisted Metal the previous
+ * frame's UI, lit and composited into the next frame.
+ *
+ * Every operation here is one synchronous submission, so the copy is already
+ * in command order: after the draws before it, before the draw that samples
+ * it. The copy is a COLOR object marked `snapshot` so the engine can take a
+ * crossbar view of it (vk_eng_surface_view); it is never an attachment.
+ * Released copies keep their images in a small pool, since a lit frame asks
+ * for one per light. */
+#define VK_SNAP_POOL 8
+static struct { vk_image im; VkFormat fmt; u32 w, h; } s_snap_pool[VK_SNAP_POOL];
+static u32 s_snap_pool_n;
+
+static void vk_eng_snapshot_recycle(vk_eng_obj* o)
+{
+    if (s_snap_pool_n < VK_SNAP_POOL && o->im.img) {
+        s_snap_pool[s_snap_pool_n].im = o->im;
+        s_snap_pool[s_snap_pool_n].fmt = o->fmt;
+        s_snap_pool[s_snap_pool_n].w = o->w;
+        s_snap_pool[s_snap_pool_n].h = o->h;
+        s_snap_pool_n++;
+    } else {
+        vk_destroy_image(&o->im);
+    }
+}
+
+static void vk_eng_snapshot_pool_drain(void)
+{
+    for (u32 i = 0; i < s_snap_pool_n; i++) vk_destroy_image(&s_snap_pool[i].im);
+    s_snap_pool_n = 0;
+}
+
+static u32 vk_eng_color_snapshot(void* user, u32 surface)
+{
+    (void)user;
+    const vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!t || t->snapshot) return 0;
+    const u32 hd = vk_eng_alloc();
+    if (!hd) return 0;
+    vk_eng_obj* o = &s_eobj[hd];
+    int reused = 0;
+    for (u32 i = 0; i < s_snap_pool_n; i++)
+        if (s_snap_pool[i].fmt == t->fmt && s_snap_pool[i].w == t->w && s_snap_pool[i].h == t->h) {
+            o->im = s_snap_pool[i].im;
+            s_snap_pool[i] = s_snap_pool[--s_snap_pool_n];
+            reused = 1;
+            break;
+        }
+    if (!reused && vk_create_image(&o->im, t->fmt, t->w, t->h,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   VK_IMAGE_ASPECT_COLOR_BIT)) {
+        vk_destroy_image(&o->im);
+        memset(o, 0, sizeof *o);
+        return 0;
+    }
+    o->kind = VK_ENG_COLOR; o->snapshot = 1;
+    o->fmt = t->fmt; o->bpp = t->bpp; o->w = t->w; o->h = t->h;
+    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
+                     reused ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
+    vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy c = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .extent = { t->w, t->h, 1 },
+    };
+    pvkCmdCopyImage(s_vk.cmd, t->im.img, VK_IMAGE_LAYOUT_GENERAL,
+                    o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    /* The copy, made visible to whatever samples it next. */
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    return hd;
+}
+
 /* ---- E4: depth snapshots --------------------------------------------------
  * A depth target read as a texture, which the engine asks for only after a
  * depth-writing draw. Metal resolves it with a fullscreen pass into R32Float;
@@ -3194,6 +3287,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .depth_target_create  = vk_eng_depth_target_create,
     .depth_target_release = vk_eng_release,
     .depth_snapshot       = vk_eng_depth_snapshot,
+    .color_snapshot       = vk_eng_color_snapshot,
     .pipeline_create      = vk_eng_pipeline_create,
     .pipeline_release     = vk_eng_pipeline_release,
     .bind_targets         = vk_eng_bind_targets,

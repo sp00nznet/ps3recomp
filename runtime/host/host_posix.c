@@ -699,6 +699,44 @@ static void emit_rtt_draws(void)
     emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);
 }
 
+/* --feedback: a draw that samples the colour target it is writing, which is
+ * what in-place deferred lighting does (read the albedo, write the lit colour
+ * over it).
+ *
+ * The red triangle goes into the --rtt surface as there, with its pitch and
+ * format declared so the surface and a texture over the same bytes describe
+ * one layout. Then,
+ * still targeting that surface, the full-screen quad samples it through TEX
+ * r0, TC0 and writes the result back over it: a copy of itself. Last, the
+ * display samples the surface as in --rtt.
+ *
+ * Red survives only if the second draw read the surface as it was when the
+ * draw started. A backend that falls back to the guest bytes at that offset
+ * (green, as in --rtt) overwrites the surface with green; one that rejects
+ * the draw leaves red behind too, so the mode also asks the engine's log. */
+static void emit_feedback_draws(void)
+{
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   RTT_OFFSET);
+    emit(NV4097_SET_SURFACE_PITCH_A,         RTT_DIM * 4u);
+    /* A8R8G8B8, Z24S8, linear: the engine only hands out a copy of a target
+     * whose declared layout is the texture's. */
+    emit(NV4097_SET_SURFACE_FORMAT,          0x148u);
+    emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_0);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, RTT_DIM << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   RTT_DIM << 16);
+    emit(NV4097_SET_SHADER_PROGRAM,          0u);
+    emit_triangle_draw();
+    emit(NV4097_SET_TEXTURE_CONTROL3 + 0,    RTT_DIM * 4u);
+    emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);     /* reads its own target */
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   0u);
+    emit(NV4097_SET_SURFACE_PITCH_A,         1280u * 4u);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
+    emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);
+}
+
 /* Declare an MRT1 set, write both of its members from ONE draw, then sample
  * one of them -- which is what a deferred renderer's G-buffer pass is.
  *
@@ -974,6 +1012,7 @@ static void submit_frame(int with_draw)
     else if (with_draw == 9) emit_mrt_draws(1);
     else if (with_draw == 8) emit_depthtex_draws();
     else if (with_draw == 7) emit_quad_draws();
+    else if (with_draw == 14) emit_feedback_draws();
     else if (with_draw == 6) emit_rtt_draws();
     else if (with_draw == 5) emit_mip_draw();
     else if (with_draw == 4) emit_depth_draw();
@@ -1179,7 +1218,7 @@ static int run_audio_pad_check(void)
  * software path, which is why Linux runs that mode and not these. */
 static int mode_needs_translator(int mode)
 {
-    return mode == 3 || mode == 5 || mode == 6 || mode == 8 ||
+    return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
            mode == 9 || mode == 10 || mode == 11;
 }
 
@@ -1196,6 +1235,7 @@ static const char* mode_flag_name(int mode)
     case 3:  return "--shader";
     case 5:  return "--mip";
     case 6:  return "--rtt";
+    case 14: return "--feedback";
     case 8:  return "--depthtex";
     case 9:  return "--mrt";
     case 10: return "--mrt-a";
@@ -1291,6 +1331,8 @@ int main(int argc, char** argv)
          * the depthBounds feature; anywhere else the mode says so and stops
          * without a verdict. */
         else if (strcmp(argv[i], "--depthbounds") == 0) do_draw = 12;
+        /* --feedback: see emit_feedback_draws. */
+        else if (strcmp(argv[i], "--feedback") == 0) do_draw = 14;
     }
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
@@ -1341,7 +1383,7 @@ int main(int argc, char** argv)
     if (do_draw == 12) upload_depth_bounds_triangles();
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
-    if (do_draw == 6) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
+    if (do_draw == 6 || do_draw == 14) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
     if (do_draw == 7) upload_quad_geometry();
     /* --depthtex draws both too: the flat triangle into the zeta, the quad
      * out of it. */
@@ -1418,6 +1460,7 @@ int main(int argc, char** argv)
                  : (do_draw == 9) ? MRT_B_ARGB
                  : (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
+                 : (do_draw == 14) ? 0xFFFF0000u  /* the copy kept the triangle  */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
                  : (do_draw == 5) ? MIP_L1_ARGB
                  : (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
@@ -1438,6 +1481,12 @@ int main(int argc, char** argv)
         u32 gd = host_backend_guest_draws();
         printf("[host] draws through guest programs: %u %s\n", gd, gd ? "OK" : "NONE");
         if (!gd) rc = 4;
+        /* --feedback: both textured draws ran, the one reading its own
+         * target included; a rejected draw would also leave the red. */
+        if (do_draw == 14 && gd < 2) {
+            printf("[host] --feedback: the self-sampling draw did not run\n");
+            rc = 4;
+        }
     }
 
     host_backend_shutdown();
