@@ -184,11 +184,12 @@ typedef struct {
     ID3DBlob* vs;
     int uses_c03;
 } VPVSEntry;
-#define VP_VS_CACHE 16  /* wave uses 5+ distinct VPs; at 4 the cache
+#define VP_VS_CACHE 128 /* wave uses 5+ distinct VPs; at 4 the cache
                          * thrashed every frame and eviction shifted slots
                          * under recorded vs_idx values -- the display mesh
                          * drew with the WRONG vertex program (sub-rect +
-                         * edge slivers instead of fullscreen) */
+                         * edge slivers instead of fullscreen). A fight in
+                         * SoulCalibur II HD uses more than 16. */
 
 /* Compiled guest-FP pipeline cache: decompiled VS (by cache slot) + decompiled
  * PS (fragment ucode at fp_addr). */
@@ -1743,6 +1744,12 @@ static int vp_get_vs(const rsx_state* st)
     if (vstart >= st->vp_ucode_bytes) vstart = 0;
     const u8* vuc = st->vp_ucode + vstart;
     u32 vlen = st->vp_ucode_bytes - vstart;
+    /* Hash the program's own bytes, up to its end bit, not everything behind it in the store (as the Metal
+     * backend does). A title that keeps several programs resident and uploads another one behind the program it
+     * draws with changed that hash on every upload, so nearly every draw missed the cache and ran D3DCompile. */
+    { extern u32 rsx_vp_program_size_instrs(const u8*, u32);
+      const u32 instrs = rsx_vp_program_size_instrs(vuc, vlen);
+      if (instrs) vlen = instrs * 16u; }
     u32 hash = vp_hash_ucode(vuc, vlen);
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
         if (s_d3d.vp_vs[i].hash == hash) return i;
