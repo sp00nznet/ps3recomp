@@ -90,9 +90,17 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_O_RDONLY     0
 #define CELL_FS_O_WRONLY     1
 #define CELL_FS_O_RDWR       2
-#define CELL_FS_O_CREAT      0x0200
-#define CELL_FS_O_TRUNC      0x0400
-#define CELL_FS_O_APPEND     0x0100
+/* Open flags: the PS3 SDK values (octal), byte for byte the set
+ * libs/filesystem/cellFs.h declares. The hex guesses that used to be here
+ * (O_CREAT 0x0200, O_TRUNC 0x0400, O_APPEND 0x0100) put the right numbers on
+ * the wrong names -- 0x200 and 0x400 are TRUNC and APPEND, not CREAT and
+ * TRUNC -- so a title opening a file with O_RDWR|O_CREAT (flags 0x42 =
+ * 000002 | 000100) hit an unnamed bit and got a plain read-only open; the file
+ * was never created. */
+#define CELL_FS_O_CREAT      0x0040   /* 000100 */
+#define CELL_FS_O_TRUNC      0x0200   /* 001000 */
+#define CELL_FS_O_APPEND     0x0400   /* 002000 */
+#define CELL_FS_O_EXCL       0x0080   /* 000200 */
 #define CELL_FS_SEEK_SET     0
 #define CELL_FS_SEEK_CUR     1
 #define CELL_FS_SEEK_END     2
@@ -239,7 +247,7 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
