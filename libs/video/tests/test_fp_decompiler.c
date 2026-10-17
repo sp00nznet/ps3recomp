@@ -369,6 +369,27 @@ int main(void)
         check("no_depth_export_entry", hlsl, "float4 main(PSInput input) : SV_TARGET {");
     }
 
+    /* SRC2 bit 31 (perspective_corr) on a texcoord read multiplies the input
+     * by 1/w (RPCS3 FragmentProgramDecompiler: "Perspective correct flag
+     * multiplies the result by 1/w"). inFAMOUS 2's water writes uv*w from the
+     * vertex program and samples TC2 with the flag set; read raw, uv*w lands
+     * far outside the screen copy and the river samples black. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(6) | TEXU(0) | END); /* TEX TC2 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 1u << 31);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("persp_tc_scaled", hlsl, "(input.tc2 * _rsx_inv_w(input.position))");
+        check("persp_helper",    hlsl, "#define _rsx_inv_w(p)");
+
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("persp_off_raw",    hlsl, "((input.tc2).xyzw).xy");
+        check_absent("persp_off_no_helper", hlsl, "_rsx_inv_w");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

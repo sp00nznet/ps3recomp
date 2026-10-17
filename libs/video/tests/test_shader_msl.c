@@ -305,6 +305,24 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- fragment program: TEX r0, TC0 with perspective_corr --------------
+     * SRC2 bit 31 scales the texcoord by 1/w. Through glslang SV_POSITION.w
+     * becomes FragCoord.w, which is already 1/w, so the helper must resolve
+     * to the bare .w here (RSX_FRAGCOORD_W_IS_RCP) -- a division would undo
+     * the correction and inFAMOUS 2's river would sample outside its copy. */
+    {
+        u8 fp[16];
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        rsx_test_fp_put_word(fp + 12, 1u << 31);
+        check_count("persp TEX FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("persp TEX FP HLSL", g_hlsl, "(input.tc0 * _rsx_inv_w(input.position))");
+        if (translate("persp TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("persp TEX FP MSL", g_msl, "gl_FragCoord.w");
+            check_absent("persp TEX FP MSL", g_msl, "1.0 / gl_FragCoord.w");
+        }
+    }
+
     /* ---- fragment program writing TWO colour targets ---------------------
      * MOV r0, COL0 ; MOV r2, COL0.zyxw (END). With 32-bit exports r0 is
      * target A and r2 is target B, so the decompiler returns a struct of two

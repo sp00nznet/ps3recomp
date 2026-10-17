@@ -69,6 +69,9 @@ bool hlsl_to_spirv(const char* hlsl, EShLanguage lang, std::vector<unsigned int>
     shader.setEnvInput(glslang::EShSourceHlsl, lang, glslang::EShClientVulkan, 100);
     shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
+    /* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
+     * decompiler's _rsx_inv_w helper which one it gets. */
+    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n");
     shader.setEntryPoint("main");
     shader.setAutoMapBindings(true);
     shader.setAutoMapLocations(true);
