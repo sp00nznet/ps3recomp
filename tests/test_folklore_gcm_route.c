@@ -16,6 +16,9 @@ extern uint32_t ppu_vm_size;
 extern void cellGcm_rsx_process_fifo(void);
 extern volatile u32 g_rsx_last_reference;
 static int engine_on, flushes, engine_clears, legacy_clears;
+/* What the engine's register file would hold, by NV4097 method, and how many
+ * methods arrived from a 2D-engine subchannel (2..6). */
+static u32 engine_reg[0x2000 / 4], engine_from_2d;
 static u32 fifo_bytes, heap = 0x00400000u;
 #define IO_ADDR 0x00100000u
 #define CTRL (VM_HLE_INJECT_BASE + 0x2000u)
@@ -36,17 +39,19 @@ static u32 allocate(u32 size, u32 alignment)
     heap = (heap + alignment - 1) & ~(alignment - 1);
     u32 result = heap; heap += size; return result;
 }
-static void emit(u32 method, u32 value)
+static void emit_on(u32 subch, u32 method, u32 value)
 {
-    write32(IO_ADDR + fifo_bytes, (1u << 18) | method);
+    write32(IO_ADDR + fifo_bytes, (1u << 18) | (subch << 13) | method);
     write32(IO_ADDR + fifo_bytes + 4, value);
     fifo_bytes += 8;
 }
+static void emit(u32 method, u32 value) { emit_on(0, method, value); }
 int rsx_draw_engine_enabled(void) { return engine_on; }
 void rsx_draw_engine_method(u32 method, u32 value)
 {
-    (void)value;
     if (method == NV4097_CLEAR_SURFACE) engine_clears++;
+    if (method >= 0x4000u && method < 0xE000u) engine_from_2d++;
+    if (method < 0xE000u) engine_reg[(method & 0x1FFCu) >> 2] = value;
 }
 void rsx_draw_engine_flush(void)
 {
@@ -78,6 +83,32 @@ int main(int argc, char** argv)
         emit(0x1800u, 0x01000000u);
         write32(CTRL, fifo_bytes); cellGcm_rsx_process_fifo();
         return 99; /* strict mode must stop before publishing a fake report */
+    }
+    if (!strcmp(argv[1], "subchannels")) {
+        /* NV4097 alpha test and blend on subchannel 0, then the 2D engines'
+         * state words at the same offsets, as Folklore sends them between
+         * draws: NV3062 surface (3), NV308A inline-transfer point and sizes
+         * (5), NV3089 format, operation, clip and output (6). None of these
+         * starts a transfer. The engine must keep the NV4097 values. */
+        emit(0x0304u, 1u);                      /* ALPHA_TEST_ENABLE */
+        emit(0x0308u, 0x0204u);                 /* ALPHA_FUNC GREATER */
+        emit(0x030Cu, 0x80u);                   /* ALPHA_REF */
+        emit(0x0310u, 1u);                      /* BLEND_ENABLE */
+        emit_on(3, 0x0300u, 0x0000000Bu);       /* NV3062 colour format Y32 */
+        emit_on(3, 0x0304u, 0x00100010u);       /* NV3062 pitch */
+        emit_on(5, 0x0304u, 0x00000004u);       /* NV308A point */
+        emit_on(5, 0x0308u, 0x00010004u);       /* NV308A size out */
+        emit_on(5, 0x030Cu, 0x00010004u);       /* NV308A size in */
+        emit_on(6, 0x0300u, 0x00000003u);       /* NV3089 colour format */
+        emit_on(6, 0x0304u, 0x00000003u);       /* NV3089 operation */
+        emit_on(6, 0x0310u, 0x00000000u);       /* NV3089 out point */
+        emit_on(1, 0x0320u, 0x80068006u);       /* NV4097 on subchannel 1 */
+        write32(CTRL, fifo_bytes); cellGcm_rsx_process_fifo();
+        assert(engine_from_2d == 0);
+        assert(engine_reg[0x0304u >> 2] == 1u && engine_reg[0x0308u >> 2] == 0x0204u);
+        assert(engine_reg[0x030Cu >> 2] == 0x80u && engine_reg[0x0310u >> 2] == 1u);
+        assert(engine_reg[0x0320u >> 2] == 0x80068006u);
+        free(vm_base); puts("2D-engine subchannels kept out of the NV4097 register file"); return 0;
     }
     emit(NV4097_SET_COLOR_CLEAR_VALUE, 0xFF101830u);
     emit(NV4097_CLEAR_SURFACE, 0xF0u);

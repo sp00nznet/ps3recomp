@@ -2188,9 +2188,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* And into the platform-neutral register-file draw engine,
                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
                  * It wants the raw method with its subchannel bits for the
-                 * same reason the live engine does, and masks them itself. */
+                 * same reason the live engine does, and masks them itself.
+                 *
+                 * Only from the subchannels routed to NV4097 below, plus the
+                 * driver methods (0xE000 and up, which the engine keeps at
+                 * their full address). The engine strips the subchannel, so a
+                 * 2D-engine method would land on the NV4097 register at the
+                 * same offset. Folklore patches fragment-program constants
+                 * with NV308A inline transfers (0x300 point, 0x304 size out,
+                 * 0x308 size in), and those were overwriting ALPHA_TEST_ENABLE,
+                 * ALPHA_FUNC and ALPHA_REF, so its alpha-tested foliage drew
+                 * as solid cards with black borders. */
                 const int engine_active = rsx_draw_engine_enabled();
-                if (engine_active)
+                const int nv4097_subch = subch == 0 || (subch == 1 && !s1_2d);
+                if (engine_active && (nv4097_subch || ((subch << 13) | m) >= 0xE000u))
                     rsx_draw_engine_method((subch << 13) | m, vm_read32(dea));
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
