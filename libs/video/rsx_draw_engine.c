@@ -128,6 +128,7 @@ typedef struct {
     u32 handle;
     u8 fixed;
     u16 tex_used;           /* units the pixel program samples */
+    u64 fp_hash;            /* eng_fp_debug_hash of the guest fragment program */
 } eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
@@ -1335,13 +1336,76 @@ static u32 eng_sampled_units(const char* ps)
  * retried on every draw of every frame. `out_tex_used` gets the units the
  * pixel program samples: all of them for the built-in pair, which keeps
  * every enabled unit bound as before. */
+/* Up to 16 comma-separated hex hashes from an environment variable. */
+static u32 eng_parse_hash_list(const char* name, u64 out[16])
+{
+    const char* e = getenv(name);
+    u32 n = 0;
+    while (e && *e && n < 16) {
+        char* end;
+        const u64 v = strtoull(e, &end, 16);
+        if (end == e) break;
+        if (v) out[n++] = v;
+        if (*end != ',') break;
+        e = end + 1;
+    }
+    return n;
+}
+
+/* The per-draw fragment-program debug knobs; nonzero drops the draw.
+ *
+ * RSX_ENGINE_SKIP_FP=<hex>[,<hex>...] drops every draw through those
+ * fragment programs: which pass paints a wrong smear, halo or black band is
+ * found by removing passes one at a time.
+ *
+ * RSX_ENGINE_REGDUMP_FP=<hex>[,<hex>...] prints the non-zero words of the
+ * whole RSX register file at the first draw through each of those programs,
+ * so the state of a broken pass can be diffed register by register against a
+ * working one -- which state it sets that the engine does not honour. */
+static int eng_debug_fp(u64 fp_hash, u32 pipeline)
+{
+    static int init;
+    static u64 skip[16], dump[16];
+    static u32 n_skip, n_dump, dumped;
+    if (!init) {
+        init = 1;
+        n_skip = eng_parse_hash_list("RSX_ENGINE_SKIP_FP", skip);
+        n_dump = eng_parse_hash_list("RSX_ENGINE_REGDUMP_FP", dump);
+    }
+    for (u32 i = 0; i < n_dump; i++) {
+        if (dump[i] != fp_hash || (dumped & (1u << i))) continue;
+        dumped |= 1u << i;
+        fprintf(stderr, "[rsx regdump] fp %016llx pipe %u frame %u begin\n",
+                (unsigned long long)fp_hash, pipeline, g.frames);
+        for (u32 r = 0; r < RSX_DSP_NUM_REGS; r++)
+            if (g.rsx.regs[r])
+                fprintf(stderr, "[rsx regdump] 0x%04X = 0x%08X\n", r * 4u, g.rsx.regs[r]);
+        fprintf(stderr, "[rsx regdump] fp %016llx end\n", (unsigned long long)fp_hash);
+    }
+    for (u32 i = 0; i < n_skip; i++)
+        if (skip[i] == fp_hash) return 1;
+    return 0;
+}
+
+/* A guest fragment program's name for the debug knobs: its structural hash
+ * (inline constants excluded) seeded with the FNV offset basis, the value
+ * RSX_FP_DEBUG matches in the decompiler. Unlike a backend pipeline handle it
+ * does not depend on the order programs are first drawn in, so a program
+ * found in one run is named the same in the next. 0 for the built-in one. */
+static u64 eng_fp_debug_hash(const u8* fp_uc, u32 fp_size)
+{
+    return fp_uc && fp_size
+        ? rsx_fp_structural_hash(fp_uc, fp_size, 1469598103934665603ull) : 0;
+}
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
-                            u32* out_tex_used)
+                            u32* out_tex_used, u64* out_fp_hash)
 {
     *out_fixed = 1;
     *out_tex_used = 0;
+    *out_fp_hash = 0;
     const u8* vp_uc = NULL;
     const u8* fp_uc = NULL;
     u32 vp_instrs = 0, fp_size = 0;
@@ -1425,6 +1489,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (g.pipelines[i].key == key) {
             *out_fixed = g.pipelines[i].fixed;
             *out_tex_used = g.pipelines[i].tex_used;
+            *out_fp_hash = g.pipelines[i].fp_hash;
             return g.pipelines[i].handle;
         }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
@@ -1456,11 +1521,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
+    const u64 fp_hash = fixed ? 0 : eng_fp_debug_hash(fp_uc, fp_size);
     /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
      * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one
      * RSX_ENGINE_PASS_DUMP's index names, and a guest fragment program's own
-     * ucode as .fp.bin with its address in .fp.txt. A failed pipeline is
-     * pipe0. */
+     * ucode as .fp.bin with its address and debug hash (the value
+     * RSX_FP_DEBUG, RSX_ENGINE_SKIP_FP and RSX_ENGINE_REGDUMP_FP take) in
+     * .fp.txt. A failed pipeline is pipe0. */
     {
         const char* dir = getenv("RSX_ENGINE_SHADER_DUMP");
         if (dir && *dir) {
@@ -1477,8 +1544,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 if ((f = fopen(path, "wb"))) { fwrite(fp_uc, 1, fp_size, f); fclose(f); }
                 snprintf(path, sizeof path, "%s/pipe%u.fp.txt", dir, handle);
                 if ((f = fopen(path, "w"))) {
-                    fprintf(f, "location %u offset 0x%08X size %u ctrl 0x%08X\n",
-                            fp_loc, fp_off, fp_size, fp_ctrl);
+                    fprintf(f, "location %u offset 0x%08X size %u ctrl 0x%08X\n"
+                               "fp %016llx\n",
+                            fp_loc, fp_off, fp_size, fp_ctrl,
+                            (unsigned long long)fp_hash);
                     fclose(f);
                 }
             }
@@ -1486,16 +1555,19 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     }
     { static u32 logs = 0; if (logs++ < 32)
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
-                        " %u constants -> %s\n",
+                        " %u constants, fp %016llx -> %s\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
-                vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)"); }
+                vi, fi, nconst, (unsigned long long)fp_hash,
+                handle ? "ok" : "FAILED (draw dropped)"); }
 
     g.pipelines[g.n_pipelines].key = key;
+    g.pipelines[g.n_pipelines].fp_hash = fp_hash;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
     g.pipelines[g.n_pipelines].tex_used =
         (u16)(fixed ? 0xFFFFu : eng_sampled_units(s_ps_hlsl));
     *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
+    *out_fp_hash = fp_hash;
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
@@ -2289,10 +2361,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * see than a missing object and hides the translation failure. */
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
+    u64 fp_hash = 0;
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
-                                          n_targets, &pipeline_is_fixed, &tex_used);
+                                          n_targets, &pipeline_is_fixed, &tex_used,
+                                          &fp_hash);
     if (!pipeline) return;
+    if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */

@@ -590,6 +590,30 @@ static int rsx_fp_decompile_internal(
         /* Condition-code registers for exec_if predication / set_cond. Reset
          * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
         "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
+    /* RSX_FP_DEBUG=<structural hash hex>:<n>:<reg[.swz]>: in the program
+     * with that structural hash (rsx_fp_structural_hash with the FNV offset
+     * basis as seed, the "fp" the engine's pipeline log and shader dump
+     * print), copy register <reg> (r3, h1, h1.wwww ...) right after its
+     * <n>-th translated instruction and export it as colour target 0 with
+     * alpha 1. An intermediate of a long shader is then seen on screen
+     * instead of reasoned out from the listing. */
+    static long dbg_n = -2; static char dbg_reg[32]; static u64 dbg_hash;
+    if (dbg_n == -2) {
+        dbg_n = -1;
+        const char* e = getenv("RSX_FP_DEBUG");
+        if (e) {
+            char* d;
+            dbg_hash = strtoull(e, &d, 16);
+            if (*d == ':') dbg_n = strtol(d + 1, &d, 10);
+            if (*d == ':') snprintf(dbg_reg, sizeof dbg_reg, "%s", d + 1);
+            if (!(dbg_reg[0] == 'r' || dbg_reg[0] == 'h')) dbg_n = -1;
+        }
+    }
+    const int dbg_here = dbg_n >= 0 &&
+        rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull) == dbg_hash;
+    u32 dbg_count = 0;
+    int dbg_done = 0;
+    if (dbg_here) out_puts(&o, "    float4 _rsx_dbg = (float4)0;\n");
 
     /* Which colour export each register file received a write to, indexed
      * [half][target]. The whole file is tracked, not just target 0, because
@@ -766,6 +790,16 @@ static int rsx_fp_decompile_internal(
             return -1;
         }
 
+        if (dbg_here && !dbg_done && dbg_count == (u32)dbg_n) {
+            /* "h1" -> (h[1]), "h1.wwww" -> (h[1]).wwww */
+            const char* dot = strchr(dbg_reg, '.');
+            const unsigned idx = (unsigned)strtoul(dbg_reg + 1, NULL, 10);
+            char line[96];
+            snprintf(line, sizeof line, "    _rsx_dbg = (float4)((%c[%u])%s);\n",
+                     dbg_reg[0], idx < 48u ? idx : 0u, dot ? dot : "");
+            out_puts(&o, line);
+            dbg_done = 1;
+        }
         /* Build the RHS expression for this opcode. */
         char rhs[640];
         int handled = 1;
@@ -929,6 +963,7 @@ static int rsx_fp_decompile_internal(
         }
 
         int has_dest = !(w0 & FP_OUT_NONE);
+        if (dbg_here && handled && !dbg_done) dbg_count++;
         if (handled && (has_dest || set_cond)) {
             u32 dst_idx = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
             int dst_half = (w0 & FP_OUT_HALF) ? 1 : 0;
@@ -1053,6 +1088,16 @@ static int rsx_fp_decompile_internal(
      * a depth buffer writes the quad's constant depth instead. The output
      * becomes a struct even for one colour target. */
     const int depth_export = ctrl != RSX_FP_CTRL_AUTO && (ctrl & 0xEu) != 0u;
+    if (dbg_here) {
+        static u32 reported;
+        if (reported++ < 8)
+            fprintf(stderr, "[RSX fp] RSX_FP_DEBUG %016llx: %s after instruction %ld%s\n",
+                    (unsigned long long)dbg_hash, dbg_reg, dbg_n,
+                    dbg_done ? "" : " not reached (program is shorter)");
+        if (dbg_done)
+            out_puts(&o, "    { float4 _d = _rsx_dbg; _d.w = 1.0;"
+                         " r[0] = _d; h[0] = _d; }\n");
+    }
     if (targets == 1 && !depth_export) {
         char tail[96];
         snprintf(tail, sizeof(tail),

@@ -12,8 +12,10 @@
  * how many SV_TARGETs a program that writes more than one export gets.
  */
 
+#define _POSIX_C_SOURCE 200809L   /* setenv */
 #include "../rsx_fp_decompiler.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_pass = 0, g_fail = 0;
@@ -89,6 +91,39 @@ static void check_true(const char* test, int cond)
 int main(void)
 {
     char hlsl[16384];
+
+    /* RSX_FP_DEBUG=<hash>:<n>:<reg>: the named register, captured after the
+     * program's n-th instruction, becomes colour target 0 with alpha 1 --
+     * in that program only. The variable is read once, on the first
+     * decompile, so this runs first. */
+    {
+        u8 prog[32];
+        u32 mask_xy = (1u<<9)|(1u<<10);
+        put_word(prog + 0, OPC(0x02) | mask_xy | OUTREG(1));          /* MUL r1.xy, r0, r0 */
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        char spec[64];
+        snprintf(spec, sizeof spec, "%llx:1:r1.xyyy", (unsigned long long)
+                 rsx_fp_structural_hash(prog, sizeof prog, 1469598103934665603ull));
+        setenv("RSX_FP_DEBUG", spec, 1);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("fp_debug_capture", hlsl,
+              "r[1].xy = _v.xy; }\n"
+              "    _rsx_dbg = (float4)((r[1]).xyyy);\n"
+              "    { float4 _v = (float4)((saturate(input.col0)).xyzw);");
+        check("fp_debug_export", hlsl, "_d.w = 1.0; r[0] = _d; h[0] = _d; }\n"
+                                       "    float4 _o = r[0];");
+        u8 other[16];
+        memcpy(other, prog + 16, sizeof other);
+        rsx_fp_decompile(other, sizeof(other), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("fp_debug_other_program", hlsl, "_rsx_dbg");
+        unsetenv("RSX_FP_DEBUG");
+    }
 
     /* Test 1: MOV r0, COL0  (write all, END). */
     {
