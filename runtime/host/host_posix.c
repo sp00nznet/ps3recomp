@@ -105,6 +105,7 @@ extern uint32_t ppu_vm_size;
 #define HEAP_BASE   0x00400000u
 
 #define CLEAR_ARGB  0xFF101830u          /* what we expect to come out again  */
+#define SPLIT_B_ARGB 0xFF20C040u         /* --split-present: the frame after  */
 #define VTX_OFFSET  0x00010000u          /* RSX offset of our vertex buffer   */
 #define TEX_OFFSET  0x00020000u          /* RSX offset of our test texture    */
 #define FP_OFFSET   0x00030000u          /* RSX offset of our fragment programs */
@@ -979,7 +980,7 @@ static void submit_frame(int with_draw)
     else if (with_draw == 4) emit_depth_draw();
     else if (with_draw == 3) emit_shader_draw();
     else if (with_draw == 2) emit_textured_draw();
-    else if (with_draw == 1) emit_triangle_draw();
+    else if (with_draw == 1 || with_draw == 13) emit_triangle_draw();
 
     guest_w32(CTRL_ADDR + 0, g_fifo_len);   /* put */
     cellGcm_rsx_process_fifo();
@@ -1291,6 +1292,14 @@ int main(int argc, char** argv)
          * the depthBounds feature; anywhere else the mode says so and stops
          * without a verdict. */
         else if (strcmp(argv[i], "--depthbounds") == 0) do_draw = 12;
+        /* --split-present (Vulkan): present the red triangle frame in two
+         * halves with the next frame drained in between, as a host that
+         * presents on its own thread does. The second frame clears to
+         * SPLIT_B_ARGB. What was shown must still be the triangle's red: the
+         * second frame's clear may not reach a present that had already
+         * begun. On the draw engine path the surface itself must hold the
+         * second frame by then. */
+        else if (strcmp(argv[i], "--split-present") == 0) do_draw = 13;
     }
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
@@ -1334,7 +1343,7 @@ int main(int argc, char** argv)
         printf("[host] --tex-io: local ea 0x%08X has offset 0x%08X, the texture's page\n",
                0xC0000000u + TEX_OFFSET, guest_r32(out));
     }
-    if (do_draw == 1) upload_triangle();
+    if (do_draw == 1 || do_draw == 13) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
     if (do_draw == 3) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
@@ -1364,6 +1373,40 @@ int main(int argc, char** argv)
     u32 got = host_backend_color();
     printf("[host] clear colour through the FIFO: 0x%08X (expected 0x%08X) %s\n",
            got, CLEAR_ARGB, got == CLEAR_ARGB ? "OK" : "MISMATCH");
+
+    if (do_draw == 13) {
+#if defined(PS3RECOMP_RSX_VULKAN) && !defined(__APPLE__)
+        cellGcmSetFlipCommand(0);
+        cellGcmTickVBlank();
+        cellGcmTickFlip();
+        rsx_vulkan_backend_present_begin();
+        emit(NV4097_SET_COLOR_CLEAR_VALUE, SPLIT_B_ARGB);   /* the next frame */
+        emit(NV4097_CLEAR_SURFACE, 0xF0u);
+        guest_w32(CTRL_ADDR + 0, g_fifo_len);
+        cellGcm_rsx_process_fifo();
+        rsx_vulkan_backend_present_finish();
+        const u32 shown = rsx_vulkan_backend_presented_center();
+        const u32 now = host_backend_center();
+        int rc = (got == CLEAR_ARGB) ? 0 : 2;
+        printf("[host] --split-present: shown 0x%08X (expected 0xFFFF0000) %s\n", shown,
+               (shown & 0x00FFFFFFu) == 0x00FF0000u ? "OK" : "MISMATCH");
+        if ((shown & 0x00FFFFFFu) != 0x00FF0000u) rc = 3;
+        if (HOST_BACKEND_GUEST_SHADERS) {
+            printf("[host] --split-present: surface now 0x%08X (expected 0x%08X) %s\n", now,
+                   SPLIT_B_ARGB, (now & 0x00FFFFFFu) == (SPLIT_B_ARGB & 0x00FFFFFFu) ? "OK" : "MISMATCH");
+            if ((now & 0x00FFFFFFu) != (SPLIT_B_ARGB & 0x00FFFFFFu)) rc = 3;
+        }
+        host_backend_shutdown();
+        free(vm_base);
+        return rc;
+#else
+        printf("[host] --split-present: skipped, the %s backend presents in one call\n",
+               HOST_BACKEND_NAME);
+        host_backend_shutdown();
+        free(vm_base);
+        return 0;
+#endif
+    }
 
     /* Flip loop, as cellGcmSetFlipCommand + the vblank ticker drive it. */
     cellGcmSetFlipCommand(0);
