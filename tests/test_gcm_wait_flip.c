@@ -196,6 +196,87 @@ static int test_completion(void)
     return 0;
 }
 
+/* Flip handler delivery: one call per completed requested flip. */
+#define FLIP_OPD 0x00012400u
+static int s_flip_calls;
+static void count_flip(uint32_t opd,uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,
+                       uint64_t a4,uint64_t a5,uint64_t a6,uint64_t a7)
+{
+    (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;(void)a6;(void)a7;
+    if(opd==FLIP_OPD) s_flip_calls++;
+}
+
+static void reset_flip_handler(void)
+{
+    reset_env(BEGIN+0x800);
+    GCM_FLIP_COUNT_RESET(s_flip_outstanding);
+    GCM_FLIP_COUNT_RESET(s_flip_completions);
+    (void)GCM_PENDING_TAKE();
+    s_flip_status=CELL_GCM_FLIP_STATUS_DONE;
+    s_flip_handler_opd=FLIP_OPD;s_flip_handler_code=0;
+    s_flip_calls=0;
+    g_ps3_guest_caller=count_flip;
+}
+
+static int finish_flip_handler(int r)
+{
+    g_ps3_guest_caller=NULL;s_flip_handler_opd=0;
+    GCM_FLIP_COUNT_RESET(s_flip_outstanding);
+    GCM_FLIP_COUNT_RESET(s_flip_completions);
+    return r;
+}
+
+/* Folklore: flip N+1 is requested before N completes. Both completions must
+ * reach the handler; the second used to see DONE and was dropped. */
+static int test_two_flips_in_flight(void)
+{
+    reset_flip_handler();
+    CHECK(gcm_flip_request(0,1)==CELL_OK);
+    CHECK(gcm_flip_request(0,1)==CELL_OK);
+    CHECK(s_flip_calls==0);                 /* strict: nothing at request time */
+    cellGcmTickFlip();ppu_gcm_pump();
+    CHECK(s_flip_calls==1 && cellGcmGetFlipStatus()==CELL_GCM_FLIP_STATUS_DONE);
+    cellGcmTickFlip();ppu_gcm_pump();
+    CHECK(s_flip_calls==2);
+    cellGcmTickFlip();ppu_gcm_pump();       /* nothing left outstanding */
+    CHECK(s_flip_calls==2);
+    return finish_flip_handler(0);
+}
+
+/* Two completions before anyone pumps: two handler calls, not one. */
+static int test_completions_not_coalesced(void)
+{
+    reset_flip_handler();
+    CHECK(gcm_flip_request(0,1)==CELL_OK && gcm_flip_request(0,1)==CELL_OK);
+    cellGcmTickFlip();cellGcmTickFlip();
+    ppu_gcm_pump();
+    CHECK(s_flip_calls==2);
+    ppu_gcm_pump();
+    CHECK(s_flip_calls==2);
+    return finish_flip_handler(0);
+}
+
+/* No flip requested, no callback -- even with the status set to WAITING by
+ * cellGcmResetFlipStatus (Tokyo Jungle's poll loop relies on this). */
+static int test_no_request_no_handler(void)
+{
+    reset_flip_handler();
+    cellGcmResetFlipStatus();
+    cellGcmTickFlip();ppu_gcm_pump();
+    CHECK(s_flip_calls==0 && cellGcmGetFlipStatus()==CELL_GCM_FLIP_STATUS_WAITING);
+    return finish_flip_handler(0);
+}
+
+/* The legacy vblank-ticker beat (cellGcm_request_tick) still delivers once. */
+static int test_legacy_tick_delivers_once(void)
+{
+    reset_flip_handler();
+    cellGcm_request_tick();cellGcm_request_tick();
+    ppu_gcm_pump();
+    CHECK(s_flip_calls==1);
+    return finish_flip_handler(0);
+}
+
 #ifdef HAVE_CHILD
 static void child_misaligned(void) { reset_env(BEGIN+2);cellGcmSetWaitFlip(CTXP); }
 static void child_short_unsafe(void)
@@ -237,6 +318,10 @@ int main(void)
         {"shortage invokes callback once and writes in new space",test_shortage_refill},
         {"callback error leaves command unwritten",test_callback_error},
         {"tick completion clears only label 1",test_completion},
+        {"two flips in flight both reach the handler",test_two_flips_in_flight},
+        {"completions before one pump are not coalesced",test_completions_not_coalesced},
+        {"no requested flip, no handler",test_no_request_no_handler},
+        {"legacy vblank tick delivers once",test_legacy_tick_delivers_once},
 #ifdef HAVE_CHILD
         {"strict fatal: misaligned current",test_fatal_misaligned},
         {"strict fatal: short unsafe, no callback",test_fatal_short_unsafe},

@@ -74,6 +74,43 @@ static int  s_gcm_initialized = 0;
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 
+/* Flip completion accounting. The flip handler runs once for every flip that
+ * completes, as the RSX flip interrupt does. A title can have two flips in
+ * flight (Folklore issues flip N+1 while the renderer is still on N), and the
+ * single status word cannot tell that apart from "no flip requested": the
+ * first completion sets DONE and the second completion used to be dropped.
+ * Folklore's main loop then spun 50,001 usleep(1) calls (~70 ms) on a flag
+ * only its flip handler sets. So: requests not yet completed, and completions
+ * not yet delivered to the handler. The guest thread (requests), renderer
+ * (completions) and pumping thread (delivery) touch these. */
+#ifdef _WIN32
+static volatile LONG s_flip_outstanding = 0;
+static volatile LONG s_flip_completions = 0;
+#define GCM_FLIP_COUNT_ADD(v)   InterlockedIncrement(&(v))
+#define GCM_FLIP_COUNT_TAKE(v)  ((u32)InterlockedExchange(&(v), 0))
+#define GCM_FLIP_COUNT_RESET(v) InterlockedExchange(&(v), 0)
+static int gcm_flip_count_dec_if_positive(volatile LONG* v)
+{
+    for (LONG c = *v; c > 0; c = *v)
+        if (InterlockedCompareExchange(v, c - 1, c) == c) return 1;
+    return 0;
+}
+#else
+#include <stdatomic.h>
+static atomic_int s_flip_outstanding = 0;
+static atomic_int s_flip_completions = 0;
+#define GCM_FLIP_COUNT_ADD(v)   atomic_fetch_add(&(v), 1)
+#define GCM_FLIP_COUNT_TAKE(v)  ((u32)atomic_exchange(&(v), 0))
+#define GCM_FLIP_COUNT_RESET(v) atomic_store(&(v), 0)
+static int gcm_flip_count_dec_if_positive(atomic_int* v)
+{
+    int c = atomic_load(v);
+    while (c > 0)
+        if (atomic_compare_exchange_weak(v, &c, c - 1)) return 1;
+    return 0;
+}
+#endif
+
 /* Count of guest flip requests (SetFlipCommand / SetPrepareFlip). The present
  * loop uses this as the frame boundary: presenting only when a flip arrived
  * keeps partially-drained frames off screen (the ticker otherwise presents on
@@ -194,6 +231,20 @@ static int gcm_flipcb_on_tick_only(void)
     static int v = -1;
     if (v < 0) v = getenv("GCM_FLIPCB_ONTICK") ? 1 : 0;
     return v;
+}
+
+/* GCM_FLIP_TIMELINE=1: one stderr line per flip-path event (request, FIFO
+ * marker, completion tick, handler delivery) with a microsecond timestamp and
+ * the flip status at that moment, to see which step a slow frame waits on. */
+static void gcm_flip_timeline(const char* ev, u32 detail)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("GCM_FLIP_TIMELINE") ? 1 : 0;
+    if (!on) return;
+    static _Thread_local int tag;
+    fprintf(stderr, "[fliptl] %s t=%llu d=%u st=%u thr=%p\n", ev,
+            (unsigned long long)(get_timestamp_ns() / 1000u), (unsigned)detail,
+            (unsigned)s_flip_status, (void*)&tag);
 }
 
 static u32 s_vblank_handler_opd   = 0;
@@ -526,6 +577,8 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_second_v_handler = NULL;
     s_last_flip_time = get_timestamp_ns();
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    GCM_FLIP_COUNT_RESET(s_flip_outstanding);
+    GCM_FLIP_COUNT_RESET(s_flip_completions);
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
     s_vblank_count = 0;
@@ -733,6 +786,7 @@ void cellGcmResetFlipStatus(void)
       if (getenv("FLIP_DBG") && n++ < 12)
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    gcm_flip_timeline("reset", 0);
 }
 
 /* NID: 0xE315A0B2 */
@@ -819,10 +873,14 @@ void ppu_gcm_pump(void)
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
+    /* Completions counted by cellGcmTickFlip, one handler call each. Bit 2
+     * alone is the legacy cellGcm_request_tick beat: one call, as before. */
+    u32 flips = GCM_FLIP_COUNT_TAKE(s_flip_completions);
+    if (!flips && (p & 2)) flips = 1;
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
     { static int d = -1; static unsigned nv, nf, calls;
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
-      if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
+      if (d) { calls++; if (p & 1) nv++; nf += flips;
                if ((calls % 20000) == 0)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
                            calls, nv, nf, s_vblank_count, 10); } }
@@ -831,8 +889,9 @@ void ppu_gcm_pump(void)
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
                            0, 0, 0, 0, 0, 0, 0);
     }
-    if (p & 2) {
+    for (; flips; flips--) {
         s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        gcm_flip_timeline("deliver", s_flip_handler_opd != 0);
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -867,8 +926,12 @@ void cellGcmTickFlip(void)
      * RPCS3 sys_rsx.cpp 0xFEC clears the entire 16-byte label at offset0x10. */
     for (u32 offset = 0x10u; offset < 0x20u; offset += 4u)
         vm_write32(GCM_LABEL_GUEST_BASE + offset, 0);
-    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
-        GCM_PENDING_SET(2);
+    /* One completion per requested flip, even when the next request has
+     * already moved the status on or a delivery already set it to DONE. */
+    const int requested = gcm_flip_count_dec_if_positive(&s_flip_outstanding);
+    gcm_flip_timeline("tick", (u32)requested);
+    if (requested)
+        GCM_FLIP_COUNT_ADD(s_flip_completions);
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -1906,6 +1969,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * guest-visible half of the request. */
                 gcm_set_current_display_buffer(w & 7u);
                 s_flip_pending = 1;
+                gcm_flip_timeline("mark", w & 7u);
                 s_flip_request_count++;
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
@@ -2655,6 +2719,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    GCM_FLIP_COUNT_ADD(s_flip_outstanding);
+    gcm_flip_timeline("req", (u32)in_fifo);
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke via OPD resolution, not a raw call into guest code.
@@ -2806,6 +2872,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    gcm_flip_timeline("prepare", bufferId);
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
@@ -3547,6 +3614,8 @@ void cellGcmTerminate(void)
     s_gcm_initialized = 0;
     s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    GCM_FLIP_COUNT_RESET(s_flip_outstanding);
+    GCM_FLIP_COUNT_RESET(s_flip_completions);
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
     s_vblank_count = 0;
     s_io_map_reserved = 0;
