@@ -972,21 +972,38 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
 
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
- * content id (rsx_live_draw.c:2002-2026). */
+ * content id (rsx_live_draw.c:2002-2026).
+ *
+ * Four independent lanes, folded at the end. A single FNV chain is one
+ * dependent multiply per 8 bytes, and this pass reads every bound texture's
+ * whole mip chain each frame: it was 12% of Folklore's renderer thread. Each
+ * step is a bijection in both the word and the running value, so changing any
+ * one word still changes its lane and therefore the folded hash. */
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                     int* readable)
 {
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
+    const u64 prime = 1099511628211ull;
+    u64 h0 = 1469598103934665603ull, h1 = h0 ^ 1u, h2 = h0 ^ 2u, h3 = h0 ^ 3u;
     u32 i = 0;
+    for (; i + 32 <= span; i += 32) {
+        u64 w0, w1, w2, w3;
+        memcpy(&w0, src + i, 8);      memcpy(&w1, src + i + 8, 8);
+        memcpy(&w2, src + i + 16, 8); memcpy(&w3, src + i + 24, 8);
+        h0 = (h0 ^ w0) * prime; h1 = (h1 ^ w1) * prime;
+        h2 = (h2 ^ w2) * prime; h3 = (h3 ^ w3) * prime;
+    }
+    u64 hash = h0;
+    hash = (hash ^ h1) * prime;
+    hash = (hash ^ h2) * prime;
+    hash = (hash ^ h3) * prime;
     for (; i + 8 <= span; i += 8) {
         u64 word;
         memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
+        hash = (hash ^ word) * prime;
     }
-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
+    for (; i < span; i++) { hash ^= src[i]; hash *= prime; }
     *readable = 1;
     return hash;
 }
