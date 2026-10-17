@@ -20,6 +20,7 @@
 #include "rsx_ao_position_dataflow.h"
 #endif
 #include "rsx_shader_window.h"
+#include "rsx_host_profile.h"
 #include "rsx_surface_layout.h"
 #include "ps3emu/strict_boot.h"
 
@@ -982,8 +983,9 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                     int* readable)
 {
+    const u64 hp_started=hp_tick();
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
-    if (!src) { *readable = 0; return 0; }
+    if (!src) { *readable = 0; hp_end(HP_HASH,hp_started); return 0; }
     const u64 prime = 1099511628211ull;
     u64 h0 = 1469598103934665603ull, h1 = h0 ^ 1u, h2 = h0 ^ 2u, h3 = h0 ^ 3u;
     u32 i = 0;
@@ -1005,6 +1007,7 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
     }
     for (; i < span; i++) { hash ^= src[i]; hash *= prime; }
     *readable = 1;
+    hp_end(HP_HASH,hp_started);
     return hash;
 }
 
@@ -1109,8 +1112,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                                       &readable);
             e->last_hash_frame = g.frames;
             if (readable && hash != e->content_hash) {
+                const u64 hp_upload_started=hp_tick();
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap);
+                hp_end(HP_UPLOAD,hp_upload_started);
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
@@ -1143,8 +1148,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
+    const u64 hp_upload_started=hp_tick();
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap);
+    hp_end(HP_UPLOAD,hp_upload_started);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) g.textures[index] = e;
     return e.handle;
@@ -1891,18 +1898,23 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
+    u64 hp_started=hp_tick();
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
+    hp_end(HP_VPREP,hp_started);
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
         return;
     }
+    hp_started=hp_tick();
     for (u32 i = 0; i < dc.n_refs; i++) {
         u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
         if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
             dc.fetch_ok = 0;
+            hp_end(HP_VDECODE,hp_started);
             return;
         }
     }
+    hp_end(HP_VDECODE,hp_started);
     dc.n_verts = dc.n_refs;
 }
 
@@ -2690,7 +2702,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
+    uint64_t hp_start = hp_tick();
     dc_fetch(&layout, rebuild);
+    hp_end(HP_VERTEX, hp_start);
     if (!dc.n_verts || !dc.fetch_ok) return;
 
     int indexed = 0;
@@ -2708,24 +2722,30 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+    hp_start = hp_tick();
     const u32 n_targets = eng_current_target_set(targets,rs.depth_test || rs.stencil_enable);
+    hp_end(HP_TARGET, hp_start);
     if (!n_targets) return;
     const u32 target = targets[0];
 
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
     const eng_surface* rt = &g.surfaces[target];
+    hp_start = hp_tick();
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      rt->raster_w, rt->raster_h, rt->samples);
+    hp_end(HP_TARGET, hp_start);
 
     /* Strict execution must expose an unavailable required pipeline. */
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     const eng_pipeline* pipeline_metadata = NULL;
+    hp_start = hp_tick();
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
                                           &pipeline_metadata);
+    hp_end(HP_PIPELINE, hp_start);
     if (!pipeline) {
         u32 fp_location=0;
         const u32 fp_offset=rsx_dsp_fragment_program(&g.rsx,&fp_location);
@@ -2745,10 +2765,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
+    hp_start = hp_tick();
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
+    hp_end(HP_TEXTURE, hp_start);
 #ifdef PS3RECOMP_RSX_CACAO
     if (g.ao_enabled && !pipeline_is_fixed && !vtex_mask) {
         rsx_dsp_texture color_tex,depth_tex;
@@ -2857,8 +2879,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    hp_start = hp_tick();
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    hp_end(HP_DRAW, hp_start);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -2983,6 +3007,7 @@ static void eng_present(u32 buffer_id)
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
+    hp_frame(g.frames);
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
 }
@@ -3059,6 +3084,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
 
 void rsx_draw_engine_shutdown(void)
 {
+    hp_close();
     if (!g.be) return;
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);

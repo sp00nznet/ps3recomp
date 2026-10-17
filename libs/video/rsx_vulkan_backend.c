@@ -601,6 +601,8 @@ static int vk_begin(void)
     return 0;
 }
 
+#include "rsx_vk_host_profile.h"
+
 static int vk_submit_and_wait(void)
 {
     vk_batch_thread_check("submit");
@@ -608,18 +610,23 @@ static int vk_submit_and_wait(void)
     if (s_batch.trace) { s_batch.trace--; VK_LOG("batch-trace: submit pending=%u recording=%d\n", drawn, s_batch.recording); }
     s_batch.recording = 0;
     s_batch.pending = 0;
+    const Uint64 hp_begin = vhp_tick();
+    Uint64 hp_queued = hp_begin;
     VkResult r = pvkEndCommandBuffer(s_vk.cmd);
     if (r == VK_SUCCESS) {
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                             .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
         r = pvkResetFences(s_vk.device, 1, &s_vk.fence);
         if (r == VK_SUCCESS) r = pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence);
+        hp_queued = vhp_tick();
         if (r == VK_SUCCESS) r = pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
     }
+    const Uint64 hp_waited = vhp_tick();
     /* Whether it ran or failed, nothing recorded is pending any more. */
     s_batch.vb = s_batch.ib = s_batch.ub = 0;
     if (s_batch.pool && s_batch.sets) pvkResetDescriptorPool(s_vk.device, s_batch.pool, 0);
     s_batch.sets = 0;
+    vhp_record(drawn, hp_begin, hp_queued, hp_waited, (int)r);
     s_batch.submits++;
     s_batch.batched += drawn;
     if (s_batch.stats && s_batch.draws - s_batch.last_report >= 20000) {
@@ -4054,6 +4061,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 void rsx_vulkan_backend_shutdown(void)
 {
     vk_flush_pending(0);
+    vhp_close();
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }
     rsx_draw_engine_set_backend(NULL);
