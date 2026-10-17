@@ -442,3 +442,21 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
+
+      # A SPURS job's entry saves its link register at 16($sp), in the caller's
+      # frame. The runner put $sp 16 bytes under the stack top, where the cache
+      # buffers start, so that save overwrote the first quadword of
+      # cacheBuffer[0]: Twisted Metal's Edge jobs lost their viewport there.
+      - name: Run the SPURS job stack frame test
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spurs_job_stack \
+            runtime/spu/tests/test_spurs_job_stack.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spurs_job_stack

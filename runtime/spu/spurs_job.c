@@ -339,7 +339,14 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     spu_context_init(&ctx, 0);
     ctx.image_id = image_id;
     memcpy(ctx.ls, ls, SPU_LS_SIZE);
-    ctx.gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
+    /* SPU stack grows down. A function saves its link register in its
+     * caller's frame, at 16($sp), so the entry's first store lands 16 bytes
+     * above $sp. The cache buffers start right at stack_top: with $sp at
+     * stack_top - 16 that save overwrote the first quadword of
+     * cacheBuffer[0] (Twisted Metal's Edge jobs read their viewport there and
+     * got width = height = 0). Leave the caller's 32-byte frame inside the
+     * stack. */
+    ctx.gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
