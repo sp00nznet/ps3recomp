@@ -79,6 +79,10 @@ typedef struct rsx_be_render_state {
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
     u32 color_mask;
+    /* Targets 1..3 of an MRT set: COLOR_MASK_MRT (0x0370), one nibble per
+     * target at [4i..4i+3] = A,R,G,B, and BLEND_ENABLE_MRT (0x036C), bit i.
+     * Target 0 keeps color_mask/blend_enable. Both reset to 0 (RPCS3). */
+    u32 color_mask_mrt, blend_mrt;
     u32 rt_fp16;                    /* the target is an FP16 HDR surface */
     u32 stencil_enable, stencil_two_sided;
     u32 depth_bounds_test;          /* SET_DEPTH_BOUNDS_TEST_ENABLE */

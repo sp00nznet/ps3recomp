@@ -279,6 +279,8 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
      * (a depth-prime pass), and rsx_dispatch_init seeds the nv40 reset value
      * so never-written reads as all-on. */
     rs->color_mask  = rsx_dsp_reg(rsx, M_COLOR_MASK);
+    rs->color_mask_mrt = rsx_dsp_reg(rsx, 0x0370) & 0xFFF0u;
+    rs->blend_mrt      = rsx_dsp_reg(rsx, 0x036C) & 0xEu;
     rs->stencil_enable    = rsx_dsp_reg(rsx, M_STENCIL_TEST_ENABLE) & 1;
     rs->stencil_two_sided = rsx_dsp_reg(rsx, M_TWO_SIDED_STENCIL) & 1;
     rs->s_func       = rsx_dsp_reg(rsx, M_STENCIL_FUNC);
@@ -318,6 +320,8 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(cull_face);
     ENG_HASH_FIELD(front_face);
     ENG_HASH_FIELD(color_mask);
+    ENG_HASH_FIELD(color_mask_mrt);
+    ENG_HASH_FIELD(blend_mrt);
     ENG_HASH_FIELD(rt_fp16);
     ENG_HASH_FIELD(stencil_enable);
     ENG_HASH_FIELD(stencil_two_sided);

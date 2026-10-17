@@ -730,6 +730,10 @@ static void emit_mrt_draws(int sample_b)
     emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_MRT1);
     emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, MRT_DIM << 16);
     emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   MRT_DIM << 16);
+    /* Targets B..D take their colour mask from COLOR_MASK_MRT (0x0370), one
+     * A,R,G,B nibble each, not from COLOR_MASK, and it resets to 0: a title
+     * enables them with cellGcmSetColorMaskMrt, as this does for B. */
+    emit(0x0370u /* NV4097_SET_COLOR_MASK_MRT */, 0xF0u);
 
     /* Clear the set, which is one clear per target on both paths, before
      * anything draws into it. That is what a G-buffer pass does, and it is

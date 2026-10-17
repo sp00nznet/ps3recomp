@@ -72,6 +72,7 @@ typedef struct {
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
+    rsx_be_render_state pipeline_rs;   /* the last pipeline's render state */
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
 
@@ -173,6 +174,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     if (!vs || !ps || !*vs || !*ps) return 0;
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
+    stub.pipeline_rs = *rs;
     return stub_handle();
 }
 
@@ -690,6 +692,18 @@ static void test_pipeline_key(void)
     CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
           "so is the depth bounds test");
 
+    /* MRT targets 1..3 carry their own colour mask (COLOR_MASK_MRT, 0x0370)
+     * and blend enable (BLEND_ENABLE_MRT, 0x036C). inFAMOUS 2's light volumes
+     * add into target 0 with targets 1 and 2 masked off; giving them target
+     * 0's state added every light into the G-buffer. */
+    b = a; b.color_mask_mrt = 0x0DF0u;
+    CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
+          "so is the MRT colour mask");
+
+    b = a; b.blend_mrt = 0x2u;
+    CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
+          "so is the MRT blend enable");
+
     /* And through the engine: transform constants change every draw of every
      * frame, and must not multiply pipelines. */
     engine_up();
@@ -734,6 +748,13 @@ static void test_pipeline_key(void)
           "and moving them does not build a pipeline (%d)",
           stub.n_pipeline_create);
     m(M_DEPTH_BOUNDS_ENABLE, 0u);
+
+    /* The decode carries the two MRT registers through to the backend. */
+    m(0x0370, 0x0DF0);
+    m(0x036C, 0x2);
+    draw_triangle();
+    CHECK(stub.pipeline_rs.color_mask_mrt == 0x0DF0u && stub.pipeline_rs.blend_mrt == 0x2u,
+          "the pipeline is built with COLOR_MASK_MRT and BLEND_ENABLE_MRT");
 
     engine_down();
 }

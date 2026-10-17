@@ -2702,17 +2702,40 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     if ((rs->color_mask >>  8) & 0xFF) wm |= MTLColorWriteMaskGreen;
     if ((rs->color_mask >> 16) & 0xFF) wm |= MTLColorWriteMaskRed;
     if ((rs->color_mask >> 24) & 0xFF) wm |= MTLColorWriteMaskAlpha;
-    /* Every attachment of an MRT set takes target A's blend and colour mask,
-     * as the vtable path's pso_for does with RTVFormats[1..]: a
-     * zero-initialised secondary attachment writes nothing at all. The count
-     * is rt_count, the set the engine resolved, and the fragment function's
-     * own output count is whatever its program exports; Metal accepts either
-     * side being the larger one, so the two do not have to agree. */
+    /* Target A takes COLOR_MASK and BLEND_ENABLE; targets B..D their own
+     * nibble of COLOR_MASK_MRT (A,R,G,B at bits 0..3) and bit of
+     * BLEND_ENABLE_MRT (RPCS3 color_mask_*(index), blend_enabled_surface_*).
+     * Giving every target A's state was wrong both ways: inFAMOUS 2's light
+     * volumes add into A with B and C masked off, and that added every light
+     * into the G-buffer (the blown-white props and the rectangles round each
+     * light); its material passes write B and C's alpha, which A's mask left
+     * stale. The count is rt_count, the set the engine resolved, and the
+     * fragment function's own output count is whatever its program exports;
+     * Metal accepts either side being the larger one. */
     for (u32 r = 0; r < rt_count; r++) {
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[r];
         ca.pixelFormat = eng_pixel_format(rt_fmt);
-        ca.writeMask   = wm;
-        if (rs->blend_enable) {
+        MTLColorWriteMask twm = wm;
+        int tblend = rs->blend_enable != 0;
+        /* PS3RECOMP_METAL_MRT_MASK: 1 (default) the hardware rule above;
+         * 0 target A's state everywhere, the old behaviour, to bisect a title
+         * that depended on it; 2 only a target the guest masks off entirely
+         * is off, with per-target blend. */
+        static int mrt_mode = -1;
+        if (mrt_mode < 0) { const char* e = getenv("PS3RECOMP_METAL_MRT_MASK"); mrt_mode = e ? atoi(e) : 1; }
+        if (r > 0 && mrt_mode != 0) {
+            const u32 nib = (rs->color_mask_mrt >> (r * 4)) & 0xFu;
+            if (mrt_mode == 1 || nib == 0) {
+                twm = MTLColorWriteMaskNone;
+                if (nib & 1u) twm |= MTLColorWriteMaskAlpha;
+                if (nib & 2u) twm |= MTLColorWriteMaskRed;
+                if (nib & 4u) twm |= MTLColorWriteMaskGreen;
+                if (nib & 8u) twm |= MTLColorWriteMaskBlue;
+            }
+            tblend = (rs->blend_mrt >> r) & 1u;
+        }
+        ca.writeMask   = twm;
+        if (tblend) {
             ca.blendingEnabled             = YES;
             ca.sourceRGBBlendFactor        = blend_factor_to_metal(rs->sf_rgb);
             ca.destinationRGBBlendFactor   = blend_factor_to_metal(rs->df_rgb);
