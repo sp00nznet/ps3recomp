@@ -100,6 +100,13 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
           /tmp/test_np_identity
 
+      # cellVideoOutSetGamma's float argument comes from f1, and the value
+      # reaches the presenter.
+      - name: Run the video out gamma test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_avconf_gamma libs/misc/tests/test_avconf_gamma.c
+          /tmp/test_avconf_gamma
+
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test

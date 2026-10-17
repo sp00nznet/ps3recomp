@@ -2303,6 +2303,14 @@ static NSString* const kEngHelperMSL = @
 "                            sampler s [[sampler(0)]]) {\n"
 "    return src.sample(s, i.uv);\n"
 "}\n"
+"fragment float4 eng_present_fs(BOut i [[stage_in]],\n"
+"                               texture2d<float> src [[texture(0)]],\n"
+"                               sampler s [[sampler(0)]],\n"
+"                               constant float& gamma [[buffer(0)]]) {\n"
+"    float4 c = src.sample(s, i.uv);\n"
+"    if (gamma != 1.0) c.rgb = pow(max(c.rgb, 0.0), float3(gamma));\n"
+"    return c;\n"
+"}\n"
 "fragment float eng_depth_fs(BOut i [[stage_in]],\n"
 "                            depth2d<float> src [[texture(0)]],\n"
 "                            sampler s [[sampler(0)]]) {\n"
@@ -3244,7 +3252,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
-        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_blit_fs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_present_fs"];
         pd.colorAttachments[0].pixelFormat = [dst pixelFormat];
         NSError* err = nil;
         s_eng_blit_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
@@ -3264,6 +3272,11 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     [e setRenderPipelineState:s_eng_blit_pso];
     [e setFragmentTexture:src atIndex:0];
     [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
+    /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
+     * setting): out = in^gamma, as RPCS3's calibration pass applies it. */
+    { extern float cellAvconfExt_display_gamma(void);
+      const float gamma = cellAvconfExt_display_gamma();
+      [e setFragmentBytes:&gamma length:sizeof gamma atIndex:0]; }
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
