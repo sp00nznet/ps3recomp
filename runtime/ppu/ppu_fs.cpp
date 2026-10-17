@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <thread>
+#include <chrono>
 #include <errno.h>
 #include <atomic>
 #include <algorithm>
@@ -402,6 +404,15 @@ static void cellFsOpen(ppu_context* ctx)
     int fd = fd_alloc_file(f,gpath,flags);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+    /* PS3_BDVD_OPEN_LATENCY_US=<n>: experiment only, off by default. Hold a
+     * successful /dev_bdvd open for n microseconds, roughly what a Blu-ray
+     * access costs on hardware. Folklore's movie start relies on its main
+     * thread taking longer than a 10 ms poll between "loader done" and play;
+     * host opens are near-instant, and that loses a wake-up ~1 boot in 5. */
+    { static long lat = -1;
+      if (lat < 0) { const char* e = getenv("PS3_BDVD_OPEN_LATENCY_US"); lat = e ? atol(e) : 0; }
+      if (lat > 0 && strncmp(gpath, "/dev_bdvd", 9) == 0)
+          std::this_thread::sleep_for(std::chrono::microseconds(lat)); }
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
      * streaming layer opens a file and never reads it (You Don't Know Jack's
