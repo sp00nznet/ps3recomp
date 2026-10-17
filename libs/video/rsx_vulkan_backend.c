@@ -1797,6 +1797,16 @@ static void vk_window_drop(const char* why)
 static void vk_window_open(const char* title)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+    /* Windows display scaling: a DPI-unaware process gets a window Windows
+     * enlarges (1280x720 becomes 1600x900 at 125%) while its Vulkan surface
+     * reports the unscaled size, so the image filled only the top-left of the
+     * window. Per-monitor DPI awareness with SDL's DPI scaling keeps the
+     * window's apparent size and gives the swapchain the real pixel size,
+     * which the present blit then fills. Read by SDL when video starts. */
+    if (SDL_WasInit(SDL_INIT_VIDEO))
+        VK_LOG("window: SDL video already started; DPI awareness hint not applied\n");
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;
@@ -1982,6 +1992,20 @@ static int vk_prepare_window_present(void)
     return 1;
 }
 
+/* The largest rectangle with the source's aspect ratio that fits the
+ * destination, centred. Equal shapes give the whole destination. */
+static void vk_fit_rect(u32 sw, u32 sh, u32 dw, u32 dh, u32* x, u32* y, u32* w, u32* h)
+{
+    u32 fw = dw, fh = dh;
+    if (sw && sh && (u64)sw * dh != (u64)sh * dw) {
+        fh = (u32)((u64)dw * sh / sw);
+        if (fh > dh) { fh = dh; fw = (u32)((u64)dh * sw / sh); }
+        if (!fw) fw = 1;
+        if (!fh) fh = 1;
+    }
+    *w = fw; *h = fh; *x = (dw - fw) / 2; *y = (dh - fh) / 2;
+}
+
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
@@ -2007,12 +2031,30 @@ static void vk_present_window(void)
     };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                           0, 0, NULL, 0, NULL, 1, &b);
+    /* Keep the image's aspect ratio: a 16:9 frame in a 16:10 fullscreen
+     * window (Steam Deck 1280x800) or an ultrawide desktop is centred with
+     * black bars instead of being stretched to fill it. */
+    const u32 dw = s_vk.sc_extent.width, dh = s_vk.sc_extent.height;
+    u32 fx, fy, fit_w, fit_h;
+    vk_fit_rect(s_vk.width, s_vk.height, dw, dh, &fx, &fy, &fit_w, &fit_h);
+    const int32_t fit_x = (int32_t)fx, fit_y = (int32_t)fy;
+    if (fit_w != dw || fit_h != dh) {
+        const VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+        const VkImageSubresourceRange all = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        pvkCmdClearColorImage(s_vk.cmd, s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              &black, 1, &all);
+        VkImageMemoryBarrier cleared = b;
+        cleared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        cleared.oldLayout = cleared.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, NULL, 0, NULL, 1, &cleared);
+    }
     VkImageBlit blit = {
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstOffsets = { { 0, 0, 0 },
-                        { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
+        .dstOffsets = { { fit_x, fit_y, 0 },
+                        { fit_x + (int32_t)fit_w, fit_y + (int32_t)fit_h, 1 } },
     };
     pvkCmdBlitImage(s_vk.cmd, display, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -2486,20 +2528,25 @@ static void vk_eng_present(void* user, u32 surface)
     if (o && o->samples > 1) o = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
     VkImage display = o ? o->im.img : VK_NULL_HANDLE;
     u32 display_width = o ? o->w : 0, display_height = o ? o->h : 0;
+    /* An output size of another shape (ultrawide, 16:10) shows the guest
+     * image at its own aspect with black bars: stretching it distorts the
+     * picture, and the game renders no wider view. */
+    u32 fit_x = 0, fit_y = 0, fit_w = s_vk.width, fit_h = s_vk.height;
+    if (o) vk_fit_rect(o->w, o->h, s_vk.width, s_vk.height, &fit_x, &fit_y, &fit_w, &fit_h);
     if (o && s_vk.fsr1_enabled && !s_vk.fsr1_failed) {
-        if (s_vk.width < o->w || s_vk.height < o->h ||
+        if (fit_w < o->w || fit_h < o->h ||
             (o->fmt != VK_FORMAT_R8G8B8A8_UNORM && o->fmt != VK_FORMAT_B8G8R8A8_UNORM)) {
             if (!s_vk.fsr1_scale_fallback)
                 VK_LOG("FSR1 bypass: downscale or non-display-UNORM source; using ordinary display blit\n");
             s_vk.fsr1_scale_fallback = 1;
         } else {
             s_vk.fsr1_scale_fallback = 0;
-            if (vk_fsr1_apply(&o->im, o->w, o->h, s_vk.width, s_vk.height, 0.2f, &display)) {
+            if (vk_fsr1_apply(&o->im, o->w, o->h, fit_w, fit_h, 0.2f, &display)) {
                 s_vk.fsr1_failed = 1;
                 VK_LOG("FSR1 unavailable: using ordinary display blit for this session\n");
             } else {
-                display_width = s_vk.width;
-                display_height = s_vk.height;
+                display_width = fit_w;
+                display_height = fit_h;
                 if (++s_vk.fsr1_frames <= 4)
                     VK_LOG("FSR1 EASU+RCAS frame %llu: guest %ux%u to display %ux%u\n",
                         (unsigned long long)s_vk.fsr1_frames, o->w, o->h,
@@ -2510,16 +2557,23 @@ static void vk_eng_present(void* user, u32 surface)
     if (o && !vk_begin()) {
         vk_barrier_image(display, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        if (fit_w != s_vk.width || fit_h != s_vk.height) {
+            const VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+            const VkImageSubresourceRange all = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            pvkCmdClearColorImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &all);
+            vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        }
         VkImageBlit blit = {
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .srcOffsets = { { 0, 0, 0 }, { (int32_t)display_width, (int32_t)display_height, 1 } },
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+            .dstOffsets = { { (int32_t)fit_x, (int32_t)fit_y, 0 },
+                            { (int32_t)(fit_x + fit_w), (int32_t)(fit_y + fit_h), 1 } },
         };
         pvkCmdBlitImage(s_vk.cmd, display, VK_IMAGE_LAYOUT_GENERAL,
                         s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                        (display_width == s_vk.width && display_height == s_vk.height) ? VK_FILTER_NEAREST
-                                                                    : VK_FILTER_LINEAR);
+                        (display_width == fit_w && display_height == fit_h) ? VK_FILTER_NEAREST
+                                                                           : VK_FILTER_LINEAR);
         vk_submit_and_wait();
     }
     vk_cb_present(&s_vk, 0);
