@@ -300,6 +300,7 @@ if(PS3RECOMP_RSX_VULKAN)
             target_link_libraries(ps3recomp_runtime PRIVATE
                 glslang::glslang-default-resource-limits)
         endif()
+        set(PS3RECOMP_SPIRV_TRANSLATION ON)
         message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
     else()
@@ -458,6 +459,25 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+    endif()
+
+    # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang
+    # only, no GPU.
+    if(PS3RECOMP_SPIRV_TRANSLATION)
+        add_executable(test_shader_spirv
+            libs/video/tests/test_shader_spirv.c
+            libs/video/rsx_shader_spirv.cpp
+        )
+        target_include_directories(test_shader_spirv PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(test_shader_spirv PRIVATE glslang::glslang glslang::SPIRV)
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(test_shader_spirv PRIVATE
+                glslang::glslang-default-resource-limits)
+        endif()
+        set_target_properties(test_shader_spirv PROPERTIES LINKER_LANGUAGE CXX)
     endif()
 endif()
 

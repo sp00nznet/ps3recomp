@@ -60,6 +60,14 @@ jobs:
       - name: Build
         run: cmake --build build --target ps3recomp_host
 
+      # The HLSL -> SPIR-V translation cache: a repeat is served from memory,
+      # PS3RECOMP_SPIRV_CACHE's files serve the next run, a damaged file is a
+      # miss. Needs glslang, which configure has already checked for.
+      - name: SPIR-V translation cache test
+        run: |
+          cmake --build build --target test_shader_spirv
+          ./build/test_shader_spirv
+
       - name: Fixed-function path (no guest programs)
         run: |
           fail=0

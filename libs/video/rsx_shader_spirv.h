@@ -58,6 +58,20 @@ int rsx_hlsl_to_spirv(const char* hlsl, int stage,
                       u32* words, u32 max_words, u32* out_words,
                       char* log, u32 log_size);
 
+/* The translation cache (rsx_shader_spirv.cpp). A request is answered from
+ * memory, else from PS3RECOMP_SPIRV_CACHE's directory, else by glslang. */
+typedef struct RsxSpirvCacheStats {
+    u32 memory_hits;
+    u32 disk_hits;
+    u32 translations;   /* glslang runs that succeeded */
+} RsxSpirvCacheStats;
+
+void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out);
+
+/* Empties the memory cache, zeroes the counters and reads
+ * PS3RECOMP_SPIRV_CACHE again on the next request. Disk files stay. */
+void rsx_hlsl_to_spirv_cache_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
