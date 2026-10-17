@@ -1573,6 +1573,22 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
 
 /* User-event ports are independent of group lifecycle event connections. */
 static SRWLOCK s_spu_port_lock = SRWLOCK_INIT;
+/* Signalled (with s_spu_port_lock held) whenever a port gets bound, per thread or per group. */
+static CONDITION_VARIABLE s_spu_port_bound = CONDITION_VARIABLE_INIT;
+/* How long an SPU's user event waits for its port to be bound before it is answered with ENOTCONN. */
+#define SPU_PORT_BIND_WAIT_MS 200u
+
+/* The queue `port` of an SPU is bound to: a binding of the thread itself (sys_spu_thread_connect_event, `t`
+ * may be NULL) wins over a group-wide one (sys_spu_thread_group_connect_event_all_threads). 0 if there is none.
+ * Call with s_spu_port_lock held. */
+static uint32_t spu_port_queue_locked(const spu_thread_t* t, uint32_t group_id, unsigned port)
+{
+    if (t) for (int i = 0; i < t->evt_bind_n; i++)
+        if (t->evt_bind[i].spup == port) return t->evt_bind[i].queue;
+    spu_group_t* g = group_id ? spu_find_group(group_id) : NULL;
+    return g ? g->user_event_ports[port & 63] : 0;
+}
+
 static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_context* ctx)
 {
     spu_group_t* g = spu_find_group((uint32_t)ctx->gpr[3]);
@@ -1590,6 +1606,7 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
                 g->user_event_ports[port] = (uint32_t)ctx->gpr[4];
                 vm_base[output] = (uint8_t)port;
                 result = CELL_OK;
+                WakeAllConditionVariable(&s_spu_port_bound);
                 break;
             }
         }
@@ -1636,13 +1653,24 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
         uint32_t data = spu_channel_read(&spu->ch_out_mbox);
         unsigned port = code & 63;
         uint32_t queue = 0;
+        /* The SPU thread starts running at group_start while the PPU is still on its way to the
+         * sys_spu_thread_connect_event / ..._connect_event_all_threads call that follows it (a real SPU needs
+         * far longer to boot than a lifted one), so a port that is not bound yet is waited for, up to
+         * SPU_PORT_BIND_WAIT_MS, before the event is answered with ENOTCONN. Multistream's first request used
+         * to fail that way and end its SPU program. */
         if (!spu->spu_group_id) {
             queue = spurs_port_queue(port);
         } else {
-            AcquireSRWLockShared(&s_spu_port_lock);
-            spu_group_t* group = spu_find_group(spu->spu_group_id);
-            if (group) queue = group->user_event_ports[port];
-            ReleaseSRWLockShared(&s_spu_port_lock);
+            const ULONGLONG deadline = GetTickCount64() + SPU_PORT_BIND_WAIT_MS;
+            AcquireSRWLockExclusive(&s_spu_port_lock);
+            for (;;) {
+                const spu_thread_t* bt = spu_find_thread(spu->spu_id);
+                if ((queue = spu_port_queue_locked(bt, spu->spu_group_id, port)) != 0) break;
+                const ULONGLONG now = GetTickCount64();
+                if (!bt || now >= deadline) break;               /* no such thread: nothing will bind it */
+                SleepConditionVariableSRW(&s_spu_port_bound, &s_spu_port_lock, (DWORD)(deadline - now), 0);
+            }
+            ReleaseSRWLockExclusive(&s_spu_port_lock);
         }
         result = CELL_ENOTCONN;
         if (queue) {
@@ -1681,11 +1709,14 @@ static int64_t sys_spu_thread_connect_event_handler(ppu_context* ctx)
     if (t) {
         /* First binding stays the default for anything we cannot port-route. */
         if (!t->connected_queue) { t->connected_queue = eq; t->connect_spup = spup; }
+        AcquireSRWLockExclusive(&s_spu_port_lock);
         int slot = -1;
         for (int i = 0; i < t->evt_bind_n; i++)
             if (t->evt_bind[i].spup == spup) { slot = i; break; }
         if (slot < 0 && t->evt_bind_n < 8) slot = t->evt_bind_n++;
         if (slot >= 0) { t->evt_bind[slot].spup = spup; t->evt_bind[slot].queue = eq; }
+        WakeAllConditionVariable(&s_spu_port_bound);
+        ReleaseSRWLockExclusive(&s_spu_port_lock);
     }
     fprintf(stderr, "[SPU] thread_connect_event tid=0x%X queue=0x%X et=0x%X spup=0x%X%s\n",
             tid, eq, et, (uint32_t)ctx->gpr[6], t ? "" : " (thread not found)");
@@ -1718,8 +1749,9 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
      * plain out-mailbox value is PPU-polled, not port-addressed). */
     if (t) {
         uint32_t port = (value >> 24) & 0xFF;
-        for (int i = 0; i < t->evt_bind_n; i++)
-            if (t->evt_bind[i].spup == port) { q = t->evt_bind[i].queue; break; }
+        AcquireSRWLockShared(&s_spu_port_lock);
+        q = spu_port_queue_locked(t, 0, port);
+        ReleaseSRWLockShared(&s_spu_port_lock);
     }
     if (!q && t && t->connected_queue) q = t->connected_queue;
     if (!q) { spu_group_t* g = spu_find_group(group_id); if (g) q = g->event_queue_id; }
