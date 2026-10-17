@@ -99,6 +99,16 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                               const u32 dim[][2], u32 cube_mask);
 
+/* NV4097_SET_SHADER_PACKER non-zero (cellGcmSetFragmentProgramGammaEnable):
+ * sRGB-encode the rgb of every colour export. Returns the number of exports
+ * patched, 0 if already applied, or -1 if the buffer would overflow. */
+int rsx_fp_apply_srgb_output(char* hlsl, u32 hlsl_size);
+
+/* TEXTURE_ADDRESS gamma bits (CELL_GCM_TEXTURE_GAMMA_R/G/B/A = bits 0..3 of
+ * gamma[unit]): convert those channels of each sample of the unit from sRGB
+ * to linear. Returns the number of Sample sites patched, or -1. */
+int rsx_fp_apply_texture_gamma(char* hlsl, u32 hlsl_size, const u8 gamma[16]);
+
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
  * half float and X32/W32Z32Y32X32 use a 32-bit float. */

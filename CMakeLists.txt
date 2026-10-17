@@ -599,6 +599,14 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
                 winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
         endif()
         set_target_properties(test_savedata_param_sfo PROPERTIES LINKER_LANGUAGE CXX)
+        # sRGB output (SHADER_PACKER) and texture gamma post-passes. CPU only;
+        # `test_rsx_fp_gamma <dir>` also writes the patched programs for an
+        # HLSL compiler check.
+        add_executable(test_rsx_fp_gamma EXCLUDE_FROM_ALL
+            tests/test_rsx_fp_gamma.c libs/video/rsx_fp_decompiler.c)
+        target_include_directories(test_rsx_fp_gamma PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_rsx_fp_gamma PRIVATE -UNDEBUG)
         add_executable(test_vulkan_anisotropy_backend EXCLUDE_FROM_ALL
             tests/test_vulkan_anisotropy_backend.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
         target_include_directories(test_vulkan_anisotropy_backend PRIVATE

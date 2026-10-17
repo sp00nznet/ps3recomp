@@ -9,6 +9,7 @@
  * below so this file is self-documenting.
  */
 
+#include <ctype.h>
 #include <stdlib.h>
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_window.h"
@@ -1306,5 +1307,125 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
         for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
             memcpy(q, "rsx_tex", 7);
     }
+    return patched;
+}
+
+/* Insert `text` at `at`, a position inside hlsl; -1 if it would not fit. */
+static int fp_insert(char* hlsl, u32 hlsl_size, char* at, const char* text)
+{
+    const size_t used = strlen(hlsl), n = strlen(text);
+    if (used + n + 1 > hlsl_size) return -1;
+    memmove(at + n, at, used - (size_t)(at - hlsl) + 1);
+    memcpy(at, text, n);
+    return 0;
+}
+
+/* A helper function in front of main's signature line, once per program. */
+static int fp_insert_helper(char* hlsl, u32 hlsl_size, const char* tag,
+                            const char* body)
+{
+    if (strstr(hlsl, tag)) return 0;
+    char* line = strstr(hlsl, "main(PSInput input)");
+    if (!line) return -1;
+    while (line > hlsl && line[-1] != '\n') line--;
+    return fp_insert(hlsl, hlsl_size, line, body);
+}
+
+/* The sRGB transfer curve both ways (IEC 61966-2-1). */
+static const char kFpSrgbEncode[] =
+    "/* rsx srgb encode */\n"
+    "float3 rsx_srgb_encode(float3 c) {\n"
+    "    c = saturate(c);\n"
+    "    return lerp(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92,"
+    " step(c, (float3)0.0031308));\n"
+    "}\n";
+static const char kFpSrgbDecode[] =
+    "/* rsx srgb decode */\n"
+    "float4 rsx_gamma_tex(float4 v, float4 m) {\n"
+    "    float4 c = saturate(v);\n"
+    "    float4 l = lerp(pow((c + 0.055) / 1.055, 2.4), c / 12.92,"
+    " step(c, (float4)0.04045));\n"
+    "    return lerp(v, l, m);\n"
+    "}\n";
+
+/* NV4097_SET_SHADER_PACKER (0x1FEC) non-zero is cellGcmSetFragmentProgram-
+ * GammaEnable: the RSX writes each colour output sRGB-encoded (RPCS3
+ * framebuffer_srgb_enabled, RSX_SHADER_CONTROL_SRGB_FRAMEBUFFER). Blending
+ * then works on the encoded values, as it does on the NV40, which is what
+ * encoding at the end of the program gives. Every export line of the form
+ * "    float4 _o... = ...;" gets its rgb encoded; alpha is left alone. The
+ * caller decides which target formats it applies to. */
+int rsx_fp_apply_srgb_output(char* hlsl, u32 hlsl_size)
+{
+    if (!hlsl || !hlsl_size) return -1;
+    if (strstr(hlsl, "/* rsx srgb encode */")) return 0;
+    int patched = 0;
+    for (char* p = hlsl; (p = strstr(p, "\n    float4 _o")) != NULL; ) {
+        p++;
+        const char* q = p + strlen("    float4 ");
+        char name[16];
+        u32 k = 0;
+        while (k + 1 < sizeof name && (isalnum((unsigned char)*q) || *q == '_'))
+            name[k++] = *q++;
+        name[k] = '\0';
+        char* eol = strchr(p, '\n');
+        if (!eol || strncmp(q, " = ", 3)) return -1;
+        char line[96];
+        snprintf(line, sizeof line, "    %s.rgb = rsx_srgb_encode(%s.rgb);\n",
+                 name, name);
+        if (fp_insert(hlsl, hlsl_size, eol + 1, line) < 0) return -1;
+        patched++;
+        p = eol + 1 + strlen(line);
+    }
+    if (patched &&
+        fp_insert_helper(hlsl, hlsl_size, "/* rsx srgb encode */", kFpSrgbEncode) < 0)
+        return -1;
+    return patched;
+}
+
+/* TEXTURE_ADDRESS bits 20-23, the CELL_GCM_TEXTURE_GAMMA_R/G/B/A mask that
+ * cellGcmSetTextureAddress takes: those channels of the unit's texels are
+ * sRGB and the shader sees them linear (RPCS3 fragment_texture::gamma, its
+ * process_texel GAMMA_CTRL_MASK). Converted after the fetch, as RPCS3's
+ * shader path does; the masked channels are those the program reads. Every
+ * Sample/SampleBias/SampleLevel call on a masked unit is wrapped in
+ * rsx_gamma_tex. Returns the number of call sites patched, or -1. */
+int rsx_fp_apply_texture_gamma(char* hlsl, u32 hlsl_size, const u8 gamma[16])
+{
+    if (!hlsl || !hlsl_size || !gamma) return -1;
+    int patched = 0;
+    for (u32 u = 0; u < 16; u++) {
+        const u32 m = gamma[u] & 0xFu;
+        if (!m) continue;
+        char needles[2][32];
+        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].Sample", u);
+        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.Sample", u);
+        char suffix[48];
+        snprintf(suffix, sizeof suffix, ", float4(%u.0, %u.0, %u.0, %u.0))",
+                 m & 1u, (m >> 1) & 1u, (m >> 2) & 1u, (m >> 3) & 1u);
+        for (int nidx = 0; nidx < 2; nidx++) {
+            for (char* at; (at = strstr(hlsl, needles[nidx])) != NULL; ) {
+                char* p = strchr(at, '(');
+                if (!p) return -1;
+                int depth = 0;
+                for (; *p; p++) {
+                    if (*p == '(') depth++;
+                    else if (*p == ')' && !--depth) break;
+                }
+                if (*p != ')') return -1;
+                if (fp_insert(hlsl, hlsl_size, p + 1, suffix) < 0 ||
+                    fp_insert(hlsl, hlsl_size, at, "rsx_gamma_tex(") < 0)
+                    return -1;
+                /* Marked so the scan moves past it; restored below. */
+                memcpy(at + strlen("rsx_gamma_tex("), "rsx_TEX", 7);
+                patched++;
+            }
+        }
+    }
+    for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
+        memcpy(q, "rsx_tex", 7);
+    if (patched &&
+        fp_insert_helper(hlsl, hlsl_size, "/* rsx srgb decode */", kFpSrgbDecode) < 0)
+        return -1;
     return patched;
 }

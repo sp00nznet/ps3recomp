@@ -1377,6 +1377,58 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
     return mask;
 }
 
+/* RSX_ENGINE_NO_GAMMA=1: ignore the sRGB controls below, for comparisons. */
+static int eng_gamma_disabled(void)
+{
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char* e = getenv("RSX_ENGINE_NO_GAMMA");
+        disabled = e && *e && *e != '0';
+    }
+    return disabled;
+}
+
+/* Fixed-point colour formats, the ones a gamma mask means anything for. */
+static int eng_gamma_format(u32 format)
+{
+    switch (format & RSX_TEX_FMT_BASE_MASK) {
+    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:  /* B8 .. A8R8G8B8 */
+    case 0x86: case 0x87: case 0x88:                        /* DXT1/23/45 */
+    case 0x8B: case 0x8F: case 0x9D: case 0x9E:             /* G8B8, R6G5B5, D1R5G5B5, D8R8G8B8 */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Units whose texels are sRGB, with each one's TEXTURE_ADDRESS gamma mask
+ * (bits 20-23: CELL_GCM_TEXTURE_GAMMA_R/G/B/A) in gamma[]. The fragment
+ * program converts the fetched channels to linear, so the masks are
+ * pipeline identity. */
+static u32 eng_gamma_units(u8 gamma[RSX_DSP_NUM_TEXTURES])
+{
+    u32 mask = 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        gamma[u] = 0;
+        if (eng_gamma_disabled() || !t.enabled || !eng_gamma_format(t.format))
+            continue;
+        gamma[u] = (u8)((t.wrap >> 20) & 0xFu);
+        if (gamma[u]) mask |= 1u << u;
+    }
+    return mask;
+}
+
+/* SHADER_PACKER (0x1FEC) non-zero: colour is written sRGB-encoded. Applied
+ * to 8-bit-per-channel colour targets; float targets hold linear values. */
+static u32 eng_srgb_output(rsx_be_format rt_fmt, u32 rt_count)
+{
+    if (eng_gamma_disabled() || !rt_count || rt_fmt != RSX_BE_FMT_R8G8B8A8)
+        return 0;
+    return rsx_dsp_reg(&g.rsx, 0x1FECu) != 0;
+}
+
 static u32 eng_cube_mask(void)
 {
     u32 mask = 0;
@@ -1567,6 +1619,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 vtex_mask = eng_vtex_mask();
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
     const u32 unnorm_mask = eng_unnorm_units(unnorm_dim);
+    u8 gamma[RSX_DSP_NUM_TEXTURES];
+    const u32 gamma_mask = eng_gamma_units(gamma);
+    const u32 srgb_out = eng_srgb_output(rt_fmt, rt_count);
     rsx_fp_shadow_state shadow;
     eng_shadow_state(&shadow);
 
@@ -1600,6 +1655,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&shadow, sizeof shadow, key);
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
+        key = eng_fnv1a(&srgb_out, sizeof srgb_out, key);
+        key = eng_fnv1a(&gamma_mask, sizeof gamma_mask, key);
+        if (gamma_mask) key = eng_fnv1a(gamma, sizeof gamma, key);
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -1641,6 +1699,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
             fi = -1;
+        if (fi > 0 && gamma_mask &&
+            rsx_fp_apply_texture_gamma(s_ps_hlsl, sizeof s_ps_hlsl, gamma) < 0)
+            fi = -1;
+        if (fi > 0 && srgb_out && rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
+            fi = -1;
+        { static u32 logs = 0; if ((gamma_mask || rsx_dsp_reg(&g.rsx, 0x1FECu)) && logs++ < 8)
+            fprintf(stderr, "[rsx engine] gamma: sRGB output %s (SHADER_PACKER 0x%08X),"
+                            " sRGB texture units 0x%04X\n", srgb_out ? "on" : "off",
+                    rsx_dsp_reg(&g.rsx, 0x1FECu), gamma_mask); }
         if (fi > 0 && rs->alpha_test_enable &&
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                              rs->alpha_func) < 0)
