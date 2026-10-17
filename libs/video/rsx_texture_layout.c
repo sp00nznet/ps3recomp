@@ -277,6 +277,33 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
     const u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
     const u32 sbpp = tl->bytes_per_texel, dbpp = tl->dst_bytes_per_texel;
 
+    /* Linear 32-bit colour is also the depth-as-ARGB reinterpretation path.
+     * Select its channel order once per row, rather than dispatching through
+     * the generic texel decoder for every pixel. Keep byte assignment order
+     * identical, including overlapping source/destination behavior. */
+    if (!tl->swizzled && sbpp == 4 && dbpp == 4 &&
+        (tl->base_format == 0x85 || tl->base_format == 0x9E)) {
+        for (u32 y = 0; y < h; ++y) {
+            u8* row = d + (size_t)y * dst_pitch;
+            const u8* source = src + (size_t)y * tl->row_bytes;
+#define ARGB_ROW(R,G,B,A) \
+            for (u32 x = 0; x < w; ++x) { \
+                const u8* s = source + (size_t)x * 4; \
+                u8* p = row + (size_t)x * 4; \
+                p[0]=(R); p[1]=(G); p[2]=(B); p[3]=(A); \
+            }
+            if (argb_as_rgba) {
+                if (tl->base_format == 0x9E) { ARGB_ROW(s[0],s[1],s[2],255); }
+                else { ARGB_ROW(s[0],s[1],s[2],s[3]); }
+            } else {
+                if (tl->base_format == 0x9E) { ARGB_ROW(s[1],s[2],s[3],255); }
+                else { ARGB_ROW(s[1],s[2],s[3],s[0]); }
+            }
+#undef ARGB_ROW
+        }
+        return;
+    }
+
     /* R8 and R8G8 reach the host byte for byte. A linear one is then a
      * straight row copy, which is worth keeping as a separate path: it is the
      * common case (Bink video planes, the G8B8 font atlas) and by far the
