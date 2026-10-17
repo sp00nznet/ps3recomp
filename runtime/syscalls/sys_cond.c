@@ -39,6 +39,20 @@ static void guest_lock(sys_mutex_info* m) { pthread_mutex_lock(&m->mtx); }
 static void guest_unlock(sys_mutex_info* m) { pthread_mutex_unlock(&m->mtx); }
 #endif
 
+/* PS3_COND_TRACE=<n>: log the first n condition waits, wakes and signals
+ * (id, guest thread, guest lr, waiters) to see which wakeup a stuck waiter
+ * missed. Off by default. */
+static void cond_trace(const char* ev, uint32_t id, const ppu_context* ctx, int waiters)
+{
+    static long budget = -2;
+    if (budget == -2) { const char* e = getenv("PS3_COND_TRACE"); budget = e ? atol(e) : -1; }
+    if (budget <= 0) return;
+    --budget;
+    fprintf(stderr, "[cond] %s id=%u tid=%llu lr=0x%08X waiters=%d\n", ev, id,
+            ctx ? (unsigned long long)ctx->thread_id : 0ull,
+            ctx ? (uint32_t)ctx->lr : 0u, waiters);
+}
+
 /* Lock ordering is table -> condition. No caller holds the condition lock
  * while acquiring a guest mutex. Native locks survive slot recycling. */
 static sys_cond_info* acquire_cond(uint32_t id)
@@ -150,6 +164,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     struct sys_cond_waiter** tail = &c->waiters;
     while (*tail) tail = &(*tail)->next;
     *tail = &waiter;
+    cond_trace("wait", LV2_ARG_U32(ctx, 0), ctx, 0);
     int depth = m->lock_count;
     m->owner_tid = 0;
     m->lock_count = 0;
@@ -194,6 +209,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     struct sys_cond_waiter** link = &c->waiters;
     while (*link != &waiter) link = &(*link)->next;
     *link = waiter.next;
+    cond_trace(result == CELL_OK ? "woke" : "wait-end", LV2_ARG_U32(ctx, 0), ctx, 0);
     cond_unlock(c);
     for (int i = 0; i < depth; ++i) guest_lock(m);
     m->owner_tid = ctx->thread_id;
@@ -201,11 +217,13 @@ int64_t sys_cond_wait(ppu_context* ctx)
     return result;
 }
 
-static int64_t signal_cond(uint32_t id, int all)
+static int64_t signal_cond(uint32_t id, int all, const ppu_context* ctx)
 {
     sys_cond_info* c = acquire_cond(id);
     if (!c) return (int32_t)CELL_ESRCH;
     int selected = 0;
+    { int n = 0; for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) n += !w->signalled;
+      cond_trace(all ? "signal-all" : "signal", id, ctx, n); }
     for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) {
         if (w->signalled) continue;
         w->signalled = 1;
@@ -219,11 +237,11 @@ static int64_t signal_cond(uint32_t id, int all)
     return CELL_OK;
 }
 
-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
-int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0, ctx); }
+int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1, ctx); }
 
 /* Preserve upstream's current broadcast fallback for signal_to. */
-int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1, ctx); }
 
 void sys_cond_init(lv2_syscall_table* tbl)
 {
