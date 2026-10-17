@@ -5,6 +5,8 @@
 #include "sys_timer.h"
 #include "sys_event.h"
 #include "../memory/vm.h"
+/* libs/video/cellGcmSys.c; weak so timer-only fixtures still link. */
+extern void ppu_gcm_pump(void) __attribute__((weak));
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
@@ -252,6 +254,14 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         nanosleep(&ts, NULL);
     }
 #endif
+
+    /* Deliver pending vblank/flip handlers on this guest thread, as every HLE
+     * import boundary already does (ppu_hle.cpp). A title that polls a flag
+     * its flip handler sets, with usleep between reads, makes no HLE calls
+     * while it waits, so delivery used to wait for some other thread's next
+     * import call. Folklore's main loop (lr 0x001D9548) spins exactly like
+     * that on its flip-done flag; ~30% of frames took ~100 ms at -O1. */
+    if (ppu_gcm_pump) ppu_gcm_pump();
 
     return CELL_OK;
 }
