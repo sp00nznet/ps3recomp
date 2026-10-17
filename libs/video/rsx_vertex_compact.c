@@ -40,52 +40,66 @@ int rsx_vertex_decode_element(
         return 0;
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    for (u32 component = 0; component < size && component < 4;
-         component++) {
-        switch (type) {
-        case RSX_VTX_TYPE_FLOAT:
-            out[component] = rsx_compact_be_f32(source + component * 4);
-            break;
-        case RSX_VTX_TYPE_HALF:
-            out[component] = rsx_compact_be_f16(source + component * 2);
-            break;
-        case RSX_VTX_TYPE_UNORM8:
+    /* Size zero succeeds even for an unknown type, without reading source. */
+    const u32 count = size < 4 ? size : 4;
+    if (!count)
+        return 1;
+    switch (type) {
+    case RSX_VTX_TYPE_FLOAT:
+        /* Keep each load bounded to its declared component. In particular a
+         * float3 at the end of guest memory must not load a fourth word. */
+        out[0] = rsx_compact_be_f32(source);
+        if (count > 1) out[1] = rsx_compact_be_f32(source + 4);
+        if (count > 2) out[2] = rsx_compact_be_f32(source + 8);
+        if (count > 3) out[3] = rsx_compact_be_f32(source + 12);
+        break;
+    case RSX_VTX_TYPE_HALF:
+        /* This decoder deliberately flushes half subnormals to signed zero. */
+        out[0] = rsx_compact_be_f16(source);
+        if (count > 1) out[1] = rsx_compact_be_f16(source + 2);
+        if (count > 2) out[2] = rsx_compact_be_f16(source + 4);
+        if (count > 3) out[3] = rsx_compact_be_f16(source + 6);
+        break;
+    case RSX_VTX_TYPE_UNORM8:
+        for (u32 component = 0; component < count; component++)
             out[component] = source[component] / 255.0f;
-            break;
-        case RSX_VTX_TYPE_UINT8:
+        break;
+    case RSX_VTX_TYPE_UINT8:
+        for (u32 component = 0; component < count; component++)
             out[component] = (float)source[component];
-            break;
-        case RSX_VTX_TYPE_SNORM16: {
+        break;
+    case RSX_VTX_TYPE_SNORM16:
+        for (u32 component = 0; component < count; component++) {
             const s16 value = (s16)(
                 (source[component * 2] << 8) | source[component * 2 + 1]);
             out[component] = value / 32767.0f;
-            break;
         }
-        case RSX_VTX_TYPE_SINT16: {
+        break;
+    case RSX_VTX_TYPE_SINT16:
+        for (u32 component = 0; component < count; component++) {
             const s16 value = (s16)(
                 (source[component * 2] << 8) | source[component * 2 + 1]);
             out[component] = (float)value;
-            break;
         }
-        case RSX_VTX_TYPE_CMP32: {
-            const u32 word =
-                ((u32)source[0] << 24) | ((u32)source[1] << 16) |
-                ((u32)source[2] << 8) | (u32)source[3];
-            s32 x = (s32)(word & 0x7FF);
-            s32 y = (s32)((word >> 11) & 0x7FF);
-            s32 z = (s32)((word >> 22) & 0x3FF);
-            if (x & 0x400) x -= 0x800;
-            if (y & 0x400) y -= 0x800;
-            if (z & 0x200) z -= 0x400;
-            out[0] = (float)x / 1023.0f;
-            out[1] = (float)y / 1023.0f;
-            out[2] = (float)z / 511.0f;
-            out[3] = 1.0f;
-            return 1;
-        }
-        default:
-            return 0;
-        }
+        break;
+    case RSX_VTX_TYPE_CMP32: {
+        const u32 word =
+            ((u32)source[0] << 24) | ((u32)source[1] << 16) |
+            ((u32)source[2] << 8) | (u32)source[3];
+        s32 x = (s32)(word & 0x7FF);
+        s32 y = (s32)((word >> 11) & 0x7FF);
+        s32 z = (s32)((word >> 22) & 0x3FF);
+        if (x & 0x400) x -= 0x800;
+        if (y & 0x400) y -= 0x800;
+        if (z & 0x200) z -= 0x400;
+        out[0] = (float)x / 1023.0f;
+        out[1] = (float)y / 1023.0f;
+        out[2] = (float)z / 511.0f;
+        out[3] = 1.0f;
+        break;
+    }
+    default:
+        return 0;
     }
     return 1;
 }

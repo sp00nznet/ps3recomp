@@ -482,8 +482,14 @@ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageF
      * invalidate, so a non-coherent one is fine. */
     const VkMemoryPropertyFlags cached = vis | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     const int readback = usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    /* Opt-in experiment: CPU-cached coherent uploads avoid slow writes into
+     * device-local BAR mappings on discrete GPUs. Keep the existing choice
+     * by default until matched-scene tests establish the tradeoff. */
+    const char* cached_upload = getenv("PS3RECOMP_VK_CACHED_UPLOAD");
+    const int prefer_cached = !readback && cached_upload && !strcmp(cached_upload, "1");
     if (readback && vk_find_memory_type(req.memoryTypeBits, cached | coh, &type) == 0) b->coherent = 1;
     else if (readback && vk_find_memory_type(req.memoryTypeBits, cached, &type) == 0) b->coherent = 0;
+    else if (prefer_cached && vk_find_memory_type(req.memoryTypeBits, cached | coh, &type) == 0) b->coherent = 1;
     else if (vk_find_memory_type(req.memoryTypeBits, coh, &type) == 0) b->coherent = 1;
     else if (vk_find_memory_type(req.memoryTypeBits, vis, &type) == 0) b->coherent = 0;
     else { VK_LOG("no host-visible memory for a buffer\n"); return -1; }
@@ -493,6 +499,9 @@ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageF
     VK_CHECK(pvkBindBufferMemory(s_vk.device, b->buf, b->mem, 0), "vkBindBufferMemory");
     VK_CHECK(pvkMapMemory(s_vk.device, b->mem, 0, VK_WHOLE_SIZE, 0, &b->ptr), "vkMapMemory");
     b->size = size;
+    if (prefer_cached) VK_LOG("cached upload: usage=0x%X bytes=%llu type=%u flags=0x%X\n",
+        (unsigned)usage, (unsigned long long)size, type,
+        (unsigned)s_vk.memprops.memoryTypes[type].propertyFlags);
     return 0;
 }
 
@@ -2922,6 +2931,8 @@ static struct {
     u32          scratch_w, scratch_h, scratch_samples;
     u32          pipeline;
     u32          vs_bytes, ps_bytes;
+    u8*          constant_shadow;
+    size_t       constant_shadow_size;
     u32          tex[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
     u32          tex_mask;
@@ -3316,6 +3327,7 @@ static void vk_eng2_shutdown(void* user)
                 if (s_e2.rp[si][f][n]) pvkDestroyRenderPass(s_vk.device, s_e2.rp[si][f][n], NULL);
     vk_destroy_image(&s_e2.scratch_depth);
     vk_destroy_buffer(&s_e2.indices);
+    free(s_e2.constant_shadow);
     if (s_e2.split_pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_e2.split_pipe_layout, NULL);
     if (s_e2.split_pool)        pvkDestroyDescriptorPool(s_vk.device, s_e2.split_pool, NULL);
     if (s_e2.split_layout)      pvkDestroyDescriptorSetLayout(s_vk.device, s_e2.split_layout, NULL);
@@ -3324,16 +3336,35 @@ static void vk_eng2_shutdown(void* user)
     s_esamp_count = 0;
 }
 
-/* Constants go straight into the shared UBO: vertex at 0, pixel at ps_off.
- * Unbatched draws are waited on; a batched draw takes its own copy in the
- * constants ring (vk_eng_draw), so overwriting here is safe either way. */
+/* Keep constants in ordinary CPU memory. Reading a HOST_VISIBLE but uncached
+ * GPU allocation to fill every batch slot can cause expensive PCIe reads.
+ * Both batched and fallback draws upload from this owned snapshot; callers
+ * may therefore reuse their input immediately after bind returns. */
+static int vk_eng_constant_shadow(void)
+{
+    if (!s_g.ubo.ptr || !s_g.ubo.size || s_g.ubo.size > SIZE_MAX) return 0;
+    const size_t bytes = (size_t)s_g.ubo.size;
+    if (s_e2.constant_shadow && s_e2.constant_shadow_size == bytes) return 1;
+    u8* p = (u8*)realloc(s_e2.constant_shadow, bytes);
+    if (!p) {
+        ps3_strict_boot_guard("vulkan-constant-shadow", "CPU constant allocation failed");
+        return 0;
+    }
+    if (bytes > s_e2.constant_shadow_size)
+        memset(p + s_e2.constant_shadow_size, 0, bytes - s_e2.constant_shadow_size);
+    s_e2.constant_shadow = p;
+    s_e2.constant_shadow_size = bytes;
+    return 1;
+}
+
 static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
-    memcpy(s_g.ubo.ptr, data, bytes);
+    if (!vk_eng_constant_shadow()) { s_e2.vs_bytes = 0; return; }
+    memcpy(s_e2.constant_shadow, data, bytes);
     s_e2.vs_bytes = bytes;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
@@ -3342,7 +3373,8 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
     if (!s_g.on || !data) { s_e2.ps_bytes = 0; return; }
     const u32 cap = (u32)(s_g.ubo.size - s_g.ps_off);
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
-    memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
+    if (!vk_eng_constant_shadow()) { s_e2.ps_bytes = 0; return; }
+    memcpy(s_e2.constant_shadow + s_g.ps_off, data, bytes);
     s_e2.ps_bytes = bytes;
 }
 static void vk_eng_bind_textures(void* user, const u32* textures,
@@ -3632,6 +3664,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
     const VkDeviceSize ibytes = (indices && index_count) ? (VkDeviceSize)index_count * 4u : 0;
     vk_batch_configure();
+    if (!vk_eng_constant_shadow()) return;
     const int batched = s_batch.on && vk_batch_ready() && s_g.ubo.ptr;
     VkDeviceSize voff = 0, ioff = 0, uvs = 0, ups = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -3665,8 +3698,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
             set = VK_NULL_HANDLE;
         } else {
             s_batch.sets++;
-            memcpy((u8*)s_batch.ubo.ptr + uvs, s_g.ubo.ptr, (size_t)vs_range);
-            memcpy((u8*)s_batch.ubo.ptr + ups, (const u8*)s_g.ubo.ptr + s_g.ps_off, (size_t)ps_range);
+            memcpy((u8*)s_batch.ubo.ptr + uvs, s_e2.constant_shadow, (size_t)vs_range);
+            memcpy((u8*)s_batch.ubo.ptr + ups, s_e2.constant_shadow + s_g.ps_off, (size_t)ps_range);
             if (!vk_eng_write_descriptors_into(P, set, s_batch.ubo.buf, uvs, ups)) return;
             s_batch.ub = ups + (ps_range + a - 1u) / a * a;
             s_batch.vb = (voff + vbytes + 15u) & ~(VkDeviceSize)15u;
@@ -3679,6 +3712,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         voff = ioff = 0;
         if (vk_ensure_vertex_buffer(vbytes)) return;
         if (ibytes && vk_eng_ensure_indices(ibytes)) return;
+        memcpy(s_g.ubo.ptr, s_e2.constant_shadow, s_e2.vs_bytes ? s_e2.vs_bytes : 16u);
+        memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, s_e2.constant_shadow + s_g.ps_off,
+               s_e2.ps_bytes ? s_e2.ps_bytes : 16u);
         set = vk_eng_write_descriptors(P);
         if (!set) return;
     }
