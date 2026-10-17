@@ -3,7 +3,10 @@
  * or transfer substitutes. Fresh process per mode. Default main or define
  * SPU_DMA_STRICT_NATIVE and call test_spu_dma_strict(mode) before VM startup.
  * positive/readonly-get/writeonly-put expect0. Every other documented mode
- * requires real strict fatal86, never a host fault or FALSE_COMPLETION. */
+ * requires real strict fatal86, never a host fault or FALSE_COMPLETION.
+ * Prefix any mode with "cache-" to run it with the opt-in verified-page cache
+ * enabled; the cache must never turn a rejection into a completion, and only
+ * pages proven wholly committed read-write may be remembered. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -64,6 +67,9 @@ int test_spu_dma_strict(const char* mode)
     spu_context* s=(spu_context*)calloc(1,sizeof *s);CHECK(s);spu_context_init(s,0);
     memset(s->ls,0xA5,SPU_LS_SIZE);
     mfc_engine m;mfc_engine_init(&m);
+    int cached=0;
+    if(!strncmp(mode,"cache-",6)) {mfc_strict_enable_verified_page_cache();mode+=6;cached=1;}
+#define REMEMBERED(page) ((g_mfc_strict_verified[(page)>>3]>>((page)&7))&1)
     if(!strcmp(mode,"positive")) {
         const uint32_t sizes[]={1,2,4,8,16,32,128,16384};
         const uint32_t commands[]={MFC_GET_CMD,MFC_GETB_CMD,MFC_GETF_CMD,MFC_PUT_CMD,MFC_PUTB_CMD,MFC_PUTF_CMD};
@@ -79,11 +85,14 @@ int test_spu_dma_strict(const char* mode)
         CHECK(submit(&m,s,MFC_GET_CMD,0,0x20000,16)==0);
         CHECK(submit(&m,s,MFC_GET_CMD,0x3FFF0,UINT64_C(0xFFFFFFF0),16)==0);
         CHECK(submit(&m,s,MFC_PUT_CMD,0x3FFFF,UINT64_C(0xFFFFFFFF),1)==0);
+        if(cached) CHECK(REMEMBERED(2) && REMEMBERED(0xFFFF) && !REMEMBERED(1) && !REMEMBERED(3));
+        else CHECK(!REMEMBERED(2) && !REMEMBERED(0xFFFF));
         puts("PASS valid ordinary GET/PUT/barrier/fence sizes, LS/EA endpoints");return 0;
     }
     if(!strcmp(mode,"readonly-get")) {
         CHECK(protect(0x20000,1,0,0));
         CHECK(submit(&m,s,MFC_GET_CMD,0x1000,0x20000,16)==0 && s->ls[0x1000]==0x6D);
+        CHECK(!REMEMBERED(2)); /* read-only page answered exactly, never cached */
         puts("PASS GET read-only source");return 0;
     }
     if(!strcmp(mode,"writeonly-put")) {

@@ -228,6 +228,52 @@ static inline int mfc_strict_span(uintptr_t address, uint32_t size, int writing)
 #endif
 }
 
+/* Verified-page cache, opt-in by the host (spu_vm_pagemap.c explains the
+ * guarantee it must give). A guest 64 KB page is remembered only after the
+ * full strict check proves the whole page committed read-write; anything else
+ * falls back to the exact uncached check of this transfer. */
+extern volatile int g_mfc_strict_page_cache;
+extern volatile unsigned char g_mfc_strict_verified[65536 / 8];
+void mfc_strict_enable_verified_page_cache(void);
+void mfc_strict_note_verified_page(unsigned int page);
+
+static inline int mfc_strict_guest_span(uint32_t ea, uint32_t size, int writing)
+{
+    extern uint32_t ppu_vm_size;
+    const uintptr_t base = (uintptr_t)vm_base;
+    if (!g_mfc_strict_page_cache || !size) return mfc_strict_span(base + ea, size, writing);
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    const uint32_t first = ea >> 16, last = (uint32_t)(((uint64_t)ea + size - 1) >> 16);
+    for (uint32_t page = first; page <= last; page++) {
+        if ((g_mfc_strict_verified[page >> 3] >> (page & 7)) & 1u) continue;
+        const uint64_t start = (uint64_t)page << 16;
+        if (start + 0x10000u <= limit && mfc_strict_span(base + (uintptr_t)start, 0x10000u, 1)) {
+            mfc_strict_note_verified_page(page);
+            continue;
+        }
+        return mfc_strict_span(base + ea, size, writing);
+    }
+    return 1;
+}
+
+/* The local side of a transfer. An SPU's own embedded store (ls_store) lives
+ * inside the context the caller holds and lsa/size were bounds-checked against
+ * SPU_LS_SIZE, so with the cache enabled it needs no host query. A raw SPU's
+ * store repointed into guest memory uses the guest check; anything else keeps
+ * the exact host check. */
+static inline int mfc_strict_local_span(spu_context* spu, uintptr_t local, uint32_t size, int writing)
+{
+    extern uint32_t ppu_vm_size;
+    if (g_mfc_strict_page_cache) {
+        if (spu->ls == spu->ls_store) return 1;
+        const uintptr_t base = (uintptr_t)vm_base;
+        const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+        if (local >= base && local - base < limit && size <= limit - (local - base))
+            return mfc_strict_guest_span((uint32_t)(local - base), size, writing);
+    }
+    return mfc_strict_span(local, size, writing);
+}
+
 static inline int mfc_strict_copy(void* local, uintptr_t remote, uint32_t size, int writing)
 {
 #ifdef _WIN32
@@ -268,7 +314,8 @@ static inline int mfc_strict_transfer(spu_context* spu, uint32_t lsa, uint64_t e
     address = base + (uintptr_t)ea;
     local += lsa;
     reason = "host-page-access";
-    if (!mfc_strict_span(address, size, writing) || !mfc_strict_span(local, size, !writing)) goto failed;
+    if (!mfc_strict_guest_span((uint32_t)ea, size, writing) ||
+        !mfc_strict_local_span(spu, local, size, !writing)) goto failed;
     reason = "os-copy";
     if (writing) {
         extern void spu_lockline_lock(void);
