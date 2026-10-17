@@ -695,6 +695,25 @@ static u8* eng_coherence_buffer(u32 bytes)
     return s_coherence_rows;
 }
 
+/* One row of 32-bit pixels between the backend's R,G,B,A and the guest's
+ * A8R8G8B8 bytes (or straight through with TEX_RGBA). Copied a byte at a
+ * time, with the TEX_RGBA test inside the loop, these two conversions were
+ * about a quarter of the FIFO thread's time while Twisted Metal booted; at
+ * the -O2 the runtime builds with, GCC vectorises neither form. Each pixel is
+ * one 32-bit rotate instead: bytes s0..s3 load as s0 | s1<<8 | s2<<16 | s3<<24
+ * on a little-endian host (ps3emu/endian.h), so rotating left by 8 gives
+ * s3,s0,s1,s2 (to the guest) and right by 8 gives s1,s2,s3,s0 (from it). */
+static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_guest)
+{
+    if (rgba) { memcpy(dst, src, (size_t)w * 4u); return; }
+    for (u32 c = 0; c < w; c++) {
+        u32 v;
+        memcpy(&v, src + (size_t)c * 4u, 4);
+        v = to_guest ? (v << 8) | (v >> 24) : (v >> 8) | (v << 24);
+        memcpy(dst + (size_t)c * 4u, &v, 4);
+    }
+}
+
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
     if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
@@ -721,11 +740,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     for (u32 r = 0; r < h; r++) {
         u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
         if (!dst) return;
-        const u8* src = rows + (size_t)r * w * 4u;
-        for (u32 c = 0; c < w; c++, src += 4, dst += 4) {
-            if (rgba) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
-            else      { dst[0] = src[3]; dst[1] = src[0]; dst[2] = src[1]; dst[3] = src[2]; }
-        }
+        eng_row_convert(dst, rows + (size_t)r * w * 4u, w, rgba, 1);
     }
 }
 
@@ -749,11 +764,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
     for (u32 r = 0; r < h; r++) {
         const u8* src = eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
         if (!src) return;
-        u8* dst = rows + (size_t)r * w * 4u;
-        for (u32 c = 0; c < w; c++, src += 4, dst += 4) {
-            if (rgba) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
-            else      { dst[0] = src[1]; dst[1] = src[2]; dst[2] = src[3]; dst[3] = src[0]; }
-        }
+        eng_row_convert(rows + (size_t)r * w * 4u, src, w, rgba, 0);
     }
     if (eng_coherence_log())
         fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"

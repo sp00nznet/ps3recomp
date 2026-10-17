@@ -267,13 +267,21 @@ static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.
  * the readback hook has to put those back into the guest's A8R8G8B8. */
 static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
 
+/* With g_stub_ramp set, pixel (c, r) reads back as R,G,B,A = 4c+1, 4c+2,
+ * 4c+3, 0x80+r instead, so every byte of a row is distinct. */
+static int g_stub_ramp;
+
 static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                           void* out, u32 pitch)
 {
     (void)u; (void)s; (void)x; (void)y;
     for (u32 r = 0; r < h; r++)
-        for (u32 c = 0; c < w; c++)
-            memcpy((u8*)out + (size_t)r * pitch + c * 4u, g_stub_pixel, 4);
+        for (u32 c = 0; c < w; c++) {
+            u8* p = (u8*)out + (size_t)r * pitch + c * 4u;
+            if (!g_stub_ramp) { memcpy(p, g_stub_pixel, 4); continue; }
+            p[0] = (u8)(4u * c + 1u); p[1] = (u8)(4u * c + 2u); p[2] = (u8)(4u * c + 3u);
+            p[3] = (u8)(0x80u + r);
+        }
 }
 
 /* Every depth target reads back as 0.5, which Z24S8 stores as 0x800000. */
@@ -288,8 +296,9 @@ static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
     return 0;
 }
 
-/* The last rectangle pushed into a colour target, and its first pixel. */
-static struct { int n; u32 surface, x, y, w, h; u8 first[4]; } g_written;
+/* The last rectangle pushed into a colour target, its first pixel and the
+ * first 64 bytes of its first row. */
+static struct { int n; u32 surface, x, y, w, h; u8 first[4]; u8 row[64]; } g_written;
 
 static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                              const void* rows, u32 row_bytes)
@@ -299,6 +308,7 @@ static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
     g_written.surface = s; g_written.x = x; g_written.y = y;
     g_written.w = w; g_written.h = h;
     memcpy(g_written.first, rows, 4);
+    memcpy(g_written.row, rows, w * 4u < sizeof g_written.row ? w * 4u : sizeof g_written.row);
 }
 
 static const rsx_draw_backend g_stub_backend = {
@@ -1040,6 +1050,47 @@ static void test_transfer_coherence(void)
     engine_down();
 }
 
+/* Whole rows, every pixel different, both ways: a byte swapped between two
+ * pixels, or a row converted only in part, shows up here. */
+static void test_transfer_rows(void)
+{
+    printf("-- transfer rows\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 1024u);
+    draw_triangle();
+
+    /* Guest A,R,G,B -> surface R,G,B,A, 13 pixels (not a multiple of a vector). */
+    u8* px = vm_base + GUEST_LOCAL_EA + 0x40000u + 5u * 1024u;
+    for (u32 c = 0; c < 13; c++) {
+        px[4 * c + 0] = (u8)(0xA0 + c); px[4 * c + 1] = (u8)(4 * c + 1);
+        px[4 * c + 2] = (u8)(4 * c + 2); px[4 * c + 3] = (u8)(4 * c + 3);
+    }
+    memset(&g_written, 0, sizeof g_written);
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u + 5u * 1024u, 1024u, 13u, 2u);
+    int ok = g_written.n == 1 && g_written.w == 13;
+    for (u32 c = 0; ok && c < 13; c++)
+        ok = g_written.row[4 * c + 0] == 4 * c + 1 && g_written.row[4 * c + 1] == 4 * c + 2 &&
+             g_written.row[4 * c + 2] == 4 * c + 3 && g_written.row[4 * c + 3] == 0xA0 + c;
+    CHECK(ok, "13 distinct A8R8G8B8 pixels arrive as R,G,B,A in order");
+
+    /* Surface R,G,B,A -> guest A,R,G,B, 3 rows of 13 pixels, and nothing past them. */
+    u8* rd = vm_base + GUEST_LOCAL_EA + 0x40000u + 8u * 1024u;
+    for (u32 r = 0; r < 4; r++) memset(rd + r * 1024u, 0xEE, 14 * 4);
+    g_stub_ramp = 1;
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, 0x40000u + 8u * 1024u, 1024u, 13u, 3u);
+    g_stub_ramp = 0;
+    ok = 1;
+    for (u32 r = 0; ok && r < 3; r++)
+        for (u32 c = 0; ok && c < 13; c++) {
+            const u8* p = rd + r * 1024u + 4 * c;
+            ok = p[0] == 0x80 + r && p[1] == 4 * c + 1 && p[2] == 4 * c + 2 && p[3] == 4 * c + 3;
+        }
+    CHECK(ok, "3 rows of 13 distinct R,G,B,A pixels land as A8R8G8B8 in order");
+    CHECK(rd[13 * 4] == 0xEE && rd[3 * 1024u] == 0xEE,
+          "the pixel after each row and the row after the rectangle are untouched");
+    engine_down();
+}
+
 static unsigned custom_reads;
 static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
 {
@@ -1416,6 +1467,7 @@ int main(void)
     test_custom_guest_mapping();
     test_queued_flip_buffer();
     test_transfer_coherence();
+    test_transfer_rows();
     test_inline_array();
     test_depth_clear_value();
     test_antialiased_surface();
