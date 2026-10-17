@@ -51,6 +51,8 @@ int main(void)
     cellSysutilCheckCallback(); assert(calls == 2);
     g_ps3_guest_caller = callback;
     cellSysutilCheckCallback(); assert(calls == 3 && last_result == CELL_MSGDIALOG_BUTTON_NONE);
+    /* The values themselves, which a title compares against: a dialog the title closed reports -1. */
+    assert(last_result == -1 && CELL_MSGDIALOG_BUTTON_INVALID == 0);
     cellSysutilCheckCallback(); assert(calls == 3);
 
     /* The yes/no auto-answer. DEFAULT is a blanket YES, including for a prompt

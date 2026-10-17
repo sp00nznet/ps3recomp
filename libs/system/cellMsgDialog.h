@@ -36,8 +36,10 @@ extern "C" {
 #define CELL_MSGDIALOG_TYPE_PROGRESSBAR_DOUBLE     0x00002000
 
 /* Button results */
-#define CELL_MSGDIALOG_BUTTON_NONE     0
-#define CELL_MSGDIALOG_BUTTON_INVALID  (-1)
+/* Result of a dialog the title closed itself (cellMsgDialogClose), and the one nothing answered: NONE is -1 and
+ * INVALID is 0, as in RPCS3. A title that tests the result for -1 never saw a close with these swapped. */
+#define CELL_MSGDIALOG_BUTTON_NONE     (-1)
+#define CELL_MSGDIALOG_BUTTON_INVALID  0
 #define CELL_MSGDIALOG_BUTTON_OK       1
 #define CELL_MSGDIALOG_BUTTON_YES      1
 #define CELL_MSGDIALOG_BUTTON_NO       2
