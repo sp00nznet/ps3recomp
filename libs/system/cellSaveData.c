@@ -744,46 +744,233 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     }
 }
 
-/* Write a simplified PARAM.SFO with the save's title/subtitle/detail */
-static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
+/* ---------------------------------------------------------------------------
+ * PARAM.SFO
+ *
+ * The console's PSF table: magic "\0PSF", version 1.1, little-endian, a key
+ * table and a value table, with the keys the system writes for a save (the same
+ * set RPCS3 writes). This port used to write a KEY=value text file instead, so
+ * its saves were invisible to a PS3 or RPCS3 and theirs could not be loaded
+ * here. Those text files are still read, so existing saves keep working, and
+ * become real PSF the next time the game saves.
+ * -----------------------------------------------------------------------*/
+enum { SFO_BYTES = 0x004, SFO_UTF8 = 0x204, SFO_INT = 0x404 };
+#define SFO_MAX_BYTES (64u * 1024u)
+
+typedef struct {
+    const char* key;
+    u32 format, length, maximum;
+    const u8* value;
+} SaveSfoEntry;
+
+static u32 sfo_get16(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8); }
+static u32 sfo_get32(const u8* p)
+{ return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+static void sfo_put16(u8* p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); }
+static void sfo_put32(u8* p, u32 v)
+{ p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24); }
+
+static void sfo_path_of(char* out, size_t cap, const char* save_path)
+{
+    snprintf(out, cap, "%s/PARAM.SFO", save_path);
+#ifdef _WIN32
+    for (char* p = out; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+#endif
+}
+
+/* The whole file, or NULL. *len receives its size. */
+static u8* sfo_load_file(const char* sfo_path, size_t* len)
+{
+    FILE* fp = ps3_strict_fs_fopen(sfo_path, "rb");
+    if (!fp) return NULL;
+    u8* data = (u8*)malloc(SFO_MAX_BYTES);
+    size_t n = data ? fread(data, 1, SFO_MAX_BYTES, fp) : 0;
+    fclose(fp);
+    if (!data || n == 0) { free(data); return NULL; }
+    *len = n;
+    return data;
+}
+
+/* Find one entry of a PSF table, bounds-checked. Returns its value or NULL. */
+static const u8* sfo_find(const u8* d, size_t n, const char* key, u32* format, u32* length)
+{
+    if (n < 20 || memcmp(d, "\0PSF", 4) || sfo_get32(d + 4) != 0x101) return NULL;
+    const u32 keys = sfo_get32(d + 8), values = sfo_get32(d + 12), count = sfo_get32(d + 16);
+    if (count > 4096 || 20 + (size_t)count * 16 > keys || keys > values || values > n) return NULL;
+    for (u32 i = 0; i < count; i++) {
+        const u8* row = d + 20 + 16 * i;
+        const size_t ko = keys + sfo_get16(row), vo = (size_t)values + sfo_get32(row + 12);
+        const u32 len = sfo_get32(row + 4), max = sfo_get32(row + 8);
+        if (ko >= values || len > max || vo > n || max > n - vo) continue;
+        const u8* name = d + ko;
+        const u8* nul = memchr(name, 0, values - ko);
+        if (!nul || strcmp((const char*)name, key)) continue;
+        *format = sfo_get16(row + 2);
+        *length = len;
+        return d + vo;
+    }
+    return NULL;
+}
+
+static void sfo_copy_string(const u8* d, size_t n, const char* key, char* out, size_t cap)
+{
+    u32 format = 0, length = 0;
+    const u8* v = sfo_find(d, n, key, &format, &length);
+    if (!v || format != SFO_UTF8 || !length) return;
+    const size_t len = strnlen((const char*)v, length);
+    const size_t keep = len < cap - 1 ? len : cap - 1;
+    memcpy(out, v, keep);
+    out[keep] = '\0';
+}
+
+static int sfo_get_int(const u8* d, size_t n, const char* key, u32* out)
+{
+    u32 format = 0, length = 0;
+    const u8* v = sfo_find(d, n, key, &format, &length);
+    if (!v || format != SFO_INT || length != 4) return 0;
+    *out = sfo_get32(v);
+    return 1;
+}
+
+/* Serialize entries, which must be sorted by key as the console writes them. */
+static size_t sfo_build(const SaveSfoEntry* e, u32 count, u8* out, size_t cap)
+{
+    const size_t keys = 20 + (size_t)count * 16;
+    size_t key_bytes = 0, value_bytes = 0;
+    for (u32 i = 0; i < count; i++) {
+        key_bytes += strlen(e[i].key) + 1;
+        value_bytes += (e[i].maximum + 3u) & ~3u;
+    }
+    const size_t values = (keys + key_bytes + 3u) & ~(size_t)3u, end = values + value_bytes;
+    if (end > cap) return 0;
+    memset(out, 0, end);
+    memcpy(out, "\0PSF", 4);
+    sfo_put32(out + 4, 0x101);
+    sfo_put32(out + 8, (u32)keys);
+    sfo_put32(out + 12, (u32)values);
+    sfo_put32(out + 16, count);
+    size_t ko = 0, vo = 0;
+    for (u32 i = 0; i < count; i++) {
+        u8* row = out + 20 + 16 * i;
+        const size_t key_len = strlen(e[i].key) + 1;
+        sfo_put16(row, (u32)ko);
+        sfo_put16(row + 2, e[i].format);
+        sfo_put32(row + 4, e[i].length);
+        sfo_put32(row + 8, e[i].maximum);
+        sfo_put32(row + 12, (u32)vo);
+        memcpy(out + keys + ko, e[i].key, key_len);
+        memcpy(out + values + vo, e[i].value, e[i].length);
+        ko += key_len;
+        vo += (e[i].maximum + 3u) & ~3u;
+    }
+    return end;
+}
+
+static SaveSfoEntry sfo_utf8(const char* key, const char* text, u32 maximum)
+{
+    const size_t len = strnlen(text, maximum - 1);
+    SaveSfoEntry e = { key, SFO_UTF8, (u32)len + 1, maximum, (const u8*)text };
+    return e;
+}
+
+/* Write PARAM.SFO for a save. An existing real PSF keeps its account binding
+ * (ACCOUNT_ID, PARAMS, PARAMS2), so a save brought from a console still
+ * belongs to it after the game saves over it here. */
+static void write_param_sfo(const char* save_path, const char* dir_name,
+                            const CellSaveDataSystemFileParam* param)
 {
     if (!param) return;
 
     char sfo_path[1024];
-    snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
-#ifdef _WIN32
-    for (char* p = sfo_path; *p; p++) {
-        if (*p == '/') *p = '\\';
+    sfo_path_of(sfo_path, sizeof(sfo_path), save_path);
+
+    static const u8 zeros[1024];
+    static const char no_account[17] = "0000000000000000";
+    const u8* account = (const u8*)no_account;
+    const u8* params = zeros;
+    const u8* params2 = zeros;
+    size_t old_len = 0;
+    u8* old = sfo_load_file(sfo_path, &old_len);
+    if (old) {
+        u32 format = 0, length = 0;
+        const u8* v;
+        if ((v = sfo_find(old, old_len, "ACCOUNT_ID", &format, &length)) && length == 16) account = v;
+        if ((v = sfo_find(old, old_len, "PARAMS", &format, &length)) && length == 1024) params = v;
+        if ((v = sfo_find(old, old_len, "PARAMS2", &format, &length)) && length == 12) params2 = v;
     }
-#endif
+
+    char title[CELL_SAVEDATA_SYSP_TITLE_SIZE], sub_title[CELL_SAVEDATA_SYSP_SUBTITLE_SIZE];
+    char detail[CELL_SAVEDATA_SYSP_DETAIL_SIZE], list_param[CELL_SAVEDATA_SYSP_LPARAM_SIZE + 1];
+    char directory[64];
+    snprintf(title, sizeof title, "%.*s", (int)sizeof param->title - 1, param->title);
+    snprintf(sub_title, sizeof sub_title, "%.*s", (int)sizeof param->subTitle - 1, param->subTitle);
+    snprintf(detail, sizeof detail, "%.*s", (int)sizeof param->detail - 1, param->detail);
+    snprintf(list_param, sizeof list_param, "%.*s", (int)sizeof param->listParam, param->listParam);
+    snprintf(directory, sizeof directory, "%s", dir_name ? dir_name : "");
+    u8 attribute[4], parental[4];
+    sfo_put32(attribute, param->attribute);
+    /* reserved2 is the guest's big-endian parental level. */
+    const u8* pl = (const u8*)param->reserved2;
+    sfo_put32(parental, ((u32)pl[0] << 24) | ((u32)pl[1] << 16) | ((u32)pl[2] << 8) | pl[3]);
+
+    const SaveSfoEntry entries[] = {
+        { "ACCOUNT_ID", SFO_BYTES, 16, 16, account },
+        { "ATTRIBUTE", SFO_INT, 4, 4, attribute },
+        { "CATEGORY", SFO_UTF8, 3, 4, (const u8*)"SD" },
+        sfo_utf8("DETAIL", detail, 1024),
+        { "PARAMS", SFO_BYTES, 1024, 1024, params },
+        { "PARAMS2", SFO_BYTES, 12, 12, params2 },
+        { "PARENTAL_LEVEL", SFO_INT, 4, 4, parental },
+        sfo_utf8("SAVEDATA_DIRECTORY", directory, 64),
+        sfo_utf8("SAVEDATA_LIST_PARAM", list_param, 8),
+        sfo_utf8("SUB_TITLE", sub_title, 128),
+        sfo_utf8("TITLE", title, 128),
+    };
+    u8* out = (u8*)malloc(SFO_MAX_BYTES);
+    const size_t size = out ? sfo_build(entries, (u32)(sizeof entries / sizeof entries[0]),
+                                        out, SFO_MAX_BYTES) : 0;
+    free(old);
+    if (!size) { free(out); return; }
 
     FILE* fp = ps3_strict_fs_fopen(sfo_path, "wb");
-    if (!fp) return;
-
-    /* Write a simplified text-based PARAM.SFO for easy debugging.
-       Games don't read this directly - our stat callback fills it from here. */
-    ps3_strict_fs_stream("save-metadata", fp);
-    fprintf(fp, "TITLE=%s\n", param->title);
-    fprintf(fp, "SUB_TITLE=%s\n", param->subTitle);
-    fprintf(fp, "DETAIL=%s\n", param->detail);
-    fprintf(fp, "ATTRIBUTE=%u\n", param->attribute);
-    fprintf(fp, "LIST_PARAM=%s\n", param->listParam);
-    fclose(fp);
+    if (fp) {
+        ps3_strict_fs_stream("save-metadata", fp);
+        ps3_strict_fs_fwrite(out, 1, size, fp);
+        fclose(fp);
+    }
+    free(out);
 }
 
-/* Read simplified PARAM.SFO */
+/* Read PARAM.SFO: a real PSF, or the KEY=value text this port used to write. */
 static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param)
 {
     if (!param) return;
     memset(param, 0, sizeof(CellSaveDataSystemFileParam));
 
     char sfo_path[1024];
-    snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
-#ifdef _WIN32
-    for (char* p = sfo_path; *p; p++) {
-        if (*p == '/') *p = '\\';
+    sfo_path_of(sfo_path, sizeof(sfo_path), save_path);
+
+    size_t n = 0;
+    u8* d = sfo_load_file(sfo_path, &n);
+    if (d && n >= 4 && !memcmp(d, "\0PSF", 4)) {
+        sfo_copy_string(d, n, "TITLE", param->title, sizeof param->title);
+        sfo_copy_string(d, n, "SUB_TITLE", param->subTitle, sizeof param->subTitle);
+        sfo_copy_string(d, n, "DETAIL", param->detail, sizeof param->detail);
+        char list_param[CELL_SAVEDATA_SYSP_LPARAM_SIZE + 1] = {0};
+        sfo_copy_string(d, n, "SAVEDATA_LIST_PARAM", list_param, sizeof list_param);
+        memcpy(param->listParam, list_param, sizeof param->listParam);
+        u32 value;
+        if (sfo_get_int(d, n, "ATTRIBUTE", &value)) param->attribute = value;
+        if (sfo_get_int(d, n, "PARENTAL_LEVEL", &value)) {
+            u8* pl = (u8*)param->reserved2;
+            pl[0] = (u8)(value >> 24); pl[1] = (u8)(value >> 16); pl[2] = (u8)(value >> 8); pl[3] = (u8)value;
+        }
+        free(d);
+        return;
     }
-#endif
+    free(d);
 
     FILE* fp = ps3_strict_fs_fopen(sfo_path, "rb");
     if (!fp) return;
@@ -913,7 +1100,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
         CellSaveDataSystemFileParam params;
         memcpy(&params, statSet.setParam, sizeof(params));
         params.attribute = ps3_bswap32(params.attribute);
-        write_param_sfo(save_path, &params);
+        write_param_sfo(save_path, dirName, &params);
     }
 
     /* Each NEXT callback requests one operation. LAST ends the sequence;

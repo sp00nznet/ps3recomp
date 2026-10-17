@@ -587,6 +587,18 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
                 winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
         endif()
         set_target_properties(test_vulkan_resolution_gpu PROPERTIES LINKER_LANGUAGE CXX)
+        # Save PARAM.SFO: real PSF written; PSF and the old text form read. CPU only.
+        add_executable(test_savedata_param_sfo EXCLUDE_FROM_ALL
+            tests/test_savedata_param_sfo.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_savedata_param_sfo PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/system")
+        target_compile_options(test_savedata_param_sfo PRIVATE -UNDEBUG)
+        target_link_libraries(test_savedata_param_sfo PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(test_savedata_param_sfo PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_savedata_param_sfo PROPERTIES LINKER_LANGUAGE CXX)
         add_executable(test_vulkan_anisotropy_backend EXCLUDE_FROM_ALL
             tests/test_vulkan_anisotropy_backend.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
         target_include_directories(test_vulkan_anisotropy_backend PRIVATE
