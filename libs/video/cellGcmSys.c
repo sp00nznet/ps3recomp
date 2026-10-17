@@ -71,6 +71,22 @@ static u64 get_timestamp_ns(void)
 static int  s_gcm_initialized = 0;
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+/* Flip requests (each puts the status back to WAITING) and the request a
+ * pending flip completion was marked for: a completion delivered late must not
+ * mark DONE a flip requested after it (see ppu_gcm_pump). */
+static volatile u32 s_flip_req_seq, s_flip_tick_seq;
+/* The status's read-modify-write transitions (request, tick, completion) run
+ * on different threads; without a lock a completion could read "no newer
+ * request" just before a request stored WAITING and then overwrite it. */
+#ifdef _WIN32
+static volatile LONG s_flip_lock;
+#define FLIP_LOCK()   do { while (InterlockedCompareExchange(&s_flip_lock, 1, 0)) YieldProcessor(); } while (0)
+#define FLIP_UNLOCK() InterlockedExchange(&s_flip_lock, 0)
+#else
+static volatile int s_flip_lock;
+#define FLIP_LOCK()   do { while (__atomic_exchange_n(&s_flip_lock, 1, __ATOMIC_ACQUIRE)) {} } while (0)
+#define FLIP_UNLOCK() __atomic_store_n(&s_flip_lock, 0, __ATOMIC_RELEASE)
+#endif
 
 /* Count of guest flip requests (SetFlipCommand / SetPrepareFlip). The present
  * loop uses this as the frame boundary: presenting only when a flip arrived
@@ -618,7 +634,11 @@ void cellGcmSetWaitFlip(void)
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
     for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
         Sleep(1);
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    /* A flip still WAITING after the bound is left to the tick. Forcing DONE
+     * here skipped its completion: the tick only completes WAITING flips, so
+     * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
+     * the FIFO put it deferred, hung with get == put whenever a frame took
+     * longer than the bound. */
 }
 
 /* NID: 0xDF6476BD. The same wait without libgcm's command-buffer space check;
@@ -632,7 +652,10 @@ void cellGcmResetFlipStatus(void)
     { static int n = 0;
       if (getenv("FLIP_DBG") && n++ < 12)
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
+    FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    s_flip_req_seq++;
+    FLIP_UNLOCK();
 }
 
 /* NID: 0xE315A0B2 */
@@ -703,9 +726,13 @@ void cellGcm_request_tick(void)
       if (need < 0) { const char* e = getenv("GCM_FLIP_NEEDS_FIFO"); need = e ? atoi(e) : 0; }
       if (need) {
           u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
-          GCM_PENDING_SET(s_fifo_getoff == put ? 3 : 1);
+          const int flip = s_fifo_getoff == put;
+          if (flip) { FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK(); }
+          GCM_PENDING_SET(flip ? 3 : 1);
           return;
       } }
+    /* This tick completes the flip requested last (see ppu_gcm_pump). */
+    FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();
     GCM_PENDING_SET(3);
 }
 
@@ -732,7 +759,17 @@ void ppu_gcm_pump(void)
                            0, 0, 0, 0, 0, 0, 0);
     }
     if (p & 2) {
-        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        /* Delivery waits for a guest thread to reach an HLE call or a timer
+         * sleep, so a newer flip may have been requested (status WAITING
+         * again) since this completion was marked. Marking DONE then would
+         * erase that request: the ticker only completes WAITING flips, so its
+         * handler would never run. inFAMOUS 2 writes its next FIFO put from
+         * the flip handler, and hung with get == put on exactly that. Leave
+         * the newer flip WAITING for the next tick. */
+        FLIP_LOCK();
+        if (s_flip_tick_seq == s_flip_req_seq)
+            s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        FLIP_UNLOCK();
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -763,8 +800,11 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
-    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
-        GCM_PENDING_SET(2);
+    FLIP_LOCK();
+    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING;
+    if (waiting) s_flip_tick_seq = s_flip_req_seq;
+    FLIP_UNLOCK();
+    if (waiting) GCM_PENDING_SET(2);
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -2385,7 +2425,10 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     }
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
+    FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    s_flip_req_seq++;
+    FLIP_UNLOCK();
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke via OPD resolution, not a raw call into guest code.
