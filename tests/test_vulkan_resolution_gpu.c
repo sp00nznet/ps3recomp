@@ -5,9 +5,22 @@
 uint8_t* vm_base;
 static unsigned checks;
 #define CHECK(v) do{++checks;if(!(v)){fprintf(stderr,"FAIL line%d: %s\n",__LINE__,#v);return 1;}}while(0)
+/* The backend reads its settings with getenv. SDL_setenv does not reach that
+ * on Windows (SDL2 writes the Win32 environment block there), so set the CRT copy. */
+static int set_env(const char* name, const char* value)
+{
+#ifdef _WIN32
+    return _putenv_s(name, value) ? -1 : 0;
+#else
+    return setenv(name, value, 1);
+#endif
+}
 int main(void)
 {
-    SDL_SetMainReady();SDL_setenv("PS3RECOMP_RENDER_SCALE","3",1);
+    /* The scale is applied by the register-file draw engine, which runs with
+     * guest programs on, as Folklore always does. */
+    SDL_SetMainReady();CHECK(set_env("PS3RECOMP_VK_GUEST_PROGRAMS","1")==0);
+    CHECK(set_env("PS3RECOMP_RENDER_SCALE","3")==0);
     CHECK(rsx_vulkan_backend_init(24,12,"Internal resolution regression")==0);
     CHECK(s_render_scale==3);
     static const char vs[]="float4 main(float4 p:ATTR0):SV_Position{return p;}";

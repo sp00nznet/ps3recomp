@@ -5,6 +5,16 @@
 uint8_t* vm_base;
 static unsigned checks;
 #define CHECK(v) do { ++checks; if (!(v)) { fprintf(stderr,"FAIL line%d: %s\n",__LINE__,#v); return 1; } } while(0)
+/* The backend reads its settings with getenv. SDL_setenv does not reach that
+ * on Windows (SDL2 writes the Win32 environment block there), so set the CRT copy. */
+static int set_env(const char* name, const char* value)
+{
+#ifdef _WIN32
+    return _putenv_s(name, value) ? -1 : 0;
+#else
+    return setenv(name, value, 1);
+#endif
+}
 static VKAPI_ATTR VkResult VKAPI_CALL fail_sampler(VkDevice device,const VkSamplerCreateInfo* info,
     const VkAllocationCallbacks* allocator,VkSampler* sampler)
 {
@@ -104,6 +114,7 @@ static int run_size(u32 width,u32 height)
 int main(void)
 {
     SDL_SetMainReady();
+    CHECK(set_env("PS3RECOMP_ANTIALIASING","fxaa")==0);
     VkImage output=VK_NULL_HANDLE;
     CHECK(vk_fxaa_apply(&output)==-1 && !output);
     for(unsigned i=0;i<4;i++) {

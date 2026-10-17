@@ -6,6 +6,16 @@
 uint8_t* vm_base;
 static unsigned checks;
 #define CHECK(v) do { ++checks; if (!(v)) { fprintf(stderr,"FAIL line%d: %s\n",__LINE__,#v); return 1; } } while(0)
+/* The backend reads its settings with getenv. SDL_setenv does not reach that
+ * on Windows (SDL2 writes the Win32 environment block there), so set the CRT copy. */
+static int set_env(const char* name, const char* value)
+{
+#ifdef _WIN32
+    return _putenv_s(name, value) ? -1 : 0;
+#else
+    return setenv(name, value, 1);
+#endif
+}
 
 static int transfer(VkImage image, u32 w, u32 h, u8* pixels, int write)
 {
@@ -186,6 +196,10 @@ static int run_present(void)
 int main(void)
 {
     SDL_SetMainReady();
+    /* As in production: the guest color target is sampleable only when a
+     * postprocess was requested at init. Sampling it otherwise is invalid
+     * Vulkan; lavapipe tolerated that, NVIDIA reads zeros. */
+    CHECK(set_env("PS3RECOMP_UPSCALER","fsr1")==0);
     VkImage output=VK_NULL_HANDLE;
     CHECK(vk_fsr1_apply(NULL,1,1,2,2,.2f,&output)==-1 && !output);
     const u32 sizes[][4]={{1,1,2,2},{3,5,5,7},{32,19,64,38},{33,21,49,31}};

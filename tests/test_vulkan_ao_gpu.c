@@ -5,6 +5,16 @@
 uint8_t* vm_base;
 static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); return 1; } } while(0)
+/* The backend reads its settings with getenv. SDL_setenv does not reach that
+ * on Windows (SDL2 writes the Win32 environment block there), so set the CRT copy. */
+static int set_env(const char* name, const char* value)
+{
+#ifdef _WIN32
+    return _putenv_s(name, value) ? -1 : 0;
+#else
+    return setenv(name, value, 1);
+#endif
+}
 
 static u32 image(VkFormat fmt,u32 w,u32 h,u32 bpp,const void* data)
 {
@@ -140,7 +150,7 @@ static int cacao_world(void)
 
 int main(void)
 {
-    SDL_SetMainReady();CHECK(SDL_setenv("PS3RECOMP_VK_GUEST_PROGRAMS","1",1)==0);
+    SDL_SetMainReady();CHECK(set_env("PS3RECOMP_VK_GUEST_PROGRAMS","1")==0);
     CHECK(rsx_vulkan_backend_init(8,4,"AO transport regression")==0);
     CHECK(resolve()==0);CHECK(composite()==0);CHECK(cacao_world()==0);
     rsx_vulkan_backend_shutdown();
