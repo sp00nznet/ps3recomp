@@ -116,6 +116,11 @@ void rsx_vertex_fetch_plan_prepare(
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
 
+/* Equivalent batch fetch into count tightly packed compact vertices. Input
+ * plan, references and guest mappings must not overlap the output. */
+int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out);
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */

@@ -306,6 +306,60 @@ int rsx_vertex_fetch_one(
     return 1;
 }
 
+int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out)
+{
+    if (!plan || (count && (!refs || (!out && plan->layout.stride)))) return 0;
+    if (!count) return 1;
+    /* One range check for the batch replaces per-attribute/per-vertex bounds
+     * and type dispatch. Unusual formats, divisors and fragmented mappings
+     * retain the existing reference path. No decoded data is cached. */
+    u32 first=UINT_MAX,last=0;
+    for (u32 i=0;i<count;++i) {
+        const u32 e=(refs[i].vertex_id+refs[i].base_index)&0x000FFFFFu;
+        if(e<first) first=e;
+        if(e>last) last=e;
+    }
+    for (u32 slot=0;slot<plan->layout.count;++slot) {
+        const rsx_vertex_fetch_attr* f=&plan->attr[plan->layout.attrs[slot]];
+        if (!f->desc.type || !f->desc.size) continue;
+        if (!f->stable_base || f->desc.frequency>1 || f->desc.size>4 ||
+            first<f->stable_first || last>f->stable_last ||
+            (f->desc.type!=RSX_VTX_TYPE_FLOAT && f->desc.type!=RSX_VTX_TYPE_HALF &&
+             f->desc.type!=RSX_VTX_TYPE_UNORM8 && f->desc.type!=RSX_VTX_TYPE_UINT8))
+            goto reference;
+    }
+    for (u32 slot=0;slot<plan->layout.count;++slot) {
+        const rsx_vertex_fetch_attr* f=&plan->attr[plan->layout.attrs[slot]];
+        if (!f->desc.type || !f->desc.size) {
+            for(u32 i=0;i<count;++i)
+                memcpy(out+(size_t)i*plan->layout.stride+slot*16u,f->default_value,16);
+            continue;
+        }
+        const u32 n=f->desc.size;
+#define FETCH_BATCH_COMPONENTS(DECODE) \
+        for(u32 i=0;i<count;++i) { \
+            const u32 e=(refs[i].vertex_id+refs[i].base_index)&0x000FFFFFu; \
+            const u8* p=f->stable_base+(u64)(e-f->stable_first)*f->stride; \
+            float* value=(float*)(out+(size_t)i*plan->layout.stride+slot*16u); \
+            value[0]=value[1]=value[2]=0.0f;value[3]=1.0f; \
+            for(u32 k=0;k<n;++k) value[k]=(DECODE); \
+        }
+        switch(f->desc.type) {
+        case RSX_VTX_TYPE_FLOAT: FETCH_BATCH_COMPONENTS(rsx_compact_be_f32(p+k*4u)); break;
+        case RSX_VTX_TYPE_HALF: FETCH_BATCH_COMPONENTS(rsx_compact_be_f16(p+k*2u)); break;
+        case RSX_VTX_TYPE_UNORM8: FETCH_BATCH_COMPONENTS(p[k]/255.0f); break;
+        case RSX_VTX_TYPE_UINT8: FETCH_BATCH_COMPONENTS((float)p[k]); break;
+        }
+#undef FETCH_BATCH_COMPONENTS
+    }
+    return 1;
+reference:
+    for(u32 i=0;i<count;++i)
+        if(!rsx_vertex_fetch_one(plan,&refs[i],out ? out+(size_t)i*plan->layout.stride : NULL)) return 0;
+    return 1;
+}
+
 static u64 rsx_vertex_remap_hash(u64 value)
 {
     value ^= value >> 33;

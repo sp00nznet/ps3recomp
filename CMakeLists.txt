@@ -603,6 +603,11 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
         target_include_directories(test_vertex_decode_equivalence PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
         target_compile_options(test_vertex_decode_equivalence PRIVATE -Wall -Wextra -Werror)
+        add_executable(test_vertex_batch_equivalence EXCLUDE_FROM_ALL
+            tests/test_vertex_batch_equivalence.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c)
+        target_include_directories(test_vertex_batch_equivalence PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_compile_options(test_vertex_batch_equivalence PRIVATE -Wall -Wextra -Werror)
         # Save PARAM.SFO: real PSF written; PSF and the old text form read. CPU only.
         add_executable(test_savedata_param_sfo EXCLUDE_FROM_ALL
             tests/test_savedata_param_sfo.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
