@@ -2683,22 +2683,48 @@ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); 
  * at ctx->current instead; the drain stops at it and fires the flip there,
  * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
  * Returns 0 when there is no room or ctx is not a mapped command buffer. */
+/* Result of the last strict context callback made for a flip; nonzero means
+ * the guest refused to make space and no flip was enqueued. */
+static s32 s_flip_callback_result;
+
+static int gcm_strict_flip_ring_valid(u32 begin, u32 cur, u32 end)
+{
+    return !((begin | cur | end) & 3u) && begin <= cur && cur <= end;
+}
+
 static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
 {
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
-    const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+    u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
     if (ps3_strict_boot_enabled()) {
-        const u32 begin = vm_read32(ctx);
+        u32 begin = vm_read32(ctx);
         /* The firmware checks space for the flip command, not a guessed
          * distance from the end of a title-owned ring. A near-end position
          * does not authorize overwriting current or inserting a JUMP.
          * Reference: RPCS3 4d5def58 gcmSetPrepareFlip (GPL-2.0).
          * Keep eight bytes reserved as in that API. Our existing internal
          * flip marker consumes one word; the guest still owns refill. */
-        if ((begin | cur | end) & 3u || begin > cur || cur > end ||
-            end - cur <= 8 || gcm_ea2io(cur) == 0xFFFFFFFFu ||
-            gcm_ea2io(cur + 3) == 0xFFFFFFFFu)
+        s_flip_callback_result = 0;
+        if (!gcm_strict_flip_ring_valid(begin, cur, end)) return 0;
+        if (end - cur <= 8) {
+            /* Same API: when current + 8 >= end the firmware asks the
+             * title's own buffer-full callback (context word 3) for 8 bytes,
+             * as cellGcmSetWaitFlip does above, and enqueues nothing if it
+             * fails. Without this, a flip that happened to land at the ring
+             * tail was a strict fatal (seen during the HDD-data dialog). */
+            const u32 opd = vm_read32(ctx + 12);
+            if (!opd || !s_context_callback) return 0;
+            const s32 result = s_context_callback(opd, ctx, 8);
+            if (result) {
+                fprintf(stderr, "[cellGcmSys] SetFlip callback failed context=0x%08X result=0x%08X\n", ctx, (u32)result);
+                s_flip_callback_result = result;
+                return -1;
+            }
+            begin = vm_read32(ctx); end = vm_read32(ctx + 4); cur = vm_read32(ctx + 8);
+            if (!gcm_strict_flip_ring_valid(begin, cur, end) || end - cur <= 8) return 0;
+        }
+        if (gcm_ea2io(cur) == 0xFFFFFFFFu || gcm_ea2io(cur + 3) == 0xFFFFFFFFu)
             return 0;
         vm_write32(cur, GCM_FLIP_MARKER | bufferId);
         vm_write32(ctx + 8, cur + 4);
@@ -2734,7 +2760,12 @@ s32 cellGcmSetFlip(void* context, u32 bufferId)
 {
     if (ps3_strict_boot_enabled()) {
         u32 ctx = (u32)(uintptr_t)context;
-        if (!gcm_flip_into_fifo(ctx, bufferId))
+        const int queued = gcm_flip_into_fifo(ctx, bufferId);
+        /* Guest callback refused space: RPCS3 enqueues no flip and reports
+         * failure only for a negative (error) result. */
+        if (queued < 0)
+            return s_flip_callback_result < 0 ? CELL_GCM_ERROR_FAILURE : CELL_OK;
+        if (!queued)
             ps3_strict_boot_guard("rsx-flip-enqueue", "context=0x%08X buffer=%u", ctx, bufferId);
         return gcm_flip_request(bufferId, 1);
     }
