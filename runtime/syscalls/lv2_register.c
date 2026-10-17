@@ -928,6 +928,32 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
     return 0;
 }
 
+/* The thread's image as the guest holds it: its source address, its size (0 when there is none) and content
+ * fingerprint, and whether lifted code is registered for those bytes (*iid is then its image id). */
+static size_t spu_thread_image(const spu_thread_t* t, uint32_t* src, uint64_t* fp, int* iid, int* registered)
+{
+    extern uint32_t ps3_spu_image_source_ea(uint32_t img_ea);
+    *src = ps3_spu_image_source_ea(t->img_ea);
+    *fp = 0;
+    *registered = 0;
+    const size_t isz = *src ? spu_elf_image_size(vm_base + *src, 1u << 20) : 0;
+    if (isz) {
+        *fp = spu_workload_fingerprint(vm_base + *src, isz);
+        *registered = spu_workload_find_img(*fp, iid) != 0;
+    }
+    return isz;
+}
+
+/* The registry id of the lifted image whose bytes this thread's sys_spu_image holds, or 0 when there is none. Two
+ * images can have code at the same entry point (SPU programs all start near 0xD0..0xF0), and the entry alone
+ * resolves to whichever registered first; the image's own bytes say which one the thread is. */
+static int spu_thread_image_id(const spu_thread_t* t)
+{
+    uint32_t src; uint64_t fp; int iid = 0, registered;
+    if (!t->img_ea || !vm_base) return 0;
+    return spu_thread_image(t, &src, &fp, &iid, &registered) && registered ? iid : 0;
+}
+
 /* sys_spu_thread_group_start(id) */
 static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
 {
@@ -1012,6 +1038,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 d.group_id = id;
                 d.entry    = t->entry_point;
                 d.img_ea   = t->img_ea;
+                d.image_id = spu_thread_image_id(t);
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
                 t->running = 1;
@@ -1050,14 +1077,11 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * existed; only the SPURS path consulted this one, so a title driving
          * plain SPU thread groups never ran a line of its lifted SPU code. */
         if (!fb && t->img_ea && vm_base) {
-            extern uint32_t ps3_spu_image_source_ea(uint32_t img_ea);
             extern int32_t spu_registry_fallback(uint32_t, uint32_t, uint32_t, void*);
-            uint32_t src = ps3_spu_image_source_ea(t->img_ea);
-            size_t isz = src ? spu_elf_image_size(vm_base + src, 1u << 20) : 0;
+            uint32_t src; uint64_t fp; int iid = 0, registered;
+            const size_t isz = spu_thread_image(t, &src, &fp, &iid, &registered);
             if (isz) {
-                uint64_t fp = spu_workload_fingerprint(vm_base + src, isz);
-                int iid = 0;
-                if (spu_workload_find_img(fp, &iid)) {
+                if (registered) {
                     fb = spu_registry_fallback;
                     user = (void*)(uintptr_t)fp;
                     fprintf(stderr, "[SPU] thread tid=0x%X image @0x%08X (%u bytes) "

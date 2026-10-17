@@ -86,7 +86,7 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
      * case. Asking the registry which image owns the entry point gets the same
      * answer the title's own registration order implies, without the lv2 layer
      * having to know any image ids. */
-    { int img = spu_image_of_function(ctx->pc);
+    { int img = d->image_id > 0 ? d->image_id : spu_image_of_function(ctx->pc);
       ctx->image_id = (img >= 0) ? img : 0; }
 
     if (d->img_ea) spu_deploy_image(ctx, d->img_ea);

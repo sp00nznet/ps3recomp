@@ -34,6 +34,7 @@ typedef struct spu_lifted_thread_desc {
     uint32_t entry;      /* LS entry point, read from the sys_spu_image       */
     uint32_t img_ea;     /* guest sys_spu_image; 0 deploys nothing            */
     uint64_t args[4];    /* sys_spu_thread_argument, as captured at initialize */
+    int      image_id;   /* registry id of the image, from its content; 0 = ask the entry point */
 } spu_lifted_thread_desc;
 
 /* How the thread stopped, in the terms the group state machine needs. */
