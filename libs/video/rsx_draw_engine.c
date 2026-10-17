@@ -1018,6 +1018,32 @@ static int eng_staging_reserve(u32 bytes)
     return 1;
 }
 
+/* RSX_ENGINE_TEXTURE_DUMP=<existing dir> with RSX_ENGINE_TEXTURE_DUMP_OFFSET=<hex>:
+ * each upload of the texture at that offset writes its first level exactly as
+ * it is handed to the backend (decoded texels, or BC blocks in row order), as
+ * <dir>/tex_<offset>_f<fmt>_<w>x<h>_r<remap>_<n>.bin. */
+static void eng_texture_dump(u32 offset, u32 fmt, u32 w, u32 h, u32 remap,
+                             const rsx_tex_layout* tl)
+{
+    static int armed = -1;
+    static u32 want = 0, n = 0;
+    static const char* dir = NULL;
+    if (armed < 0) {
+        dir = getenv("RSX_ENGINE_TEXTURE_DUMP");
+        const char* at = getenv("RSX_ENGINE_TEXTURE_DUMP_OFFSET");
+        armed = (dir && *dir && at && *at) ? 1 : 0;
+        if (armed) want = (u32)strtoul(at, NULL, 16);
+    }
+    if (!armed || offset != want || n >= 8) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/tex_%08X_f%02X_%ux%u_r%08X_%u.bin",
+             dir, offset, fmt & 0xFFu, w, h, remap, n++);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(g.tex_staging, 1, (size_t)tl->dst_row_bytes * tl->rows, f);
+    fclose(f);
+}
+
 /* Decode a guest texture out of guest memory and hand every face and level to
  * the backend. Returns the backend handle, or 0. */
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
@@ -1048,6 +1074,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
                                face + lv[m].offset, lv[m].w, lv[m].h, tl,
                                rsx_texture_argb_is_rgba());
+            if (f == 0 && m == 0) eng_texture_dump(offset, fmt, w, h, remap, tl);
             g.be->texture_upload(g.be->user, handle, f, m, lv[m].w, lv[m].h,
                                  g.tex_staging, tl->dst_row_bytes, tl->rows);
         }
@@ -2147,6 +2174,8 @@ static void pd_write_surface(u32 slot, const char* path)
     free(rgb);
 }
 
+static void pd_write_depth(u32 zslot, const char* path, float* lo_out, float* hi_out);
+
 /* Capture after the real draw, without skipping or substituting any draw. */
 static void pd_draw_images(void)
 {
@@ -2160,6 +2189,10 @@ static void pd_draw_images(void)
         pass = pass * 10u + (u32)(*p - '0');
     }
     if (pass != s_pd.pass) return;
+    /* RSX_ENGINE_PASS_DUMP_IMAGES_FROM=<draw>: skip the draws before it, so
+     * the image budget reaches the middle of a long pass. */
+    const char* from = getenv("RSX_ENGINE_PASS_DUMP_IMAGES_FROM");
+    if (from && s_pd.draws - 1u < (u32)strtoul(from, NULL, 0)) return;
     for (u32 k = 0; k < s_pd.n_targets; ++k) {
         const eng_surface* surface = &g.surfaces[s_pd.targets[k]];
         const u64 bytes = (u64)surface->w * surface->h * 3u;
@@ -2170,6 +2203,19 @@ static void pd_draw_images(void)
                                s_pd.dir, s_pd.pass, s_pd.draws - 1u, k);
         if (n < 0 || (size_t)n >= sizeof path) continue;
         pd_write_surface(s_pd.targets[k], path);
+        s_pd.image_bytes += bytes;
+    }
+    /* ...and the depth target after the same draw. */
+    if (s_pd.zslot != ENG_INVALID) {
+        const eng_zdepth* z = &g.zdepths[s_pd.zslot];
+        const u64 bytes = (u64)z->w * z->h;
+        if (!bytes || s_pd.image_bytes + bytes > 256u * 1024u * 1024u) return;
+        char path[1024];
+        const int n = snprintf(path, sizeof path, "%s/pass%03u_draw%03u_z.pgm",
+                               s_pd.dir, s_pd.pass, s_pd.draws - 1u);
+        if (n < 0 || (size_t)n >= sizeof path) return;
+        float lo, hi;
+        pd_write_depth(s_pd.zslot, path, &lo, &hi);
         s_pd.image_bytes += bytes;
     }
 }
@@ -2423,9 +2469,26 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
             if (!(tex_mask & (1u << u))) continue;
             rsx_dsp_texture t;
             rsx_dsp_get_texture(&g.rsx, u, &t);
-            fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
-                    t.format & 0xFFu, t.width, t.height);
+            fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u r%08X c%08X", u, t.location,
+                    t.offset, t.format & 0xFFu, t.width, t.height, t.remap, t.control0);
         }
+        /* RSX_ENGINE_PASS_DUMP_DRAWS=regs: every register the title wrote
+         * since the previous logged draw, value as it stands now. */
+        { static int regs = -1;
+          static u32 last[RSX_DSP_NUM_REGS];
+          if (regs < 0) { const char* e = getenv("RSX_ENGINE_PASS_DUMP_DRAWS");
+                          regs = (e && !strcmp(e, "regs")) ? 1 : 0; }
+          if (regs) {
+              u32 shown = 0, changed = 0;
+              fprintf(s_pd.draws_log, " | wrote");
+              for (u32 i = 0; i < RSX_DSP_NUM_REGS; i++) {
+                  if (g.rsx.seen[i] == last[i]) continue;
+                  last[i] = g.rsx.seen[i];
+                  changed++;
+                  if (shown < 64) { fprintf(s_pd.draws_log, " %04X=%08X", i * 4u, g.rsx.regs[i]); shown++; }
+              }
+              if (changed > shown) fprintf(s_pd.draws_log, " (+%u more)", changed - shown);
+          } }
         fprintf(s_pd.draws_log, "\n");
     }
     const u32 draw = s_pd.draws++;
