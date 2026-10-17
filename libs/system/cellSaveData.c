@@ -53,6 +53,19 @@
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 
+/* $PS3_GAMEDATA_ROOT replaces the cwd-relative "./gamedata", so a port can keep
+ * the player's saves in one fixed place (e.g. ~/Library/Application Support/...)
+ * no matter which directory the game was launched from. */
+static void adopt_gamedata_root(void)
+{
+    static int s_done = 0;
+    if (s_done) return;
+    s_done = 1;
+    const char* env = getenv("PS3_GAMEDATA_ROOT");
+    if (env && *env)
+        snprintf(s_save_root, sizeof(s_save_root), "%s/dev_hdd0/home/00000001/savedata", env);
+}
+
 /* Ensure directory (and parents) exist */
 static void ensure_dirs(const char* path)
 {
@@ -73,6 +86,7 @@ static void ensure_dirs(const char* path)
 
 static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
+    adopt_gamedata_root();
     snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
 #ifdef _WIN32
     for (char* p = buf; *p; p++) {
@@ -437,6 +451,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 {
     u32 count = 0;
 
+    adopt_gamedata_root();
     ensure_dirs(s_save_root);
 
 #ifdef _WIN32

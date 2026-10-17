@@ -40,6 +40,19 @@
 
 static int s_trophy_initialized = 0;
 static char s_storage_path[512] = "gamedata/trophies";
+static int  s_storage_path_set = 0;
+
+/* $PS3_GAMEDATA_ROOT (see cellSaveData.c) moves the default next to the saves;
+ * an explicit sceNpTrophySetStoragePath still wins. */
+static void trophy_adopt_gamedata_root(void)
+{
+    static int s_done = 0;
+    if (s_done || s_storage_path_set) return;
+    s_done = 1;
+    const char* env = getenv("PS3_GAMEDATA_ROOT");
+    if (env && *env)
+        snprintf(s_storage_path, sizeof(s_storage_path), "%s/trophies", env);
+}
 
 /* Per-context data */
 typedef struct {
@@ -68,6 +81,7 @@ static void trophy_ensure_dir(void)
     char tmp[512];
     char* p;
 
+    trophy_adopt_gamedata_root();
     strncpy(tmp, s_storage_path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
 
@@ -85,6 +99,7 @@ static void trophy_ensure_dir(void)
 static void trophy_get_filepath(const SceNpCommunicationId* commId,
                                  char* buf, size_t bufsize)
 {
+    trophy_adopt_gamedata_root();
     snprintf(buf, bufsize, "%s/%s.json", s_storage_path, commId->data);
 }
 
@@ -174,6 +189,7 @@ void sceNpTrophySetStoragePath(const char* path)
     if (path) {
         strncpy(s_storage_path, path, sizeof(s_storage_path) - 1);
         s_storage_path[sizeof(s_storage_path) - 1] = '\0';
+        s_storage_path_set = 1;
     }
 }
 

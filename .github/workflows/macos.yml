@@ -72,6 +72,8 @@ jobs:
           /tmp/test_dialog_callbacks
           clang -std=gnu17 -I include                 libs/system/tests/test_savedata_fixed.c                 -Wl,-dead_strip -o /tmp/test_savedata_fixed
           /tmp/test_savedata_fixed
+          clang -std=gnu17 -I include                 libs/system/tests/test_savedata_root.c                 -Wl,-dead_strip -o /tmp/test_savedata_root
+          /tmp/test_savedata_root
 
       - name: Run self-contained SPU helper tests
         run: |
