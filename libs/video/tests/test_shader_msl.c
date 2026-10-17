@@ -305,6 +305,23 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- fragment program: TEX r0, TC0 with EXP_TEX on a biased unit -----
+     * The _bx2 fetch: the lanes the unit's biased remap names come back as
+     * x*2-1. The helper must survive glslang/spirv-cross intact. */
+    {
+        u8 fp[16];
+        u8 expand[16] = {0};
+        expand[0] = 0x7;
+        rsx_test_fp_instr(fp, RSX_TEST_FP_OPC(RSX_TEST_FP_OP_TEX) | RSX_TEST_FP_MASK_XYZW |
+                              RSX_TEST_FP_INSRC_TC0 | RSX_TEST_FP_TEXU(0) | (1u << 21) | RSX_TEST_FP_END,
+                              RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("expand TEX FP", rsx_fp_decompile_buffered_shadow_color_expand_ex(fp, sizeof fp, 0x40u, 0,
+                        NULL, NULL, expand, g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("expand TEX FP HLSL", g_hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        if (translate("expand TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("expand TEX FP MSL", g_msl, "* 2.0");
+    }
+
     /* ---- fragment program writing TWO colour targets ---------------------
      * MOV r0, COL0 ; MOV r2, COL0.zyxw (END). With 32-bit exports r0 is
      * target A and r2 is target B, so the decompiler returns a struct of two

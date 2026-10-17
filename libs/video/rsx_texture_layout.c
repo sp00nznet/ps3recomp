@@ -355,3 +355,30 @@ u8 rsx_texture_gamma_mask(u32 format, u32 control1, u32 filter, u32 address)
     }
     return gamma;
 }
+
+u8 rsx_texture_expand_mask(u32 format, u32 control1, u32 filter, u32 address)
+{
+    /* RPCS3 rsx::get_format_features, RSX_FORMAT_FEATURE_BIASED_NORMALIZATION:
+     * the 8-bit colour formats, the depth formats, X16, Y16_X16 and HILO8.
+     * Floats and the 32-bit depth-as-colour reads have nothing to expand. */
+    switch (format & 0x9Fu) {
+    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x8B: case 0x8D: case 0x8E: case 0x8F:
+    case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x98:
+    case 0x97: case 0x9D: case 0x9E: break;
+    default: return 0;
+    }
+    if (!((address >> 12) & 1u)) return 0;          /* UNSIGNED_REMAP_NORMAL */
+    if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;
+    u8 remap[4]; rsx_texture_component_remap(control1, format, remap);
+    static const u8 rgba_lane[4] = {3, 0, 1, 2};
+    u8 mask = 0;
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 source = (control1 >> (2u * i)) & 3u;
+        if (remap[i] < RSX_REMAP_ZERO && !((filter >> (28u + source)) & 1u))
+            mask |= (u8)(1u << rgba_lane[i]);
+    }
+    /* Bit 4: 16-bit channels (X16, Y16_X16) re-centre on 32768/32767. */
+    if (mask && ((format & 0x9Fu) == 0x94u || (format & 0x9Fu) == 0x95u)) mask |= 0x10u;
+    return mask;
+}

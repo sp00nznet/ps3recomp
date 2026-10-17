@@ -690,6 +690,32 @@ static void test_remap_dxt_matches_argb(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(d[i], a[i]);
 }
 
+/* --- _bx2 expansion (SET_TEXTURE_ADDRESS UNSIGNED_REMAP_BIASED, bit 12) --- */
+
+static void test_expand_mask(void)
+{
+    /* Biased unsigned remap on an identity crossbar: every lane. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0u, 0x1000u), 0xF);
+    /* UNSIGNED_REMAP_NORMAL: nothing to expand. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0u, 0u), 0);
+    /* A lane the crossbar forces to ONE (0xA9E4: A's op = 1) is not a
+     * source and stays out. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xA9E4u, 0u, 0x1000u), 0x7);
+    /* A source channel SET_TEXTURE_FILTER flags signed takes the
+     * sign-extension read instead: b signed (bit 31) drops the B lane. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0x80000000u, 0x1000u), 0xB);
+    /* Float formats never expand (DEPTH24_D8 and X16 do, as on RPCS3); a
+     * zero control1 is the identity crossbar. */
+    CHECK_EQ(rsx_texture_expand_mask(0x9Au, 0xAAE4u, 0u, 0x1000u), 0);
+    CHECK_EQ(rsx_texture_expand_mask(0x9Bu, 0xAAE4u, 0u, 0x1000u), 0);
+    CHECK_EQ(rsx_texture_expand_mask(0x90u, 0xAAE4u, 0u, 0x1000u), 0xF);
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0u, 0u, 0x1000u), 0xF);
+    /* 16-bit channels (X16, Y16_X16) carry bit 4; DEPTH24_D8 above did not. */
+    CHECK_EQ(rsx_texture_expand_mask(0x94u, 0xAAE4u, 0u, 0x1000u) & 0x10u, 0x10u);
+    CHECK_EQ(rsx_texture_expand_mask(0x95u, 0xAAE4u, 0u, 0x1000u) & 0x10u, 0x10u);
+    CHECK_EQ(rsx_texture_expand_mask(0x94u, 0xAAE4u, 0u, 0u), 0);
+}
+
 static void test_remap_rejects_null(void)
 {
     rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, NULL);   /* must not crash */
@@ -723,6 +749,7 @@ int main(void)
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
     test_remap_dxt_matches_argb();
+    test_expand_mask();
     test_remap_rejects_null();
 
     if (g_fail) { printf("\nRSX texture layout: %d FAILED\n", g_fail); return 1; }

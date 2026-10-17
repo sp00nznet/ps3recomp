@@ -542,13 +542,77 @@ static void fp_gamma_helper(Out* out)
         "                  (mask & 8u) ? decoded.a : v.a);\n}\n");
 }
 
+/* Texture sign expansion: units a TEX/TXP/TXB/TXL fetches from whose
+ * expand mask is set. The same walk as the gamma one. */
+u32 rsx_fp_texture_expand_units(const u8* ucode, u32 max_bytes,
+                                 const u8 expand_masks[16])
+{
+    if (!ucode || !expand_masks) return 0;
+    u32 units = 0;
+    for (u32 off = 0; off + 16 <= max_bytes;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const u32 op = (w0 >> 24) & 63u, unit = (w0 >> FP_TEX_UNIT_SHIFT) & 15u;
+        if (!(w2 & FP_BRANCH) && expand_masks[unit] &&
+            (op == OP_TEX || op == OP_TXP || op == OP_TXB || op == OP_TXL))
+            units |= 1u << unit;
+        off += 16;
+        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) off += 16;
+        if (w0 & FP_END) return units;
+    }
+    return 0;
+}
+
+/* Units a TEX/TXP/TXB/TXL reads with EXP_TEX (OPDEST bit 21, _bx2). */
+u32 rsx_fp_texture_bx2_units(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0;
+    u32 units = 0;
+    for (u32 off = 0; off + 16 <= max_bytes;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const u32 op = (w0 >> 24) & 63u, unit = (w0 >> FP_TEX_UNIT_SHIFT) & 15u;
+        if (!(w2 & FP_BRANCH) && (w0 & (1u << 21)) &&
+            (op == OP_TEX || op == OP_TXP || op == OP_TXB || op == OP_TXL))
+            units |= 1u << unit;
+        off += 16;
+        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) off += 16;
+        if (w0 & FP_END) return units;
+    }
+    return 0;
+}
+
+static void fp_expand_helper(Out* out)
+{
+    out_puts(out,
+        "float4 _rsx_expand_input(float4 v, uint mask, bool bx2) {\n"
+        "    float4 e = bx2 ? v * 2.0 - 1.0\n"
+        "             : (mask & 16u) ? (floor(v * 65535.0 + 0.5) - 32768.0) / 32767.0\n"
+        "                            : (floor(v * 255.0 + 0.5) - 128.0) / 127.0;\n"
+        "    return float4((mask & 1u) ? e.r : v.r,\n"
+        "                  (mask & 2u) ? e.g : v.g,\n"
+        "                  (mask & 4u) ? e.b : v.b,\n"
+        "                  (mask & 8u) ? e.a : v.a);\n}\n");
+}
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     int buffered, const rsx_fp_shadow_desc* shadow, const u8 gamma_masks[16],
+    const u8* expand_masks,
     char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
     const u32 gamma_units = rsx_fp_texture_gamma_units(ucode, max_bytes, gamma_masks);
+    const u32 expand_units = rsx_fp_texture_expand_units(ucode, max_bytes, expand_masks);
+    /* _bx2 (EXP_TEX) fetches expand whatever unit they read: the modifier is
+     * the instruction's, not the texture's. inFAMOUS 2 stores tangent-space
+     * normal maps and its occlusion-cone LUTs unsigned and reads them with
+     * TEX_bx2; about a quarter of its fragment programs do. */
+    const u32 bx2_units = rsx_fp_texture_bx2_units(ucode, max_bytes);
 
     const u32 sampled_units = rsx_fp_texture_units(ucode, max_bytes);
     if (shadow) for (u32 u = 0; u < 16; u++)
@@ -927,6 +991,32 @@ static int rsx_fp_decompile_internal(
                                         sample, gamma_masks[tex_unit] & 15u);
             if (length < 0 || (size_t)length >= sizeof rhs) return -1;
         }
+        /* Texture sign expansion (RPCS3 _process_texel). A unit whose
+         * SET_TEXTURE_ADDRESS asks for UNSIGNED_REMAP_BIASED returns every
+         * fetch re-centred on the lanes the mask names, (round(x*255)-128)/127
+         * (16-bit channels: /32767), after gamma and not on gamma lanes. A
+         * fetch carrying EXP_TEX (OPDEST bit 21, the _bx2 modifier) returns
+         * x*2-1 on every lane, whatever the unit says, and bypasses gamma.
+         * A comparison fetch has nothing to expand. */
+        if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
+            !(shadow && shadow[tex_unit].enabled) &&
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            const int bx2 = (w0 & (1u << 21)) != 0;
+            u32 mask = bx2 ? 15u : (expand_masks[tex_unit] & 0x1Fu);
+            if (!bx2 && gamma_masks) mask &= ~(gamma_masks[tex_unit] & 15u);
+            if (mask & 15u) {
+                char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
+                const int length = snprintf(rhs, sizeof rhs, "_rsx_expand_input(%s, %uu, %s)",
+                                            sample, mask, bx2 ? "true" : "false");
+                if (length < 0 || (size_t)length >= sizeof rhs) return -1;
+            }
+        } else if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
+                   (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            static u32 reported;
+            if (reported++ < 32)
+                fprintf(stderr, "[RSX fp] sign-expand fetch opcode %u unsupported on unit %u (read unexpanded)\n",
+                        opcode, tex_unit);
+        }
 
         int has_dest = !(w0 & FP_OUT_NONE);
         if (handled && (has_dest || set_cond)) {
@@ -1124,6 +1214,7 @@ static int rsx_fp_decompile_internal(
         if ((sampled_units & (1u << u)) && shadow[u].enabled)
             fp_shadow_helper(&p, u, tex_cube_mask, &shadow[u]);
     if (gamma_units) fp_gamma_helper(&p);
+    if (expand_units || bx2_units) fp_expand_helper(&p);
     /* NV40 pack/unpack. A packed word travels on in a float's bits, so the
      * packs bitcast and the unpacks bitcast back; the sRGB forms follow
      * RPCS3's _builtin_pkg/_builtin_upg (linear_to_srgb, srgb_to_linear).
@@ -1169,7 +1260,7 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, NULL, NULL, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, NULL, NULL, NULL, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -1177,7 +1268,7 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, NULL, NULL, out, out_size,
+        ucode, max_bytes, ctrl, tex_cube_mask, 1, NULL, NULL, NULL, out, out_size,
         out_constant_count);
 }
 
@@ -1187,7 +1278,7 @@ int rsx_fp_decompile_buffered_shadow_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
-        1, shadow, NULL, out, out_size, out_constant_count);
+        1, shadow, NULL, NULL, out, out_size, out_constant_count);
 }
 
 int rsx_fp_decompile_buffered_shadow_color_ex(
@@ -1196,7 +1287,17 @@ int rsx_fp_decompile_buffered_shadow_color_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
-        1, shadow, gamma_masks, out, out_size, out_constant_count);
+        1, shadow, gamma_masks, NULL, out, out_size, out_constant_count);
+}
+
+int rsx_fp_decompile_buffered_shadow_color_expand_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
+    const u8 expand_masks[16],
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        1, shadow, gamma_masks, expand_masks, out, out_size, out_constant_count);
 }
 
 static float fp_half_to_float(u16 h)
@@ -1587,5 +1688,5 @@ int rsx_fp_decompile_buffered_color_ex(
     const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
-        1, NULL, gamma_masks, out, out_size, out_constant_count);
+        1, NULL, gamma_masks, NULL, out, out_size, out_constant_count);
 }
