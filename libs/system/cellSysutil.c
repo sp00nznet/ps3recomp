@@ -11,6 +11,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <sys/stat.h>   /* mkdir -- preparing the /dev_hdd1 cache directory */
+#ifdef _WIN32
+#  include <direct.h>
+#  ifndef mkdir
+#    define mkdir(p, m) _mkdir(p)
+#  endif
+#endif
 
 /* Guest-memory stores — out-params from the recompiled title are guest VM
  * addresses, not host pointers. */
@@ -418,6 +426,24 @@ s32 cellSysCacheMount(char* param)
     memcpy(vm_base + ea + 0x20, s_cache_path, n);
     vm_base[ea + 0x20 + n] = '\0';
     s_cache_mounted = 1;
+
+    /* The guest path above is only half the mount: /dev_hdd1 must also exist as
+     * a WRITABLE host directory, or a title's first cache open fails against the
+     * read-only disc root and it never creates its media threads. Create the
+     * cache directory under the same host root ppu_fs.cpp maps /dev_hdd1 to
+     * (PS3_HDD1_ROOT); without that root /dev_hdd1 is not remapped, so there is
+     * nothing to prepare. */
+    { const char* root = getenv("PS3_HDD1_ROOT");
+      if (root && *root) {
+          char hpath[512];
+          snprintf(hpath, sizeof hpath, "%s/cache", root);
+          mkdir(hpath, 0777);
+          snprintf(hpath, sizeof hpath, "%s/cache/%s", root, cache_id);
+          if (mkdir(hpath, 0777) == 0 || errno == EEXIST)
+              printf("[cellSysutil] SysCacheMount: host cache dir %s ready\n", hpath);
+          else
+              printf("[cellSysutil] SysCacheMount: host cache dir %s NOT created (errno=%d)\n",
+                     hpath, errno); } }
 
     return CELL_OK;   /* CELL_SYSCACHE_RET_OK_CLEARED */
 }

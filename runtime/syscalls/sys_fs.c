@@ -144,6 +144,19 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         }
     }
 
+    /* /dev_hdd1 overlays the CACHE partition, the same way ppu_fs.cpp host_path
+     * maps it: /dev_hdd0/... is the installed-update dir, /dev_hdd1/... the
+     * writable cache. PS3_HDD1_ROOT = host dir that /dev_hdd1 maps into. */
+    {
+        static const char* hdd1_root = NULL; static int hdd1_init = 0;
+        if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
+        if (hdd1_root && *hdd1_root && strncmp(ps3_path, "/dev_hdd1/", 10) == 0) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd1_root, ps3_path + 10);
+            fs_normalize_sep(host_path);
+            return;
+        }
+    }
+
     /* /dev_flash is FIRMWARE, not game data. ppu_fs.cpp serves it from a real
      * dev_flash tree ($PS3_DEV_FLASH); this layer was missing the same branch, so
      * a firmware path opened through the raw syscall resolved to <root>/... and
