@@ -2169,6 +2169,21 @@ static void pd_write_surface(u32 slot, const char* path)
         fprintf(f, "P6\n%u %u\n255\n", s->w, s->h);
         fwrite(rgb, 1, (size_t)s->w * s->h * 3u, f);
         fclose(f);
+        /* RSX_ENGINE_PASS_DUMP_ALPHA=1: an RGBA8 surface's alpha as <path>_a.pgm,
+         * for passes that use it (glow masks, coverage). */
+        static int alpha = -1;
+        if (alpha < 0) alpha = getenv("RSX_ENGINE_PASS_DUMP_ALPHA") ? 1 : 0;
+        char apath[1100];
+        if (alpha && s->fmt == RSX_BE_FMT_R8G8B8A8 &&
+            snprintf(apath, sizeof apath, "%s_a.pgm", path) < (int)sizeof apath) {
+            FILE* a = fopen(apath, "wb");
+            if (a) {
+                for (size_t i = 0; i < (size_t)s->w * s->h; i++) rgb[i] = raw[i * 4u + 3u];
+                fprintf(a, "P5\n%u %u\n255\n", s->w, s->h);
+                fwrite(rgb, 1, (size_t)s->w * s->h, a);
+                fclose(a);
+            }
+        }
     }
     free(raw);
     free(rgb);
