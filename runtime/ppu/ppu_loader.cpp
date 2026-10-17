@@ -3030,6 +3030,7 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" __attribute__((weak)) void ppu_gcm_pump(void);   /* cellGcmSys.c */
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3046,6 +3047,15 @@ extern "C" void lv2_syscall(ppu_context* ctx)
           const char* e = getenv("PPU_GUARD_EA");
           if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
     uint64_t num = ctx->gpr[11];
+    /* Deliver pending GCM vblank/flip/user callbacks at the timer sleeps too,
+     * not only at HLE imports (ppu_hle.cpp): on hardware they fire
+     * asynchronously, and a guest thread that polls with usleep alone would
+     * otherwise never see the handler it is waiting for. inFAMOUS 2 defers its
+     * FIFO put to the flip handler (0x13AC88 stores it at obj+72, 0x13AC34
+     * writes it) and then spins in 0x13ACE8 on the ref register with
+     * sys_timer_usleep only; it used to be rescued by another thread's HLE
+     * call, and hung once that thread had nothing left to poll. */
+    if ((num == 141 || num == 142) && ppu_gcm_pump) ppu_gcm_pump();
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
