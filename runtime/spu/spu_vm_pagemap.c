@@ -39,3 +39,33 @@ void mfc_strict_note_verified_page(unsigned int page)
     __atomic_fetch_or(&g_mfc_strict_verified[(page >> 3) & 8191u], (unsigned char)(1u << (page & 7)), __ATOMIC_RELAXED);
 #endif
 }
+
+/* One implementation of the verified-page test, shared by strict MFC DMA and
+ * the SPURS guest-range validators (cellSpurs.c, spurs_job_snapshot.c).
+ * Returns 1 only when the cache is enabled and every 64 KB page touched by
+ * [ea, ea+size) is proven committed read-write; unproven pages get the full
+ * strict check once and are remembered only if it passes. 0 means "use the
+ * caller's exact uncached check", never "invalid". */
+#include "spu_dma.h"
+int mfc_strict_guest_range_verified(uint32_t ea, uint32_t size)
+{
+    extern uint32_t ppu_vm_size;
+    if (!g_mfc_strict_page_cache || !size || !vm_base) return 0;
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    if ((uint64_t)ea + size > limit) return 0;
+    const uint32_t first = ea >> 16, last = (uint32_t)(((uint64_t)ea + size - 1) >> 16);
+    for (uint32_t page = first; page <= last; page++) {
+        if ((g_mfc_strict_verified[page >> 3] >> (page & 7)) & 1u) continue;
+        const uint64_t start = (uint64_t)page << 16;
+        if (start + 0x10000u > limit ||
+            !mfc_strict_span((uintptr_t)vm_base + (uintptr_t)start, 0x10000u, 1)) return 0;
+        mfc_strict_note_verified_page(page);
+    }
+    return 1;
+}
+
+/* Exported fault-reporting copy (the same one strict DMA uses). */
+int mfc_strict_host_copy(void* local, uintptr_t remote, uint32_t size, int writing)
+{
+    return mfc_strict_copy(local, remote, size, writing);
+}

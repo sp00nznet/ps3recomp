@@ -476,11 +476,16 @@ static int spurs_inst_exists(u32 ea)
 {spurs_inst_lock();int found=spurs_inst_find_locked(ea)!=NULL;spurs_inst_unlock();return found;}
 static u32 spurs_inst_nspus(u32 ea)
 {spurs_inst_lock();struct SpursInst*si=spurs_inst_find_locked(ea);u32 n=si?si->nspus:0;spurs_inst_unlock();return n;}
+/* runtime/spu/spu_vm_pagemap.c: 1 only for host-guaranteed verified RW pages. */
+int mfc_strict_guest_range_verified(uint32_t ea, uint32_t size);
 static int spurs_guest_span(u64 ea,u32 size,int writing)
 {
     if(!size||ea>UINT32_MAX||size>0x100000000ull-ea)return 0;
     uintptr_t first,last;
     if(!ps3_guest_byte_address(ea,&first)||!ps3_guest_byte_address(ea+size-1,&last))return 0;
+    /* A verified page is committed read-write, which satisfies either mode;
+     * otherwise keep the exact per-4K-page permission walk. */
+    if(mfc_strict_guest_range_verified((uint32_t)ea,size))return 1;
     for(uintptr_t p=first;;){
         if(!ps3_guest_byte_permission(p,writing))return 0;
         uintptr_t step=4096u-(p&4095u);

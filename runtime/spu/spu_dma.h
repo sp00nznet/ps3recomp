@@ -236,24 +236,13 @@ extern volatile int g_mfc_strict_page_cache;
 extern volatile unsigned char g_mfc_strict_verified[65536 / 8];
 void mfc_strict_enable_verified_page_cache(void);
 void mfc_strict_note_verified_page(unsigned int page);
+int mfc_strict_guest_range_verified(uint32_t ea, uint32_t size);
+int mfc_strict_host_copy(void* local, uintptr_t remote, uint32_t size, int writing);
 
 static inline int mfc_strict_guest_span(uint32_t ea, uint32_t size, int writing)
 {
-    extern uint32_t ppu_vm_size;
-    const uintptr_t base = (uintptr_t)vm_base;
-    if (!g_mfc_strict_page_cache || !size) return mfc_strict_span(base + ea, size, writing);
-    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
-    const uint32_t first = ea >> 16, last = (uint32_t)(((uint64_t)ea + size - 1) >> 16);
-    for (uint32_t page = first; page <= last; page++) {
-        if ((g_mfc_strict_verified[page >> 3] >> (page & 7)) & 1u) continue;
-        const uint64_t start = (uint64_t)page << 16;
-        if (start + 0x10000u <= limit && mfc_strict_span(base + (uintptr_t)start, 0x10000u, 1)) {
-            mfc_strict_note_verified_page(page);
-            continue;
-        }
-        return mfc_strict_span(base + ea, size, writing);
-    }
-    return 1;
+    if (mfc_strict_guest_range_verified(ea, size)) return 1;
+    return mfc_strict_span((uintptr_t)vm_base + ea, size, writing);
 }
 
 /* The local side of a transfer. An SPU's own embedded store (ls_store) lives
@@ -274,10 +263,37 @@ static inline int mfc_strict_local_span(spu_context* spu, uintptr_t local, uint3
     return mfc_strict_span(local, size, writing);
 }
 
+#ifdef _WIN32
+/* kernelbase's Read/WriteProcessMemory query the target region before every
+ * copy (and WriteProcessMemory may lift a read-only protection to write it);
+ * in Folklore gameplay those queries alone were ~22% of process CPU. The
+ * native calls they wrap are the same fault-reporting copy without the query,
+ * and a write never changes protection, so a read-only page simply fails. */
+typedef LONG (NTAPI *mfc_nt_copy_fn)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+static inline mfc_nt_copy_fn mfc_nt_copy(int writing)
+{
+    static mfc_nt_copy_fn volatile s_fn[2];
+    static volatile LONG s_ready[2];
+    if (!s_ready[writing]) {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        s_fn[writing] = ntdll ? (mfc_nt_copy_fn)(void (*)(void))GetProcAddress(ntdll,
+            writing ? "NtWriteVirtualMemory" : "NtReadVirtualMemory") : NULL;
+        s_ready[writing] = 1;
+    }
+    return s_fn[writing];
+}
+#endif
+
 static inline int mfc_strict_copy(void* local, uintptr_t remote, uint32_t size, int writing)
 {
 #ifdef _WIN32
     SIZE_T copied = 0;
+    mfc_nt_copy_fn native = mfc_nt_copy(writing);
+    if (native) {
+        /* NtRead: (process, source, buffer); NtWrite: (process, target, buffer). */
+        LONG status = native(GetCurrentProcess(), (PVOID)remote, local, size, &copied);
+        return status >= 0 && copied == size;
+    }
     int okay = writing ? WriteProcessMemory(GetCurrentProcess(), (void*)remote, local, size, &copied)
                        : ReadProcessMemory(GetCurrentProcess(), (void*)remote, local, size, &copied);
     return okay && copied == size;

@@ -20,6 +20,10 @@
 #endif
 #endif
 
+int mfc_strict_guest_range_verified(uint32_t ea, uint32_t size); /* spu_vm_pagemap.c */
+int mfc_strict_host_copy(void* local, uintptr_t remote, uint32_t size, int writing);
+extern uint8_t* vm_base;
+
 static int checked_read(const void* base, uint64_t limit, uint64_t ea,
                         uint32_t length, void* destination)
 {
@@ -30,6 +34,10 @@ static int checked_read(const void* base, uint64_t limit, uint64_t ea,
     address += (uintptr_t)ea;
     if (length > UINTPTR_MAX - address) return 0;
     uintptr_t current = address, end = address + length;
+    /* Guest pages proven committed read-write under the host's guarantee
+     * skip the region walk; the copy below still reports any fault. */
+    if (base == (const void*)vm_base && mfc_strict_guest_range_verified((uint32_t)ea, length))
+        return mfc_strict_host_copy(destination, address, length, 0);
 #ifdef _WIN32
     while (current < end) {
         MEMORY_BASIC_INFORMATION mbi;
