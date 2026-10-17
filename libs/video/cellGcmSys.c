@@ -14,6 +14,7 @@
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+#include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 
@@ -910,6 +911,25 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
                                 x1 - x0, y1 - y0);
 }
 
+/* A guest-memory row copy with the same reservation bookkeeping a coherent
+ * PPU store does (ppu_loader.cpp VM_WRITE_COH), once per row instead of per
+ * pixel: an SPU holding a reservation on a 128-byte line the row overwrites
+ * loses it and gets its lost-reservation event. The two byte swaps a
+ * vm_read32/vm_write32 pair does cancel, so the bytes move verbatim. */
+static void gcm_row_copy(u32 d, u32 s, u32 n)
+{
+    extern u8* vm_base;
+    const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
+    int reserved = 0;
+    for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
+    if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
+    spu_lockline_lock();
+    memmove(vm_base + d, vm_base + s, n);
+    for (u32 a = l0; a <= l1; a += 128)
+        if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
+    spu_lockline_unlock();
+}
+
 static void nv3089_blit(void)
 {
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
@@ -1055,6 +1075,33 @@ static void nv3089_blit(void)
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
     if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
+    /* NV3089_ROWCOPY (default 1): an unscaled blit copies a row at a time.
+     * The per-pixel loop pays a vm_read32 and a vm_write32 per pixel -- the
+     * bounds and null-store checks, the store hooks, a reservation lookup and
+     * two byte swaps that cancel -- and a title that copies 1280x720 surfaces
+     * to main memory every frame (inFAMOUS 2 does, for its SPU lighting)
+     * spent a quarter of the FIFO thread there. NV3089_ROWCOPY=0 keeps the
+     * per-pixel copy, which is what the PPU store watches see. */
+    static int rowcopy = -1;
+    if (rowcopy < 0) { const char* e = getenv("NV3089_ROWCOPY"); rowcopy = e ? atoi(e) : 1; }
+    if (rowcopy && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
+        /* the integer source start the per-pixel loop derives for x = y = 0 */
+        const u32 sx0 = (u32)(((u64)u0 << 8) >> 20), sy0 = (u32)(((u64)v0 << 8) >> 20);
+        u32 xa = 0, xb = out_w;                       /* destination x range inside the clip */
+        if (out_x < cx0) xa = cx0 - out_x;
+        if ((u64)out_x + xb > cx1) xb = cx1 > out_x ? cx1 - out_x : 0;
+        if (xa < xb) {
+            const u32 n = (xb - xa) * bpp;
+            for (u32 y = 0; y < out_h; y++) {
+                const u32 dy = out_y + y;
+                if (dy < cy0 || dy >= cy1) continue;
+                const u64 sa = (u64)src + (u64)(sy0 + y) * in_pitch + (u64)(sx0 + xa) * bpp;
+                const u64 da = (u64)dst + (u64)dy * dst_pitch + (u64)(out_x + xa) * bpp;
+                if (sa + n > 0x100000000ull || da + n > 0x100000000ull) continue;
+                gcm_row_copy((u32)da, (u32)sa, n);
+            }
+        }
+    } else
     for (u32 y = 0; y < out_h; y++) {
         u32 dy = out_y + y;
         if (dy < cy0 || dy >= cy1) continue;
