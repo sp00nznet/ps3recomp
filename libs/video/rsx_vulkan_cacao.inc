@@ -105,7 +105,7 @@ static void vk_cacao_layout(VkImage image,VkImageLayout from,VkImageLayout to)
  * The engine must have qualified the matching depth projection beforehand. */
 static u32 vk_eng_cacao_world(void* user,u32 color,u32 depth,u32 logical_w,u32 logical_h,
     const float projection[16],u32 remap,u32 rsx_format,float radius,float strength)
-{
+{ vk_flush_pending(0);
     (void)user;
     if(s_cacao.failed)return 0;
     if(!projection || !logical_w || !logical_h || !isfinite(radius) || radius<=0 ||
