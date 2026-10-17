@@ -884,6 +884,10 @@ static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
     return off;
 }
 
+/* IMAGE_IN_POINT is 12.4 fixed point per axis; DS_DX / DT_DY step the source in 20 fractional bits (1.0 = 0x100000).
+ * The origin in the steps' scale is therefore origin << 16: an origin of one texel (0x10) is 0x100000. */
+static inline u64 nv3089_origin(u32 p) { return (u64)p << 16; }
+
 /* The draw engine renders on the host GPU, so the scene a title copies out
  * with NV3089 is not in guest memory, and what it copies in never reaches the
  * engine's surfaces. Around the guest-memory copy below: write the source
@@ -893,9 +897,9 @@ static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
 {
     if (!rsx_draw_engine_enabled() || !out_w || !out_h) return;
     const u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 */
-    const u32 sx0 = u0 >> 4, sy0 = v0 >> 4;
-    const u32 sx1 = (u32)((((u64)u0 << 8) + (u64)(out_w - 1) * s_nv3089.ds_dx) >> 20);
-    const u32 sy1 = (u32)((((u64)v0 << 8) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
+    const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
+    const u32 sx1 = (u32)((nv3089_origin(u0) + (u64)(out_w - 1) * s_nv3089.ds_dx) >> 20);
+    const u32 sy1 = (u32)((nv3089_origin(v0) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
     if (sx1 < sx0 || sy1 < sy0) return;
     const u32 loc = (s_nv3089.src_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
     rsx_draw_engine_guest_read(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
@@ -992,10 +996,10 @@ static void nv3089_blit(void)
           const u8* sbase = vm_base + src2;
           u8* dbase = vm_base + dst2;
           for (u32 y = 0; y < out_h; y++) {
-              u64 sv = ((u64)v0b << 8) + (u64)y * s_nv3089.dt_dy;
+              u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
               const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
               for (u32 x = 0; x < out_w; x++) {
-                  u64 su = ((u64)u0b << 8) + (u64)x * s_nv3089.ds_dx;
+                  u64 su = nv3089_origin(u0b) + (u64)x * s_nv3089.ds_dx;
                   memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
                          srow + (u32)(su >> 20) * 4, 4);
               }
@@ -1058,12 +1062,12 @@ static void nv3089_blit(void)
     for (u32 y = 0; y < out_h; y++) {
         u32 dy = out_y + y;
         if (dy < cy0 || dy >= cy1) continue;
-        u64 sv = ((u64)v0 << 8) + (u64)y * s_nv3089.dt_dy;         /* 20.12 */
+        u64 sv = nv3089_origin(v0) + (u64)y * s_nv3089.dt_dy;
         u32 sy = (u32)(sv >> 20);
         for (u32 x = 0; x < out_w; x++) {
             u32 dx = out_x + x;
             if (dx < cx0 || dx >= cx1) continue;
-            u64 su = ((u64)u0 << 8) + (u64)x * s_nv3089.ds_dx;
+            u64 su = nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx;
             u32 sx = (u32)(su >> 20);
             u32 s = src + sy * in_pitch + sx * bpp;
             u32 d = dst + dy * dst_pitch + dx * bpp;
