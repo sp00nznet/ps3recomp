@@ -1287,6 +1287,7 @@ static const char* const kEngFixedVS =
 "    float4 fog:FOG;\n"
 "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
 "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+"    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
 "};\n"
 "cbuffer VPConst : register(b0) {\n"
 "    float4 vp_c[512];\n"
@@ -1304,6 +1305,7 @@ static const char* const kEngFixedVS =
 "    Out.col0 = input.a3; Out.col1 = float4(0,0,0,1); Out.fog = (float4)0;\n"
 "    Out.t0 = input.a8; Out.t1 = (float4)0; Out.t2 = (float4)0; Out.t3 = (float4)0;\n"
 "    Out.t4 = (float4)0; Out.t5 = (float4)0; Out.t6 = (float4)0; Out.t7 = (float4)0;\n"
+"    Out.t8 = (float4)0; Out.t9 = (float4)0;\n"
 "    return Out;\n"
 "}\n";
 

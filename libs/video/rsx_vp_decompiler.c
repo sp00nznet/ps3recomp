@@ -590,6 +590,7 @@ static int rsx_vp_decompile_impl(
         "    float4 fog:FOG;\n"
         "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
         "};\n"
         /* b0: 512 vec4 transform constants + the RSX viewport transform,
          * pre-mapped by the harness to D3D clip space:
@@ -655,7 +656,9 @@ static int rsx_vp_decompile_impl(
     if (has_flow) emit(&o, "    }\n");
 
     /* Output register map (see header comment): o0 = HPOS through the RSX
-     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7. */
+     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7,
+     * o15 = TEX8, o6 = TEX9 (RPCS3's reg_table: TEX9 shares the point-size
+     * register). */
     emit(&o,
         "    VSOutput Out;\n"
         "    float4 _p = o[0];\n"
@@ -663,6 +666,7 @@ static int rsx_vp_decompile_impl(
         "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
         "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"
+        "    Out.t8=o[15]; Out.t9=o[6];\n"
         "    return Out;\n"
         "}\n");
 

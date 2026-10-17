@@ -220,6 +220,49 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- fragment program: MOV r0, FACING ---------------------------------
+     * Input 0xE is the face flag, +1 front / -1 back. Two-sided materials
+     * multiply the normal by it; it used to read as zero. */
+    {
+        u8 fp[16];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC(0xE) | RSX_TEST_FP_END,
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("FACING FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("FACING FP HLSL", g_hlsl, "bool _rsx_front : SV_IsFrontFace;");
+        check("FACING FP HLSL", g_hlsl, "input._rsx_front ? float4(1,1,1,1) : float4(-1,-1,-1,-1)");
+        if (translate("FACING FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("FACING FP MSL", g_msl, "[[front_facing]]");
+    }
+
+    /* ---- fragment program: MOV r0, TC8 / TC9 ------------------------------
+     * They follow TEXCOORD7 (locn10), and the VP writes them from o15 / o6. */
+    for (u32 n = 8; n <= 9; n++) {
+        u8 fp[16];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC(0xC + (n - 8)) | RSX_TEST_FP_END,
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("TC8/9 FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("TC8/9 FP HLSL", g_hlsl, n == 8 ? "(input.tc8).xyzw" : "(input.tc9).xyzw");
+        check("TC8/9 FP HLSL", g_hlsl, "float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;");
+        if (translate("TC8/9 FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("TC8/9 FP MSL", g_msl, n == 8 ? "[[user(locn11)]]" : "[[user(locn12)]]");
+    }
+    {
+        u8 vp[16];
+        rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 15, 1);   /* MOV o15, v0, END */
+        rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl);
+        check("TC8 VP HLSL", g_hlsl, "Out.t8=o[15]; Out.t9=o[6];");
+        if (translate("TC8 VP", RSX_SHADER_STAGE_VERTEX) == 0)
+            check("TC8 VP MSL", g_msl, "[[user(locn11)]]");
+    }
+
     /* ---- fragment program: TEX r0, TC0 (unit 0) --------------------------- */
     {
         u8 fp[16];
