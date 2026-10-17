@@ -690,6 +690,22 @@ static void test_remap_dxt_matches_argb(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(d[i], a[i]);
 }
 
+/* Y16_X16: 0xE4 presents R-G-R-G (RGBA = X,Y,X,Y); with CONTROL1's high word
+ * (the remap override) set, R-R-R-G (X,X,X,Y). 0x4E swaps the pair
+ * (RPCS3 fragment_texture::decoded_remap). */
+static void test_remap_y16x16_lanes(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAE4u, 0x95u, m);
+    CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 1); CHECK_EQ(m[B_], 0); CHECK_EQ(m[A_], 1);
+    rsx_texture_component_remap(0x0001AAE4u, 0x95u, m);
+    CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0); CHECK_EQ(m[A_], 1);
+    rsx_texture_component_remap(0xAA4Eu, 0x95u, m);
+    CHECK_EQ(m[R_], 1); CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 1); CHECK_EQ(m[A_], 0);
+    rsx_texture_component_remap(0x0001AA4Eu, 0x95u, m);
+    CHECK_EQ(m[R_], 1); CHECK_EQ(m[G_], 1); CHECK_EQ(m[B_], 1); CHECK_EQ(m[A_], 0);
+}
+
 static void test_remap_rejects_null(void)
 {
     rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, NULL);   /* must not crash */
@@ -719,6 +735,7 @@ int main(void)
     test_remap_identity();
     test_remap_identity_packs_to_d3d_default();
     test_remap_b8_lanes();
+    test_remap_y16x16_lanes();
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();

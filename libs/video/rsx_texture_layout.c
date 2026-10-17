@@ -323,6 +323,26 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
 
+    /* Y16_X16 (and HILO8): two 16-bit channels whose crossbar is encoded in
+     * 16-bit blocks -- 0xE4 or 0x4E only -- and presented interleaved
+     * R-G-R-G, or R-R-R-G when CONTROL1's high word (the remap override,
+     * bit 16) is set (RPCS3 fragment_texture::decoded_remap, verified on
+     * hardware with Virtua Fighter 5 / Mass Effect 3). Through the plain
+     * ARGB table a .w read got the resource's empty alpha, 1.0, instead of
+     * Y: inFAMOUS 2's water reads its 64x64 wave map through .yw that way. */
+    if (base == 0x95u || base == 0x98u || base == 0x99u) {
+        const int ovr = (control1 >> 16) & 0xFFFFu;
+        u32 lo = control1 & 0xFFu;
+        switch (lo) {
+        case 0xE4: lo = ovr ? 0x56u : 0x66u; break;
+        case 0x4E: lo = ovr ? 0xA9u : 0x99u; break;
+        case 0xEE: lo = 0xAAu; break;
+        case 0x44: lo = 0x55u; break;
+        default: break;
+        }
+        control1 = (control1 & ~0xFFu) | lo;
+    }
+
     /* i runs A, R, G, B -- the crossbar's field order, LSB first. */
     for (int i = 0; i < 4; i++) {
         u32 s  = (control1 >> (i * 2)) & 3u;
