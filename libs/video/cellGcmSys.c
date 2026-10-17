@@ -1543,6 +1543,14 @@ void cellGcm_rsx_process_fifo(void)
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
+/* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
+static int gcm_get_eq_put(void)
+{
+    static int eq = -1;
+    if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+    return eq;
+}
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -1783,7 +1791,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   why = "parked";
                   break;
               }
-              s_fifo_getoff = tgt; }
+              s_fifo_getoff = tgt;
+              /* get is the RSX's fetch pointer: a title polling it sees the
+               * GPU leave a segment as soon as the JUMP out of it is taken.
+               * The end of the pass, where get is otherwise published, can
+               * come tens of milliseconds later. GCM_GET_EQ_PUT keeps its
+               * own value. */
+              if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); }
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
@@ -2175,9 +2189,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * to answer one question for a title that reports its ring full while the
      * walker says it is drained: is the title reading `get`, or something else?
      * If the overflow survives this, `get` is not what it consults. */
-    { static int eq = -1;
-      if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
-      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
