@@ -231,6 +231,15 @@ typedef struct rsx_draw_backend {
      * engine owns the returned handle and releases it with texture_release.
      * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
     u32 (*color_snapshot)(void* user, u32 surface);
+
+    /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
+     * a volume of `depth` slices per level, each slice one upload of decoded
+     * rows. A backend that leaves these NULL gets the first slice as a 2D
+     * texture through texture_create/texture_upload, as before. */
+    u32  (*texture_create_3d)(void* user, rsx_be_format fmt, u32 w, u32 h,
+                              u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
+    void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
+                              u32 w, u32 h, const void* src, u32 row_bytes);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

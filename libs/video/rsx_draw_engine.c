@@ -121,6 +121,7 @@ typedef struct {
     u64 content_hash;
     u32 last_hash_frame;
     u64 last_use_serial;
+    u32 depth;                  /* slices of a 3D texture, else 1 */
 } eng_texture;
 
 typedef struct {
@@ -868,6 +869,33 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
     return lv[n - 1].offset + lv[n - 1].tl.face_bytes;
 }
 
+/* A 3D texture: each level is `depth` slices (halving with the level), one
+ * face_bytes each -- consecutive for a linear image, one Morton block for a
+ * swizzled one. */
+static u32 eng_texture_span_3d(u32 fmt, u32 w, u32 h, u32 depth, u32 levels, u32 pitch)
+{
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
+    if (!n) return 0;
+    u32 total = 0, d = depth ? depth : 1u;
+    for (u32 m = 0; m < n; m++) { total += lv[m].tl.face_bytes * d; if (d > 1) d >>= 1; }
+    return total;
+}
+
+/* Slice z of a swizzled 3D level, de-interleaved into row-major rows of
+ * w * bpp bytes, so the 2D decode can convert it as a linear image. */
+static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, u32 z, u32 bpp)
+{
+    u32 lw = 0, lh = 0, ld = 0;
+    while ((1u << lw) < w) lw++;
+    while ((1u << lh) < h) lh++;
+    while ((1u << ld) < d) ld++;
+    for (u32 y = 0; y < h; y++)
+        for (u32 x = 0; x < w; x++)
+            memcpy(dst + ((size_t)y * w + x) * bpp,
+                   src + (size_t)rsx_swizzle_offset_3d(x, y, z, lw, lh, ld) * bpp, bpp);
+}
+
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
@@ -902,11 +930,51 @@ static int eng_staging_reserve(u32 bytes)
 /* Decode a guest texture out of guest memory and hand every face and level to
  * the backend. Returns the backend handle, or 0. */
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                              u32 levels, u32 pitch, int cube, u32 remap)
+                              u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!nlv || !lv[0].tl.face_bytes) return 0;
+    /* A volume: every slice of every level decoded and uploaded on its own.
+     * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
+     * first slice and sampled in 2D it darkened whole boxes round every prop. */
+    if (depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
+        !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
+        const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
+        const u8* src = eng_guest_ptr(NULL, location, offset, span);
+        if (!src) return 0;
+        const u32 handle = g.be->texture_create_3d(g.be->user, eng_texfmt(lv[0].tl.fmt),
+                                                   w, h, depth, nlv, remap, fmt);
+        if (!handle) return 0;
+        const u8* level_src = src;
+        u32 d = depth;
+        for (u32 m = 0; m < nlv; m++) {
+            const rsx_tex_layout* tl = &lv[m].tl;
+            const u32 lin_bytes = tl->swizzled ? tl->row_bytes * tl->rows : 0u;
+            if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows + lin_bytes)) {
+                g.be->texture_release(g.be->user, handle);
+                return 0;
+            }
+            for (u32 z = 0; z < d; z++) {
+                if (tl->swizzled) {
+                    u8* lin = g.tex_staging + tl->dst_row_bytes * tl->rows;
+                    eng_deswizzle_3d_slice(lin, level_src, lv[m].w, lv[m].h, d, z, tl->bytes_per_texel);
+                    rsx_tex_layout ltl = *tl; ltl.swizzled = 0;
+                    rsx_texture_decode(g.tex_staging, tl->dst_row_bytes, lin, lv[m].w, lv[m].h,
+                                       &ltl, rsx_texture_argb_is_rgba());
+                } else {
+                    rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
+                                       level_src + (size_t)z * tl->face_bytes, lv[m].w, lv[m].h,
+                                       tl, rsx_texture_argb_is_rgba());
+                }
+                g.be->texture_upload_3d(g.be->user, handle, z, m, lv[m].w, lv[m].h,
+                                        g.tex_staging, tl->dst_row_bytes);
+            }
+            level_src += (size_t)tl->face_bytes * d;
+            if (d > 1) d >>= 1;
+        }
+        return handle;
+    }
     const u32 faces = cube ? 6u : 1u;
     const u32 face_stride = cube
         ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
@@ -944,10 +1012,12 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * nothing: returning white "made the recovered orphanage render as flat
  * green/black geometry" (rsx_live_draw.c:2326-2334). */
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                            u32 levels, u32 pitch, int cube, u32 remap)
+                            u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
-    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+    if (!depth) depth = 1;
+    const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
+                               : eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
     for (u32 i = 0; i < g.n_textures; i++) {
@@ -955,7 +1025,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         if (e->location != location || e->offset != offset ||
             e->format != fmt || e->width != w || e->height != h ||
             e->pitch != pitch || e->remap != remap ||
-            e->cubemap != (u32)(cube != 0))
+            e->cubemap != (u32)(cube != 0) || e->depth != depth)
             continue;
         if (e->handle && e->last_hash_frame != g.frames) {
             int readable = 0;
@@ -964,7 +1034,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->last_hash_frame = g.frames;
             if (readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
-                                                     levels, pitch, cube, remap);
+                                                     levels, pitch, cube, remap, depth);
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
@@ -992,13 +1062,13 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     memset(&e, 0, sizeof(e));
     e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.pitch = pitch;
-    e.remap = remap; e.cubemap = (u32)(cube != 0);
+    e.remap = remap; e.cubemap = (u32)(cube != 0); e.depth = depth;
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
-                                  cube, remap);
+                                  cube, remap, depth);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) g.textures[index] = e;
     return e.handle;
@@ -1191,6 +1261,23 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
     return mask;
 }
 
+/* Units bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3 with a
+ * depth), declared Texture3D and sampled with three coordinates. Only when
+ * the backend can create one: otherwise the first slice stays a 2D texture
+ * and the program samples it in 2D, as before. */
+static u32 eng_volume_mask(void)
+{
+    if (!g.be->texture_create_3d || !g.be->texture_upload_3d) return 0;
+    u32 mask = 0;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (t.enabled && !t.cubemap && t.dimension == 3 && t.depth > 1 && t.width && t.height)
+            mask |= 1u << u;
+    }
+    return mask;
+}
+
 static u32 eng_cube_mask(void)
 {
     u32 mask = 0;
@@ -1353,6 +1440,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
         rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
     const u32 cube_mask = eng_cube_mask();
+    const u32 vol_mask = eng_volume_mask();
     const u32 vtex_mask = eng_vtex_mask();
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
     u32 shadow_mask = 0;
@@ -1373,6 +1461,17 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
+    /* Texture sign expansion: SET_TEXTURE_ADDRESS's UNSIGNED_REMAP_BIASED
+     * asks that every fetch come back re-centred to -1..1. Same rule as
+     * gamma: only units the program samples count. */
+    u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
+        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (t.enabled) expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
+    }
+    const u32 expand_units = fixed ? 0 : rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks);
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
+        if (!(expand_units & (1u << u))) expand_masks[u] = 0;
 
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
     /* Shadow helpers normalize against the bound resource themselves. Only
@@ -1404,7 +1503,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
         if (gamma_units) key = eng_fnv1a(gamma_masks, sizeof gamma_masks, key);
+        if (expand_units) key = eng_fnv1a(expand_masks, sizeof expand_masks, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
+        if (vol_mask) key = eng_fnv1a(&vol_mask, sizeof vol_mask, key);
         if (shadow_mask) {
             key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
             key = eng_fnv1a(shadow, sizeof shadow, key);
@@ -1439,8 +1540,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
-        fi = rsx_fp_decompile_buffered_shadow_color_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
-                shadow_mask ? shadow : NULL, gamma_masks, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask,
+                shadow_mask ? shadow : NULL, gamma_masks, expand_units ? expand_masks : NULL,
+                s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
@@ -1824,7 +1926,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
-                                               (int)t.cubemap, t.remap & 0xFFFFu);
+                                               (int)t.cubemap, t.remap & 0xFFFFu,
+                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
                 continue;
             }
         }
@@ -1860,7 +1963,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             eng_surface_to_guest((u32)sampled)) {
             textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                            t.width, t.height, t.mipmaps, t.pitch,
-                                           (int)t.cubemap, t.remap & 0xFFFFu);
+                                           (int)t.cubemap, t.remap & 0xFFFFu,
+                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
             continue;
         }
         if (sampled >= 0) {
@@ -1883,7 +1987,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         }
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
-                                       (int)t.cubemap, t.remap & 0xFFFFu);
+                                       (int)t.cubemap, t.remap & 0xFFFFu,
+                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
     }
     return mask;
 }
@@ -1901,7 +2006,7 @@ static u32 sink_bind_vertex_textures(
         /* A vertex unit has no crossbar, so its remap is the identity. */
         textures[u] = eng_texture_slot(vt.location, vt.offset, vt.format,
                                        vt.width, vt.height, vt.mipmaps,
-                                       vt.pitch, 0, 0xAAE4u);
+                                       vt.pitch, 0, 0xAAE4u, 1u);
         if (textures[u]) bound |= 1u << u;
     }
     return bound;

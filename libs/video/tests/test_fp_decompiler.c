@@ -300,6 +300,31 @@ int main(void)
         check_absent("lif_handled", hlsl, "unhandled FP opcode");
     }
 
+    /* A unit bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3) is
+     * declared Texture3D and sampled with three coordinates; TXP divides
+     * them by w. inFAMOUS 2's occlusion volumes look up an 8x8x8 cone LUT. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TEX TC0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 1u,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("vol_decl",   hlsl, "Texture3D   rsx_tex0 : register(t0);");
+        check("vol_sample", hlsl, "rsx_tex0.Sample(rsx_samp[0], ((input.tc0).xyzw).xyz)");
+        put_word(prog + 0, OPC(0x18) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TXP TC0 */
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 1u,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("vol_txp", hlsl, "rsx_tex0.Sample(rsx_samp[0], ((input.tc0).xyzw).xyz / ((input.tc0).xyzw).w)");
+        /* No volume units: the array declaration and 2D sample as before. */
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 0,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("vol_none", hlsl, "rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)");
+    }
+
     /* A 4096-byte program fits the D3D12 caller's input bound, but its
      * predicated, CC-writing instructions expand beyond 32 KiB of HLSL.
      * Assemble it here instead of depending on a captured game shader. */
@@ -367,6 +392,76 @@ int main(void)
         rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
         check_absent("no_depth_export_semantic", hlsl, "SV_Depth");
         check("no_depth_export_entry", hlsl, "float4 main(PSInput input) : SV_TARGET {");
+    }
+
+    /* Sign expansion: a TEX on a unit whose SET_TEXTURE_ADDRESS asks for the
+     * biased unsigned remap returns the masked lanes re-centred, and with
+     * EXP_TEX (OPDEST bit 21, the _bx2 modifier) as x*2-1 (RPCS3
+     * _process_texel). inFAMOUS 2's deferred composite reads its normals
+     * G-buffer that way; read unexpanded, normalize() ran on 0..1 encodings
+     * and every normal leaned towards (1,1,1). */
+    {
+        u8 prog[16];
+        u8 expand[16] = {0};
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | (1u << 21) | END); /* TEX TC0, EXP_TEX */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        expand[0] = 0x7;   /* R, G, B lanes signed */
+        check_true("expand_units", rsx_fp_texture_expand_units(prog, sizeof prog, expand) == 1u);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_wrapped", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        check("expand_helper",  hlsl, "float4 _rsx_expand_input(float4 v, uint mask, bool bx2)");
+        check("expand_math",    hlsl, "v * 2.0 - 1.0");
+
+        expand[0] = 0;     /* the unit is not biased: _bx2 still expands every lane */
+        check_true("expand_units_none", rsx_fp_texture_expand_units(prog, sizeof prog, expand) == 0u);
+        check_true("bx2_units", rsx_fp_texture_bx2_units(prog, sizeof prog) == 1u);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_bx2_unbiased", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        /* ...and the older entry point, with no masks, is byte-identical. */
+        char plain[16384];
+        rsx_fp_decompile_buffered_shadow_color_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                  plain, sizeof plain, &nk);
+        check_true("expand_old_entry_identical", strcmp(plain, hlsl) == 0);
+
+        /* Biased but no EXP_TEX bit: the fetch still re-centres (RPCS3 applies
+         * the remap to every read; only the formula and gamma differ). */
+        expand[0] = 0x7;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        check_true("expand_units_nobit", rsx_fp_texture_expand_units(prog, sizeof prog, expand) == 1u);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_nobit_wrapped", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 7u, false)");
+        check("expand_nobit_math",    hlsl, "(floor(v * 255.0 + 0.5) - 128.0) / 127.0");
+
+        /* Gamma lanes are decoded, not re-centred: gamma rgb + biased rgba
+         * leaves the expansion with the alpha lane only, around the gamma. */
+        u8 gamma[16] = {0}; gamma[0] = 0x7; expand[0] = 0xF;
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, gamma,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_after_gamma", hlsl,
+              "_rsx_expand_input(_rsx_gamma_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 7u), 8u, false)");
+        /* Gamma on every biased lane: nothing left to expand. */
+        gamma[0] = 0xF;
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, gamma,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check_absent("expand_all_gamma", hlsl, "_rsx_expand_input(rsx_tex");
+        /* With EXP_TEX, gamma steps aside and every biased lane is x*2-1. */
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | (1u << 21) | END);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, gamma,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_bx2_over_gamma", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        check_absent("expand_bx2_no_gamma", hlsl, "_rsx_gamma_input(");
+        /* Bit 4 (16-bit channels) rides along in the mask argument. */
+        expand[0] = 0x13;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        rsx_fp_decompile_buffered_shadow_color_expand_ex(prog, sizeof prog, CTRL_32BIT, 0, NULL, NULL,
+                                                         expand, hlsl, sizeof hlsl, &nk);
+        check("expand_16bit", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 19u, false)");
     }
 
     printf("\n===========================================\n");

@@ -2504,6 +2504,43 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
        bytesPerImage:0];
 }
 
+/* 3D textures: one MTLTextureType3D of `depth` slices, uploaded a slice at a
+ * time (bytesPerImage spans one slice of decoded rows). */
+static u32 eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                 u32 depth, u32 mips, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    if (!s_dev || !w || !h || !depth) return 0;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    td.textureType      = MTLTextureType3D;
+    td.pixelFormat      = eng_pixel_format(fmt);
+    td.width            = w;
+    td.height           = h;
+    td.depth            = depth;
+    td.mipmapLevelCount = mips ? mips : 1;
+    td.usage            = MTLTextureUsageShaderRead;
+    u8 sel[4];
+    rsx_texture_component_remap(remap, rsx_fmt & 0x9Fu, sel);
+    td.swizzle = MTLTextureSwizzleChannelsMake(
+        swizzle_sel(sel[1]), swizzle_sel(sel[2]),
+        swizzle_sel(sel[3]), swizzle_sel(sel[0]));
+    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+}
+
+static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+                                  u32 w, u32 h, const void* src, u32 row_bytes)
+{
+    (void)user;
+    id<MTLTexture> t = eng_obj(handle);
+    if (!t || !src || !row_bytes) return;
+    [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1)
+         mipmapLevel:mip
+               slice:0
+           withBytes:src
+         bytesPerRow:row_bytes
+       bytesPerImage:(NSUInteger)row_bytes * h];
+}
+
 static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                    const void* seed, u32 seed_row_bytes)
 {
@@ -3466,6 +3503,8 @@ static const rsx_draw_backend s_engine_backend = {
     .texture_create       = eng_texture_create,
     .texture_upload       = eng_texture_upload,
     .texture_release      = eng_obj_release,
+    .texture_create_3d    = eng_texture_create_3d,
+    .texture_upload_3d    = eng_texture_upload_3d,
     .color_target_create  = eng_color_target_create,
     .color_target_release = eng_obj_release,
     .surface_view         = eng_surface_view,

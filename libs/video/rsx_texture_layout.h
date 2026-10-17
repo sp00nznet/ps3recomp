@@ -140,6 +140,9 @@ u32 rsx_texture_cube_face_stride(u32 rsx_fmt, u32 w, u32 h, u32 levels,
  * Interleaves the low bits of x and y, then appends whichever axis still has
  * bits left when the other is exhausted (non-square images). */
 u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h);
+/* The same for a 3D image: x, y and z bits interleave (x first) while all
+ * three have bits, then whichever still do (RPCS3 convert_linear_swizzle_3d). */
+u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d);
 
 /* ceil(log2(v)); 0 for v <= 1. */
 u32 rsx_log2_ceil(u32 v);
@@ -174,6 +177,15 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
  * Float/depth/non-gamma formats return zero; source signed flags take
  * precedence after the existing crossbar. No texture bytes are converted. */
 u8 rsx_texture_gamma_mask(u32 format, u32 control1, u32 filter, u32 address);
+/* Per-final-RGBA-lane mask (bits 0..3) of the lanes every fetch re-centres
+ * to the signed range: every lane the crossbar fills from a source channel
+ * when SET_TEXTURE_ADDRESS asks for CELL_GCM_TEXTURE_UNSIGNED_REMAP_BIASED
+ * (bit 12), less lanes whose source SET_TEXTURE_FILTER flags signed (those
+ * take the sign-extension read instead). Bit 4 marks 16-bit channels (X16,
+ * Y16_X16). Only the formats that carry the feature return non-zero (RPCS3
+ * fragment_texture::format_features, RSX_FORMAT_FEATURE_BIASED_NORMALIZATION).
+ * No texture bytes are converted. */
+u8 rsx_texture_expand_mask(u32 format, u32 control1, u32 filter, u32 address);
 
 /* --- component remap (NV4097 TEXTURE_CONTROL1 crossbar) ------------------
  *
