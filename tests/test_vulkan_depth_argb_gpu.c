@@ -106,12 +106,12 @@ int main(void)
     rsx_vertex_layout_plan layout = {0}; layout.count = 1; layout.stride = 16; layout.attrs[0] = 0;
     rsx_be_render_state state = {0}; state.color_mask = 0x01010101u;
     state.depth_test = 1; state.depth_write = 1; state.depth_func = 0x207;   /* ALWAYS */
+    state.antialias_control = 0xFFFF0001u;
+    const u32 pipeline = vk_eng_pipeline_create(NULL, vs, fs, &state, &layout, 16, RSX_BE_FMT_R8G8B8A8, 1);
+    CHECK(pipeline != 0);
     for (u32 scale = 1; scale <= 2; ++scale) {
         s_render_scale = scale;
         for (u32 samples = 2; samples <= 4; samples += 2) {
-            state.antialias_control = 0xFFFF0001u;
-            const u32 pipeline = vk_eng_pipeline_create(NULL, vs, fs, &state, &layout, 16, RSX_BE_FMT_R8G8B8A8, 1);
-            CHECK(pipeline != 0);
             const u32 LW = 160, LH = 90;
             const u32 color = vk_eng_color_multisample(NULL, RSX_BE_FMT_R8G8B8A8, LW, LH, samples);
             const u32 depth = vk_eng_depth_multisample(NULL, LW, LH, samples);
@@ -144,9 +144,10 @@ int main(void)
                 CHECK(distinct > W / 2u);                   /* the depth really varies */
             }
             free(floats); free(guest); free(want); free(got);
-            vk_eng_release(NULL, depth); vk_eng_release(NULL, color); vk_eng_pipeline_release(NULL, pipeline);
+            vk_eng_release(NULL, depth); vk_eng_release(NULL, color);
         }
     }
+    vk_eng_pipeline_release(NULL, pipeline);
     s_render_scale = 1;
     /* Single-sample depth stays on the CPU path. */
     {
