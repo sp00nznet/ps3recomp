@@ -58,6 +58,11 @@ int rsx_hlsl_to_spirv(const char* hlsl, int stage,
                       u32* words, u32 max_words, u32* out_words,
                       char* log, u32 log_size);
 
+/* Disk-cache counters since process start (PS3RECOMP_SHADER_CACHE_DIR; see
+ * rsx_shader_spirv.cpp). All zero when the cache is off or glslang is absent.
+ * Any pointer may be NULL. */
+void rsx_spirv_cache_stats(u32* hits, u32* misses, u32* stores, u32* rejects);
+
 #ifdef __cplusplus
 }
 #endif

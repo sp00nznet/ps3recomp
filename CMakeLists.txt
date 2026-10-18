@@ -361,6 +361,15 @@ if(PS3RECOMP_RSX_VULKAN)
         endif()
         message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
+        # SPIR-V disk cache: hits, damaged-file rejection, no cached failures. CPU only.
+        add_executable(test_spirv_cache EXCLUDE_FROM_ALL
+            tests/test_spirv_cache.cpp libs/video/rsx_shader_spirv.cpp)
+        target_include_directories(test_spirv_cache PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_link_libraries(test_spirv_cache PRIVATE glslang::glslang glslang::SPIRV)
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(test_spirv_cache PRIVATE glslang::glslang-default-resource-limits)
+        endif()
     else()
         message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
     endif()
