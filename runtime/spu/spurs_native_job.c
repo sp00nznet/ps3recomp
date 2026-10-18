@@ -139,6 +139,7 @@ spurs_native_job_result spurs_native_job_dispatch(
    resolved==SPURS_NATIVE_NOT_FOUND?SPURS_NATIVE_JOB_UNREGISTERED:SPURS_NATIVE_JOB_INVALID;
   return result;
  }
+ result.profile_registered=1;
  /* EXACT_GET relies on the strict MFC's checked synchronous copy and fatal
   * transfer errors. Compatibility DMA semantics cannot certify delivered data. */
  if((profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET||profile->input.kind==SPURS_NATIVE_INPUT_EXACT_GET_PAIR||profile->input.kind==SPURS_NATIVE_INPUT_ORDERED_DMA||profile->input.kind==SPURS_NATIVE_INPUT_GUEST_DMA)&&!ps3_strict_boot_enabled()){

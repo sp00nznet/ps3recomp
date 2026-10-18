@@ -26,6 +26,9 @@ typedef struct spurs_native_job_result {
  uint32_t completed_puts,completed_transfers;
  spurs_native_indirect_failure indirect_failure;
  uint32_t indirect_pc;
+ /* Identity/layout resolution succeeded, even if later admission/execution
+  * failed. Diagnostic capture filtering only; this does not qualify a job. */
+ int profile_registered;
 } spurs_native_job_result;
 /* No guest descriptor/image rereads, arbitrary dispatch entry or readiness
  * assertion. Resolution requires a sealed trusted-startup registry. The owner

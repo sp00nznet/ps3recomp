@@ -2414,6 +2414,19 @@ typedef struct {
     u64 snapshot_us, admission_us, dispatch_us, release_us;
 } jc_job_timing;
 
+static void jc_capture_job(const spurs_job_snapshot* snapshot)
+{
+    char capture_prefix[4096];
+    spurs_job_capture_status capture=spurs_job_snapshot_capture(snapshot,capture_prefix,sizeof capture_prefix);
+    if(capture!=SPURS_JOB_CAPTURE_DISABLED){
+        fprintf(stderr,"[spurs-job-capture] status=%s job=0x%08X descriptor_size=%u image_size=%u fp=0x%016llX prefix=%s\n",
+            capture==SPURS_JOB_CAPTURE_WRITTEN?"written":capture==SPURS_JOB_CAPTURE_LIMIT?"limit":"error",
+            snapshot->job_ea,snapshot->descriptor_size,snapshot->image_size,
+            (unsigned long long)snapshot->fingerprint,capture==SPURS_JOB_CAPTURE_WRITTEN?capture_prefix:"<none>");
+        fflush(stderr);
+    }
+}
+
 static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 size_desc,
                           jc_job_timing* timing)
 {
@@ -2447,31 +2460,29 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
         }
         printf("\n");
     }
-    char capture_prefix[4096];
-    const spurs_native_profile* known_profile = NULL;
     const char* capture_unknown = getenv("FOLKLORE_SPU_CAPTURE_UNREGISTERED_ONLY");
-    int skip_known = capture_unknown && !strcmp(capture_unknown,"1") &&
-        spurs_native_registry_resolve(&snapshot,&known_profile)==SPURS_NATIVE_OK;
-    spurs_job_capture_status capture = skip_known ? SPURS_JOB_CAPTURE_DISABLED :
-        spurs_job_snapshot_capture(&snapshot, capture_prefix, sizeof capture_prefix);
-    if (capture != SPURS_JOB_CAPTURE_DISABLED) {
-        fprintf(stderr, "[spurs-job-capture] status=%s job=0x%08X descriptor_size=%u image_size=%u fp=0x%016llX prefix=%s\n",
-                capture == SPURS_JOB_CAPTURE_WRITTEN ? "written" :
-                capture == SPURS_JOB_CAPTURE_LIMIT ? "limit" : "error",
-                snapshot.job_ea, snapshot.descriptor_size, snapshot.image_size,
-                (unsigned long long)snapshot.fingerprint,
-                capture == SPURS_JOB_CAPTURE_WRITTEN ? capture_prefix : "<none>");
-        fflush(stderr);
-    }
+    const int unknown_only=capture_unknown&&!strcmp(capture_unknown,"1");
+    /* Full captures can contain live auxiliary guest data: retain their
+     * pre-execution ordering. Unknown-only capture uses dispatch's checked
+     * resolution below instead of hashing/resolving the same snapshot twice. */
+    if(!unknown_only)jc_capture_job(&snapshot);
     /* Native profiles consume the complete owned snapshot on an actual worker
      * of this retained chain owner. This first scheduler policy supports one
      * worker only; job index is never fabricated into an SPU identity. */
     if(spurs_inst_nspus(chain->owner.ea)!=1){
+        if(unknown_only){
+            const spurs_native_profile* known=NULL;
+            if(spurs_native_registry_resolve(&snapshot,&known)!=SPURS_NATIVE_OK)jc_capture_job(&snapshot);
+        }
         ps3_strict_boot_guard("spurs-native-job-worker-policy","owner=0x%08X requires_one_worker=1",chain->owner.ea);
         spurs_job_snapshot_release(&snapshot);return 0;
     }
     const u64 dispatch_started=timing?jc_trace_us():0;
     spurs_native_job_result native=spurs_native_job_dispatch(&snapshot,chain->owner,0);
+    /* Unregistered/invalid/open-registry resolution returns before staging or
+     * execution. Capture remains before compatibility dispatch/strict stop.
+     * Registered jobs were already excluded, including admission failures. */
+    if(unknown_only&&!native.profile_registered)jc_capture_job(&snapshot);
     int dispatched=0;
     if(native.status==SPURS_NATIVE_JOB_UNREGISTERED||native.status==SPURS_NATIVE_JOB_REGISTRY_OPEN){
         /* Preserve existing MISS/HIT strict stops. In strict mode this legacy
