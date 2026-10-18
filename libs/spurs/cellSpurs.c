@@ -2409,9 +2409,16 @@ enum {                              /* CellSpursJobHeader (48 B) */
     JH_SIZE          = 0x30,
 };
 
-static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 size_desc)
+static u64 jc_trace_us(void);
+typedef struct {
+    u64 snapshot_us, admission_us, dispatch_us, release_us;
+} jc_job_timing;
+
+static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 size_desc,
+                          jc_job_timing* timing)
 {
     extern uint32_t ppu_vm_size;
+    const u64 started=timing?jc_trace_us():0;
     spurs_job_snapshot snapshot;
     spurs_job_snapshot_status status = spurs_job_snapshot_acquire(
         vm_base, ppu_vm_size ? ppu_vm_size : 0x100000000ull,
@@ -2423,6 +2430,7 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
                 idx, (unsigned long long)raw_job_ea, spurs_job_snapshot_status_name(status));
         return 0;
     }
+    const u64 acquired=timing?jc_trace_us():0;
     /* All decoding and diagnostics use the same owned descriptor. Guest pages
      * may change after either copy; this is not a quiesced guest epoch. */
     static atomic_uint logged_jobs;
@@ -2462,6 +2470,7 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
         ps3_strict_boot_guard("spurs-native-job-worker-policy","owner=0x%08X requires_one_worker=1",chain->owner.ea);
         spurs_job_snapshot_release(&snapshot);return 0;
     }
+    const u64 dispatch_started=timing?jc_trace_us():0;
     spurs_native_job_result native=spurs_native_job_dispatch(&snapshot,chain->owner,0);
     int dispatched=0;
     if(native.status==SPURS_NATIVE_JOB_UNREGISTERED||native.status==SPURS_NATIVE_JOB_REGISTRY_OPEN){
@@ -2479,7 +2488,14 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
         ps3_strict_boot_guard("spurs-native-job-failed","job=0x%08X status=%u pc=0x%05X spu_status=%u stop=%u gets=%u",
             snapshot.job_ea,(unsigned)native.status,native.pc,native.spu_status,native.stop_code,native.completed_gets);
     }
+    const u64 dispatched_at=timing?jc_trace_us():0;
     spurs_job_snapshot_release(&snapshot);
+    if(timing){
+        timing->snapshot_us=acquired-started;
+        timing->admission_us=dispatch_started-acquired;
+        timing->dispatch_us=dispatched_at-dispatch_started;
+        timing->release_us=jc_trace_us()-dispatched_at;
+    }
     return dispatched==1;
 }
 
@@ -2775,6 +2791,9 @@ static s32 jc_execute(struct SpursChain*c)
     u32 pc=c->entry_ea,ret_pc=0;unsigned idle=0,jobs=0;
     const int timing=getenv("SPURS_JOB_TIMING")!=NULL;
     unsigned timing_lines=0;
+    u64 window_start=timing?jc_trace_us():0,window_jobs=0,window_job_us=0,window_max_us=0;
+    u64 window_snapshot_us=0,window_admission_us=0,window_dispatch_us=0;
+    u64 window_guards=0,window_guard_us=0;
     while(!atomic_load_explicit(&c->stop,memory_order_acquire)){
         if(idle++>4096){ps3_strict_boot_guard("spurs-chain-progress-limit","chain=0x%08X pc=0x%08X jobs=%u",c->jc_ea,pc,jobs);return CELL_SPURS_TASK_ERROR_STAT;}
         if(!spurs_guest_span(pc,8,0)){ps3_strict_boot_guard("spurs-invalid-chain-command","chain=0x%08X pc=0x%08X",c->jc_ea,pc);return CELL_SPURS_TASK_ERROR_INVAL;}
@@ -2782,11 +2801,33 @@ static s32 jc_execute(struct SpursChain*c)
         if(cmd&&op==0){
             extern u32 g_spurs_job_ls_handle;g_spurs_job_ls_handle=c->jc_ea;
             const u64 started=timing?jc_trace_us():0;
-            if(!jc_run_one_job(c,cmd&~7ull,(int)jobs,c->size_desc))return CELL_SPURS_TASK_ERROR_STAT;
-            if(timing){const u64 ended=jc_trace_us();if(ended-started>4000 && timing_lines++<256)
-                fprintf(stderr,"[spurs-job-time] chain=0x%08X job=0x%08X start_us=%llu end_us=%llu duration_us=%llu\n",
+            jc_job_timing phases={0};
+            if(!jc_run_one_job(c,cmd&~7ull,(int)jobs,c->size_desc,timing?&phases:NULL))return CELL_SPURS_TASK_ERROR_STAT;
+            if(timing){const u64 ended=jc_trace_us(),elapsed=ended-started;
+                ++window_jobs;window_job_us+=elapsed;if(elapsed>window_max_us)window_max_us=elapsed;
+                window_snapshot_us+=phases.snapshot_us;window_admission_us+=phases.admission_us;
+                window_dispatch_us+=phases.dispatch_us;
+                if(elapsed>4000 && timing_lines++<256)
+                fprintf(stderr,"[spurs-job-time] chain=0x%08X job=0x%08X start_us=%llu end_us=%llu duration_us=%llu snapshot_us=%llu admission_us=%llu dispatch_us=%llu release_us=%llu\n",
                     c->jc_ea,(u32)(cmd&~7ull),(unsigned long long)started,
-                    (unsigned long long)ended,(unsigned long long)(ended-started));}
+                    (unsigned long long)ended,(unsigned long long)elapsed,
+                    (unsigned long long)phases.snapshot_us,(unsigned long long)phases.admission_us,
+                    (unsigned long long)phases.dispatch_us,(unsigned long long)phases.release_us);
+                /* A per-job threshold misses many short jobs whose aggregate
+                 * exceeds the audio period. Five-second totals expose that
+                 * without writing every job to the shared log. */
+                if(ended-window_start>=5000000ull){
+                    fprintf(stderr,"[spurs-job-window] chain=0x%08X start_us=%llu end_us=%llu jobs=%llu job_us=%llu max_us=%llu snapshot_us=%llu admission_us=%llu dispatch_us=%llu guards=%llu guard_us=%llu\n",
+                        c->jc_ea,(unsigned long long)window_start,(unsigned long long)ended,
+                        (unsigned long long)window_jobs,(unsigned long long)window_job_us,
+                        (unsigned long long)window_max_us,(unsigned long long)window_snapshot_us,
+                        (unsigned long long)window_admission_us,(unsigned long long)window_dispatch_us,
+                        (unsigned long long)window_guards,(unsigned long long)window_guard_us);
+                    window_start=ended;window_jobs=window_job_us=window_max_us=0;
+                    window_snapshot_us=window_admission_us=window_dispatch_us=0;
+                    window_guards=window_guard_us=0;
+                }
+            }
             ++jobs;idle=0;pc+=8;continue; /* Only the job's real protocol emits events. */
         }
         if(op==1||op==3||op==4){
@@ -2802,7 +2843,8 @@ static s32 jc_execute(struct SpursChain*c)
             const u64 started=timing?jc_trace_us():0;
             if(!jg_wait_cancellable((u32)(cmd&~127ull),&c->stop))
                 return atomic_load_explicit(&c->stop,memory_order_acquire)?CELL_OK:CELL_SPURS_TASK_ERROR_STAT;
-            if(timing){const u64 ended=jc_trace_us();if(ended-started>20000 && timing_lines++<256)
+            if(timing){const u64 ended=jc_trace_us();++window_guards;window_guard_us+=ended-started;
+                if(ended-started>20000 && timing_lines++<256)
                 fprintf(stderr,"[spurs-guard-time] chain=0x%08X guard=0x%08X start_us=%llu end_us=%llu duration_us=%llu\n",
                     c->jc_ea,(u32)(cmd&~127ull),(unsigned long long)started,
                     (unsigned long long)ended,(unsigned long long)(ended-started));}
