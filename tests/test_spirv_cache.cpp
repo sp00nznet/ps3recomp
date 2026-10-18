@@ -99,7 +99,8 @@ int main(int argc, char** argv)
     for (auto& p : files(dir)) CHECK(p.extension() == ".spv");   /* no temp files left */
 
     /* A one-character change in the source is a different entry. */
-    std::string vs2 = kVs; vs2[vs2.size() - 3] = ' ';
+    std::string vs2 = kVs; vs2[vs2.size() - 3] = '\t';
+    CHECK(vs2 != kVs);
     std::vector<u32> h = translate(vs2.c_str(), RSX_SHADER_STAGE_VERTEX, &rc);
     CHECK(rc == 0 && files(dir).size() == before + 1);
 
