@@ -27,6 +27,18 @@ static inline int rsx_hud_anchor_clip(double low, double high, int vertical)
     return vertical ? sum < 0.0 : sum >= 0.0;
 }
 
+/* A sliced corner HUD must use one edge anchor even when a short slice's
+ * center falls inside the central overlay region. The captured status-bar
+ * shader also contains transparent vertices crossing the screen center.
+ * Preserve center anchors for central overlays and genuinely centered quads. */
+static inline int rsx_hud_horizontal_anchor(const double low[2],const double high[2],int status_marker)
+{
+    const int corner_band=low[1]>=0.5 || high[1]<=-0.5;
+    if(status_marker || (corner_band && (low[0]>=0.0 || high[0]<=0.0)))
+        return low[0]+high[0]>=0.0;
+    return rsx_hud_anchor_clip(low[0],high[0],0);
+}
+
 /* Accept one canonical decimal integer in [50,100]. The caller owns defaults. */
 static inline int rsx_hud_parse_percent(const char *text, unsigned *out)
 {

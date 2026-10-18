@@ -132,7 +132,7 @@ static int eng_folklore_hud_check(const rsx_be_render_state* rs,eng_surface* rt,
     const int marker=pipeline && pipeline->folklore_hud_marker;
     if(marker){g.hud_active=1;g.hud_marker_seen=1;}
     *why=NULL;
-    *right=rsx_hud_anchor_clip(low[0],high[0],0);
+    *right=rsx_hud_horizontal_anchor(low,high,marker);
     *bottom=rsx_hud_anchor_clip(low[1],high[1],1);
     return 1;
 }

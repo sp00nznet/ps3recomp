@@ -181,6 +181,41 @@ static void test_center_and_presentation(void)
 
 }
 
+static void test_observed_status_slices(void)
+{
+    /* run234856Z, first gameplay frame2799. These six draws were the only
+     * central-anchor candidates among all600 captured HUD diagnostic draws. */
+    const double bounds[][4]={
+        {-0.325,0.675,0.744,0.789}, /* status shader's transparent full strip */
+        {0.163,0.263,0.722,0.811}, {0.209,0.309,0.644,0.733},
+        {0.219,0.319,0.567,0.656}, {-0.273,-0.248,0.608,0.653},
+        {-0.266,-0.241,0.597,0.642},
+        {0.263,0.444,0.722,0.811}, {0.444,0.544,0.722,0.811}
+    };
+    const float in[8]={1,1,0,0,0,0,0,0};
+    const float wide=(16.0f/9.0f)/(3440.0f/1440.0f);
+    for(unsigned i=0;i<sizeof bounds/sizeof bounds[0];++i) {
+        const double low[2]={bounds[i][0],bounds[i][2]},high[2]={bounds[i][1],bounds[i][3]};
+        const int anchor=rsx_hud_horizontal_anchor(low,high,i==0);
+        CHECK(anchor==((i==4 || i==5)?0:1));
+        for(unsigned percent=60;percent<=100;percent+=20) {
+            float actual[8],expected[8];
+            CHECK(!rsx_hud_compose_xf_aspect(in,percent,wide,anchor,0,actual));
+            CHECK(!rsx_hud_compose_xf_aspect(in,percent,wide,(i==4 || i==5)?0:1,0,expected));
+            CHECK(memcmp(actual,expected,sizeof actual)==0);
+        }
+    }
+    /* Neighboring health frame pieces share the same transform: their common
+     * x=.263 endpoint cannot acquire a center-versus-edge gap. */
+    const double low0[2]={0.163,0.722},high0[2]={0.263,0.811};
+    const double low1[2]={0.263,0.722},high1[2]={0.444,0.811};
+    CHECK(rsx_hud_horizontal_anchor(low0,high0,0)==rsx_hud_horizontal_anchor(low1,high1,0));
+    const double prompt_low[2]={0.1,-0.2},prompt_high[2]={0.2,0.2};
+    CHECK(rsx_hud_horizontal_anchor(prompt_low,prompt_high,0)==2);
+    const double heading_low[2]={-0.3,0.7},heading_high[2]={0.3,0.8};
+    CHECK(rsx_hud_horizontal_anchor(heading_low,heading_high,0)==2);
+}
+
 static void test_full_target(void)
 {
     const rsx_hud_rect whole={0,0,1280,720};
@@ -197,7 +232,7 @@ static void test_full_target(void)
 int main(void)
 {
     test_parser(); test_clip_transform(); test_scissor(); test_aspect_compensation();
-    test_center_and_presentation(); test_full_target();
+    test_center_and_presentation(); test_full_target(); test_observed_status_slices();
     printf("test_rsx_hud_geometry: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }
