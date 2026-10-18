@@ -138,7 +138,7 @@ static int vk_eng_pack_pipeline(u32 fi, u32 samples, u32 ci, u32 sample)
         .pVertexInputState=&vi,.pInputAssemblyState=&ia,.pViewportState=&vp,.pRasterizationState=&raster,
         .pMultisampleState=&ms,.pColorBlendState=&cb,.pDynamicState=&dy,.layout=s_msaa_pack.layout,.renderPass=s_msaa_pack.pass[fi][ci]};
     VkPipeline pipeline=VK_NULL_HANDLE;
-    if (pvkCreateGraphicsPipelines(s_vk.device,VK_NULL_HANDLE,1,&gci,NULL,&pipeline)!=VK_SUCCESS) return 0;
+    if (pvkCreateGraphicsPipelines(s_vk.device,vk_pcache(),1,&gci,NULL,&pipeline)!=VK_SUCCESS) return 0;
     s_msaa_pack.pipeline[fi][ci][sample]=pipeline;
     return 1;
 }

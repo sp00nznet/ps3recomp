@@ -291,7 +291,7 @@ static int vk_fsr1_pass_init(vk_fsr1_pass* p, const vk_image* src,
         ci.layout = p->layout;
         ci.renderPass = p->rp;
         ci.subpass = 0;
-        if ((r = pvkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &p->pipe)) != VK_SUCCESS) {
+        if ((r = pvkCreateGraphicsPipelines(d, vk_pcache(), 1, &ci, NULL, &p->pipe)) != VK_SUCCESS) {
             VK_LOG("fsr1: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
             goto fail;
         }

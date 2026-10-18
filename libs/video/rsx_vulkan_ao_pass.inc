@@ -253,7 +253,7 @@ static int vk_ao_create_slot(int slot, VkShaderModule fs)
     gp.layout = s_vk_ao.pipe_layout;
     gp.renderPass = s_vk_ao.rp[slot];
     gp.subpass = 0;
-    if (pvkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, NULL, &s_vk_ao.pipe[slot]) != VK_SUCCESS) {
+    if (pvkCreateGraphicsPipelines(dev, vk_pcache(), 1, &gp, NULL, &s_vk_ao.pipe[slot]) != VK_SUCCESS) {
         if (s_vk_ao.pipe[slot]) pvkDestroyPipeline(dev,s_vk_ao.pipe[slot],NULL);
         s_vk_ao.pipe[slot] = VK_NULL_HANDLE;
         pvkDestroyRenderPass(dev, s_vk_ao.rp[slot], NULL);

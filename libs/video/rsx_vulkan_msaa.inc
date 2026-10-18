@@ -80,7 +80,7 @@ static int vk_eng_expansion_pipeline(VkFormat format, u32 index)
     VkGraphicsPipelineCreateInfo gci={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=stages,
         .pVertexInputState=&vi,.pInputAssemblyState=&ia,.pViewportState=&vp,.pRasterizationState=&raster,
         .pMultisampleState=&ms,.pColorBlendState=&cb,.pDynamicState=&dy,.layout=s_msaa_expand.layout,.renderPass=s_msaa_expand.pass[index]};
-    return pvkCreateGraphicsPipelines(s_vk.device,VK_NULL_HANDLE,1,&gci,NULL,&s_msaa_expand.pipeline[index])==VK_SUCCESS;
+    return pvkCreateGraphicsPipelines(s_vk.device,vk_pcache(),1,&gci,NULL,&s_msaa_expand.pipeline[index])==VK_SUCCESS;
 }
 
 static u32 vk_eng_expand_samples(u32 surface)

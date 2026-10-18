@@ -247,6 +247,8 @@ typedef struct vk_state {
 static vk_state s_vk;
 
 #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
+
+#include "rsx_vulkan_pipeline_cache.inc"
 #define VK_CHECK(call, what)                                               \
     do { VkResult r_ = (call);                                             \
          if (r_ != VK_SUCCESS) {                                           \
@@ -1082,8 +1084,9 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
         .pDynamicState = &dy, .layout = s_vk.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, vk_pcache(), 1, &gci, NULL, &p);
     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
+    vk_pcache_created();
     s_vk.pipelines[slot] = p;
     return p;
 }
@@ -1423,11 +1426,12 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
         .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, vk_pcache(), 1, &gci, NULL, &p);
     if (r != VK_SUCCESS) {
         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
         return VK_NULL_HANDLE;
     }
+    vk_pcache_created();
     vk_gpipe_entry* e = &s_g.pipes[s_g.pipe_count++];
     e->vs = vs; e->fs = fs; e->depth_key = dkey; e->pipe = p;
     return p;
@@ -2099,6 +2103,7 @@ static void vk_fit_rect(u32 sw, u32 sh, u32 dw, u32 dh, u32* x, u32* y, u32* w, 
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
+    vk_pcache_tick(s_vk.device);
     if (!s_vk.windowed || !s_vk.swapchain) return;
 
     VkImage display = s_vk.display_image ? s_vk.display_image : s_vk.color.img;
@@ -3391,10 +3396,12 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 samples)
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = layout, .renderPass = rp, .subpass = 0 };
-    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
+    if (pvkCreateGraphicsPipelines(s_vk.device, vk_pcache(), 1, &gci, NULL,
                                    &P->variant[si][topo_idx]) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
         P->variant[si][topo_idx] = VK_NULL_HANDLE;
+    } else {
+        vk_pcache_created();
     }
     return P->variant[si][topo_idx];
 }
@@ -4040,6 +4047,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                                .pEnabledFeatures = &want };
     VK_CHECK(pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device), "vkCreateDevice");
     if (vk_load_device_functions()) return -1;
+    vk_pcache_init(s_vk.instance, s_vk.phys, s_vk.device);
     VK_LOG("anisotropy: supported=%d device_limit=%g override=%u (0=guest,1=off)\n",
            s_vk.anisotropy_ok, (double)s_vk.max_anisotropy, s_vk.anisotropy_override);
     if (s_vk.windowed && vk_load_wsi_device_functions())
@@ -4201,6 +4209,7 @@ void rsx_vulkan_backend_shutdown(void)
         vk_destroy_buffer(&s_vk.readback);
         if (s_vk.fence) pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
         if (s_vk.pool)  pvkDestroyCommandPool(s_vk.device, s_vk.pool, NULL);
+        vk_pcache_shutdown(s_vk.device);
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);

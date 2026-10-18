@@ -284,7 +284,7 @@ static int vk_fxaa_init(void)
         ci.layout = s_fxaa.layout;
         ci.renderPass = s_fxaa.rp;
         ci.subpass = 0;
-        if ((r = pvkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &s_fxaa.pipe)) != VK_SUCCESS) {
+        if ((r = pvkCreateGraphicsPipelines(d, vk_pcache(), 1, &ci, NULL, &s_fxaa.pipe)) != VK_SUCCESS) {
             VK_LOG("fxaa: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
             goto fail;
         }
