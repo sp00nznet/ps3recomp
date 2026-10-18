@@ -2558,6 +2558,8 @@ static struct {
     u64 pending;    /* accumulated credits, never silently wrap */
     u32 auto_reset;
     int active;
+    int trace;
+    u64 ready_us;   /* diagnostic only: time the first complete credit arrived */
 } s_jobguards[MAX_JOBGUARDS];
 
 /* Caller holds s_jobguard_lock exclusively. Slots are never retired here. */
@@ -2588,6 +2590,8 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
     s_jobguards[i].pending    = 0;
     s_jobguards[i].auto_reset = auto_reset;
     s_jobguards[i].active     = 1;
+    s_jobguards[i].trace      = getenv("SPURS_JOB_TIMING")!=NULL;
+    s_jobguards[i].ready_us   = 0;
     vm_write32(ea, notify_count);
     jg_unlock();
     printf("[cellSpurs] JobGuardInitialize(guard=0x%08X chain=0x%08X notify=%u "
@@ -2610,6 +2614,9 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
         return CELL_SPURS_TASK_ERROR_AGAIN;
     }
     ++s_jobguards[i].pending;
+    if(s_jobguards[i].trace && s_jobguards[i].reset &&
+       s_jobguards[i].pending==s_jobguards[i].reset)
+        s_jobguards[i].ready_us=jc_trace_us();
     u32 remaining = s_jobguards[i].pending >= s_jobguards[i].reset
                   ? 0u : s_jobguards[i].reset - (u32)s_jobguards[i].pending;
     s_jobguards[i].count = remaining;
@@ -2663,11 +2670,22 @@ static int jg_wait_cancellable(u32 ea,const atomic_int*stop)
             return 1;
         }
         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
+            /* Backlogged credits have no single unambiguous timestamp. Only
+             * measure the one-credit handoff, not time deliberately idle. */
+            const u64 ready=s_jobguards[i].trace && s_jobguards[i].reset &&
+                s_jobguards[i].pending==s_jobguards[i].reset?s_jobguards[i].ready_us:0;
             s_jobguards[i].pending -= s_jobguards[i].reset;
             if (!s_jobguards[i].auto_reset) s_jobguards[i].reset = 0;
             s_jobguards[i].count = s_jobguards[i].reset;
             vm_write32(ea, s_jobguards[i].count);
             jg_unlock();
+            if(ready){
+                const u64 woke=jc_trace_us();
+                static atomic_uint wake_lines;
+                if(woke>ready+1000 && atomic_fetch_add_explicit(&wake_lines,1,memory_order_relaxed)<128)
+                    fprintf(stderr,"[spurs-wake-time] guard=0x%08X start_us=%llu end_us=%llu duration_us=%llu\n",
+                        ea,(unsigned long long)ready,(unsigned long long)woke,(unsigned long long)(woke-ready));
+            }
             return 1;
         }
         /* Monotonic clock, so the 20-second bound is elapsed time. */
