@@ -10,7 +10,18 @@
 #define GUARD_EA 0x10000u
 #define PARAM_EA 0x20000u
 #define ROUNDS 2000u
+#define LATENCY_ROUNDS 200u
 static atomic_uint acknowledged;
+static double now_us(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER f,c;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&c);
+    return (double)c.QuadPart*1e6/(double)f.QuadPart;
+#else
+    struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e6+t.tv_nsec/1e3;
+#endif
+}
+static int cmp_double(const void*a,const void*b){double x=*(const double*)a,y=*(const double*)b;return (x>y)-(x<y);}
 static unsigned worker_kind;
 static void set_strict(int enabled)
 {
@@ -31,6 +42,12 @@ static void worker(unsigned index)
         }
     } else if(worker_kind==1) {
         for(unsigned n=0;n<ROUNDS;n++) CHECK(cellSpursJobGuardNotify(GUARD_EA)==CELL_OK);
+    } else if(worker_kind==3) {
+        /* The walker side: wait, then acknowledge at once. */
+        for(unsigned n=1;n<=LATENCY_ROUNDS;n++) {
+            CHECK(jg_wait(GUARD_EA)==1);
+            atomic_store_explicit(&acknowledged,n,memory_order_release);
+        }
     } else {
         for(unsigned n=0;n<16;n++) {
             u32 ea=GUARD_EA+(index*16+n)*128;
@@ -90,6 +107,26 @@ int main(int argc,char**argv)
         CHECK(cellSpursJobGuardNotify(GUARD_EA)==CELL_SPURS_TASK_ERROR_AGAIN);
         jg_lock();CHECK(s_jobguards[i].pending==UINT64_MAX);
         CHECK(vm_read32(GUARD_EA)==mirrored);jg_unlock();
+    } else if(!strcmp(argv[1],"latency")) {
+        /* Notify to a walker that is already asleep in the wait must wake it
+         * promptly: a sound engine runs one guarded lap per 5.3 ms block. The
+         * old Sleep(1) poll took >= 1 ms per lap (15.6 ms without a raised
+         * timer resolution); a woken wait takes microseconds. */
+        CHECK(cellSpursJobGuardInitialize(0x30000,GUARD_EA,1,1,1)==CELL_OK);
+        worker_kind=3;test_thread t=start(0);
+        static double lat[LATENCY_ROUNDS];
+        for(unsigned n=1;n<=LATENCY_ROUNDS;n++) {
+            Sleep(3); /* let the walker settle into the wait */
+            double t0=now_us();
+            CHECK(cellSpursJobGuardNotify(GUARD_EA)==CELL_OK);
+            while(atomic_load_explicit(&acknowledged,memory_order_acquire)!=n) {}
+            lat[n-1]=now_us()-t0;
+        }
+        join(t);
+        qsort(lat,LATENCY_ROUNDS,sizeof lat[0],cmp_double);
+        printf("guard wake latency: median %.0f us, p90 %.0f us, max %.0f us\n",
+               lat[LATENCY_ROUNDS/2],lat[LATENCY_ROUNDS*9/10],lat[LATENCY_ROUNDS-1]);
+        CHECK(lat[LATENCY_ROUNDS/2]<500.0);
     } else if(!strcmp(argv[1],"unknown-strict")) {
         (void)jg_wait(GUARD_EA);return 91;
     } else if(!strcmp(argv[1],"unknown-compat")) {

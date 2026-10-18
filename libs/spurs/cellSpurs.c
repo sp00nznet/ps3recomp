@@ -2510,14 +2510,30 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
 /* One mutex protects registry lifetime, credits and guest count mirrors.
  * Notify's release publishes preceding caller writes to a successful wait's
  * acquire. Guest parameters must stay owned by the consumer until it is done. */
+/* Waiters sleep on s_jobguard_cv; Notify and chain shutdown wake them. */
 #ifdef _WIN32
 static SRWLOCK s_jobguard_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_jobguard_cv = CONDITION_VARIABLE_INIT;
 static void jg_lock(void) { AcquireSRWLockExclusive(&s_jobguard_lock); }
 static void jg_unlock(void) { ReleaseSRWLockExclusive(&s_jobguard_lock); }
+static void jg_wake_all(void) { WakeAllConditionVariable(&s_jobguard_cv); }
+/* Caller holds the lock; it is held again on return (wake, timeout or spurious). */
+static void jg_sleep_locked(unsigned ms) { SleepConditionVariableSRW(&s_jobguard_cv, &s_jobguard_lock, ms, 0); }
 #else
 static pthread_mutex_t s_jobguard_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_jobguard_cv = PTHREAD_COND_INITIALIZER;
 static void jg_lock(void) { pthread_mutex_lock(&s_jobguard_lock); }
 static void jg_unlock(void) { pthread_mutex_unlock(&s_jobguard_lock); }
+static void jg_wake_all(void) { pthread_cond_broadcast(&s_jobguard_cv); }
+static void jg_sleep_locked(unsigned ms)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    until.tv_sec += ms / 1000u + until.tv_nsec / 1000000000L;
+    until.tv_nsec %= 1000000000L;
+    pthread_cond_timedwait(&s_jobguard_cv, &s_jobguard_lock, &until);
+}
 #endif
 static struct {
     u32 ea;
@@ -2586,6 +2602,7 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
       if (logged++ < 8)
           printf("[cellSpurs] JobGuardNotify(0x%08X) -> %u remaining\n", ea, remaining); }
     jg_unlock();
+    jg_wake_all();
     return CELL_OK;
 }
 
@@ -2605,15 +2622,24 @@ s32 cellSpursJobGuardReset(u64 guard_ea)
     return CELL_OK;
 }
 
-/* Preserve the existing bounded polling/timeout contract. Every predicate and
- * credit consumption is serialized; no mutex is held while the walker sleeps.
- * A one-shot guard still stays open after its first release (reset becomes0). */
+/* Preserve the existing bounded timeout contract. Every predicate and credit
+ * consumption is serialized under the lock; the condition wait releases it
+ * while the walker sleeps. A one-shot guard still stays open after its first
+ * release (reset becomes 0).
+ *
+ * Notify wakes the walker at once. This used to poll with Sleep(1), which
+ * costs at least one scheduler tick (1-2 ms at a 1 ms timer resolution, 15.6
+ * ms without one) per guarded lap. Folklore's sound engine runs one guarded
+ * lap per 5.3 ms audio block and waits for it before mixing the next, so that
+ * tick alone left it behind the device at 60 FPS: it lapped the 16-block ring
+ * and whole 85 ms laps played as silence. The 10 ms bound only re-checks the
+ * stop flag and the 20 s limit. */
 static int jg_wait_cancellable(u32 ea,const atomic_int*stop)
 {
     const ULONGLONG started = GetTickCount64();
+    jg_lock();
     for (;;) {
-        if(stop&&atomic_load_explicit(stop,memory_order_acquire))return 0;
-        jg_lock();
+        if(stop&&atomic_load_explicit(stop,memory_order_acquire)){jg_unlock();return 0;}
         int i = jg_find(ea);
         if (i < 0) {
             jg_unlock();
@@ -2628,16 +2654,11 @@ static int jg_wait_cancellable(u32 ea,const atomic_int*stop)
             jg_unlock();
             return 1;
         }
-        jg_unlock();
-        /* Sleep(1) can exceed one millisecond, notably on Windows. Use the
-         * monotonic clock so the intended 20-second bound is elapsed time. */
+        /* Monotonic clock, so the 20-second bound is elapsed time. */
         if (GetTickCount64() - started >= 20000ull) break;
-#ifdef _WIN32
-        Sleep(1);
-#else
-        usleep(1000);
-#endif
+        jg_sleep_locked(10);
     }
+    jg_unlock();
     printf("[cellSpurs] guard 0x%08X still closed after 20 s -- chain gives up\n", ea);
     ps3_strict_boot_guard("spurs-job-guard-timeout", "guard=0x%08X", ea);
     return 0;
@@ -2735,16 +2756,37 @@ static void jc_signal_done(u32 jc_ea, int job_index)
     spurs_route_unlock();
 }
 
+/* Opt-in latency evidence for real job-chain work. No tracing in normal runs;
+ * slow entries only, bounded to avoid diagnostic I/O dominating the producer. */
+static u64 jc_trace_us(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
+    return (u64)(now.QuadPart / frequency.QuadPart) * 1000000ull +
+           (u64)(now.QuadPart % frequency.QuadPart) * 1000000ull / frequency.QuadPart;
+#else
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    return (u64)now.tv_sec * 1000000ull + (u64)now.tv_nsec / 1000ull;
+#endif
+}
 static s32 jc_execute(struct SpursChain*c)
 {
     u32 pc=c->entry_ea,ret_pc=0;unsigned idle=0,jobs=0;
+    const int timing=getenv("SPURS_JOB_TIMING")!=NULL;
+    unsigned timing_lines=0;
     while(!atomic_load_explicit(&c->stop,memory_order_acquire)){
         if(idle++>4096){ps3_strict_boot_guard("spurs-chain-progress-limit","chain=0x%08X pc=0x%08X jobs=%u",c->jc_ea,pc,jobs);return CELL_SPURS_TASK_ERROR_STAT;}
         if(!spurs_guest_span(pc,8,0)){ps3_strict_boot_guard("spurs-invalid-chain-command","chain=0x%08X pc=0x%08X",c->jc_ea,pc);return CELL_SPURS_TASK_ERROR_INVAL;}
         u64 cmd=vm_read64(pc);u32 op=(u32)(cmd&7),ext=(u32)(cmd&127);
         if(cmd&&op==0){
             extern u32 g_spurs_job_ls_handle;g_spurs_job_ls_handle=c->jc_ea;
+            const u64 started=timing?jc_trace_us():0;
             if(!jc_run_one_job(c,cmd&~7ull,(int)jobs,c->size_desc))return CELL_SPURS_TASK_ERROR_STAT;
+            if(timing){const u64 ended=jc_trace_us();if(ended-started>4000 && timing_lines++<256)
+                fprintf(stderr,"[spurs-job-time] chain=0x%08X job=0x%08X start_us=%llu end_us=%llu duration_us=%llu\n",
+                    c->jc_ea,(u32)(cmd&~7ull),(unsigned long long)started,
+                    (unsigned long long)ended,(unsigned long long)(ended-started));}
             ++jobs;idle=0;pc+=8;continue; /* Only the job's real protocol emits events. */
         }
         if(op==1||op==3||op==4){
@@ -2757,8 +2799,13 @@ static s32 jc_execute(struct SpursChain*c)
         if(op==7&&ext==7)return CELL_OK;
         if(op==7&&ext==15){
             if(cmd>>32)return CELL_SPURS_TASK_ERROR_INVAL;
+            const u64 started=timing?jc_trace_us():0;
             if(!jg_wait_cancellable((u32)(cmd&~127ull),&c->stop))
                 return atomic_load_explicit(&c->stop,memory_order_acquire)?CELL_OK:CELL_SPURS_TASK_ERROR_STAT;
+            if(timing){const u64 ended=jc_trace_us();if(ended-started>20000 && timing_lines++<256)
+                fprintf(stderr,"[spurs-guard-time] chain=0x%08X guard=0x%08X start_us=%llu end_us=%llu duration_us=%llu\n",
+                    c->jc_ea,(u32)(cmd&~127ull),(unsigned long long)started,
+                    (unsigned long long)ended,(unsigned long long)(ended-started));}
             pc+=8;continue;
         }
         if(cmd&&op!=2){ps3_strict_boot_guard("spurs-unsupported-chain-command","chain=0x%08X pc=0x%08X command=0x%016llX",c->jc_ea,pc,(unsigned long long)cmd);return CELL_SPURS_TASK_ERROR_INVAL;}
@@ -2794,7 +2841,7 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
     if(!jc_ea||jc_ea>UINT32_MAX)return CELL_SPURS_TASK_ERROR_INVAL;
     spurs_inst_lock();
     for(unsigned i=0;i<MAX_JOBCHAINS;i++)if(s_jobchains[i].jc_ea==(u32)jc_ea){
-        atomic_store_explicit(&s_jobchains[i].stop,1,memory_order_release);spurs_inst_unlock();return CELL_OK;
+        atomic_store_explicit(&s_jobchains[i].stop,1,memory_order_release);spurs_inst_unlock();jg_wake_all();return CELL_OK;
     }
     spurs_inst_unlock();return CELL_SPURS_TASK_ERROR_STAT;
 }

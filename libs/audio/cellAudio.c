@@ -146,6 +146,10 @@ static u64            s_audio_start_us = 0;
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
 static unsigned long long g_audio_submit_failures, g_audio_submitted;
+/* Device fill diagnostics: blocks that found the device queue empty (it ran
+ * dry: the engine played zeros) and blocks produced more than one engine
+ * period after their deadline (late submissions). */
+static unsigned long long g_audio_underruns, g_audio_late, g_audio_notify_full, g_audio_reprimes;
 static atomic_int    s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -223,6 +227,11 @@ static int audio_backend_room(void)
 }
 
 static void audio_backend_wait(void) { SDL_Delay(1); }
+/* Fill steering is WASAPI-only; SDL keeps its queue-depth heuristic. */
+static u32 audio_backend_buffer_frames(void) { return 0; }
+static u32 audio_backend_period_frames(void) { return 0; }
+static u32 audio_backend_target_frames(void) { return 0; }
+static int audio_backend_pad_silence(u32 frames) { (void)frames; return 0; }
 
 static u32 audio_backend_queued_samples(void)
 {
@@ -240,6 +249,8 @@ static IAudioClient*        s_wasapi_client = NULL;
 static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
+static UINT32               s_wasapi_period_frames = 0;
+static UINT32               s_wasapi_target_frames = 0;
 static int audio_paced(void) { return getenv("AUDIO_DEVICE_BURST") == NULL; }
 
 static int audio_backend_init(void)
@@ -286,8 +297,10 @@ static int audio_backend_init(void)
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize          = 0;
 
-    /* Request event-driven mode with a ~20ms buffer */
-    REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
+    /* Event-driven shared stream with a 100 ms buffer: room for the standing
+     * fill (audio_fill_target) plus catch-up after a late wake. The old 20 ms
+     * buffer could hold little more than one engine period. */
+    REFERENCE_TIME buf_duration = 1000000; /* 100 ms in 100 ns units */
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     hr = s_wasapi_client->lpVtbl->Initialize(
@@ -317,6 +330,14 @@ static int audio_backend_init(void)
     }
 
     s_wasapi_client->lpVtbl->GetBufferSize(s_wasapi_client, &s_wasapi_buf_frames);
+    {
+        REFERENCE_TIME default_period = 0, minimum_period = 0;
+        if (FAILED(s_wasapi_client->lpVtbl->GetDevicePeriod(s_wasapi_client, &default_period, &minimum_period)) ||
+            default_period <= 0)
+            default_period = 100000; /* 10 ms */
+        s_wasapi_period_frames = (UINT32)((default_period * CELL_AUDIO_SAMPLE_RATE + 9999999) / 10000000);
+        s_wasapi_target_frames = audio_fill_target(s_wasapi_period_frames, s_wasapi_buf_frames);
+    }
 
     hr = s_wasapi_client->lpVtbl->GetService(
         s_wasapi_client, &IID_IAudioRenderClient, (void**)&s_wasapi_render);
@@ -328,10 +349,14 @@ static int audio_backend_init(void)
     }
 
     /* A device callback is an engine quantum, not a guest block clock.
-     * Prime two guest blocks so the producer can run at 48 kHz without
-     * starving the first engine quantum. This is startup latency only. */
+     * Prime the standing fill with silence so the producer can run at 48 kHz
+     * with a margin of more than one engine pass. This is startup latency
+     * only; the pacer's trim then holds the fill there. */
+    fprintf(stderr, "[cellAudio] WASAPI shared: buffer %u frames, period %u, standing fill %u (%.1f ms)\n",
+            (unsigned)s_wasapi_buf_frames, (unsigned)s_wasapi_period_frames, (unsigned)s_wasapi_target_frames,
+            s_wasapi_target_frames * 1000.0 / CELL_AUDIO_SAMPLE_RATE);
     if (audio_paced()) {
-        UINT32 prime = CELL_AUDIO_BLOCK_SAMPLES * 2;
+        UINT32 prime = s_wasapi_target_frames;
         if (prime > s_wasapi_buf_frames) prime = s_wasapi_buf_frames;
         BYTE* buffer = NULL;
         hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, prime, &buffer);
@@ -411,6 +436,25 @@ static int audio_backend_room(void)
     return (int)(s_wasapi_buf_frames - padding);
 }
 
+/* Queue `frames` of silence behind what the device holds (see the mixer's
+ * stall handling). */
+static int audio_backend_pad_silence(u32 frames)
+{
+    BYTE* buffer = NULL;
+    if (!s_wasapi_render || !frames) return 0;
+    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, frames, &buffer);
+    if (SUCCEEDED(hr))
+        hr = s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, frames, AUDCLNT_BUFFERFLAGS_SILENT);
+    if (SUCCEEDED(hr)) return 1;
+    ++g_audio_submit_failures;
+    if (g_audio_submit_failures <= 4)
+        fprintf(stderr, "[cellAudio] re-prime failed: 0x%08lX\n", hr);
+    return 0;
+}
+static u32 audio_backend_buffer_frames(void) { return s_wasapi_buf_frames; }
+static u32 audio_backend_period_frames(void) { return s_wasapi_period_frames; }
+static u32 audio_backend_target_frames(void) { return s_wasapi_target_frames; }
+
 /* Block until the device has consumed some of its buffer. */
 static void audio_backend_wait(void)
 {
@@ -437,6 +481,31 @@ static inline float ld_be_f32(const float* p)
     float f;
     memcpy(&f, &v, 4);
     return f;
+}
+
+/* AUDIO_BLOCK_TRACE only: how many blocks after the read cursor of the first
+ * running port already hold PCM -- the game's lead over the device. Zero
+ * means the next block will be read before the game has written it. */
+static unsigned audio_ring_lead(void)
+{
+    unsigned lead = 0;
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
+        AudioPortSlot* port = &s_ports[p];
+        if (!port->in_use || !port->running || !port->buffer) continue;
+        const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+        for (u32 b = 0; b + 1 < nblock; b++) {
+            const float* bp = port->buffer + ((port->read_index + b) % nblock) * CELL_AUDIO_BLOCK_SAMPLES * nch;
+            int nz = 0;
+            for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES * nch; s += 8)
+                if (bp[s] != 0.0f) { nz = 1; break; }
+            if (!nz) break;
+            ++lead;
+        }
+        break;
+    }
+    mutex_unlock(&s_audio_mutex);
+    return lead;
 }
 
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
@@ -559,9 +628,11 @@ static void audio_notify_event_queues(void)
     for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
         if (!s_notify_queues[i].in_use) continue;
         uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
-        if (qid)
-            sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
-                                       0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
+        /* A full queue means the game's audio thread is still behind on
+         * earlier blocks: count it (the block it misses plays as silence). */
+        if (qid && sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
+                                              0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0) == -1)
+            ++g_audio_notify_full;
     }
 }
 
@@ -617,9 +688,16 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         fprintf(stderr, "[cellAudio] paced 48kHz, timer=%s, MMCSS Audio=%s\n",
                 timer ? "waitable" : "Sleep fallback", mmcss ? "enabled" : "unavailable");
     }
+    audio_fill fill = {0};
+    fill.target = audio_backend_target_frames();
+    const u32 device_frames = audio_backend_buffer_frames();
+    const uint64_t period_ticks = (uint64_t)qf.QuadPart * audio_backend_period_frames() / CELL_AUDIO_SAMPLE_RATE;
+    unsigned long long reported_underruns = 0; ULONGLONG report_at = GetTickCount64() + 60000;
     const char* trace_path = getenv("AUDIO_BLOCK_TRACE");
     FILE* trace = trace_path ? fopen(trace_path, "wb") : NULL;
-    if (trace) fprintf(trace, "block,qpc_us,room,peak,silent,dropped,submitted,submit_failures,rebases,mix_us,capture_submit_us,previous_tail_us\n");
+    if (trace) fprintf(trace, "block,qpc_us,room,peak,silent,dropped,submitted,submit_failures,rebases,mix_us,capture_submit_us,previous_tail_us,padding,target,late_us,underruns,late,trim_us,notify_full,lead,reprimes\n");
+    uint64_t late_ticks = 0;
+    unsigned long long seen_rebases = 0;
     uint64_t previous_tail_us = 0;
     LARGE_INTEGER trace_now = {0};
     while (s_mix_thread_running) {
@@ -631,12 +709,37 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         }
         if (room < 0 || paced) {
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            const uint64_t scheduled = pacer.epoch + audio_pacer_offset(&pacer);
             if (!audio_pacer_ready(&pacer, (uint64_t)now.QuadPart)) {
                 uint64_t due = audio_pacer_deadline(&pacer);
                 audio_wait_clock(timer, due > (uint64_t)now.QuadPart ? due - now.QuadPart : 1, (uint64_t)qf.QuadPart);
                 continue;
             }
+            late_ticks = (uint64_t)now.QuadPart > scheduled ? (uint64_t)now.QuadPart - scheduled : 0;
+            if (period_ticks && late_ticks > period_ticks) ++g_audio_late;
             audio_pacer_consumed(&pacer, (uint64_t)now.QuadPart);
+        }
+        u32 padding = 0;
+        if (room >= 0 && device_frames) {
+            padding = device_frames > (u32)room ? device_frames - (u32)room : 0;
+            if (padding == 0 && blocks > 0) ++g_audio_underruns;
+            /* Recover only when a >50 ms pacer stall also left the device
+             * empty. A paused endpoint can retain audio during a thread
+             * stall: adding silence there would create a new gap. Restore
+             * the standing fill after a confirmed underrun, at
+             * the gap that already exists, instead of trimming it back over
+             * ~30 s of near-empty queue and repeated underruns. No guest
+             * block is dropped, replaced or reordered. */
+            if (pacer.rebases != seen_rebases) {
+                seen_rebases = pacer.rebases;
+                if (paced && fill.target && padding == 0) {
+                    if (audio_backend_pad_silence(fill.target)) {
+                        padding = fill.target;
+                        ++g_audio_reprimes;
+                    }
+                }
+            }
+            if (paced && fill.target) audio_fill_observe(&fill, &pacer, padding);
         }
         blocks++;
         /* Mix and submit one block */
@@ -665,14 +768,23 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; ++i) {
                 float a = fabsf(s_mix_buffer[i]); if (a > peak) peak = a;
             }
-            fprintf(trace, "%llu,%llu,%d,%.9g,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", blocks,
+            fprintf(trace, "%llu,%llu,%d,%.9g,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%llu,%llu,%llu,%lld,%llu,%u,%llu\n", blocks,
                 (unsigned long long)(now.QuadPart / qf.QuadPart) * 1000000ULL +
                 (unsigned long long)(now.QuadPart % qf.QuadPart) * 1000000ULL / qf.QuadPart,
                 room, peak, peak == 0.0f, g_audio_dropped,
                 g_audio_submitted, g_audio_submit_failures, (unsigned long long)pacer.rebases,
                 (unsigned long long)(mix_end.QuadPart-mix_begin.QuadPart)*1000000ULL/qf.QuadPart,
                 (unsigned long long)(now.QuadPart-mix_end.QuadPart)*1000000ULL/qf.QuadPart,
-                (unsigned long long)previous_tail_us);
+                (unsigned long long)previous_tail_us, (unsigned)padding, (unsigned)fill.target,
+                (unsigned long long)(late_ticks*1000000ULL/qf.QuadPart), g_audio_underruns, g_audio_late,
+                (long long)(fill.trim_ticks*1000000LL/qf.QuadPart), g_audio_notify_full, audio_ring_lead(), g_audio_reprimes);
+        }
+        /* One line a minute, only when the device ran dry in that minute. */
+        if (GetTickCount64() >= report_at) {
+            if (g_audio_underruns != reported_underruns)
+                fprintf(stderr, "[cellAudio] device ran dry %llu times in the last minute (fill target %u frames, %llu late blocks so far)\n",
+                        g_audio_underruns - reported_underruns, (unsigned)fill.target, g_audio_late);
+            reported_underruns = g_audio_underruns; report_at = GetTickCount64() + 60000;
         }
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
@@ -681,8 +793,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
             if (now - t0 >= 5000) {
-                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, late %llu, notify full %llu, fill %u/%u, trim %+.0f us, device buf %u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
+                        g_audio_underruns, g_audio_late, g_audio_notify_full, (unsigned)padding, (unsigned)fill.target,
+                        fill.trim_ticks * 1e6 / (double)qf.QuadPart,
                 #if AUDIO_BACKEND_WASAPI
                         (unsigned)s_wasapi_buf_frames, 10);
 #else
