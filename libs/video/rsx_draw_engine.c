@@ -14,6 +14,7 @@
 #include "rsx_draw_batches.h"
 #include "rsx_depth_clip.h"
 #include "rsx_capture_depth.h"
+#include "rsx_hud_geometry.h"
 #ifdef PS3RECOMP_RSX_CACAO
 #include "rsx_ao_depth_state.h"
 #include "rsx_ao_position_program.h"
@@ -143,6 +144,7 @@ typedef struct {
     u64 key;
     u32 handle;
     u8 fixed;
+    u8 folklore_hud_marker;
     u16 tex_used;           /* units the pixel program samples */
 #ifdef PS3RECOMP_RSX_CACAO
     u16 position_rows[4];
@@ -161,6 +163,10 @@ static struct {
     int ready;
     int default_on;
     u32 width, height;
+    unsigned hud_percent;
+    float world_aspect,hud_horizontal_factor;
+    int hud_world_seen,hud_logged,hud_active;
+    u32 hud_composite_target,hud_draws;
 
     rsx_dispatch rsx;
 
@@ -1306,8 +1312,9 @@ static void eng_ao_depth_draw(u32 zslot, const eng_pipeline* pipeline,
         if (position_known) {
             float m[4][4];
             for (u32 row=0;row<4;++row) memcpy(m[row],g.vp_cb+rows[row]*16u,16);
-            known=rsx_ao_projection_extract(m,effective,effective+4,
-                                           (float)width/height,&projection);
+            const float camera_aspect=g.world_aspect>0 && width==1280 && height==720 &&
+                g.zdepths[zslot].samples==2 ? g.world_aspect : (float)width/height;
+            known=rsx_ao_projection_extract(m,effective,effective+4,camera_aspect,&projection);
         }
     }
     rsx_ao_depth_write(&g.zdepths[zslot].ao,g.frames,
@@ -1767,6 +1774,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+    /* Fingerprint of the owned title's status-bar VP, not translated code.
+     * Cache once so enabled HUD scaling adds no per-draw shader hashing. */
+    g.pipelines[g.n_pipelines].folklore_hud_marker=(u8)((g.hud_percent<100 || g.world_aspect>0) &&
+        !fixed && vp_instrs==56 &&
+        eng_fnv1a(vp_uc,896u,1469598103934665603ull)==0x1a26cdde5af49fecull);
     g.pipelines[g.n_pipelines].tex_used =
         (u16)(fixed ? 0xFFFFu : eng_sampled_units(s_ps_hlsl));
     *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
@@ -2665,6 +2677,7 @@ static void pd_present(u32 presented)
     }
 }
 
+#include "rsx_folklore_hud.inc"
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -2804,6 +2817,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
     xf[2] = depth_clip.scale;
     xf[6] = depth_clip.offset;
+    int hud_right=0,hud_bottom=0,hud_transformed=0;
+    if ((g.hud_percent<100 || g.world_aspect>0) && !pipeline_is_fixed &&
+        eng_folklore_hud(&rs,rt,pipeline_metadata,tex_mask,&hud_right,&hud_bottom) &&
+        !rsx_hud_compose_xf_aspect(xf,g.hud_percent,g.hud_horizontal_factor,hud_right,hud_bottom,xf)) {
+        hud_transformed=1;g.hud_draws++;
+    }
     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
     memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
 
@@ -2872,6 +2891,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
             if (gy + gh < bottom) bottom = gy + gh;
             sw = right > sx ? right - sx : 0;
             sh = bottom > sy ? bottom - sy : 0;
+        }
+        if (hud_transformed) {
+            rsx_hud_rect transformed;
+            if (!rsx_hud_scale_scissor_aspect((rsx_hud_rect){sx,sy,sw,sh},
+                rt->raster_w,rt->raster_h,g.hud_percent,g.hud_horizontal_factor,hud_right,hud_bottom,&transformed)) {
+                sx=transformed.x;sy=transformed.y;sw=transformed.w;sh=transformed.h;
+            }
         }
         g.be->set_scissor(g.be->user, sx, sy, sw, sh);
     }
@@ -3006,7 +3032,14 @@ static void eng_present(u32 buffer_id)
     }
     pd_present(target);
     g.last_present_surface = target;
+    if(g.be->set_present_aspect)
+        g.be->set_present_aspect(g.be->user,g.hud_active ? g.world_aspect : 0);
     g.be->present(g.be->user, g.surfaces[target].handle);
+    if (g.hud_draws && !g.hud_logged) {
+        fprintf(stderr,"[rsx HUD] Folklore scale %u%% transformed %u overlay draws\n",
+                g.hud_percent,g.hud_draws);g.hud_logged=1;
+    }
+    g.hud_world_seen=0;g.hud_composite_target=0;g.hud_draws=0;g.hud_active=0;
     g.frames++;
     hp_frame(g.frames);
     g.last_guest_draws = g.guest_draws;
@@ -3056,6 +3089,22 @@ int rsx_draw_engine_init(u32 width, u32 height)
     if (!g.be) return -1;
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
+    g.hud_percent=100;
+    g.world_aspect=0;g.hud_horizontal_factor=1;
+    const char* aspect=getenv("PS3RECOMP_FOLKLORE_CAMERA_ASPECT");
+    if(aspect && *aspect) {
+        char* end=NULL;double value=strtod(aspect,&end);
+        if(!end || *end || !isfinite(value) || value<16.0/9.0 || value>32.0/9.0 || !g.be->set_present_aspect) {
+            fprintf(stderr,"[rsx display] invalid or unsupported experimental camera aspect\n");return -1;
+        }
+        g.world_aspect=(float)value;
+        g.hud_horizontal_factor=(16.0f/9.0f)/g.world_aspect;
+    }
+    const char* hud=getenv("PS3RECOMP_FOLKLORE_HUD_SCALE");
+    if (hud && *hud && rsx_hud_parse_percent(hud,&g.hud_percent)) {
+        fprintf(stderr,"[rsx HUD] invalid Folklore HUD scale; expected integer50..100\n");
+        return -1;
+    }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {

@@ -233,6 +233,9 @@ typedef struct rsx_draw_backend {
                              u32 logical_w, u32 logical_h,
                              const float projection[16], u32 remap,
                              u32 rsx_format, float radius, float strength);
+    /* Optional per-present camera aspect. Zero restores native surface aspect.
+     * Does not resize guest targets or change their texture coordinates. */
+    void (*set_present_aspect)(void* user, float aspect);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

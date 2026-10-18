@@ -575,6 +575,21 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
         target_compile_options(test_rsx_vulkan_anisotropy PRIVATE -Wall -Wextra -Werror)
         target_link_libraries(test_rsx_vulkan_anisotropy PRIVATE m)
         add_executable(test_rsx_vulkan_resolution EXCLUDE_FROM_ALL libs/video/tests/test_rsx_vulkan_resolution.c)
+        add_executable(test_rsx_display_geometry EXCLUDE_FROM_ALL libs/video/tests/test_rsx_display_geometry.c)
+        add_executable(test_rsx_hud_geometry EXCLUDE_FROM_ALL libs/video/tests/test_rsx_hud_geometry.c)
+        target_compile_options(test_rsx_hud_geometry PRIVATE -Wall -Wextra -Werror)
+        target_link_libraries(test_rsx_hud_geometry PRIVATE m)
+        add_executable(test_vulkan_display_gpu EXCLUDE_FROM_ALL
+            tests/test_vulkan_display_gpu.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_vulkan_display_gpu PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_link_libraries(test_vulkan_display_gpu PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(test_vulkan_display_gpu PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_vulkan_display_gpu PROPERTIES LINKER_LANGUAGE CXX)
         add_executable(test_vulkan_resolution_gpu EXCLUDE_FROM_ALL
             tests/test_vulkan_resolution_gpu.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
         target_include_directories(test_vulkan_resolution_gpu PRIVATE

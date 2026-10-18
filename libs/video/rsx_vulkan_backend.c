@@ -50,6 +50,7 @@
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
 #include "rsx_resolution_scale.h"
+#include "rsx_display_geometry.h"
 #include "rsx_vulkan_anisotropy.h"
 #include "rsx_depth_clip.h"
 #include "rsx_frame_dump.h"
@@ -163,6 +164,8 @@ typedef struct vk_state {
     VkPhysicalDeviceMemoryProperties memprops;
 
     u32              width, height;
+    rsx_display_rect content_rect;  /* valid image inside the output canvas */
+    float present_aspect;
     int              fxaa_enabled;
     u64              fxaa_frames;
     int              fsr1_enabled, fsr1_failed, fsr1_scale_fallback;
@@ -217,6 +220,7 @@ typedef struct vk_state {
     u32              anisotropy_override; /* Immutable for this device lifetime. */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
+    int              selected_display; /* SDL display index for window/fullscreen */
     SDL_Window*      window;
     const char*      inst_exts[16];
     u32              inst_ext_count;
@@ -390,7 +394,7 @@ static int vk_pick_device(void)
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     /* Vulkan guarantees 4096; the engine's targets and textures may use what
      * the device really has (a title's 4608-wide target on RADV). */
-    s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
+    s_vk.max_dim = p.limits.maxImageDimension2D;
     s_vk.max_anisotropy = p.limits.maxSamplerAnisotropy;
     VK_LOG("using device %d: %s\n", best, p.deviceName);
     return 0;
@@ -1782,6 +1786,63 @@ static int vk_env_on(const char* name)
     return v && v[0] && v[0] != '0';
 }
 
+static int vk_select_display(void)
+{
+    const int count=SDL_GetNumVideoDisplays();
+    const char* value=getenv("PS3RECOMP_VK_DISPLAY");
+    if (!value || !value[0]) return 0;
+    int index=0;
+    if (rsx_display_parse_index(value,count,&index)) {
+        VK_LOG("PS3RECOMP_VK_DISPLAY=%s invalid (display count %d); using display 0\n",value,count);
+        return 0;
+    }
+    return index;
+}
+
+static int vk_selected_display_bounds(SDL_Rect* bounds)
+{
+    if (SDL_GetDisplayUsableBounds(s_vk.selected_display,bounds)==0 &&
+        bounds->w>0 && bounds->h>0) return 0;
+    if (SDL_GetDisplayBounds(s_vk.selected_display,bounds)==0 &&
+        bounds->w>0 && bounds->h>0) return 0;
+    VK_LOG("display %d bounds unavailable: %s\n",s_vk.selected_display,SDL_GetError());
+    return -1;
+}
+
+/* The RSX canvas remains at its requested size; only the SDL client area is
+ * shrunk. Leave room for decorations and the taskbar on the chosen display. */
+static void vk_place_window_on_display(void)
+{
+    SDL_Rect bounds;
+    if (!s_vk.window || vk_selected_display_bounds(&bounds)) return;
+    int top=0,left=0,bottom=0,right=0;
+    if (SDL_GetWindowBordersSize(s_vk.window,&top,&left,&bottom,&right)!=0)
+        top=left=bottom=right=0;
+    if (top<0) top=0; if (left<0) left=0;
+    if (bottom<0) bottom=0; if (right<0) right=0;
+    const int reserve_w=(left+right)>64 ? left+right : 64;
+    const int reserve_h=(top+bottom)>96 ? top+bottom : 96;
+    const uint32_t available_w=(uint32_t)(bounds.w>reserve_w ? bounds.w-reserve_w : 1);
+    const uint32_t available_h=(uint32_t)(bounds.h>reserve_h ? bounds.h-reserve_h : 1);
+    int current_w=0,current_h=0;
+    SDL_GetWindowSize(s_vk.window,&current_w,&current_h);
+    uint32_t w=1,h=1;
+    if (rsx_display_window_size((uint32_t)(current_w>0?current_w:1),
+                                (uint32_t)(current_h>0?current_h:1),
+                                available_w,available_h,&w,&h)==0 &&
+        ((int)w!=current_w || (int)h!=current_h))
+        SDL_SetWindowSize(s_vk.window,(int)w,(int)h);
+    SDL_GetWindowSize(s_vk.window,&current_w,&current_h);
+    const int outer_w=current_w+left+right,outer_h=current_h+top+bottom;
+    SDL_SetWindowPosition(s_vk.window,
+                          bounds.x+left+(bounds.w-outer_w)/2,
+                          bounds.y+top+(bounds.h-outer_h)/2);
+    const char* display_name=SDL_GetDisplayName(s_vk.selected_display);
+    VK_LOG("window display %d (%s): usable %dx%d, client %dx%d, canvas %ux%u\n",
+           s_vk.selected_display,display_name?display_name:"unknown",
+           bounds.w,bounds.h,current_w,current_h,s_vk.width,s_vk.height);
+}
+
 static void vk_window_drop(const char* why)
 {
     if (why) VK_LOG("window disabled, continuing headless: %s\n", why);
@@ -1851,11 +1912,22 @@ static void vk_window_open(const char* title)
         return;
     }
 #endif
-    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
-    if (vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    s_vk.selected_display=vk_select_display();
+    SDL_Rect bounds;
+    uint32_t window_w=s_vk.width,window_h=s_vk.height;
+    if (vk_selected_display_bounds(&bounds)) {
+        bounds.x=bounds.y=0;
+        bounds.w=(int)s_vk.width;bounds.h=(int)s_vk.height;
+    }
+    const uint32_t available_w=(uint32_t)(bounds.w>64 ? bounds.w-64 : 1);
+    const uint32_t available_h=(uint32_t)(bounds.h>96 ? bounds.h-96 : 1);
+    (void)rsx_display_window_size(s_vk.width,s_vk.height,available_w,available_h,
+                                  &window_w,&window_h);
+    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
-                                   SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                   (int)s_vk.width, (int)s_vk.height, flags);
+                                   SDL_WINDOWPOS_CENTERED_DISPLAY(s_vk.selected_display),
+                                   SDL_WINDOWPOS_CENTERED_DISPLAY(s_vk.selected_display),
+                                   (int)window_w, (int)window_h, flags);
     s_vk.windowed = 1;          /* so vk_window_drop also shuts SDL video down */
     if (!s_vk.window) {
         char why[256];
@@ -1863,6 +1935,10 @@ static void vk_window_open(const char* title)
         vk_window_drop(why);
         return;
     }
+    vk_place_window_on_display();
+    if (vk_env_on("PS3RECOMP_VK_FULLSCREEN") &&
+        SDL_SetWindowFullscreen(s_vk.window,SDL_WINDOW_FULLSCREEN_DESKTOP)!=0)
+        VK_LOG("startup fullscreen transition failed: %s\n",SDL_GetError());
     ps3_pad_keyboard_attach(SDL_GetWindowID(s_vk.window));
     ps3_pad_keyboard_focus(SDL_GetWindowID(s_vk.window),
                            !!(SDL_GetWindowFlags(s_vk.window)&SDL_WINDOW_INPUT_FOCUS));
@@ -2015,14 +2091,9 @@ static int vk_prepare_window_present(void)
  * destination, centred. Equal shapes give the whole destination. */
 static void vk_fit_rect(u32 sw, u32 sh, u32 dw, u32 dh, u32* x, u32* y, u32* w, u32* h)
 {
-    u32 fw = dw, fh = dh;
-    if (sw && sh && (u64)sw * dh != (u64)sh * dw) {
-        fh = (u32)((u64)dw * sh / sw);
-        if (fh > dh) { fh = dh; fw = (u32)((u64)dh * sw / sh); }
-        if (!fw) fw = 1;
-        if (!fh) fh = 1;
-    }
-    *w = fw; *h = fh; *x = (dw - fw) / 2; *y = (dh - fh) / 2;
+    rsx_display_rect r={0,0,dw,dh};
+    (void)rsx_display_fit(sw,sh,dw,dh,&r);
+    *x=r.x; *y=r.y; *w=r.w; *h=r.h;
 }
 
 /* Blit the offscreen target into the next swapchain image and present it. */
@@ -2055,7 +2126,10 @@ static void vk_present_window(void)
      * black bars instead of being stretched to fill it. */
     const u32 dw = s_vk.sc_extent.width, dh = s_vk.sc_extent.height;
     u32 fx, fy, fit_w, fit_h;
-    vk_fit_rect(s_vk.width, s_vk.height, dw, dh, &fx, &fy, &fit_w, &fit_h);
+    /* Crop only the bars we added, then fit once. Fitting the whole canvas
+     * again leaves bars on all four sides when the window aspect changes. */
+    const rsx_display_rect content=s_vk.content_rect;
+    vk_fit_rect(content.w, content.h, dw, dh, &fx, &fy, &fit_w, &fit_h);
     const int32_t fit_x = (int32_t)fx, fit_y = (int32_t)fy;
     if (fit_w != dw || fit_h != dh) {
         const VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
@@ -2070,7 +2144,8 @@ static void vk_present_window(void)
     }
     VkImageBlit blit = {
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+        .srcOffsets = { { (int32_t)content.x, (int32_t)content.y, 0 },
+                        { (int32_t)(content.x+content.w), (int32_t)(content.y+content.h), 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .dstOffsets = { { fit_x, fit_y, 0 },
                         { fit_x + (int32_t)fit_w, fit_y + (int32_t)fit_h, 1 } },
@@ -2540,6 +2615,12 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
 
 /* The named surface becomes the frame: blit it onto the display image, then
  * the existing present does the readback, the PPM dump and the window. */
+static void vk_eng_set_present_aspect(void* user,float aspect)
+{
+    (void)user;
+    s_vk.present_aspect=isfinite(aspect) && aspect>=16.0f/9.0f && aspect<=32.0f/9.0f ? aspect : 0;
+}
+
 static void vk_eng_present(void* user, u32 surface)
 { vk_flush_pending(0);
     (void)user;
@@ -2551,7 +2632,13 @@ static void vk_eng_present(void* user, u32 surface)
      * image at its own aspect with black bars: stretching it distorts the
      * picture, and the game renders no wider view. */
     u32 fit_x = 0, fit_y = 0, fit_w = s_vk.width, fit_h = s_vk.height;
-    if (o) vk_fit_rect(o->w, o->h, s_vk.width, s_vk.height, &fit_x, &fit_y, &fit_w, &fit_h);
+    if (o && !(s_vk.present_aspect>0 &&
+               fabs((double)s_vk.present_aspect-(double)s_vk.width/s_vk.height)<0.000001)) {
+        const u32 aspect_h=s_vk.present_aspect>0 ? 1000000u : o->h;
+        const u32 aspect_w=s_vk.present_aspect>0 ? (u32)(s_vk.present_aspect*1000000.0f+0.5f) : o->w;
+        vk_fit_rect(aspect_w,aspect_h,s_vk.width,s_vk.height,&fit_x,&fit_y,&fit_w,&fit_h);
+    }
+    s_vk.content_rect=(rsx_display_rect){fit_x,fit_y,fit_w,fit_h};
     if (o && s_vk.fsr1_enabled && !s_vk.fsr1_failed) {
         if (fit_w < o->w || fit_h < o->h ||
             (o->fmt != VK_FORMAT_R8G8B8A8_UNORM && o->fmt != VK_FORMAT_B8G8R8A8_UNORM)) {
@@ -3817,6 +3904,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,
+    .set_present_aspect   = vk_eng_set_present_aspect,
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
@@ -3850,6 +3938,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     }
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
+    if (!rsx_display_extent_valid(s_vk.width,s_vk.height,8192)) {
+        VK_LOG("output extent %ux%u exceeds 8192 per axis or 33554432 pixels\n",s_vk.width,s_vk.height);
+        return -1;
+    }
+    s_vk.content_rect=(rsx_display_rect){0,0,s_vk.width,s_vk.height};
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
     /* Writing a full frame to disk on every present costs more than the
      * present itself and slows a title enough to change what it does; a
@@ -3902,6 +3995,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         if (!s_vk.windowed) return -1;
         vk_window_drop("no device can present to the window");
         if (vk_pick_device()) return -1;
+    }
+    if (!rsx_display_extent_valid(s_vk.width,s_vk.height,s_vk.max_dim)) {
+        VK_LOG("output extent %ux%u exceeds device limit %u\n",s_vk.width,s_vk.height,s_vk.max_dim);
+        return -1;
     }
 
     float prio = 1.0f;
@@ -4118,6 +4215,27 @@ int rsx_vulkan_backend_pump_messages(void)
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        const Uint32 window_id=SDL_GetWindowID(s_vk.window);
+        if (e.type==SDL_KEYDOWN && e.key.windowID==window_id &&
+            e.key.keysym.sym==SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)) {
+            if (!e.key.repeat) {
+                const Uint32 mode=(SDL_GetWindowFlags(s_vk.window)&SDL_WINDOW_FULLSCREEN_DESKTOP)
+                                  ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP;
+                if (mode) vk_place_window_on_display();
+                if (SDL_SetWindowFullscreen(s_vk.window,mode)==0) {
+                    s_vk.swapchain_dirty=1;
+                    VK_LOG("window mode: %s\n",mode?"borderless fullscreen":"windowed");
+                } else VK_LOG("fullscreen transition failed: %s\n",SDL_GetError());
+            }
+            continue; /* Alt+Enter must not also press the guest Start button. */
+        }
+        if (e.type==SDL_WINDOWEVENT && e.window.windowID==window_id) {
+            if (e.window.event==SDL_WINDOWEVENT_SIZE_CHANGED ||
+                e.window.event==SDL_WINDOWEVENT_RESTORED ||
+                e.window.event==SDL_WINDOWEVENT_MINIMIZED)
+                s_vk.swapchain_dirty=1;
+            if (e.window.event==SDL_WINDOWEVENT_CLOSE) quit=1;
+        }
         ps3_pad_keyboard_sdl_event(&e,SDL_GetWindowID(s_vk.window));
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
