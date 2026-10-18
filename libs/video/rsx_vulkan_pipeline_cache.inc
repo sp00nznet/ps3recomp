@@ -52,6 +52,7 @@ static struct {
     SDL_atomic_t dirty;            /* pipelines created since the last save started */
     SDL_atomic_t saving;           /* a background save is running */
     SDL_atomic_t created, loaded_ok;
+    SDL_Thread* save_thread;       /* joined before reuse or device destruction */
     Uint32 last_save_ms;
     unsigned saves, save_failures;
 } s_pcache;
@@ -180,6 +181,8 @@ static int SDLCALL vk_pcache_save_thread(void* ud)
     vk_pcache_job* job = (vk_pcache_job*)ud;
     const Uint32 t0 = SDL_GetTicks();
     const int rc = vk_pcache_save_now(job->device);
+    /* A failed write must be retried even if no further pipelines appear. */
+    if (rc != 0) SDL_AtomicAdd(&s_pcache.dirty, 1);
     VK_LOG("pipeline cache: background save %s in %u ms (pipelines created this session %d)\n",
            rc == 0 ? "ok" : "failed", SDL_GetTicks() - t0, SDL_AtomicGet(&s_pcache.created));
     free(job);
@@ -196,13 +199,17 @@ static void vk_pcache_tick(VkDevice device)
     const Uint32 now = SDL_GetTicks();
     if (s_pcache.last_save_ms && now - s_pcache.last_save_ms < PCACHE_SAVE_INTERVAL_MS) return;
     if (!SDL_AtomicCAS(&s_pcache.saving, 0, 1)) return;
+    if (s_pcache.save_thread) {
+        SDL_WaitThread(s_pcache.save_thread, NULL);
+        s_pcache.save_thread = NULL;
+    }
     vk_pcache_job* job = (vk_pcache_job*)malloc(sizeof *job);
     if (!job) { SDL_AtomicSet(&s_pcache.saving, 0); return; }
     job->device = device;
     SDL_AtomicSet(&s_pcache.dirty, 0);
     s_pcache.last_save_ms = now ? now : 1;
     SDL_Thread* t = SDL_CreateThread(vk_pcache_save_thread, "vk-pcache-save", job);
-    if (t) SDL_DetachThread(t);
+    if (t) s_pcache.save_thread = t;
     else { free(job); SDL_AtomicSet(&s_pcache.dirty, 1); SDL_AtomicSet(&s_pcache.saving, 0); }
 }
 
@@ -260,15 +267,16 @@ static void vk_pcache_init(VkInstance instance, VkPhysicalDevice phys, VkDevice 
 static void vk_pcache_shutdown(VkDevice device)
 {
     if (!s_pcache.cache) return;
-    for (int i = 0; i < 500 && SDL_AtomicGet(&s_pcache.saving); i++) SDL_Delay(10);
-    if (!SDL_AtomicGet(&s_pcache.saving)) {
-        if (SDL_AtomicGet(&s_pcache.dirty) && vk_pcache_save_now(device) == 0)
-            SDL_AtomicSet(&s_pcache.dirty, 0);
-        VK_LOG("pipeline cache: shutdown, created=%d saves=%u failures=%u\n",
-               SDL_AtomicGet(&s_pcache.created), s_pcache.saves, s_pcache.save_failures);
-        pvkDestroyPipelineCache(device, s_pcache.cache, NULL);
+    if (s_pcache.save_thread) {
+        /* The worker calls Vulkan with this device and writes s_pcache. A
+         * timeout cannot make either resource safe to destroy or reset. */
+        SDL_WaitThread(s_pcache.save_thread, NULL);
+        s_pcache.save_thread = NULL;
     }
-    /* A save that never finished keeps the cache object alive; the device is
-     * being destroyed anyway and the file on disk is the previous good copy. */
+    if (SDL_AtomicGet(&s_pcache.dirty) && vk_pcache_save_now(device) == 0)
+        SDL_AtomicSet(&s_pcache.dirty, 0);
+    VK_LOG("pipeline cache: shutdown, created=%d saves=%u failures=%u\n",
+           SDL_AtomicGet(&s_pcache.created), s_pcache.saves, s_pcache.save_failures);
+    pvkDestroyPipelineCache(device, s_pcache.cache, NULL);
     s_pcache.cache = VK_NULL_HANDLE;
 }
