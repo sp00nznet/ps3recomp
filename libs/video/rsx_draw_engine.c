@@ -1075,6 +1075,16 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                             w, h, nlv, faces, remap, fmt);
     if (!handle) return 0;
+    {   /* RSX_ENGINE_UPLOAD_LOG=N: the first N uploads (diagnostic). */
+        static int left = -1;
+        if (left < 0) { const char* e = getenv("RSX_ENGINE_UPLOAD_LOG"); left = e ? atoi(e) : 0; }
+        if (left > 0) {
+            left--;
+            fprintf(stderr, "[rsx engine] upload frame=%u loc=%u off=0x%08X fmt=0x%02X base=0x%02X %ux%u levels=%u faces=%u swz=%d pitch=%u\n",
+                    g.frames, location, offset, fmt, lv[0].tl.base_format, w, h, nlv, faces,
+                    (int)lv[0].tl.swizzled, pitch);
+        }
+    }
 
     for (u32 f = 0; f < faces; f++) {
         const u8* face = src + (size_t)f * face_stride;
