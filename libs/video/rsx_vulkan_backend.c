@@ -552,8 +552,21 @@ static void vk_invalidate(vk_buffer* b)
 #define VK_BATCH_VB_MIN    (8u << 20)         /* vertex ring floor */
 #define VK_BATCH_IB_MIN    (2u << 20)         /* index ring floor */
 #define VK_BATCH_UBO_BYTES (16u << 20)        /* constants ring */
+/* Texture uploads are deferred the same way: their bytes go into a staging
+ * ring and their copies are recorded after the batched draws (each behind a
+ * full barrier, as before) instead of one allocate/submit/wait/free each.
+ * A save load in Folklore issued 724 of those in one frame (~120 ms of
+ * waits plus allocation). PS3RECOMP_VK_DEFER_UPLOADS=0 restores them. */
+#define VK_UPLOAD_RING_MIN (32u << 20)
+#define VK_UPLOAD_RING_MAX (512u << 20)
+#define VK_UPLOAD_ALIGN    256u
 static struct {
     int on, configured, stats, failed;
+    int defer;                     /* texture uploads deferred into the batch */
+    u32 uploads;                   /* deferred uploads recorded in s_vk.cmd */
+    vk_buffer ring;                /* upload staging ring */
+    VkDeviceSize rc;               /* its cursor */
+    u64 deferred_uploads;
     u32 max;                       /* draws per batch (PS3RECOMP_VK_BATCH_MAX) */
     u32 trace;                     /* PS3RECOMP_VK_BATCH_TRACE: events left to log */
     int recording;                 /* s_vk.cmd begun, not yet submitted */
@@ -579,7 +592,10 @@ static void vk_batch_configure(void)
     const char* mx = getenv("PS3RECOMP_VK_BATCH_MAX");
     s_batch.max = mx ? (u32)strtoul(mx, NULL, 10) : VK_BATCH_SETS;
     if (!s_batch.max || s_batch.max > VK_BATCH_SETS) s_batch.max = VK_BATCH_SETS;
-    VK_LOG("engine draw batching: %s\n", s_batch.on ? "on" : "off (PS3RECOMP_VK_BATCH=0)");
+    const char* du = getenv("PS3RECOMP_VK_DEFER_UPLOADS");
+    s_batch.defer = s_batch.on && !(du && du[0] == '0');
+    VK_LOG("engine draw batching: %s, texture uploads %s\n", s_batch.on ? "on" : "off (PS3RECOMP_VK_BATCH=0)",
+           s_batch.defer ? "deferred" : "waited");
 }
 
 /* Diagnostic: the backend assumes one calling thread. */
@@ -597,8 +613,8 @@ static void vk_batch_thread_check(const char* where)
 static int vk_begin(void)
 {
     vk_batch_thread_check("begin");
-    /* Append after batched draws; otherwise start fresh, as before. */
-    if (s_batch.recording && s_batch.pending) return 0;
+    /* Append after batched draws and uploads; otherwise start fresh, as before. */
+    if (s_batch.recording && (s_batch.pending || s_batch.uploads)) return 0;
     s_batch.recording = 0;
     VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -617,6 +633,7 @@ static int vk_submit_and_wait_impl(const char* site)
     if (s_batch.trace) { s_batch.trace--; VK_LOG("batch-trace: submit pending=%u recording=%d\n", drawn, s_batch.recording); }
     s_batch.recording = 0;
     s_batch.pending = 0;
+    s_batch.uploads = 0;
     const Uint64 hp_begin = vhp_tick();
     Uint64 hp_queued = hp_begin;
     VkResult r = pvkEndCommandBuffer(s_vk.cmd);
@@ -631,6 +648,7 @@ static int vk_submit_and_wait_impl(const char* site)
     const Uint64 hp_waited = vhp_tick();
     /* Whether it ran or failed, nothing recorded is pending any more. */
     s_batch.vb = s_batch.ib = s_batch.ub = 0;
+    s_batch.rc = 0;
     if (s_batch.pool && s_batch.sets) pvkResetDescriptorPool(s_vk.device, s_batch.pool, 0);
     s_batch.sets = 0;
     vhp_record(drawn, hp_begin, hp_queued, hp_waited, (int)r, site);
@@ -638,9 +656,10 @@ static int vk_submit_and_wait_impl(const char* site)
     s_batch.batched += drawn;
     if (s_batch.stats && s_batch.draws - s_batch.last_report >= 20000) {
         s_batch.last_report = s_batch.draws;
-        VK_LOG("batch: submits=%llu draws=%llu batched=%llu flush entry=%llu destroy=%llu ring=%llu fallback=%llu\n",
+        VK_LOG("batch: submits=%llu draws=%llu batched=%llu uploads=%llu flush entry=%llu destroy=%llu ring=%llu fallback=%llu\n",
                (unsigned long long)s_batch.submits, (unsigned long long)s_batch.draws,
-               (unsigned long long)s_batch.batched, (unsigned long long)s_batch.flush[0],
+               (unsigned long long)s_batch.batched, (unsigned long long)s_batch.deferred_uploads,
+               (unsigned long long)s_batch.flush[0],
                (unsigned long long)s_batch.flush[1], (unsigned long long)s_batch.flush[2],
                (unsigned long long)s_batch.flush[3]);
     }
@@ -654,7 +673,7 @@ static int vk_submit_and_wait_impl(const char* site)
  * reason: 0 entry point, 1 object destruction, 2 ring/pool full, 3 fallback. */
 static void vk_flush_pending_impl(int reason, const char* site)
 {
-    if (!s_batch.recording || !s_batch.pending) return;
+    if (!s_batch.recording || !(s_batch.pending || s_batch.uploads)) return;
     if (reason >= 0 && reason < 4) s_batch.flush[reason]++;
     if (s_batch.trace) { s_batch.trace--; VK_LOG("batch-trace: flush reason=%d pending=%u\n", reason, s_batch.pending); }
     vk_submit_and_wait_impl(site);
@@ -2115,6 +2134,8 @@ static void vk_present_window(void)
         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
     }
 
+    /* This submission bypasses vk_submit_and_wait, so nothing may be pending. */
+    vk_flush_pending(0);
     if (vk_begin()) return;
     vk_barrier_image(display, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkImageMemoryBarrier b = {
@@ -2346,11 +2367,53 @@ static vk_eng_obj* vk_eng_get(u32 handle, int kind)
 
 /* Copy `rows` rows of `w` texels from host memory into a w x h rectangle at
  * (x, y) of one level / layer of an image that is in GENERAL. */
+/* Room for `bytes` in the upload ring, flushing (or growing it) when short.
+ * Returns 0 and the offset, or -1 to fall back to a waited upload. */
+static int vk_upload_ring_reserve(VkDeviceSize bytes, VkDeviceSize* off)
+{
+    if (!s_batch.defer || !bytes || bytes > VK_UPLOAD_RING_MAX) return -1;
+    VkDeviceSize at = (s_batch.rc + VK_UPLOAD_ALIGN - 1u) & ~(VkDeviceSize)(VK_UPLOAD_ALIGN - 1u);
+    if (s_batch.ring.buf && at + bytes <= s_batch.ring.size) { *off = at; s_batch.rc = at + bytes; return 0; }
+    vk_flush_pending(2);           /* the ring's bytes are free once nothing is pending */
+    if (!s_batch.ring.buf || bytes > s_batch.ring.size) {
+        VkDeviceSize size = s_batch.ring.size ? s_batch.ring.size : VK_UPLOAD_RING_MIN;
+        while (size < bytes) size *= 2u;
+        vk_destroy_buffer(&s_batch.ring);
+        if (vk_create_host_buffer(&s_batch.ring, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
+            !s_batch.ring.coherent) {
+            vk_destroy_buffer(&s_batch.ring);
+            VK_LOG("texture upload ring (%llu bytes) unavailable; uploads waited\n", (unsigned long long)size);
+            s_batch.defer = 0;
+            return -1;
+        }
+    }
+    s_batch.rc = bytes; *off = 0;
+    return 0;
+}
+
 static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
                                 u32 w, u32 h, size_t tight, u32 rows,
                                 const void* src, u32 row_bytes)
 {
     if (tight > row_bytes) tight = row_bytes;
+    vk_batch_configure();
+    VkDeviceSize off;
+    if (vk_upload_ring_reserve((VkDeviceSize)tight * rows, &off) == 0) {
+        for (u32 y = 0; y < rows; y++)
+            memcpy((u8*)s_batch.ring.ptr + off + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
+        if (vk_begin()) return -1;
+        vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkBufferImageCopy region = {
+            .bufferOffset = off,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+            .imageOffset = { (int32_t)x, (int32_t)y, 0 },
+            .imageExtent = { w, h, 1 },
+        };
+        pvkCmdCopyBufferToImage(s_vk.cmd, s_batch.ring.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        s_batch.uploads++;
+        s_batch.deferred_uploads++;
+        return 0;
+    }
     vk_buffer st = {0};
     if (vk_create_host_buffer(&st, (VkDeviceSize)tight * rows, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
         !st.coherent) { vk_destroy_buffer(&st); return -1; }
@@ -2786,7 +2849,10 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
  * (vk_eng_split_layout). */
 static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                  u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
-{ vk_flush_pending(0);
+{   /* A new image and a recorded layout change: nothing here touches what
+     * pending draws use, so with deferred uploads it joins their batch. */
+    vk_batch_configure();
+    if (!s_batch.defer) vk_flush_pending(0);
     (void)user;
     u32 bpp;
     const VkFormat vf = vk_eng_format(fmt, &bpp);
@@ -2824,6 +2890,7 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
     if (vk_begin()) goto fail;
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (s_batch.defer) { s_batch.uploads++; return hd; }
     if (vk_submit_and_wait()) goto fail;
     return hd;
 fail:
@@ -2834,7 +2901,10 @@ fail:
 
 static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u32 w, u32 h,
                                   const void* src, u32 row_bytes, u32 rows)
-{ vk_flush_pending(0);
+{   /* The rows are copied into the ring now and the copy is ordered after
+     * the pending draws on the GPU, so it need not wait for them. */
+    vk_batch_configure();
+    if (!s_batch.defer) vk_flush_pending(0);
     (void)user;
     vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
     if (!o || !src || !row_bytes || !rows || face >= (o->cube ? 6u : 1u)) return;
@@ -3420,9 +3490,10 @@ static void vk_eng2_shutdown(void* user)
     vk_flush_pending(0);
     if (s_batch.pool) pvkDestroyDescriptorPool(s_vk.device, s_batch.pool, NULL);
     vk_destroy_buffer(&s_batch.ubo);
-    { const int on = s_batch.on, configured = s_batch.configured, stats = s_batch.stats;
+    vk_destroy_buffer(&s_batch.ring);
+    { const int on = s_batch.on, configured = s_batch.configured, stats = s_batch.stats, defer = s_batch.defer;
       memset(&s_batch, 0, sizeof s_batch);
-      s_batch.on = on; s_batch.configured = configured; s_batch.stats = stats; }
+      s_batch.on = on; s_batch.configured = configured; s_batch.stats = stats; s_batch.defer = defer; }
     for (u32 i = 1; i <= VK_ENG_MAX_PIPE; i++) vk_eng_pipeline_release(user, i);
     vk_eng_drop_framebuffers();
     for (u32 si = 0; si < 3; si++)
