@@ -140,6 +140,7 @@ int main(int argc,char**argv)
  if(emit_event){queue=sys_event_queue_create_direct(0,1);C(queue);C(cellSpursAttachLv2EventQueue((CellSpurs*)(uintptr_t)0x10000,queue,(uint8_t*)(uintptr_t)0x23000,1)==0);C(vm_base[0x23000]==16);receive(queue,0,worker);}
  spurs_owner_token requested=owner;if(is("stale"))requested.generation++;
  spurs_native_job_result r=spurs_native_job_dispatch(&snap,requested,0);
+ C(r.profile_registered); /* Identity survives later admission/execution failure. */
  int shape=(!strncmp(mode,"wrong-",6)&&!is("wrong-put-payload"))||is("guest-unsupported")||is("guest-overlay");
  int admission=is("strict-off")||is("guest-strict-off")||is("busy")||is("stale")||is("nonquiescent");
  int negative=shape||is("wrong-put-payload")||is("late-get-mismatch")||is("missing-all")||is("missing-last")||is("extra");
