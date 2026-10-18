@@ -453,7 +453,8 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
     return vk_create_image_levels(im, fmt, w, h, 1, usage, aspect);
 }
 
-static void vk_flush_pending(int reason);
+static void vk_flush_pending_impl(int reason, const char* site);
+#define vk_flush_pending(reason) vk_flush_pending_impl((reason), __func__)
 
 static void vk_destroy_image(vk_image* im)
 {
@@ -603,7 +604,7 @@ static int vk_begin(void)
 
 #include "rsx_vk_host_profile.h"
 
-static int vk_submit_and_wait(void)
+static int vk_submit_and_wait_impl(const char* site)
 {
     vk_batch_thread_check("submit");
     const u32 drawn = s_batch.pending;
@@ -626,7 +627,7 @@ static int vk_submit_and_wait(void)
     s_batch.vb = s_batch.ib = s_batch.ub = 0;
     if (s_batch.pool && s_batch.sets) pvkResetDescriptorPool(s_vk.device, s_batch.pool, 0);
     s_batch.sets = 0;
-    vhp_record(drawn, hp_begin, hp_queued, hp_waited, (int)r);
+    vhp_record(drawn, hp_begin, hp_queued, hp_waited, (int)r, site);
     s_batch.submits++;
     s_batch.batched += drawn;
     if (s_batch.stats && s_batch.draws - s_batch.last_report >= 20000) {
@@ -641,14 +642,16 @@ static int vk_submit_and_wait(void)
     return 0;
 }
 
+#define vk_submit_and_wait() vk_submit_and_wait_impl(__func__)
+
 /* Submit and wait for batched draws, if any.
  * reason: 0 entry point, 1 object destruction, 2 ring/pool full, 3 fallback. */
-static void vk_flush_pending(int reason)
+static void vk_flush_pending_impl(int reason, const char* site)
 {
     if (!s_batch.recording || !s_batch.pending) return;
     if (reason >= 0 && reason < 4) s_batch.flush[reason]++;
     if (s_batch.trace) { s_batch.trace--; VK_LOG("batch-trace: flush reason=%d pending=%u\n", reason, s_batch.pending); }
-    vk_submit_and_wait();
+    vk_submit_and_wait_impl(site);
 }
 
 /* Order this command buffer's use of an image after everything submitted

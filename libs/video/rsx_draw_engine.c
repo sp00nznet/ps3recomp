@@ -1841,6 +1841,7 @@ static int dc_reserve_indices(u32 count)
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
+    u64 hp_refs_started=hp_tick();
     for (u32 b = 0; b < dc.arr.count && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr.data[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr.data[b].first + i, 0)) dc.fetch_ok = 0;
@@ -1881,6 +1882,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             }
         }
     }
+    hp_end(HP_VREFS,hp_refs_started);
     if (!dc.fetch_ok) return;
 
     dc.n_source_refs = dc.n_refs;
@@ -1888,11 +1890,13 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
      * repeated references. A line strip or a point list is drawn in the order
      * it arrived, so collapsing duplicates would reorder it. */
     if (allow_remap && dc.n_refs > 1) {
+        u64 hp_remap_started=hp_tick();
         u32 unique = dc.n_refs;
         if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
             dc.refs_remapped = unique < dc.n_refs;
             dc.n_refs = unique;
         }
+        hp_end(HP_REMAP,hp_remap_started);
     }
 
     dc.layout = *layout;

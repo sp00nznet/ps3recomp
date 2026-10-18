@@ -10,7 +10,7 @@
 #else
 #include <time.h>
 #endif
-enum { HP_VERTEX, HP_TARGET, HP_PIPELINE, HP_TEXTURE, HP_DRAW, HP_HASH, HP_UPLOAD, HP_VPREP, HP_VDECODE, HP_BUCKETS };
+enum { HP_VERTEX, HP_TARGET, HP_PIPELINE, HP_TEXTURE, HP_DRAW, HP_HASH, HP_UPLOAD, HP_VPREP, HP_VDECODE, HP_VREFS, HP_REMAP, HP_BUCKETS };
 static FILE* hp_file;
 static int hp_initialized;
 static uint64_t hp_elapsed[HP_BUCKETS], hp_calls[HP_BUCKETS];
@@ -27,7 +27,7 @@ static uint64_t hp_tick(void)
             hp_frequency = (uint64_t)f.QuadPart;
 #endif
             hp_file = fopen(path,"wb");
-            if (hp_file) fprintf(hp_file,"frame,vertex_ns,target_ns,pipeline_ns,texture_ns,draw_ns,hash_ns,upload_ns,vprep_ns,vdecode_ns,vertex_calls,target_calls,pipeline_calls,texture_calls,draw_calls,hash_calls,upload_calls,vprep_calls,vdecode_calls,end_ns\n");
+            if (hp_file) fprintf(hp_file,"frame,vertex_ns,target_ns,pipeline_ns,texture_ns,draw_ns,hash_ns,upload_ns,vprep_ns,vdecode_ns,vrefs_ns,remap_ns,vertex_calls,target_calls,pipeline_calls,texture_calls,draw_calls,hash_calls,upload_calls,vprep_calls,vdecode_calls,vrefs_calls,remap_calls,end_ns\n");
         }
     }
     if (!hp_file) return 0;
