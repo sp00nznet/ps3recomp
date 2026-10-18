@@ -249,6 +249,7 @@ static vk_state s_vk;
 #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
 
 #include "rsx_vulkan_pipeline_cache.inc"
+#include "rsx_vulkan_pipeline_timing.inc"
 #define VK_CHECK(call, what)                                               \
     do { VkResult r_ = (call);                                             \
          if (r_ != VK_SUCCESS) {                                           \
@@ -1149,7 +1150,7 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
         .pDynamicState = &dy, .layout = s_vk.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, vk_pcache(), 1, &gci, NULL, &p);
+    VkResult r = vk_create_graphics_timed("fallback", 0, s_vk.device, vk_pcache(), 1, &gci, NULL, &p);
     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
     vk_pcache_created();
     s_vk.pipelines[slot] = p;
@@ -1491,7 +1492,7 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
         .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, vk_pcache(), 1, &gci, NULL, &p);
+    VkResult r = vk_create_graphics_timed("guest", s_g.pipe_count, s_vk.device, vk_pcache(), 1, &gci, NULL, &p);
     if (r != VK_SUCCESS) {
         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
         return VK_NULL_HANDLE;
@@ -3567,7 +3568,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 samples)
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = layout, .renderPass = rp, .subpass = 0 };
-    if (pvkCreateGraphicsPipelines(s_vk.device, vk_pcache(), 1, &gci, NULL,
+    if (vk_create_graphics_timed("engine", (u32)(P-s_epipe)+1, s_vk.device, vk_pcache(), 1, &gci, NULL,
                                    &P->variant[si][topo_idx]) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
         P->variant[si][topo_idx] = VK_NULL_HANDLE;
