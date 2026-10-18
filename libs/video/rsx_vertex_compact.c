@@ -417,6 +417,38 @@ int rsx_vertex_remap_build(
         }
     }
 
+    /* Most indexed draws share one base and a compact raw index range.
+     * Use the existing generation-stamped slots directly in that case.
+     * Check raw IDs, without the fetcher's 20-bit wrapping: remap equality
+     * is still the full (vertex_id, base_index) pair. No guest data is cached. */
+    if (count >= 16u) {
+        u32 minimum = refs[0].vertex_id, maximum = minimum;
+        const u32 base = refs[0].base_index;
+        u32 i;
+        for (i = 1; i < count; ++i) {
+            if (refs[i].base_index != base) break;
+            if (refs[i].vertex_id < minimum) minimum = refs[i].vertex_id;
+            if (refs[i].vertex_id > maximum) maximum = refs[i].vertex_id;
+            if ((u64)maximum - minimum + 1u > required_slots) break;
+        }
+        if (i == count) {
+            u32 unique = 0;
+            for (u32 occurrence = 0; occurrence < count; ++occurrence) {
+                const rsx_vertex_ref ref = refs[occurrence];
+                rsx_vertex_remap_slot* slot = &remap->slots[ref.vertex_id - minimum];
+                if (slot->generation != remap->generation) {
+                    slot->key = ((u64)base << 32) | ref.vertex_id;
+                    slot->value = unique;
+                    slot->generation = remap->generation;
+                    refs[unique++] = ref;
+                }
+                remap->occurrence_to_unique[occurrence] = slot->value;
+            }
+            *unique_count = unique;
+            return 1;
+        }
+    }
+
     u32 unique = 0;
     const u32 mask = remap->slot_capacity - 1u;
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
