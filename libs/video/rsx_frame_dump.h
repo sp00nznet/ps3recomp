@@ -14,7 +14,10 @@
 
 /* One renderer owns a dump path. Replace only after a complete write/close,
  * so an unrelated strict-stop thread cannot truncate the last complete frame.
- * A killed process may leave the disposable .tmp sibling for the next dump. */
+ * A killed process may leave the disposable .tmp sibling for the next dump.
+ * The replace is atomic but not write-through: forcing 2.7 MB to disk on the
+ * presenting thread held some presents for 30-300 ms, which made periodic
+ * dumps (PS3RECOMP_VK_DUMP_EVERY) show up as stutter in timing runs. */
 static inline int rsx_dump_ppm(const char* path, const unsigned char* rgba,
                                uint32_t width, uint32_t height)
 {
@@ -38,7 +41,7 @@ static inline int rsx_dump_ppm(const char* path, const unsigned char* rgba,
         if(fclose(f)!=0)failed=1;
         if(!failed) {
 #ifdef _WIN32
-            failed=!MoveFileExA(temporary,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+            failed=!MoveFileExA(temporary,path,MOVEFILE_REPLACE_EXISTING);
 #else
             failed=rename(temporary,path)!=0;
 #endif

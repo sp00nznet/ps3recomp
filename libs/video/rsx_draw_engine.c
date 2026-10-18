@@ -54,6 +54,9 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_SURFACES   64
 #define ENG_MAX_ZDEPTHS    64
 #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
+#define ENG_TEX_INDEX_SIZE 2048u          /* power of two, at least 2x ENG_MAX_TEXTURES */
+_Static_assert(ENG_TEX_INDEX_SIZE >= 2u * ENG_MAX_TEXTURES && ENG_MAX_TEXTURES < 0xFFFFu &&
+               (ENG_TEX_INDEX_SIZE & (ENG_TEX_INDEX_SIZE - 1u)) == 0, "texture index size");
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
@@ -176,6 +179,7 @@ static struct {
     u32 n_zdepths;
     eng_texture textures[ENG_MAX_TEXTURES];
     u32 n_textures;
+    u16 texture_index[ENG_TEX_INDEX_SIZE];  /* open addressing: textures[] index + 1, 0 = empty */
     eng_pipeline pipelines[ENG_MAX_PIPELINES];
     u32 n_pipelines;
     eng_display_buffer display_buffers[8];
@@ -1098,6 +1102,74 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * cache full evicts the least recently used entry rather than returning
  * nothing: returning white "made the recovered orphanage render as flat
  * green/black geometry" (rsx_live_draw.c:2326-2334). */
+/* The texture cache is looked up for every sampled unit of every draw. A
+ * linear scan of up to ENG_MAX_TEXTURES entries per lookup is replaced by an
+ * open-addressing index over the same key; entries are unique per key because
+ * one is only added after a miss. RSX_ENGINE_TEXTURE_INDEX_CHECK=1 also runs
+ * the old scan on every lookup and stops strictly if the two ever disagree. */
+static u32 eng_tex_key_hash(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                            u32 pitch, u32 remap, u32 cube)
+{
+    const u32 k[8] = { location, offset, fmt, w, h, pitch, remap, cube };
+    u32 x = 2166136261u;
+    for (u32 i = 0; i < 8; i++) { x ^= k[i]; x *= 16777619u; x ^= x >> 15; }
+    return x;
+}
+
+static int eng_tex_matches(const eng_texture* e, u32 location, u32 offset, u32 fmt,
+                           u32 w, u32 h, u32 pitch, u32 remap, u32 cube)
+{
+    return e->location == location && e->offset == offset && e->format == fmt &&
+           e->width == w && e->height == h && e->pitch == pitch &&
+           e->remap == remap && e->cubemap == cube;
+}
+
+static void eng_tex_index_insert(u32 i)
+{
+    const eng_texture* e = &g.textures[i];
+    u32 s = eng_tex_key_hash(e->location, e->offset, e->format, e->width, e->height,
+                             e->pitch, e->remap, e->cubemap) & (ENG_TEX_INDEX_SIZE - 1u);
+    while (g.texture_index[s]) s = (s + 1u) & (ENG_TEX_INDEX_SIZE - 1u);
+    g.texture_index[s] = (u16)(i + 1u);
+}
+
+static void eng_tex_index_rebuild(void)
+{
+    memset(g.texture_index, 0, sizeof g.texture_index);
+    for (u32 i = 0; i < g.n_textures; i++) eng_tex_index_insert(i);
+}
+
+static int eng_tex_index_check(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ENGINE_TEXTURE_INDEX_CHECK"); on = e && e[0] == '1'; }
+    return on;
+}
+
+static int eng_tex_find(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                        u32 pitch, u32 remap, u32 cube)
+{
+    int found = -1;
+    for (u32 s = eng_tex_key_hash(location, offset, fmt, w, h, pitch, remap, cube) & (ENG_TEX_INDEX_SIZE - 1u);
+         g.texture_index[s]; s = (s + 1u) & (ENG_TEX_INDEX_SIZE - 1u)) {
+        const u32 i = g.texture_index[s] - 1u;
+        if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, pitch, remap, cube)) {
+            found = (int)i; break;
+        }
+    }
+    if (eng_tex_index_check()) {
+        int scan = -1;
+        for (u32 i = 0; i < g.n_textures && scan < 0; i++)
+            if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, pitch, remap, cube))
+                scan = (int)i;
+        if (scan != found)
+            ps3_strict_boot_guard("rsx-texture-index",
+                "location=%u offset=0x%08X format=0x%X index=%d scan=%d entries=%u",
+                location, offset, fmt, found, scan, g.n_textures);
+    }
+    return found;
+}
+
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap)
 {
@@ -1105,13 +1177,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
-    for (u32 i = 0; i < g.n_textures; i++) {
-        eng_texture* e = &g.textures[i];
-        if (e->location != location || e->offset != offset ||
-            e->format != fmt || e->width != w || e->height != h ||
-            e->pitch != pitch || e->remap != remap ||
-            e->cubemap != (u32)(cube != 0))
-            continue;
+    const int found = eng_tex_find(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0));
+    if (found >= 0) {
+        eng_texture* e = &g.textures[found];
         if (e->handle && e->last_hash_frame != g.frames) {
             int readable = 0;
             const u64 hash = eng_texture_content_hash(location, offset, span,
@@ -1159,7 +1227,11 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                   cube, remap);
     hp_end(HP_UPLOAD,hp_upload_started);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
-    if (e.handle || !evicted) g.textures[index] = e;
+    if (e.handle || !evicted) {
+        g.textures[index] = e;
+        if (evicted) eng_tex_index_rebuild();   /* the evicted key leaves the index */
+        else eng_tex_index_insert(index);
+    }
     return e.handle;
 }
 
@@ -1211,7 +1283,9 @@ static int eng_surface_to_guest(u32 slot)
     if (!s->guest_dirty) return 1;
     if (s->fmt != RSX_BE_FMT_R8G8B8A8 || s->pitch < s->w * 4u || !g.be->readback)
         return 0;
+    const uint64_t hp_start = hp_tick();
     rsx_draw_engine_guest_read(s->location, s->offset, s->pitch, s->w, s->h);
+    hp_end(HP_RBCOLOR, hp_start);
     s->guest_dirty = 0;
     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
     return 1;
@@ -1239,9 +1313,12 @@ static int eng_zdepth_to_guest(u32 slot)
         s_depth_rows = n;
         s_depth_cap = w * h;
     }
+    const uint64_t hp_start = hp_tick();
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
-    if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
-                             w * (u32)sizeof(float)) != 0)
+    const int rb = g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
+                                        w * (u32)sizeof(float));
+    hp_end(HP_RBDEPTH, hp_start);
+    if (rb != 0)
         return 0;
     for (u32 r = 0; r < h; r++) {
         u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
@@ -2064,10 +2141,12 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             continue;
         }
         if (sampled >= 0) {
+            const uint64_t hp_view = hp_tick();
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
                                      t.remap & 0xFFFFu, t.format)
                 : 0;
+            hp_end(HP_SVIEW, hp_view);
             textures[u] = view ? view : g.surfaces[sampled].handle;
             continue;
         }
