@@ -48,6 +48,10 @@ static void worker(unsigned index)
             CHECK(jg_wait(GUARD_EA)==1);
             atomic_store_explicit(&acknowledged,n,memory_order_release);
         }
+    } else if(worker_kind==4) {
+        atomic_store_explicit(&acknowledged,1,memory_order_release);
+        CHECK(jg_wait_cancellable(GUARD_EA,&s_jobchains[0].stop)==0);
+        atomic_store_explicit(&acknowledged,2,memory_order_release);
     } else {
         for(unsigned n=0;n<16;n++) {
             u32 ea=GUARD_EA+(index*16+n)*128;
@@ -127,6 +131,23 @@ int main(int argc,char**argv)
         printf("guard wake latency: median %.0f us, p90 %.0f us, max %.0f us\n",
                lat[LATENCY_ROUNDS/2],lat[LATENCY_ROUNDS*9/10],lat[LATENCY_ROUNDS-1]);
         CHECK(lat[LATENCY_ROUNDS/2]<500.0);
+    } else if(!strcmp(argv[1],"shutdown")) {
+        /* Exercise the public shutdown wake path with a closed guard. The
+         * waiter must cancel without consuming or fabricating a credit. */
+        CHECK(cellSpursJobGuardInitialize(0x30000,GUARD_EA,1,1,1)==CELL_OK);
+        s_jobchains[0].jc_ea=0x30000;
+        atomic_init(&s_jobchains[0].stop,0);
+        worker_kind=4;test_thread t=start(0);
+        while(atomic_load_explicit(&acknowledged,memory_order_acquire)!=1) Sleep(0);
+        Sleep(3);
+        double t0=now_us();
+        CHECK(cellSpursShutdownJobChain(0x30000)==CELL_OK);
+        join(t);
+        double elapsed=now_us()-t0;
+        CHECK(atomic_load_explicit(&acknowledged,memory_order_acquire)==2);
+        CHECK(vm_read32(GUARD_EA)==1);
+        CHECK(elapsed<1000000.0);
+        printf("guard shutdown wake: %.0f us; closed credit preserved\n",elapsed);
     } else if(!strcmp(argv[1],"unknown-strict")) {
         (void)jg_wait(GUARD_EA);return 91;
     } else if(!strcmp(argv[1],"unknown-compat")) {
