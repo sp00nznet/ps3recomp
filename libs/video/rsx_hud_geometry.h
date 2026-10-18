@@ -8,6 +8,25 @@
 
 typedef struct rsx_hud_rect { uint32_t x, y, w, h; } rsx_hud_rect;
 
+/* Guest viewport/scissor coverage, before optional backend render scaling. */
+static inline int rsx_hud_covers_target(uint32_t w,uint32_t h,
+                                        rsx_hud_rect viewport,rsx_hud_rect scissor,
+                                        float sx,float sy,float tx,float ty)
+{
+    return w && h && viewport.x==0 && viewport.y==0 && viewport.w>=w && viewport.h>=h &&
+        scissor.x==0 && scissor.y==0 && scissor.w>=w && scissor.h>=h &&
+        fabsf(sx*2.0f-w)<0.01f && fabsf(fabsf(sy)*2.0f-h)<0.01f &&
+        fabsf(tx-w*0.5f)<0.01f && fabsf(ty-h*0.5f)<0.01f;
+}
+
+/* Clip-space anchor: 0 first edge, 1 last edge, 2 center. */
+static inline int rsx_hud_anchor_clip(double low, double high, int vertical)
+{
+    const double sum = low + high;
+    if (fabs(sum) < 0.70 || (!vertical && high - low > 1.50)) return 2;
+    return vertical ? sum < 0.0 : sum >= 0.0;
+}
+
 /* Accept one canonical decimal integer in [50,100]. The caller owns defaults. */
 static inline int rsx_hud_parse_percent(const char *text, unsigned *out)
 {
@@ -41,11 +60,11 @@ static inline int rsx_hud_compose_xf_aspect(const float in[8], unsigned percent,
     float result[8];
     const double s = (double)percent / 100.0;
     const double sx = s * (double)horizontal_factor;
-    const double ax = right ? 1.0 : -1.0;
-    const double ay = bottom ? -1.0 : 1.0;
+    const double ax = right == 2 ? 0.0 : right ? 1.0 : -1.0;
+    const double ay = bottom == 2 ? 0.0 : bottom ? -1.0 : 1.0;
     if (!in || !out || percent < 50u || percent > 100u ||
         !isfinite(horizontal_factor) || horizontal_factor <= 0.0f || horizontal_factor > 1.0f ||
-        (right != 0 && right != 1) || (bottom != 0 && bottom != 1)) return -1;
+        (right < 0 || right > 2) || (bottom < 0 || bottom > 2)) return -1;
     for (unsigned i = 0; i < 8; ++i)
         if (!isfinite(in[i])) return -1;
     const double xscale = sx * (double)in[0];
@@ -83,9 +102,9 @@ static inline int rsx_hud_scale_scissor_aspect(rsx_hud_rect in,
     if (!out || !target_w || !target_h || !in.w || !in.h ||
         percent < 50u || percent > 100u ||
         !isfinite(horizontal_factor) || horizontal_factor <= 0.0f || horizontal_factor > 1.0f ||
-        (right != 0 && right != 1) || (bottom != 0 && bottom != 1)) return -1;
-    ax = right ? (double)target_w : 0.0;
-    ay = bottom ? (double)target_h : 0.0;
+        (right < 0 || right > 2) || (bottom < 0 || bottom > 2)) return -1;
+    ax = right == 2 ? (double)target_w * 0.5 : right ? (double)target_w : 0.0;
+    ay = bottom == 2 ? (double)target_h * 0.5 : bottom ? (double)target_h : 0.0;
     lo_x = floor(ax + sx * ((double)in.x - ax));
     hi_x = ceil(ax + sx * ((double)((uint64_t)in.x + in.w) - ax));
     lo_y = floor(ay + s * ((double)in.y - ay));

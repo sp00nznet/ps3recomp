@@ -113,6 +113,8 @@ typedef struct {
     u32 handle;
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
+    /* Content provenance survives repeated flips, not clears/reallocation. */
+    int folklore_world;     /* 0 native/menu/movie, 1 scene, 2 resolved world */
 #ifdef PS3RECOMP_RSX_CACAO
     int ao_invalidated;     /* external guest writes break scene association */
 #endif
@@ -173,7 +175,7 @@ static struct {
     u32 width, height;
     unsigned hud_percent;
     float world_aspect,hud_horizontal_factor;
-    int hud_world_seen,hud_logged,hud_active;
+    int hud_world_seen,hud_logged,hud_active,hud_marker_seen;
     u32 hud_composite_target,hud_draws;
 
     rsx_dispatch rsx;
@@ -638,6 +640,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->handle = handle;
     s->color_serial = 0;
     s->guest_dirty = 0;
+    s->folklore_world = 0;
 #ifdef PS3RECOMP_RSX_CACAO
     s->ao_invalidated=0;
 #endif
@@ -858,6 +861,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+    g.surfaces[slot].folklore_world = 0;
 }
 
 static u32 eng_current_surface(void)
@@ -2865,6 +2869,18 @@ static void pd_present(u32 presented)
     }
 }
 
+static int eng_folklore_full_target(const eng_surface* rt)
+{
+    rsx_dsp_viewport vp;
+    rsx_dsp_get_viewport(&g.rsx,&vp);
+    const u32 sh=rsx_dsp_reg(&g.rsx,M_SCISSOR_HORIZONTAL);
+    const u32 sv=rsx_dsp_reg(&g.rsx,M_SCISSOR_VERTICAL);
+    return rsx_hud_covers_target(rt->raster_w,rt->raster_h,
+        (rsx_hud_rect){vp.x,vp.y,vp.w,vp.h},
+        (rsx_hud_rect){sh&0xFFFFu,sv&0xFFFFu,sh>>16,sv>>16},
+        vp.scale[0],vp.scale[1],vp.translate[0],vp.translate[1]);
+}
+
 #include "rsx_folklore_hud.inc"
 static void sink_end(void* user, const rsx_dispatch* r)
 {
@@ -2932,7 +2948,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    const eng_surface* rt = &g.surfaces[target];
+    eng_surface* rt = &g.surfaces[target];
     hp_start = hp_tick();
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      rt->raster_w, rt->raster_h, rt->samples);
@@ -3007,7 +3023,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
     xf[6] = depth_clip.offset;
     int hud_right=0,hud_bottom=0,hud_transformed=0;
     if ((g.hud_percent<100 || g.world_aspect>0) && !pipeline_is_fixed &&
-        eng_folklore_hud(&rs,rt,pipeline_metadata,tex_mask,&hud_right,&hud_bottom) &&
+        eng_folklore_hud(&rs,rt,pipeline_metadata,tex_mask,indexed?g.indices:NULL,n_draw,
+                         topology==RSX_TOPOLOGY_TRIANGLE_STRIP ? 1 : topology==RSX_TOPOLOGY_TRIANGLES ? 0 : -1,
+                         &hud_right,&hud_bottom) &&
         !rsx_hud_compose_xf_aspect(xf,g.hud_percent,g.hud_horizontal_factor,hud_right,hud_bottom,xf)) {
         hud_transformed=1;g.hud_draws++;
     }
@@ -3143,8 +3161,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         /* Every target the set names, not only A: a deferred pass clears its
          * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
          * keep whatever the last frame left in them. */
-        for (u32 i = 0; i < n_targets; i++)
+        for (u32 i = 0; i < n_targets; i++) {
             g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
+            g.surfaces[targets[i]].folklore_world = 0;
+        }
         eng_surfaces_wrote(targets, n_targets);
 #ifdef PS3RECOMP_RSX_CACAO
         for(u32 i=0;i<n_targets;++i)g.surfaces[targets[i]].ao_invalidated=0;
@@ -3220,8 +3240,22 @@ static void eng_present(u32 buffer_id)
     }
     pd_present(target);
     g.last_present_surface = target;
+    /* Diagnostic transitions, never a timeout or a presentation input. */
+    static int display_logs=-1, last_content=-1;
+    if(display_logs<0) {
+        const char* e=getenv("RSX_ENGINE_DISPLAY_LOG");
+        display_logs=e?atoi(e):0;
+    }
+    if(display_logs>0 && last_content!=g.surfaces[target].folklore_world) {
+        fprintf(stderr,"[rsx display] frame=%u target=%u content=%d aspect=%.6g hud=%d\n",
+            g.frames,g.surfaces[target].handle,g.surfaces[target].folklore_world,
+            eng_folklore_present_aspect(&g.surfaces[target]),g.hud_active);
+        --display_logs;
+    }
+    last_content=g.surfaces[target].folklore_world;
     if(g.be->set_present_aspect)
-        g.be->set_present_aspect(g.be->user,g.hud_active ? g.world_aspect : 0);
+        g.be->set_present_aspect(g.be->user,eng_folklore_present_aspect(&g.surfaces[target]));
+    if(g.surfaces[target].folklore_world != 2)g.hud_marker_seen=0;
     g.be->present(g.be->user, g.surfaces[target].handle);
     if (g.hud_draws && !g.hud_logged) {
         fprintf(stderr,"[rsx HUD] Folklore scale %u%% transformed %u overlay draws\n",

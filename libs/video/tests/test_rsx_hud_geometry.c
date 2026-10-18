@@ -60,7 +60,7 @@ static void test_clip_transform(void)
     for (unsigned i = 0; i < 8; ++i) out[i] = 9.0f;
     CHECK(rsx_hud_compose_xf(in, 49, 0, 0, out) == -1);
     CHECK(rsx_hud_compose_xf(in, 101, 0, 0, out) == -1);
-    CHECK(rsx_hud_compose_xf(in, 75, 2, 0, out) == -1);
+    CHECK(rsx_hud_compose_xf(in, 75, 3, 0, out) == -1);
     float bad[8]; memcpy(bad, in, sizeof(bad)); bad[0] = NAN;
     CHECK(rsx_hud_compose_xf(bad, 75, 0, 0, out) == -1);
     for (unsigned i = 0; i < 8; ++i) CHECK(out[i] == 9.0f);
@@ -99,7 +99,7 @@ static void test_scissor(void)
     CHECK(rsx_hud_scale_scissor((rsx_hud_rect){0, 0, 20, 20},
                                 100, 100, 49, 0, 0, &out) == -1);
     CHECK(rsx_hud_scale_scissor((rsx_hud_rect){0, 0, 20, 20},
-                                100, 100, 75, 0, 2, &out) == -1);
+                                100, 100, 75, 0, 3, &out) == -1);
     CHECK(out.x == 7 && out.y == 8 && out.w == 9 && out.h == 10);
 }
 
@@ -159,9 +159,45 @@ static void test_aspect_compensation(void)
     CHECK(rsx_hud_scale_scissor_aspect(whole, 0, 1440, 75, wide, 0, 0, &new_rect) == -1);
 }
 
+static void test_center_and_presentation(void)
+{
+    const float in[8] = {1, 1, 0, 0, 0, 0, 0, 0};
+    const float wide = (float)((16.0 / 9.0) / (3440.0 / 1440.0));
+    float out[8];
+    rsx_hud_rect rect;
+    CHECK(rsx_hud_anchor_clip(-0.2,0.2,0) == 2);
+    CHECK(rsx_hud_anchor_clip(-0.9,0.9,0) == 2);
+    CHECK(rsx_hud_anchor_clip(-0.95,-0.65,0) == 0);
+    CHECK(rsx_hud_anchor_clip(0.65,0.95,0) == 1);
+    CHECK(rsx_hud_anchor_clip(0.65,0.95,1) == 0);
+    CHECK(rsx_hud_anchor_clip(-0.95,-0.65,1) == 1);
+    CHECK(rsx_hud_compose_xf_aspect(in, 75, wide, 2, 2, out) == 0);
+    CHECK(near(out[0], 1920.0f / 3440.0f) && near(out[1], 0.75f));
+    CHECK(near(out[4], 0) && near(out[5], 0));
+    CHECK(rsx_hud_scale_scissor_aspect((rsx_hud_rect){0,0,3440,1440},
+        3440,1440,75,wide,2,2,&rect) == 0);
+    CHECK(rect.x == 760 && rect.y == 180 && rect.w == 1920 && rect.h == 1080);
+    CHECK(rsx_hud_compose_xf_aspect(in, 75, wide, 3, 2, out) == -1);
+
+}
+
+static void test_full_target(void)
+{
+    const rsx_hud_rect whole={0,0,1280,720};
+    CHECK(rsx_hud_covers_target(1280,720,whole,whole,640,360,640,360));
+    CHECK(rsx_hud_covers_target(1280,720,whole,whole,640,-360,640,360));
+    CHECK(!rsx_hud_covers_target(1280,720,(rsx_hud_rect){1,0,1280,720},whole,640,360,640,360));
+    CHECK(!rsx_hud_covers_target(1280,720,whole,(rsx_hud_rect){0,0,1279,720},640,360,640,360));
+    CHECK(!rsx_hud_covers_target(1280,720,whole,whole,320,180,640,360));
+    CHECK(!rsx_hud_covers_target(1280,720,whole,whole,640,360,641,360));
+    CHECK(!rsx_hud_covers_target(1280,720,whole,whole,NAN,360,640,360));
+    CHECK(!rsx_hud_covers_target(0,720,whole,whole,0,360,0,360));
+}
+
 int main(void)
 {
     test_parser(); test_clip_transform(); test_scissor(); test_aspect_compensation();
+    test_center_and_presentation(); test_full_target();
     printf("test_rsx_hud_geometry: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static int g_failures;
 static u32 msaa_color_w, msaa_color_h, msaa_color_samples, msaa_depth_samples;
@@ -1453,6 +1454,108 @@ static void test_shadow_pipeline(void)
     engine_down();
 }
 
+/* Actual dispatch -> content classification -> selected flip -> aspect callback.
+ * The backend is a CPU recorder, so this proves state lifetime, not pixels. */
+static float folklore_presented_aspect;
+static void folklore_aspect(void* user,float aspect)
+{ (void)user;folklore_presented_aspect=aspect; }
+
+static void folklore_matrix(int perspective)
+{
+    m(M_VP_UPLOAD_CONST_ID,256);
+    for(u32 row=0;row<4;++row)for(u32 col=0;col<4;++col) {
+        const float value=(row==col || (perspective && row==3 && col==0))?1.0f:0.0f;
+        m(M_VP_UPLOAD_CONST+(row*4u+col)*4u,f32_bits(value));
+    }
+}
+
+static void folklore_quad(void)
+{
+    const float vertices[4][4]={{-1,-1,0,1},{1,-1,0,1},{1,1,0,1},{-1,1,0,1}};
+    m(M_BEGIN_END,RSX_PRIMITIVE_QUADS);
+    for(u32 i=0;i<4;++i)for(u32 j=0;j<4;++j)m(M_INLINE_ARRAY,f32_bits(vertices[i][j]));
+    m(M_BEGIN_END,0);
+}
+
+static void test_folklore_presentation(void)
+{
+    const char* old=getenv("PS3RECOMP_FOLKLORE_CAMERA_ASPECT");
+    char* saved=old?strdup(old):NULL;
+#ifdef _WIN32
+    _putenv_s("PS3RECOMP_FOLKLORE_CAMERA_ASPECT","2.388888888888889");
+#else
+    setenv("PS3RECOMP_FOLKLORE_CAMERA_ASPECT","2.388888888888889",1);
+#endif
+    rsx_draw_backend backend=g_stub_backend;backend.set_present_aspect=folklore_aspect;
+    engine_up_with(&backend);
+    m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);
+    m(M_SURFACE_CLIP_H,1280u<<16);m(M_SURFACE_CLIP_V,720u<<16);
+    m(0x0A00,1280u<<16);m(0x0A04,720u<<16);
+    m(0x0A20,f32_bits(640));m(0x0A24,f32_bits(360));
+    m(0x0A30,f32_bits(640));m(0x0A34,f32_bits(360));
+    m(M_SCISSOR_H,1280u<<16);m(M_SCISSOR_V,720u<<16);
+    m(M_CONTEXT_DMA_ZETA,DMA_LOCAL);m(M_ZETA_OFFSET,ZETA_OFFSET);
+    /* Synthetic resident VP + two TEX instructions, no owned game shader. */
+    m(0x1E9C,0);m(0x0B80,0);m(0x0B84,0);m(0x0B88,0);m(0x0B8C,1);m(0x1EA0,0);
+    u8* fp=vm_base+0x30000;memset(fp,0,32);
+    for(u32 unit=0;unit<2;++unit) {
+        fp_word(fp+unit*16,(0x17u<<24)|(0xFu<<9)|(4u<<13)|(unit<<17)|(unit==1));
+        fp_word(fp+unit*16+4,1u|(1u<<11)|(2u<<13)|(3u<<15)|(7u<<18));
+    }
+    m(0x08E4,0x30002u);m(0x1D60,0x40u);
+    m(M_SURFACE_FORMAT,0x090B3148u);m(M_COLOR_A_PITCH,10240);m(M_ZETA_PITCH,10240);
+    m(M_DEPTH_TEST,1);folklore_matrix(1);folklore_quad();
+    CHECK(msaa_color_w==1280 && msaa_color_h==720,"Folklore fixture records native world raster");
+    /* The proven resolve writes a distinct single-sample output. */
+    m(M_SURFACE_FORMAT,0x090B0148u);m(M_COLOR_A_PITCH,5120);m(M_COLOR_A_OFFSET,0x10000);
+    m(M_DEPTH_TEST,0);m(M_DEPTH_WRITE,0);folklore_matrix(0);
+    bind_texture_unit(RSX_LOCATION_LOCAL,0x40000);m(M_TEX_UNIT+0x18,(2560u<<16)|720u);m(0x1840,10240);
+    m(M_TEX_UNIT+0x20,TEX_OFFSET);
+    m(M_TEX_UNIT+0x24,2u|(2u<<4)|((0x85u|0x20u)<<8)|(1u<<16));
+    m(M_TEX_UNIT+0x2C,0x80000000u);m(M_TEX_UNIT+0x30,0xAAE4u);
+    m(M_TEX_UNIT+0x38,(2560u<<16)|720u);m(0x1844,10240);
+    folklore_quad();
+    rsx_draw_engine_set_display_buffer(0,RSX_LOCATION_LOCAL,0x10000,5120,1280,720);
+    rsx_draw_engine_present_buffer(0);
+    CHECK(fabsf(folklore_presented_aspect-3440.0f/1440.0f)<0.00001f,
+          "world resolve presents wide without any HUD marker");
+    for(unsigned i=0;i<8;++i)rsx_draw_engine_present_buffer(0);
+    CHECK(fabsf(folklore_presented_aspect-3440.0f/1440.0f)<0.00001f,
+          "eight repeated flips retain world aspect without a frame timeout");
+    m(M_COLOR_A_OFFSET,0x80000);m(M_CLEAR_BUFFERS,0xF0);
+    rsx_draw_engine_set_display_buffer(1,RSX_LOCATION_LOCAL,0x80000,5120,1280,720);
+    rsx_draw_engine_present_buffer(1);
+    CHECK(folklore_presented_aspect==0,"native second flip buffer is independent of world buffer");
+    rsx_draw_engine_present_buffer(0);
+    CHECK(folklore_presented_aspect>2,"returning to unchanged world buffer remains wide");
+    m(M_COLOR_A_OFFSET,0x10000);m(M_CLEAR_BUFFERS,0xF0);
+    rsx_draw_engine_present_buffer(0);
+    CHECK(folklore_presented_aspect==0,"color clear deliberately resets world content");
+    folklore_quad();rsx_draw_engine_present_buffer(0);
+    CHECK(folklore_presented_aspect>2,"fresh world resolve restores wide after clear");
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL,0x10000,5120,1,1);
+    rsx_draw_engine_present_buffer(0);
+    CHECK(folklore_presented_aspect==0,"guest upload invalidates prior world provenance");
+    folklore_quad();rsx_draw_engine_present_buffer(0);
+    CHECK(folklore_presented_aspect>2,"world resolve restores wide after guest upload");
+    m(M_TEX_UNIT+0x0C,0);m(M_TEX_UNIT+0x2C,0);
+    m(0x0310,1); /* blended tutorial/fade */
+    folklore_quad();rsx_draw_engine_present_buffer(0);
+    CHECK(folklore_presented_aspect>2,"blended fullscreen overlay preserves world presentation");
+    m(0x0310,0);folklore_quad();rsx_draw_engine_present_buffer(0);
+    CHECK(folklore_presented_aspect>2,"untextured fullscreen flash preserves world presentation");
+    bind_texture_unit(RSX_LOCATION_MAIN,TEX_OFFSET); /* native menu/movie texture */
+    folklore_quad();rsx_draw_engine_present_buffer(0);
+    CHECK(folklore_presented_aspect==0,"opaque native textured fullscreen replacement resets presentation");
+    engine_down();
+#ifdef _WIN32
+    _putenv_s("PS3RECOMP_FOLKLORE_CAMERA_ASPECT",saved?saved:"");
+#else
+    if(saved)setenv("PS3RECOMP_FOLKLORE_CAMERA_ASPECT",saved,1);else unsetenv("PS3RECOMP_FOLKLORE_CAMERA_ASPECT");
+#endif
+    free(saved);
+}
+
 int main(int argc, char** argv)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1515,6 +1618,7 @@ int main(int argc, char** argv)
     test_multisample_seed();
     test_active_depth_layout();
     test_shadow_pipeline();
+    test_folklore_presentation();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
