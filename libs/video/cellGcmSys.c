@@ -2458,8 +2458,32 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
+/* How long the drain may make no progress at all before the wait is treated
+ * as a hang. 15 s by default: a one-off renderer hitch (a first-time shader
+ * or pipeline compile on a slow machine, heavy disk load) must stall the game,
+ * not end it. The 30 s absolute deadline below still rejects endless command
+ * cycles. PS3RECOMP_RSX_REFILL_IDLE_MS=<1000..30000> overrides it for
+ * diagnostics; the launcher never passes it to a player's game. */
+static u64 gcm_refill_idle_deadline_ns(void)
+{
+    static u64 deadline = 0;
+    if (!deadline) {
+        u64 ms = 15000;
+        const char* e = getenv("PS3RECOMP_RSX_REFILL_IDLE_MS");
+        if (e && *e) {
+            char* end = NULL;
+            const unsigned long long v = strtoull(e, &end, 10);
+            if (end && *end == 0 && v >= 1000 && v <= 30000) ms = v;
+            else fprintf(stderr, "[gcm] ignoring PS3RECOMP_RSX_REFILL_IDLE_MS=%s (want 1000..30000)\n", e);
+        }
+        deadline = ms * UINT64_C(1000000);
+    }
+    return deadline;
+}
+
 static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begin)
 {
+    const u64 idle_deadline = gcm_refill_idle_deadline_ns();
     u64 started = get_timestamp_ns();
     u64 progressed = started;
     u64 sampled = started;
@@ -2489,7 +2513,7 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
         const u64 packets = atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed);
         if (packets != previous_packets) { previous_packets = packets; progressed = now; }
         if ((drained == begin) == at_begin) break;
-        if (!suspended && (now - progressed >= UINT64_C(5000000000) || now - started >= UINT64_C(30000000000))) {
+        if (!suspended && (now - progressed >= idle_deadline || now - started >= UINT64_C(30000000000))) {
             /* Never wait for this diagnostic snapshot. A concurrent metadata
              * update is labelled incoherent, not retried. The epoch does not
              * claim coherence with independently sampled renderer/semaphore state. */
