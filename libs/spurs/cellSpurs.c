@@ -2674,6 +2674,7 @@ static int jg_wait_cancellable(u32 ea,const atomic_int*stop)
              * measure the one-credit handoff, not time deliberately idle. */
             const u64 ready=s_jobguards[i].trace && s_jobguards[i].reset &&
                 s_jobguards[i].pending==s_jobguards[i].reset?s_jobguards[i].ready_us:0;
+            if(s_jobguards[i].pending>s_jobguards[i].reset)s_jobguards[i].ready_us=0;
             s_jobguards[i].pending -= s_jobguards[i].reset;
             if (!s_jobguards[i].auto_reset) s_jobguards[i].reset = 0;
             s_jobguards[i].count = s_jobguards[i].reset;
