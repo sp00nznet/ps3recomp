@@ -2286,6 +2286,18 @@ static void vk_cb_present(void* ud, u32 buffer_id)
             VK_LOG("FXAA frame %llu filtered at %ux%u\n", (unsigned long long)s_vk.fxaa_frames, s_vk.width, s_vk.height);
     }
     s_vk.display_image = display;
+    /* The whole frame comes back to host memory for the frame dump, the
+     * vtable path's centre-pixel probe and the offscreen GPU suites. A
+     * windowed draw-engine session needs it only on dump frames (the engine
+     * keeps its own probe), so it skips a 3.7 MB copy and a GPU wait. */
+    const int dump_due = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
+    if (s_vk.windowed && s_vk.eng_active && !dump_due) {
+        s_vk.presented++;
+        s_g.last_draws = s_g.draws;
+        s_g.draws = 0;
+        vk_present_window();
+        return;
+    }
     if (vk_begin()) return;
     vk_barrier_image(display, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkBufferImageCopy region = {
