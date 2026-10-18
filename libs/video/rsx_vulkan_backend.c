@@ -567,6 +567,8 @@ static struct {
     vk_buffer ring;                /* upload staging ring */
     VkDeviceSize rc;               /* its cursor */
     u64 deferred_uploads;
+    int merge;                     /* consecutive batched draws share a render pass */
+    u64 merged;
     u32 max;                       /* draws per batch (PS3RECOMP_VK_BATCH_MAX) */
     u32 trace;                     /* PS3RECOMP_VK_BATCH_TRACE: events left to log */
     int recording;                 /* s_vk.cmd begun, not yet submitted */
@@ -594,8 +596,11 @@ static void vk_batch_configure(void)
     if (!s_batch.max || s_batch.max > VK_BATCH_SETS) s_batch.max = VK_BATCH_SETS;
     const char* du = getenv("PS3RECOMP_VK_DEFER_UPLOADS");
     s_batch.defer = s_batch.on && !(du && du[0] == '0');
-    VK_LOG("engine draw batching: %s, texture uploads %s\n", s_batch.on ? "on" : "off (PS3RECOMP_VK_BATCH=0)",
-           s_batch.defer ? "deferred" : "waited");
+    const char* mp = getenv("PS3RECOMP_VK_MERGE_PASSES");
+    s_batch.merge = s_batch.on && !(mp && mp[0] == '0');
+    VK_LOG("engine draw batching: %s, texture uploads %s, render passes %s\n",
+           s_batch.on ? "on" : "off (PS3RECOMP_VK_BATCH=0)",
+           s_batch.defer ? "deferred" : "waited", s_batch.merge ? "merged" : "per draw");
 }
 
 /* Diagnostic: the backend assumes one calling thread. */
@@ -610,11 +615,28 @@ static void vk_batch_thread_check(const char* where)
     }
 }
 
+/* The render pass batched draws leave open for the next draw into the same
+ * targets (vk_eng_draw). Anything else recorded or submitted closes it. */
+static struct {
+    int open;
+    VkRenderPass rp;
+    VkFramebuffer fb;
+    u32 w, h;
+} s_rp;
+
+static void vk_rp_close(void)
+{
+    if (!s_rp.open) return;
+    pvkCmdEndRenderPass(s_vk.cmd);
+    s_rp.open = 0;
+}
+
 static int vk_begin(void)
 {
     vk_batch_thread_check("begin");
     /* Append after batched draws and uploads; otherwise start fresh, as before. */
-    if (s_batch.recording && (s_batch.pending || s_batch.deferred)) return 0;
+    if (s_batch.recording && (s_batch.pending || s_batch.deferred)) { vk_rp_close(); return 0; }
+    s_rp.open = 0;
     s_batch.recording = 0;
     VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -629,6 +651,7 @@ static int vk_begin(void)
 static int vk_submit_and_wait_impl(const char* site)
 {
     vk_batch_thread_check("submit");
+    vk_rp_close();
     const u32 drawn = s_batch.pending;
     if (s_batch.trace) { s_batch.trace--; VK_LOG("batch-trace: submit pending=%u recording=%d\n", drawn, s_batch.recording); }
     s_batch.recording = 0;
@@ -656,9 +679,10 @@ static int vk_submit_and_wait_impl(const char* site)
     s_batch.batched += drawn;
     if (s_batch.stats && s_batch.draws - s_batch.last_report >= 20000) {
         s_batch.last_report = s_batch.draws;
-        VK_LOG("batch: submits=%llu draws=%llu batched=%llu uploads=%llu flush entry=%llu destroy=%llu ring=%llu fallback=%llu\n",
+        VK_LOG("batch: submits=%llu draws=%llu batched=%llu merged=%llu uploads=%llu flush entry=%llu destroy=%llu ring=%llu fallback=%llu\n",
                (unsigned long long)s_batch.submits, (unsigned long long)s_batch.draws,
-               (unsigned long long)s_batch.batched, (unsigned long long)s_batch.deferred_uploads,
+               (unsigned long long)s_batch.batched, (unsigned long long)s_batch.merged,
+               (unsigned long long)s_batch.deferred_uploads,
                (unsigned long long)s_batch.flush[0],
                (unsigned long long)s_batch.flush[1], (unsigned long long)s_batch.flush[2],
                (unsigned long long)s_batch.flush[3]);
@@ -3502,9 +3526,11 @@ static void vk_eng2_shutdown(void* user)
     if (s_batch.pool) pvkDestroyDescriptorPool(s_vk.device, s_batch.pool, NULL);
     vk_destroy_buffer(&s_batch.ubo);
     vk_destroy_buffer(&s_batch.ring);
-    { const int on = s_batch.on, configured = s_batch.configured, stats = s_batch.stats, defer = s_batch.defer;
+    { const int on = s_batch.on, configured = s_batch.configured, stats = s_batch.stats, defer = s_batch.defer,
+                merge = s_batch.merge;
       memset(&s_batch, 0, sizeof s_batch);
-      s_batch.on = on; s_batch.configured = configured; s_batch.stats = stats; s_batch.defer = defer; }
+      s_batch.on = on; s_batch.configured = configured; s_batch.stats = stats; s_batch.defer = defer;
+      s_batch.merge = merge; }
     for (u32 i = 1; i <= VK_ENG_MAX_PIPE; i++) vk_eng_pipeline_release(user, i);
     vk_eng_drop_framebuffers();
     for (u32 si = 0; si < 3; si++)
@@ -3908,23 +3934,41 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     if (ibytes) memcpy((u8*)s_e2.indices.ptr + ioff, indices, (size_t)ibytes);
     const int deferred = batched && set != s_g.set && set != s_e2.split_set;
 
-    if (vk_begin()) return;
-    if (deferred) {
-        /* Batched draws run in one command buffer: keep each draw after the
-         * previous one's writes, as separate waited submissions did. */
-        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                               .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-                               .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
-        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    /* Continue the open render pass when this draw goes into the same targets
+     * and samples none of them: the attachments are then written in primitive
+     * order inside one subpass, as the per-draw barrier ordered them before,
+     * and nothing else was written since that pass began. */
+    int cont = deferred && s_batch.merge && s_rp.open && s_batch.recording && s_batch.pending &&
+               s_rp.rp == rp && s_rp.fb == fb && s_rp.w == w && s_rp.h == h;
+    for (u32 u = 0; cont && u < RSX_MAX_TEXTURES; u++) {
+        if (!((s_e2.tex_mask >> u) & 1u)) continue;
+        const u32 t = s_e2.tex[u];
+        if (!t || t >= VK_ENG_MAX_OBJ) continue;
+        const u32 img = s_eobj[t].kind == VK_ENG_VIEW ? s_eobj[t].surface : t;
+        for (u32 i = 0; i < n; i++)
+            if (img == s_eng_bound.rt[i]) cont = 0;
     }
-    /* Orders memory for the surfaces this draw touches. */
-    for (u32 i = 0; i < n; i++)
-        vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-                                  .renderPass = rp, .framebuffer = fb,
-                                  .renderArea = { { 0, 0 }, { w, h } } };
-    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    if (cont) {
+        s_batch.merged++;
+    } else {
+        if (vk_begin()) return;
+        if (deferred) {
+            /* Batched draws run in one command buffer: keep each draw after the
+             * previous one's writes, as separate waited submissions did. */
+            VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                   .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                                   .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+            pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        }
+        /* Orders memory for the surfaces this draw touches. */
+        for (u32 i = 0; i < n; i++)
+            vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                      .renderPass = rp, .framebuffer = fb,
+                                      .renderArea = { { 0, 0 }, { w, h } } };
+        pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    }
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
@@ -3954,8 +3998,12 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
-    pvkCmdEndRenderPass(s_vk.cmd);
     s_batch.draws++;
+    if (deferred && s_batch.merge) {
+        s_rp.open = 1; s_rp.rp = rp; s_rp.fb = fb; s_rp.w = w; s_rp.h = h;
+    } else {
+        pvkCmdEndRenderPass(s_vk.cmd);
+    }
     if (deferred) {
         if (s_batch.trace) { s_batch.trace--; VK_LOG("batch-trace: deferred draw pending=%u\n", s_batch.pending + 1); }
         if (++s_batch.pending >= s_batch.max) vk_submit_and_wait();
