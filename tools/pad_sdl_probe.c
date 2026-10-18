@@ -123,6 +123,6 @@ int main(int argc,char** argv)
         SDL_Delay((Uint32)interval);
     } while (SDL_GetTicks64()-start < (Uint64)seconds*1000);
     for (int i=0;i<count;i++) close_pad(&pads[i]);
-    int output_failed=ferror(stdout);
+    int output_failed=fflush(stdout)!=0 || ferror(stdout);
     SDL_Quit(); return output_failed ? 1 : 0;
 }
