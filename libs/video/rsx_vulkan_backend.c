@@ -563,7 +563,7 @@ static void vk_invalidate(vk_buffer* b)
 static struct {
     int on, configured, stats, failed;
     int defer;                     /* texture uploads deferred into the batch */
-    u32 uploads;                   /* deferred uploads recorded in s_vk.cmd */
+    u32 deferred;                  /* deferred non-draw commands recorded in s_vk.cmd */
     vk_buffer ring;                /* upload staging ring */
     VkDeviceSize rc;               /* its cursor */
     u64 deferred_uploads;
@@ -614,7 +614,7 @@ static int vk_begin(void)
 {
     vk_batch_thread_check("begin");
     /* Append after batched draws and uploads; otherwise start fresh, as before. */
-    if (s_batch.recording && (s_batch.pending || s_batch.uploads)) return 0;
+    if (s_batch.recording && (s_batch.pending || s_batch.deferred)) return 0;
     s_batch.recording = 0;
     VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -633,7 +633,7 @@ static int vk_submit_and_wait_impl(const char* site)
     if (s_batch.trace) { s_batch.trace--; VK_LOG("batch-trace: submit pending=%u recording=%d\n", drawn, s_batch.recording); }
     s_batch.recording = 0;
     s_batch.pending = 0;
-    s_batch.uploads = 0;
+    s_batch.deferred = 0;
     const Uint64 hp_begin = vhp_tick();
     Uint64 hp_queued = hp_begin;
     VkResult r = pvkEndCommandBuffer(s_vk.cmd);
@@ -673,11 +673,16 @@ static int vk_submit_and_wait_impl(const char* site)
  * reason: 0 entry point, 1 object destruction, 2 ring/pool full, 3 fallback. */
 static void vk_flush_pending_impl(int reason, const char* site)
 {
-    if (!s_batch.recording || !(s_batch.pending || s_batch.uploads)) return;
+    if (!s_batch.recording || !(s_batch.pending || s_batch.deferred)) return;
     if (reason >= 0 && reason < 4) s_batch.flush[reason]++;
     if (s_batch.trace) { s_batch.trace--; VK_LOG("batch-trace: flush reason=%d pending=%u\n", reason, s_batch.pending); }
     vk_submit_and_wait_impl(site);
 }
+
+/* End of a command that only the GPU depends on (a clear, a layout change):
+ * with deferral it stays recorded behind the batch, else it is submitted and
+ * waited on as before. */
+#define vk_submit_or_defer() (s_batch.defer ? (s_batch.deferred++, 0) : vk_submit_and_wait())
 
 /* Order this command buffer's use of an image after everything submitted
  * before it; from UNDEFINED it is also the one-time move to GENERAL. */
@@ -2410,7 +2415,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
             .imageExtent = { w, h, 1 },
         };
         pvkCmdCopyBufferToImage(s_vk.cmd, s_batch.ring.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-        s_batch.uploads++;
+        s_batch.deferred++;
         s_batch.deferred_uploads++;
         return 0;
     }
@@ -2646,7 +2651,9 @@ static void vk_eng_bind_targets(void* user, const u32* surfaces, u32 count, u32 
 }
 
 static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
-{ vk_flush_pending(0);
+{   /* A recorded clear, ordered on the GPU like a draw: it joins the batch. */
+    vk_batch_configure();
+    if (!s_batch.defer) vk_flush_pending(0);
     (void)user;
     /* The debug hook reports the last colour asked for, as Metal's does. */
     s_vk.clear_argb = ((u32)(rgba[3] * 255.0f + 0.5f) << 24) |
@@ -2661,12 +2668,13 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
-    vk_submit_and_wait();
+    vk_submit_or_defer();
 }
 
 static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
                                        float depth_value, u8 stencil)
-{ vk_flush_pending(0);
+{   vk_batch_configure();
+    if (!s_batch.defer) vk_flush_pending(0);
     (void)user;
     vk_eng_obj* o = vk_eng_get(depth, VK_ENG_DEPTH);
     VkImageAspectFlags aspect = 0;
@@ -2678,7 +2686,7 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
-    vk_submit_and_wait();
+    vk_submit_or_defer();
 }
 
 /* The named surface becomes the frame: blit it onto the display image, then
@@ -2890,8 +2898,7 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
     if (vk_begin()) goto fail;
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (s_batch.defer) { s_batch.uploads++; return hd; }
-    if (vk_submit_and_wait()) goto fail;
+    if (vk_submit_or_defer()) goto fail;
     return hd;
 fail:
     vk_destroy_image(&o->im);
@@ -2916,9 +2923,13 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
 /* A colour target sampled with a unit's crossbar: an extra view of the same
  * image, cached by (surface, crossbar, format) and released with the target. */
 static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
-{ vk_flush_pending(0);
-    (void)user;
+{   (void)user;
     vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
+    vk_batch_configure();
+    /* A single-sample target's view is a CPU-side lookup or a new VkImageView:
+     * nothing pending reads or writes it, so it need not wait. A multisample
+     * target is expanded first, which keeps the old flush. */
+    if (!s_batch.defer || !t || t->samples > 1) vk_flush_pending(0);
     if (!t) return 0;
     if (t->samples > 1) {
         t = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
