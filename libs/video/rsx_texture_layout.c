@@ -318,11 +318,19 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
 
     /* Morton order interleaves the low bits of x and y, so a swizzled image
      * has to be walked texel by texel; so does anything the host cannot take
-     * as stored. */
+     * as stored. For x < 2^l2w and y < 2^l2h, rsx_swizzle_offset(x, y) is the
+     * OR of its x-only and y-only parts (their bits are disjoint), so each
+     * row takes one table lookup per texel instead of the bit loop. */
+    u32 xoff[4096];
+    const int table = tl->swizzled && w <= 4096u;
+    if (table)
+        for (u32 x = 0; x < w; x++) xoff[x] = rsx_swizzle_offset(x, 0, l2w, l2h);
     for (u32 y = 0; y < h; y++) {
         u8* drow = d + (size_t)y * dst_pitch;
+        const u32 yoff = table ? rsx_swizzle_offset(0, y, l2w, l2h) : 0;
         for (u32 x = 0; x < w; x++) {
-            const u8* s = tl->swizzled
+            const u8* s = table ? src + (size_t)(xoff[x] | yoff) * sbpp
+                : tl->swizzled
                 ? src + (size_t)rsx_swizzle_offset(x, y, l2w, l2h) * sbpp
                 : src + (size_t)y * tl->row_bytes + (size_t)x * sbpp;
             decode_texel(tl, s, drow + (size_t)x * dbpp, argb_as_rgba);
