@@ -23,6 +23,7 @@
 static int g_failures;
 static u32 msaa_color_w, msaa_color_h, msaa_color_samples, msaa_depth_samples;
 static float last_viewport_w, last_viewport_h;
+static u32 last_depth_w,last_depth_h,last_color_w,last_color_h;
 
 #define CHECK(cond, ...)                                                      \
     do {                                                                      \
@@ -149,6 +150,7 @@ static u32 stub_color_create(void* u, rsx_be_format f, u32 w, u32 h,
                              const void* seed, u32 seed_row)
 {
     (void)u; (void)f; (void)w; (void)h; (void)seed_row;
+    last_color_w=w;last_color_h=h;
     stub.n_color_create++;
     if (seed) stub.n_color_seeded++;
     stub.last_created_color = stub_handle();
@@ -162,7 +164,7 @@ static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
 { (void)u; (void)remap; (void)fmt; return surface; }
 
 static u32 stub_depth_create(void* u, u32 w, u32 h)
-{ (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
+{ (void)u; last_depth_w=w;last_depth_h=h;stub.n_depth_create++; return stub_handle(); }
 
 static u32 stub_color_msaa(void* u, rsx_be_format fmt, u32 w, u32 h, u32 samples)
 {
@@ -382,11 +384,11 @@ static const rsx_draw_backend g_stub_backend = {
 
 static void m(u32 method, u32 arg) { rsx_draw_engine_method(method, arg); }
 
-static void engine_up_with(const rsx_draw_backend* backend)
+static void engine_up_extent(const rsx_draw_backend* backend,u32 width,u32 height)
 {
     memset(&stub, 0, sizeof stub);
     rsx_draw_engine_set_backend(backend);
-    if (rsx_draw_engine_init(1280, 720) != 0) {
+    if (rsx_draw_engine_init(width, height) != 0) {
         printf("[FAIL] engine init\n");
         exit(1);
     }
@@ -400,6 +402,7 @@ static void engine_up_with(const rsx_draw_backend* backend)
     m(M_VTXBUF_OFFSET, 0x80000000u | VTX_OFFSET);
 }
 
+static void engine_up_with(const rsx_draw_backend* backend) { engine_up_extent(backend,1280,720); }
 static void engine_up(void) { engine_up_with(&g_stub_backend); }
 
 static void engine_down(void)
@@ -1454,6 +1457,48 @@ static void test_shadow_pipeline(void)
     engine_down();
 }
 
+/* Output resolution is presentation-only. Guest depth reserves follow guest
+ * buffers/viewport, then the backend scales color and depth exactly once. */
+static void test_depth_guest_canvas(void)
+{
+    const u32 outputs[][2]={{1280,720},{3440,1440},{3840,2160},{8192,4096}};
+    for(unsigned i=0;i<sizeof outputs/sizeof outputs[0];++i) {
+        engine_up_extent(&g_stub_backend,outputs[i][0],outputs[i][1]);
+        rsx_draw_engine_set_display_buffer(0,RSX_LOCATION_LOCAL,0x40000,5120,1280,720);
+        m(M_CONTEXT_DMA_ZETA,DMA_LOCAL);m(M_ZETA_OFFSET,ZETA_OFFSET);
+        m(M_SURFACE_FORMAT,0x090B0148u);m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);
+        m(M_SURFACE_CLIP_H,1280u<<16);m(M_SURFACE_CLIP_V,720u<<16);
+        m(0x0A00,1280u<<16);m(0x0A04,720u<<16);
+        m(M_CLEAR_BUFFERS,1);
+        CHECK(last_depth_w==1280 && last_depth_h==720,
+              "output %ux%u keeps guest depth1280x720 (got %ux%u)",outputs[i][0],outputs[i][1],last_depth_w,last_depth_h);
+        CHECK(last_depth_w==last_color_w && last_depth_h==last_color_h,
+              "full-canvas guest color and depth requests match before backend scaling");
+        /* A smaller guest pass retains the registered native canvas reserve. */
+        const int allocations=stub.n_depth_create;
+        m(M_SURFACE_CLIP_H,256u<<16);m(M_SURFACE_CLIP_V,256u<<16);
+        m(0x0A00,256u<<16);m(0x0A04,256u<<16);m(M_CLEAR_BUFFERS,1);
+        CHECK(stub.n_depth_create==allocations,"small pass reuses native guest canvas at output%u",outputs[i][0]);
+        /* Nonzero viewport origin contributes to attachment coverage. */
+        m(0x0A00,(1400u<<16)|64u);m(0x0A04,(800u<<16)|32u);m(M_CLEAR_BUFFERS,1);
+        CHECK(last_depth_w==1464 && last_depth_h==832,"guest viewport origin plus extent is covered");
+        /* Clip origin is independent of viewport origin. */
+        m(0x0A00,1280u<<16);m(0x0A04,720u<<16);
+        m(M_SURFACE_CLIP_H,(1280u<<16)|256u);m(M_SURFACE_CLIP_V,(720u<<16)|128u);m(M_CLEAR_BUFFERS,1);
+        CHECK(last_depth_w==1536 && last_depth_h==848,"guest clip origin plus extent is covered");
+        engine_down();
+    }
+    engine_up_extent(&g_stub_backend,3440,1440);
+    m(M_CONTEXT_DMA_ZETA,DMA_LOCAL);m(M_ZETA_OFFSET,ZETA_OFFSET);
+    m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_0);m(M_SURFACE_FORMAT,0x090B3148u);
+    m(M_SURFACE_CLIP_H,1280u<<16);m(M_SURFACE_CLIP_V,720u<<16);
+    m(M_COLOR_A_PITCH,10240);m(M_ZETA_PITCH,10240);
+    m(0x0A00,(1400u<<16)|64u);m(0x0A04,(800u<<16)|32u);m(M_CLEAR_BUFFERS,1);
+    CHECK(last_depth_w==1280 && last_depth_h==720 && msaa_depth_samples==2,
+          "native MSAA layout remains pitch-bound despite output and viewport size");
+    engine_down();
+}
+
 /* Actual dispatch -> content classification -> selected flip -> aspect callback.
  * The backend is a CPU recorder, so this proves state lifetime, not pixels. */
 static float folklore_presented_aspect;
@@ -1619,6 +1664,7 @@ int main(int argc, char** argv)
     test_active_depth_layout();
     test_shadow_pipeline();
     test_folklore_presentation();
+    test_depth_guest_canvas();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

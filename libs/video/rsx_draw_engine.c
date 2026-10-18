@@ -879,11 +879,24 @@ static u32 eng_current_surface(void)
  * upstream's ef3271b records that as "the black player-character mass". */
 static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h, u32 samples)
 {
-    /* The attachment must cover the whole canvas: an early pass declaring a
-     * smaller clip than the live viewport otherwise gets a target the host
-     * API rejects when a later, larger pass binds it. */
-    const u32 raster_w = samples > 1 ? rt_w : (rt_w > g.width ? rt_w : g.width);
-    const u32 raster_h = samples > 1 ? rt_h : (rt_h > g.height ? rt_h : g.height);
+    /* Cover the guest canvas, including viewport/clip origins. g.width and
+     * g.height are the host OUTPUT extent, which must not pad guest depth and
+     * then be multiplied again by render scale. Registered guest display
+     * buffers retain the original full-canvas reserve for smaller passes. */
+    u32 raster_w=rt_w,raster_h=rt_h;
+    if(samples==1) {
+        for(u32 i=0;i<8;++i) if(g.display_buffers[i].valid) {
+            if(g.display_buffers[i].width>raster_w)raster_w=g.display_buffers[i].width;
+            if(g.display_buffers[i].height>raster_h)raster_h=g.display_buffers[i].height;
+        }
+        rsx_dsp_viewport vp;rsx_dsp_surface sf;
+        rsx_dsp_get_viewport(&g.rsx,&vp);rsx_dsp_get_surface(&g.rsx,&sf);
+        /* Register fields are16-bit; these sums cannot overflow u32. */
+        if(vp.w && vp.x+vp.w>raster_w)raster_w=vp.x+vp.w;
+        if(vp.h && vp.y+vp.h>raster_h)raster_h=vp.y+vp.h;
+        if(sf.clip_w && sf.clip_x+sf.clip_w>raster_w)raster_w=sf.clip_x+sf.clip_w;
+        if(sf.clip_h && sf.clip_y+sf.clip_h>raster_h)raster_h=sf.clip_y+sf.clip_h;
+    }
     u32 want_w = raster_w * (samples > 1 ? 2u : 1u);
     u32 want_h = raster_h * (samples > 2 ? 2u : 1u);
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM)
