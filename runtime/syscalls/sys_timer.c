@@ -43,6 +43,34 @@ int lv2_deadline_passed(int64_t deadline)
     QueryPerformanceCounter(&now);
     return now.QuadPart >= deadline;
 }
+
+/* A relative wait on this thread's own high-resolution waitable timer.
+ * A plain timer or Sleep() ends on the next 1 ms scheduler tick at best, so a
+ * guest usleep(1000) lasted 1-2 ms and a 10 ms one 10-11 ms; the PS3 sleeps
+ * what was asked. Returns 0 (caller falls back to its old wait) when the
+ * timer is unavailable (before Windows 10 1803) or PS3RECOMP_PRECISE_WAITS=0. */
+int lv2_precise_wait_us(uint64_t usec)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("PS3RECOMP_PRECISE_WAITS");
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled || !usec) return 0;
+    static __thread HANDLE timer;
+    static __thread int failed;
+    if (!timer && !failed) {
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+        if (!timer) failed = 1;
+    }
+    if (!timer) return 0;
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)(usec * 10u);          /* 100 ns units, relative */
+    if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) return 0;
+    WaitForSingleObject(timer, INFINITE);
+    return 1;
+}
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -216,7 +244,9 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
-    if (usec >= 1000) {
+    if (usec >= 1000 && lv2_precise_wait_us(usec)) {
+        /* waited */
+    } else if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         if (timer) {
             LARGE_INTEGER due;

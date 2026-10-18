@@ -2481,6 +2481,11 @@ static u64 gcm_refill_idle_deadline_ns(void)
     return deadline;
 }
 
+#ifdef _WIN32
+/* runtime/syscalls/sys_timer.c; weak so fixtures without it still link. */
+extern int lv2_precise_wait_us(uint64_t usec) __attribute__((weak));
+#endif
+
 static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begin)
 {
     const u64 idle_deadline = gcm_refill_idle_deadline_ns();
@@ -2492,7 +2497,13 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
     u64 previous_packets = packets_started;
     int spins = 0;
     while ((previous == begin) != at_begin) {
-        Sleep(1); ++spins;
+        /* The renderer drains on its own thread; poll every 200 us rather
+         * than once per 1-2 ms scheduler tick (lv2_precise_wait_us). */
+#ifdef _WIN32
+        if (!lv2_precise_wait_us || !lv2_precise_wait_us(200))
+#endif
+            Sleep(1);
+        ++spins;
         const u32 drained = atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire);
         const u64 now = get_timestamp_ns();
         const int suspended = atomic_load_explicit(&s_host_presentation_suspended, memory_order_acquire);

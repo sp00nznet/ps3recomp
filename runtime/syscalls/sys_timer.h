@@ -41,6 +41,9 @@ uint64_t ppu_timebase_now(void);
  * (same approach sys_timer_usleep already uses). */
 int64_t lv2_usec_deadline(uint64_t usec);      /* QPC value 'usec' from now */
 int     lv2_deadline_passed(int64_t deadline); /* 1 once QPC >= deadline */
+/* Wait `usec` on a per-thread high-resolution timer; 0 if unavailable or
+ * PS3RECOMP_PRECISE_WAITS=0 (the caller then waits as before). */
+int     lv2_precise_wait_us(uint64_t usec);
 #endif
 
 #define SYS_TIMER_MAX  64
