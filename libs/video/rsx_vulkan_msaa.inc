@@ -19,7 +19,8 @@ static const char vk_msaa_expand_fs[] =
 static struct {
     VkDescriptorSetLayout set_layout;
     VkDescriptorPool pool;
-    VkDescriptorSet set;
+    VkDescriptorSet spare[VK_ENG_MAX_OBJ];  /* sets of released targets, for reuse */
+    u32 nspare;
     VkPipelineLayout layout;
     VkShaderModule vs, fs;
     VkRenderPass pass[3];
@@ -47,11 +48,10 @@ static int vk_eng_expansion_pipeline(VkFormat format, u32 index)
         VkDescriptorSetLayoutBinding binding={RSX_SPIRV_TEXTURE_BINDING,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,NULL};
         VkDescriptorSetLayoutCreateInfo sci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&binding};
         if (pvkCreateDescriptorSetLayout(s_vk.device,&sci,NULL,&s_msaa_expand.set_layout)!=VK_SUCCESS) return 0;
-        VkDescriptorPoolSize size={VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1};
-        VkDescriptorPoolCreateInfo pci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&size};
+        /* One set per multisample target at most (each keeps its own). */
+        VkDescriptorPoolSize size={VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,VK_ENG_MAX_OBJ};
+        VkDescriptorPoolCreateInfo pci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=VK_ENG_MAX_OBJ,.poolSizeCount=1,.pPoolSizes=&size};
         if (pvkCreateDescriptorPool(s_vk.device,&pci,NULL,&s_msaa_expand.pool)!=VK_SUCCESS) return 0;
-        VkDescriptorSetAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=s_msaa_expand.pool,.descriptorSetCount=1,.pSetLayouts=&s_msaa_expand.set_layout};
-        if (pvkAllocateDescriptorSets(s_vk.device,&ai,&s_msaa_expand.set)!=VK_SUCCESS) return 0;
         VkPipelineLayoutCreateInfo lci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&s_msaa_expand.set_layout};
         if (pvkCreatePipelineLayout(s_vk.device,&lci,NULL,&s_msaa_expand.layout)!=VK_SUCCESS) return 0;
         if (vk_eng_translate(vk_msaa_expand_vs,RSX_SHADER_STAGE_VERTEX,&s_msaa_expand.vs) ||
@@ -83,6 +83,24 @@ static int vk_eng_expansion_pipeline(VkFormat format, u32 index)
     return pvkCreateGraphicsPipelines(s_vk.device,vk_pcache(),1,&gci,NULL,&s_msaa_expand.pipeline[index])==VK_SUCCESS;
 }
 
+/* A target's cached expansion objects go when it goes, or when its expanded
+ * texture changes; pending passes may use them, so flush first. */
+static void vk_eng_expansion_forget(vk_eng_obj* src)
+{
+    if (!src->exp_fb && !src->exp_view && !src->exp_set) return;
+    vk_flush_pending(1);
+    if (src->exp_fb) pvkDestroyFramebuffer(s_vk.device,src->exp_fb,NULL);
+    if (src->exp_view) pvkDestroyImageView(s_vk.device,src->exp_view,NULL);
+    /* After vk_eng_expansion_shutdown the pool (and with it the set) is gone. */
+    if (src->exp_set && s_msaa_expand.pool && s_msaa_expand.nspare < VK_ENG_MAX_OBJ)
+        s_msaa_expand.spare[s_msaa_expand.nspare++]=src->exp_set;
+    src->exp_fb=VK_NULL_HANDLE; src->exp_view=VK_NULL_HANDLE; src->exp_set=VK_NULL_HANDLE; src->exp_dst=0;
+}
+
+/* Expand a 2x/4x target into a single-sample texture with one sample per
+ * texel. The source view, framebuffer and descriptor set stay with the
+ * target, so the pass is only recorded: with deferral it joins the batch
+ * (vk_submit_or_defer) instead of waiting on the GPU every frame. */
 static u32 vk_eng_expand_samples(u32 surface)
 {
     if (!surface || surface>=VK_ENG_MAX_OBJ) return 0;
@@ -93,8 +111,6 @@ static u32 vk_eng_expand_samples(u32 surface)
     const VkFormat format=depth?VK_FORMAT_R32_SFLOAT:src->fmt;
     const u32 index=depth?2u:(format==VK_FORMAT_R16G16B16A16_SFLOAT?1u:0u);
     const u32 w=src->w*2u,h=src->h*(src->samples==4?2u:1u);
-    VkImageView source_view=VK_NULL_HANDLE;
-    VkFramebuffer framebuffer=VK_NULL_HANDLE;
     if (!vk_eng_expansion_pipeline(format,index)) goto fail;
     if (!src->expanded) {
         const u32 hd=vk_eng_alloc();
@@ -110,41 +126,47 @@ static u32 vk_eng_expand_samples(u32 surface)
         src->expanded=hd;
         if (vk_begin()) goto fail;
         vk_barrier_image(dst->im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_UNDEFINED);
-        if (vk_submit_and_wait()) goto fail;
+        if (vk_submit_or_defer()) goto fail;
     }
     vk_eng_obj* dst=vk_eng_get(src->expanded,VK_ENG_TEXTURE);
     if (!dst) goto fail;
-    VkImageViewCreateInfo vci={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=src->im.img,
-        .viewType=VK_IMAGE_VIEW_TYPE_2D,.format=src->fmt,
-        .subresourceRange={depth?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
-    if (pvkCreateImageView(s_vk.device,&vci,NULL,&source_view)!=VK_SUCCESS) goto fail;
-    VkFramebufferCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-        .renderPass=s_msaa_expand.pass[index],.attachmentCount=1,.pAttachments=&dst->im.view,.width=w,.height=h,.layers=1};
-    if (pvkCreateFramebuffer(s_vk.device,&fci,NULL,&framebuffer)!=VK_SUCCESS) goto fail;
-    VkDescriptorImageInfo info={VK_NULL_HANDLE,source_view,VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_msaa_expand.set,
-        .dstBinding=RSX_SPIRV_TEXTURE_BINDING,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,.pImageInfo=&info};
-    pvkUpdateDescriptorSets(s_vk.device,1,&write,0,NULL);
+    if (!src->exp_fb || src->exp_dst!=src->expanded) {
+        vk_eng_expansion_forget(src);
+        VkImageViewCreateInfo vci={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=src->im.img,
+            .viewType=VK_IMAGE_VIEW_TYPE_2D,.format=src->fmt,
+            .subresourceRange={depth?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+        if (pvkCreateImageView(s_vk.device,&vci,NULL,&src->exp_view)!=VK_SUCCESS) goto fail;
+        VkFramebufferCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass=s_msaa_expand.pass[index],.attachmentCount=1,.pAttachments=&dst->im.view,.width=w,.height=h,.layers=1};
+        if (pvkCreateFramebuffer(s_vk.device,&fci,NULL,&src->exp_fb)!=VK_SUCCESS) goto fail;
+        if (s_msaa_expand.nspare) src->exp_set=s_msaa_expand.spare[--s_msaa_expand.nspare];
+        else {
+            VkDescriptorSetAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=s_msaa_expand.pool,.descriptorSetCount=1,.pSetLayouts=&s_msaa_expand.set_layout};
+            if (pvkAllocateDescriptorSets(s_vk.device,&ai,&src->exp_set)!=VK_SUCCESS) { src->exp_set=VK_NULL_HANDLE; goto fail; }
+        }
+        VkDescriptorImageInfo info={VK_NULL_HANDLE,src->exp_view,VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=src->exp_set,
+            .dstBinding=RSX_SPIRV_TEXTURE_BINDING,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,.pImageInfo=&info};
+        pvkUpdateDescriptorSets(s_vk.device,1,&write,0,NULL);
+        src->exp_dst=src->expanded;
+    }
     if (vk_begin()) goto fail;
     vk_barrier_image(src->im.img,depth?s_vk.depth_aspect:VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
     vk_barrier_image(dst->im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
     VkRenderPassBeginInfo bi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=s_msaa_expand.pass[index],
-        .framebuffer=framebuffer,.renderArea={{0,0},{w,h}}};
+        .framebuffer=src->exp_fb,.renderArea={{0,0},{w,h}}};
     pvkCmdBeginRenderPass(s_vk.cmd,&bi,VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,s_msaa_expand.pipeline[index]);
     VkViewport viewport={0,0,(float)w,(float)h,0,1};VkRect2D scissor={{0,0},{w,h}};
     pvkCmdSetViewport(s_vk.cmd,0,1,&viewport);pvkCmdSetScissor(s_vk.cmd,0,1,&scissor);
-    pvkCmdBindDescriptorSets(s_vk.cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,s_msaa_expand.layout,0,1,&s_msaa_expand.set,0,NULL);
+    pvkCmdBindDescriptorSets(s_vk.cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,s_msaa_expand.layout,0,1,&src->exp_set,0,NULL);
     pvkCmdDraw(s_vk.cmd,3,1,0,0);
     pvkCmdEndRenderPass(s_vk.cmd);
-    if (vk_submit_and_wait()) goto fail;
-    pvkDestroyFramebuffer(s_vk.device,framebuffer,NULL);
-    pvkDestroyImageView(s_vk.device,source_view,NULL);
+    if (vk_submit_or_defer()) goto fail;
     src->expansion_valid=1;
     return src->expanded;
 fail:
-    if (framebuffer) pvkDestroyFramebuffer(s_vk.device,framebuffer,NULL);
-    if (source_view) pvkDestroyImageView(s_vk.device,source_view,NULL);
+    vk_eng_expansion_forget(src);
     ps3_strict_boot_guard("vulkan-msaa-expand","cannot preserve individual samples surface=%u samples=%u",surface,src->samples);
     return 0;
 }

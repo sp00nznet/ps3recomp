@@ -624,6 +624,22 @@ static struct {
     u32 w, h;
 } s_rp;
 
+/* Released textures that recorded, unsubmitted commands may still sample
+ * (vk_eng_release); destroyed after the submission that ends them. */
+#define VK_GRAVE_MAX 256u
+static struct { vk_image im[VK_GRAVE_MAX]; u32 n; } s_grave;
+
+static void vk_grave_empty(void)
+{
+    for (u32 i = 0; i < s_grave.n; i++) {
+        vk_image* im = &s_grave.im[i];
+        if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
+        if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
+        if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    }
+    s_grave.n = 0;
+}
+
 static void vk_rp_close(void)
 {
     if (!s_rp.open) return;
@@ -669,6 +685,7 @@ static int vk_submit_and_wait_impl(const char* site)
         if (r == VK_SUCCESS) r = pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
     }
     const Uint64 hp_waited = vhp_tick();
+    if (r == VK_SUCCESS) vk_grave_empty();
     /* Whether it ran or failed, nothing recorded is pending any more. */
     s_batch.vb = s_batch.ib = s_batch.ub = 0;
     s_batch.rc = 0;
@@ -2331,6 +2348,11 @@ typedef struct vk_eng_obj {
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
+    /* Multisample target: what its expansion pass reuses (rsx_vulkan_msaa.inc). */
+    VkImageView     exp_view;
+    VkFramebuffer   exp_fb;
+    VkDescriptorSet exp_set;
+    u32             exp_dst;
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -2519,6 +2541,7 @@ static int vk_eng_init(void* user, u32 width, u32 height)
 
 static u32 vk_eng_expand_samples(u32 surface);
 static void vk_eng_expansion_shutdown(void);
+static void vk_eng_expansion_forget(vk_eng_obj* src);
 static int vk_eng_pack_samples(u32 surface, u32 expanded);
 static void vk_eng_pack_shutdown(void);
 #ifdef PS3RECOMP_RSX_CACAO
@@ -2526,8 +2549,21 @@ static void vk_eng_cacao_shutdown(void);
 #endif
 
 static void vk_eng_release(void* user, u32 handle)
-{ vk_flush_pending(0);
-    (void)user;
+{   (void)user;
+    /* A plain texture pending commands may still sample goes to the
+     * graveyard, destroyed once the next submission has completed; anything
+     * else (targets, their views and framebuffers) waits as before. */
+    if (handle && handle < VK_ENG_MAX_OBJ && s_eobj[handle].kind == VK_ENG_TEXTURE &&
+        !s_eobj[handle].expanded && !s_eobj[handle].exp_fb && s_batch.defer &&
+        s_batch.recording && (s_batch.pending || s_batch.deferred)) {
+        if (s_grave.n == VK_GRAVE_MAX) vk_flush_pending(1);
+        if (s_batch.recording && (s_batch.pending || s_batch.deferred)) {
+            s_grave.im[s_grave.n++] = s_eobj[handle].im;
+            memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
+            return;
+        }
+    }
+    vk_flush_pending(0);
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
     if (s_eobj[handle].kind == VK_ENG_COLOR)
         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
@@ -2542,6 +2578,7 @@ static void vk_eng_release(void* user, u32 handle)
     }
     if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
+    vk_eng_expansion_forget(&s_eobj[handle]);
     if (s_eobj[handle].expanded) {
         const u32 expanded = s_eobj[handle].expanded;
         s_eobj[handle].expanded = 0;
@@ -2950,10 +2987,10 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
 {   (void)user;
     vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
     vk_batch_configure();
-    /* A single-sample target's view is a CPU-side lookup or a new VkImageView:
-     * nothing pending reads or writes it, so it need not wait. A multisample
-     * target is expanded first, which keeps the old flush. */
-    if (!s_batch.defer || !t || t->samples > 1) vk_flush_pending(0);
+    /* A view is a CPU-side lookup or a new VkImageView, and a multisample
+     * target's expansion pass is recorded behind the pending draws: nothing
+     * here needs the GPU idle. */
+    if (!s_batch.defer || !t) vk_flush_pending(0);
     if (!t) return 0;
     if (t->samples > 1) {
         t = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
