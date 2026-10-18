@@ -14,11 +14,13 @@
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
+#include "audio_pacer.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <math.h>
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
@@ -143,7 +145,8 @@ static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
-static volatile int  s_mix_thread_running = 0;
+static unsigned long long g_audio_submit_failures, g_audio_submitted;
+static atomic_int    s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
 /* Is s_mix_thread a thread that exists and has not been joined? The Win32
@@ -202,8 +205,12 @@ static void audio_backend_shutdown(void)
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
     if (s_sdl_audio_dev) {
-        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
-                       num_samples * 2 * sizeof(float));
+        if (SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
+                          num_samples * 2 * sizeof(float)) < 0) {
+            ++g_audio_submit_failures;
+            if (g_audio_submit_failures <= 4)
+                fprintf(stderr, "[cellAudio] SDL_QueueAudio failed: %s\n", SDL_GetError());
+        } else g_audio_submitted += num_samples;
     }
 }
 
@@ -233,6 +240,7 @@ static IAudioClient*        s_wasapi_client = NULL;
 static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
+static int audio_paced(void) { return getenv("AUDIO_DEVICE_BURST") == NULL; }
 
 static int audio_backend_init(void)
 {
@@ -319,7 +327,20 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+    /* A device callback is an engine quantum, not a guest block clock.
+     * Prime two guest blocks so the producer can run at 48 kHz without
+     * starving the first engine quantum. This is startup latency only. */
+    if (audio_paced()) {
+        UINT32 prime = CELL_AUDIO_BLOCK_SAMPLES * 2;
+        if (prime > s_wasapi_buf_frames) prime = s_wasapi_buf_frames;
+        BYTE* buffer = NULL;
+        hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, prime, &buffer);
+        if (SUCCEEDED(hr))
+            hr = s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, prime, AUDCLNT_BUFFERFLAGS_SILENT);
+        if (FAILED(hr)) { fprintf(stderr, "[cellAudio] prime failed: 0x%08lX\n", hr); return -1; }
+    }
+    hr = s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+    if (FAILED(hr)) { fprintf(stderr, "[cellAudio] Start failed: 0x%08lX\n", hr); return -1; }
     return 0;
 }
 
@@ -347,7 +368,13 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     if (!s_wasapi_render) return;
 
     UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    if (FAILED(hr) || padding > s_wasapi_buf_frames) {
+        ++g_audio_submit_failures;
+        if (g_audio_submit_failures <= 4)
+            fprintf(stderr, "[cellAudio] submit padding failed: 0x%08lX\n", hr);
+        return;
+    }
 
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available) {
@@ -357,11 +384,15 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     if (num_samples == 0) return;
 
     BYTE* buf = NULL;
-    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
+    hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
-        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
+        hr = s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
+        if (SUCCEEDED(hr)) { g_audio_submitted += num_samples; return; }
     }
+    ++g_audio_submit_failures;
+    if (g_audio_submit_failures <= 4)
+        fprintf(stderr, "[cellAudio] render submission failed: 0x%08lX\n", hr);
 }
 
 /* Frames the device can take right now; -1 with no device open. */
@@ -535,6 +566,23 @@ static void audio_notify_event_queues(void)
 }
 
 #ifdef _WIN32
+/* A per-thread multimedia reservation and per-thread high resolution timer
+ * keep audio scheduling independent of video activity and process-wide timer
+ * resolution. Neither changes the default device or global audio settings. */
+static void audio_wait_clock(HANDLE timer, uint64_t ticks, uint64_t frequency)
+{
+    if (!ticks) return;
+    if (timer) {
+        LARGE_INTEGER relative;
+        relative.QuadPart = -(LONGLONG)((ticks * 10000000ULL + frequency - 1) / frequency);
+        if (SetWaitableTimer(timer, &relative, 0, NULL, NULL, FALSE)) {
+            WaitForSingleObject(timer, 10);
+            return;
+        }
+    }
+    Sleep(1);
+}
+
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -548,23 +596,54 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      * With no device, pace on the performance counter instead. */
     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
     unsigned long long blocks = 0;
+    audio_pacer pacer;
+    audio_pacer_init(&pacer, (uint64_t)q0.QuadPart, (uint64_t)qf.QuadPart);
+    const int paced = getenv("AUDIO_DEVICE_BURST") == NULL;
+    HANDLE timer = NULL, mmcss = NULL;
+    HMODULE avrt = NULL;
+    typedef HANDLE (WINAPI *mmcss_begin_fn)(LPCWSTR, LPDWORD);
+    typedef BOOL (WINAPI *mmcss_end_fn)(HANDLE);
+    mmcss_end_fn mmcss_end = NULL;
+    if (paced) {
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        if (!timer) timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+        avrt = LoadLibraryW(L"avrt.dll");
+        if (avrt) {
+            mmcss_begin_fn begin = (mmcss_begin_fn)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW");
+            mmcss_end = (mmcss_end_fn)GetProcAddress(avrt, "AvRevertMmThreadCharacteristics");
+            DWORD task_index = 0;
+            if (begin && mmcss_end) mmcss = begin(L"Audio", &task_index);
+        }
+        fprintf(stderr, "[cellAudio] paced 48kHz, timer=%s, MMCSS Audio=%s\n",
+                timer ? "waitable" : "Sleep fallback", mmcss ? "enabled" : "unavailable");
+    }
+    const char* trace_path = getenv("AUDIO_BLOCK_TRACE");
+    FILE* trace = trace_path ? fopen(trace_path, "wb") : NULL;
+    if (trace) fprintf(trace, "block,qpc_us,room,peak,silent,dropped,submitted,submit_failures,rebases,mix_us,capture_submit_us,previous_tail_us\n");
+    uint64_t previous_tail_us = 0;
+    LARGE_INTEGER trace_now = {0};
     while (s_mix_thread_running) {
         const int room = audio_backend_room();
-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
-        if (room < 0) {
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) {
+            if (paced) audio_wait_clock(timer, (uint64_t)qf.QuadPart / 1000, (uint64_t)qf.QuadPart);
+            else audio_backend_wait();
+            continue;
+        }
+        if (room < 0 || paced) {
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
-            const long long due = q0.QuadPart +
-                (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
-            if (now.QuadPart < due) { Sleep(1); continue; }
-            /* More than 50 ms behind (device just went away, a debugger
-             * stop): drop the backlog instead of mixing it in a burst. */
-            if (now.QuadPart - due > qf.QuadPart / 20)
-                q0.QuadPart = now.QuadPart -
-                    (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+            if (!audio_pacer_ready(&pacer, (uint64_t)now.QuadPart)) {
+                uint64_t due = audio_pacer_deadline(&pacer);
+                audio_wait_clock(timer, due > (uint64_t)now.QuadPart ? due - now.QuadPart : 1, (uint64_t)qf.QuadPart);
+                continue;
+            }
+            audio_pacer_consumed(&pacer, (uint64_t)now.QuadPart);
         }
         blocks++;
         /* Mix and submit one block */
+        LARGE_INTEGER mix_begin = {0}, mix_end = {0};
+        if (trace) QueryPerformanceCounter(&mix_begin);
         audio_mix_one_block();
+        if (trace) QueryPerformanceCounter(&mix_end);
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
          * "is any port producing sound" is answerable (LBP Bink movie audio). */
         { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
@@ -579,6 +658,22 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
           if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
           if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        if (trace) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            trace_now = now;
+            float peak = 0.0f;
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; ++i) {
+                float a = fabsf(s_mix_buffer[i]); if (a > peak) peak = a;
+            }
+            fprintf(trace, "%llu,%llu,%d,%.9g,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", blocks,
+                (unsigned long long)(now.QuadPart / qf.QuadPart) * 1000000ULL +
+                (unsigned long long)(now.QuadPart % qf.QuadPart) * 1000000ULL / qf.QuadPart,
+                room, peak, peak == 0.0f, g_audio_dropped,
+                g_audio_submitted, g_audio_submit_failures, (unsigned long long)pacer.rebases,
+                (unsigned long long)(mix_end.QuadPart-mix_begin.QuadPart)*1000000ULL/qf.QuadPart,
+                (unsigned long long)(now.QuadPart-mix_end.QuadPart)*1000000ULL/qf.QuadPart,
+                (unsigned long long)previous_tail_us);
+        }
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
@@ -597,8 +692,16 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 
         /* Notify event queues */
         audio_notify_event_queues();
+        if (trace) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            previous_tail_us = (uint64_t)(now.QuadPart-trace_now.QuadPart)*1000000ULL/qf.QuadPart;
+        }
     }
 
+    if (trace) fclose(trace);
+    if (timer) CloseHandle(timer);
+    if (mmcss) mmcss_end(mmcss);
+    if (avrt) FreeLibrary(avrt);
     printf("[cellAudio] Mixing thread stopped\n");
     return 0;
 }
@@ -647,27 +750,28 @@ static int audio_start_mix_thread(void)
     return 0;
 }
 
-static void audio_stop_mix_thread(void)
+static int audio_stop_mix_thread(void)
 {
     s_mix_thread_running = 0;
 #ifdef _WIN32
     if (s_mix_thread) {
-        WaitForSingleObject(s_mix_thread, 2000);
+        if (WaitForSingleObject(s_mix_thread, 2000) != WAIT_OBJECT_0) {
+            fprintf(stderr, "[cellAudio] Mixer has not exited; retaining backend and port state\n");
+            return -1;
+        }
         CloseHandle(s_mix_thread);
         s_mix_thread = NULL;
     }
 #else
-    /* Same guard. Init leaves s_audio_initialized set even when the mixing
-     * thread failed to start ("continuing silently" -- a title without audio
-     * still runs), so Quit reaches here with s_mix_thread never assigned.
-     * pthread_t has no null value to test, and joining an unset one, or
+    /* pthread_t has no null value to test, and joining an unset one, or
      * joining the same one twice, is undefined rather than an error the way
      * WaitForSingleObject on a null HANDLE is. */
     if (s_mix_thread_live) {
-        pthread_join(s_mix_thread, NULL);
+        if (pthread_join(s_mix_thread, NULL) != 0) return -1;
         s_mix_thread_live = 0;
     }
 #endif
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -691,11 +795,14 @@ s32 cellAudioInit(void)
 
     memset(s_ports, 0, sizeof(s_ports));
     memset(s_notify_queues, 0, sizeof(s_notify_queues));
+    g_audio_dropped = g_audio_submit_failures = g_audio_submitted = 0;
     mutex_init(&s_audio_mutex);
 
     if (audio_backend_init() < 0) {
-        printf("[cellAudio] WARNING: Audio backend init failed, continuing silently\n");
-        /* Don't fail -- games should still run without audio */
+        fprintf(stderr, "[cellAudio] Audio backend initialization failed\n");
+        audio_backend_shutdown();
+        mutex_destroy(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_AUDIOSYSTEM;
     }
 
 
@@ -709,7 +816,10 @@ s32 cellAudioInit(void)
       s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }
 #endif
     if (audio_start_mix_thread() < 0) {
-        printf("[cellAudio] WARNING: Could not start mixing thread\n");
+        fprintf(stderr, "[cellAudio] Could not start mixing thread\n");
+        audio_backend_shutdown();
+        mutex_destroy(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_AUDIOSYSTEM;
     }
 
     s_audio_initialized = 1;
@@ -723,7 +833,8 @@ s32 cellAudioQuit(void)
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
-    audio_stop_mix_thread();
+    if (audio_stop_mix_thread() < 0)
+        return CELL_AUDIO_ERROR_AUDIOSYSTEM;
     audio_backend_shutdown();
 
     /* Port buffers live in the guest vm_base arena (bump-allocated, not host
