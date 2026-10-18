@@ -14,6 +14,7 @@
 #include "rsx_draw_batches.h"
 #include "rsx_depth_clip.h"
 #include "rsx_capture_depth.h"
+#include "rsx_depth_guest.h"
 #include "rsx_hud_geometry.h"
 #ifdef PS3RECOMP_RSX_CACAO
 #include "rsx_ao_depth_state.h"
@@ -130,6 +131,10 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+    /* The backend's GPU-side A8R8G8B8 reading of this depth (depth_to_argb),
+     * what it was made for, and the depth_serial it holds. */
+    u32 argb, argb_w, argb_h, argb_remap, argb_fmt;
+    u64 argb_serial;
 #ifdef PS3RECOMP_RSX_CACAO
     rsx_ao_depth_state ao;
 #endif
@@ -924,6 +929,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h, u32 samp
     z->snapshot_valid = 0;
     z->depth_serial = 0;
     z->guest_dirty = 0;
+    z->argb = 0;           /* released with the old depth target */
+    z->argb_serial = 0;
 #ifdef PS3RECOMP_RSX_CACAO
     memset(&z->ao,0,sizeof(z->ao));
 #endif
@@ -1335,14 +1342,11 @@ static int eng_zdepth_to_guest(u32 slot)
         if (!dst) return 0;
         const float* src = s_depth_rows + (size_t)r * w;
         for (u32 c = 0; c < w; c++) {
-            float d = src[c];
-            if (!(d > 0.0f)) d = 0.0f;
-            if (d > 1.0f) d = 1.0f;
             if (bpp == 2u) {
-                const u32 v = (u32)(d * 65535.0f + 0.5f);
+                const u32 v = rsx_depth_guest_z16(src[c]);
                 dst[0] = (u8)(v >> 8); dst[1] = (u8)v;
             } else {
-                const u32 v = (u32)(d * 16777215.0f + 0.5f);
+                const u32 v = rsx_depth_guest_z24(src[c]);
                 dst[0] = (u8)(v >> 16); dst[1] = (u8)(v >> 8); dst[2] = (u8)v; dst[3] = 0;
             }
             dst += bpp;
@@ -1354,6 +1358,99 @@ static int eng_zdepth_to_guest(u32 slot)
         fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
                 z->offset, bpp == 2u ? "Z16" : "Z24S8", z->pitch, w, h);
     return 1;
+}
+
+/* A Z24S8 depth target read as linear A8R8G8B8 (a deferred renderer
+ * rebuilding positions from it) is stored to guest memory, re-hashed and
+ * re-decoded on every frame it changes: a GPU wait for the readback plus a
+ * full-size hash, decode and upload on the CPU. When the texture reads exactly
+ * the bytes eng_zdepth_to_guest would store (same address and pitch, inside
+ * the stored rectangle, one linear level), the backend can produce the decoded
+ * texels on the GPU instead, behind the pending draws. Guest memory is then
+ * left as it is: it stays guest_dirty and is stored when anything reads it
+ * through guest memory, the way a colour target's bytes are. Reused while the
+ * depth is unchanged. PS3RECOMP_VK_DEPTH_ARGB=0 keeps the guest-memory path. */
+static int eng_depth_argb_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_DEPTH_ARGB"); on = !(e && e[0] == '0'); }
+    return on;
+}
+
+/* RSX_ENGINE_DEPTH_ARGB_CHECK=<n> (diagnostic; it stalls on purpose): for the
+ * first n conversions also store the depth through guest memory, decode it the
+ * way an upload would, and compare that with the GPU texture byte for byte. */
+static void eng_depth_argb_check(u32 slot, const rsx_dsp_texture* t, u32 tex)
+{
+    static int left = -1;
+    static u32 runs, bad_runs;
+    if (left < 0) { const char* e = getenv("RSX_ENGINE_DEPTH_ARGB_CHECK"); left = e ? atoi(e) : 0; }
+    if (left <= 0 || !g.be->readback) return;
+    left--;
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    g.zdepths[slot].guest_dirty = 1;
+    if (!rsx_texture_mip_chain(t->format, t->width, t->height, 1, t->pitch, lv) ||
+        !eng_zdepth_to_guest(slot)) {
+        fprintf(stderr, "[rsx engine] depth-argb check: guest store failed\n");
+        return;
+    }
+    const rsx_tex_layout* tl = &lv[0].tl;
+    const u8* src = (const u8*)eng_guest_ptr(NULL, t->location, t->offset, tl->face_bytes);
+    const size_t bytes = (size_t)tl->dst_row_bytes * tl->rows;
+    u8* want = (u8*)malloc(bytes);
+    u8* got = (u8*)malloc(bytes);
+    if (src && want && got) {
+        rsx_texture_decode(want, tl->dst_row_bytes, src, t->width, t->height, tl,
+                           rsx_texture_argb_is_rgba());
+        g.be->readback(g.be->user, tex, 0, 0, t->width, t->height, got, tl->dst_row_bytes);
+        u32 differ = 0, first = 0;
+        for (size_t i = 0; i < bytes; i += 4)
+            if (memcmp(want + i, got + i, 4) && !differ++) first = (u32)(i / 4);
+        runs++;
+        if (differ) bad_runs++;
+        fprintf(stderr, "[rsx engine] depth-argb check %u: %ux%u fmt=0x%02X remap=0x%04X "
+                "%u texels differ (runs with differences %u)",
+                runs, t->width, t->height, t->format, t->remap & 0xFFFFu, differ, bad_runs);
+        if (differ)
+            fprintf(stderr, "; first at %u,%u want %02X%02X%02X%02X got %02X%02X%02X%02X",
+                    first % t->width, first / t->width,
+                    want[first * 4], want[first * 4 + 1], want[first * 4 + 2], want[first * 4 + 3],
+                    got[first * 4], got[first * 4 + 1], got[first * 4 + 2], got[first * 4 + 3]);
+        fputc('\n', stderr);
+    }
+    free(want);
+    free(got);
+}
+
+static u32 eng_zdepth_argb(u32 slot, const rsx_dsp_texture* t, u32 base_fmt)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    if (!g.be->depth_to_argb || !z->handle || !eng_depth_argb_enabled() ||
+        (base_fmt != 0x85u && base_fmt != 0x9Eu) || z->zfmt == 1u /* Z16 */ ||
+        t->cubemap || t->mipmaps > 1u || t->location != z->location ||
+        t->offset != z->offset || t->pitch != z->pitch)
+        return 0;
+    const u32 w = z->used_w < z->w ? z->used_w : z->w;
+    const u32 h = z->used_h < z->h ? z->used_h : z->h;
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    if (!t->width || !t->height || t->width > w || t->height > h || z->pitch < w * 4u ||
+        rsx_texture_mip_chain(t->format, t->width, t->height, 1, t->pitch, lv) != 1u ||
+        lv[0].tl.swizzled || lv[0].tl.bytes_per_texel != 4u || lv[0].tl.dst_bytes_per_texel != 4u)
+        return 0;
+    const u32 remap = t->remap & 0xFFFFu;
+    if (z->argb && z->argb_serial == z->depth_serial && z->argb_w == t->width &&
+        z->argb_h == t->height && z->argb_remap == remap && z->argb_fmt == t->format)
+        return z->argb;
+    const uint64_t hp_start = hp_tick();
+    const u32 tex = g.be->depth_to_argb(g.be->user, z->handle, t->width, t->height, remap,
+                                        t->format, rsx_texture_argb_is_rgba() ? 1u : 0u);
+    hp_end(HP_RBDEPTH, hp_start);
+    z->argb = tex;
+    if (!tex) return 0;
+    z->argb_serial = z->depth_serial;
+    z->argb_w = t->width; z->argb_h = t->height; z->argb_remap = remap; z->argb_fmt = t->format;
+    eng_depth_argb_check(slot, t, tex);
+    return tex;
 }
 
 /* A depth write or clear through the current zeta, recorded with what the
@@ -2119,6 +2216,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
+            const u32 argb = eng_zdepth_argb((u32)zsrc, &t, base_fmt);
+            if (argb) { textures[u] = argb; continue; }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,

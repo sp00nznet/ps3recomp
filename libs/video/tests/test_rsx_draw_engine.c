@@ -381,10 +381,10 @@ static const rsx_draw_backend g_stub_backend = {
 
 static void m(u32 method, u32 arg) { rsx_draw_engine_method(method, arg); }
 
-static void engine_up(void)
+static void engine_up_with(const rsx_draw_backend* backend)
 {
     memset(&stub, 0, sizeof stub);
-    rsx_draw_engine_set_backend(&g_stub_backend);
+    rsx_draw_engine_set_backend(backend);
     if (rsx_draw_engine_init(1280, 720) != 0) {
         printf("[FAIL] engine init\n");
         exit(1);
@@ -398,6 +398,8 @@ static void engine_up(void)
     m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
     m(M_VTXBUF_OFFSET, 0x80000000u | VTX_OFFSET);
 }
+
+static void engine_up(void) { engine_up_with(&g_stub_backend); }
 
 static void engine_down(void)
 {
@@ -1229,6 +1231,77 @@ static void test_depth_read_as_color(void)
     engine_down();
 }
 
+/* The same read through a backend that converts the depth on the GPU
+ * (depth_to_argb): no readback, no guest store, no upload, and one
+ * conversion per depth write. */
+static struct { int calls; u32 depth, w, h, remap, fmt, flags; } g_argb;
+
+static u32 stub_depth_to_argb(void* u, u32 d, u32 w, u32 h, u32 remap, u32 fmt, u32 flags)
+{
+    (void)u;
+    g_argb.calls++;
+    g_argb.depth = d; g_argb.w = w; g_argb.h = h;
+    g_argb.remap = remap; g_argb.fmt = fmt; g_argb.flags = flags;
+    return 900u + (u32)g_argb.calls;
+}
+
+static void test_depth_read_as_color_on_gpu(void)
+{
+    printf("-- zeta read as A8R8G8B8, converted on the GPU\n");
+    rsx_draw_backend backend = g_stub_backend;
+    backend.depth_to_argb = stub_depth_to_argb;
+    memset(&g_argb, 0, sizeof g_argb);
+    engine_up_with(&backend);
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    draw_triangle();
+    const u32 zeta = stub.bound_depth;
+
+    u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
+    memset(z, 0xEE, 16);
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(0x1840, 256u * 4u);                      /* texture pitch = zeta pitch */
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    CHECK(g_argb.calls == 1 && stub.bound_tex[0] == 901u,
+          "the unit samples the backend's conversion (%d calls, bound %u)", g_argb.calls, stub.bound_tex[0]);
+    CHECK(g_argb.depth == zeta && g_argb.w == 4 && g_argb.h == 4 && g_argb.remap == 0xAAE4u &&
+          g_argb.fmt == (0x85u | 0x20u) && g_argb.flags == 0,
+          "it converts that zeta for the unit's size, crossbar and format");
+    CHECK(stub.n_depth_readback == 0 && stub.n_texture_create == uploads && z[0] == 0xEE && z[3] == 0xEE,
+          "nothing is read back, stored or uploaded (%d readbacks)", stub.n_depth_readback);
+
+    draw_triangle();
+    CHECK(g_argb.calls == 1 && stub.bound_tex[0] == 901u, "an unchanged depth is converted once");
+
+    m(M_DEPTH_TEST, 1u); m(M_DEPTH_WRITE, 1u);
+    draw_triangle();                           /* writes the depth again */
+    m(M_DEPTH_TEST, 0u); m(M_DEPTH_WRITE, 0u);
+    draw_triangle();
+    CHECK(g_argb.calls >= 2 && stub.bound_tex[0] == 900u + (u32)g_argb.calls,
+          "a depth write makes the next read convert again (%d calls)", g_argb.calls);
+
+    /* A pitch other than the zeta's reads other bytes: through guest memory. */
+    const int calls = g_argb.calls;
+    m(0x1840, 512u * 4u);
+    draw_triangle();
+    CHECK(g_argb.calls == calls && stub.n_depth_readback == 1 &&
+          z[0] == 0x80 && z[1] == 0x00 && z[2] == 0x00 && z[3] == 0x00,
+          "a texture pitch unlike the zeta's still stores through guest memory (%d readbacks)",
+          stub.n_depth_readback);
+    engine_down();
+}
+
 static void test_color_read_as_float(void)
 {
     printf("-- colour target read as X32_FLOAT\n");
@@ -1436,6 +1509,7 @@ int main(int argc, char** argv)
     test_inline_array();
     test_depth_clear_value();
     test_depth_read_as_color();
+    test_depth_read_as_color_on_gpu();
     test_color_read_as_float();
     test_multisample_layout();
     test_multisample_seed();

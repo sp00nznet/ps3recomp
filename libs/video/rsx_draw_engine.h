@@ -236,6 +236,17 @@ typedef struct rsx_draw_backend {
     /* Optional per-present camera aspect. Zero restores native surface aspect.
      * Does not resize guest targets or change their texture coordinates. */
     void (*set_present_aspect)(void* user, float aspect);
+    /* Optional. A texture holding, for the top-left w x h logical texels of a
+     * Z24S8 depth target, exactly the host texels rsx_texture_decode makes of
+     * the bytes depth_readback + the engine's guest store would leave in
+     * memory (rsx_depth_guest.h), read as the linear A8R8G8B8 or D8R8G8B8
+     * `rsx_fmt` with the `remap` crossbar; `flags` bit 0 is
+     * rsx_texture_argb_is_rgba(). It is recorded behind the pending draws on
+     * the GPU instead of read back. The texture belongs to the depth target
+     * and stays valid until it is released or the next call; 0 means the
+     * backend cannot, and the engine stores through guest memory instead. */
+    u32 (*depth_to_argb)(void* user, u32 depth, u32 w, u32 h, u32 remap,
+                         u32 rsx_fmt, u32 flags);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

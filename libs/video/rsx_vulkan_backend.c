@@ -2365,6 +2365,14 @@ typedef struct vk_eng_obj {
     VkFramebuffer   exp_fb;
     VkDescriptorSet exp_set;
     u32             exp_dst;
+    /* DEPTH: its GPU-side A8R8G8B8 texture, or 0. That TEXTURE: the R32_UINT
+     * view, framebuffer and source set its pass reuses, and the expanded
+     * depth the set names (rsx_vulkan_depth_argb.inc). */
+    u32             argb;
+    VkImageView     argb_view;
+    VkFramebuffer   argb_fb;
+    VkDescriptorSet argb_set;
+    u32             argb_src;
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -2556,6 +2564,8 @@ static void vk_eng_expansion_shutdown(void);
 static void vk_eng_expansion_forget(vk_eng_obj* src);
 static int vk_eng_pack_samples(u32 surface, u32 expanded);
 static void vk_eng_pack_shutdown(void);
+static void vk_eng_depth_argb_forget(vk_eng_obj* o);
+static void vk_eng_depth_argb_shutdown(void);
 #ifdef PS3RECOMP_RSX_CACAO
 static void vk_eng_cacao_shutdown(void);
 #endif
@@ -2566,7 +2576,7 @@ static void vk_eng_release(void* user, u32 handle)
      * graveyard, destroyed once the next submission has completed; anything
      * else (targets, their views and framebuffers) waits as before. */
     if (handle && handle < VK_ENG_MAX_OBJ && s_eobj[handle].kind == VK_ENG_TEXTURE &&
-        !s_eobj[handle].expanded && !s_eobj[handle].exp_fb && s_batch.defer &&
+        !s_eobj[handle].expanded && !s_eobj[handle].exp_fb && !s_eobj[handle].argb_fb && s_batch.defer &&
         s_batch.recording && (s_batch.pending || s_batch.deferred)) {
         if (s_grave.n == VK_GRAVE_MAX) vk_flush_pending(1);
         if (s_batch.recording && (s_batch.pending || s_batch.deferred)) {
@@ -2588,9 +2598,15 @@ static void vk_eng_release(void* user, u32 handle)
         s_eobj[handle].surface = 0;
         if (vk_eng_get(snap, VK_ENG_TEXTURE)) vk_eng_release(user, snap);
     }
+    if (s_eobj[handle].kind == VK_ENG_DEPTH && s_eobj[handle].argb) {
+        const u32 argb = s_eobj[handle].argb;
+        s_eobj[handle].argb = 0;
+        if (vk_eng_get(argb, VK_ENG_TEXTURE)) vk_eng_release(user, argb);
+    }
     if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
     vk_eng_expansion_forget(&s_eobj[handle]);
+    vk_eng_depth_argb_forget(&s_eobj[handle]);
     if (s_eobj[handle].expanded) {
         const u32 expanded = s_eobj[handle].expanded;
         s_eobj[handle].expanded = 0;
@@ -2608,6 +2624,7 @@ static void vk_eng_shutdown(void* user)
     vk_eng2_shutdown(user);
     vk_eng_expansion_shutdown();
     vk_eng_pack_shutdown();
+    vk_eng_depth_argb_shutdown();
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
 }
 
@@ -3562,6 +3579,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 samples)
 
 #include "rsx_vulkan_msaa.inc"
 #include "rsx_vulkan_msaa_upload.inc"
+#include "rsx_vulkan_depth_argb.inc"
 #ifdef PS3RECOMP_RSX_CACAO
 #include "rsx_vulkan_ao_pass.inc"
 #include "rsx_vulkan_cacao.inc"
@@ -4096,6 +4114,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .color_target_write   = vk_eng_color_target_write,
     .color_target_create_multisample = vk_eng_color_multisample,
     .depth_target_create_multisample = vk_eng_depth_multisample,
+    .depth_to_argb        = vk_eng_depth_to_argb,
 #ifdef PS3RECOMP_RSX_CACAO
     .ambient_occlusion = vk_eng_cacao_world,
 #endif
