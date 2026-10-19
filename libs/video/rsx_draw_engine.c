@@ -12,6 +12,7 @@
  */
 #include "rsx_draw_engine.h"
 #include "rsx_draw_batches.h"
+#include "texture_pack.h"
 #include "rsx_depth_clip.h"
 #include "rsx_capture_depth.h"
 #include "rsx_depth_guest.h"
@@ -143,7 +144,7 @@ typedef struct {
 } eng_zdepth;
 
 typedef struct {
-    u32 location, offset, format, width, height, levels, pitch, remap, cubemap;
+    u32 location, offset, format, width, height, levels, pitch, remap, cubemap, dimension;
     u32 handle;
     u64 content_hash;
     u32 last_hash_frame;
@@ -1084,7 +1085,8 @@ static void eng_texture_dump(u32 offset, u32 fmt, u32 w, u32 h, u32 remap,
 /* Decode a guest texture out of guest memory and hand every face and level to
  * the backend. Returns the backend handle, or 0. */
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                              u32 levels, u32 pitch, int cube, u32 remap)
+                              u32 levels, u32 pitch, int cube, u32 remap,
+                              u32 dimension)
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
@@ -1095,6 +1097,49 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     if (!src) return 0;
+
+    /* Match exact compressed base bytes only for two-dimensional textures.
+     * Dimension is part of cache identity below, so a 3D binding cannot reuse
+     * a previously replaced 2D handle. Guest format/remap stay unchanged. */
+    const char* pack_root = getenv("FOLKLORE_TEXTURE_PACK");
+    const u32 base_fmt = fmt & 0x9Fu;
+    const u32 pack_fmt = base_fmt == 0x86u ? 1u :
+                         base_fmt == 0x87u ? 2u :
+                         base_fmt == 0x88u ? 3u : 0u;
+    const char* pack_scale_text = getenv("FOLKLORE_TEXTURE_SCALE");
+    const u32 pack_scale = pack_scale_text && strcmp(pack_scale_text, "2") == 0 ? 2u :
+                           pack_scale_text && strcmp(pack_scale_text, "4") == 0 ? 4u : 0u;
+    if (g.be->texture_upload_valid && pack_scale && dimension == 2u && !cube && pack_fmt && pack_root && *pack_root &&
+        lv[0].tl.compressed && w <= ENG_MAX_TEX_DIM && h <= ENG_MAX_TEX_DIM) {
+        texture_pack pack;
+        if (texture_pack_load(pack_root, src, lv[0].tl.face_bytes,
+                              pack_fmt, w, h, &pack)) {
+            if (pack.levels >= nlv && pack.width == w * pack_scale && pack.height == h * pack_scale) {
+                const u32 replacement = g.be->texture_create(g.be->user,
+                    RSX_BE_FMT_R8G8B8A8, pack.width, pack.height, nlv,
+                    1u, remap, fmt);
+                if (replacement) {
+                    for (u32 m = 0; m < nlv; m++)
+                        g.be->texture_upload(g.be->user, replacement, 0u, m,
+                            pack.level_width[m], pack.level_height[m],
+                            pack.level[m], pack.row_bytes[m],
+                            pack.level_height[m]);
+                    if (g.be->texture_upload_valid(g.be->user, replacement)) {
+                        static u32 logged_replacements;
+                        if (logged_replacements < 8u) {
+                            logged_replacements++;
+                            fprintf(stderr, "[texture-pack] %ux%u -> %ux%u (%ux), original format=0x%02X\n",
+                                    w, h, pack.width, pack.height, pack_scale, base_fmt);
+                        }
+                        texture_pack_free(&pack);
+                        return replacement;
+                    }
+                    g.be->texture_release(g.be->user, replacement);
+                }
+            }
+            texture_pack_free(&pack);
+        }
+    }
 
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                             w, h, nlv, faces, remap, fmt);
@@ -1142,27 +1187,27 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * one is only added after a miss. RSX_ENGINE_TEXTURE_INDEX_CHECK=1 also runs
  * the old scan on every lookup and stops strictly if the two ever disagree. */
 static u32 eng_tex_key_hash(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                            u32 levels, u32 pitch, u32 remap, u32 cube)
+                            u32 levels, u32 pitch, u32 remap, u32 cube, u32 dimension)
 {
-    const u32 k[9] = { location, offset, fmt, w, h, levels, pitch, remap, cube };
+    const u32 k[10] = { location, offset, fmt, w, h, levels, pitch, remap, cube, dimension };
     u32 x = 2166136261u;
-    for (u32 i = 0; i < 9; i++) { x ^= k[i]; x *= 16777619u; x ^= x >> 15; }
+    for (u32 i = 0; i < 10; i++) { x ^= k[i]; x *= 16777619u; x ^= x >> 15; }
     return x;
 }
 
 static int eng_tex_matches(const eng_texture* e, u32 location, u32 offset, u32 fmt,
-                           u32 w, u32 h, u32 levels, u32 pitch, u32 remap, u32 cube)
+                           u32 w, u32 h, u32 levels, u32 pitch, u32 remap, u32 cube, u32 dimension)
 {
     return e->location == location && e->offset == offset && e->format == fmt &&
            e->width == w && e->height == h && e->levels == levels && e->pitch == pitch &&
-           e->remap == remap && e->cubemap == cube;
+           e->remap == remap && e->cubemap == cube && e->dimension == dimension;
 }
 
 static void eng_tex_index_insert(u32 i)
 {
     const eng_texture* e = &g.textures[i];
     u32 s = eng_tex_key_hash(e->location, e->offset, e->format, e->width, e->height,
-                             e->levels, e->pitch, e->remap, e->cubemap) & (ENG_TEX_INDEX_SIZE - 1u);
+                             e->levels, e->pitch, e->remap, e->cubemap, e->dimension) & (ENG_TEX_INDEX_SIZE - 1u);
     while (g.texture_index[s]) s = (s + 1u) & (ENG_TEX_INDEX_SIZE - 1u);
     g.texture_index[s] = (u16)(i + 1u);
 }
@@ -1181,20 +1226,20 @@ static int eng_tex_index_check(void)
 }
 
 static int eng_tex_find(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                        u32 levels, u32 pitch, u32 remap, u32 cube)
+                        u32 levels, u32 pitch, u32 remap, u32 cube, u32 dimension)
 {
     int found = -1;
-    for (u32 s = eng_tex_key_hash(location, offset, fmt, w, h, levels, pitch, remap, cube) & (ENG_TEX_INDEX_SIZE - 1u);
+    for (u32 s = eng_tex_key_hash(location, offset, fmt, w, h, levels, pitch, remap, cube, dimension) & (ENG_TEX_INDEX_SIZE - 1u);
          g.texture_index[s]; s = (s + 1u) & (ENG_TEX_INDEX_SIZE - 1u)) {
         const u32 i = g.texture_index[s] - 1u;
-        if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, levels, pitch, remap, cube)) {
+        if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, levels, pitch, remap, cube, dimension)) {
             found = (int)i; break;
         }
     }
     if (eng_tex_index_check()) {
         int scan = -1;
         for (u32 i = 0; i < g.n_textures && scan < 0; i++)
-            if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, levels, pitch, remap, cube))
+            if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, levels, pitch, remap, cube, dimension))
                 scan = (int)i;
         if (scan != found)
             ps3_strict_boot_guard("rsx-texture-index",
@@ -1205,13 +1250,14 @@ static int eng_tex_find(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 }
 
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                            u32 levels, u32 pitch, int cube, u32 remap)
+                            u32 levels, u32 pitch, int cube, u32 remap,
+                            u32 dimension)
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
-    const int found = eng_tex_find(location, offset, fmt, w, h, levels, pitch, remap, (u32)(cube != 0));
+    const int found = eng_tex_find(location, offset, fmt, w, h, levels, pitch, remap, (u32)(cube != 0), dimension);
     if (found >= 0) {
         eng_texture* e = &g.textures[found];
         if (e->handle && e->last_hash_frame != g.frames) {
@@ -1222,7 +1268,8 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if (readable && hash != e->content_hash) {
                 const u64 hp_upload_started=hp_tick();
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
-                                                     levels, pitch, cube, remap);
+                                                     levels, pitch, cube, remap,
+                                                     dimension);
                 hp_end(HP_UPLOAD,hp_upload_started);
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
@@ -1252,13 +1299,14 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.levels = levels; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0);
+    e.dimension = dimension;
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
     const u64 hp_upload_started=hp_tick();
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
-                                  cube, remap);
+                                  cube, remap, dimension);
     hp_end(HP_UPLOAD,hp_upload_started);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) {
@@ -2238,7 +2286,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
-                                               (int)t.cubemap, t.remap & 0xFFFFu);
+                                               (int)t.cubemap, t.remap & 0xFFFFu, t.dimension);
                 continue;
             }
         }
@@ -2254,7 +2302,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             }
             textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                            t.width, t.height, t.mipmaps, t.pitch,
-                                           (int)t.cubemap, t.remap & 0xFFFFu);
+                                           (int)t.cubemap, t.remap & 0xFFFFu, t.dimension);
             continue;
         }
         if (sampled >= 0 && zsrc < 0 &&
@@ -2263,7 +2311,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             eng_surface_to_guest((u32)sampled)) {
             textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                            t.width, t.height, t.mipmaps, t.pitch,
-                                           (int)t.cubemap, t.remap & 0xFFFFu);
+                                           (int)t.cubemap, t.remap & 0xFFFFu, t.dimension);
             continue;
         }
         if (sampled >= 0) {
@@ -2288,7 +2336,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         }
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
-                                       (int)t.cubemap, t.remap & 0xFFFFu);
+                                       (int)t.cubemap, t.remap & 0xFFFFu, t.dimension);
     }
     return mask;
 }
@@ -2308,7 +2356,7 @@ static u32 sink_bind_vertex_textures(
         /* A vertex unit has no crossbar, so its remap is the identity. */
         textures[u] = eng_texture_slot(vt.location, vt.offset, vt.format,
                                        vt.width, vt.height, vt.mipmaps,
-                                       vt.pitch, 0, 0xAAE4u);
+                                       vt.pitch, 0, 0xAAE4u, vt.dimension);
         if (textures[u]) bound |= 1u << u;
     }
     return bound;

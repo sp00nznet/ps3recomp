@@ -44,6 +44,9 @@ file(GLOB_RECURSE HLE_SOURCES
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+# Reconfigure after copying texture_pack.c/.h beside rsx_draw_engine.c.
+list(REMOVE_ITEM HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/texture_pack.c")
+list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/texture_pack.c")
 
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
@@ -127,6 +130,8 @@ add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
 )
+find_package(ZLIB REQUIRED)
+target_link_libraries(ps3recomp_runtime PRIVATE ZLIB::ZLIB)
 
 include(cmake/SceneRayShaders.cmake)
 

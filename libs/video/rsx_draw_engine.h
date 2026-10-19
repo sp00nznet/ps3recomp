@@ -127,6 +127,10 @@ typedef struct rsx_draw_backend {
     void (*texture_upload)(void* user, u32 texture, u32 face, u32 mip,
                            u32 w, u32 h, const void* src, u32 row_bytes,
                            u32 rows);
+    /* Optional immediate upload status. A replacement caller checks after all
+     * mip uploads and falls back when NULL or false. This reports CPU staging
+     * and command-recording failures, not later GPU execution failures. */
+    int  (*texture_upload_valid)(void* user, u32 texture);
     void (*texture_release)(void* user, u32 texture);
 
     /* Colour targets. `seed` is the guest's own bytes for the surface,
