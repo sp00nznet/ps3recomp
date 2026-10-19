@@ -1,4 +1,5 @@
 #version 460
+#define RSX_TRANSPORT_FLAGS p.counts.w
 #extension GL_EXT_ray_query : require
 layout(local_size_x=8,local_size_y=8) in;
 layout(std430,binding=0) readonly buffer Outputs {vec4 value[];} vs;
@@ -16,6 +17,7 @@ layout(binding=9) uniform sampler2D worldColor;
 layout(binding=10) uniform sampler2D rasterDepth;
 layout(/*RSX_SCENE_OUTPUT_FORMAT*/,binding=11) writeonly uniform image2D outputColor;
 layout(/*RSX_SCENE_RAW_FORMAT*/,binding=12) writeonly uniform image2D rawColor;
+layout(std430,binding=13) buffer History {vec4 value[];} history;
 layout(push_constant) uniform Phase {uint mode;} phase;
 // Individual descriptors and literal switch indices avoid descriptor indexing
 // features and nonuniformEXT. Every descriptor is populated, including dummies.
@@ -434,11 +436,13 @@ void recordDepthFailure(uvec2 pixel,uvec2 raster,float z,float expected,bool can
     ao.value[base+10u]=candidate?materials.value[material].raster.w:0u;
     ao.value[base+11u]=candidate?materials.value[material].alpha.x:0xffffffffu;
 }
+/*RSX_HYBRID_HELPER*/
 void tracePixel(uvec2 pixel){
     uint index=pixel.y*p.dims.x+pixel.x;ao.value[index]=0;
     for(uint plane=3u;plane<10u;plane++)ao.value[pixelCount()*plane+index]=0u;
     if((atomicOr(validity.flags,0u)&~2u)!=0u)return;
-    bool authored=(p.counts.w&4u)!=0u;
+    if((RSX_TRANSPORT_FLAGS&32u)!=0u){hybridTrace(pixel);return;}
+    bool authored=(RSX_TRANSPORT_FLAGS&4u)!=0u;
     uvec2 raster=authored?pixel/uvec2(p.counts.z,1):min(uvec2((vec2(pixel)+.5)*vec2(p.dims.zw)/vec2(p.dims.xy)),p.dims.zw-1);
     uint sampleIndex=authored?pixel.x%p.counts.z:0u;
     float z=texelFetch(rasterDepth,ivec2(raster.x*p.counts.z+sampleIndex,raster.y),0).r;
@@ -517,12 +521,12 @@ void tracePixel(uvec2 pixel){
         if(!finite3(original)||any(greaterThan(abs(original-rasterRGB),vec3(2.0/255.0))))return;
         atomicAdd(ao.value[statsBase()+24u],1u);
         vec3 position=direction*t;vec4 visibility=authoredSourceVisibility(primitive,bary,position,normal,t*spread,spread);
-        uint state=pathHash(index+1u);vec3 indirect=(p.counts.w&8u)!=0u || !source.source.transportValid?vec3(0):authoredBounce(primitive,position,normal,source.source.diffuseProxy,t*spread,spread,state);
+        uint state=pathHash(index+1u);vec3 indirect=(RSX_TRANSPORT_FLAGS&8u)!=0u || !source.source.transportValid?vec3(0):authoredBounce(primitive,position,normal,source.source.diffuseProxy,t*spread,spread,state);
         if(any(greaterThan(abs(indirect),vec3(0))))atomicAdd(ao.value[statsBase()+26u],1u);
         bool reflected=false;vec3 reflectedRadiance=vec3(0);
         if(source.source.reflectionValid){
             countRay(29);
-            if((p.counts.w&16u)!=0u)reflected=authoredReflection(primitive,position,normal,source.source.reflectionDirection,t*spread,spread,state,reflectedRadiance);
+            if((RSX_TRANSPORT_FLAGS&16u)!=0u)reflected=authoredReflection(primitive,position,normal,source.source.reflectionDirection,t*spread,spread,state,reflectedRadiance);
         }
         authoredCubeOverride=reflected;authoredReflectedRadiance=reflectedRadiance;
         bool composed=authoredEvaluate(primitive,bary,direction,t*spread,visibility,indirect,source);
@@ -534,7 +538,7 @@ void tracePixel(uvec2 pixel){
         if(any(greaterThan(abs(delta),vec3(1.0/255.0))))atomicAdd(ao.value[statsBase()+25u],1u);
         return;
     }
-    if((p.counts.w&1u)!=0u){
+    if((RSX_TRANSPORT_FLAGS&1u)!=0u){
         float radiance=0.0;uint state=pathHash(index+1u);
         // Half-diagonal of one native raster pixel, in view-space ray slope.
         // This is a conservative ray-cone policy, not raster derivative parity.
@@ -566,6 +570,7 @@ vec3 guidePosition(uvec2 pixel,float depth){
 // and alpha are never blurred. Current-frame depth and hit normals reject
 // discontinuities; no temporal history, fabricated motion or NVIDIA RR claim.
 void filterTransport(uvec2 pixel){
+    if((RSX_TRANSPORT_FLAGS&32u)!=0u){hybridFilter(pixel);return;}
     uint index=pixel.y*p.dims.x+pixel.x,n=pixelCount();
     uint source=phase.mode==2u?0u:phase.mode==3u?1u:2u;
     uint destination=phase.mode==3u?2u:1u;
@@ -627,7 +632,7 @@ void main(){
             uint primary=ao.value[statsBase()],matched=ao.value[statsBase()+1u];
             // At most 0.1% (minimum two samples) may fall back locally. This
             // keeps gross projection/geometry corruption a whole-frame reject.
-            if(primary-matched>max(2u,primary/1000u))atomicOr(validity.flags,8u);
+            if((RSX_TRANSPORT_FLAGS&32u)==0u && primary-matched>max(2u,primary/1000u))atomicOr(validity.flags,8u);
         }
         return;
     }
@@ -639,7 +644,9 @@ void main(){
     // A separate dispatch and shader-write/read barrier make EVERY trace's
     // validity writes visible before ANY color is selected. Sparse unmatched
     // samples retain original color; invalid scenes reject the entire pass.
-    if((validity.flags&~2u)==0u && (p.counts.w&4u)!=0u){
+    if((validity.flags&~2u)==0u && (RSX_TRANSPORT_FLAGS&32u)!=0u){
+        hybridComposite(pixel,original,raw);
+    }else if((validity.flags&~2u)==0u && (RSX_TRANSPORT_FLAGS&4u)!=0u){
         uint index=pixel.y*p.dims.x+pixel.x;vec3 delta;
         for(uint c=0u;c<3u;c++)delta[c]=uintBitsToFloat(ao.value[pixelCount()*(7u+c)+index]);
         original.rgb=clamp(original.rgb+delta,vec3(0),vec3(1));raw=original;
@@ -647,7 +654,7 @@ void main(){
         uvec2 a=min(uvec2(vec2(pixel/uvec2(p.counts.z,1))*vec2(p.dims.xy)/vec2(p.dims.zw)),p.dims.xy-1);
         float rawTransport=uintBitsToFloat(ao.value[a.y*p.dims.x+a.x]);
         raw.rgb*=1-p.settings.z*rawTransport;
-        float filtered=(p.counts.w&2u)!=0u?upsampleTransport(pixel,a):rawTransport;
+        float filtered=(RSX_TRANSPORT_FLAGS&2u)!=0u?upsampleTransport(pixel,a):rawTransport;
         original.rgb*=1-p.settings.z*filtered;
     }
     imageStore(rawColor,ivec2(pixel),raw);

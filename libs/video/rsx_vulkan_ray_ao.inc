@@ -27,8 +27,8 @@ static struct {
     int test_disable_authored_sources,test_disable_authored_bounce,test_disable_authored_reflections;
     int ready,failed,warned;u32 color,raw_color,cw,ch,aw,ah;VkFormat format;u64 device_generation;
     VkDescriptorSetLayout layout;VkPipelineLayout pipeline_layout;VkDescriptorPool pool;VkDescriptorSet set;
-    VkPipeline gather,trace[2];VkAccelerationStructureKHR blas,tlas;
-    vk_buffer indices,materials,fp,params,triangles,ao,instances,blas_store,tlas_store,bscratch,tscratch,flag_readback;
+    VkPipeline gather,trace[2];u64 last_hybrid_log,hybrid_nonfinite,hybrid_black_frames;u32 history_w,history_h;VkAccelerationStructureKHR blas,tlas;
+    vk_buffer history;vk_buffer indices,materials,fp,params,triangles,ao,instances,blas_store,tlas_store,bscratch,tscratch,flag_readback;
     PFN_vkCreateComputePipelines create_compute;PFN_vkCmdDispatch dispatch;
     PFN_vkGetBufferDeviceAddress address;PFN_vkCreateAccelerationStructureKHR create_as;
     PFN_vkDestroyAccelerationStructureKHR destroy_as;PFN_vkGetAccelerationStructureBuildSizesKHR sizes;
@@ -108,7 +108,9 @@ static VkPipeline vk_ray_pipeline(const char *source)
     if(pvkCreateShaderModule(s_vk.device,&sm,NULL,&module)!=VK_SUCCESS)goto done;
     VkComputePipelineCreateInfo pc={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=module,.pName="main"},.layout=s_ray_ao.pipeline_layout};
     if(s_ray_ao.create_compute(s_vk.device,vk_pcache(),1,&pc,NULL,&pipeline)!=VK_SUCCESS){if(pipeline)pvkDestroyPipeline(s_vk.device,pipeline,NULL);pipeline=VK_NULL_HANDLE;}
-    else {vk_pcache_created();VK_LOG("ray pipeline ready after %.3fms total\n",
+    else {vk_pcache_created();
+        if(s_pcache.cache && !SDL_AtomicGet(&s_pcache.saving) && vk_pcache_save_now(s_vk.device)==0)SDL_AtomicSet(&s_pcache.dirty,0);
+        VK_LOG("ray pipeline ready after %.3fms total\n",
         (double)(SDL_GetPerformanceCounter()-compile_start)*1000.0/(double)SDL_GetPerformanceFrequency());}
 done:if(module)pvkDestroyShaderModule(s_vk.device,module,NULL);free(words);return pipeline;
 }
@@ -142,12 +144,12 @@ static int vk_ray_initialize(void)
         s_ray_ao.memory_budget&&s_ray_ao.memory_properties2?"available":"unavailable (heap bounds plus allocation result)");
     const VkPhysicalDeviceLimits *l=&s_ray_ao.properties.limits;
     if(l->maxPerStageDescriptorSamplers<38 || l->maxPerStageDescriptorSampledImages<38 || l->maxDescriptorSetSamplers<38 || l->maxDescriptorSetSampledImages<38 ||
-       l->maxPerStageDescriptorStorageBuffers<7 || l->maxDescriptorSetStorageBuffers<7 || l->maxPerStageDescriptorStorageImages<2 || l->maxDescriptorSetStorageImages<2 || l->maxPerStageResources<49 || l->maxPushConstantsSize<4 ||
+       l->maxPerStageDescriptorStorageBuffers<8 || l->maxDescriptorSetStorageBuffers<8 || l->maxPerStageDescriptorStorageImages<2 || l->maxDescriptorSetStorageImages<2 || l->maxPerStageResources<50 || l->maxPushConstantsSize<4 ||
        !s_ray_ao.as_properties.maxPerStageDescriptorAccelerationStructures || !s_ray_ao.as_properties.maxDescriptorSetAccelerationStructures ||
        !s_ray_ao.as_properties.minAccelerationStructureScratchOffsetAlignment || !s_ray_ao.as_properties.maxInstanceCount)goto fail;
     VkFormatProperties vertex_format;pvkGetPhysicalDeviceFormatProperties(s_vk.phys,VK_FORMAT_R32G32B32_SFLOAT,&vertex_format);
     if(!(vertex_format.bufferFeatures&VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR))goto fail;
-    VkDescriptorSetLayoutBinding binding[49];u32 n=0;
+    VkDescriptorSetLayoutBinding binding[50];u32 n=0;
     for(u32 i=0;i<7;i++)binding[n++]=(VkDescriptorSetLayoutBinding){.binding=i,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT};
     binding[n++]=(VkDescriptorSetLayoutBinding){.binding=7,.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT};
     binding[n++]=(VkDescriptorSetLayoutBinding){.binding=8,.descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT};
@@ -155,23 +157,32 @@ static int vk_ray_initialize(void)
     binding[n++]=(VkDescriptorSetLayoutBinding){.binding=11,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT};
     binding[n++]=(VkDescriptorSetLayoutBinding){.binding=12,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT};
     for(u32 i=0;i<VK_RAY_ALL_TEXTURES;i++)binding[n++]=(VkDescriptorSetLayoutBinding){.binding=16+i,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT};
+    binding[n++]=(VkDescriptorSetLayoutBinding){.binding=13,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT};
     VkDescriptorSetLayoutCreateInfo sl={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=n,.pBindings=binding};
     if(pvkCreateDescriptorSetLayout(s_vk.device,&sl,NULL,&s_ray_ao.layout)!=VK_SUCCESS)goto fail;
     VkPushConstantRange push={VK_SHADER_STAGE_COMPUTE_BIT,0,4};
     VkPipelineLayoutCreateInfo pl={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&s_ray_ao.layout,.pushConstantRangeCount=1,.pPushConstantRanges=&push};
     if(pvkCreatePipelineLayout(s_vk.device,&pl,NULL,&s_ray_ao.pipeline_layout)!=VK_SUCCESS)goto fail;
-    VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,7},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,38},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2}};
+    VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,8},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,38},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2}};
     VkDescriptorPoolCreateInfo dp={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=5,.pPoolSizes=sizes};
     if(pvkCreateDescriptorPool(s_vk.device,&dp,NULL,&s_ray_ao.pool)!=VK_SUCCESS)goto fail;
     VkDescriptorSetAllocateInfo da={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=s_ray_ao.pool,.descriptorSetCount=1,.pSetLayouts=&s_ray_ao.layout};
     if(pvkAllocateDescriptorSets(s_vk.device,&da,&s_ray_ao.set)!=VK_SUCCESS)goto fail;
     s_ray_ao.gather=vk_ray_pipeline(rsx_scene_gather_glsl);if(!s_ray_ao.gather)goto fail;
-    char *with_transport=vk_ray_replace(rsx_scene_trace_glsl,"/*RSX_PATH_TRANSPORT_HELPER*/",rsx_path_transport_glsl);if(!with_transport)goto fail;
+    char *hybrid_text=vk_ray_replace(rsx_scene_trace_glsl,"/*RSX_HYBRID_HELPER*/",rsx_hybrid_trace_glsl);if(!hybrid_text)goto fail;
+    char *with_transport=vk_ray_replace(hybrid_text,"/*RSX_PATH_TRANSPORT_HELPER*/",rsx_path_transport_glsl);free(hybrid_text);if(!with_transport)goto fail;
     char *with_footprint=vk_ray_replace(with_transport,"/*RSX_RAY_FOOTPRINT_HELPER*/",rsx_ray_footprint_glsl);free(with_transport);if(!with_footprint)goto fail;
     char *with_alpha=vk_ray_replace(with_footprint,"/*RSX_SCENE_ALPHA_HELPER*/",rsx_scene_alpha_glsl);free(with_footprint);if(!with_alpha)goto fail;
     char *with_authored=vk_ray_replace(with_alpha,"/*RSX_POOL_RGB_HELPER*/",rsx_pool_rgb_glsl);free(with_alpha);if(!with_authored)goto fail;
     char *with_terrain=vk_ray_replace(with_authored,"/*RSX_TERRAIN_RGB_HELPER*/",rsx_terrain_rgb_glsl);free(with_authored);if(!with_terrain)goto fail;
     char *with_rgb=vk_ray_replace(with_terrain,"/*RSX_SCENE_RGB_HELPER*/",rsx_scene_rgb_glsl);free(with_terrain);if(!with_rgb)goto fail;
+    const char *hybrid_compile=getenv("PS3RECOMP_RSX_HYBRID_PT");
+    if(hybrid_compile && !strcmp(hybrid_compile,"1")){
+        const char *denoise_compile=getenv("PS3RECOMP_RSX_RAY_DENOISE");
+        char *specialized=vk_ray_replace(with_rgb,"#define RSX_TRANSPORT_FLAGS p.counts.w",
+            denoise_compile && !strcmp(denoise_compile,"off")?"#define RSX_TRANSPORT_FLAGS 52u":"#define RSX_TRANSPORT_FLAGS 54u");
+        free(with_rgb);with_rgb=specialized;if(!with_rgb)goto fail;
+    }
     for(unsigned i=0;i<2;i++) {
         char *output_text=vk_ray_replace(with_rgb,"/*RSX_SCENE_OUTPUT_FORMAT*/",i?"rgba16f":"rgba8");
         char *text=output_text?vk_ray_replace(output_text,"/*RSX_SCENE_RAW_FORMAT*/",i?"rgba16f":"rgba8"):NULL;
@@ -261,7 +272,7 @@ static void vk_rt_ao_shutdown(void)
     if(s_ray_ao.color)vk_eng_release(NULL,s_ray_ao.color);
     if(s_ray_ao.raw_color)vk_eng_release(NULL,s_ray_ao.raw_color);
     if(s_ray_ao.tlas)s_ray_ao.destroy_as(s_vk.device,s_ray_ao.tlas,NULL);if(s_ray_ao.blas)s_ray_ao.destroy_as(s_vk.device,s_ray_ao.blas,NULL);
-    vk_buffer *buffers[]={&s_ray_ao.indices,&s_ray_ao.materials,&s_ray_ao.fp,&s_ray_ao.params,&s_ray_ao.triangles,&s_ray_ao.ao,&s_ray_ao.instances,&s_ray_ao.blas_store,&s_ray_ao.tlas_store,&s_ray_ao.bscratch,&s_ray_ao.tscratch,&s_ray_ao.flag_readback};
+    vk_buffer *buffers[]={&s_ray_ao.history,&s_ray_ao.indices,&s_ray_ao.materials,&s_ray_ao.fp,&s_ray_ao.params,&s_ray_ao.triangles,&s_ray_ao.ao,&s_ray_ao.instances,&s_ray_ao.blas_store,&s_ray_ao.tlas_store,&s_ray_ao.bscratch,&s_ray_ao.tscratch,&s_ray_ao.flag_readback};
     for(unsigned i=0;i<sizeof buffers/sizeof buffers[0];i++)vk_ray_destroy_buffer(buffers[i]);
     if(s_ray_ao.queries)s_ray_ao.destroy_queries(s_vk.device,s_ray_ao.queries,NULL);
     if(s_ray_ao.gather)pvkDestroyPipeline(s_vk.device,s_ray_ao.gather,NULL);for(unsigned i=0;i<2;i++)if(s_ray_ao.trace[i])pvkDestroyPipeline(s_vk.device,s_ray_ao.trace[i],NULL);
@@ -402,7 +413,9 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     failure="matching color/depth snapshot";
     if(!source || !snapshot || source->w!=width*gx || source->h!=height || snapshot->w!=width*gx || snapshot->h!=height || snapshot->fmt!=VK_FORMAT_R32_SFLOAT)goto fail;
     const char *authored_env=getenv("PS3RECOMP_RSX_AUTHORED_LIGHTS");
-    const u32 authored_mode=authored_env && !strcmp(authored_env,"1");
+    const char *hybrid_env=getenv("PS3RECOMP_RSX_HYBRID_PT");
+    const u32 hybrid_mode=hybrid_env && !strcmp(hybrid_env,"1");
+    const u32 authored_mode=hybrid_mode || (authored_env && !strcmp(authored_env,"1"));
     u32 aw=authored_mode?width*gx:(width<320?width:320),ah=authored_mode?height:(height<180?height:180);
     // All resources/samplers retire after the prior synchronous submission.
     vk_ray_alpha_reset();
@@ -411,6 +424,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
        !vk_ray_buffer(&s_ray_ao.indices,(VkDeviceSize)triangles*32,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
        !vk_ray_buffer(&s_ray_ao.materials,(VkDeviceSize)epoch->draw_count*sizeof(vk_ray_material),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
        !vk_ray_buffer(&s_ray_ao.fp,16u*1024u*1024u,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
+       !vk_ray_buffer(&s_ray_ao.history,(VkDeviceSize)aw*ah*32,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,0,0) ||
        !vk_ray_buffer(&s_ray_ao.params,sizeof(vk_ray_parameters),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,1,0) ||
        !vk_ray_buffer(&s_ray_ao.triangles,(VkDeviceSize)triangles*36,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,0,1) ||
        !vk_ray_buffer(&s_ray_ao.ao,(VkDeviceSize)aw*ah*40+128,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,0,0) ||
@@ -437,24 +451,24 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
          * coverage; an inset or undersized scissor remains unsupported. */
         const int coverage=(rs->antialias_control&0x10u) || (rs->blend_enable && !(rs->antialias_control&0x100u));
         const int standard_blend=!rs->blend_enable || (rs->sf_rgb==0x302u && rs->df_rgb==0x303u && rs->eq_rgb==0x8006u);
-        if(!pipeline->used || !pipeline->scene_vs || !pipeline->scene_ps || !standard_blend || !rsx_scene_stencil_unconditional(rs) || !rs->depth_test || !rs->depth_write || (rs->depth_func!=0x201u && rs->depth_func!=0x203u) ||
+        if(!hybrid_mode && (!pipeline->used || !pipeline->scene_vs || !pipeline->scene_ps || !standard_blend || !rsx_scene_stencil_unconditional(rs) || !rs->depth_test || !rs->depth_write || (rs->depth_func!=0x201u && rs->depth_func!=0x203u) ||
            draw.viewport[0]!=0 || draw.viewport[1]!=0 || draw.viewport[2]!=(float)width || draw.viewport[3]!=(float)height || !vk_rt_depth_range(draw.viewport[4],draw.viewport[5]) ||
-           draw.scissor[0]!=0 || draw.scissor[1]!=0 || draw.scissor[2]<width || draw.scissor[3]<height) {
+           draw.scissor[0]!=0 || draw.scissor[1]!=0 || draw.scissor[2]<width || draw.scissor[3]<height)) {
             if(s_ray_ao.rejected<8)VK_LOG("ray AO rejected draw=%u pipeline=%u blend=%u stencil=%u aa=0x%x depth=%u/%u/0x%x viewport=%.1f,%.1f,%.1f,%.1f,%.3f,%.3f scissor=%u,%u,%u,%u expected=%ux%u\n",i,draw.pipeline,rs->blend_enable,rs->stencil_enable,rs->antialias_control,rs->depth_test,rs->depth_write,rs->depth_func,draw.viewport[0],draw.viewport[1],draw.viewport[2],draw.viewport[3],draw.viewport[4],draw.viewport[5],draw.scissor[0],draw.scissor[1],draw.scissor[2],draw.scissor[3],width,height);
             if(s_ray_ao.rejected<8 && !standard_blend)VK_LOG("ray AO unsupported blend factors=0x%x/0x%x equation=0x%x\n",rs->sf_rgb,rs->df_rgb,rs->eq_rgb);
             if(s_ray_ao.rejected<8 && !rsx_scene_stencil_unconditional(rs))VK_LOG("ray AO stencil contents required front=0x%x back=0x%x twoSided=%u mask=0x%x\n",rs->s_func,rs->bs_func,rs->stencil_two_sided,rs->s_func_mask);
             goto fail;
         }
-        u32 mask=rs->antialias_control>>16,needed=(1u<<samples)-1;if((mask&needed)!=needed)goto fail;
+        u32 mask=rs->antialias_control>>16,needed=(1u<<samples)-1;if(!hybrid_mode && (mask&needed)!=needed)goto fail;
         int tested=rs->alpha_test_enable && rs->alpha_func!=0x207u;
         int contract=(tested || coverage || rs->blend_enable)?pipeline->scene_alpha_contract:-1;
         const rsx_scene_alpha_contract *alpha_contract=contract<0?NULL:rsx_scene_alpha_contract_for_id((unsigned)contract);
         failure="exact alpha contract/resources";
         // The generated decompiler emits active OP_KIL as discard; (never
         // predicates emit nothing). Opaque/ALWAYS state cannot hide that kill.
-        if(contract<0 && (strstr(pipeline->scene_ps,"discard;") || strstr(pipeline->scene_ps,"clip(")))goto fail;
+        if(!hybrid_mode && contract<0 && (strstr(pipeline->scene_ps,"discard;") || strstr(pipeline->scene_ps,"clip(")))goto fail;
         if((tested && rs->alpha_func!=0x204u) || ((tested || coverage || rs->blend_enable) &&
-            (!alpha_contract || draw.ps_bytes!=pipeline->scene_alpha_fp_bytes || tested!=rsx_scene_alpha_contract_has_threshold(alpha_contract))))goto fail;
+            (!alpha_contract || draw.ps_bytes!=pipeline->scene_alpha_fp_bytes || tested!=rsx_scene_alpha_contract_has_threshold(alpha_contract)))){if(hybrid_mode){contract=-1;alpha_contract=NULL;}else goto fail;}
         if(fp_used+draw.ps_bytes>s_ray_ao.fp.size)goto fail;
         int light_contract=rsx_authored__pair(pipeline->scene_vs_sha256,pipeline->scene_ps_sha256);
         u32 position_proof=vk_ray_unit_position(&draw,light_contract);
@@ -470,7 +484,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         /* A depth-only prepass is shadow geometry, never the RGB owner.
          * Preserve partial masks as possible ambiguous color writers. */
         material.authored[1]=rs->color_mask&0x00ffffffu;
-        if(contract>=0)for(u32 unit=0;unit<2;unit++)if(pipeline->scene_alpha_mask&(1u<<unit))if(!(draw.texture_mask&(1u<<unit)) || !vk_ray_alpha_texture(draw.textures[unit],&draw.samplers[unit],&material.textures[unit]))goto fail;
+        if(contract>=0)for(u32 unit=0;unit<2;unit++)if(pipeline->scene_alpha_mask&(1u<<unit))if(!(draw.texture_mask&(1u<<unit)) || !vk_ray_alpha_texture(draw.textures[unit],&draw.samplers[unit],&material.textures[unit])){if(hybrid_mode)material.alpha[0]=UINT32_MAX;else goto fail;}
         /* Exact recovered source pairs only. Unknown/resource failures keep
          * this material's exact original raster RGB, without omitting geometry. */
         const rsx_authored_lights *a=&s_ray_ao.authored_lights[i];
@@ -483,11 +497,35 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
             else s_ray_ao.authored_texture_failed[light_contract]++;
         }
         else if(authored_mode && light_contract>=0 && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE)s_ray_ao.authored_state_failed[light_contract]++;
+        if(hybrid_mode){
+            /* Generic base selection: avoid two-channel normal maps and LUTs;
+             * prefer a color-sized unit 1 when unit 0 is the normal source. */
+            int unit=-1;u64 score=0;
+            for(u32 u=0;u<2;u++)if(draw.texture_mask&(1u<<u)){
+                const vk_eng_obj *t=vk_eng_get(draw.textures[u],VK_ENG_TEXTURE);
+                if(!t || t->cube || t->surface || t->w<16 || t->h<16 || t->fmt==VK_FORMAT_BC5_UNORM_BLOCK || t->fmt==VK_FORMAT_BC5_SNORM_BLOCK)continue;
+                u64 value=(u64)t->w*t->h*(u==1?2u:1u);if(value>score){score=value;unit=(int)u;}
+            }
+            material.textures[2]=UINT32_MAX;
+            if(unit>=0)vk_ray_texture(draw.textures[unit],&draw.samplers[unit],&material.textures[2],0);
+            material.textures[3]=(u32)(unit<0?0:unit);
+            material.depth_range[2]=rs->alpha_test_enable?(float)rs->alpha_ref_raw/255.0f:0.0f;
+            material.depth_range[3]=(float)epoch->frame;
+            /* An exact pool source explicitly carries a cube reflection. */
+            if(light_contract==1 || strstr(pipeline->scene_ps,"TextureCube "))material.textures[3]|=0x100u;
+            if(a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE)for(u32 l=0;l<4;l++){
+                memcpy(material.light_view[l],a->lights[l].view,16);memcpy(material.light_rgb[l],a->lights[l].rgb,12);
+                material.light_rgb[l][3]=(float)a->lights[l].status;
+            }
+        }
         if(draw.ps_bytes)memcpy((unsigned char*)s_ray_ao.fp.ptr+fp_used,draw.ps_constants,draw.ps_bytes);
         fp_used+=draw.ps_bytes;
         // Exact captured source supplies h, avoiding projection cancellation.
         // Scale metadata is used only after the full shared-position proof.
-        material.authored[3]=position_proof && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE;
+        /* Hybrid geometry comes from the captured post-transform clip output,
+         * including the actual projection/depth normalization. Source skin
+         * weights are not a substitute for that captured homogeneous scale. */
+        material.authored[3]=!hybrid_mode && position_proof && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE;
         ((vk_ray_material*)s_ray_ao.materials.ptr)[i]=material;
         rsx_scene_batch_input input={pipeline->scene_vs,draw.layout,draw.vertices,(size_t)draw.vertex_count*draw.layout.stride,draw.vertex_count,draw.vs_constants,draw.vs_bytes};u32 base=0;
         failure="batch immutable upload/cache";
@@ -501,6 +539,31 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
             destination[3]=i;scales[3]=0;primitive++;
         }
     }
+    if(hybrid_mode){
+        vk_ray_material *all=(vk_ray_material*)s_ray_ao.materials.ptr;int light_source=-1;
+        for(u32 i=0;i<epoch->draw_count && light_source<0;i++)for(u32 l=0;l<4;l++)
+            if(all[i].light_rgb[l][3]==1.0f && all[i].light_view[l][3]==0.0f){light_source=(int)i;break;}
+        if(light_source>=0)for(u32 i=0;i<epoch->draw_count;i++){
+            int active=0;for(u32 l=0;l<4;l++)active|=all[i].light_rgb[l][3]==1.0f;
+            if(!active){memcpy(all[i].light_view,all[light_source].light_view,sizeof all[i].light_view);memcpy(all[i].light_rgb,all[light_source].light_rgb,sizeof all[i].light_rgb);}
+        }
+    }
+    u32 hybrid_fog_index=(u32)(fp_used/16);
+    if(hybrid_mode){
+        float fog[4]={.08f,.08f,.08f,1.0f};int found=0;
+        vk_ray_material *all=(vk_ray_material*)s_ray_ao.materials.ptr;
+        for(u32 i=0;i<epoch->draw_count && !found;i++){
+            u32 offset=all[i].authored[0]==3u?12u:all[i].authored[0]==2u?25u:UINT32_MAX;
+            if(offset<all[i].alpha[2]){
+                const float *c=(const float*)s_ray_ao.fp.ptr+(all[i].alpha[1]+offset)*4;
+                if(isfinite(c[0]) && isfinite(c[1]) && isfinite(c[2])){
+                    memcpy(fog,c,12);found=1;
+                }
+            }
+        }
+        if(fp_used+16>s_ray_ao.fp.size)goto fail;
+        memcpy((u8*)s_ray_ao.fp.ptr+fp_used,fog,16);fp_used+=16;
+    }
     if(primitive!=triangles || !rsx_scene_epoch_seal(epoch,s_rt_capture.frame,epoch->serial))goto fail;
     /* Opaque shaders can have no fragment constants. Vulkan still requires
      * a nonzero descriptor range even when the shader never accesses it. */
@@ -508,10 +571,12 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     const char *lighting=getenv("PS3RECOMP_RSX_PATH_PREVIEW");
     const u32 path_preview=!authored_mode && lighting && !strcmp(lighting,"1");
     const char *denoise_setting=getenv("PS3RECOMP_RSX_RAY_DENOISE");
-    const u32 denoise=!authored_mode && (denoise_setting?!strcmp(denoise_setting,"spatial"):path_preview);
-    const char *transport_mode=authored_mode?"authored-source-preview":path_preview?"diffuse-path-preview":"ray-AO";
-    vk_ray_parameters parameters={{projection[0],projection[5],projection[10],projection[14]},{aw,ah,width,height},{triangles,epoch->vertex_count,gx,path_preview|(denoise?2u:0u)|(authored_mode?4u:0u)|(s_ray_ao.test_disable_authored_bounce?8u:0u)|(s_ray_ao.test_disable_authored_reflections?0u:16u)},{radius,fmaxf(.00001f,radius*.001f),strength,.005f}};
-    if(authored_mode && s_ray_ao.traced==0)VK_LOG("authored-source preview: contract0/pool91/terrain90 exact source subsets; full sample resolution; per-source shadows plus one colored bounce using bounded source diffuse proxies at both surfaces, source-directed mirror reflections on qualified hits, original cube on misses; no physical BRDF/roughness/emission; explicit cone LOD plus primary raster agreement; per-vertex source homogeneous scales with translated per-hit light correction; unknown materials unchanged; NOT full PT or DLSS\n");
+    const u32 denoise=(hybrid_mode || !authored_mode) && (denoise_setting?!strcmp(denoise_setting,"spatial"):path_preview);
+    const char *transport_mode=hybrid_mode?"hybrid-path-tracing":authored_mode?"authored-source-preview":path_preview?"diffuse-path-preview":"ray-AO";
+    vk_ray_parameters parameters={{projection[0],projection[5],projection[10],projection[14]},{aw,ah,width,height},{triangles,epoch->vertex_count,gx,(hybrid_mode?32u:0u)|path_preview|(denoise?2u:0u)|(authored_mode?4u:0u)|(s_ray_ao.test_disable_authored_bounce?8u:0u)|(s_ray_ao.test_disable_authored_reflections?0u:16u)},{radius,fmaxf(.00001f,radius*.001f),strength,.005f}};
+    if(authored_mode && !hybrid_mode && s_ray_ao.traced==0)VK_LOG("authored-source preview: contract0/pool91/terrain90 exact source subsets; full sample resolution; per-source shadows plus one colored bounce using bounded source diffuse proxies at both surfaces, source-directed mirror reflections on qualified hits, original cube on misses; no physical BRDF/roughness/emission; explicit cone LOD plus primary raster agreement; per-vertex source homogeneous scales with translated per-hit light correction; unknown materials unchanged; NOT full PT or DLSS\n");
+    if(hybrid_mode && s_ray_ao.traced==0)VK_LOG("Hybrid path tracing (raster primary, traced shadows/bounce/reflections, generic materials where the original shader is not yet decoded)\n");
+    if(hybrid_mode)parameters.settings[3]=(float)hybrid_fog_index;
     if(path_preview && s_ray_ao.traced==0)VK_LOG("diffuse path preview: current-frame geometry, 8 paths/pixel, 4 diffuse bounces, neutral secondary reflectance 0.65, uniform environment; original primary color retained; NOT recovered physical game materials/lights\n");
     if(s_ray_ao.traced==0)VK_LOG("ray transport mode=%s denoiser=%s current-frame depth/normal guided; no temporal history or DLSS Ray Reconstruction\n",transport_mode,denoise?"spatial-atrous-3-pass":"off");
     memcpy(s_ray_ao.params.ptr,&parameters,sizeof parameters);
@@ -530,6 +595,13 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     if(vk_begin() || pvkResetFences(s_vk.device,1,&s_vk.fence)!=VK_SUCCESS)goto fail;
     if(s_ray_ao.queries){s_ray_ao.reset_queries(s_vk.cmd,s_ray_ao.queries,0,6);vk_ray_stamp(0,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);}
     rsx_scene_batch_output batch;if(rsx_vulkan_scene_batch_record(token,s_vk.cmd,s_vk.fence,&batch))goto abandon;recorded=1;
+    if(hybrid_mode){
+        /* Invalid post-VS vertices were replaced with zero. Gather discards
+         * those triangles locally instead of discarding every other draw. */
+        vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+        s_ray_ao.fill_buffer(s_vk.cmd,batch.validity,0,4,0);
+        vk_ray_memory(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
+    }
     vk_ray_stamp(1,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     vk_eng_obj *out=vk_eng_get(s_ray_ao.color,VK_ENG_COLOR);if(!out)goto abandon;
     // Discard only the private output's old contents; guest color stays intact.
@@ -537,7 +609,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     vk_barrier_image(s_eobj[s_ray_ao.raw_color].im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_UNDEFINED);
     VkDescriptorBufferInfo bi[8]={{batch.vertices,0,batch.vertex_bytes},{s_ray_ao.indices.buf,0,(VkDeviceSize)triangles*32},{s_ray_ao.triangles.buf,0,(VkDeviceSize)triangles*36},{batch.validity,0,4},
         {s_ray_ao.materials.buf,0,(VkDeviceSize)epoch->draw_count*sizeof(vk_ray_material)},{s_ray_ao.fp.buf,0,fp_used},{s_ray_ao.ao.buf,0,(VkDeviceSize)aw*ah*40+128},{s_ray_ao.params.buf,0,sizeof parameters}};
-    VkWriteDescriptorSet writes[49];u32 wn=0;for(u32 i=0;i<8;i++)writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=i,.descriptorCount=1,.descriptorType=i==7?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]};
+    VkWriteDescriptorSet writes[50];u32 wn=0;for(u32 i=0;i<8;i++)writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=i,.descriptorCount=1,.descriptorType=i==7?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]};
     VkWriteDescriptorSetAccelerationStructureKHR wa={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,.accelerationStructureCount=1,.pAccelerationStructures=&s_ray_ao.tlas};
     writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.pNext=&wa,.dstSet=s_ray_ao.set,.dstBinding=8,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR};
     VkDescriptorImageInfo images[3]={{s_vk.sampler,source->im.view,VK_IMAGE_LAYOUT_GENERAL},{s_vk.sampler,snapshot->im.view,VK_IMAGE_LAYOUT_GENERAL},{VK_NULL_HANDLE,out->im.view,VK_IMAGE_LAYOUT_GENERAL}};
@@ -545,7 +617,13 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     VkDescriptorImageInfo raw_image={VK_NULL_HANDLE,s_eobj[s_ray_ao.raw_color].im.view,VK_IMAGE_LAYOUT_GENERAL};
     writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=12,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.pImageInfo=&raw_image};
     for(u32 i=0;i<VK_RAY_ALL_TEXTURES;i++)writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=16+i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&s_ray_ao.alpha_images[i]};
+    VkDescriptorBufferInfo history_info={s_ray_ao.history.buf,0,(VkDeviceSize)aw*ah*32};
+    writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=13,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&history_info};
     pvkUpdateDescriptorSets(s_vk.device,wn,writes,0,NULL);
+    if(s_ray_ao.history_w!=aw || s_ray_ao.history_h!=ah){
+        s_ray_ao.fill_buffer(s_vk.cmd,s_ray_ao.history.buf,0,(VkDeviceSize)aw*ah*32,0);
+        s_ray_ao.history_w=aw;s_ray_ao.history_h=ah;
+    }
     s_ray_ao.fill_buffer(s_vk.cmd,s_ray_ao.ao.buf,(VkDeviceSize)aw*ah*40,128,0);
     vk_ray_memory(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
     vk_ray_memory(VK_PIPELINE_STAGE_HOST_BIT|VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_HOST_WRITE_BIT|VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_UNIFORM_READ_BIT|VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
@@ -577,27 +655,37 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     submitted=1;if(rsx_vulkan_scene_batch_mark_submitted(token) || rsx_vulkan_scene_batch_reset(token))goto fail;recorded=0;token=0;
     memcpy(&s_ray_ao.last_flags,s_ray_ao.flag_readback.ptr,4);s_ray_ao.traced++;
     memcpy(s_ray_ao.gpu_stats,(unsigned char*)s_ray_ao.flag_readback.ptr+4,128);
+    if(hybrid_mode){s_ray_ao.hybrid_nonfinite+=s_ray_ao.gpu_stats[6];if(s_ray_ao.gpu_stats[0] && !s_ray_ao.gpu_stats[7])s_ray_ao.hybrid_black_frames++;}
     if((s_ray_ao.last_flags&1u) && s_ray_ao.gpu_stats[31] && s_ray_ao.invalid_position<8){
         float values[10];memcpy(values,&s_ray_ao.gpu_stats[14],sizeof values);
         VK_LOG("ray gather position failure primitive=%u vertex=%u material=%u clip=%g,%g,%g,%g sourceH=%g depthRange=%g,%g depth=%g predicted=%g recoveredH=%g\n",
             s_ray_ao.gpu_stats[31]-1,s_ray_ao.gpu_stats[12],s_ray_ao.gpu_stats[13],values[0],values[1],values[2],values[3],values[4],values[5],values[6],values[7],values[8],values[9]);
     }
     if(s_ray_ao.last_flags&1u)s_ray_ao.invalid_position++;if(s_ray_ao.last_flags&4u)s_ray_ao.invalid_alpha++;if(s_ray_ao.last_flags&8u)s_ray_ao.invalid_depth++;if(s_ray_ao.last_flags&16u)s_ray_ao.invalid_numeric++;
-    if(authored_mode)VK_LOG("authored source frame=%llu qualifiedDraws=%u/%u rasterAgreed=%u changedSamples=%u coloredBounceSamples=%u ambiguousOwners=%u shadowedSources=%u reflectionDirections=%u reflectedHits=%u\n",(unsigned long long)epoch->frame,s_ray_ao.authored_draws,epoch->draw_count,s_ray_ao.gpu_stats[24],s_ray_ao.gpu_stats[25],s_ray_ao.gpu_stats[26],s_ray_ao.gpu_stats[27],s_ray_ao.gpu_stats[28],s_ray_ao.gpu_stats[29],s_ray_ao.gpu_stats[30]);
+    if(authored_mode && !hybrid_mode)VK_LOG("authored source frame=%llu qualifiedDraws=%u/%u rasterAgreed=%u changedSamples=%u coloredBounceSamples=%u ambiguousOwners=%u shadowedSources=%u reflectionDirections=%u reflectedHits=%u\n",(unsigned long long)epoch->frame,s_ray_ao.authored_draws,epoch->draw_count,s_ray_ao.gpu_stats[24],s_ray_ao.gpu_stats[25],s_ray_ao.gpu_stats[26],s_ray_ao.gpu_stats[27],s_ray_ao.gpu_stats[28],s_ray_ao.gpu_stats[29],s_ray_ao.gpu_stats[30]);
     if(!s_ray_ao.gpu_stats[1] || !s_ray_ao.gpu_stats[2])s_ray_ao.empty_ao++;
     if(!(s_ray_ao.last_flags&~2u) && s_ray_ao.gpu_stats[1] && (authored_mode?s_ray_ao.gpu_stats[24]:s_ray_ao.gpu_stats[2])){out->scale=scale;out->grid_x=gx;out->grid_y=1;replacement=vk_eng_surface_view(NULL,s_ray_ao.color,remap,rsx_format);if(replacement)s_ray_ao.completed++;}
     if(!replacement)s_ray_ao.rejected++;
     if(s_ray_ao.queries){u64 times[6];if(s_ray_ao.query_results(s_vk.device,s_ray_ao.queries,0,6,sizeof times,times,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){u64 mask_bits=s_ray_ao.timestamp_bits>=64?UINT64_MAX:(1ull<<s_ray_ao.timestamp_bits)-1;for(unsigned i=0;i<5;i++)s_ray_ao.gpu_ms[i]=(double)((times[i+1]-times[i])&mask_bits)*s_ray_ao.properties.limits.timestampPeriod/1000000.0;}}
     s_ray_ao.cpu_ms=(double)(SDL_GetPerformanceCounter()-start)*1000.0/(double)SDL_GetPerformanceFrequency();
+    if(hybrid_mode && SDL_GetTicks64()-s_ray_ao.last_hybrid_log>=1000){
+        u32 world=s_ray_ao.gpu_stats[0],traced=s_ray_ao.gpu_stats[24],hits=s_ray_ao.gpu_stats[5];
+        VK_LOG("hybrid PT frame=%llu world=%u traced=%u (%.2f%%) rasterFallback=%u genericHits=%.2f%% bounceHits=%u reflectionHits=%u shadows=%u PT=%.3fms flags=0x%x reflectionRays=%u nonfinite=%u nonblack=%u owners=%u families=%u/%u/%u/%u\n",
+            (unsigned long long)epoch->frame,world,traced,world?100.0*traced/world:0.0,world-traced,
+            hits?100.0*s_ray_ao.gpu_stats[4]/hits:0.0,s_ray_ao.gpu_stats[26],s_ray_ao.gpu_stats[30],s_ray_ao.gpu_stats[28],
+            s_ray_ao.gpu_ms[1]+s_ray_ao.gpu_ms[2]+s_ray_ao.gpu_ms[3]+s_ray_ao.gpu_ms[4],s_ray_ao.last_flags,s_ray_ao.gpu_stats[29],s_ray_ao.gpu_stats[6],s_ray_ao.gpu_stats[7],s_ray_ao.gpu_stats[8],s_ray_ao.gpu_stats[9],s_ray_ao.gpu_stats[10],s_ray_ao.gpu_stats[11],s_ray_ao.gpu_stats[12]);
+        s_ray_ao.last_hybrid_log=SDL_GetTicks64();
+        VK_LOG("hybrid PT cumulative nonfinite=%llu blackWorldFrames=%llu completedFrames=%llu; max diffuse bounces=1 max specular rays/path=1\n",(unsigned long long)s_ray_ao.hybrid_nonfinite,(unsigned long long)s_ray_ao.hybrid_black_frames,(unsigned long long)s_ray_ao.completed);
+    }
     double copy_ms=(double)(s_rt_capture.copy_ticks-s_ray_ao.last_copy_ticks)*1000.0/(double)SDL_GetPerformanceFrequency();
     u64 copied=s_rt_capture.copied_bytes-s_ray_ao.last_copy_bytes;s_ray_ao.last_copy_ticks=s_rt_capture.copy_ticks;s_ray_ao.last_copy_bytes=s_rt_capture.copied_bytes;
     if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))VK_LOG("ray transport mode=%s denoiser=%s frame=%llu epoch=%llu requested=%llu traced=%llu validFrames=%llu fallback=%llu flags=0x%x reasonCounts(pos/alpha/depth/numeric)=%llu/%llu/%llu/%llu draws=%u vertices=%u triangles=%u traceGrid=%ux%u paths=%u maxBounces=%u alphaLOD=ray-cone copied=%llu copyCPU=%.3fms totalCPU=%.3fms prepare/record/wait=%.3f/%.3f/%.3fms GPU(VS/gather/AS/trace/composite)=%.3f/%.3f/%.3f/%.3f/%.3fms timestampBits=%u\n",transport_mode,denoise?"spatial":"off",(unsigned long long)epoch->frame,(unsigned long long)epoch->generation,(unsigned long long)s_ray_ao.attempted,(unsigned long long)s_ray_ao.traced,(unsigned long long)s_ray_ao.completed,(unsigned long long)s_ray_ao.rejected,s_ray_ao.last_flags,(unsigned long long)s_ray_ao.invalid_position,(unsigned long long)s_ray_ao.invalid_alpha,(unsigned long long)s_ray_ao.invalid_depth,(unsigned long long)s_ray_ao.invalid_numeric,epoch->draw_count,epoch->vertex_count,triangles,aw,ah,authored_mode?1u:path_preview?8u:4u,authored_mode?1u:path_preview?4u:1u,(unsigned long long)copied,copy_ms,s_ray_ao.cpu_ms,(double)(record_start-start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(submit_start-record_start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(SDL_GetPerformanceCounter()-submit_start)*1000.0/(double)SDL_GetPerformanceFrequency(),s_ray_ao.gpu_ms[0],s_ray_ao.gpu_ms[1],s_ray_ao.gpu_ms[2],s_ray_ao.gpu_ms[3],s_ray_ao.gpu_ms[4],s_ray_ao.timestamp_bits);
     if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))VK_LOG("ray AO actual queries primary=%u matched=%u secondary=%u alphaRejected=%u emptyFrames=%llu\n",s_ray_ao.gpu_stats[0],s_ray_ao.gpu_stats[1],s_ray_ao.gpu_stats[2],s_ray_ao.gpu_stats[3],(unsigned long long)s_ray_ao.empty_ao);
-    if(s_ray_ao.gpu_stats[4] && (s_ray_ao.traced<=4 || s_ray_ao.traced%120==0)){
+    if(!hybrid_mode && s_ray_ao.gpu_stats[4] && (s_ray_ao.traced<=4 || s_ray_ao.traced%120==0)){
         float numeric_value;memcpy(&numeric_value,&s_ray_ao.gpu_stats[11],4);
         VK_LOG("ray AO alpha failure material=%u primitive=%u status=%d contract=%u fpCount=%u numericReason=%u value=%g\n",s_ray_ao.gpu_stats[5],s_ray_ao.gpu_stats[6],(int32_t)s_ray_ao.gpu_stats[7],s_ray_ao.gpu_stats[8],s_ray_ao.gpu_stats[9],s_ray_ao.gpu_stats[10],numeric_value);
     }
-    if(!(s_ray_ao.last_flags&1u) && s_ray_ao.gpu_stats[12] && (s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))){
+    if(!hybrid_mode && !(s_ray_ao.last_flags&1u) && s_ray_ao.gpu_stats[12] && (s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))){
         float z,expected,nearest;memcpy(&z,&s_ray_ao.gpu_stats[17],4);memcpy(&expected,&s_ray_ao.gpu_stats[18],4);memcpy(&nearest,&s_ray_ao.gpu_stats[19],4);
         VK_LOG("ray AO depth failure pixel=%u,%u raster=%u,%u sample=0 z=%g expected=%g candidate=%u nearest=%g primitive=%u material=%u coverage=%u alphaContract=%u\n",s_ray_ao.gpu_stats[13],s_ray_ao.gpu_stats[14],s_ray_ao.gpu_stats[15],s_ray_ao.gpu_stats[16],z,expected,s_ray_ao.gpu_stats[20]!=UINT32_MAX,nearest,s_ray_ao.gpu_stats[20],s_ray_ao.gpu_stats[21],s_ray_ao.gpu_stats[22],s_ray_ao.gpu_stats[23]);
     }

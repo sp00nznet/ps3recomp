@@ -96,10 +96,13 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
     if(!s_vk.rt_enabled || !pipeline || pipeline>VK_ENG_MAX_PIPE)return;
     const vk_eng_pipe* p=&s_epipe[pipeline-1];
     if(!p->rs.depth_test || !p->rs.depth_write)return;
+    const char *hybrid_env=getenv("PS3RECOMP_RSX_HYBRID_PT");
+    const int hybrid=hybrid_env && !strcmp(hybrid_env,"1");
+    if(hybrid && p->rs.blend_enable)return; // Opaque/cutout BVH; raster retains blended layers.
     rsx_scene_epoch* e=vk_rt_epoch(s_eng_bound.depth);
     if(!e || e->reason!=RSX_SCENE_EPOCH_OK)return;
     if(s_rt_capture.overflow || topology!=RSX_TOPOLOGY_TRIANGLES || !p->scene_vs ||
-       !p->scene_ps || (!p->rs.alpha_test_enable && (strstr(p->scene_ps,"discard") || strstr(p->scene_ps,"clip("))) ||
+       !p->scene_ps || (!hybrid && !p->rs.alpha_test_enable && (strstr(p->scene_ps,"discard") || strstr(p->scene_ps,"clip("))) ||
        stride!=p->scene_layout.stride || !s_e2.constant_shadow ||
        !s_e2.have_vp || !s_e2.have_sc || !vk_rt_depth_range(s_e2.vp[4],s_e2.vp[5])) {
         if(!s_rt_capture.rejected_pipeline_logged[pipeline-1]){
@@ -127,7 +130,7 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
     const int needs_alpha=(p->rs.alpha_test_enable && p->rs.alpha_func!=0x207u) ||
         p->rs.blend_enable || (p->rs.antialias_control&0x10u);
     in.texture_mask=needs_alpha?p->scene_alpha_mask:0;
-    if(needs_alpha && (p->scene_alpha_contract<0 || !in.texture_mask ||
+    if(!hybrid && needs_alpha && (p->scene_alpha_contract<0 || !in.texture_mask ||
        (s_e2.tex_mask&in.texture_mask)!=in.texture_mask || s_e2.ps_bytes!=p->scene_alpha_fp_bytes)) {
         if(!s_rt_capture.rejected_pipeline_logged[pipeline-1]){
             s_rt_capture.rejected_pipeline_logged[pipeline-1]=1;
@@ -135,6 +138,7 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
         }
         rsx_scene_epoch_invalidate(e,RSX_SCENE_EPOCH_UNSUPPORTED);++s_rt_capture.rejected;return;
     }
+    if(hybrid)in.texture_mask=s_e2.tex_mask;
     for(unsigned u=0;u<16;++u)if(in.texture_mask&(1u<<u)) {
         const vk_eng_obj* t=vk_eng_get(s_e2.tex[u],VK_ENG_TEXTURE);
         int snapshot=0;
@@ -142,6 +146,7 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
             if((s_eobj[j].kind==VK_ENG_COLOR || s_eobj[j].kind==VK_ENG_DEPTH) &&
                (s_eobj[j].surface==s_e2.tex[u] || s_eobj[j].expanded==s_e2.tex[u]))snapshot=1;
         if(!t || t->surface || t->expanded || t->cube || snapshot) {
+            if(hybrid){in.texture_mask&=~(1u<<u);continue;}
             if(!s_rt_capture.rejected_pipeline_logged[pipeline-1]){
                 s_rt_capture.rejected_pipeline_logged[pipeline-1]=1;
                 VK_LOG("ray capture alpha resource unsupported pipeline=%u unit=%u texture=%u present=%u surface=%u expanded=%u cube=%u snapshot=%d\n",pipeline,u,s_e2.tex[u],t!=NULL,t?t->surface:0,t?t->expanded:0,t?t->cube:0,snapshot);
@@ -152,7 +157,7 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
     const char *authored=getenv("PS3RECOMP_RSX_AUTHORED_LIGHTS");
     int light_contract=rsx_authored__pair(p->scene_vs_sha256,p->scene_ps_sha256);
     if(authored && !strcmp(authored,"1") && light_contract>=0){
-        u32 rgb_mask=light_contract==0?7u:127u,rgb_count=light_contract==0?3u:7u;
+        u32 rgb_mask=light_contract==0?7u:light_contract==1?127u:31u,rgb_count=light_contract==0?3u:light_contract==1?7u:5u;
         int ready=(s_e2.tex_mask&rgb_mask)==rgb_mask;
         for(u32 u=0;u<rgb_count&&ready;u++){
             const vk_eng_obj *t=vk_eng_get(s_e2.tex[u],VK_ENG_TEXTURE);

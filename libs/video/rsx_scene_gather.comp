@@ -16,10 +16,11 @@ bool clipToView(vec4 clip,vec2 depthRange,float sourceH,out vec3 point){
     // Inverse of the qualified centered positive-Z projection, homogeneous.
     // Unlike dividing clip by clip.w, this retains vertices on the camera plane.
     precise float w=(depth-p.projection.z*clip.w)/p.projection.w;
+    bool hybrid=(p.counts.w&32u)!=0u;
     if(sourceH!=0.0){
         if(isnan(sourceH)||isinf(sourceH)||sourceH<=1e-20)return false;
         precise float predicted=p.projection.z*clip.w+p.projection.w*sourceH;
-        if(abs(predicted-depth)>1e-5*max(1.0,max(abs(predicted),abs(depth))))return false;
+        if(!hybrid && abs(predicted-depth)>1e-5*max(1.0,max(abs(predicted),abs(depth))))return false;
         w=sourceH;
     }
     // Match trace varying recovery's supported positive homogeneous domain.
@@ -49,14 +50,14 @@ void main(){
             }
         }
     }
-    if(!good){atomicOr(validity.flags,1u);v[0]=v[1]=v[2]=vec3(0);}
+    if(!good){if((p.counts.w&32u)==0u)atomicOr(validity.flags,1u);v[0]=v[1]=v[2]=vec3(0);}
     else {
         Material m=materials.value[ids.w];
         // Vulkan framebuffer area is -cross(screen edges)/2. Guest VS replay
         // precedes Vulkan's Y inversion, so positive dot(n,v0)*sx*sy is CCW.
         float area=dot(cross(v[1]-v[0],v[2]-v[0]),v[0])*p.projection.x*p.projection.y;
-        if(isnan(area)||isinf(area)){atomicOr(validity.flags,1u);v[0]=v[1]=v[2]=vec3(0);}
-        else if(m.raster.x!=0u){
+        if(isnan(area)||isinf(area)){if((p.counts.w&32u)==0u)atomicOr(validity.flags,1u);v[0]=v[1]=v[2]=vec3(0);}
+        else if((p.counts.w&32u)==0u && m.raster.x!=0u){
             bool front=m.raster.z!=0u?area>0:area<0;
             if(m.raster.y==0x408u || (m.raster.y==0x404u?front:!front))v[0]=v[1]=v[2]=vec3(0);
         }
