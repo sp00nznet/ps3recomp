@@ -55,6 +55,8 @@
 #if PAD_BACKEND_SDL2
   #include <SDL2/SDL.h>
   #include "pad_motion_sdl.h"
+  #include "g7_motion_backend.h"
+  #include "pad_motion_g7.h"
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -131,6 +133,16 @@ static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
 static PadMotionSDL s_sdl_motion[PAD_MAX_HOST_PORTS];
 static SDL_JoystickID s_sdl_instance[PAD_MAX_HOST_PORTS];
+static int s_g7_port = -1;
+static SDL_JoystickID s_g7_instance = -1;
+static int pad_g7_candidate(SDL_GameController *gc)
+{
+    return gc && SDL_GameControllerGetVendor(gc) == 0x3537 &&
+        SDL_GameControllerGetProduct(gc) == 0x10c6 &&
+        !SDL_GameControllerHasSensor(gc, SDL_SENSOR_ACCEL) &&
+        !SDL_GameControllerHasSensor(gc, SDL_SENSOR_GYRO);
+}
+
 #endif
 
 /* Keyboard fallback for port 0.
@@ -388,6 +400,21 @@ static void pad_poll_sdl2(void)
 {
     SDL_GameControllerUpdate();
     pad_refresh_sdl2();
+    int g7_port = -1, g7_count = 0;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; ++i) {
+        if (pad_g7_candidate(s_sdl_controllers[i])) { g7_port = i; ++g7_count; }
+    }
+    if (g7_count != 1) g7_port = -1;
+    SDL_JoystickID g7_instance = g7_port >= 0 ? s_sdl_instance[g7_port] : -1;
+    if (g7_port != s_g7_port || g7_instance != s_g7_instance) {
+        g7_motion_stop();
+        s_g7_port = g7_port;
+        s_g7_instance = g7_instance;
+        if (g7_port >= 0) {
+            int started = g7_motion_start(0x3537, 0x10c6);
+            printf("[cellPad] G7 accelerometer port=%d started=%d; yaw uncalibrated\n", g7_port, started);
+        }
+    }
 
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
 
@@ -405,6 +432,16 @@ static void pad_poll_sdl2(void)
         }
 
         s_host_state[i].connected = 1;
+        if (i == s_g7_port) {
+            g7_motion_sample raw;
+            s_host_state[i].motion_capable = 1;
+            s_host_state[i].motion_valid =
+                (s_port_setting[i] & CELL_PAD_SETTING_SENSOR_ON) &&
+                g7_motion_get_raw_sample(&raw);
+            memset(s_host_state[i].motion, 0, sizeof(s_host_state[i].motion));
+            if (s_host_state[i].motion_valid)
+                pad_motion_g7_map(&raw, s_host_state[i].motion);
+        } else {
         s_host_state[i].motion_capable = pad_motion_sdl_capable(gc);
         if ((s_port_setting[i] & CELL_PAD_SETTING_SENSOR_ON) &&
             (!s_sdl_motion[i].enabled ||
@@ -413,6 +450,7 @@ static void pad_poll_sdl2(void)
             pad_motion_sdl_set_enabled(&s_sdl_motion[i],gc,1);
         s_host_state[i].motion_valid = pad_motion_sdl_poll(&s_sdl_motion[i],gc);
         memcpy(s_host_state[i].motion,s_sdl_motion[i].sample,sizeof(s_host_state[i].motion));
+        }
 
         u16 btns = 0;
         if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK))          btns |= CELL_PAD_CTRL_SELECT;
@@ -479,6 +517,8 @@ static void pad_init_backend(void)
 
 static void pad_shutdown_backend(void)
 {
+    g7_motion_stop();
+    s_g7_port = -1; s_g7_instance = -1;
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         if (s_sdl_controllers[i]) {
             pad_motion_sdl_set_enabled(&s_sdl_motion[i],s_sdl_controllers[i],0);
@@ -550,7 +590,7 @@ static void pad_poll_stick_motion(int keyboard)
         PadHostState* hs = &s_host_state[i];
         int physical = 0;
 #if PAD_BACKEND_SDL2
-        physical = pad_motion_sdl_capable(s_sdl_controllers[i]);
+        physical = i == s_g7_port || pad_motion_sdl_capable(s_sdl_controllers[i]);
 #endif
         int active = hs->connected && s_stick_mode &&
                      (!physical || s_stick_mode == 2);
@@ -1283,7 +1323,7 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
     pad_backend_lock();
 #if PAD_BACKEND_SDL2
     if (port_no < PAD_MAX_HOST_PORTS && !s_stick_mapped[port_no] && s_host_state[port_no].motion_capable) {
-        int ok=pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],
+        int ok=(int)port_no == s_g7_port ? 1 : pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],
                                         !!(port_setting & CELL_PAD_SETTING_SENSOR_ON));
         s_host_state[port_no].motion_valid=0;
         if (!ok) {
@@ -1380,7 +1420,7 @@ s32 cellPadSetSensorMode(u32 port_no, u32 mode)
     }
 #if PAD_BACKEND_SDL2
     if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].motion_capable) {
-        int ok=pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],(int)mode);
+        int ok=(int)port_no == s_g7_port ? 1 : pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],(int)mode);
         s_host_state[port_no].motion_valid=0;
         if (ok) {
             if (mode) s_port_setting[port_no] |= CELL_PAD_SETTING_SENSOR_ON;
