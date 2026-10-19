@@ -1,0 +1,41 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "../libs/video/rsx_scene_alpha.glsl"
+layout(local_size_x=64) in;
+struct AlphaCase {
+    RsxSceneAlphaVertexOutput vertex;
+    vec4 lod;
+    uvec4 config; // contract ID, float4 constant base, per-material FP count, callback failure mask
+    vec4 tex0;vec4 tex1;
+};
+struct AlphaAnswer {vec4 value;ivec4 meta;};
+layout(std430,set=0,binding=0) readonly buffer Cases {AlphaCase value[];} cases;
+layout(std430,set=0,binding=1) readonly buffer Constants {vec4 value[];} fp;
+layout(std430,set=0,binding=2) writeonly buffer Answers {AlphaAnswer value[];} answers;
+layout(push_constant) uniform Parameters {uint count;uint fp_count;} parameters;
+uint fixture_epoch_invalid=0;
+bool rsx_scene_alpha_load_constant(uint index,out vec4 value){
+    if(index>=parameters.fp_count)return false;
+    value=fp.value[index];return true;
+}
+bool rsx_scene_alpha_sample(uint material_id,uint unit,vec2 uv,float lod,out vec4 rgba){
+    if(material_id>=parameters.count || unit>1)return false;
+    AlphaCase c=cases.value[material_id];
+    if((c.config.w&(1u<<unit))!=0)return false;
+    vec2 expected=c.config.x<2 || unit==1?c.vertex.t0.xy:c.vertex.t0.zw;
+    if(any(notEqual(uv,expected)) || lod!=c.lod[unit])return false;
+    rgba=unit==0?c.tex0:c.tex1;return true;
+}
+void rsx_scene_alpha_invalidate_epoch(uint material_id,int status){
+    // Real integration must mark its shared scene epoch invalid. This fixture
+    // has one invocation per material, so a private flag is sufficient.
+    if(material_id==gl_GlobalInvocationID.x && status<0)fixture_epoch_invalid=1;
+}
+void main(){
+    uint id=gl_GlobalInvocationID.x;if(id>=parameters.count)return;
+    AlphaCase c=cases.value[id];
+    RsxSceneAlphaResult r=RsxSceneAlphaResult(123.0,456.0,789.0,37);
+    int status=rsx_scene_alpha_evaluate(c.config.x,id,c.config.y,c.config.z,c.vertex,c.lod.xy,r);
+    answers.value[id].value=vec4(r.raw_alpha,r.alpha,r.reference,0);
+    answers.value[id].meta=ivec4(r.keep,status,int(fixture_epoch_invalid),0);
+}

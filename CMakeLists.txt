@@ -128,6 +128,8 @@ add_library(ps3recomp_runtime STATIC
     ${RUNTIME_SOURCES}
 )
 
+include(cmake/SceneRayShaders.cmake)
+
 if(ANDROID)
     find_path(PS3RECOMP_UCONTEXT_INCLUDE_DIR libucontext/libucontext.h REQUIRED)
     find_library(PS3RECOMP_UCONTEXT_POSIX_LIBRARY NAMES ucontext_posix REQUIRED)
@@ -525,6 +527,98 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
     set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
 
     if(PS3RECOMP_RSX_VULKAN)
+        add_executable(test_scene_epoch EXCLUDE_FROM_ALL tests/test_scene_epoch.c libs/video/rsx_scene_epoch.c)
+        target_include_directories(test_scene_epoch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_scene_epoch PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+        target_link_libraries(test_scene_epoch PRIVATE m)
+        add_executable(test_scene_alpha EXCLUDE_FROM_ALL tests/test_scene_alpha.c libs/video/rsx_scene_alpha.c)
+        target_include_directories(test_scene_alpha PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_scene_alpha PRIVATE -Wall -Wextra -Werror -ffp-contract=off -fno-fast-math)
+        target_link_libraries(test_scene_alpha PRIVATE m)
+        add_executable(test_scene_bvh EXCLUDE_FROM_ALL tests/test_scene_bvh.c libs/video/rsx_scene_bvh.c)
+        target_compile_options(test_scene_bvh PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+        target_link_libraries(test_scene_bvh PRIVATE m)
+        add_executable(scene_ray_reference EXCLUDE_FROM_ALL tests/scene_ray_reference.c libs/video/rsx_scene_bvh.c)
+        target_compile_options(scene_ray_reference PRIVATE -Wall -Wextra -Werror)
+        target_link_libraries(scene_ray_reference PRIVATE m)
+        add_executable(test_vulkan_advanced_capabilities EXCLUDE_FROM_ALL
+            tests/test_vulkan_advanced_capabilities.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_vulkan_advanced_capabilities PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_link_libraries(test_vulkan_advanced_capabilities PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(PS3RECOMP_RSX_CACAO)
+            target_compile_definitions(test_vulkan_advanced_capabilities PRIVATE PS3RECOMP_RSX_CACAO)
+            target_include_directories(test_vulkan_advanced_capabilities PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cacao/inc")
+        endif()
+        if(WIN32)
+            target_link_libraries(test_vulkan_advanced_capabilities PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_vulkan_advanced_capabilities PROPERTIES LINKER_LANGUAGE CXX)
+        find_library(PS3RECOMP_RAY_QUERY_LOADER NAMES vulkan-1 vulkan)
+        find_program(PS3RECOMP_RAY_QUERY_GLSLANG NAMES glslang glslangValidator)
+        if(PS3RECOMP_RAY_QUERY_LOADER AND PS3RECOMP_RAY_QUERY_GLSLANG)
+            add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/scene_ray_query.spv"
+                COMMAND "${PS3RECOMP_RAY_QUERY_GLSLANG}" -V --target-env vulkan1.2
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/scene_ray_query.comp"
+                    -o "${CMAKE_CURRENT_BINARY_DIR}/scene_ray_query.spv"
+                DEPENDS tests/scene_ray_query.comp VERBATIM)
+            add_custom_target(scene_ray_query_shader DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/scene_ray_query.spv")
+            add_executable(test_vulkan_ray_query_geometry EXCLUDE_FROM_ALL tests/test_vulkan_ray_query_geometry.c)
+            target_include_directories(test_vulkan_ray_query_geometry PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+            target_link_libraries(test_vulkan_ray_query_geometry PRIVATE "${PS3RECOMP_RAY_QUERY_LOADER}" m)
+            add_dependencies(test_vulkan_ray_query_geometry scene_ray_query_shader)
+        endif()
+        add_executable(test_vulkan_scene_bridge EXCLUDE_FROM_ALL
+            tests/test_vulkan_scene_bridge.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_vulkan_scene_bridge PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_link_libraries(test_vulkan_scene_bridge PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(test_vulkan_scene_bridge PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_vulkan_scene_bridge PROPERTIES LINKER_LANGUAGE CXX)
+        add_executable(test_scene_vertex_outputs EXCLUDE_FROM_ALL
+            tests/test_scene_vertex_outputs.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_scene_vertex_outputs PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_link_libraries(test_scene_vertex_outputs PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(test_scene_vertex_outputs PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_scene_vertex_outputs PROPERTIES LINKER_LANGUAGE CXX)
+        add_executable(test_scene_batch_gpu EXCLUDE_FROM_ALL
+            tests/test_scene_batch_gpu.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_scene_batch_gpu PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_link_libraries(test_scene_batch_gpu PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(test_scene_batch_gpu PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_scene_batch_gpu PROPERTIES LINKER_LANGUAGE CXX)
+        add_executable(test_vulkan_ray_ao_live EXCLUDE_FROM_ALL
+            tests/test_vulkan_ray_ao_live.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_vulkan_ray_ao_live PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_link_libraries(test_vulkan_ray_ao_live PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(test_vulkan_ray_ao_live PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_vulkan_ray_ao_live PROPERTIES LINKER_LANGUAGE CXX)
+        add_executable(test_scene_alpha_replay EXCLUDE_FROM_ALL
+            tests/test_scene_alpha_replay.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
+        target_include_directories(test_scene_alpha_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video" "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_link_libraries(test_scene_alpha_replay PRIVATE ps3recomp_runtime m SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(test_scene_alpha_replay PRIVATE
+                winpthread dbghelp user32 gdi32 winmm d3d12 dxgi d3dcompiler dxguid)
+        endif()
+        set_target_properties(test_scene_alpha_replay PROPERTIES LINKER_LANGUAGE CXX)
         add_executable(test_gcm_wait_flip EXCLUDE_FROM_ALL tests/test_gcm_wait_flip.c tests/gcm_wait_link_stubs.c)
         target_include_directories(test_gcm_wait_flip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
         target_compile_options(test_gcm_wait_flip PRIVATE -ffunction-sections -fdata-sections)

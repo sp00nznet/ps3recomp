@@ -13,12 +13,12 @@ static void eng_ao_configure(void)
     const char* mode=getenv("PS3RECOMP_RSX_AO");
     g.ao_radius=eng_ao_parameter("PS3RECOMP_RSX_AO_RADIUS",1.2f);
     g.ao_strength=eng_ao_parameter("PS3RECOMP_RSX_AO_STRENGTH",1.0f);
-    g.ao_enabled=mode && strcmp(mode,"cacao")==0 && g.be->ambient_occlusion &&
+    g.ao_enabled=mode && (!strcmp(mode,"cacao") || !strcmp(mode,"rayquery")) && g.be->ambient_occlusion &&
         g.ao_radius>0 && g.ao_radius<=1000 && g.ao_strength>0 && g.ao_strength<=1;
     g.ao_logged=0;
     if(mode && *mode && strcmp(mode,"off"))
-        fprintf(stderr,"[rsx engine] CACAO %s; radius %.5g strength %.5g; qualified world composites only\n",
-            g.ao_enabled?"requested":"disabled (unsupported mode/backend or parameters)",g.ao_radius,g.ao_strength);
+        fprintf(stderr,"[rsx engine] AO mode=%s %s; radius %.5g strength %.5g; qualified world composites only\n",
+            mode,g.ao_enabled?"requested":"disabled (unsupported mode/backend or parameters)",g.ao_radius,g.ao_strength);
 }
 
 static int eng_ao_address(u32 location,u32 offset,const rsx_dsp_texture* t)
@@ -90,7 +90,7 @@ static u32 eng_ao_composite(const u32* targets,u32 n_targets,u32 current_zslot,
         color->raster_w,color->raster_h,&depth->ao.projection.matrix[0][0],
         ct->remap&0xFFFFu,ct->format,g.ao_radius,g.ao_strength);
     if(replacement && !g.ao_logged) {
-        fprintf(stderr,"[rsx engine] CACAO world composite applied frame %u logical %ux%u samples %u; original sources preserved\n",
+        fprintf(stderr,"[rsx engine] requested AO world composite applied frame %u logical %ux%u samples %u; original sources preserved\n",
             g.frames,color->raster_w,color->raster_h,color->samples);
         g.ao_logged=1;
     }

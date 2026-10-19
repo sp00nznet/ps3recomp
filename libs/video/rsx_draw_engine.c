@@ -2697,8 +2697,10 @@ static void pd_first_draw_state(u32 pipeline)
  * Supported target CPUs are little
  * endian. Attribute IDs occupy words8..23; words24..28 describe culling and
  * source reference/cut counts. No guest state is changed or synthesized. */
+#include "rsx_scene_capture.inc"
+
 static void pd_geometry(const rsx_be_render_state* rs, u32 topology,
-                        int indexed, u32 draw_count, u32 draw, u32 pipeline)
+                        int indexed, u32 draw_count, u32 draw, u32 pipeline, u32 tex_mask)
 {
     const char* enabled = getenv("RSX_ENGINE_PASS_DUMP_GEOMETRY");
     if (!enabled || strcmp(enabled, "1")) return;
@@ -2739,6 +2741,7 @@ static void pd_geometry(const rsx_be_render_state* rs, u32 topology,
     const int closed = fclose(f);
     s_pd.geometry_bytes += bytes;
     if (!complete || closed) fprintf(stderr,"[rsx engine] incomplete geometry capture %s\n",path);
+    else pd_alpha_textures(rs,draw,tex_mask);
 }
 
 static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
@@ -2804,7 +2807,7 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
         fprintf(s_pd.draws_log, "\n");
     }
     const u32 draw = s_pd.draws++;
-    pd_geometry(rs, topology, indexed, draw_count, draw, pipeline);
+    pd_geometry(rs, topology, indexed, draw_count, draw, pipeline, tex_mask);
     if (draw) return;
     pd_first_draw_state(pipeline);
 

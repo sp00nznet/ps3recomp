@@ -1,0 +1,133 @@
+#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x=8,local_size_y=8) in;
+layout(std430,binding=0) readonly buffer Outputs {vec4 value[];} vs;
+layout(std430,binding=1) readonly buffer Indices {uvec4 triangle[];} indices;
+layout(std430,binding=2) readonly buffer Positions {float xyz[];} positions;
+layout(std430,binding=3) buffer Validity {uint flags;} validity;
+struct Material {uvec4 alpha;uvec4 raster;uvec4 textures;};
+layout(std430,binding=4) readonly buffer Materials {Material value[];} materials;
+layout(std430,binding=5) readonly buffer Constants {vec4 value[];} fp;
+// Float occlusion bits followed by four uint counters, initialized by host fill.
+layout(std430,binding=6) buffer Occlusion {uint value[];} ao;
+layout(std140,binding=7) uniform Parameters {vec4 projection;uvec4 dims;uvec4 counts;vec4 settings;} p;
+layout(binding=8) uniform accelerationStructureEXT scene;
+layout(binding=9) uniform sampler2D worldColor;
+layout(binding=10) uniform sampler2D rasterDepth;
+layout(/*RSX_SCENE_OUTPUT_FORMAT*/,binding=11) writeonly uniform image2D outputColor;
+layout(push_constant) uniform Phase {uint mode;} phase;
+// Individual descriptors and literal switch indices avoid descriptor indexing
+// features and nonuniformEXT. Every descriptor is populated, including dummies.
+#define TEX(N) layout(binding=16+N) uniform sampler2D alphaTexture##N;
+TEX(0) TEX(1) TEX(2) TEX(3) TEX(4) TEX(5) TEX(6) TEX(7)
+TEX(8) TEX(9) TEX(10) TEX(11) TEX(12) TEX(13) TEX(14) TEX(15)
+TEX(16) TEX(17) TEX(18) TEX(19) TEX(20) TEX(21) TEX(22) TEX(23)
+TEX(24) TEX(25) TEX(26) TEX(27) TEX(28) TEX(29) TEX(30) TEX(31)
+#undef TEX
+/*RSX_SCENE_ALPHA_HELPER*/
+bool rsx_scene_alpha_load_constant(uint index,out vec4 value){if(index>=fp.value.length())return false;value=fp.value[index];return true;}
+void rsx_scene_alpha_invalidate_epoch(uint material,int status){atomicOr(validity.flags,4u);}
+bool rsx_scene_alpha_sample(uint material,uint unit,vec2 uv,float lod,out vec4 rgba){
+    if(material>=materials.value.length() || unit>1 || any(isnan(uv)) || any(isinf(uv)) || isnan(lod)||isinf(lod))return false;
+    uint slot=materials.value[material].textures[unit];
+    // LOD0 is an explicit AO policy. Captured sampler min/max/mip/filter/wrap
+    // and the original remapped texture view still apply; no raster derivatives.
+#define SAMPLE(N) case N: rgba=textureLod(alphaTexture##N,uv,lod);return true;
+    switch(slot){
+    SAMPLE(0) SAMPLE(1) SAMPLE(2) SAMPLE(3) SAMPLE(4) SAMPLE(5) SAMPLE(6) SAMPLE(7)
+    SAMPLE(8) SAMPLE(9) SAMPLE(10) SAMPLE(11) SAMPLE(12) SAMPLE(13) SAMPLE(14) SAMPLE(15)
+    SAMPLE(16) SAMPLE(17) SAMPLE(18) SAMPLE(19) SAMPLE(20) SAMPLE(21) SAMPLE(22) SAMPLE(23)
+    SAMPLE(24) SAMPLE(25) SAMPLE(26) SAMPLE(27) SAMPLE(28) SAMPLE(29) SAMPLE(30) SAMPLE(31)
+    default:return false;}
+#undef SAMPLE
+}
+void countRay(uint counter){atomicAdd(ao.value[p.dims.x*p.dims.y+counter],1u);}
+vec3 point(uint primitive,uint corner){uint i=primitive*9+corner*3;return vec3(positions.xyz[i],positions.xyz[i+1],positions.xyz[i+2]);}
+RsxSceneAlphaVertexOutput interpolate(uint primitive,vec2 b){
+    uvec3 ids=indices.triangle[primitive].xyz;vec3 w=vec3(1-b.x-b.y,b.x,b.y);
+    RsxSceneAlphaVertexOutput v;
+#define FIELD(NAME,N) v.NAME=vs.value[ids.x*12+N]*w.x+vs.value[ids.y*12+N]*w.y+vs.value[ids.z*12+N]*w.z;
+    FIELD(pos,0) FIELD(col0,1) FIELD(col1,2) FIELD(fog,3)
+    FIELD(t0,4) FIELD(t1,5) FIELD(t2,6) FIELD(t3,7) FIELD(t4,8) FIELD(t5,9) FIELD(t6,10) FIELD(t7,11)
+#undef FIELD
+    return v;
+}
+bool secondary(vec3 origin,vec3 direction){
+    countRay(2);
+    rayQueryEXT q;rayQueryInitializeEXT(q,scene,gl_RayFlagsTerminateOnFirstHitEXT,255,origin,0,direction,p.settings.x);
+    while(rayQueryProceedEXT(q)){
+        if(rayQueryGetIntersectionTypeEXT(q,false)!=gl_RayQueryCandidateIntersectionTriangleEXT){atomicOr(validity.flags,4u);continue;}
+        uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(q,false),material=indices.triangle[primitive].w;
+        Material m=materials.value[material];bool keep=m.alpha.x==0xffffffffu;
+        if(!keep){
+            RsxSceneAlphaResult result;
+            int status=rsx_scene_alpha_evaluate(m.alpha.x,material,m.alpha.y,m.alpha.z,
+                interpolate(primitive,rayQueryGetIntersectionBarycentricsEXT(q,false)),vec2(0),result);
+            keep=status==RSX_SCENE_ALPHA_OK && result.keep!=0;
+            if(status==RSX_SCENE_ALPHA_OK && !keep)countRay(3);
+        }
+        if(keep)rayQueryConfirmIntersectionEXT(q);
+    }
+    return rayQueryGetIntersectionTypeEXT(q,true)==gl_RayQueryCommittedIntersectionTriangleEXT;
+}
+bool finite3(vec3 v){return !any(isnan(v)) && !any(isinf(v));}
+void tracePixel(uvec2 pixel){
+    uint index=pixel.y*p.dims.x+pixel.x;ao.value[index]=0;
+    if((atomicOr(validity.flags,0u)&~2u)!=0u)return;
+    uvec2 raster=min(uvec2((vec2(pixel)+.5)*vec2(p.dims.zw)/vec2(p.dims.xy)),p.dims.zw-1);
+    float z=texelFetch(rasterDepth,ivec2(raster.x*p.counts.z,raster.y),0).r;
+    if(isnan(z)||isinf(z)||z<0 || z>1){atomicOr(validity.flags,8u);return;}
+    if(z>=1)return;
+    float expected=p.projection.w/(z-p.projection.z);
+    float nearZ=-p.projection.w/p.projection.z;
+    if(!rsx_scene_alpha_finite(expected)||expected<=0 || nearZ<=0){atomicOr(validity.flags,8u);return;}
+    float sampleOffset=p.counts.z==2u?.75:.5;
+    vec2 uv=(vec2(raster)+sampleOffset)/vec2(p.dims.zw);
+    vec3 direction=vec3((2*uv.x-1)/p.projection.x,(1-2*uv.y)/p.projection.y,1);
+    float tolerance=max(.001,expected*p.settings.w);
+    if(!finite3(direction)||!rsx_scene_alpha_finite(expected+tolerance)){
+        atomicOr(validity.flags,16u);return;
+    }
+    countRay(0);rayQueryEXT q;rayQueryInitializeEXT(q,scene,0,255,vec3(0),nearZ,direction,expected+tolerance);
+    // Primary visibility comes from the actual raster depth, including its
+    // accepted alpha/mip result. Ignore nearer cutout candidates. Do not run
+    // guessed-LOD alpha on primary rays or claim raster mip equivalence.
+    while(rayQueryProceedEXT(q))if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
+        float t=rayQueryGetIntersectionTEXT(q,false);
+        float depth=p.projection.z+p.projection.w/t;
+        if(abs(t-expected)<=tolerance && abs(depth-z)<=.00004)rayQueryConfirmIntersectionEXT(q);
+    }
+    if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT){atomicOr(validity.flags,8u);return;}
+    uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(q,true);float t=rayQueryGetIntersectionTEXT(q,true);
+    vec3 normal=cross(point(primitive,1)-point(primitive,0),point(primitive,2)-point(primitive,0));
+    float length2=dot(normal,normal);
+    if(!finite3(normal)||isnan(length2)||isinf(length2)||length2<=1e-20){atomicOr(validity.flags,16u);return;}
+    normal/=sqrt(length2);if(dot(normal,direction)>0)normal=-normal;
+    vec3 tangent=normalize(cross(abs(normal.z)<.999?vec3(0,0,1):vec3(0,1,0),normal));
+    vec3 bitangent=cross(normal,tangent),origin=direction*t+normal*p.settings.y;
+    if(!finite3(origin)||!finite3(tangent)||!finite3(bitangent)){atomicOr(validity.flags,16u);return;}
+    countRay(1);
+    uint blocked=0;
+    for(uint i=0;i<4;i++){
+        float u=(float(i)+.5)/4,phi=6.28318530718*float((i>>1)|((i&1u)<<1))/4;
+        vec3 local=vec3(sqrt(u)*cos(phi),sqrt(u)*sin(phi),sqrt(1-u));
+        vec3 ray=normalize(tangent*local.x+bitangent*local.y+normal*local.z);
+        if(!finite3(ray)){atomicOr(validity.flags,16u);return;}
+        if(secondary(origin,ray))blocked++;
+    }
+    ao.value[index]=floatBitsToUint(float(blocked)/4);
+}
+void main(){
+    uvec2 pixel=gl_GlobalInvocationID.xy;
+    if(phase.mode==0u){if(all(lessThan(pixel,p.dims.xy)))tracePixel(pixel);return;}
+    uvec2 expanded=uvec2(p.dims.z*p.counts.z,p.dims.w);
+    if(any(greaterThanEqual(pixel,expanded)))return;
+    vec4 original=texelFetch(worldColor,ivec2(pixel),0);
+    // A separate dispatch and shader-write/read barrier make EVERY trace's
+    // validity writes visible before ANY color is selected. No partial AO.
+    if((validity.flags&~2u)==0u){
+        uvec2 a=min(uvec2(vec2(pixel/uvec2(p.counts.z,1))*vec2(p.dims.xy)/vec2(p.dims.zw)),p.dims.xy-1);
+        original.rgb*=1-p.settings.z*uintBitsToFloat(ao.value[a.y*p.dims.x+a.x]);
+    }
+    imageStore(outputColor,ivec2(pixel),original);
+}

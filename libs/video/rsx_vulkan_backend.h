@@ -55,6 +55,8 @@
 #define PS3RECOMP_RSX_VULKAN_BACKEND_H
 
 #include "rsx_commands.h"
+#include "rsx_render_capabilities.h"
+#include "rsx_scene_bridge.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +69,29 @@ int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 
 /* Unregister and destroy every Vulkan object, then unload the library. */
 void rsx_vulkan_backend_shutdown(void);
+
+/* Read on the owning render thread after init, or before init/after shutdown
+ * for an unknown device report. Never enables a rendering feature. */
+rsx_render_capabilities rsx_vulkan_backend_advanced_capabilities(void);
+/* JSON capability report for launcher adapters. NULL/0 returns required bytes
+ * excluding NUL. Insufficient buffers return -1 and are emptied, never partial
+ * JSON. Physical feature fields use -1 unknown, 0 absent, 1 supported. */
+int rsx_vulkan_backend_advanced_report(char* out, size_t capacity);
+
+/* Experimental synchronous scene bridge on the owning render thread. Replays
+ * generated VS without vertex textures. Output is float4 clip position before
+ * Vulkan Y inversion, including the guest viewport epilogue, per unique input
+ * vertex. Does not imply world geometry or complete scene coverage. Returns
+ * -1 on unsupported data/device/compiler, leaving output unchanged. */
+int rsx_vulkan_backend_replay_positions(const char* shader,const rsx_vertex_layout_plan* layout,
+    const void* vertices,u32 count,const void* constants,size_t constant_bytes,
+    float* positions,size_t position_floats);
+
+/* Complete generated VS varyings for material/alpha qualification. Only
+ * position must be finite; unused varying bit patterns remain unchanged. */
+int rsx_vulkan_backend_replay_outputs(const char* shader,const rsx_vertex_layout_plan* layout,
+    const void* vertices,u32 count,const void* constants,size_t constant_bytes,
+    rsx_scene_vertex_output* outputs,size_t output_count);
 
 /* Headless: always 0. Windowed: drains SDL's event queue; -1 once the
  * window has been closed or Esc pressed. */

@@ -213,6 +213,7 @@ typedef struct vk_state {
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              alpha_to_one_ok; /* alphaToOne enabled when supported */
     int              anisotropy_ok;
+    int              rt_requested, rt_enabled; /* explicit rayquery mode only */
 #ifdef PS3RECOMP_RSX_CACAO
     int              cacao_api_ok, cacao_device_ok;
 #endif
@@ -2378,6 +2379,17 @@ typedef struct vk_eng_obj {
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 
+/* Optional live scene collection, implemented after the scene-batch module. */
+static int vk_rt_shader_contract(const char* source,u32* mask,u32* bytes);
+static void vk_rt_capture_clear(u32 depth,float value);
+static void vk_rt_capture_resource(u32 resource);
+static void vk_rt_capture_pipeline(u32 pipeline);
+static void vk_rt_capture_present(void);
+static void vk_rt_capture_shutdown(void);
+static void vk_rt_ao_shutdown(void);
+static u32 vk_eng_ray_world(void* user,u32 color,u32 depth,u32 logical_w,u32 logical_h,const float projection[16],u32 remap,u32 rsx_format,float radius,float strength);
+static void vk_rt_capture_draw(u32 pipeline,rsx_topology topology,const void* vertices,
+    u32 vertex_count,u32 stride,const u32* indices,u32 index_count);
 /* Defined with the E2 pipeline state further down. */
 static void vk_eng_drop_framebuffers(void);
 static void vk_eng2_shutdown(void* user);
@@ -2588,9 +2600,11 @@ static void vk_eng_release(void* user, u32 handle)
     }
     vk_flush_pending(0);
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
+    if(s_vk.rt_enabled)vk_rt_capture_resource(handle);
     if (s_eobj[handle].kind == VK_ENG_COLOR)
         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
+                if(s_vk.rt_enabled)vk_rt_capture_resource(i);
                 vk_destroy_image(&s_eobj[i].im);
                 memset(&s_eobj[i], 0, sizeof s_eobj[i]);
             }
@@ -2773,6 +2787,7 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!o || !aspect || vk_begin()) return;
     o->expansion_valid = 0;
+    if(s_vk.rt_enabled && (flags&RSX_BE_CLEAR_DEPTH))vk_rt_capture_clear(depth,depth_value);
     VkClearDepthStencilValue d = { depth_value, stencil };
     VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
@@ -2790,6 +2805,7 @@ static void vk_eng_set_present_aspect(void* user,float aspect)
 
 static void vk_eng_present(void* user, u32 surface)
 { vk_flush_pending(0);
+    if(s_vk.rt_enabled)vk_rt_capture_present();
     (void)user;
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (o && o->samples > 1) o = vk_eng_get(vk_eng_expand_samples(surface), VK_ENG_TEXTURE);
@@ -3006,6 +3022,7 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     (void)user;
     vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
     if (!o || !src || !row_bytes || !rows || face >= (o->cube ? 6u : 1u)) return;
+    if(s_vk.rt_enabled)vk_rt_capture_resource(texture);
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
     vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);
@@ -3188,6 +3205,10 @@ static int vk_eng_depth_readback(void* user,u32 depth,u32 x,u32 y,u32 w,u32 h,fl
 typedef struct vk_eng_pipe {
     int                 used;
     VkShaderModule      vs, fs;
+    char *scene_vs, *scene_ps;
+    int scene_alpha_contract;
+    u32 scene_alpha_mask,scene_alpha_fp_bytes;
+    rsx_vertex_layout_plan scene_layout;
     rsx_be_render_state rs;
     u32                 nslots, stride, rt_count;
     VkFormat            rt_fmt;          /* picks the render pass it is built against */
@@ -3443,6 +3464,17 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     P->rt_count = rt_count;
     P->rt_fmt = cf;
     P->cube_mask = vk_eng_cube_units(ps_hlsl);
+    if(s_vk.rt_enabled) {
+        const size_t vl=strlen(vs_hlsl),pl=strlen(ps_hlsl);
+        if(vl<262144 && pl<262144) {
+            P->scene_vs=(char*)malloc(vl+1);P->scene_ps=(char*)malloc(pl+1);
+            if(P->scene_vs && P->scene_ps) {
+                memcpy(P->scene_vs,vs_hlsl,vl+1);memcpy(P->scene_ps,ps_hlsl,pl+1);
+                P->scene_layout=*layout;
+                P->scene_alpha_contract=rs->alpha_test_enable?vk_rt_shader_contract(ps_hlsl,&P->scene_alpha_mask,&P->scene_alpha_fp_bytes):-1;
+            } else {free(P->scene_vs);free(P->scene_ps);P->scene_vs=P->scene_ps=NULL;}
+        }
+    }
     P->used = 1;
     return slot + 1u;
 }
@@ -3452,6 +3484,8 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     (void)user;
     if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
     vk_eng_pipe* P = &s_epipe[pipeline - 1];
+    if(s_vk.rt_enabled)vk_rt_capture_pipeline(pipeline);
+    free(P->scene_vs);free(P->scene_ps);
     for (u32 si = 0; si < 3; si++)
         for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
             if (P->variant[si][t]) pvkDestroyPipeline(s_vk.device, P->variant[si][t], NULL);
@@ -4066,6 +4100,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
+    if(s_vk.rt_enabled)vk_rt_capture_draw(s_e2.pipeline,topology,vertices,vertex_count,stride,indices,index_count);
     s_batch.draws++;
     if (deferred && s_batch.merge) {
         s_rp.open = 1; s_rp.rp = rp; s_rp.fb = fb; s_rp.w = w; s_rp.h = h;
@@ -4078,6 +4113,18 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         return;
     }
     vk_submit_and_wait();
+}
+
+/* Dispatch only the explicitly selected algorithm. Any ray-query failure
+ * returns zero and the compositor retains the original guest world color. */
+static u32 vk_eng_world_ao(void* user,u32 color,u32 depth,u32 logical_w,u32 logical_h,const float projection[16],u32 remap,u32 rsx_format,float radius,float strength)
+{
+    if(s_vk.rt_requested)return vk_eng_ray_world(user,color,depth,logical_w,logical_h,projection,remap,rsx_format,radius,strength);
+#ifdef PS3RECOMP_RSX_CACAO
+    return vk_eng_cacao_world(user,color,depth,logical_w,logical_h,projection,remap,rsx_format,radius,strength);
+#else
+    return 0;
+#endif
 }
 
 static const rsx_draw_backend s_vk_engine_backend = {
@@ -4116,9 +4163,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .color_target_create_multisample = vk_eng_color_multisample,
     .depth_target_create_multisample = vk_eng_depth_multisample,
     .depth_to_argb        = vk_eng_depth_to_argb,
-#ifdef PS3RECOMP_RSX_CACAO
-    .ambient_occlusion = vk_eng_cacao_world,
-#endif
+    .ambient_occlusion = vk_eng_world_ao,
 };
 
 static rsx_backend s_vulkan_backend = {
@@ -4136,12 +4181,20 @@ static rsx_backend s_vulkan_backend = {
 /* ---------------------------------------------------------------------------
  * Public entry points
  * -------------------------------------------------------------------------*/
+#include "rsx_vulkan_advanced.inc"
+#include "rsx_vulkan_scene.inc"
+#include "rsx_vulkan_scene_batch.inc"
+#include "rsx_vulkan_rt_capture.inc"
+#include "rsx_vulkan_ray_ao.inc"
+
 static int vk_init_all(u32 width, u32 height, const char* title)
 {
     if (!rsx_vk_anisotropy_parse_override(getenv("PS3RECOMP_ANISOTROPY"), &s_vk.anisotropy_override)) {
         VK_LOG("PS3RECOMP_ANISOTROPY must be auto,0,1,2,4,8 or16\n");
         return -1;
     }
+    { const char* mode=getenv("PS3RECOMP_RSX_AO");
+      s_vk.rt_requested=mode && !strcmp(mode,"rayquery"); }
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
     if (!rsx_display_extent_valid(s_vk.width,s_vk.height,8192)) {
@@ -4175,6 +4228,14 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         app.apiVersion=VK_API_VERSION_1_1;s_vk.cacao_api_ok=1;
     }
 #endif
+    if (s_vk.rt_requested) {
+        PFN_vkEnumerateInstanceVersion rt_enum=(PFN_vkEnumerateInstanceVersion)
+            pvkGetInstanceProcAddr(VK_NULL_HANDLE,"vkEnumerateInstanceVersion");
+        u32 version=VK_API_VERSION_1_0;
+        if(rt_enum && rt_enum(&version)==VK_SUCCESS && version>=VK_API_VERSION_1_2)
+            app.apiVersion=VK_API_VERSION_1_2;
+        else VK_LOG("rayquery unavailable: Vulkan1.2 loader required; raster retained\n");
+    }
     if (s_vk.windowed) {
         ci.enabledExtensionCount   = s_vk.inst_ext_count;
         ci.ppEnabledExtensionNames = s_vk.inst_exts;
@@ -4207,11 +4268,13 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         return -1;
     }
 
+    vk_advanced_probe(app.apiVersion);
+
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
-    static const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    const char* dev_exts[4] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
     /* DXT (BC1-3) is how PS3 titles ship most textures; Vulkan gates it
      * behind a feature, enabled only when the device reports it. */
     VkPhysicalDeviceFeatures have, want;
@@ -4244,7 +4307,50 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
                                .ppEnabledExtensionNames = s_vk.windowed ? dev_exts : NULL,
                                .pEnabledFeatures = &want };
-    VK_CHECK(pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device), "vkCreateDevice");
+    VkPhysicalDeviceBufferDeviceAddressFeatures rt_bda={
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+        .bufferDeviceAddress=VK_TRUE};
+    VkPhysicalDeviceRayQueryFeaturesKHR rt_rq={
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        .pNext=&rt_bda,.rayQuery=VK_TRUE};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR rt_as={
+        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+        .pNext=&rt_rq,.accelerationStructure=VK_TRUE};
+    int enable_rt=0;
+    if(s_vk.rt_requested && app.apiVersion>=VK_API_VERSION_1_2 &&
+       s_advanced.device_api>=VK_API_VERSION_1_2 &&
+       s_advanced.acceleration_structure==1 && s_advanced.ray_query==1 &&
+       s_advanced.buffer_device_address==1 && s_advanced.deferred_host_operations==1) {
+        u32 count=0;pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys,&count,NULL);
+        VkQueueFamilyProperties* props=count && count<=1024?
+            (VkQueueFamilyProperties*)calloc(count,sizeof *props):NULL;
+        if(props) {
+            pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys,&count,props);
+            enable_rt=s_vk.queue_family<count &&
+                (props[s_vk.queue_family].queueFlags&VK_QUEUE_COMPUTE_BIT)!=0;
+            free(props);
+        }
+        VkFormatProperties format;
+        pvkGetPhysicalDeviceFormatProperties(s_vk.phys,VK_FORMAT_R32G32B32_SFLOAT,&format);
+        if(!(format.bufferFeatures&VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR))enable_rt=0;
+    }
+    if(enable_rt) {
+        u32 n=s_vk.windowed?1u:0u;
+        dev_exts[n++]=VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
+        dev_exts[n++]=VK_KHR_RAY_QUERY_EXTENSION_NAME;
+        dev_exts[n++]=VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
+        dci.enabledExtensionCount=n;dci.ppEnabledExtensionNames=dev_exts;dci.pNext=&rt_as;
+    } else if(s_vk.rt_requested) VK_LOG("rayquery unavailable: required device features/queue/format; raster retained\n");
+    VkResult device_result=pvkCreateDevice(s_vk.phys,&dci,NULL,&s_vk.device);
+    if(device_result!=VK_SUCCESS && enable_rt) {
+        VK_LOG("rayquery device creation failed (%d); retrying existing raster features\n",(int)device_result);
+        enable_rt=0;dci.pNext=NULL;dci.enabledExtensionCount=s_vk.windowed?1u:0u;
+        dci.ppEnabledExtensionNames=s_vk.windowed?dev_exts:NULL;
+        device_result=pvkCreateDevice(s_vk.phys,&dci,NULL,&s_vk.device);
+    }
+    VK_CHECK(device_result,"vkCreateDevice");
+    s_vk.rt_enabled=enable_rt;
+    if(enable_rt)VK_LOG("rayquery logical device features enabled; gameplay scene not yet qualified\n");
     if (vk_load_device_functions()) return -1;
     vk_pcache_init(s_vk.instance, s_vk.phys, s_vk.device);
     VK_LOG("anisotropy: supported=%d device_limit=%g override=%u (0=guest,1=off)\n",
@@ -4362,6 +4468,8 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
                "requested but bypassed on diagnostic vtable path; requires draw engine");
     VK_LOG("offscreen target %ux%u ready, depth format %d (%s)\n",
            s_vk.width, s_vk.height, (int)s_vk.depth_format, title ? title : "");
+    s_advanced.initialized = 1;
+    VK_LOG("advanced rendering: RT/PT/DLSS unavailable; existing raster settings retained\n");
     return 0;
 }
 
@@ -4385,6 +4493,9 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         if (pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
+        vk_rt_ao_shutdown();
+        vk_rt_capture_shutdown();
+        rsx_vulkan_scene_batch_shutdown();
         vk_guest_shutdown();
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
@@ -4415,6 +4526,7 @@ void rsx_vulkan_backend_shutdown(void)
     rsx_vk_library_close(s_vk.lib);
     free(s_vk.cpu_verts);
     memset(&s_vk, 0, sizeof s_vk);
+    vk_advanced_reset();
 }
 
 int rsx_vulkan_backend_pump_messages(void)

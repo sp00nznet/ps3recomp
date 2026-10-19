@@ -54,7 +54,9 @@ static int capture_load(capture* c,const char* path)
     c->vertices=(const float*)(c->bytes+128);
     c->indices=h[6]?(const u32*)(c->bytes+128+(size_t)vb):NULL;
     c->constants=c->bytes+128+(size_t)vb+(size_t)ib;
+#ifndef RSX_CAPTURE_ALLOW_NONFINITE_ATTRIBUTES
     for(size_t i=0;i<vb/4;i++)if(!isfinite(c->vertices[i]))goto bad;
+#endif
     for(u32 i=0;i<h[6];i++)if(c->indices[i]>=h[4])goto bad;
     for(u32 i=0;i<h[30]/4;i++)if(!isfinite(((const float*)c->constants)[i]))goto bad;
     return 1;
@@ -139,12 +141,13 @@ static int measure(const capture* depth,const capture* color,const char* dvs,
     }
     printf("{\"scope\":\"position-only replay, single sample, solid fragment\",\"baseline\":%u,\"equal\":%u,\"lequal\":%u,\"equal_missing\":%u,\"lequal_missing\":%u,\"equal_extra\":%u,\"lequal_extra\":%u}\n",
            covered[0],covered[1],covered[2],missing[1],missing[2],extra[1],extra[2]);
-    result=covered[0]>0;
-    if(expected==1)result=result && !missing[1] && !missing[2] && !extra[1] && !extra[2];
+    result=expected==3 || covered[0]>0;
+    if(expected==1 || expected==3)result=result && !missing[1] && !missing[2] && !extra[1] && !extra[2];
     if(expected==2)result=result && !covered[1] && !covered[2] && missing[1]==covered[0] && missing[2]==covered[0];
 end:
     for(unsigned i=0;i<4;i++)if(pipes[i])vk_eng_pipeline_release(NULL,pipes[i]);
-    /* All targets are owned by this one process and destroyed on shutdown. */
+    if(rt)vk_eng_release(NULL,rt);
+    if(z)vk_eng_release(NULL,z);
     free(pixels);free(baseline);return result;
 }
 

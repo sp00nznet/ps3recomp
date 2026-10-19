@@ -41,6 +41,8 @@ extern "C" {
 #define RSX_SPIRV_PSCONST_BINDING  1u
 #define RSX_SPIRV_TEXTURE_BINDING  16u
 #define RSX_SPIRV_SAMPLER_BINDING  48u
+/* Vulkan-only compute support, used by the explicit scene-data replay path. */
+#define RSX_SHADER_STAGE_COMPUTE 2
 
 /* 1 when built with glslang, 0 when the stub is in. */
 int rsx_hlsl_to_spirv_available(void);
@@ -62,6 +64,10 @@ int rsx_hlsl_to_spirv(const char* hlsl, int stage,
  * rsx_shader_spirv.cpp). All zero when the cache is off or glslang is absent.
  * Any pointer may be NULL. */
 void rsx_spirv_cache_stats(u32* hits, u32* misses, u32* stores, u32* rejects);
+/* Explicit-layout GLSL compute only, targeting Vulkan1.2/SPIR-V1.5 for
+ * opt-in ray-query kernels. Does not change legacy HLSL binding/Y conventions. */
+int rsx_glsl_compute_to_spirv(const char* source,u32* words,u32 max_words,
+    u32* out_words,char* log,u32 log_size);
 
 #ifdef __cplusplus
 }

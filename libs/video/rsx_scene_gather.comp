@@ -1,0 +1,37 @@
+#version 460
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer Outputs {vec4 value[];} vs;
+layout(std430,binding=1) readonly buffer Indices {uvec4 triangle[];} indices;
+layout(std430,binding=2) writeonly buffer Positions {float xyz[];} positions;
+layout(std430,binding=3) buffer Validity {uint flags;} validity;
+struct Material {uvec4 alpha;uvec4 raster;uvec4 textures;};
+layout(std430,binding=4) readonly buffer Materials {Material value[];} materials;
+layout(std140,binding=7) uniform Parameters {vec4 projection;uvec4 dims;uvec4 counts;vec4 settings;} p;
+bool finite3(vec3 v){return !any(isnan(v)) && !any(isinf(v));}
+bool clipToView(vec4 clip,out vec3 point){
+    // Inverse of the qualified centered positive-Z projection, homogeneous.
+    // Unlike dividing clip by clip.w, this retains vertices on the camera plane.
+    float w=(clip.z-p.projection.z*clip.w)/p.projection.w;
+    if(isnan(w)||isinf(w)||abs(w)<1e-20)return false;
+    point=vec3(clip.x/p.projection.x,clip.y/p.projection.y,clip.w)/w;
+    return finite3(point);
+}
+void main(){
+    uint t=gl_GlobalInvocationID.x;if(t>=p.counts.x)return;
+    uvec4 ids=indices.triangle[t];vec3 v[3];bool good=(atomicOr(validity.flags,0u)&1u)==0u;
+    if(any(greaterThanEqual(ids.xyz,uvec3(p.counts.y))) || ids.w>=materials.value.length())good=false;
+    if(good)for(uint i=0;i<3;i++)if(!clipToView(vs.value[ids[i]*12],v[i]))good=false;
+    if(!good){atomicOr(validity.flags,1u);v[0]=v[1]=v[2]=vec3(0);}
+    else {
+        Material m=materials.value[ids.w];
+        // Vulkan framebuffer area is -cross(screen edges)/2. Guest VS replay
+        // precedes Vulkan's Y inversion, so positive dot(n,v0)*sx*sy is CCW.
+        float area=dot(cross(v[1]-v[0],v[2]-v[0]),v[0])*p.projection.x*p.projection.y;
+        if(isnan(area)||isinf(area)){atomicOr(validity.flags,1u);v[0]=v[1]=v[2]=vec3(0);}
+        else if(m.raster.x!=0u){
+            bool front=m.raster.z!=0u?area>0:area<0;
+            if(m.raster.y==0x408u || (m.raster.y==0x404u?front:!front))v[0]=v[1]=v[2]=vec3(0);
+        }
+    }
+    for(uint i=0;i<3;i++)for(uint c=0;c<3;c++)positions.xyz[t*9+i*3+c]=v[i][c];
+}

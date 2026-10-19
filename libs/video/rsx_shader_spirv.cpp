@@ -72,16 +72,16 @@ bool glslang_ready()
 
 extern "C" int rsx_hlsl_to_spirv_available(void) { return 1; }
 
-static int rsx_translate_uncached(const char* hlsl, int stage,
-                                  u32* words, u32 max_words, u32* out_words,
-                                  char* log, u32 log_size)
+static int compile_spirv(const char* hlsl, int stage,
+                         u32* words, u32 max_words, u32* out_words,
+                         char* log, u32 log_size, bool glsl)
 {
     if (out_words) *out_words = 0;
     if (!hlsl || !words || !out_words || max_words == 0) {
         put_log(log, log_size, "bad arguments", nullptr);
         return -1;
     }
-    if (stage != RSX_SHADER_STAGE_VERTEX && stage != RSX_SHADER_STAGE_FRAGMENT) {
+    if (stage != RSX_SHADER_STAGE_VERTEX && stage != RSX_SHADER_STAGE_FRAGMENT && stage != RSX_SHADER_STAGE_COMPUTE) {
         put_log(log, log_size, "unknown shader stage", nullptr);
         return -1;
     }
@@ -90,25 +90,27 @@ static int rsx_translate_uncached(const char* hlsl, int stage,
         return -1;
     }
 
-    const EShLanguage lang = (stage == RSX_SHADER_STAGE_VERTEX) ? EShLangVertex
-                                                                : EShLangFragment;
+    const EShLanguage lang = stage == RSX_SHADER_STAGE_VERTEX ? EShLangVertex :
+                            stage == RSX_SHADER_STAGE_FRAGMENT ? EShLangFragment : EShLangCompute;
     const EShMessages msgs =
-        (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules | EShMsgReadHlsl);
+        (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules | (glsl ? 0 : EShMsgReadHlsl));
 
     glslang::TShader shader(lang);
     const char* strings[1] = { hlsl };
     shader.setStrings(strings, 1);
-    shader.setEnvInput(glslang::EShSourceHlsl, lang, glslang::EShClientVulkan, 100);
-    shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
-    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
+    shader.setEnvInput(glsl ? glslang::EShSourceGlsl : glslang::EShSourceHlsl, lang, glslang::EShClientVulkan, 100);
+    shader.setEnvClient(glslang::EShClientVulkan, glsl ? glslang::EShTargetVulkan_1_2 : glslang::EShTargetVulkan_1_0);
+    shader.setEnvTarget(glslang::EShTargetSpv, glsl ? glslang::EShTargetSpv_1_5 : glslang::EShTargetSpv_1_0);
     shader.setEntryPoint("main");
-    shader.setAutoMapBindings(true);
-    shader.setAutoMapLocations(true);
-    shader.setShiftBinding(glslang::EResTexture, RSX_SPIRV_TEXTURE_BINDING);
-    shader.setShiftBinding(glslang::EResSampler, RSX_SPIRV_SAMPLER_BINDING);
-    if (lang == EShLangVertex) shader.setInvertY(true);
+    if (!glsl) {
+        shader.setAutoMapBindings(true);
+        shader.setAutoMapLocations(true);
+        shader.setShiftBinding(glslang::EResTexture, RSX_SPIRV_TEXTURE_BINDING);
+        shader.setShiftBinding(glslang::EResSampler, RSX_SPIRV_SAMPLER_BINDING);
+        if (lang == EShLangVertex) shader.setInvertY(true);
+    }
 
-    if (!shader.parse(GetDefaultResources(), 100, false, msgs)) {
+    if (!shader.parse(GetDefaultResources(), glsl ? 460 : 100, false, msgs)) {
         put_log(log, log_size, "HLSL parse", shader.getInfoLog());
         return -1;
     }
@@ -141,6 +143,13 @@ static int rsx_translate_uncached(const char* hlsl, int stage,
     memcpy(words, spirv.data(), spirv.size() * sizeof(u32));
     *out_words = (u32)spirv.size();
     return 0;
+}
+
+static int rsx_translate_uncached(const char* hlsl, int stage,
+                                  u32* words, u32 max_words, u32* out_words,
+                                  char* log, u32 log_size)
+{
+    return compile_spirv(hlsl, stage, words, max_words, out_words, log, log_size, false);
 }
 
 namespace {
@@ -298,6 +307,9 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
     report();
     return r;
 }
+extern "C" int rsx_glsl_compute_to_spirv(const char* source,u32* words,u32 capacity,
+    u32* written,char* log,u32 log_size)
+{ return compile_spirv(source,RSX_SHADER_STAGE_COMPUTE,words,capacity,written,log,log_size,true); }
 
 #else /* !PS3RECOMP_HAVE_SPIRV_TRANSLATION */
 
@@ -321,5 +333,9 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
         snprintf(log, log_size, "HLSL -> SPIR-V translation not built (glslang not found)");
     return -1;
 }
+
+extern "C" int rsx_glsl_compute_to_spirv(const char* source,u32* words,u32 capacity,
+    u32* written,char* log,u32 log_size)
+{ return rsx_hlsl_to_spirv(source,RSX_SHADER_STAGE_COMPUTE,words,capacity,written,log,log_size); }
 
 #endif
