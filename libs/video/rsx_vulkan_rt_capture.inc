@@ -2,34 +2,49 @@
  * meshes are inputs. Rendering and shader execution remain with the caller. */
 #include "rsx_scene_epoch.h"
 #include "rsx_scene_alpha.h"
+#include "rsx_authored_lights.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>
 #endif
 /* Use the operating system SHA256 implementation. Hashing occurs only when an
  * explicitly requested rayquery pipeline is created, never per draw. */
-static int vk_rt_shader_contract(const char* source,u32* mask,u32* bytes)
+static int vk_rt_source_sha256(const char* source,char hex[65])
 {
+    if(!hex)return 0;
+    hex[0]=0;
 #ifdef _WIN32
-    *mask=0;*bytes=0;if(!source)return -1;
-    size_t length=strlen(source);if(length>=262144)return -1;
+    if(!source)return 0;
+    size_t length=strlen(source);if(length>=262144)return 0;
     BCRYPT_ALG_HANDLE algorithm=NULL;BCRYPT_HASH_HANDLE hash=NULL;
-    unsigned char digest[32];char hex[65];int result=-1;
-    if(BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,NULL,0)<0)return -1;
+    unsigned char digest[32];int result=0;
+    if(BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,NULL,0)<0)return 0;
     if(BCryptCreateHash(algorithm,&hash,NULL,0,NULL,0,0)>=0 &&
        BCryptHashData(hash,(PUCHAR)source,(ULONG)length,0)>=0 &&
        BCryptFinishHash(hash,digest,sizeof digest,0)>=0) {
         static const char digits[]="0123456789abcdef";
         for(unsigned i=0;i<32;++i){hex[i*2]=digits[digest[i]>>4];hex[i*2+1]=digits[digest[i]&15];}
-        hex[64]=0;const rsx_scene_alpha_contract* contract=rsx_scene_alpha_contract_for_sha256(hex);
-        result=rsx_scene_alpha_contract_id(contract);
-        if(result>=0){*mask=rsx_scene_alpha_texture_mask(contract);*bytes=(u32)rsx_scene_alpha_required_fp_bytes(contract);}
+        hex[64]=0;result=1;
     }
     if(hash)BCryptDestroyHash(hash);BCryptCloseAlgorithmProvider(algorithm,0);
     return result;
 #else
-    (void)source;*mask=0;*bytes=0;return -1; /* No unverified digest implementation fallback. */
+    (void)source;return 0; /* No unverified digest implementation fallback. */
 #endif
+}
+static int vk_rt_shader_contract(const char* source,u32* mask,u32* bytes)
+{
+    char hex[65];*mask=0;*bytes=0;
+    if(!vk_rt_source_sha256(source,hex))return -1;
+    const rsx_scene_alpha_contract* contract=rsx_scene_alpha_contract_for_sha256(hex);
+    int result=rsx_scene_alpha_contract_id(contract);
+    if(result>=0){*mask=rsx_scene_alpha_texture_mask(contract);*bytes=(u32)rsx_scene_alpha_required_fp_bytes(contract);}
+    return result;
+}
+/* Same ordinary, nondegenerate depth interval supported by rsx_depth_clip. */
+static int vk_rt_depth_range(float n,float f)
+{
+    return isfinite(n) && isfinite(f) && n>=0.0f && f<=1.0f && f-n>0.000001f;
 }
 #define VK_RT_EPOCHS 4u
 #define VK_RT_TOTAL_BYTES (128u*1024u*1024u)
@@ -38,6 +53,7 @@ static struct {
     u64 frame,generation;
     int overflow;
     u64 copied_bytes,draws,rejected,copy_ticks;
+    u8 rejected_pipeline_logged[VK_ENG_MAX_PIPE];
 } s_rt_capture;
 static rsx_scene_epoch* vk_rt_epoch(u32 depth)
 {
@@ -85,7 +101,11 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
     if(s_rt_capture.overflow || topology!=RSX_TOPOLOGY_TRIANGLES || !p->scene_vs ||
        !p->scene_ps || (!p->rs.alpha_test_enable && (strstr(p->scene_ps,"discard") || strstr(p->scene_ps,"clip("))) ||
        stride!=p->scene_layout.stride || !s_e2.constant_shadow ||
-       !s_e2.have_vp || !s_e2.have_sc || s_e2.vp[4]!=0 || s_e2.vp[5]!=1) {
+       !s_e2.have_vp || !s_e2.have_sc || !vk_rt_depth_range(s_e2.vp[4],s_e2.vp[5])) {
+        if(!s_rt_capture.rejected_pipeline_logged[pipeline-1]){
+            s_rt_capture.rejected_pipeline_logged[pipeline-1]=1;
+            VK_LOG("ray capture draw unsupported pipeline=%u frame=%llu topology=%u stride=%u/%u shaders=%u/%u alphaTest=%u viewport=%u scissor=%u depthRange=%.5g/%.5g\n",pipeline,(unsigned long long)s_rt_capture.frame,topology,stride,p->scene_layout.stride,p->scene_vs!=NULL,p->scene_ps!=NULL,p->rs.alpha_test_enable,s_e2.have_vp,s_e2.have_sc,s_e2.vp[4],s_e2.vp[5]);
+        }
         rsx_scene_epoch_invalidate(e,RSX_SCENE_EPOCH_UNSUPPORTED);++s_rt_capture.rejected;return;
     }
     size_t total=0;
@@ -104,9 +124,15 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
     in.ps_constants=s_e2.constant_shadow+s_g.ps_off;in.ps_bytes=s_e2.ps_bytes;
     /* Opaque AO needs no fragment textures. Live render-target views are not
      * immutable alpha resources and require a separate snapshot implementation. */
-    in.texture_mask=p->rs.alpha_test_enable?p->scene_alpha_mask:0;
-    if(p->rs.alpha_test_enable && (p->scene_alpha_contract<0 || !in.texture_mask ||
+    const int needs_alpha=(p->rs.alpha_test_enable && p->rs.alpha_func!=0x207u) ||
+        p->rs.blend_enable || (p->rs.antialias_control&0x10u);
+    in.texture_mask=needs_alpha?p->scene_alpha_mask:0;
+    if(needs_alpha && (p->scene_alpha_contract<0 || !in.texture_mask ||
        (s_e2.tex_mask&in.texture_mask)!=in.texture_mask || s_e2.ps_bytes!=p->scene_alpha_fp_bytes)) {
+        if(!s_rt_capture.rejected_pipeline_logged[pipeline-1]){
+            s_rt_capture.rejected_pipeline_logged[pipeline-1]=1;
+            VK_LOG("ray capture alpha unsupported pipeline=%u contract=%d alpha=%u blend=%u aa=0x%x textureMask=0x%x/0x%x fpBytes=%u/%u\n",pipeline,p->scene_alpha_contract,p->rs.alpha_test_enable,p->rs.blend_enable,p->rs.antialias_control,s_e2.tex_mask,in.texture_mask,s_e2.ps_bytes,p->scene_alpha_fp_bytes);
+        }
         rsx_scene_epoch_invalidate(e,RSX_SCENE_EPOCH_UNSUPPORTED);++s_rt_capture.rejected;return;
     }
     for(unsigned u=0;u<16;++u)if(in.texture_mask&(1u<<u)) {
@@ -116,8 +142,24 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
             if((s_eobj[j].kind==VK_ENG_COLOR || s_eobj[j].kind==VK_ENG_DEPTH) &&
                (s_eobj[j].surface==s_e2.tex[u] || s_eobj[j].expanded==s_e2.tex[u]))snapshot=1;
         if(!t || t->surface || t->expanded || t->cube || snapshot) {
+            if(!s_rt_capture.rejected_pipeline_logged[pipeline-1]){
+                s_rt_capture.rejected_pipeline_logged[pipeline-1]=1;
+                VK_LOG("ray capture alpha resource unsupported pipeline=%u unit=%u texture=%u present=%u surface=%u expanded=%u cube=%u snapshot=%d\n",pipeline,u,s_e2.tex[u],t!=NULL,t?t->surface:0,t?t->expanded:0,t?t->cube:0,snapshot);
+            }
             rsx_scene_epoch_invalidate(e,RSX_SCENE_EPOCH_UNSUPPORTED);++s_rt_capture.rejected;return;
         }
+    }
+    const char *authored=getenv("PS3RECOMP_RSX_AUTHORED_LIGHTS");
+    int light_contract=rsx_authored__pair(p->scene_vs_sha256,p->scene_ps_sha256);
+    if(authored && !strcmp(authored,"1") && light_contract>=0){
+        u32 rgb_mask=light_contract==0?7u:127u,rgb_count=light_contract==0?3u:7u;
+        int ready=(s_e2.tex_mask&rgb_mask)==rgb_mask;
+        for(u32 u=0;u<rgb_count&&ready;u++){
+            const vk_eng_obj *t=vk_eng_get(s_e2.tex[u],VK_ENG_TEXTURE);
+            if(!t || t->surface || t->expanded || t->cube!=(light_contract==1&&u==3))ready=0;
+            for(u32 j=1;j<VK_ENG_MAX_OBJ&&ready;j++)if((s_eobj[j].kind==VK_ENG_COLOR||s_eobj[j].kind==VK_ENG_DEPTH)&&(s_eobj[j].surface==s_e2.tex[u]||s_eobj[j].expanded==s_e2.tex[u]))ready=0;
+        }
+        if(ready)in.texture_mask|=rgb_mask;
     }
     memcpy(in.textures,s_e2.tex,sizeof in.textures);
     memcpy(in.samplers,s_e2.samp,sizeof in.samplers);

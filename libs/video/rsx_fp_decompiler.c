@@ -330,21 +330,21 @@ static void decode_src(u32 w, int abs_bit, Src* s)
 }
 
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
- * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
+ * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..9; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
 static const char* input_expr(u32 input_src)
 {
-    static const char* tc[8] = {
+    static const char* tc[10] = {
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
-        "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
+        "input.tc4", "input.tc5", "input.tc6", "input.tc7", "input.tc8", "input.tc9" };
     switch (input_src) {
     case 0x0: return "input.position"; /* WPOS */
     case 0x1: return "input.col0";     /* COL0 */
     case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
     default:
-        if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
-        return "float4(0,0,0,0)";      /* TC8/TC9/FACING not plumbed */
+        if (input_src >= 0x4 && input_src <= 0xD) return tc[input_src - 0x4]; /* TC0..9 */
+        return "float4(0,0,0,0)";      /* FACING remains unsupported */
     }
 }
 
@@ -920,8 +920,12 @@ static int rsx_fp_decompile_internal(
         "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
         "    float4 fog : FOG;\n"
         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
-        "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
-        "};\n");
+        "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n");
+    /* Preserve existing source/cache identities when neither extended input
+     * is consumed. Both fields share one layout when either is required. */
+    if (strstr(out,"input.tc8") || strstr(out,"input.tc9"))
+        out_puts(&p,"    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n");
+    out_puts(&p,"};\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the

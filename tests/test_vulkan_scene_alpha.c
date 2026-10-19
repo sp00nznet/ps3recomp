@@ -13,10 +13,10 @@ typedef struct gpu_case {
     float lod[4];uint32_t config[4];float tex[2][4];
 } gpu_case;
 typedef struct gpu_answer {float value[4];int32_t meta[4];} gpu_answer;
-_Static_assert(sizeof(gpu_case)==256,"std430 case stride");
-_Static_assert(offsetof(gpu_case,lod)==192,"std430 LOD offset");
-_Static_assert(offsetof(gpu_case,config)==208,"std430 metadata offset");
-_Static_assert(offsetof(gpu_case,tex)==224,"std430 sample offset");
+_Static_assert(sizeof(gpu_case)==288,"std430 case stride");
+_Static_assert(offsetof(gpu_case,lod)==224,"std430 LOD offset");
+_Static_assert(offsetof(gpu_case,config)==240,"std430 metadata offset");
+_Static_assert(offsetof(gpu_case,tex)==256,"std430 sample offset");
 _Static_assert(sizeof(gpu_answer)==32,"std430 answer stride");
 
 enum {MAX_CASES=256,VARIANT_COUNT=22};

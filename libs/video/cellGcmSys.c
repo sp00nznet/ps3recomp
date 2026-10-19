@@ -2031,6 +2031,36 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            /* GCM_DRAW_PACKET_TRACE=1 and GCM_DRAW_PACKET_GATE=<existing file>:
+             * identify the guest EA of at most 24 draw packet headers after the
+             * operator arms the gate. The normal path never probes the file.
+             * This observes the FIFO consumer; writer attribution comes from
+             * a separate PPU write watch or a successful SPU PUT trace. */
+            if (method == 0x1814u || method == 0x1824u) {
+                static int enabled = -1, armed, printed;
+                static const char* gate;
+                if (enabled < 0) {
+                    const char* e = getenv("GCM_DRAW_PACKET_TRACE");
+                    gate = getenv("GCM_DRAW_PACKET_GATE");
+                    enabled = e && *e == '1' && gate && *gate;
+                }
+                if (enabled && printed < 24) {
+                    if (!armed) {
+                        FILE* f = fopen(gate, "rb");
+                        if (f) { fclose(f); armed = 1; }
+                    }
+                    if (armed) {
+                        const u32 arg_ea = count ? gcm_io2ea(s_fifo_getoff + 4u) : 0u;
+                        const u32 arg0 = arg_ea ? vm_read32(arg_ea) : 0u;
+                        fprintf(stderr, "[drawpkt] n=%d get_io=0x%08X header_ea=0x%08X"
+                                        " header=0x%08X type=%u subch=%u method=0x%04X"
+                                        " count=%u arg_ea=0x%08X arg0=0x%08X"
+                                        " address_source=gcm_io2ea\n",
+                                ++printed, s_fifo_getoff, ea, w, type, subch,
+                                method, count, arg_ea, arg0);
+                    }
+                }
+            }
             /* TCONST_FIFO=1: how the title actually streams vertex constants.
              * NV4097_SET_TRANSFORM_CONSTANT is a 32-register window; if a block
              * arrives NON-INCREMENTING then every dword carries the same method
@@ -2495,6 +2525,8 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
     u32 previous = atomic_load_explicit(&g_gcm_fifo_drained_ea, memory_order_acquire);
     const u64 packets_started = atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed);
     u64 previous_packets = packets_started;
+    const int trace_progress = getenv("GCM_REFILL_PROGRESS") != NULL;
+    u64 progress_sample = started;
     int spins = 0;
     while ((previous == begin) != at_begin) {
         /* The renderer drains on its own thread; poll every 200 us rather
@@ -2524,6 +2556,19 @@ static int gcm_wait_refill_drain(u32 ctx_ea, u32 begin, u32 current, int at_begi
         const u64 packets = atomic_load_explicit(&s_drain_packet_count, memory_order_relaxed);
         if (packets != previous_packets) { previous_packets = packets; progressed = now; }
         if ((drained == begin) == at_begin) break;
+        if (trace_progress && now - progress_sample >= UINT64_C(1000000000)) {
+            progress_sample = now;
+            /* Independent atomic samples are diagnostic only. Never acknowledge
+             * ring ownership or alter the strict idle/absolute deadlines here. */
+            fprintf(stderr, "[rsx-refill-progress] elapsed_ms=%llu idle_ms=%llu begin=0x%08X current=0x%08X drained=0x%08X await_begin=%d packets=%llu delta=%llu packet_ea=0x%08X word=0x%08X host_phase=%u suspended=%d\n",
+                (unsigned long long)((now-started)/1000000),
+                (unsigned long long)((now-progressed)/1000000), begin, current,
+                drained, at_begin, (unsigned long long)packets,
+                (unsigned long long)(packets-packets_started),
+                atomic_load_explicit(&s_drain_packet_ea, memory_order_relaxed),
+                atomic_load_explicit(&s_drain_packet_word, memory_order_relaxed),
+                atomic_load_explicit(&s_host_renderer_phase, memory_order_relaxed), suspended);
+        }
         if (!suspended && (now - progressed >= idle_deadline || now - started >= UINT64_C(30000000000))) {
             /* Never wait for this diagnostic snapshot. A concurrent metadata
              * update is labelled incoherent, not retried. The epoch does not

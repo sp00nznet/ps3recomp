@@ -13,6 +13,7 @@ static struct {
     int hud_world_seen, hud_active, hud_marker_seen;
     float world_aspect;
     u32 hud_composite_target, frames, n_surfaces;
+    u64 write_serial;
     eng_surface surfaces[3];
 } g;
 static struct {
@@ -47,6 +48,13 @@ static void quad(float x0,float y0,float x1,float y1)
     dc.verts=(unsigned char*)v; dc.n_verts=4;
     dc.layout.count=1;dc.layout.stride=16;dc.layout.attrs[0]=0;
 }
+static void particles(float x0,float y0,float x1,float y1)
+{
+    static float v[8][4];
+    quad(x0,y0,x1,y1);
+    memcpy(v,dc.verts,4*16);memcpy(v+4,dc.verts,4*16);
+    dc.verts=(unsigned char*)v;dc.n_verts=8;
+}
 int main(void)
 {
     g.world_aspect=3440.0f/1440.0f;
@@ -76,6 +84,45 @@ int main(void)
     quad(0.7f,0.7f,0.9f,0.9f);
     CHECK(eng_folklore_hud(&alpha,final,&marker,1,quad_indices,6,0,&right,&bottom));
     CHECK(right==1 && bottom==0 && g.hud_marker_seen);
+    /* Actual animated health bounds from GUI baseline frame 2689. The old
+     * independent classifier picks center (2), displacing the effect by 440px
+     * at 3440x1440. Its immediately preceding bar establishes the right anchor. */
+    quad(-0.325f,0.744f,0.675f,0.789f);
+    CHECK(eng_folklore_hud_check(&alpha,final,&marker,3,quad_indices,6,0,&right,&bottom,low,high,&why));
+    ++g.write_serial;
+    rsx_be_render_state effect=alpha;effect.blend_enable=1;
+    particles(-0.029f,0.635f,0.727f,0.886f);
+    CHECK(eng_folklore_hud_check(&effect,final,&other,1,NULL,8,0,&right,&bottom,low,high,&why));
+    CHECK(right==1 && bottom==0 && why && !strcmp(why,"status-effect"));
+    /* The association is consumed, not a persistent rule for all overlays. */
+    CHECK(eng_folklore_hud_check(&effect,final,&other,1,NULL,8,0,&right,&bottom,low,high,&why));
+    CHECK(right==2);
+    quad(-0.325f,0.744f,0.675f,0.789f);
+    CHECK(eng_folklore_hud_check(&alpha,final,&marker,3,quad_indices,6,0,&right,&bottom,low,high,&why));
+    ++g.write_serial;
+    ++g.frames;
+    particles(-0.029f,0.635f,0.727f,0.886f);
+    CHECK(eng_folklore_hud_check(&effect,final,&other,1,NULL,8,0,&right,&bottom,low,high,&why));
+    CHECK(right==2); /* never inherit across frames */
+    quad(-0.325f,0.744f,0.675f,0.789f);
+    CHECK(eng_folklore_hud_check(&alpha,final,&marker,3,quad_indices,6,0,&right,&bottom,low,high,&why));
+    ++g.write_serial;
+    quad(-0.2f,-0.2f,0.2f,0.2f);
+    CHECK(eng_folklore_hud_check(&effect,final,&other,1,quad_indices,6,0,&right,&bottom,low,high,&why));
+    CHECK(right==2 && bottom==2); /* centered prompt retains its anchor */
+    quad(-0.325f,0.744f,0.675f,0.789f);
+    CHECK(eng_folklore_hud_check(&alpha,final,&marker,3,quad_indices,6,0,&right,&bottom,low,high,&why));
+    g.write_serial+=2; /* marker, then a write bypassing HUD classification */
+    particles(-0.029f,0.635f,0.727f,0.886f);
+    CHECK(eng_folklore_hud_check(&effect,final,&other,1,NULL,8,0,&right,&bottom,low,high,&why));
+    CHECK(right==2);
+    quad(-0.325f,0.744f,0.675f,0.789f);
+    CHECK(eng_folklore_hud_check(&alpha,final,&marker,3,quad_indices,6,0,&right,&bottom,low,high,&why));
+    ++g.write_serial;
+    particles(-0.029f,0.635f,0.727f,0.886f);
+    eng_surface another=*final;another.handle=99;
+    CHECK(eng_folklore_hud_check(&effect,&another,&other,1,NULL,8,0,&right,&bottom,low,high,&why));
+    CHECK(right==2);
     /* Repeated flips/hidden HUD retain the *surface*, independent of frame-local markers. */
     g.hud_composite_target=0;g.hud_world_seen=0;g.hud_active=0;g.hud_marker_seen=0;
     CHECK(final->folklore_world==2 && eng_folklore_present_aspect(final)==g.world_aspect);

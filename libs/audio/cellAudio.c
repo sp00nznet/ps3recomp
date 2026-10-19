@@ -483,6 +483,51 @@ static inline float ld_be_f32(const float* p)
     return f;
 }
 
+#if AUDIO_BACKEND_WASAPI
+/* Optional same-slot PCM evidence. Snapshots may overlap guest writes; the
+ * timestamps bound that observation rather than claiming an atomic block. */
+static int s_pcm_probe_enabled;
+static unsigned s_pcm_probe_remaining;
+static const char *s_pcm_probe_request;
+static unsigned s_pcm_probe_poll;
+static int s_pcm_probe_armed;
+static uint64_t s_pcm_probe_frequency;
+static struct {
+    uint64_t begin_us,end_us,read_index;
+    unsigned valid,port,slot,nonzero,nonfinite;
+    float peak;
+} s_pcm_probe;
+static uint64_t audio_pcm_probe_now(void)
+{
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    const uint64_t q=(uint64_t)t.QuadPart,f=s_pcm_probe_frequency;
+    return (q/f)*1000000ULL+(q%f)*1000000ULL/f;
+}
+static void audio_pcm_probe_slot(unsigned p, const AudioPortSlot *port,
+                                  unsigned slot, const float *src, unsigned count)
+{
+    if (!s_pcm_probe_enabled || !s_pcm_probe_remaining || s_pcm_probe.valid) return;
+    /* Optional sentinel delays the bounded snapshot until gameplay. This is
+     * diagnostic-only and never removes a caller-owned request file. */
+    if (!s_pcm_probe_armed) {
+        if (s_pcm_probe_poll++ % 188u) return;
+        if (GetFileAttributesA(s_pcm_probe_request)==INVALID_FILE_ATTRIBUTES) return;
+        s_pcm_probe_armed=1;
+    }
+    --s_pcm_probe_remaining;
+    s_pcm_probe.valid=1; s_pcm_probe.port=p; s_pcm_probe.slot=slot;
+    s_pcm_probe.read_index=port->read_index;
+    s_pcm_probe.begin_us=audio_pcm_probe_now();
+    for (unsigned i=0;i<count;++i) {
+        const float f=ld_be_f32(src+i);
+        if (f!=0.0f) ++s_pcm_probe.nonzero;
+        if (!isfinite(f)) ++s_pcm_probe.nonfinite;
+        else if (fabsf(f)>s_pcm_probe.peak) s_pcm_probe.peak=fabsf(f);
+    }
+    s_pcm_probe.end_us=audio_pcm_probe_now();
+}
+#endif
+
 /* AUDIO_BLOCK_TRACE only: how many blocks after the read cursor of the first
  * running port already hold PCM -- the game's lead over the device. Zero
  * means the next block will be read before the game has written it. */
@@ -512,6 +557,9 @@ static unsigned audio_ring_lead(void)
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
+#if AUDIO_BACKEND_WASAPI
+    if (s_pcm_probe_enabled) memset(&s_pcm_probe,0,sizeof(s_pcm_probe));
+#endif
 
     mutex_lock(&s_audio_mutex);
 
@@ -547,6 +595,9 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+#if AUDIO_BACKEND_WASAPI
+        audio_pcm_probe_slot((unsigned)p,port,block_idx,src,CELL_AUDIO_BLOCK_SAMPLES*nch);
+#endif
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
@@ -695,7 +746,15 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     unsigned long long reported_underruns = 0; ULONGLONG report_at = GetTickCount64() + 60000;
     const char* trace_path = getenv("AUDIO_BLOCK_TRACE");
     FILE* trace = trace_path ? fopen(trace_path, "wb") : NULL;
-    if (trace) fprintf(trace, "block,qpc_us,room,peak,silent,dropped,submitted,submit_failures,rebases,mix_us,capture_submit_us,previous_tail_us,padding,target,late_us,underruns,late,trim_us,notify_full,lead,reprimes\n");
+    const char *pcm_probe=getenv("FOLKLORE_AUDIO_PCM_TRACE");
+    s_pcm_probe_enabled=trace && pcm_probe && strcmp(pcm_probe,"1")==0;
+    s_pcm_probe_remaining=12000; /* At most64 seconds of48kHz/256-frame blocks. */
+    s_pcm_probe_request=getenv("FOLKLORE_AUDIO_PCM_TRACE_REQUEST");
+    s_pcm_probe_armed=!s_pcm_probe_request || !*s_pcm_probe_request;
+    s_pcm_probe_poll=0;
+    memset(&s_pcm_probe,0,sizeof(s_pcm_probe));
+    s_pcm_probe_frequency=(uint64_t)qf.QuadPart;
+    if (trace) fprintf(trace, "block,qpc_us,room,peak,silent,dropped,submitted,submit_failures,rebases,mix_us,capture_submit_us,previous_tail_us,padding,target,late_us,underruns,late,trim_us,notify_full,lead,reprimes,pcm_valid,pcm_port,pcm_slot,pcm_read_index,pcm_begin_us,pcm_end_us,pcm_nonzero,pcm_nonfinite,pcm_peak\n");
     uint64_t late_ticks = 0;
     unsigned long long seen_rebases = 0;
     uint64_t previous_tail_us = 0;
@@ -768,7 +827,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; ++i) {
                 float a = fabsf(s_mix_buffer[i]); if (a > peak) peak = a;
             }
-            fprintf(trace, "%llu,%llu,%d,%.9g,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%llu,%llu,%llu,%lld,%llu,%u,%llu\n", blocks,
+            fprintf(trace, "%llu,%llu,%d,%.9g,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%llu,%llu,%llu,%lld,%llu,%u,%llu", blocks,
                 (unsigned long long)(now.QuadPart / qf.QuadPart) * 1000000ULL +
                 (unsigned long long)(now.QuadPart % qf.QuadPart) * 1000000ULL / qf.QuadPart,
                 room, peak, peak == 0.0f, g_audio_dropped,
@@ -778,6 +837,11 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 (unsigned long long)previous_tail_us, (unsigned)padding, (unsigned)fill.target,
                 (unsigned long long)(late_ticks*1000000ULL/qf.QuadPart), g_audio_underruns, g_audio_late,
                 (long long)(fill.trim_ticks*1000000LL/qf.QuadPart), g_audio_notify_full, audio_ring_lead(), g_audio_reprimes);
+            fprintf(trace,",%u,%u,%u,%llu,%llu,%llu,%u,%u,%.9g\n",
+                s_pcm_probe.valid,s_pcm_probe.port,s_pcm_probe.slot,
+                (unsigned long long)s_pcm_probe.read_index,
+                (unsigned long long)s_pcm_probe.begin_us,(unsigned long long)s_pcm_probe.end_us,
+                s_pcm_probe.nonzero,s_pcm_probe.nonfinite,s_pcm_probe.peak);
         }
         /* One line a minute, only when the device ran dry in that minute. */
         if (GetTickCount64() >= report_at) {

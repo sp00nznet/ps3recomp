@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "sys_ppu_thread.h"
 #include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -347,6 +348,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
+    if (ctx->thread_id == 11)
+        ppu_vdec_wait_trace(ctx, "event-receive-enter", queue_id, -1);
     /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
@@ -568,16 +571,23 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* Closure wins over timeout and over queued events after a forced destroy. */
     if (!q->active || (!q->count && q->cancelled)) {
         queue_unlock(q);
+        if (ctx->thread_id == 11)
+            ppu_vdec_wait_trace(ctx, "event-receive-cancel", queue_id, CELL_ECANCELED);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
     if (!q->count) {
         queue_unlock(q);
+        if (ctx->thread_id == 11)
+            ppu_vdec_wait_trace(ctx, "event-receive-empty", queue_id,
+                                timed_out ? CELL_ETIMEDOUT : CELL_ESRCH);
         return (int64_t)(int32_t)(timed_out ? CELL_ETIMEDOUT : CELL_ESRCH);
     }
     sys_event_t evt = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
     int remaining_count = --q->count;
     queue_unlock(q);
+    if (ctx->thread_id == 11)
+        ppu_vdec_wait_trace(ctx, "event-receive-ok", queue_id, remaining_count);
     /* lv2 sys_event_queue_receive returns the event in REGISTERS r4..r7
      * (r3=rc, r4=source, r5=data1, r6=data2, r7=data3) -- this is the ABI the
      * caller reads (e.g. the SPURS service func_00C5DAB0 checks r4==source key,
@@ -937,6 +947,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
     uint64_t data1   = LV2_ARG_U64(ctx, 1);
     uint64_t data2   = LV2_ARG_U64(ctx, 2);
     uint64_t data3   = LV2_ARG_U64(ctx, 3);
+    ppu_vdec_wait_trace(ctx, "event-port-send-enter", port_id, -1);
     static int s_send_stack = -1; if (s_send_stack < 0) s_send_stack = getenv("PS3_EVT_SEND_STACK") != NULL;
     if (s_send_stack) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
         if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
@@ -1015,11 +1026,13 @@ int64_t sys_event_port_send(ppu_context* ctx)
       g_spu_pending_evt_valid = 0; }
 
     if (event_queue_push(q, &evt) < 0) {
+        ppu_vdec_wait_trace(ctx, "event-port-send-full", qidx, CELL_EBUSY);
         fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
                 port_id, qidx, 10);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
 
+    ppu_vdec_wait_trace(ctx, "event-port-send-ok", qidx, CELL_OK);
     return CELL_OK;
 }
 
@@ -1136,6 +1149,8 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
 int64_t sys_event_flag_wait(ppu_context* ctx)
 {
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
+    if (ctx->thread_id == 11)
+        ppu_vdec_wait_trace(ctx, "event-flag-wait-enter", flag_id, -1);
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
@@ -1389,6 +1404,7 @@ int64_t sys_event_flag_set(ppu_context* ctx)
 {
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
+    ppu_vdec_wait_trace(ctx, "event-flag-set-enter", flag_id, -1);
 
     { static int _n=0; if(_n++<200) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
         flag_id,(unsigned long long)bitpat); }
@@ -1412,6 +1428,7 @@ int64_t sys_event_flag_set(ppu_context* ctx)
     pthread_mutex_unlock(&f->lock);
 #endif
 
+    ppu_vdec_wait_trace(ctx, "event-flag-set-ok", flag_id, CELL_OK);
     return CELL_OK;
 }
 

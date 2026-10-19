@@ -69,6 +69,15 @@ static int eng_folklore_hud_check(const rsx_be_render_state* rs,eng_surface* rt,
                                   const eng_pipeline* pipeline,u32 tex_mask,const u32* indices,u32 count,int strip,int* right,int* bottom,
                                   double low[2],double high[2],const char** why)
 {
+    /* The status strip is followed immediately by its animated particle batch.
+     * The batch's bounds move across the center while the strip stays anchored
+     * at the right edge. Reclassifying each particle phase independently caused
+     * a 440-pixel jump at 3440x1440. Keep only immediate, same-frame provenance;
+     * no unrelated overlay or later target may inherit it. */
+    static struct { u32 frame,target; u64 next_write; int valid,right,bottom; double low[2],high[2]; } status;
+    const int previous_status=status.valid && status.frame==g.frames && status.target==rt->handle &&
+        status.next_write==g.write_serial;
+    status.valid=0;
     float matrix[4][4];
     memcpy(matrix,g.rsx.constants+256,sizeof matrix);
     if (rt->raster_w!=1280 || rt->raster_h!=720) { *why="size"; return 0; }
@@ -134,6 +143,23 @@ static int eng_folklore_hud_check(const rsx_be_render_state* rs,eng_surface* rt,
     *why=NULL;
     *right=rsx_hud_horizontal_anchor(low,high,marker);
     *bottom=rsx_hud_anchor_clip(low[1],high[1],1);
+    if (!marker && previous_status && tex_mask==1u && rs->blend_enable &&
+        rs->alpha_test_enable && dc.n_verts>=8 && dc.n_verts%4==0 &&
+        low[0]<status.high[0] && high[0]>status.low[0] &&
+        low[1]<=status.low[1] && high[1]>=status.high[1] &&
+        high[1]-low[1]<0.4 && (low[1]>0.5 || high[1]<-0.5)) {
+        *right=status.right;*bottom=status.bottom;
+        *why="status-effect";
+    }
+    if (marker) {
+        status.frame=g.frames;status.target=rt->handle;status.valid=1;
+        /* The marker's own colour write follows classification. Any other
+         * colour/depth write or clear breaks the association, even when that
+         * operation bypasses the HUD classifier. */
+        status.next_write=g.write_serial+1;
+        status.right=*right;status.bottom=*bottom;
+        memcpy(status.low,low,sizeof status.low);memcpy(status.high,high,sizeof status.high);
+    }
     return 1;
 }
 
@@ -150,10 +176,10 @@ static int eng_folklore_hud(const rsx_be_render_state* rs,eng_surface* rt,
     if (left>0 && g.hud_composite_target && rt->handle==g.hud_composite_target) {
         left--;
         fprintf(stderr,"[rsx HUD] frame=%u hud=%d why=%s blend=%d alpha=%d depth=%d verts=%u tex=0x%X "
-                "marker=%d active=%d x=[%.3f,%.3f] y=[%.3f,%.3f]\n",
+                "marker=%d active=%d x=[%.3f,%.3f] y=[%.3f,%.3f] anchor=%d,%d\n",
                 g.frames,hud,why?why:"-",rs->blend_enable,rs->alpha_test_enable,
                 rs->depth_test,dc.n_verts,tex_mask,pipeline&&pipeline->folklore_hud_marker,g.hud_active,
-                low[0],high[0],low[1],high[1]);
+                low[0],high[0],low[1],high[1],hud?*right:-1,hud?*bottom:-1);
     }
     return hud;
 }

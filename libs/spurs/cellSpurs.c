@@ -13,6 +13,7 @@
  */
 
 #include "cellSpurs.h"
+#include "spurs_image_timing.h"
 #include "ps3emu/strict_boot.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
@@ -2412,6 +2413,8 @@ enum {                              /* CellSpursJobHeader (48 B) */
 static u64 jc_trace_us(void);
 typedef struct {
     u64 snapshot_us, admission_us, dispatch_us, release_us;
+    u64 fingerprint;
+    u32 image_size;
 } jc_job_timing;
 
 static void jc_capture_job(const spurs_job_snapshot* snapshot)
@@ -2500,6 +2503,12 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
             snapshot.job_ea,(unsigned)native.status,native.pc,native.spu_status,native.stop_code,native.completed_gets);
     }
     const u64 dispatched_at=timing?jc_trace_us():0;
+    if(timing){
+        /* Snapshot release clears owned storage. Record its admitted identity
+         * before release, never a reused job descriptor address. */
+        timing->fingerprint=snapshot.fingerprint;
+        timing->image_size=snapshot.image_size;
+    }
     spurs_job_snapshot_release(&snapshot);
     if(timing){
         timing->snapshot_us=acquired-started;
@@ -2824,6 +2833,8 @@ static s32 jc_execute(struct SpursChain*c)
     u64 window_start=timing?jc_trace_us():0,window_jobs=0,window_job_us=0,window_max_us=0;
     u64 window_snapshot_us=0,window_admission_us=0,window_dispatch_us=0;
     u64 window_guards=0,window_guard_us=0;
+    struct spurs_image_timing image_timing;
+    if(timing)spurs_image_timing_reset(&image_timing);
     while(!atomic_load_explicit(&c->stop,memory_order_acquire)){
         if(idle++>4096){ps3_strict_boot_guard("spurs-chain-progress-limit","chain=0x%08X pc=0x%08X jobs=%u",c->jc_ea,pc,jobs);return CELL_SPURS_TASK_ERROR_STAT;}
         if(!spurs_guest_span(pc,8,0)){ps3_strict_boot_guard("spurs-invalid-chain-command","chain=0x%08X pc=0x%08X",c->jc_ea,pc);return CELL_SPURS_TASK_ERROR_INVAL;}
@@ -2837,6 +2848,7 @@ static s32 jc_execute(struct SpursChain*c)
                 ++window_jobs;window_job_us+=elapsed;if(elapsed>window_max_us)window_max_us=elapsed;
                 window_snapshot_us+=phases.snapshot_us;window_admission_us+=phases.admission_us;
                 window_dispatch_us+=phases.dispatch_us;
+                spurs_image_timing_add(&image_timing,phases.fingerprint,phases.image_size,phases.dispatch_us);
                 if(elapsed>4000 && timing_lines++<256)
                 fprintf(stderr,"[spurs-job-time] chain=0x%08X job=0x%08X start_us=%llu end_us=%llu duration_us=%llu snapshot_us=%llu admission_us=%llu dispatch_us=%llu release_us=%llu\n",
                     c->jc_ea,(u32)(cmd&~7ull),(unsigned long long)started,
@@ -2853,6 +2865,8 @@ static s32 jc_execute(struct SpursChain*c)
                         (unsigned long long)window_max_us,(unsigned long long)window_snapshot_us,
                         (unsigned long long)window_admission_us,(unsigned long long)window_dispatch_us,
                         (unsigned long long)window_guards,(unsigned long long)window_guard_us);
+                    spurs_image_timing_emit(&image_timing,stderr,c->jc_ea,window_start,ended);
+                    spurs_image_timing_reset(&image_timing);
                     window_start=ended;window_jobs=window_job_us=window_max_us=0;
                     window_snapshot_us=window_admission_us=window_dispatch_us=0;
                     window_guards=window_guard_us=0;

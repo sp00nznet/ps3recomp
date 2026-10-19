@@ -59,11 +59,11 @@ static char* mask_shader(const char* original) {
 }
 static char* varying_shader(void) {
     char* out=calloc(1,4096);if(!out)return NULL;
-    const char* names[]={"pos","col0","col1","fog","t0","t1","t2","t3","t4","t5","t6","t7"};
-    const char* semantics[]={"SV_Position","COLOR0","COLOR1","FOG","TEXCOORD0","TEXCOORD1","TEXCOORD2","TEXCOORD3","TEXCOORD4","TEXCOORD5","TEXCOORD6","TEXCOORD7"};
-    size_t n=(size_t)sprintf(out,"struct VSInput {");for(unsigned i=0;i<12;i++)n+=(size_t)sprintf(out+n,"float4 a%u:ATTR%u;",i,i);
-    n+=(size_t)sprintf(out+n,"};struct VSOutput {");for(unsigned i=0;i<12;i++)n+=(size_t)sprintf(out+n,"float4 %s:%s;",names[i],semantics[i]);
-    n+=(size_t)sprintf(out+n,"};VSOutput main(VSInput input){VSOutput o;");for(unsigned i=0;i<12;i++)n+=(size_t)sprintf(out+n,"o.%s=input.a%u;",names[i],i);
+    const char* names[]={"pos","col0","col1","fog","t0","t1","t2","t3","t4","t5","t6","t7","t8","t9"};
+    const char* semantics[]={"SV_Position","COLOR0","COLOR1","FOG","TEXCOORD0","TEXCOORD1","TEXCOORD2","TEXCOORD3","TEXCOORD4","TEXCOORD5","TEXCOORD6","TEXCOORD7","TEXCOORD8","TEXCOORD9"};
+    size_t n=(size_t)sprintf(out,"struct VSInput {");for(unsigned i=0;i<14;i++)n+=(size_t)sprintf(out+n,"float4 a%u:ATTR%u;",i,i);
+    n+=(size_t)sprintf(out+n,"};struct VSOutput {");for(unsigned i=0;i<14;i++)n+=(size_t)sprintf(out+n,"float4 %s:%s;",names[i],semantics[i]);
+    n+=(size_t)sprintf(out+n,"};VSOutput main(VSInput input){VSOutput o;");for(unsigned i=0;i<14;i++)n+=(size_t)sprintf(out+n,"o.%s=input.a%u;",names[i],i);
     strcpy(out+n,"return o;}");return out;
 }
 static int render(const capture* c,const char* vs,const char* ps,const u32* textures,const rsx_be_sampler_desc* samplers,u32 mask,u8* pixels) {
@@ -100,7 +100,7 @@ int main(int argc,char** argv) {
     if(mask!=(u32)requested){fprintf(stderr,"alpha texture mask mismatch\n");goto done;}
     vertices=malloc((size_t)a.h[4]*sizeof *vertices);first=malloc(1280*720*4);second=malloc(1280*720*4);if(!vertices || !first || !second)goto done;
     if(rsx_vulkan_backend_replay_outputs(vs,&a.layout,a.vertices,a.h[4],a.constants,a.h[30],vertices,a.h[4]))goto done;
-    b=a;b.bytes=NULL;b.vertices=(const float*)vertices;b.h[5]=sizeof *vertices;rsx_vertex_layout_plan_init(&b.layout,0xfff);
+    b=a;b.bytes=NULL;b.vertices=(const float*)vertices;b.h[5]=sizeof *vertices;rsx_vertex_layout_plan_init(&b.layout,0x3fff);
     if(!render(&a,vs,masked,textures,samplers,mask,first) || !render(&b,replay,masked,textures,samplers,mask,second))goto done;
     unsigned original=0,replayed=0,different=0,invalid=0,opaque=0;
     for(size_t i=0;i<1280*720;i++) {

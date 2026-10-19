@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "sys_ppu_thread.h"
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -343,6 +344,8 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
                   (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    if (ctx->thread_id == 11)
+        ppu_vdec_wait_trace(ctx, "semaphore-wait-enter", sem_id, -1);
     /* Per-port hook: an engine job manager may spin on sys_semaphore_wait /
      * trywait waiting for SPU-job completions a lifted policy module never
      * writes, so a port can satisfy them here. Defined weakly below, so this is
@@ -389,10 +392,14 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
         if (s->value > 0) {
             s->value--;
             LeaveCriticalSection(&s->value_lock);
+            if (ctx->thread_id == 11)
+                ppu_vdec_wait_trace(ctx, "semaphore-wait-ok", sem_id, CELL_OK);
             return CELL_OK;
         }
         if (timeout_us > 0 && lv2_deadline_passed(deadline)) {
             LeaveCriticalSection(&s->value_lock);
+            if (ctx->thread_id == 11)
+                ppu_vdec_wait_trace(ctx, "semaphore-wait-timeout", sem_id, CELL_ETIMEDOUT);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
         s->waiters++;
@@ -502,6 +509,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
 {
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
+    ppu_vdec_wait_trace(ctx, "semaphore-post-enter", sem_id, -1);
 
     { static int _n=0; if (getenv("SEMTID") && _n < 60000)
         fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d)\n",
@@ -553,6 +561,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
 
     if (wake > 0)
         ReleaseSemaphore(s->sem_handle, wake, NULL);
+    ppu_vdec_wait_trace(ctx, "semaphore-post-ok", sem_id, wake);
 #else
     pthread_mutex_lock(&s->mtx);
     if (s->value + count > s->max_value) {
@@ -562,9 +571,10 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     s->value += count;
     /* Wake the waiters this post can satisfy (broadcast is also correct — they
      * re-check value — but min(count,waiters) signals is precise). */
-    { int wake = (count < s->waiters) ? count : s->waiters;
-      for (int i = 0; i < wake; i++) pthread_cond_signal(&s->cv); }
+    int wake = (count < s->waiters) ? count : s->waiters;
+    for (int i = 0; i < wake; i++) pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mtx);
+    ppu_vdec_wait_trace(ctx, "semaphore-post-ok", sem_id, wake);
 #endif
 
     return CELL_OK;

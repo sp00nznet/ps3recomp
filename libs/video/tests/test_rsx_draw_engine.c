@@ -95,7 +95,7 @@ typedef struct {
     rsx_topology draw_topology;
     u32 scissor[4];
     u32 stencil_ref;
-    u32 last_created_texture, last_created_color;
+    u32 last_created_texture, last_created_color, last_created_mips;
     u32 last_released;
     float last_clear_depth;
     int n_depth_readback;
@@ -120,9 +120,10 @@ static void stub_submit(void* u, u32 reason) { (void)u; (void)reason; }
 static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
                                u32 faces, u32 remap, u32 rsx_fmt)
 {
-    (void)u; (void)f; (void)w; (void)h; (void)mips; (void)faces;
+    (void)u; (void)f; (void)w; (void)h; (void)faces;
     (void)remap; (void)rsx_fmt;
     stub.n_texture_create++;
+    stub.last_created_mips=mips;
     stub.last_created_texture = stub_handle();
     return stub.last_created_texture;
 }
@@ -681,6 +682,52 @@ static void test_texture_cache(void)
     CHECK(stub.n_texture_create == creates + 1,
           "the least recently used entry was the one evicted");
 
+    engine_down();
+}
+
+static void test_texture_cache_mips(void)
+{
+    printf("-- texture cache mip identity\n");
+    engine_up();
+    bind_texture_unit(RSX_LOCATION_MAIN,TEX_OFFSET);
+    memset(vm_base+TEX_OFFSET,0x31,84); /* 4x4, 2x2, 1x1 RGBA8 mip chain. */
+    draw_triangle();
+    const u32 single=stub.bound_tex[0];
+    CHECK(single && stub.n_texture_create==1 && stub.n_texture_upload==1 &&
+          stub.last_created_mips==1,"single-level resource uploads once");
+
+    /* Keep every other descriptor bit and all guest bytes fixed. Changing the
+     * mip count in the same frame must miss the cache's hash fast path. */
+    m(M_TEX_UNIT+0x04,2u|(2u<<4)|((0x85u|0x20u)<<8)|(3u<<16));
+    draw_triangle();
+    const u32 multi=stub.bound_tex[0];
+    CHECK(multi && multi!=single && stub.n_texture_create==2 &&
+          stub.n_texture_upload==4 && stub.last_created_mips==3 &&
+          stub.alive[single] && stub.alive[multi],
+          "three-level descriptor uploads all mips as a separate live resource");
+    draw_triangle();
+    CHECK(stub.bound_tex[0]==multi && stub.n_texture_create==2,
+          "unchanged three-level descriptor still reuses its resource");
+
+    m(M_TEX_UNIT+0x04,2u|(2u<<4)|((0x85u|0x20u)<<8)|(1u<<16));
+    draw_triangle();
+    CHECK(stub.bound_tex[0]==single && stub.n_texture_create==2 &&
+          stub.alive[single] && stub.alive[multi],
+          "return to single level reuses its own still-live resource");
+
+    rsx_draw_engine_present();
+    memset(vm_base+TEX_OFFSET,0x42,84);
+    draw_triangle();
+    const u32 refreshed_single=stub.bound_tex[0];
+    CHECK(refreshed_single!=single && stub.n_texture_create==3 &&
+          !stub.alive[single] && stub.alive[multi] && stub.n_texture_release==1,
+          "changed bytes replace only the single-level resource");
+    m(M_TEX_UNIT+0x04,2u|(2u<<4)|((0x85u|0x20u)<<8)|(3u<<16));
+    draw_triangle();
+    CHECK(stub.bound_tex[0]!=multi && stub.n_texture_create==4 &&
+          !stub.alive[multi] && stub.alive[refreshed_single] &&
+          stub.n_texture_release==2 && stub.n_texture_upload==8,
+          "changed full chain replaces and releases its own resource");
     engine_down();
 }
 
@@ -1644,6 +1691,7 @@ int main(int argc, char** argv)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_texture_cache_mips();
     test_anisotropy_decode();
     test_pipeline_key();
     test_restart_expansion();

@@ -8,7 +8,7 @@
 uint8_t* vm_base;
 static unsigned checks;
 #define CHECK(x) do { ++checks; if(!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); return 0; } } while(0)
-_Static_assert(sizeof(rsx_scene_vertex_output)==192,"complete output size");
+_Static_assert(sizeof(rsx_scene_vertex_output)==224,"complete output size");
 _Static_assert(offsetof(rsx_scene_vertex_output,pos)==0,"position offset");
 _Static_assert(offsetof(rsx_scene_vertex_output,col0)==16,"color0 offset");
 _Static_assert(offsetof(rsx_scene_vertex_output,col1)==32,"color1 offset");
@@ -26,7 +26,7 @@ static const char synthetic_shader[]=
     "struct VSInput {float4 a0:ATTR0;float4 a8:ATTR8;};\n"
     "struct VSOutput {float4 pos:SV_Position;float4 col0:COLOR0;float4 col1:COLOR1;float4 fog:FOG;\n"
     "float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;\n"
-    "float4 t4:TEXCOORD4;float4 t5:TEXCOORD5;float4 t6:TEXCOORD6;float4 t7:TEXCOORD7;};\n"
+    "float4 t4:TEXCOORD4;float4 t5:TEXCOORD5;float4 t6:TEXCOORD6;float4 t7:TEXCOORD7;float4 t8:TEXCOORD8;float4 t9:TEXCOORD9;};\n"
     "cbuffer VPConst:register(b0){float4 c[514];};\n"
     "VSOutput main(VSInput input){VSOutput o;\n"
     "o.pos=input.a0*c[0]+c[1];\n"
@@ -35,11 +35,11 @@ static const char synthetic_shader[]=
     "o.t0=input.a8*c[5]+c[35];o.t1=input.a8*c[6]+c[36];\n"
     "o.t2=input.a8*c[7]+c[37];o.t3=input.a8*c[8]+c[38];\n"
     "o.t4=input.a8*c[9]+c[39];o.t5=input.a8*c[10]+c[40];\n"
-    "o.t6=input.a8*c[11]+c[41];o.t7=asfloat(asuint(c[42]));return o;}\n";
+    "o.t6=input.a8*c[11]+c[41];o.t7=asfloat(asuint(c[42]));o.t8=input.a8*c[43];o.t9=input.a0+c[44];return o;}\n";
 
 static int cpu_checks(void)
 {
-    static const char* const fields[]={"pos","col0","col1","fog","t0","t1","t2","t3","t4","t5","t6","t7"};
+    static const char* const fields[]={"pos","col0","col1","fog","t0","t1","t2","t3","t4","t5","t6","t7","t8","t9"};
     rsx_vertex_layout_plan l;rsx_vertex_layout_plan_init(&l,(1u<<0)|(1u<<8));
     char* source=rsx_scene_compute_outputs_source(synthetic_shader,&l,3);
     CHECK(source && strlen(source)<strlen(synthetic_shader)+4096);
@@ -47,13 +47,13 @@ static int cpu_checks(void)
     CHECK(strstr(source,"input.a0=rsx_scene_in[id.x*2+0];"));
     CHECK(strstr(source,"input.a8=rsx_scene_in[id.x*2+1];"));
     CHECK(strstr(source,"if(id.x>=3) return;"));
-    for(unsigned i=0;i<12;++i){
-        char store[100];snprintf(store,sizeof store,"rsx_scene_out[id.x*12+%u]=result.%s;",i,fields[i]);
+    for(unsigned i=0;i<14;++i){
+        char store[100];snprintf(store,sizeof store,"rsx_scene_out[id.x*14+%u]=result.%s;",i,fields[i]);
         CHECK(strstr(source,store));
     }
     free(source);
     source=rsx_scene_compute_source(synthetic_shader,&l,3);
-    CHECK(source && strstr(source,"rsx_scene_out[id.x]=result.pos;") && !strstr(source,"id.x*12"));free(source);
+    CHECK(source && strstr(source,"rsx_scene_out[id.x]=result.pos;") && !strstr(source,"id.x*14"));free(source);
     source=rsx_scene_compute_outputs_source(synthetic_shader,&l,262144);CHECK(source);free(source);
     CHECK(!rsx_scene_compute_outputs_source(synthetic_shader,&l,262145));
     CHECK(!rsx_scene_compute_outputs_source(synthetic_shader,&l,0));
@@ -98,19 +98,21 @@ static int synthetic_gpu_checks(void)
     for(unsigned k=0;k<4;++k){
         constants[0][k]=(float)(k+1);constants[1][k]=(float)k;
         for(unsigned i=0;i<10;++i){constants[i+2][k]=(float)(i+k+1);constants[i+32][k]=(float)(i*4+k+20);}
-        constants[42][k]=(float)(90+k);
+        constants[42][k]=(float)(90+k);constants[43][k]=(float)(7+k);constants[44][k]=(float)(20+k);
     }
     rsx_scene_vertex_output output[3];float positions[12];
     CHECK(!rsx_vulkan_backend_replay_outputs(synthetic_shader,&l,vertices,3,constants,sizeof constants,output,3));
     CHECK(!rsx_vulkan_backend_replay_positions(synthetic_shader,&l,vertices,3,constants,sizeof constants,positions,12));
     for(unsigned v=0;v<3;++v){
-        float fields[48];memcpy(fields,&output[v],sizeof fields);
+        float fields[56];memcpy(fields,&output[v],sizeof fields);
         for(unsigned k=0;k<4;++k){
             float expected=vertices[v][k]*constants[0][k]+constants[1][k];
             CHECK(fields[k]==expected && positions[v*4+k]==expected);
             for(unsigned i=0;i<10;++i)
                 CHECK(fields[(i+1)*4+k]==vertices[v][k+4]*constants[i+2][k]+constants[i+32][k]);
             CHECK(fields[44+k]==constants[42][k]);
+            CHECK(output[v].t8[k]==vertices[v][k+4]*constants[43][k]);
+            CHECK(output[v].t9[k]==vertices[v][k]+constants[44][k]);
         }
     }
     /* Unused varyings may contain NaNs/infinities/signed zero. The replay

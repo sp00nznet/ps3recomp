@@ -30,6 +30,10 @@ extern "C" {
 /* Maximum concurrent PPU threads */
 #define PPU_THREAD_MAX  64
 
+/* Opt-in, bounded movie_post synchronization trace. result is -1 on entry. */
+void ppu_vdec_wait_trace(ppu_context* ctx, const char* operation,
+                         uint32_t object, int64_t result);
+
 /* Thread states */
 #define PPU_THREAD_STATE_FREE       0
 #define PPU_THREAD_STATE_RUNNING    1

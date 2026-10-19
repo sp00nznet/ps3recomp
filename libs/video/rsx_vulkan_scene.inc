@@ -51,7 +51,8 @@ static int vk_scene_replay(const char* shader,const rsx_vertex_layout_plan* layo
     VkComputePipelineCreateInfo cp={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=module,.pName="main"},.layout=pipeline_layout};
-    if(create_compute(s_vk.device,VK_NULL_HANDLE,1,&cp,NULL,&pipe)!=VK_SUCCESS)goto end;
+    if(create_compute(s_vk.device,vk_pcache(),1,&cp,NULL,&pipe)!=VK_SUCCESS)goto end;
+    vk_pcache_created();
     VkDescriptorPoolSize sizes[2]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2}};
     VkDescriptorPoolCreateInfo dp={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets=1,.poolSizeCount=2,.pPoolSizes=sizes};

@@ -143,7 +143,7 @@ typedef struct {
 } eng_zdepth;
 
 typedef struct {
-    u32 location, offset, format, width, height, pitch, remap, cubemap;
+    u32 location, offset, format, width, height, levels, pitch, remap, cubemap;
     u32 handle;
     u64 content_hash;
     u32 last_hash_frame;
@@ -1142,19 +1142,19 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * one is only added after a miss. RSX_ENGINE_TEXTURE_INDEX_CHECK=1 also runs
  * the old scan on every lookup and stops strictly if the two ever disagree. */
 static u32 eng_tex_key_hash(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                            u32 pitch, u32 remap, u32 cube)
+                            u32 levels, u32 pitch, u32 remap, u32 cube)
 {
-    const u32 k[8] = { location, offset, fmt, w, h, pitch, remap, cube };
+    const u32 k[9] = { location, offset, fmt, w, h, levels, pitch, remap, cube };
     u32 x = 2166136261u;
-    for (u32 i = 0; i < 8; i++) { x ^= k[i]; x *= 16777619u; x ^= x >> 15; }
+    for (u32 i = 0; i < 9; i++) { x ^= k[i]; x *= 16777619u; x ^= x >> 15; }
     return x;
 }
 
 static int eng_tex_matches(const eng_texture* e, u32 location, u32 offset, u32 fmt,
-                           u32 w, u32 h, u32 pitch, u32 remap, u32 cube)
+                           u32 w, u32 h, u32 levels, u32 pitch, u32 remap, u32 cube)
 {
     return e->location == location && e->offset == offset && e->format == fmt &&
-           e->width == w && e->height == h && e->pitch == pitch &&
+           e->width == w && e->height == h && e->levels == levels && e->pitch == pitch &&
            e->remap == remap && e->cubemap == cube;
 }
 
@@ -1162,7 +1162,7 @@ static void eng_tex_index_insert(u32 i)
 {
     const eng_texture* e = &g.textures[i];
     u32 s = eng_tex_key_hash(e->location, e->offset, e->format, e->width, e->height,
-                             e->pitch, e->remap, e->cubemap) & (ENG_TEX_INDEX_SIZE - 1u);
+                             e->levels, e->pitch, e->remap, e->cubemap) & (ENG_TEX_INDEX_SIZE - 1u);
     while (g.texture_index[s]) s = (s + 1u) & (ENG_TEX_INDEX_SIZE - 1u);
     g.texture_index[s] = (u16)(i + 1u);
 }
@@ -1181,25 +1181,25 @@ static int eng_tex_index_check(void)
 }
 
 static int eng_tex_find(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                        u32 pitch, u32 remap, u32 cube)
+                        u32 levels, u32 pitch, u32 remap, u32 cube)
 {
     int found = -1;
-    for (u32 s = eng_tex_key_hash(location, offset, fmt, w, h, pitch, remap, cube) & (ENG_TEX_INDEX_SIZE - 1u);
+    for (u32 s = eng_tex_key_hash(location, offset, fmt, w, h, levels, pitch, remap, cube) & (ENG_TEX_INDEX_SIZE - 1u);
          g.texture_index[s]; s = (s + 1u) & (ENG_TEX_INDEX_SIZE - 1u)) {
         const u32 i = g.texture_index[s] - 1u;
-        if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, pitch, remap, cube)) {
+        if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, levels, pitch, remap, cube)) {
             found = (int)i; break;
         }
     }
     if (eng_tex_index_check()) {
         int scan = -1;
         for (u32 i = 0; i < g.n_textures && scan < 0; i++)
-            if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, pitch, remap, cube))
+            if (eng_tex_matches(&g.textures[i], location, offset, fmt, w, h, levels, pitch, remap, cube))
                 scan = (int)i;
         if (scan != found)
             ps3_strict_boot_guard("rsx-texture-index",
-                "location=%u offset=0x%08X format=0x%X index=%d scan=%d entries=%u",
-                location, offset, fmt, found, scan, g.n_textures);
+                "location=%u offset=0x%08X format=0x%X levels=%u index=%d scan=%d entries=%u",
+                location, offset, fmt, levels, found, scan, g.n_textures);
     }
     return found;
 }
@@ -1211,7 +1211,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
-    const int found = eng_tex_find(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0));
+    const int found = eng_tex_find(location, offset, fmt, w, h, levels, pitch, remap, (u32)(cube != 0));
     if (found >= 0) {
         eng_texture* e = &g.textures[found];
         if (e->handle && e->last_hash_frame != g.frames) {
@@ -1250,7 +1250,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     eng_texture e;
     memset(&e, 0, sizeof(e));
     e.location = location; e.offset = offset; e.format = fmt;
-    e.width = w; e.height = h; e.pitch = pitch;
+    e.width = w; e.height = h; e.levels = levels; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0);
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;

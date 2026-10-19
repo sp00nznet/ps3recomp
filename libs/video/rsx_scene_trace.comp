@@ -5,16 +5,17 @@ layout(std430,binding=0) readonly buffer Outputs {vec4 value[];} vs;
 layout(std430,binding=1) readonly buffer Indices {uvec4 triangle[];} indices;
 layout(std430,binding=2) readonly buffer Positions {float xyz[];} positions;
 layout(std430,binding=3) buffer Validity {uint flags;} validity;
-struct Material {uvec4 alpha;uvec4 raster;uvec4 textures;};
+struct Material {uvec4 alpha;uvec4 raster;uvec4 textures;vec4 depth_range;uvec4 authored;uvec4 rgb_textures[2];vec4 light_view[4];vec4 light_rgb[4];vec4 light_to_view[3];};
 layout(std430,binding=4) readonly buffer Materials {Material value[];} materials;
 layout(std430,binding=5) readonly buffer Constants {vec4 value[];} fp;
-// Float occlusion bits followed by four uint counters, initialized by host fill.
+// Ten float planes (transport ping/pong, guides and RGB delta), then 32 counters.
 layout(std430,binding=6) buffer Occlusion {uint value[];} ao;
 layout(std140,binding=7) uniform Parameters {vec4 projection;uvec4 dims;uvec4 counts;vec4 settings;} p;
 layout(binding=8) uniform accelerationStructureEXT scene;
 layout(binding=9) uniform sampler2D worldColor;
 layout(binding=10) uniform sampler2D rasterDepth;
 layout(/*RSX_SCENE_OUTPUT_FORMAT*/,binding=11) writeonly uniform image2D outputColor;
+layout(/*RSX_SCENE_RAW_FORMAT*/,binding=12) writeonly uniform image2D rawColor;
 layout(push_constant) uniform Phase {uint mode;} phase;
 // Individual descriptors and literal switch indices avoid descriptor indexing
 // features and nonuniformEXT. Every descriptor is populated, including dummies.
@@ -25,13 +26,24 @@ TEX(16) TEX(17) TEX(18) TEX(19) TEX(20) TEX(21) TEX(22) TEX(23)
 TEX(24) TEX(25) TEX(26) TEX(27) TEX(28) TEX(29) TEX(30) TEX(31)
 #undef TEX
 /*RSX_SCENE_ALPHA_HELPER*/
+/*RSX_PATH_TRANSPORT_HELPER*/
+/*RSX_RAY_FOOTPRINT_HELPER*/
+bool rsx_pool_rgb_load_constant(uint absolute_index,out vec4 value);
+bool rsx_pool_rgb_sample2d(uint material,uint unit,vec2 uv,float lod,out vec4 rgba);
+bool rsx_pool_rgb_sample_cube(uint material,uint unit,vec3 direction,float lod,out vec4 rgba);
+/*RSX_POOL_RGB_HELPER*/
+/*RSX_TERRAIN_RGB_HELPER*/
+bool rsx_scene_rgb_load_constant(uint material,int index,out vec4 value);
+bool rsx_scene_rgb_sample(uint material,int unit,vec2 uv,float lod,out vec4 value);
+void rsx_scene_rgb_invalidate(uint material,int status);
+/*RSX_SCENE_RGB_HELPER*/
 bool rsx_scene_alpha_load_constant(uint index,out vec4 value){if(index>=fp.value.length())return false;value=fp.value[index];return true;}
 void rsx_scene_alpha_invalidate_epoch(uint material,int status){atomicOr(validity.flags,4u);}
 bool rsx_scene_alpha_sample(uint material,uint unit,vec2 uv,float lod,out vec4 rgba){
     if(material>=materials.value.length() || unit>1 || any(isnan(uv)) || any(isinf(uv)) || isnan(lod)||isinf(lod))return false;
     uint slot=materials.value[material].textures[unit];
-    // LOD0 is an explicit AO policy. Captured sampler min/max/mip/filter/wrap
-    // and the original remapped texture view still apply; no raster derivatives.
+    // A ray-cone footprint supplies the explicit LOD. Captured sampler
+    // min/max/mip/filter/wrap and the remapped texture view remain authoritative.
 #define SAMPLE(N) case N: rgba=textureLod(alphaTexture##N,uv,lod);return true;
     switch(slot){
     SAMPLE(0) SAMPLE(1) SAMPLE(2) SAMPLE(3) SAMPLE(4) SAMPLE(5) SAMPLE(6) SAMPLE(7)
@@ -41,47 +53,401 @@ bool rsx_scene_alpha_sample(uint material,uint unit,vec2 uv,float lod,out vec4 r
     default:return false;}
 #undef SAMPLE
 }
-void countRay(uint counter){atomicAdd(ao.value[p.dims.x*p.dims.y+counter],1u);}
-vec3 point(uint primitive,uint corner){uint i=primitive*9+corner*3;return vec3(positions.xyz[i],positions.xyz[i+1],positions.xyz[i+2]);}
-RsxSceneAlphaVertexOutput interpolate(uint primitive,vec2 b){
-    uvec3 ids=indices.triangle[primitive].xyz;vec3 w=vec3(1-b.x-b.y,b.x,b.y);
-    RsxSceneAlphaVertexOutput v;
-#define FIELD(NAME,N) v.NAME=vs.value[ids.x*12+N]*w.x+vs.value[ids.y*12+N]*w.y+vs.value[ids.z*12+N]*w.z;
-    FIELD(pos,0) FIELD(col0,1) FIELD(col1,2) FIELD(fog,3)
-    FIELD(t0,4) FIELD(t1,5) FIELD(t2,6) FIELD(t3,7) FIELD(t4,8) FIELD(t5,9) FIELD(t6,10) FIELD(t7,11)
-#undef FIELD
-    return v;
+uint pixelCount(){return p.dims.x*p.dims.y;}
+uvec2 alphaTextureSize(uint slot){
+#define SIZE(N) case N:return uvec2(textureSize(alphaTexture##N,0));
+    switch(slot){
+    SIZE(0) SIZE(1) SIZE(2) SIZE(3) SIZE(4) SIZE(5) SIZE(6) SIZE(7)
+    SIZE(8) SIZE(9) SIZE(10) SIZE(11) SIZE(12) SIZE(13) SIZE(14) SIZE(15)
+    SIZE(16) SIZE(17) SIZE(18) SIZE(19) SIZE(20) SIZE(21) SIZE(22) SIZE(23)
+    SIZE(24) SIZE(25) SIZE(26) SIZE(27) SIZE(28) SIZE(29) SIZE(30) SIZE(31)
+    default:return uvec2(0);}
+#undef SIZE
 }
-bool secondary(vec3 origin,vec3 direction){
-    countRay(2);
-    rayQueryEXT q;rayQueryInitializeEXT(q,scene,gl_RayFlagsTerminateOnFirstHitEXT,255,origin,0,direction,p.settings.x);
-    while(rayQueryProceedEXT(q)){
-        if(rayQueryGetIntersectionTypeEXT(q,false)!=gl_RayQueryCandidateIntersectionTriangleEXT){atomicOr(validity.flags,4u);continue;}
-        uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(q,false),material=indices.triangle[primitive].w;
-        Material m=materials.value[material];bool keep=m.alpha.x==0xffffffffu;
-        if(!keep){
-            RsxSceneAlphaResult result;
-            int status=rsx_scene_alpha_evaluate(m.alpha.x,material,m.alpha.y,m.alpha.z,
-                interpolate(primitive,rayQueryGetIntersectionBarycentricsEXT(q,false)),vec2(0),result);
-            keep=status==RSX_SCENE_ALPHA_OK && result.keep!=0;
-            if(status==RSX_SCENE_ALPHA_OK && !keep)countRay(3);
-        }
-        if(keep)rayQueryConfirmIntersectionEXT(q);
+uint statsBase(){return pixelCount()*10u;}
+void countRay(uint counter){atomicAdd(ao.value[statsBase()+counter],1u);}
+vec3 point(uint primitive,uint corner){uint i=primitive*9+corner*3;return vec3(positions.xyz[i],positions.xyz[i+1],positions.xyz[i+2]);}
+bool finite3(vec3 v);
+// Gather divides each source homogeneous position by h before building the
+// Euclidean triangle. Its ray barycentrics must therefore be divided by the
+// same h and renormalized to reproduce raster perspective varyings. Skinning
+// weights in actual captures are not always exactly unit-sum. This does not
+// replace the separate exact source-position proof for authored light recovery.
+bool homogeneousWeights(uint primitive,vec2 b,out vec3 w){
+    if(any(isnan(b)) || any(isinf(b)))return false;
+    uvec4 ids=indices.triangle[primitive];precise vec3 h;
+    vec2 range=materials.value[ids.w].depth_range.xy;
+    for(uint i=0u;i<3u;i++){
+        vec4 clip=vs.value[ids[i]*14u];
+        if(any(isnan(clip)) || any(isinf(clip)))return false;
+        precise float depth=(range.y-range.x)*clip.z+range.x*clip.w;
+        h[i]=materials.value[ids.w].authored.w!=0u?uintBitsToFloat(indices.triangle[p.counts.x+primitive][i]):(depth-p.projection.z*clip.w)/p.projection.w;
     }
-    return rayQueryGetIntersectionTypeEXT(q,true)==gl_RayQueryCommittedIntersectionTriangleEXT;
+    if(!finite3(h) || any(lessThanEqual(h,vec3(1e-20))))return false;
+    precise vec3 beta=vec3(1-b.x-b.y,b.x,b.y);
+    precise vec3 adjusted=beta/h;precise float denominator=(adjusted.x+adjusted.y)+adjusted.z;
+    if(!finite3(adjusted) || isnan(denominator) || isinf(denominator) || denominator<=0)return false;
+    if(h.x==h.y && h.y==h.z){w=beta;return finite3(w);}
+    w=adjusted/denominator;return finite3(w);
+}
+bool interpolate(uint primitive,vec2 b,out RsxSceneAlphaVertexOutput v){
+    uvec3 ids=indices.triangle[primitive].xyz;vec3 w;
+    if(!homogeneousWeights(primitive,b,w)){atomicOr(validity.flags,16u);return false;}
+#define FIELD(NAME,N) v.NAME=vs.value[ids.x*14+N]*w.x+vs.value[ids.y*14+N]*w.y+vs.value[ids.z*14+N]*w.z;
+    FIELD(pos,0) FIELD(col0,1) FIELD(col1,2) FIELD(fog,3)
+    FIELD(t0,4) FIELD(t1,5) FIELD(t2,6) FIELD(t3,7) FIELD(t4,8) FIELD(t5,9) FIELD(t6,10) FIELD(t7,11) FIELD(t8,12) FIELD(t9,13)
+#undef FIELD
+    return true;
+}
+bool hitAlpha(uint primitive,vec2 bary,vec3 direction,float coneRadius,out float coverage){
+    uint material=indices.triangle[primitive].w;
+    Material m=materials.value[material];
+    coverage=1.0;
+    if(m.alpha.x==0xffffffffu)return true;
+    if(m.alpha.x>=uint(rsx_scene_alpha_contracts.length())){atomicOr(validity.flags,4u);return false;}
+    uvec3 ids=indices.triangle[primitive].xyz;
+    vec4 uv0=vs.value[ids.x*14+4],uv1=vs.value[ids.y*14+4],uv2=vs.value[ids.z*14+4];
+    vec2 lod=vec2(0);
+    uint kind=rsx_scene_alpha_contracts[m.alpha.x].kind;
+    for(uint unit=0u;unit<(kind==0u?1u:2u);unit++){
+        bool normalMap=kind!=0u && unit==0u;
+        if(!rsx_ray_footprint_lod(point(primitive,0),point(primitive,1),point(primitive,2),
+            normalMap?uv0.zw:uv0.xy,normalMap?uv1.zw:uv1.xy,normalMap?uv2.zw:uv2.xy,
+            direction,coneRadius,alphaTextureSize(m.textures[unit]),lod[unit])){
+            atomicOr(validity.flags,16u);return false;
+        }
+    }
+    RsxSceneAlphaResult result;RsxSceneAlphaVertexOutput vertex;
+    if(!interpolate(primitive,bary,vertex))return false;
+    int status=rsx_scene_alpha_evaluate(m.alpha.x,material,m.alpha.y,m.alpha.z,
+        vertex,lod,result);
+    if(status!=RSX_SCENE_ALPHA_OK){
+        uint diagnostic=statsBase()+4u;
+        if(atomicCompSwap(ao.value[diagnostic],0u,1u)==0u){
+            ao.value[diagnostic+1u]=material;
+            ao.value[diagnostic+2u]=primitive;
+            ao.value[diagnostic+3u]=uint(status);
+            ao.value[diagnostic+4u]=m.alpha.x;
+            ao.value[diagnostic+5u]=m.alpha.z;
+            ao.value[diagnostic+6u]=rsx_scene_alpha_numeric_reason;
+            ao.value[diagnostic+7u]=floatBitsToUint(rsx_scene_alpha_numeric_value);
+        }
+        return false;
+    }
+    if(result.keep==0){countRay(3);return false;}
+    if(m.raster.w!=0u){
+        // Continuous coverage for the explicitly qualified A2C/src-alpha
+        // paths. This does not reproduce the rasterizer's per-sample mask.
+        if(!rsx_scene_alpha_finite(result.coverage)){atomicOr(validity.flags,16u);return false;}
+        coverage=result.coverage;
+    }
+    return coverage>0.0;
+}
+uint pathHash(uint x);float pathRandom(inout uint state);
+layout(binding=48) uniform samplerCube authoredCube0;
+layout(binding=49) uniform samplerCube authoredCube1;
+layout(binding=50) uniform samplerCube authoredCube2;
+layout(binding=51) uniform samplerCube authoredCube3;
+uint authoredPrimitive=0u;vec3 authoredDirection=vec3(0,0,1);float authoredRadius=0.0;
+uint authoredCalls[7];
+bool authoredCubeOverride=false;vec3 authoredReflectedRadiance=vec3(0);
+bool rsx_pool_rgb_load_constant(uint index,out vec4 value){return rsx_scene_alpha_load_constant(index,value);}
+bool authoredLod(uint material,uint unit,out float lod){
+    Material m=materials.value[material];uint slot=m.rgb_textures[unit/4u][unit%4u];
+    if(unit==3u && m.authored.x==2u){lod=0.0;return true;} // Cube reflection derivative is not recovered.
+    uvec3 ids=indices.triangle[authoredPrimitive].xyz;
+    vec4 a=vs.value[ids.x*14u+4u],b=vs.value[ids.y*14u+4u],c=vs.value[ids.z*14u+4u];
+    if(m.authored.x==1u){
+        // Contract0 unit1 is a normal-indexed lighting LUT. Its raster
+        // derivative is unavailable; the strict primary color check remains.
+        if(unit==1u){lod=0.0;return true;}
+        if(unit==2u){a=vs.value[ids.x*14u+5u];b=vs.value[ids.y*14u+5u];c=vs.value[ids.z*14u+5u];}
+        return rsx_ray_footprint_lod(point(authoredPrimitive,0),point(authoredPrimitive,1),point(authoredPrimitive,2),
+            unit==2u?a.zw:a.xy,unit==2u?b.zw:b.xy,unit==2u?c.zw:c.xy,authoredDirection,authoredRadius,alphaTextureSize(slot),lod);
+    }
+    if(m.authored.x==3u){
+        if(unit==2u || unit==4u){lod=0.0;return true;} // Normal/view LUT derivatives unavailable.
+        if(unit==3u){a=vs.value[ids.x*14u+5u];b=vs.value[ids.y*14u+5u];c=vs.value[ids.z*14u+5u];}
+        bool zw=unit==0u || unit==3u;
+        return rsx_ray_footprint_lod(point(authoredPrimitive,0),point(authoredPrimitive,1),point(authoredPrimitive,2),
+            zw?a.zw:a.xy,zw?b.zw:b.xy,zw?c.zw:c.xy,authoredDirection,authoredRadius,alphaTextureSize(slot),lod);
+    }
+    bool zw=unit==0u || (unit==2u && (authoredCalls[unit]++%2u)==0u) || unit==4u || unit==6u;
+    if(unit==5u){a=vs.value[ids.x*14u+5u];b=vs.value[ids.y*14u+5u];c=vs.value[ids.z*14u+5u];zw=true;}
+    return rsx_ray_footprint_lod(point(authoredPrimitive,0),point(authoredPrimitive,1),point(authoredPrimitive,2),
+        zw?a.zw:a.xy,zw?b.zw:b.xy,zw?c.zw:c.xy,authoredDirection,authoredRadius,alphaTextureSize(slot),lod);
+}
+bool rsx_pool_rgb_sample2d(uint material,uint unit,vec2 uv,float ignored,out vec4 rgba){
+    if(material>=materials.value.length() || unit>6u || (unit==3u && materials.value[material].authored.x==2u))return false;
+    uint slot=materials.value[material].rgb_textures[unit/4u][unit%4u];float lod;
+    if(!authoredLod(material,unit,lod))return false;
+#define SAMPLE(N) case N:rgba=textureLod(alphaTexture##N,uv,lod);return true;
+    switch(slot){
+    SAMPLE(0) SAMPLE(1) SAMPLE(2) SAMPLE(3) SAMPLE(4) SAMPLE(5) SAMPLE(6) SAMPLE(7)
+    SAMPLE(8) SAMPLE(9) SAMPLE(10) SAMPLE(11) SAMPLE(12) SAMPLE(13) SAMPLE(14) SAMPLE(15)
+    SAMPLE(16) SAMPLE(17) SAMPLE(18) SAMPLE(19) SAMPLE(20) SAMPLE(21) SAMPLE(22) SAMPLE(23)
+    SAMPLE(24) SAMPLE(25) SAMPLE(26) SAMPLE(27) SAMPLE(28) SAMPLE(29) SAMPLE(30) SAMPLE(31)
+    default:return false;}
+#undef SAMPLE
+}
+bool rsx_pool_rgb_sample_cube(uint material,uint unit,vec3 direction,float lod,out vec4 rgba){
+    if(material>=materials.value.length() || unit!=3u)return false;
+    uint slot=materials.value[material].rgb_textures[0].w;
+    switch(slot){case 0:rgba=textureLod(authoredCube0,direction,0);if(authoredCubeOverride)rgba.rgb=authoredReflectedRadiance;return true;
+        case 1:rgba=textureLod(authoredCube1,direction,0);if(authoredCubeOverride)rgba.rgb=authoredReflectedRadiance;return true;
+        case 2:rgba=textureLod(authoredCube2,direction,0);if(authoredCubeOverride)rgba.rgb=authoredReflectedRadiance;return true;
+        case 3:rgba=textureLod(authoredCube3,direction,0);if(authoredCubeOverride)rgba.rgb=authoredReflectedRadiance;return true;default:return false;}
+}
+bool rsx_scene_rgb_load_constant(uint material,int index,out vec4 value){
+    if(material>=materials.value.length() || index<0)return false;
+    Material m=materials.value[material];if(uint(index)>=m.alpha.z)return false;
+    return rsx_scene_alpha_load_constant(m.alpha.y+uint(index),value);
+}
+bool rsx_scene_rgb_sample(uint material,int unit,vec2 uv,float lod,out vec4 value){
+    if(unit<0 || unit>2)return false;
+    return rsx_pool_rgb_sample2d(material,uint(unit),uv,lod,value);
+}
+void rsx_scene_rgb_invalidate(uint material,int status){} // Local original-RGB fallback.
+bool authoredEvaluate(uint primitive,vec2 bary,vec3 direction,float radius,vec4 visibility,vec3 indirect,out RsxPoolRgbOutput outputValue){
+    uint material=indices.triangle[primitive].w;Material m=materials.value[material];
+    if(m.authored.x<1u || m.authored.x>3u)return false;
+    authoredPrimitive=primitive;authoredDirection=direction;authoredRadius=radius;
+    if(m.authored.x==1u){
+        RsxSceneAlphaVertexOutput v;if(!interpolate(primitive,bary,v))return false;
+        vec4 vertex[12]=vec4[12](v.pos,v.col0,v.col1,v.fog,v.t0,v.t1,v.t2,v.t3,v.t4,v.t5,v.t6,v.t7);
+        RsxSceneRgbOutput source;
+        if(rsx_scene_rgb_evaluate(material,true,0u,vertex,vec3(0),source)!=0 || !source.keep)return false;
+        vec3 composed;if(rsx_scene_rgb_compose(source,visibility.xy,indirect,composed)!=0)return false;
+        outputValue.originalRGBA=vec4(source.authoredRGB,source.rawAlpha);
+        outputValue.composedRGBA=vec4(composed,source.rawAlpha);
+        outputValue.source.direct[0]=source.source.lut[0];outputValue.source.direct[1]=source.source.lut[1];
+        outputValue.source.direct[2]=outputValue.source.direct[3]=vec3(0);
+        outputValue.source.diffuseProxy=source.baseRGB;
+        outputValue.source.transportValid=finite3(source.baseRGB)&&all(greaterThanEqual(source.baseRGB,vec3(0)))&&all(lessThanEqual(source.baseRGB,vec3(1)));
+        outputValue.source.reflectionValid=false;outputValue.source.reflectionDirection=vec3(0);
+        for(int i=0;i<4;i++){
+            outputValue.source.diffuseDirect[i]=outputValue.source.direct[i];
+            outputValue.source.transportValid=outputValue.source.transportValid&&finite3(outputValue.source.direct[i])&&all(greaterThanEqual(outputValue.source.direct[i],vec3(0)));
+        }
+        return true;
+    }
+    for(int i=0;i<7;i++)authoredCalls[i]=0u;
+    float lod[7];for(int i=0;i<7;i++)lod[i]=0.0;
+    // replay may sample twice; per-source-unit counter wraps the two tex2 calls.
+    RsxSceneAlphaVertexOutput v;if(!interpolate(primitive,bary,v))return false;
+    if(m.authored.x==3u){float terrainLod[5];for(int i=0;i<5;i++)terrainLod[i]=0.0;
+        return rsx_terrain_rgb_evaluate(true,material,m.alpha.y,m.alpha.z,v,terrainLod,visibility,indirect,outputValue)==0;}
+    return rsx_pool_rgb_evaluate(true,m.authored.z==1u,material,m.alpha.y,m.alpha.z,v,lod,visibility,indirect,outputValue)==0;
+}
+// Exact alpha-aware source visibility; no sphere/sky proxy or AO radius cap.
+float authoredVisibility(vec3 origin,vec3 direction,float maximum,float radius,float spread){
+    countRay(2);float transmittance=1.0,minimum=0.0;
+    for(uint layer=0u;layer<32u;layer++){
+        rayQueryEXT q;rayQueryInitializeEXT(q,scene,0,255,origin,minimum,direction,maximum);
+        while(rayQueryProceedEXT(q))if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
+            float coverage;if(hitAlpha(rayQueryGetIntersectionPrimitiveIndexEXT(q,false),rayQueryGetIntersectionBarycentricsEXT(q,false),direction,radius+rayQueryGetIntersectionTEXT(q,false)*spread,coverage))rayQueryConfirmIntersectionEXT(q);
+        }
+        if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return transmittance;
+        float coverage,t=rayQueryGetIntersectionTEXT(q,true);
+        if(!hitAlpha(rayQueryGetIntersectionPrimitiveIndexEXT(q,true),rayQueryGetIntersectionBarycentricsEXT(q,true),direction,radius+t*spread,coverage))return 0.0;
+        transmittance*=1.0-coverage;if(transmittance<=.001)return 0.0;
+        minimum=t+max(.000001,abs(t)*.000001);if(minimum>=maximum)return transmittance;
+    }
+    atomicOr(validity.flags,16u);return 0.0;
+}
+vec4 authoredSourceVisibility(uint primitive,vec2 bary,vec3 position,vec3 normal,float radius,float spread){
+    Material m=materials.value[indices.triangle[primitive].w];vec4 visibility=vec4(1);
+    float scale=1.0;
+    if(m.authored.w!=0u){
+        vec3 weights;if(!homogeneousWeights(primitive,bary,weights)){atomicOr(validity.flags,16u);return visibility;}
+        vec3 hs=vec3(uintBitsToFloat(indices.triangle[p.counts.x+primitive].x),
+                     uintBitsToFloat(indices.triangle[p.counts.x+primitive].y),
+                     uintBitsToFloat(indices.triangle[p.counts.x+primitive].z));
+        scale=(weights.x*hs.x+weights.y*hs.y)+weights.z*hs.z;
+        if(isnan(scale)||isinf(scale)||scale<=1e-20){atomicOr(validity.flags,16u);return visibility;}
+    }
+    for(uint light=0u;light<4u;light++){
+        if(m.light_rgb[light].w!=1.0)continue;
+        vec4 h=m.light_view[light];if(h.w<0.0)continue;
+        if(scale!=1.0){
+            vec3 translation=vec3(m.light_to_view[0].w,m.light_to_view[1].w,m.light_to_view[2].w)*h.w;
+            h.xyz=(h.xyz-translation)/scale+translation;
+        }
+        vec3 vector=h.w==0.0?h.xyz:h.xyz/h.w-position;
+        float distance=length(vector);if(isnan(distance)||isinf(distance)||distance<=p.settings.y)continue;
+        vec3 direction=vector/distance;
+        visibility[light]=authoredVisibility(position+normal*p.settings.y,direction,h.w==0.0?10000.0:max(p.settings.y,distance-p.settings.y),radius,spread);
+        if(visibility[light]<.999)countRay(28);
+    }
+    return visibility;
+}
+// Return only the unique opaque color owner at the nearest accepted hit.
+// Unknown occluders never become transparent or borrow a farther material.
+bool authoredSurfaceHit(vec3 rayOrigin,vec3 direction,float radius,float spread,uint state,
+    out uint hit,out vec2 bary,out float t){
+    countRay(2);rayQueryEXT q;rayQueryInitializeEXT(q,scene,0,255,rayOrigin,0.0,direction,10000.0);
+    while(rayQueryProceedEXT(q))if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
+        float coverage;uint hit=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
+        if(hitAlpha(hit,rayQueryGetIntersectionBarycentricsEXT(q,false),direction,radius+rayQueryGetIntersectionTEXT(q,false)*spread,coverage)){
+            uint key=pathHash(state^pathHash(hit+0x85ebca6bu));if(float(key>>8)*(1.0/16777216.0)<coverage)rayQueryConfirmIntersectionEXT(q);
+        }
+    }
+    if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return false; // No invented environment/emission.
+    hit=rayQueryGetIntersectionPrimitiveIndexEXT(q,true);t=rayQueryGetIntersectionTEXT(q,true);
+    bary=rayQueryGetIntersectionBarycentricsEXT(q,true);
+    // The nearest geometric hit may be a depth-only copy. Search only its
+    // narrow surface interval for a unique color writer; never trace through
+    // an unsupported occluder to borrow a surface behind it.
+    float surfaceTolerance=max(.000001,abs(t)*.000001);
+    rayQueryEXT owners;countRay(2);
+    rayQueryInitializeEXT(owners,scene,0,255,rayOrigin,max(0.0,t-surfaceTolerance),direction,t+surfaceTolerance);
+    uint colorMaterial=0xffffffffu,colorPrimitive=0xffffffffu;bool ambiguous=false;
+    while(rayQueryProceedEXT(owners))if(rayQueryGetIntersectionTypeEXT(owners,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
+        uint candidate=rayQueryGetIntersectionPrimitiveIndexEXT(owners,false),material=indices.triangle[candidate].w;
+        if(materials.value[material].authored.y==0u)continue;
+        float coverage;vec2 candidateBary=rayQueryGetIntersectionBarycentricsEXT(owners,false);
+        if(!hitAlpha(candidate,candidateBary,direction,radius+t*spread,coverage))continue;
+        // Source-colored transport currently qualifies opaque color owners.
+        // A partially covered coplanar layer is not proof of this ray's owner.
+        if(coverage!=1.0)return false;
+        if(colorMaterial!=0xffffffffu && colorMaterial!=material)ambiguous=true;
+        colorMaterial=material;colorPrimitive=candidate;bary=candidateBary;
+    }
+    if(ambiguous || colorPrimitive==0xffffffffu)return false;
+    hit=colorPrimitive;return true;
+}
+bool authoredHitRadiance(uint hit,vec2 bary,vec3 rayOrigin,vec3 direction,float t,
+    float radius,float spread,out vec3 radiance){
+    RsxPoolRgbOutput source;
+    if(!authoredEvaluate(hit,bary,direction,radius+t*spread,vec4(1),vec3(0),source) || !source.source.transportValid)return false;
+    vec3 n=cross(point(hit,1)-point(hit,0),point(hit,2)-point(hit,0));
+    if(!rsx_pt_internal_unit(n,n))return false;if(dot(n,direction)>0)n=-n;
+    vec4 visibility=authoredSourceVisibility(hit,bary,rayOrigin+direction*t,n,radius+t*spread,spread);
+    radiance=vec3(0);for(int i=0;i<4;i++)if(materials.value[indices.triangle[hit].w].light_rgb[i].w==1.0)
+        radiance+=source.source.diffuseDirect[i]*visibility[i];
+    return finite3(radiance)&&all(greaterThanEqual(radiance,vec3(0)));
+}
+bool authoredReflection(uint primitive,vec3 position,vec3 normal,vec3 sourceDirection,
+    float radius,float spread,uint state,out vec3 radiance){
+    Material m=materials.value[indices.triangle[primitive].w];
+    // The qualified orthogonal light-space transform rotates a direction;
+    // translation must not be applied to it. Preserve the game's cube direction.
+    vec3 direction=vec3(dot(m.light_to_view[0].xyz,sourceDirection),
+        dot(m.light_to_view[1].xyz,sourceDirection),dot(m.light_to_view[2].xyz,sourceDirection));
+    if(!rsx_pt_internal_unit(direction,direction))return false;
+    vec3 origin=position+normal*(dot(normal,direction)>=0.0?p.settings.y:-p.settings.y);
+    uint hit;vec2 bary;float t;
+    if(!authoredSurfaceHit(origin,direction,radius,spread,state,hit,bary,t))return false;
+    if(!authoredHitRadiance(hit,bary,origin,direction,t,radius,spread,radiance))return false;
+    countRay(30);return true;
+}
+vec3 authoredBounce(uint primitive,vec3 position,vec3 normal,vec3 receiverProxy,float radius,float spread,inout uint state){
+    vec3 direction;float pdf;if(!rsx_pt_cosine_sample(normal,pathRandom(state),pathRandom(state),direction,pdf))return vec3(0);
+    vec3 origin=position+normal*p.settings.y,radiance;uint hit;vec2 bary;float t;
+    if(!authoredSurfaceHit(origin,direction,radius,spread,state,hit,bary,t) ||
+       !authoredHitRadiance(hit,bary,origin,direction,t,radius,spread,radiance))return vec3(0);
+    return radiance*receiverProxy;
+}
+
+float secondary(vec3 origin,vec3 direction,float coneRadius,float coneSpread){
+    countRay(2);
+    float transmittance=1.0,minimum=0.0;
+    // Closest accepted layers avoid counting duplicated coplanar raster
+    // passes twice. The distance epsilon and finite layer budget are explicit
+    // AO approximation limits; exhausting the budget invalidates the epoch.
+    for(uint layer=0;layer<32u;layer++){
+        rayQueryEXT q;rayQueryInitializeEXT(q,scene,0,255,origin,minimum,direction,p.settings.x);
+        while(rayQueryProceedEXT(q)){
+            if(rayQueryGetIntersectionTypeEXT(q,false)!=gl_RayQueryCandidateIntersectionTriangleEXT){atomicOr(validity.flags,4u);continue;}
+            float coverage;
+            if(hitAlpha(rayQueryGetIntersectionPrimitiveIndexEXT(q,false),rayQueryGetIntersectionBarycentricsEXT(q,false),direction,coneRadius+rayQueryGetIntersectionTEXT(q,false)*coneSpread,coverage))
+                rayQueryConfirmIntersectionEXT(q);
+        }
+        if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return 1.0-transmittance;
+        float coverage;
+        if(!hitAlpha(rayQueryGetIntersectionPrimitiveIndexEXT(q,true),rayQueryGetIntersectionBarycentricsEXT(q,true),direction,coneRadius+rayQueryGetIntersectionTEXT(q,true)*coneSpread,coverage)){
+            atomicOr(validity.flags,4u);return 0.0;
+        }
+        transmittance*=1.0-coverage;
+        if(transmittance<=.001)return 1.0-transmittance;
+        float distance=rayQueryGetIntersectionTEXT(q,true);
+        minimum=distance+max(.000001,abs(distance)*.000001);
+        if(minimum>=p.settings.x)return 1.0-transmittance;
+    }
+    atomicOr(validity.flags,16u);return 0.0;
 }
 bool finite3(vec3 v){return !any(isnan(v)) && !any(isinf(v));}
+uint pathHash(uint x){x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x;}
+float pathRandom(inout uint state){state=pathHash(state+0x9e3779b9u);return float(state>>8)*(1.0/16777216.0);}
+// Experimental diffuse environment transport. Primary authored color stays in
+// the game's raster path. Secondary surfaces have an explicit neutral 0.65
+// reflectance, not guessed game PBR materials. No screen-space ray marching.
+float pathEnvironment(vec3 origin,vec3 normal,float coneRadius,float coneSpread,inout uint state){
+    vec3 throughput=vec3(1.0);
+    for(uint bounce=0u;bounce<4u;bounce++){
+        vec3 direction;float pdf;
+        float u=pathRandom(state),v=pathRandom(state);
+        if(!rsx_pt_cosine_sample(normal,u,v,direction,pdf)){atomicOr(validity.flags,16u);return 0.0;}
+        countRay(2);
+        rayQueryEXT q;rayQueryInitializeEXT(q,scene,0,255,origin,0.0,direction,10000.0);
+        while(rayQueryProceedEXT(q)){
+            if(rayQueryGetIntersectionTypeEXT(q,false)!=gl_RayQueryCandidateIntersectionTriangleEXT){atomicOr(validity.flags,4u);continue;}
+            float coverage;
+            uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
+            vec2 bary=rayQueryGetIntersectionBarycentricsEXT(q,false);
+            if(hitAlpha(primitive,bary,direction,coneRadius+rayQueryGetIntersectionTEXT(q,false)*coneSpread,coverage)){
+                // Stable stochastic coverage per candidate/path, independent of
+                // implementation-defined traversal order. Unknown alpha rejects.
+                // Intersection distance changes by subpixel amounts during
+                // movement. Hashing its float bits made coverage jump randomly.
+                uint coverageKey=pathHash(state^pathHash(primitive+0x85ebca6bu));
+                if(float(coverageKey>>8)*(1.0/16777216.0)<coverage)rayQueryConfirmIntersectionEXT(q);
+            }
+        }
+        if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return throughput.x;
+        uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(q,true);
+        float distance=rayQueryGetIntersectionTEXT(q,true);
+        coneRadius+=distance*coneSpread;
+        vec3 n=cross(point(primitive,1)-point(primitive,0),point(primitive,2)-point(primitive,0));
+        if(!rsx_pt_internal_unit(n,normal)){atomicOr(validity.flags,16u);return 0.0;}
+        if(dot(normal,direction)>0.0)normal=-normal;
+        vec3 nextThroughput,nextOrigin;
+        if(!rsx_pt_diffuse_step(throughput,vec3(.65),nextThroughput) ||
+           !rsx_pt_offset(origin+direction*distance,normal,p.settings.y,nextOrigin)){
+            atomicOr(validity.flags,16u);return 0.0;
+        }
+        throughput=nextThroughput;origin=nextOrigin;
+    }
+    // Explicit finite-bounce truncation; no invented emission at the last hit.
+    return 0.0;
+}
+void recordDepthFailure(uvec2 pixel,uvec2 raster,float z,float expected,bool candidate,float nearest,uint primitive){
+    uint base=statsBase()+12u;
+    if(atomicAdd(ao.value[base],1u)!=0u)return;
+    ao.value[base+1u]=pixel.x;ao.value[base+2u]=pixel.y;
+    ao.value[base+3u]=raster.x;ao.value[base+4u]=raster.y;
+    ao.value[base+5u]=floatBitsToUint(z);ao.value[base+6u]=floatBitsToUint(expected);
+    ao.value[base+7u]=candidate?floatBitsToUint(nearest):0u;
+    ao.value[base+8u]=candidate?primitive:0xffffffffu;
+    uint material=candidate?indices.triangle[primitive].w:0xffffffffu;
+    ao.value[base+9u]=material;
+    ao.value[base+10u]=candidate?materials.value[material].raster.w:0u;
+    ao.value[base+11u]=candidate?materials.value[material].alpha.x:0xffffffffu;
+}
 void tracePixel(uvec2 pixel){
     uint index=pixel.y*p.dims.x+pixel.x;ao.value[index]=0;
+    for(uint plane=3u;plane<10u;plane++)ao.value[pixelCount()*plane+index]=0u;
     if((atomicOr(validity.flags,0u)&~2u)!=0u)return;
-    uvec2 raster=min(uvec2((vec2(pixel)+.5)*vec2(p.dims.zw)/vec2(p.dims.xy)),p.dims.zw-1);
-    float z=texelFetch(rasterDepth,ivec2(raster.x*p.counts.z,raster.y),0).r;
-    if(isnan(z)||isinf(z)||z<0 || z>1){atomicOr(validity.flags,8u);return;}
+    bool authored=(p.counts.w&4u)!=0u;
+    uvec2 raster=authored?pixel/uvec2(p.counts.z,1):min(uvec2((vec2(pixel)+.5)*vec2(p.dims.zw)/vec2(p.dims.xy)),p.dims.zw-1);
+    uint sampleIndex=authored?pixel.x%p.counts.z:0u;
+    float z=texelFetch(rasterDepth,ivec2(raster.x*p.counts.z+sampleIndex,raster.y),0).r;
+    if(isnan(z)||isinf(z)||z<0 || z>1){recordDepthFailure(pixel,raster,z,0.0,false,0.0,0u);atomicOr(validity.flags,8u);return;}
     if(z>=1)return;
     float expected=p.projection.w/(z-p.projection.z);
     float nearZ=-p.projection.w/p.projection.z;
-    if(!rsx_scene_alpha_finite(expected)||expected<=0 || nearZ<=0){atomicOr(validity.flags,8u);return;}
-    float sampleOffset=p.counts.z==2u?.75:.5;
+    if(!rsx_scene_alpha_finite(expected)||expected<=0 || nearZ<=0){recordDepthFailure(pixel,raster,z,expected,false,0.0,0u);atomicOr(validity.flags,8u);return;}
+    float sampleOffset=p.counts.z==2u?(sampleIndex==0u?.75:.25):.5;
     vec2 uv=(vec2(raster)+sampleOffset)/vec2(p.dims.zw);
     vec3 direction=vec3((2*uv.x-1)/p.projection.x,(1-2*uv.y)/p.projection.y,1);
     float tolerance=max(.001,expected*p.settings.w);
@@ -92,13 +458,42 @@ void tracePixel(uvec2 pixel){
     // Primary visibility comes from the actual raster depth, including its
     // accepted alpha/mip result. Ignore nearer cutout candidates. Do not run
     // guessed-LOD alpha on primary rays or claim raster mip equivalence.
+    bool hadCandidate=false;float nearest=0.0;uint nearestPrimitive=0u;
+    uint ownerPrimitive=0xffffffffu,ownerMaterial=0xffffffffu;
+    float ownerT=0.0;vec2 ownerBary=vec2(0);bool ownerAmbiguous=false;
     while(rayQueryProceedEXT(q))if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
         float t=rayQueryGetIntersectionTEXT(q,false);
+        if(!hadCandidate || abs(t-expected)<abs(nearest-expected)){
+            hadCandidate=true;nearest=t;nearestPrimitive=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
+        }
         float depth=p.projection.z+p.projection.w/t;
-        if(abs(t-expected)<=tolerance && abs(depth-z)<=.00004)rayQueryConfirmIntersectionEXT(q);
+        uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
+        vec2 range=materials.value[indices.triangle[primitive].w].depth_range.xy;
+        // A triangle clipped by its original draw range cannot own this sample.
+        if(depth>=range.x && depth<=range.y &&
+           abs(t-expected)<=tolerance && abs(depth-z)<=.00004){
+            if(!authored)rayQueryConfirmIntersectionEXT(q);
+            else {
+                uint material=indices.triangle[primitive].w;
+                if(materials.value[material].authored.y==0u)continue;
+                // Do not commit/prune: all possible color writers at the
+                // raster depth must be considered, even equal-depth draws.
+                // RGB agreement alone cannot prove which draw owns a sample.
+                if(ownerMaterial!=0xffffffffu && ownerMaterial!=material)ownerAmbiguous=true;
+                if(ownerPrimitive==0xffffffffu || abs(t-expected)<abs(ownerT-expected)){
+                    ownerPrimitive=primitive;ownerMaterial=material;ownerT=t;
+                    ownerBary=rayQueryGetIntersectionBarycentricsEXT(q,false);
+                }
+            }
+        }
     }
-    if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT){atomicOr(validity.flags,8u);return;}
-    uint primitive=rayQueryGetIntersectionPrimitiveIndexEXT(q,true);float t=rayQueryGetIntersectionTEXT(q,true);
+    // Raster edges/MSAA can leave isolated samples without a matching triangle.
+    // Keep those pixels neutral with invalid guides. The validation dispatch
+    // below rejects widespread mismatch after every trace has finished.
+    if(authored && ownerAmbiguous){countRay(1);countRay(27);return;}
+    if(authored?ownerPrimitive==0xffffffffu:rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT){recordDepthFailure(pixel,raster,z,expected,hadCandidate,nearest,nearestPrimitive);return;}
+    uint primitive=authored?ownerPrimitive:rayQueryGetIntersectionPrimitiveIndexEXT(q,true);
+    float t=authored?ownerT:rayQueryGetIntersectionTEXT(q,true);
     vec3 normal=cross(point(primitive,1)-point(primitive,0),point(primitive,2)-point(primitive,0));
     float length2=dot(normal,normal);
     if(!finite3(normal)||isnan(length2)||isinf(length2)||length2<=1e-20){atomicOr(validity.flags,16u);return;}
@@ -107,27 +502,154 @@ void tracePixel(uvec2 pixel){
     vec3 bitangent=cross(normal,tangent),origin=direction*t+normal*p.settings.y;
     if(!finite3(origin)||!finite3(tangent)||!finite3(bitangent)){atomicOr(validity.flags,16u);return;}
     countRay(1);
-    uint blocked=0;
+    ao.value[pixelCount()*3u+index]=floatBitsToUint(normal.x);
+    ao.value[pixelCount()*4u+index]=floatBitsToUint(normal.y);
+    ao.value[pixelCount()*5u+index]=floatBitsToUint(normal.z);
+    ao.value[pixelCount()*6u+index]=floatBitsToUint(t);
+    if(authored){
+        vec2 bary=ownerBary;RsxPoolRgbOutput source;
+        float spread=length(1.0/(abs(p.projection.xy)*vec2(p.dims.zw)));
+        if(!authoredEvaluate(primitive,bary,direction,t*spread,vec4(1),vec3(0),source))return;
+        vec3 rasterRGB=texelFetch(worldColor,ivec2(pixel),0).rgb;
+        vec3 original=clamp(source.originalRGBA.rgb,vec3(0),vec3(1));
+        // Original source/raster agreement owns this sample. Unknown/composited
+        // sources and unmatched derivatives retain exactly the original RGB.
+        if(!finite3(original)||any(greaterThan(abs(original-rasterRGB),vec3(2.0/255.0))))return;
+        atomicAdd(ao.value[statsBase()+24u],1u);
+        vec3 position=direction*t;vec4 visibility=authoredSourceVisibility(primitive,bary,position,normal,t*spread,spread);
+        uint state=pathHash(index+1u);vec3 indirect=(p.counts.w&8u)!=0u || !source.source.transportValid?vec3(0):authoredBounce(primitive,position,normal,source.source.diffuseProxy,t*spread,spread,state);
+        if(any(greaterThan(abs(indirect),vec3(0))))atomicAdd(ao.value[statsBase()+26u],1u);
+        bool reflected=false;vec3 reflectedRadiance=vec3(0);
+        if(source.source.reflectionValid){
+            countRay(29);
+            if((p.counts.w&16u)!=0u)reflected=authoredReflection(primitive,position,normal,source.source.reflectionDirection,t*spread,spread,state,reflectedRadiance);
+        }
+        authoredCubeOverride=reflected;authoredReflectedRadiance=reflectedRadiance;
+        bool composed=authoredEvaluate(primitive,bary,direction,t*spread,visibility,indirect,source);
+        authoredCubeOverride=false;
+        if(!composed)return;
+        vec3 modified=clamp(source.composedRGBA.rgb,vec3(0),vec3(1));if(!finite3(modified))return;
+        vec3 delta=modified-original;
+        for(uint channel=0u;channel<3u;channel++)ao.value[pixelCount()*(7u+channel)+index]=floatBitsToUint(delta[channel]);
+        if(any(greaterThan(abs(delta),vec3(1.0/255.0))))atomicAdd(ao.value[statsBase()+25u],1u);
+        return;
+    }
+    if((p.counts.w&1u)!=0u){
+        float radiance=0.0;uint state=pathHash(index+1u);
+        // Half-diagonal of one native raster pixel, in view-space ray slope.
+        // This is a conservative ray-cone policy, not raster derivative parity.
+        float coneSpread=length(1.0/(abs(p.projection.xy)*vec2(p.dims.zw)));
+        for(uint path=0u;path<8u;path++)radiance+=pathEnvironment(origin,normal,t*coneSpread,coneSpread,state);
+        ao.value[index]=floatBitsToUint(1.0-radiance/8.0);
+        return;
+    }
+    float blocked=0.0;
     for(uint i=0;i<4;i++){
         float u=(float(i)+.5)/4,phi=6.28318530718*float((i>>1)|((i&1u)<<1))/4;
         vec3 local=vec3(sqrt(u)*cos(phi),sqrt(u)*sin(phi),sqrt(1-u));
         vec3 ray=normalize(tangent*local.x+bitangent*local.y+normal*local.z);
         if(!finite3(ray)){atomicOr(validity.flags,16u);return;}
-        if(secondary(origin,ray))blocked++;
+        float coneSpread=length(1.0/(abs(p.projection.xy)*vec2(p.dims.zw)));
+        blocked+=secondary(origin,ray,t*coneSpread,coneSpread);
     }
-    ao.value[index]=floatBitsToUint(float(blocked)/4);
+    ao.value[index]=floatBitsToUint(blocked/4.0);
+}
+vec3 guideNormal(uint index){return vec3(uintBitsToFloat(ao.value[pixelCount()*3u+index]),uintBitsToFloat(ao.value[pixelCount()*4u+index]),uintBitsToFloat(ao.value[pixelCount()*5u+index]));}
+float guideDepth(uint index){return uintBitsToFloat(ao.value[pixelCount()*6u+index]);}
+vec3 guidePosition(uvec2 pixel,float depth){
+    uvec2 raster=min(uvec2((vec2(pixel)+.5)*vec2(p.dims.zw)/vec2(p.dims.xy)),p.dims.zw-1);
+    float offset=p.counts.z==2u?.75:.5;
+    vec2 uv=(vec2(raster)+offset)/vec2(p.dims.zw);
+    return vec3((2*uv.x-1)/p.projection.x,(1-2*uv.y)/p.projection.y,1)*depth;
+}
+// Three spatial a-trous passes filter only stochastic transport. Texture color
+// and alpha are never blurred. Current-frame depth and hit normals reject
+// discontinuities; no temporal history, fabricated motion or NVIDIA RR claim.
+void filterTransport(uvec2 pixel){
+    uint index=pixel.y*p.dims.x+pixel.x,n=pixelCount();
+    uint source=phase.mode==2u?0u:phase.mode==3u?1u:2u;
+    uint destination=phase.mode==3u?2u:1u;
+    float center=uintBitsToFloat(ao.value[source*n+index]);
+    float depth=guideDepth(index);vec3 normal=guideNormal(index);
+    if((atomicOr(validity.flags,0u)&~2u)!=0u || depth<=0.0){ao.value[destination*n+index]=floatBitsToUint(center);return;}
+    vec3 point=guidePosition(pixel,depth);
+    int stepSize=1<<int(phase.mode-2u);
+    const float kernel[5]=float[5](1,4,6,4,1);
+    float sum=0.0,weightSum=0.0;
+    for(int y=-2;y<=2;y++)for(int x=-2;x<=2;x++){
+        ivec2 q=ivec2(pixel)+ivec2(x,y)*stepSize;
+        if(any(lessThan(q,ivec2(0))) || any(greaterThanEqual(q,ivec2(p.dims.xy))))continue;
+        uint qi=uint(q.y)*p.dims.x+uint(q.x);float z=guideDepth(qi);
+        if(z<=0.0)continue;
+        vec3 qnormal=guideNormal(qi);float alignment=max(dot(normal,qnormal),0.0);
+        if(alignment<.5)continue;
+        vec3 delta=guidePosition(uvec2(q),z)-point;
+        float planeDistance=max(abs(dot(normal,delta)),abs(dot(qnormal,delta)));
+        float sigma=.01+.0005*min(depth,z);
+        float weight=kernel[x+2]*kernel[y+2]*pow(alignment,32.0)*exp(-planeDistance/sigma);
+        sum+=uintBitsToFloat(ao.value[source*n+qi])*weight;weightSum+=weight;
+    }
+    float result=weightSum>0.0?sum/weightSum:center;
+    if(isnan(result)||isinf(result)){atomicOr(validity.flags,16u);result=center;}
+    ao.value[destination*n+index]=floatBitsToUint(result);
+}
+float upsampleTransport(uvec2 pixel,uvec2 nearest){
+    uint n=pixelCount();
+    if(guideDepth(nearest.y*p.dims.x+nearest.x)<=0.0)return 0.0;
+    float z=texelFetch(rasterDepth,ivec2(pixel),0).r;
+    if(z>=1.0)return 0.0;
+    float depth=p.projection.w/(z-p.projection.z);
+    if(isnan(depth)||isinf(depth)||depth<=0.0)return 0.0;
+    float sampleOffset=p.counts.z==2u?(pixel.x%2u==0u?.75:.25):.5;
+    vec2 uv=(vec2(pixel/uvec2(p.counts.z,1))+sampleOffset)/vec2(p.dims.zw);
+    vec3 position=vec3((2*uv.x-1)/p.projection.x,(1-2*uv.y)/p.projection.y,1)*depth;
+    vec2 low=uv*vec2(p.dims.xy)-.5;ivec2 base=ivec2(floor(low));vec2 fraction=fract(low);
+    float sum=0.0,weightSum=0.0;
+    for(int y=0;y<2;y++)for(int x=0;x<2;x++){
+        ivec2 q=base+ivec2(x,y);
+        if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(p.dims.xy))))continue;
+        uint qi=uint(q.y)*p.dims.x+uint(q.x);float qz=guideDepth(qi);if(qz<=0.0)continue;
+        vec3 delta=position-guidePosition(uvec2(q),qz);
+        float planeDistance=abs(dot(guideNormal(qi),delta));
+        float sigma=.01+.0005*min(depth,qz);
+        float weight=(x==0?1-fraction.x:fraction.x)*(y==0?1-fraction.y:fraction.y)*exp(-planeDistance/sigma);
+        sum+=uintBitsToFloat(ao.value[n+qi])*weight;weightSum+=weight;
+    }
+    // No compatible surface must retain authored color, not borrow lighting
+    // from the other side of a depth discontinuity.
+    return weightSum>1e-8?sum/weightSum:0.0;
 }
 void main(){
     uvec2 pixel=gl_GlobalInvocationID.xy;
     if(phase.mode==0u){if(all(lessThan(pixel,p.dims.xy)))tracePixel(pixel);return;}
+    if(phase.mode==5u){
+        if(all(equal(pixel,uvec2(0)))){
+            uint primary=ao.value[statsBase()],matched=ao.value[statsBase()+1u];
+            // At most 0.1% (minimum two samples) may fall back locally. This
+            // keeps gross projection/geometry corruption a whole-frame reject.
+            if(primary-matched>max(2u,primary/1000u))atomicOr(validity.flags,8u);
+        }
+        return;
+    }
+    if(phase.mode>=2u){if(all(lessThan(pixel,p.dims.xy)))filterTransport(pixel);return;}
     uvec2 expanded=uvec2(p.dims.z*p.counts.z,p.dims.w);
     if(any(greaterThanEqual(pixel,expanded)))return;
     vec4 original=texelFetch(worldColor,ivec2(pixel),0);
+    vec4 raw=original;
     // A separate dispatch and shader-write/read barrier make EVERY trace's
-    // validity writes visible before ANY color is selected. No partial AO.
-    if((validity.flags&~2u)==0u){
+    // validity writes visible before ANY color is selected. Sparse unmatched
+    // samples retain original color; invalid scenes reject the entire pass.
+    if((validity.flags&~2u)==0u && (p.counts.w&4u)!=0u){
+        uint index=pixel.y*p.dims.x+pixel.x;vec3 delta;
+        for(uint c=0u;c<3u;c++)delta[c]=uintBitsToFloat(ao.value[pixelCount()*(7u+c)+index]);
+        original.rgb=clamp(original.rgb+delta,vec3(0),vec3(1));raw=original;
+    }else if((validity.flags&~2u)==0u){
         uvec2 a=min(uvec2(vec2(pixel/uvec2(p.counts.z,1))*vec2(p.dims.xy)/vec2(p.dims.zw)),p.dims.xy-1);
-        original.rgb*=1-p.settings.z*uintBitsToFloat(ao.value[a.y*p.dims.x+a.x]);
+        float rawTransport=uintBitsToFloat(ao.value[a.y*p.dims.x+a.x]);
+        raw.rgb*=1-p.settings.z*rawTransport;
+        float filtered=(p.counts.w&2u)!=0u?upsampleTransport(pixel,a):rawTransport;
+        original.rgb*=1-p.settings.z*filtered;
     }
+    imageStore(rawColor,ivec2(pixel),raw);
     imageStore(outputColor,ivec2(pixel),original);
 }

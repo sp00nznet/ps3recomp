@@ -152,7 +152,8 @@ static struct LwmSlot { volatile long addr; HANDLE sem;
     volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
-             unsigned ppu_thread_prof_pc(unsigned tid); }
+             unsigned ppu_thread_prof_pc(unsigned tid);
+             void ppu_vdec_wait_trace(ppu_context*, const char*, uint32_t, int64_t); }
 static volatile long g_lwm_tab_lock = 0;
 /* PS3_LWMUTEX_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader.
  * Records, per mutex, the acquiring tid + a QPC microsecond timestamp; on a
@@ -209,6 +210,8 @@ volatile int g_nd_inpump = 0;
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
+    if (ctx->thread_id == 11)
+        ppu_vdec_wait_trace(ctx, "lwmutex-lock-enter", lwm, -1);
     uint32_t self = LWM_SELF(ctx);
     /* lv2 ABI: r4 = timeout in microseconds, 0 = infinite. The real kernel
      * returns ETIMEDOUT (0x8001000B) when the wait expires; games rely on that
@@ -241,6 +244,8 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
             DWORD wr = WaitForSingleObject(s, ms);
+            if (ctx->thread_id == 11)
+                ppu_vdec_wait_trace(ctx, "lwmutex-lock-wake", lwm, wr);
             if (wr == WAIT_TIMEOUT) {           /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
                     (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
@@ -339,9 +344,15 @@ static void sys_lwcond_create(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+static void sys_lwcond_signal(ppu_context* ctx)     {
+    ppu_vdec_wait_trace(ctx, "lwcond-signal-noop", (uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0;
+}
+static void sys_lwcond_signal_all(ppu_context* ctx) {
+    ppu_vdec_wait_trace(ctx, "lwcond-signal-all-noop", (uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0;
+}
+static void sys_lwcond_signal_to(ppu_context* ctx)  {
+    ppu_vdec_wait_trace(ctx, "lwcond-signal-to-noop", (uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0;
+}
 /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
  * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
  * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
@@ -349,6 +360,8 @@ static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+    if (ctx->thread_id == 11)
+        ppu_vdec_wait_trace(ctx, "lwcond-wait-enter", lwcond, -1);
     uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
@@ -363,6 +376,8 @@ static void sys_lwcond_wait(ppu_context* ctx)
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
     ctx->gpr[3] = 0;
+    if (ctx->thread_id == 11)
+        ppu_vdec_wait_trace(ctx, "lwcond-wait-return", lwcond, 0);
 }
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.

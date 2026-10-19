@@ -20,8 +20,10 @@ typedef enum rsx_scene_alpha_status {
 typedef struct rsx_scene_alpha_result {
     float raw_alpha; /* Final guest expression before component NaN sanitation. */
     float alpha;     /* NaN becomes zero; infinity is retained. */
-    float reference;
-    int keep;        /* Strict alpha > reference. NaN reference never passes. */
+    float reference; /* NAN when the matched shader has no alpha test. */
+    int keep;        /* Thresholded: strict alpha > reference. Otherwise always 1. */
+    float coverage;  /* Saturated alpha, used only as continuous secondary-ray coverage. */
+    int thresholded; /* 1 when the matched shader performs an alpha test. */
 } rsx_scene_alpha_result;
 
 /* Return 1 after writing the shader-visible RGBA sample, or 0 if unavailable.
@@ -33,25 +35,34 @@ typedef struct rsx_scene_alpha_result {
 typedef int (*rsx_scene_alpha_sample_fn)(void* user,unsigned texture_index,
     float u,float v,float explicit_lod,float rgba[4]);
 
-/* Caller must compute SHA256 of the exact captured PS HLSL bytes. Only eight
- * contracts, covering pipelines68/69/72/74/75/76/77/78/79/80, match. Each has
+/* Caller must compute SHA256 of the exact captured PS HLSL bytes. Fifteen
+ * contracts match. Each has
  * two explicit verified byte identities: captured CRLF and runtime LF source.
  * Both digests are stored; no fuzzy source normalization is performed here.
  * Pipeline numbers alone do not identify supported semantics. Hex is case
  * insensitive; malformed/unknown digests return NULL. No source hashing is
  * performed here. Returned contracts are immutable and safe to share. */
 const rsx_scene_alpha_contract* rsx_scene_alpha_contract_for_sha256(const char* sha256_hex);
-/* Unknown/NULL contract pointers return NULL or zero. The SHA accessor returns
+/* Unknown/NULL contract pointers return NULL, zero, or -1 as appropriate. The SHA accessor returns
  * the canonical captured CRLF identity for either matching source alias.
- * FP size includes the
- * final fp_alpha float4, whose x component is the comparison reference. */
+ * FP size includes the final fp_alpha float4. Its x component is the
+ * comparison reference only when the shader actually performs an alpha test. */
 const char* rsx_scene_alpha_contract_sha256(const rsx_scene_alpha_contract* contract);
 size_t rsx_scene_alpha_required_fp_bytes(const rsx_scene_alpha_contract* contract);
 unsigned rsx_scene_alpha_texture_mask(const rsx_scene_alpha_contract* contract);
-/* Stable GPU helper IDs: 0=68/69, 1=74, 2=72, 3=75, 4=76, 5=77/79,
- * 6=78, 7=80. IDs may be emitted only after exact source-hash matching.
+/* Stable GPU helper IDs: 0..7 are the original strict alpha-test contracts;
+ * 8=pipe72 A2C, 9=pipe73 A2C, 10=pipe75 A2C without shader alpha tests;
+ * 11=the exact pipe107 strict alpha-test contract;
+ * 12=the exact pipe110 A2C contract without a shader alpha test;
+ * 13=pipe117 strict alpha; 14=byte-identical pipe119/129 strict Fresnel alpha.
+ * IDs may be emitted only after exact source-hash matching.
  * Unknown contracts return -1; never select an ID by pipeline number alone. */
 int rsx_scene_alpha_contract_id(const rsx_scene_alpha_contract* contract);
+/* Safe reverse lookup for an ID already derived from an exact source hash.
+ * Unknown IDs return NULL. */
+const rsx_scene_alpha_contract* rsx_scene_alpha_contract_for_id(unsigned id);
+/* 1 for a shader alpha test, 0 for no shader alpha test, -1 for unknown. */
+int rsx_scene_alpha_contract_has_threshold(const rsx_scene_alpha_contract* contract);
 
 /* Use the full per-draw PS constant buffer with its exact required byte size.
  * Varyings must already have the correct triangle interpolation and projection
@@ -59,8 +70,10 @@ int rsx_scene_alpha_contract_id(const rsx_scene_alpha_contract* contract);
  * unused positions/varyings/constants/sample channels may contain NaNs.
  * lod_by_texture provides 16 entries; only dependent texture slots are read.
  *
- * On success, result.keep=0 rejects this candidate and ray traversal continues;
- * result.keep=1 accepts it. Every negative status requires an explicit caller
+ * On success, thresholded result.keep=0 rejects this candidate and ray traversal
+ * continues; keep=1 accepts it. Without a shader alpha test, keep is always 1;
+ * coverage is a clamped scalar proxy, not the exact raster A2C sample mask.
+ * Every negative status requires an explicit caller
  * fallback; it MUST NOT be interpreted as alpha rejection or opaque acceptance.
  * Output is unchanged on failure. Sampler callbacks can occur before a failure.
  *

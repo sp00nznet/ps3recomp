@@ -25,7 +25,7 @@
  *       r[D3.sca_dst_tmp]. The SCA unit reads SRC2.
  *   VEC ADD reads src0 + src2 (not src1).
  *   Output register map: o0 = HPOS, o1 = COL0, o2 = COL1, o3/o4 = back-face
- *       colors, o5.x = FOG, o6 = point size / TEX9, o7..o14 = TEX0..7,
+ *       colors, o5.x = FOG, o6 = point size / TEX9, o7..o15 = TEX0..8,
  *       o15 = TEX8. Unwritten outputs default to (0,0,0,1).
  */
 #include "rsx_vp_decompiler.h"
@@ -460,8 +460,10 @@ static int rsx_vp_decompile_impl(
                 snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
                          rhs, saturate ? " _v = saturate(_v);" : "");
                 emit(&b, line);
-                if (vec_result && dst_out != 0x1F)
-                    emit_store_cc(&b, "o[%u]", dst_out & 15, m, &cc);
+                if (vec_result && dst_out != 0x1F) {
+                    if (dst_out > 15) return -1;
+                    emit_store_cc(&b, "o[%u]", dst_out, m, &cc);
+                }
                 if (dst_tmp != 0x3F)
                     emit_store_cc(&b, "r[%u]", dst_tmp & 31, m, &cc);
                 if (cc_update)
@@ -540,8 +542,10 @@ static int rsx_vp_decompile_impl(
                 emit(&b, line);
                 /* SCA writes the output register when the VEC unit does not
                  * own it; otherwise it targets its own temp. */
-                if (!vec_result && dst_out != 0x1F)
-                    emit_store_cc(&b, "o[%u]", dst_out & 15, m, &cc);
+                if (!vec_result && dst_out != 0x1F) {
+                    if (dst_out > 15) return -1;
+                    emit_store_cc(&b, "o[%u]", dst_out, m, &cc);
+                }
                 if (sca_dst_tmp != 0x3F)
                     emit_store_cc(&b, "r[%u]", sca_dst_tmp & 31, m, &cc);
                 emit(&b, "    }\n");
@@ -590,6 +594,7 @@ static int rsx_vp_decompile_impl(
         "    float4 fog:FOG;\n"
         "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
         "};\n"
         /* b0: 512 vec4 transform constants + the RSX viewport transform,
          * pre-mapped by the harness to D3D clip space:
@@ -655,7 +660,8 @@ static int rsx_vp_decompile_impl(
     if (has_flow) emit(&o, "    }\n");
 
     /* Output register map (see header comment): o0 = HPOS through the RSX
-     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7. */
+     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o15 = TEX0..8.
+     * TEX9 shares o6 with point-size/clip outputs; never wrap invalid o16. */
     emit(&o,
         "    VSOutput Out;\n"
         "    float4 _p = o[0];\n"
@@ -663,6 +669,7 @@ static int rsx_vp_decompile_impl(
         "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
         "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"
+        "    Out.t8=o[15]; Out.t9=o[6];\n"
         "    return Out;\n"
         "}\n");
 

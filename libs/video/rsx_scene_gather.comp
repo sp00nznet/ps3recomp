@@ -4,15 +4,27 @@ layout(std430,binding=0) readonly buffer Outputs {vec4 value[];} vs;
 layout(std430,binding=1) readonly buffer Indices {uvec4 triangle[];} indices;
 layout(std430,binding=2) writeonly buffer Positions {float xyz[];} positions;
 layout(std430,binding=3) buffer Validity {uint flags;} validity;
-struct Material {uvec4 alpha;uvec4 raster;uvec4 textures;};
+struct Material {uvec4 alpha;uvec4 raster;uvec4 textures;vec4 depth_range;uvec4 authored;uvec4 rgb_textures[2];vec4 light_view[4];vec4 light_rgb[4];vec4 light_to_view[3];};
 layout(std430,binding=4) readonly buffer Materials {Material value[];} materials;
+layout(std430,binding=6) buffer Diagnostics {uint value[];} diagnostics;
 layout(std140,binding=7) uniform Parameters {vec4 projection;uvec4 dims;uvec4 counts;vec4 settings;} p;
 bool finite3(vec3 v){return !any(isnan(v)) && !any(isinf(v));}
-bool clipToView(vec4 clip,out vec3 point){
+bool clipToView(vec4 clip,vec2 depthRange,float sourceH,out vec3 point){
+    // Undo only the host normalization. The paired viewport stores effective
+    // depth unchanged; common projection is qualified by the engine's epoch.
+    precise float depth=(depthRange.y-depthRange.x)*clip.z+depthRange.x*clip.w;
     // Inverse of the qualified centered positive-Z projection, homogeneous.
     // Unlike dividing clip by clip.w, this retains vertices on the camera plane.
-    float w=(clip.z-p.projection.z*clip.w)/p.projection.w;
-    if(isnan(w)||isinf(w)||abs(w)<1e-20)return false;
+    precise float w=(depth-p.projection.z*clip.w)/p.projection.w;
+    if(sourceH!=0.0){
+        if(isnan(sourceH)||isinf(sourceH)||sourceH<=1e-20)return false;
+        precise float predicted=p.projection.z*clip.w+p.projection.w*sourceH;
+        if(abs(predicted-depth)>1e-5*max(1.0,max(abs(predicted),abs(depth))))return false;
+        w=sourceH;
+    }
+    // Match trace varying recovery's supported positive homogeneous domain.
+    // Unsupported scales fail this epoch before entering the acceleration data.
+    if(isnan(w)||isinf(w)||w<=1e-20)return false;
     point=vec3(clip.x/p.projection.x,clip.y/p.projection.y,clip.w)/w;
     return finite3(point);
 }
@@ -20,7 +32,23 @@ void main(){
     uint t=gl_GlobalInvocationID.x;if(t>=p.counts.x)return;
     uvec4 ids=indices.triangle[t];vec3 v[3];bool good=(atomicOr(validity.flags,0u)&1u)==0u;
     if(any(greaterThanEqual(ids.xyz,uvec3(p.counts.y))) || ids.w>=materials.value.length())good=false;
-    if(good)for(uint i=0;i<3;i++)if(!clipToView(vs.value[ids[i]*12],v[i]))good=false;
+    if(good)for(uint i=0;i<3;i++){
+        float h=materials.value[ids.w].authored.w!=0u?uintBitsToFloat(indices.triangle[p.counts.x+t][i]):0.0;
+        vec4 clip=vs.value[ids[i]*14];vec2 range=materials.value[ids.w].depth_range.xy;
+        if(!clipToView(clip,range,h,v[i])){
+            good=false;uint base=p.dims.x*p.dims.y*10u;
+            if(diagnostics.value.length()>=base+32u && atomicCompSwap(diagnostics.value[base+31u],0u,t+1u)==0u){
+                diagnostics.value[base+12u]=ids[i];diagnostics.value[base+13u]=ids.w;
+                for(uint j=0;j<4;j++)diagnostics.value[base+14u+j]=floatBitsToUint(clip[j]);
+                diagnostics.value[base+18u]=floatBitsToUint(h);
+                diagnostics.value[base+19u]=floatBitsToUint(range.x);diagnostics.value[base+20u]=floatBitsToUint(range.y);
+                float depth=(range.y-range.x)*clip.z+range.x*clip.w;
+                diagnostics.value[base+21u]=floatBitsToUint(depth);
+                diagnostics.value[base+22u]=floatBitsToUint(p.projection.z*clip.w+p.projection.w*h);
+                diagnostics.value[base+23u]=floatBitsToUint((depth-p.projection.z*clip.w)/p.projection.w);
+            }
+        }
+    }
     if(!good){atomicOr(validity.flags,1u);v[0]=v[1]=v[2]=vec3(0);}
     else {
         Material m=materials.value[ids.w];

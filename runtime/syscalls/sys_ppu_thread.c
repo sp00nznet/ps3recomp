@@ -386,6 +386,61 @@ unsigned ppu_thread_prof_pc(unsigned tid)
  * iterate guest threads without depending on ppu_thread_info's layout. */
 static unsigned s_prof_main_pc = 0;   /* main guest thread: ctx lives outside the table */
 
+void ppu_vdec_wait_trace(ppu_context* ctx, const char* operation,
+                         uint32_t object, int64_t result)
+{
+    static volatile long enabled = -1;
+    static volatile long consumer_count = 0;
+    static volatile long producer_count = 0;
+    static volatile long armed = 0;
+    if (!ctx || !operation) return;
+#ifdef _WIN32
+    long on = InterlockedCompareExchange(&enabled, 0, 0);
+#else
+    long on = __atomic_load_n(&enabled, __ATOMIC_ACQUIRE);
+#endif
+    if (on < 0) {
+        const char* e = getenv("PS3_VDEC_WAIT_TRACE");
+        long value = (e && e[0] == '1') ? 1 : 0;
+#ifdef _WIN32
+        InterlockedCompareExchange(&enabled, value, -1);
+        on = InterlockedCompareExchange(&enabled, 0, 0);
+#else
+        long expected = -1;
+        __atomic_compare_exchange_n(&enabled, &expected, value, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        on = __atomic_load_n(&enabled, __ATOMIC_ACQUIRE);
+#endif
+    }
+    if (!on) return;
+#ifdef _WIN32
+    if (ctx->thread_id == 11) InterlockedExchange(&armed, 1);
+    if (!InterlockedCompareExchange(&armed, 0, 0)) return;
+#else
+    if (ctx->thread_id == 11) __atomic_store_n(&armed, 1, __ATOMIC_RELEASE);
+    if (!__atomic_load_n(&armed, __ATOMIC_ACQUIRE)) return;
+#endif
+    /* Separate budgets ensure a fast consumer loop cannot suppress producer
+     * evidence. Sample powers of two after the first 48 consumer calls. */
+    volatile long* counter = ctx->thread_id == 11 ? &consumer_count : &producer_count;
+#ifdef _WIN32
+    long before = InterlockedCompareExchange(counter, 0, 0);
+    if (before >= (ctx->thread_id == 11 ? 1048576 : 128)) return;
+    long n = InterlockedIncrement(counter);
+#else
+    long before = __atomic_load_n(counter, __ATOMIC_RELAXED);
+    if (before >= (ctx->thread_id == 11 ? 1048576 : 128)) return;
+    long n = __sync_add_and_fetch(counter, 1);
+#endif
+    if (ctx->thread_id == 11) {
+        if (n > 48 && ((unsigned long)n & ((unsigned long)n - 1)) != 0) return;
+    } else if (n > 128) return;
+    fprintf(stderr, "[vdec-wait] n=%ld tid=%llu op=%s obj=%u result=0x%08X pc=0x%08X cia=0x%08X lr=0x%08X\n",
+            n, (unsigned long long)ctx->thread_id, operation, object,
+            (unsigned)(uint32_t)result, ppu_thread_prof_pc((unsigned)ctx->thread_id),
+            (unsigned)ctx->cia, (unsigned)ctx->lr);
+}
+
 int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
 {
     if (idx < 0 || idx >= PPU_THREAD_MAX) return 0;
@@ -786,6 +841,8 @@ static uint32_t g_cdl_v0, g_cdl_s0, g_cdl_s1, g_cdl_s6;
 
 int64_t sys_ppu_thread_yield(ppu_context* ctx)
 {
+    if (ctx->thread_id == 11)
+        ppu_vdec_wait_trace(ctx, "thread-yield", 0, -1);
     /* PS1_SPINWAIT=1: who is yielding, and what is it waiting for?
      *
      * The chain, established from lr + ctr on a caught stall: the interpreter

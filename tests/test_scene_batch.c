@@ -21,14 +21,14 @@ static const char fixture[]=
     "o.col0=c[2];o.t7=asfloat(asuint(c[42]));return o;}\n";
 int main(int argc,char **argv)
 {
-    _Static_assert(sizeof(rsx_scene_vertex_output)==192,"full output contract");
+    _Static_assert(sizeof(rsx_scene_vertex_output)==224,"full output contract");
     rsx_vertex_layout_plan layout={0};layout.mask=1;layout.stride=16;layout.count=1;
     char *source=rsx_scene_batch_compute_source(fixture,&layout);CHECK(source);
     CHECK(strstr(source,"VSOutput rsx_scene_vertex(VSInput input)"));
     CHECK(strstr(source,"if(id.x>=rsx_scene_count) return;"));
     CHECK(!strstr(source,"if(id.x>=1)"));
     CHECK(strstr(source,"input.a0=rsx_scene_in[rsx_scene_input_base+id.x*1+0];"));
-    CHECK(strstr(source,"rsx_scene_out[rsx_scene_output_base+id.x*12+11]=result.t7;"));
+    CHECK(strstr(source,"rsx_scene_out[rsx_scene_output_base+id.x*14+11]=result.t7;"));
     CHECK(strstr(source,"result.pos=float4(0,0,0,0)"));
     CHECK(!strstr(source,"result.t7=") && !strstr(source,"result.col0="));
     CHECK(strstr(source,"InterlockedOr(rsx_scene_validity[0],1u"));

@@ -4,7 +4,7 @@
 #include <string.h>
 #include <math.h>
 
-_Static_assert(sizeof(rsx_scene_vertex_output)==192,"scene vertex output layout must be 12 float4 values");
+_Static_assert(sizeof(rsx_scene_vertex_output)==224,"scene vertex output layout must be 14 float4 values");
 
 static char* compute_source(const char* vs,const rsx_vertex_layout_plan* l,unsigned count,int full)
 {
@@ -36,10 +36,14 @@ static char* compute_source(const char* vs,const rsx_vertex_layout_plan* l,unsig
     for(unsigned i=0;i<l->count;++i)
         used+=(size_t)sprintf(out+used,"input.a%u=rsx_scene_in[id.x*%u+%u];\n",l->attrs[i],l->count,i);
     if(full) {
-        static const char* const fields[]={"pos","col0","col1","fog","t0","t1","t2","t3","t4","t5","t6","t7"};
+        static const char* const fields[]={"pos","col0","col1","fog","t0","t1","t2","t3","t4","t5","t6","t7","t8","t9"};
         used+=(size_t)sprintf(out+used,"VSOutput result=rsx_scene_vertex(input);\n");
-        for(unsigned i=0;i<12;++i)
-            used+=(size_t)sprintf(out+used,"rsx_scene_out[id.x*12+%u]=result.%s;\n",i,fields[i]);
+        for(unsigned i=0;i<14;++i) {
+            /* Archived eight-coordinate captures keep zero for absent fields. */
+            if(i>=12 && !strstr(vs,i==12?"TEXCOORD8":"TEXCOORD9"))
+                used+=(size_t)sprintf(out+used,"rsx_scene_out[id.x*14+%u]=(float4)0;\n",i);
+            else used+=(size_t)sprintf(out+used,"rsx_scene_out[id.x*14+%u]=result.%s;\n",i,fields[i]);
+        }
         strcpy(out+used,"}\n");
     }else strcpy(out+used,"VSOutput result=rsx_scene_vertex(input); rsx_scene_out[id.x]=result.pos; }\n");
     return out;

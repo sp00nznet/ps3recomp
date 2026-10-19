@@ -239,6 +239,7 @@ typedef struct vk_state {
     u32              last_center;
     u32              presented;
     u64              successful_window_presents;
+    u64              successful_offscreen_frames; /* completed GPU readbacks */
     int              swapchain_dirty;
     int              present_deferred;
     const char*      dump_path;
@@ -2322,6 +2323,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
     size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
+    if (!s_vk.windowed) s_vk.successful_offscreen_frames++;
     s_vk.presented++;
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
@@ -2381,6 +2383,7 @@ static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 
 /* Optional live scene collection, implemented after the scene-batch module. */
 static int vk_rt_shader_contract(const char* source,u32* mask,u32* bytes);
+static int vk_rt_source_sha256(const char* source,char hex[65]);
 static void vk_rt_capture_clear(u32 depth,float value);
 static void vk_rt_capture_resource(u32 resource);
 static void vk_rt_capture_pipeline(u32 pipeline);
@@ -2863,7 +2866,7 @@ static void vk_eng_present(void* user, u32 surface)
                         s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                         (display_width == fit_w && display_height == fit_h) ? VK_FILTER_NEAREST
                                                                            : VK_FILTER_LINEAR);
-        vk_submit_and_wait();
+        if (vk_submit_and_wait()) return;
     }
     vk_cb_present(&s_vk, 0);
 }
@@ -3206,6 +3209,7 @@ typedef struct vk_eng_pipe {
     int                 used;
     VkShaderModule      vs, fs;
     char *scene_vs, *scene_ps;
+    char scene_vs_sha256[65],scene_ps_sha256[65];
     int scene_alpha_contract;
     u32 scene_alpha_mask,scene_alpha_fp_bytes;
     rsx_vertex_layout_plan scene_layout;
@@ -3471,7 +3475,9 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
             if(P->scene_vs && P->scene_ps) {
                 memcpy(P->scene_vs,vs_hlsl,vl+1);memcpy(P->scene_ps,ps_hlsl,pl+1);
                 P->scene_layout=*layout;
-                P->scene_alpha_contract=rs->alpha_test_enable?vk_rt_shader_contract(ps_hlsl,&P->scene_alpha_mask,&P->scene_alpha_fp_bytes):-1;
+                P->scene_alpha_contract=vk_rt_shader_contract(ps_hlsl,&P->scene_alpha_mask,&P->scene_alpha_fp_bytes);
+                vk_rt_source_sha256(vs_hlsl,P->scene_vs_sha256);
+                vk_rt_source_sha256(ps_hlsl,P->scene_ps_sha256);
             } else {free(P->scene_vs);free(P->scene_ps);P->scene_vs=P->scene_ps=NULL;}
         }
     }
@@ -4186,6 +4192,7 @@ static rsx_backend s_vulkan_backend = {
 #include "rsx_vulkan_scene_batch.inc"
 #include "rsx_vulkan_rt_capture.inc"
 #include "rsx_vulkan_ray_ao.inc"
+#include "rsx_vulkan_dlss.inc"
 
 static int vk_init_all(u32 width, u32 height, const char* title)
 {
@@ -4228,7 +4235,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         app.apiVersion=VK_API_VERSION_1_1;s_vk.cacao_api_ok=1;
     }
 #endif
-    if (s_vk.rt_requested) {
+    if (s_vk.rt_requested || vk_dlss_requested()) {
         PFN_vkEnumerateInstanceVersion rt_enum=(PFN_vkEnumerateInstanceVersion)
             pvkGetInstanceProcAddr(VK_NULL_HANDLE,"vkEnumerateInstanceVersion");
         u32 version=VK_API_VERSION_1_0;
@@ -4240,9 +4247,12 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         ci.enabledExtensionCount   = s_vk.inst_ext_count;
         ci.ppEnabledExtensionNames = s_vk.inst_exts;
     }
+    const char *dlss_inst_names[64];
+    vk_dlss_instance_prepare(&ci,dlss_inst_names,64,app.apiVersion);
     VkResult ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
     if (ir != VK_SUCCESS && s_vk.windowed) {
         vk_window_drop("vkCreateInstance with the surface extensions failed");
+        vk_dlss_shutdown();
         ci.enabledExtensionCount = 0;
         ci.ppEnabledExtensionNames = NULL;
         ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
@@ -4274,7 +4284,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
-    const char* dev_exts[4] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    const char* dev_exts[64] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
     /* DXT (BC1-3) is how PS3 titles ship most textures; Vulkan gates it
      * behind a feature, enabled only when the device reports it. */
     VkPhysicalDeviceFeatures have, want;
@@ -4341,7 +4351,23 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         dev_exts[n++]=VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
         dci.enabledExtensionCount=n;dci.ppEnabledExtensionNames=dev_exts;dci.pNext=&rt_as;
     } else if(s_vk.rt_requested) VK_LOG("rayquery unavailable: required device features/queue/format; raster retained\n");
+    VkDeviceCreateInfo baseline_dci=dci;
+    VkPhysicalDeviceFeatures baseline_want=want;
+    int enable_dlss=vk_dlss_device_prepare(&dci,dev_exts,64);
+    if(enable_dlss){
+        /* Vulkan12 includes bufferDeviceAddress, so its promoted feature
+         * must not also occur in the ray query extension chain. */
+        rt_rq.pNext=NULL;
+        want.shaderStorageImageExtendedFormats=have.shaderStorageImageExtendedFormats;
+        want.shaderInt16=have.shaderInt16;
+    }
     VkResult device_result=pvkCreateDevice(s_vk.phys,&dci,NULL,&s_vk.device);
+    if(device_result!=VK_SUCCESS && enable_dlss){
+        VK_LOG("DLSS device creation failed (%d); retaining prior rendering requirements\n",(int)device_result);
+        enable_dlss=0;dci=baseline_dci;want=baseline_want;rt_rq.pNext=&rt_bda;
+        vk_dlss_shutdown();
+        device_result=pvkCreateDevice(s_vk.phys,&dci,NULL,&s_vk.device);
+    }
     if(device_result!=VK_SUCCESS && enable_rt) {
         VK_LOG("rayquery device creation failed (%d); retrying existing raster features\n",(int)device_result);
         enable_rt=0;dci.pNext=NULL;dci.enabledExtensionCount=s_vk.windowed?1u:0u;
@@ -4352,6 +4378,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.rt_enabled=enable_rt;
     if(enable_rt)VK_LOG("rayquery logical device features enabled; gameplay scene not yet qualified\n");
     if (vk_load_device_functions()) return -1;
+    vk_dlss_device_selected(enable_dlss);
+    vk_dlss_device_created();
     vk_pcache_init(s_vk.instance, s_vk.phys, s_vk.device);
     VK_LOG("anisotropy: supported=%d device_limit=%g override=%u (0=guest,1=off)\n",
            s_vk.anisotropy_ok, (double)s_vk.max_anisotropy, s_vk.anisotropy_override);
@@ -4463,6 +4491,25 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
     else
         rsx_set_backend(&s_vulkan_backend);
     VK_LOG("%s path\n", s_vk.eng_active ? "register-file draw engine" : "vtable");
+    /* Driver compilation can take longer than the FIFO liveness watchdog.
+     * Finish requested ray pipelines before the caller releases guest threads. */
+    if(s_vk.rt_requested && s_vk.rt_enabled) {
+        u64 prepare_start=SDL_GetPerformanceCounter();
+        VK_LOG("ray pipeline preparation before guest dispatch started\n");
+        if(!vk_ray_initialize()) {
+            VK_LOG("requested ray pipeline preparation failed\n");
+            rsx_vulkan_backend_shutdown();return -1;
+        }
+        /* Persist expensive ray compilation before guest dispatch, including
+         * runs that never reach their first present. No save thread exists yet. */
+        if(s_pcache.cache && SDL_AtomicGet(&s_pcache.dirty)) {
+            int saved=vk_pcache_save_now(s_vk.device);
+            if(!saved)SDL_AtomicSet(&s_pcache.dirty,0);
+            VK_LOG("ray prewarm pipeline cache checkpoint %s\n",saved?"failed":"saved");
+        }
+        VK_LOG("ray pipeline preparation before guest dispatch completed in %.3fms\n",
+            (double)(SDL_GetPerformanceCounter()-prepare_start)*1000.0/(double)SDL_GetPerformanceFrequency());
+    }
     if (s_vk.fsr1_enabled)
         VK_LOG("FSR1: %s\n", s_vk.eng_active ? "guest display EASU+RCAS, before optional FXAA" :
                "requested but bypassed on diagnostic vtable path; requires draw engine");
@@ -4493,6 +4540,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         if (pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
+        vk_dlss_shutdown();
         vk_rt_ao_shutdown();
         vk_rt_capture_shutdown();
         rsx_vulkan_scene_batch_shutdown();
@@ -4522,6 +4570,7 @@ void rsx_vulkan_backend_shutdown(void)
         vk_pcache_shutdown(s_vk.device);
         pvkDestroyDevice(s_vk.device, NULL);
     }
+    vk_dlss_shutdown();
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
     rsx_vk_library_close(s_vk.lib);
     free(s_vk.cpu_verts);
@@ -4574,6 +4623,11 @@ void rsx_vulkan_backend_present(void)
 u64 rsx_vulkan_backend_successful_presents(void)
 {
     return s_vk.successful_window_presents;
+}
+
+u64 rsx_vulkan_backend_successful_offscreen_frames(void)
+{
+    return s_vk.successful_offscreen_frames;
 }
 
 int rsx_vulkan_backend_window_active(void)

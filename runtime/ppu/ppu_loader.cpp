@@ -2284,14 +2284,31 @@ static uint32_t ppu_code_hi(void)
  * vm_oob() only bounds the arena. Inside it, vm_stack_allocate() leaves an
  * inaccessible guard page below every guest thread's stack, so a scan that
  * runs up past the top of a shallow stack lands on the guard of the stack
- * allocated after it. On Windows the port's demand-commit handler turns that
- * read into a commit; on POSIX it is a SIGSEGV, and the diagnostic takes the
- * title down with it. Off Windows, ask the kernel first: write() from an
+ * allocated after it. Do not let diagnostics trigger demand commits or guard
+ * faults. On Windows query page protections; off Windows ask the kernel first:
+ * write() from an
  * unreadable page fails with EFAULT instead of faulting. */
 static bool ppu_dump_readable(uint32_t ea, uint32_t n)
 {
-    if (vm_oob(ea, n)) return false;
+    if (!n || (uint64_t)ea + n > 0x100000000ULL || vm_oob(ea, n)) return false;
 #ifdef _WIN32
+    /* Diagnostics must never demand-commit guest memory or consume guards.
+     * A valid arena offset is not proof that the pages are readable. */
+    uintptr_t at = (uintptr_t)(vm_base + ea);
+    const uintptr_t end = at + n;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((const void*)at, &mbi, sizeof mbi) ||
+            mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
+        const DWORD access = mbi.Protect & 0xFF;
+        if (access != PAGE_READONLY && access != PAGE_READWRITE &&
+            access != PAGE_WRITECOPY && access != PAGE_EXECUTE_READ &&
+            access != PAGE_EXECUTE_READWRITE && access != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= at) return false;
+        at = next;
+    }
     return true;
 #else
     static int s_probe[2] = {-1, -1};
@@ -2307,6 +2324,37 @@ static bool ppu_dump_readable(uint32_t ea, uint32_t n)
     }
     return true;
 #endif
+}
+
+/* Read through the kernel on Windows so a protection change after the query
+ * fails the diagnostic instead of dereferencing an inaccessible guest page.
+ * Accept a wide address to reject arithmetic wrap before narrowing to EA. */
+static bool ppu_dump_word(uint64_t ea, uint32_t* word)
+{
+    if (!word || ea > UINT32_MAX || !ppu_dump_readable((uint32_t)ea, 4)) return false;
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    return ReadProcessMemory(GetCurrentProcess(), vm_base + ea, word, 4, &copied) && copied == 4;
+#else
+    memcpy(word, vm_base + ea, 4);
+    return true;
+#endif
+}
+
+/* Bounded raw diagnostic snapshot. Never publishes partial reads. */
+extern "C" int ppu_diagnostic_read(uint64_t ea, void* destination, uint32_t bytes)
+{
+    unsigned char temporary[256];
+    if(!vm_base || !destination || !bytes || bytes>sizeof temporary ||
+       ea>UINT32_MAX || ea+bytes>0x100000000ULL ||
+       !ppu_dump_readable((uint32_t)ea,bytes)) return 0;
+#ifdef _WIN32
+    SIZE_T copied=0;
+    if(!ReadProcessMemory(GetCurrentProcess(),vm_base+ea,temporary,bytes,&copied) || copied!=bytes) return 0;
+#else
+    memcpy(temporary,vm_base+ea,bytes);
+#endif
+    memcpy(destination,temporary,bytes);return 1;
 }
 
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
@@ -2339,7 +2387,7 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
           fprintf(stderr, "%s\n", gr);
       } }
     if (ppu_dump_readable(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
-        for (int i=0;i<24 && ppu_dump_readable(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
+        for (int i=0;i<24;i++){ uint32_t t; if (!ppu_dump_word((uint64_t)sp+i*4,&t)) break; rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
         fprintf(stderr,"%s\n",rw); }
     /* Identify the worker's dispatched method: func_000750A8 vcalls
      * [[arg+0xC]+0] (code) with toc [[arg+0xC]+4]. Dump for the known thread
@@ -2347,13 +2395,13 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
      * receive-loop function even though the thread stack has no return addrs. */
     { const uint32_t args[2] = {0x40003450u, 0x40003E80u};
       for (int j=0;j<2;j++){ uint32_t o=args[j];
-        if (!ppu_dump_readable(o+0xC,8)) continue;
         uint32_t vt, code, toc; { uint32_t t;
-          memcpy(&t,vm_base+o+0xC,4); vt=__builtin_bswap32(t);
-          if (vt<0x600000 || vt>=0x50000000u) { /* vt could be a guest ptr */ }
+          if (!ppu_dump_word((uint64_t)o+0xC,&t)) continue;
+          vt=__builtin_bswap32(t);
         }
-        if (ppu_dump_readable(vt,8)) { uint32_t t; memcpy(&t,vm_base+vt,4); code=__builtin_bswap32(t);
-          memcpy(&t,vm_base+vt+4,4); toc=__builtin_bswap32(t);
+        uint32_t raw_code, raw_toc;
+        if (ppu_dump_word(vt,&raw_code) && ppu_dump_word((uint64_t)vt+4,&raw_toc)) {
+          code=__builtin_bswap32(raw_code); toc=__builtin_bswap32(raw_toc);
           fprintf(stderr,"      ARG[0x%08X] vtbl=0x%08X -> method code=0x%08X toc=0x%08X (worker body?)\n", o, vt, code, toc); }
       } }
     /* The real frame chain FIRST, then the scan.
@@ -2371,11 +2419,9 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     { char bc[900]; int bp = snprintf(bc, sizeof bc, "[GSTACK:%s] chain:", tag ? tag : "?");
       uint32_t f = sp;
       for (int d = 0; d < 24 && bp < 820; d++) {
-          if (!ppu_dump_readable(f, 8)) break;
-          uint32_t t; memcpy(&t, vm_base + f + 4, 4);   /* low half of the 64-bit back chain */
+          uint32_t t; if (!ppu_dump_word((uint64_t)f + 4, &t)) break;
           uint32_t prev = __builtin_bswap32(t);
-          if (prev <= f || !ppu_dump_readable(prev + 0x14, 4)) break;   /* stacks grow down */
-          memcpy(&t, vm_base + prev + 0x14, 4);         /* low half of the saved lr */
+          if (prev <= f || !ppu_dump_word((uint64_t)prev + 0x14, &t)) break;
           uint32_t ra = __builtin_bswap32(t);
           if (ra >= 0x10000 && ra < ppu_code_hi()) {
               uint32_t bg = 0;
@@ -2390,8 +2436,8 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     char gs[1200]; int gp = snprintf(gs, sizeof gs, "[GSTACK:%s] sp=0x%08X:", tag ? tag : "?", sp);
     uint32_t last = 0;
     for (int i = 0; i < 700 && gp < 1100; i++) {
-        uint32_t a = sp + i*4; if (!ppu_dump_readable(a,4)) break;
-        uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
+        uint32_t t; if (!ppu_dump_word((uint64_t)sp + i*4, &t)) break;
+        uint32_t w = __builtin_bswap32(t);
         if (w < 0x10000 || w >= ppu_code_hi()) continue;
         uint32_t bg = 0;
         for (uint64_t k = 0; k < function_table_count; k++) { uint32_t aa = function_table[k].addr; if (aa <= w && aa > bg) bg = aa; }
@@ -2424,8 +2470,8 @@ int ppu_alloc_probe(void* vctx, uint32_t size, uint32_t obj, uint32_t sp)
     char gs[1400]; int gp = snprintf(gs, sizeof gs, "      GSTACK-codeptrs:");
     uint32_t last = 0;
     for (int i = 0; i < 900 && gp < 1300; i++) {
-        uint32_t a = sp + i*4; if (!ppu_dump_readable(a,4)) break;
-        uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
+        uint32_t t; if (!ppu_dump_word((uint64_t)sp + i*4, &t)) break;
+        uint32_t w = __builtin_bswap32(t);
         if (w < 0x10000 || w >= 0x900000) continue;
         uint32_t bg = 0;
         for (uint64_t k = 0; k < function_table_count; k++) { uint32_t aa = function_table[k].addr; if (aa <= w && aa > bg) bg = aa; }

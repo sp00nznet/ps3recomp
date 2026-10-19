@@ -23,7 +23,7 @@ static int rsx_sb_emit(char *text,size_t capacity,size_t *used,const char *forma
 char *rsx_scene_batch_compute_source(const char *vs,const rsx_vertex_layout_plan *layout)
 {
     static const char marker[]="\nRWStructuredBuffer<float4> rsx_scene_in : register(u80);\n";
-    static const char *const fields[]={"pos","col0","col1","fog","t0","t1","t2","t3","t4","t5","t6","t7"};
+    static const char *const fields[]={"pos","col0","col1","fog","t0","t1","t2","t3","t4","t5","t6","t7","t8","t9"};
     if(rsx_sb_string_length(vs)==SIZE_MAX)return NULL;
     /* Reuse diagnostic validation/entry renaming. Only replace the exact
      * generated wrapper suffix, never arbitrary text inside a guest program. */
@@ -46,11 +46,15 @@ char *rsx_scene_batch_compute_source(const char *vs,const rsx_vertex_layout_plan
     RSX_SB_EMIT("VSOutput result=rsx_scene_vertex(input); uint rsx_scene_old;\n"
         "if(any(isnan(result.pos)) || any(isinf(result.pos))) { result.pos=float4(0,0,0,0); InterlockedOr(rsx_scene_validity[0],1u,rsx_scene_old); }\n"
         "bool rsx_scene_varying_bad=false;\n");
-    for(unsigned i=1;i<12;i++)
+    for(unsigned i=1;i<14;i++)
+        if(i<12 || strstr(vs,i==12?"TEXCOORD8":"TEXCOORD9"))
         RSX_SB_EMIT("rsx_scene_varying_bad=rsx_scene_varying_bad || any(isnan(result.%s)) || any(isinf(result.%s));\n",fields[i],fields[i]);
     RSX_SB_EMIT("if(rsx_scene_varying_bad) InterlockedOr(rsx_scene_validity[0],2u,rsx_scene_old);\n");
-    for(unsigned i=0;i<12;i++)
-        RSX_SB_EMIT("rsx_scene_out[rsx_scene_output_base+id.x*12+%u]=result.%s;\n",i,fields[i]);
+    for(unsigned i=0;i<14;i++) {
+        if(i>=12 && !strstr(vs,i==12?"TEXCOORD8":"TEXCOORD9"))
+            RSX_SB_EMIT("rsx_scene_out[rsx_scene_output_base+id.x*14+%u]=(float4)0;\n",i);
+        else RSX_SB_EMIT("rsx_scene_out[rsx_scene_output_base+id.x*14+%u]=result.%s;\n",i,fields[i]);
+    }
     RSX_SB_EMIT("}\n");
 #undef RSX_SB_EMIT
     return out;
@@ -202,7 +206,8 @@ static int rsx_sb_pipeline_get(rsx_sb_state *b,const rsx_scene_batch_input *in,u
     if(pvkCreateShaderModule(s_vk.device,&sm,NULL,&module)!=VK_SUCCESS)goto done;
     VkComputePipelineCreateInfo pc={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=module,.pName="main"},.layout=b->pipeline_layout};
-    if(b->create_compute(s_vk.device,VK_NULL_HANDLE,1,&pc,NULL,&pipeline)!=VK_SUCCESS)goto done;
+    if(b->create_compute(s_vk.device,vk_pcache(),1,&pc,NULL,&pipeline)!=VK_SUCCESS)goto done;
+    vk_pcache_created();
     *index=b->cache_count;b->cache[b->cache_count++]=(rsx_sb_pipeline){key,in->layout,pipeline};b->key_bytes+=length+1;key=NULL;pipeline=VK_NULL_HANDLE;result=0;
 done:
     if(module)pvkDestroyShaderModule(s_vk.device,module,NULL);if(pipeline)pvkDestroyPipeline(s_vk.device,pipeline,NULL);
@@ -280,7 +285,7 @@ int rsx_vulkan_scene_batch_record(uint64_t token,VkCommandBuffer command,VkFence
     for(uint32_t i=0;i<b->cpu.draw_count;i++) {
         unsigned char *target=(unsigned char*)b->constants.ptr+(size_t)stride*i;
         memcpy(target,b->cpu.constants+(size_t)i*RSX_SCENE_BATCH_CONSTANT_BYTES,RSX_SCENE_BATCH_CONSTANT_BYTES);
-        uint32_t parameters[4]={b->cpu.draw[i].count,(uint32_t)(b->cpu.draw[i].input_offset/16),b->cpu.draw[i].base*12,0};
+        uint32_t parameters[4]={b->cpu.draw[i].count,(uint32_t)(b->cpu.draw[i].input_offset/16),b->cpu.draw[i].base*14,0};
         memcpy(target+(size_t)param_offset,parameters,sizeof parameters);
     }
     VkDescriptorBufferInfo info[5]={{b->constants.buf,0,RSX_SCENE_BATCH_CONSTANT_BYTES},{b->constants.buf,0,16},

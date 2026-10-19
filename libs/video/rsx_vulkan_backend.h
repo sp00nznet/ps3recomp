@@ -104,6 +104,8 @@ void rsx_vulkan_backend_present(void);
  * Headless readbacks and failed presents never increment this counter.
  * These queries are called by the backend's owning render thread. */
 u64 rsx_vulkan_backend_successful_presents(void);
+/* Completed offscreen GPU readbacks; this never counts window presentation. */
+u64 rsx_vulkan_backend_successful_offscreen_frames(void);
 int rsx_vulkan_backend_window_active(void);
 /* Last present was deferred by minimization or swapchain recreation. No
  * submission is counted. The caller retains the pending flip and pumps events. */
