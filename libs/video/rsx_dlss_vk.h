@@ -150,6 +150,7 @@ typedef struct rsx_dlss_frame {
     float pre_exposure;              /* Finite and > 0. */
     float exposure_scale;            /* Finite and > 0. */
     uint32_t reset;                  /* 1 on first frame or history discontinuity. */
+    rsx_dlss_image bias;             /* Optional R8 current-color bias for unmatched motion. */
 } rsx_dlss_frame;
 
 /* Caller owns image memory, usage bits, barriers and real Vulkan layouts.

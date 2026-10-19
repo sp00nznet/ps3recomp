@@ -2358,6 +2358,7 @@ typedef struct vk_eng_obj {
     u32      bpp;                    /* bytes per texel, 0 for depth     */
     u32      w, h;                 /* physical image extent */
     u32      scale, grid_x, grid_y; /* guest raster scale and expanded sample grid */
+    u32      guest_w, guest_h;       /* explicit extent for fractional world scale */
     u32      samples, expanded;
     int      expansion_valid;
     vk_image im;                     /* a VIEW owns only im.view            */
@@ -2391,6 +2392,10 @@ static void vk_rt_capture_present(void);
 static void vk_rt_capture_shutdown(void);
 static void vk_rt_ao_shutdown(void);
 static u32 vk_eng_ray_world(void* user,u32 color,u32 depth,u32 logical_w,u32 logical_h,const float projection[16],u32 remap,u32 rsx_format,float radius,float strength);
+static u64 s_temporal_geometry,s_temporal_slots;
+static void vk_eng_temporal_identity(void* user,u64 geometry,u64 slots){(void)user;s_temporal_geometry=geometry;s_temporal_slots=slots;}
+static void vk_dlss_jitter(float out[2]);
+static void vk_dlss_jitter_upload(void *constants,size_t bytes);
 static void vk_rt_capture_draw(u32 pipeline,rsx_topology topology,const void* vertices,
     u32 vertex_count,u32 stride,const u32* indices,u32 index_count);
 /* Defined with the E2 pipeline state further down. */
@@ -2714,7 +2719,10 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
 
 static u32 vk_eng_target_multisample(void* user, rsx_be_format fmt, u32 w, u32 h, u32 samples, int depth)
 {
+    const u32 guest_w=w,guest_h=h;
+    const int quality=vk_eng_quality_world(w,h,samples);
     if ((samples != 2 && samples != 4) || vk_eng_scale_extent(&w,&h,samples)) return 0;
+    if(quality){w=1707;h=960;}
     u32 bpp = 0;
     const VkFormat vf = depth ? s_vk.depth_format : vk_eng_format(fmt, &bpp);
     if (!depth && vk_eng_rt_index(vf) < 0) return 0;
@@ -2729,6 +2737,7 @@ static u32 vk_eng_target_multisample(void* user, rsx_be_format fmt, u32 w, u32 h
     }
     o->kind = depth ? VK_ENG_DEPTH : VK_ENG_COLOR;
     o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h; o->scale=s_render_scale; o->samples = samples;
+    if(quality){o->guest_w=guest_w;o->guest_h=guest_h;}
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkImageSubresourceRange range = {aspect, 0, 1, 0, 1};
@@ -3058,7 +3067,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     }
     o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
-    o->scale=t->scale;o->grid_x=t->grid_x;o->grid_y=t->grid_y;
+    o->scale=t->scale;o->grid_x=t->grid_x;o->grid_y=t->grid_y;o->guest_w=t->guest_w;o->guest_h=t->guest_h;
     return hd;
 }
 /* ---- E4: depth snapshots --------------------------------------------------
@@ -3453,7 +3462,8 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
         scaled_ps=(char*)malloc(length+512u);
         if (!scaled_ps) { pvkDestroyShaderModule(s_vk.device,P->vs,NULL); memset(P,0,sizeof *P);return 0; }
         memcpy(scaled_ps,ps_hlsl,length+1u);
-        if (rsx_fp_apply_resolution_scale(scaled_ps,(u32)length+512u,1,1,s_render_scale,s_render_scale)<0) {
+        const int quality=rs->depth_test && vk_eng_quality_world(1280,720,2);
+        if (rsx_fp_apply_resolution_scale(scaled_ps,(u32)length+512u,quality?1280:1,quality?720:1,quality?1707:s_render_scale,quality?960:s_render_scale)<0) {
             free(scaled_ps);pvkDestroyShaderModule(s_vk.device,P->vs,NULL);memset(P,0,sizeof *P);return 0;
         }
     }
@@ -3718,14 +3728,17 @@ static void vk_eng_set_viewport(void* user, float x, float y, float w, float h,
                                 float min_depth, float max_depth)
 {
     (void)user;
-    s_e2.vp[0] = x*s_render_scale; s_e2.vp[1] = y*s_render_scale; s_e2.vp[2] = w*s_render_scale; s_e2.vp[3] = h*s_render_scale; s_e2.have_vp = 1;
+    float sx,sy;vk_eng_bound_scale(&sx,&sy);
+    s_e2.vp[0] = x*sx; s_e2.vp[1] = y*sy; s_e2.vp[2] = w*sx; s_e2.vp[3] = h*sy; s_e2.have_vp = 1;
     s_e2.vp[4] = min_depth; s_e2.vp[5] = max_depth;
 }
 static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 {
     (void)user;
-    s_e2.sc[0] = x>UINT32_MAX/s_render_scale?UINT32_MAX:x*s_render_scale; s_e2.sc[1] = y>UINT32_MAX/s_render_scale?UINT32_MAX:y*s_render_scale;
-    s_e2.sc[2] = w>UINT32_MAX/s_render_scale?UINT32_MAX:w*s_render_scale; s_e2.sc[3] = h>UINT32_MAX/s_render_scale?UINT32_MAX:h*s_render_scale; s_e2.have_sc = 1;
+    float sx,sy;vk_eng_bound_scale(&sx,&sy);
+    double x0=floor((double)x*sx),y0=floor((double)y*sy),x1=ceil(((double)x+w)*sx),y1=ceil(((double)y+h)*sy);
+    s_e2.sc[0]=(u32)fmin(x0,UINT32_MAX);s_e2.sc[1]=(u32)fmin(y0,UINT32_MAX);
+    s_e2.sc[2]=(u32)fmin(x1-x0,UINT32_MAX);s_e2.sc[3]=(u32)fmin(y1-y0,UINT32_MAX);s_e2.have_sc=1;
 }
 static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
 
@@ -4019,6 +4032,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         } else {
             s_batch.sets++;
             memcpy((u8*)s_batch.ubo.ptr + uvs, s_e2.constant_shadow, (size_t)vs_range);
+            vk_dlss_jitter_upload((u8*)s_batch.ubo.ptr+uvs,(size_t)vs_range);
             memcpy((u8*)s_batch.ubo.ptr + ups, s_e2.constant_shadow + s_g.ps_off, (size_t)ps_range);
             if (!vk_eng_write_descriptors_into(P, set, s_batch.ubo.buf, uvs, ups)) return;
             s_batch.ub = ups + (ps_range + a - 1u) / a * a;
@@ -4033,6 +4047,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         if (vk_ensure_vertex_buffer(vbytes)) return;
         if (ibytes && vk_eng_ensure_indices(ibytes)) return;
         memcpy(s_g.ubo.ptr, s_e2.constant_shadow, s_e2.vs_bytes ? s_e2.vs_bytes : 16u);
+        vk_dlss_jitter_upload(s_g.ubo.ptr,s_e2.vs_bytes);
         memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, s_e2.constant_shadow + s_g.ps_off,
                s_e2.ps_bytes ? s_e2.ps_bytes : 16u);
         set = vk_eng_write_descriptors(P);
@@ -4163,6 +4178,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,
     .set_present_aspect   = vk_eng_set_present_aspect,
+    .set_temporal_identity= vk_eng_temporal_identity,
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
@@ -4193,6 +4209,7 @@ static rsx_backend s_vulkan_backend = {
 #include "rsx_vulkan_rt_capture.inc"
 #include "rsx_vulkan_ray_ao.inc"
 #include "rsx_vulkan_dlss.inc"
+#include "rsx_vulkan_dlss_frame.inc"
 
 static int vk_init_all(u32 width, u32 height, const char* title)
 {

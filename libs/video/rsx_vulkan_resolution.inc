@@ -4,6 +4,20 @@
 static u32 s_render_scale = 1;
 static int vk_eng_readback_rows_raw(u32,u32,u32,u32,u32,void*,u32);
 static int vk_eng_depth_readback_raw(u32,u32,u32,u32,u32,void*,u32);
+static int vk_eng_quality_world(u32 w,u32 h,u32 samples)
+{
+    const char *enabled=getenv("PS3RECOMP_DLSS");
+    return enabled && !strcmp(enabled,"1") && w==1280 && h==720 && samples==2;
+}
+static void vk_eng_bound_scale(float *x,float *y)
+{
+    *x=*y=(float)s_render_scale;
+    u32 handle=s_eng_bound.nrt?s_eng_bound.rt[0]:s_eng_bound.depth;
+    if(handle && handle<VK_ENG_MAX_OBJ){
+        const vk_eng_obj *o=&s_eobj[handle];
+        if(o->guest_w && o->guest_h){*x=(float)o->w/o->guest_w;*y=(float)o->h/o->guest_h;}
+    }
+}
 
 static int vk_eng_resolution_config(void)
 {
@@ -47,9 +61,38 @@ static int vk_eng_scale_region_get(const vk_eng_obj* o,u32 x,u32 y,u32 w,u32 h,
 }
 
 typedef int (*vk_eng_raw_reader)(u32,u32,u32,u32,u32,void*,u32);
+/* Preserve sample lanes while crossing a fractional-resolution CPU transfer.
+ * This slow path is for guest readback/upload only; world rendering stays GPU. */
+static int vk_eng_fractional_transfer(u32 handle,const vk_eng_obj *o,u32 bpp,
+    u32 x,u32 y,u32 w,u32 h,void *data,u32 pitch,vk_eng_raw_reader read_raw,int write)
+{
+    if(!data || !bpp || !w || !h || x>o->guest_w || w>o->guest_w-x ||
+       y>o->guest_h || h>o->guest_h-y || (u64)w*bpp>pitch ||
+       (u64)o->w*o->h*bpp>SIZE_MAX || (u64)o->w*bpp>UINT32_MAX)return -1;
+    u32 gx=o->grid_x?o->grid_x:1,gy=o->grid_y?o->grid_y:1;
+    u8 *pixels=(u8*)malloc((size_t)o->w*o->h*bpp);if(!pixels)return -1;
+    int rc=read_raw(handle,0,0,o->w,o->h,pixels,o->w*bpp);
+    if(!rc && !write)for(u32 iy=0;iy<h;iy++)for(u32 ix=0;ix<w;ix++){
+        u32 lx=x+ix,ly=y+iy;
+        u32 hx=(u32)(((u64)(2*(lx/gx)+1)*(o->w/gx))/(2*(o->guest_w/gx)))*gx+lx%gx;
+        u32 hy=(u32)(((u64)(2*(ly/gy)+1)*(o->h/gy))/(2*(o->guest_h/gy)))*gy+ly%gy;
+        memcpy((u8*)data+(size_t)iy*pitch+(size_t)ix*bpp,pixels+((size_t)hy*o->w+hx)*bpp,bpp);
+    }
+    if(!rc && write){
+        for(u32 hy=0;hy<o->h;hy++)for(u32 hx=0;hx<o->w;hx++){
+            u32 lx=(u32)(((u64)(hx/gx)*(o->guest_w/gx))/(o->w/gx))*gx+hx%gx;
+            u32 ly=(u32)(((u64)(hy/gy)*(o->guest_h/gy))/(o->h/gy))*gy+hy%gy;
+            if(lx>=x && lx-x<w && ly>=y && ly-y<h)
+                memcpy(pixels+((size_t)hy*o->w+hx)*bpp,(u8*)data+(size_t)(ly-y)*pitch+(size_t)(lx-x)*bpp,bpp);
+        }
+        rc=vk_eng_upload_region(o->im.img,0,0,0,0,o->w,o->h,(size_t)o->w*bpp,o->h,pixels,o->w*bpp);
+    }
+    free(pixels);return rc;
+}
 static int vk_eng_scaled_read(u32 handle,const vk_eng_obj* o,u32 bpp,
     u32 x,u32 y,u32 w,u32 h,void* out,u32 pitch,vk_eng_raw_reader read_raw)
 {
+    if(o && o->guest_w)return vk_eng_fractional_transfer(handle,o,bpp,x,y,w,h,out,pitch,read_raw,0);
     vk_eng_scale_region r;
     if (!out || !bpp || (u64)w*bpp>pitch || vk_eng_scale_region_get(o,x,y,w,h,&r)) return -1;
     if (r.k==1) return read_raw(handle,x,y,w,h,out,pitch);
@@ -74,6 +117,7 @@ static int vk_eng_scaled_read(u32 handle,const vk_eng_obj* o,u32 bpp,
 static int vk_eng_scaled_write(u32 handle,vk_eng_obj* o,u32 x,u32 y,u32 w,u32 h,
                                 const void* rows,u32 pitch)
 {
+    if(o && o->guest_w)return vk_eng_fractional_transfer(handle,o,o->bpp,x,y,w,h,(void*)rows,pitch,vk_eng_readback_rows_raw,1);
     vk_eng_scale_region r;
     if (!rows || !o || !o->bpp || (u64)w*o->bpp>pitch || vk_eng_scale_region_get(o,x,y,w,h,&r)) return -1;
     if (r.k==1) return vk_eng_upload_region(o->im.img,0,0,x,y,w,h,(size_t)w*o->bpp,h,rows,pitch);

@@ -1,0 +1,103 @@
+#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D sourceColor;
+layout(binding=1) uniform sampler2D sourceDepth;
+layout(std430,binding=2) readonly buffer Vertices {vec4 value[];} vertices;
+layout(std430,binding=3) readonly buffer Indices {uvec4 value[];} indices;
+layout(std430,binding=4) buffer Clips {vec4 value[];} clips;
+layout(std430,binding=5) buffer Draws {uvec4 value[];} draws;
+layout(binding=6) uniform accelerationStructureEXT scene;
+layout(std140,binding=7) uniform Parameters {
+    mat4 reprojection;vec4 projection;vec4 jitter;
+    uvec4 sizes;uvec4 history; // input width/height, vertex count, reset; prev/current bank, unused
+} p;
+layout(rgba16f,binding=8) writeonly uniform image2D colorInput;
+layout(r32f,binding=9) writeonly uniform image2D depthInput;
+layout(rg32f,binding=10) writeonly uniform image2D motionInput;
+layout(r8,binding=11) writeonly uniform image2D biasInput;
+layout(binding=12) uniform sampler2D dlssOutput;
+layout(rgba8,binding=13) writeonly uniform image2D expandedOutput;
+layout(push_constant) uniform Phase {uint mode;} phase;
+bool finite4(vec4 v){return !any(isnan(v))&&!any(isinf(v));}
+void main(){
+    uvec2 pixel=gl_GlobalInvocationID.xy;
+    if(phase.mode==1){
+        uint vertex=pixel.y*1024u+pixel.x;
+        if(pixel.x<1024 && vertex<p.sizes.z)clips.value[p.history.y+vertex]=vertices.value[vertex*14u];
+        return;
+    }
+    if(phase.mode==2){
+        if(pixel.x<5120 && pixel.y<1440){
+            vec4 c=texelFetch(dlssOutput,ivec2(pixel.x/2u,pixel.y),0);
+            if(!finite4(c))atomicAdd(draws.value[257].x,1);
+            imageStore(expandedOutput,ivec2(pixel),finite4(c)?clamp(c,vec4(0),vec4(1)):vec4(0,0,0,1));
+        }
+        return;
+    }
+    if(any(greaterThanEqual(pixel,p.sizes.xy)))return;
+    ivec2 q=ivec2(pixel)*ivec2(2,1);
+    float a=texelFetch(sourceDepth,q,0).r,b=texelFetch(sourceDepth,q+ivec2(1,0),0).r;
+    uint sampleIndex=b<a?1u:0u;float z=min(a,b);
+    if(isnan(z)||isinf(z))z=1;
+    vec4 color=(texelFetch(sourceColor,q,0)+texelFetch(sourceColor,q+ivec2(1,0),0))*.5;
+    imageStore(colorInput,ivec2(pixel),finite4(color)?color:vec4(0,0,0,1));
+    imageStore(depthInput,ivec2(pixel),vec4(z));
+    vec2 motion=vec2(0);float bias=1;
+    vec2 sampleOffset=sampleIndex==0u?vec2(.75):vec2(.25);
+    vec2 uv=(vec2(pixel)+sampleOffset-p.jitter.xy)/vec2(p.sizes.xy);
+    vec4 current=vec4(uv.x*2-1,1-uv.y*2,z,1);
+    if(z>=0 && z<1 && p.sizes.w==0u){
+        vec4 previous=p.reprojection*current;
+        if(finite4(previous)&&previous.w>1e-6)
+            motion=(previous.xy/previous.w-current.xy)*vec2(.5,-.5)*vec2(p.sizes.xy);
+        float depth=p.projection.w/(z-p.projection.z);
+        uint index=pixel.y*p.sizes.x+pixel.x;
+        float oldDepth=clips.value[524288u+index].x;
+        atomicAdd(draws.value[256].x,1);
+        if(oldDepth>0 && abs(oldDepth-depth)>max(.1,depth*.1))atomicAdd(draws.value[256].y,1);
+        clips.value[524288u+index]=vec4(depth);
+        vec3 position=vec3(current.x/p.projection.x,current.y/p.projection.y,1)*depth;
+        float distance=length(position),tolerance=max(.01,distance*.005);
+        vec3 direction=normalize(position);uint owner=0xffffffffu;vec2 bary=vec2(0);float best=1e30;
+        rayQueryEXT ray;rayQueryInitializeEXT(ray,scene,0,255,vec3(0),max(.001,distance-tolerance),direction,distance+tolerance);
+        while(rayQueryProceedEXT(ray))if(rayQueryGetIntersectionTypeEXT(ray,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
+            uint candidate=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false);
+            float delta=abs(rayQueryGetIntersectionTEXT(ray,false)-distance);
+            if(delta<best || (delta==best && candidate<owner)){
+                owner=candidate;best=delta;bary=rayQueryGetIntersectionBarycentricsEXT(ray,false);
+            }
+        }
+        if(owner!=0xffffffffu){
+            uvec4 tri=indices.value[owner],map=draws.value[tri.w];
+            if(map.z!=0u){
+                vec3 weights=vec3(1-bary.x-bary.y,bary);
+                // BVH is in reconstructed view coordinates, so its barycentrics
+                // are affine view-space weights, not screen-space weights.
+                vec4 prev=vec4(0),now=vec4(0);bool valid=true;
+                for(uint i=0;i<3;i++){
+                    vec4 cc=vertices.value[tri[i]*14u];
+                    float h=(cc.z-p.projection.z*cc.w)/p.projection.w;
+                    if(isnan(h)||isinf(h)||h<=1e-6)valid=false;else weights[i]/=h;
+                }
+                float sumWeights=weights.x+weights.y+weights.z;
+                if(sumWeights<=1e-6)valid=false;else weights/=sumWeights;
+                for(uint i=0;i<3;i++){
+                    uint local=tri[i]-map.y;
+                    vec4 pc=clips.value[p.history.x+map.x+local];
+                    vec4 cc=vertices.value[tri[i]*14u];
+                    if(!finite4(pc)||!finite4(cc)||pc.w<=0||cc.w<=0)valid=false;
+                    prev+=pc*weights[i];now+=cc*weights[i];
+                }
+                if(valid&&prev.w>1e-6&&now.w>1e-6){
+                    motion=(prev.xy/prev.w-now.xy/now.w)*vec2(.5,-.5)*vec2(p.sizes.xy);
+                    bias=0;
+                }
+            }
+        }
+    }
+    if(any(isnan(motion))||any(isinf(motion))||any(greaterThan(abs(motion),vec2(p.sizes.xy)))){motion=vec2(0);bias=1;}
+    imageStore(motionInput,ivec2(pixel),vec4(motion,0,0));
+    if(bias==0)atomicAdd(draws.value[256].z,1);else atomicAdd(draws.value[256].w,1);
+    imageStore(biasInput,ivec2(pixel),vec4(bias));
+}

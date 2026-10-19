@@ -3128,6 +3128,25 @@ static void sink_end(void* user, const rsx_dispatch* r)
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    if(g.be->set_temporal_identity){
+        u64 geometry=1469598103934665603ull,slots=1469598103934665603ull;
+        for(u32 a=0;a<16;a++){
+            rsx_dsp_vertex_attr attr;rsx_dsp_get_vertex_attr(&g.rsx,a,&attr);
+            const u32 fields[]={a,attr.type,attr.size,attr.stride,attr.frequency,attr.offset,attr.location};
+            for(u32 k=0;k<7;k++)geometry=(geometry^fields[k])*1099511628211ull;
+        }
+        geometry=(geometry^rsx_dsp_vertex_data_base_offset(&g.rsx))*1099511628211ull;
+        geometry=(geometry^rsx_dsp_vertex_data_base_index(&g.rsx))*1099511628211ull;
+        for(u32 k=0;k<dc.n_refs;k++){
+            geometry=(geometry^dc.refs[k].vertex_id)*1099511628211ull;
+            geometry=(geometry^dc.refs[k].base_index)*1099511628211ull;
+        }
+        if(pipeline_metadata && pipeline_metadata->position_known){
+            for(u32 k=0;k<4;k++)slots=(slots^pipeline_metadata->position_rows[k])*1099511628211ull;
+        }else slots=0;
+        if(dc.inl)slots=0;
+        g.be->set_temporal_identity(g.be->user,geometry,slots);
+    }
     hp_start = hp_tick();
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);

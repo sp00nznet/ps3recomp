@@ -9,6 +9,7 @@ vec3 hybridPosition(ivec2 pixel){
     if(isnan(depth)||isinf(depth)||depth<=0.0)return vec3(0);
     float offset=p.counts.z==2u?(pixel.x%2==0?.75:.25):.5;
     vec2 uv=(vec2(pixel/ivec2(p.counts.z,1))+offset)/vec2(p.dims.zw);
+    uv-=fp.value[uint(p.settings.w)+1u].xy/vec2(p.dims.zw);
     return vec3((2.0*uv.x-1.0)/p.projection.x,(1.0-2.0*uv.y)/p.projection.y,1.0)*depth;
 }
 vec3 hybridSky(){

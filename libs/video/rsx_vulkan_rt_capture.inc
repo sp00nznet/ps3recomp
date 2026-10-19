@@ -123,6 +123,7 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
     rsx_scene_draw_input in={0};
     in.pipeline=pipeline;in.vertex_count=vertex_count;in.index_count=indices?index_count:0;
     in.vertices=vertices;in.indices=indices;in.layout=p->scene_layout;in.state=p->rs;
+    in.geometry_identity=s_temporal_geometry;in.constant_slots=s_temporal_slots;
     in.vs_constants=s_e2.constant_shadow;in.vs_bytes=s_e2.vs_bytes;
     in.ps_constants=s_e2.constant_shadow+s_g.ps_off;in.ps_bytes=s_e2.ps_bytes;
     /* Opaque AO needs no fragment textures. Live render-target views are not

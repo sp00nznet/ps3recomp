@@ -236,6 +236,9 @@ typedef struct rsx_draw_backend {
     /* Optional per-present camera aspect. Zero restores native surface aspect.
      * Does not resize guest targets or change their texture coordinates. */
     void (*set_present_aspect)(void* user, float aspect);
+    /* Current guest geometry binding and transform-constant slots. Optional;
+     * duplicates and changed topology must not reuse temporal history. */
+    void (*set_temporal_identity)(void*,u64 geometry,u64 constant_slots);
     /* Optional. A texture holding, for the top-left w x h logical texels of a
      * Z24S8 depth target, exactly the host texels rsx_texture_decode makes of
      * the bytes depth_readback + the engine's guest store would leave in

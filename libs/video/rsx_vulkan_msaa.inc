@@ -123,6 +123,7 @@ static u32 vk_eng_expand_samples(u32 surface)
         }
         dst->kind=VK_ENG_TEXTURE;dst->fmt=format;dst->bpp=depth?4u:src->bpp;dst->w=w;dst->h=h;
         dst->scale=src->scale;dst->grid_x=2;dst->grid_y=src->samples==4?2u:1u;
+        if(src->guest_w){dst->guest_w=src->guest_w*2;dst->guest_h=src->guest_h*dst->grid_y;}
         src->expanded=hd;
         if (vk_begin()) goto fail;
         vk_barrier_image(dst->im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_UNDEFINED);

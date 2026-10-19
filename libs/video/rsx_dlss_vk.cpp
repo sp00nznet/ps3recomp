@@ -41,8 +41,8 @@ static void NVSDK_CONV diagnostic_log(const char *message,NVSDK_NGX_Logging_Leve
 }
 static void diagnostic_logging(NVSDK_NGX_FeatureCommonInfo &common)
 {
-    const char *trace=std::getenv("PS3RECOMP_DLSS_TRACE");
-    if(trace && !std::strcmp(trace,"1")){
+    char trace[8]{};
+    if(GetEnvironmentVariableA("PS3RECOMP_DLSS_TRACE",trace,sizeof(trace))==1 && trace[0]=='1'){
         common.LoggingInfo.LoggingCallback=diagnostic_log;
         common.LoggingInfo.MinimumLoggingLevel=NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
     }
@@ -485,11 +485,17 @@ extern "C" RSX_DLSS_API rsx_dlss_status rsx_dlss_evaluate(
     NVSDK_NGX_Resource_VK depth = ngx_image(f->depth, false);
     NVSDK_NGX_Resource_VK motion = ngx_image(f->motion, false);
     NVSDK_NGX_Resource_VK output = ngx_image(f->output, true);
+    NVSDK_NGX_Resource_VK bias{};
+    if(f->bias.image){
+        if(!image_ok(f->bias,VK_FORMAT_R8_UNORM,cfg.input_width,cfg.input_height,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))return RSX_DLSS_BAD_ARGUMENT;
+        bias=ngx_image(f->bias,false);
+    }
     NVSDK_NGX_Parameter *p = c->parameters;
     p->Set(NVSDK_NGX_Parameter_Color, static_cast<void *>(&color));
     p->Set(NVSDK_NGX_Parameter_Depth, static_cast<void *>(&depth));
     p->Set(NVSDK_NGX_Parameter_MotionVectors, static_cast<void *>(&motion));
     p->Set(NVSDK_NGX_Parameter_Output, static_cast<void *>(&output));
+    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask,f->bias.image?static_cast<void*>(&bias):nullptr);
     p->Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.0f);
     p->Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.0f);
     p->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, f->jitter_x);

@@ -13,6 +13,7 @@ set(rsx_scene_shader_sources
     "${rsx_scene_shader_dir}/rsx_scene_gather.comp"
     "${rsx_scene_shader_dir}/rsx_scene_trace.comp"
     "${rsx_scene_shader_dir}/rsx_hybrid_trace.glsl"
+    "${rsx_scene_shader_dir}/rsx_dlss_frame.comp"
     "${rsx_scene_shader_dir}/rsx_scene_alpha.glsl"
     "${rsx_scene_shader_dir}/rsx_path_transport.glsl"
     "${rsx_scene_shader_dir}/rsx_ray_footprint.glsl"
@@ -29,9 +30,10 @@ rsx_scene_embed_string(rsx_pool_rgb_glsl "${rsx_scene_shader_dir}/rsx_pool_rgb.g
 rsx_scene_embed_string(rsx_terrain_rgb_glsl "${rsx_scene_shader_dir}/rsx_terrain_rgb.glsl" terrain_rgb)
 rsx_scene_embed_string(rsx_scene_rgb_glsl "${rsx_scene_shader_dir}/rsx_scene_rgb.glsl" scene_rgb)
 rsx_scene_embed_string(rsx_hybrid_trace_glsl "${rsx_scene_shader_dir}/rsx_hybrid_trace.glsl" hybrid)
+rsx_scene_embed_string(rsx_dlss_frame_glsl "${rsx_scene_shader_dir}/rsx_dlss_frame.comp" dlss_frame)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/scene")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/scene/rsx_scene_shader_sources.h"
-    "/* Generated from reviewed GLSL sources by SceneRayShaders.cmake. */\n#pragma once\n${gather}${trace}${alpha}${transport}${footprint}${pool_rgb}${terrain_rgb}${scene_rgb}${hybrid}")
+    "/* Generated from reviewed GLSL sources by SceneRayShaders.cmake. */\n#pragma once\n${gather}${trace}${alpha}${transport}${footprint}${pool_rgb}${terrain_rgb}${scene_rgb}${hybrid}${dlss_frame}")
 include_directories("${CMAKE_CURRENT_BINARY_DIR}/generated/scene")
 target_include_directories(ps3recomp_runtime PRIVATE
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated/scene>")

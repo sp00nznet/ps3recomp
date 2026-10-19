@@ -26,6 +26,7 @@ typedef struct rsx_scene_draw_input {
     const void *vertices, *vs_constants, *ps_constants;
     const uint32_t* indices; /* NULL means sequential triangles. */
     size_t vs_bytes, ps_bytes;
+    uint64_t geometry_identity,constant_slots;
 } rsx_scene_draw_input;
 typedef struct rsx_scene_draw_snapshot {
     rsx_scene_draw_input draw; /* pointers are resolved by get(), not stored */

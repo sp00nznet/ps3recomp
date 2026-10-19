@@ -2,6 +2,8 @@
  * from evaluation and presentation; only actual completed frames may claim SR. */
 #if defined(_WIN32)
 #include "rsx_dlss_loader.h"
+static int vk_dlss_frame_initialize(void);
+static void vk_dlss_frame_destroy(void);
 static struct {
     rsx_dlss_loader loader;
     rsx_dlss_vk *context;
@@ -102,11 +104,13 @@ static void vk_dlss_device_created(void)
     VK_LOG("DLSS game-device context status=%d available=%u support=0x%x ngx=0x%x; evaluatedFrames=0\n",
         status,report.available,report.support_flags,(unsigned)report.ngx_result);
     if(status!=RSX_DLSS_OK){s_dlss.context=NULL;s_dlss.device_ready=0;}
+    else vk_dlss_frame_initialize();
 }
 static void vk_dlss_device_selected(int enabled){s_dlss.device_ready=enabled;}
 static void vk_dlss_shutdown(void)
 {
     /* Caller drains the borrowed device before this function. */
+    vk_dlss_frame_destroy();
     if(s_dlss.context)s_dlss.loader.destroy(s_dlss.context);
     rsx_dlss_loader_close(&s_dlss.loader);memset(&s_dlss,0,sizeof s_dlss);
 }

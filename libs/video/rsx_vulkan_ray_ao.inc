@@ -13,6 +13,7 @@
 #define VK_RAY_ALL_TEXTURES (VK_RAY_TEXTURES+VK_RAY_CUBES)
 #include "rsx_authored_lights.h"
 #include "rsx_ray_memory.h"
+static u32 vk_dlss_world(u32 source,u32 depth,VkBuffer vertices,const rsx_scene_epoch *epoch,const float projection[16],u32 remap,u32 format);
 typedef struct vk_ray_material {u32 alpha[4],raster[4],textures[4];float depth_range[4];u32 authored[4],rgb_textures[8];float light_view[4][4],light_rgb[4][4],light_to_view[3][4];} vk_ray_material;
 typedef struct vk_ray_parameters {float projection[4];u32 dims[4],counts[4];float settings[4];} vk_ray_parameters;
 _Static_assert(sizeof(vk_ray_material)==288 && offsetof(vk_ray_material,depth_range)==48,"GLSL std430 material layout");
@@ -402,6 +403,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     u32 scale=c->scale?c->scale:1,gx=samples==2?2:1;
     u64 width64=(u64)logical_w*scale,height64=(u64)logical_h*scale;if(!width64 || width64>UINT32_MAX/gx || !height64 || height64>UINT32_MAX)goto fail;
     u32 width=(u32)width64,height=(u32)height64;
+    if(c->guest_w==logical_w && c->guest_h==logical_h){width=c->w;height=c->h;}
     if(c->w!=width || c->h!=height || z->w!=width || z->h!=height || (c->fmt!=VK_FORMAT_R8G8B8A8_UNORM && c->fmt!=VK_FORMAT_R16G16B16A16_SFLOAT))goto fail;
     vk_flush_pending(0);
     failure="device/shader/descriptor capabilities";
@@ -563,6 +565,9 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         }
         if(fp_used+16>s_ray_ao.fp.size)goto fail;
         memcpy((u8*)s_ray_ao.fp.ptr+fp_used,fog,16);fp_used+=16;
+        float jitter[4]={0};vk_dlss_jitter(jitter);
+        if(fp_used+16>s_ray_ao.fp.size)goto fail;
+        memcpy((u8*)s_ray_ao.fp.ptr+fp_used,jitter,16);fp_used+=16;
     }
     if(primitive!=triangles || !rsx_scene_epoch_seal(epoch,s_rt_capture.frame,epoch->serial))goto fail;
     /* Opaque shaders can have no fragment constants. Vulkan still requires
@@ -690,6 +695,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         VK_LOG("ray AO depth failure pixel=%u,%u raster=%u,%u sample=0 z=%g expected=%g candidate=%u nearest=%g primitive=%u material=%u coverage=%u alphaContract=%u\n",s_ray_ao.gpu_stats[13],s_ray_ao.gpu_stats[14],s_ray_ao.gpu_stats[15],s_ray_ao.gpu_stats[16],z,expected,s_ray_ao.gpu_stats[20]!=UINT32_MAX,nearest,s_ray_ao.gpu_stats[20],s_ray_ao.gpu_stats[21],s_ray_ao.gpu_stats[22],s_ray_ao.gpu_stats[23]);
     }
     if(replacement)vk_ray_capture_pair(source_color,s_ray_ao.color,width*gx,height,gx,epoch->frame,epoch->generation,transport_mode,denoise,strength);
+    if(replacement){u32 sr=vk_dlss_world(s_ray_ao.color,source_depth,batch.vertices,epoch,projection,remap,rsx_format);if(sr)replacement=sr;}
     return replacement;
 abandon:
     // If submission failed, drain before invalidating recorded command storage.
