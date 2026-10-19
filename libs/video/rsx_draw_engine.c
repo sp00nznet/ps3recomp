@@ -1115,11 +1115,14 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         if (texture_pack_load(pack_root, src, lv[0].tl.face_bytes,
                               pack_fmt, w, h, &pack)) {
             if (pack.levels >= nlv && pack.width == w * pack_scale && pack.height == h * pack_scale) {
+                /* Keep one-level UI textures one-level. Mipmapped artwork
+                 * needs the extra levels down to 1x1 at its larger base size. */
+                const u32 replacement_levels = nlv > 1u ? pack.levels : 1u;
                 const u32 replacement = g.be->texture_create(g.be->user,
-                    RSX_BE_FMT_R8G8B8A8, pack.width, pack.height, nlv,
+                    RSX_BE_FMT_R8G8B8A8, pack.width, pack.height, replacement_levels,
                     1u, remap, fmt);
                 if (replacement) {
-                    for (u32 m = 0; m < nlv; m++)
+                    for (u32 m = 0; m < replacement_levels; m++)
                         g.be->texture_upload(g.be->user, replacement, 0u, m,
                             pack.level_width[m], pack.level_height[m],
                             pack.level[m], pack.row_bytes[m],
