@@ -578,6 +578,9 @@ static void pad_poll_sdl2(void)
 
 static void pad_init_backend(void)
 {
+    /* PS3 prompts refer to face-button positions. Nintendo labels otherwise
+     * swap A/B and X/Y, including GameSir controllers in Switch mode. */
+    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
     if (!s_sdl_inited) {
         if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
             if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) return;
