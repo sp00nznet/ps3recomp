@@ -43,8 +43,43 @@ static Uint32 was_init(Uint32 flags) { return flags; }
 static int init(Uint32 flags) { (void)flags;return 0; }
 static int joysticks(void) { return leading_unmapped+fixture.attached; }
 static int rumble(SDL_GameController* p,Uint16 a,Uint16 b,Uint32 t) { (void)p;(void)a;(void)b;(void)t;return 0; }
-static Uint16 fixture_vendor(SDL_GameController* p) { (void)p;return 0; }
-static Uint16 fixture_product(SDL_GameController* p) { (void)p;return 0; }
+static Uint16 fixture_vid,fixture_pid;
+static Uint16 fixture_vendor(SDL_GameController* p) { (void)p;return fixture_vid; }
+static Uint16 fixture_product(SDL_GameController* p) { (void)p;return fixture_pid; }
+#ifdef PAD_FIXTURE_G7_MOCK
+#include "../libs/input/g7_motion_backend.h"
+static Uint64 fixture_ticks=100;
+static Uint64 fixture_get_ticks(void) { return fixture_ticks; }
+#define SDL_GetTicks64 fixture_get_ticks
+static int fixture_g7_starts,fixture_g7_stops,fixture_g7_services;
+static int fixture_g7_idle=1,fixture_g7_start_ok=1,fixture_g7_hold_stop;
+static Uint16 fixture_g7_started_vid,fixture_g7_started_pid;
+static g7_motion_sample fixture_g7_raw;
+static g7_motion_state fixture_g7_start_state=G7_MOTION_RUNNING;
+static int fixture_g7_start(uint16_t vid,uint16_t pid) {
+    ++fixture_g7_starts;
+    fixture_g7_started_vid=vid;fixture_g7_started_pid=pid;
+    if(!fixture_g7_idle||!fixture_g7_start_ok)return 0;
+    fixture_g7_idle=0;
+    fixture_g7_raw.state=fixture_g7_start_state;
+    return 1;
+}
+static void fixture_g7_stop(void) {
+    ++fixture_g7_stops;
+    memset(&fixture_g7_raw,0,sizeof(fixture_g7_raw));
+    fixture_g7_raw.state=G7_MOTION_STOPPED;
+    if(!fixture_g7_hold_stop)fixture_g7_idle=1;
+}
+static int fixture_g7_service(void) { ++fixture_g7_services;return fixture_g7_idle; }
+static int fixture_g7_sample(g7_motion_sample *out) {
+    *out=fixture_g7_raw;
+    return out->fresh_valid&&out->state==G7_MOTION_RUNNING;
+}
+#define g7_motion_start fixture_g7_start
+#define g7_motion_stop fixture_g7_stop
+#define g7_motion_service fixture_g7_service
+#define g7_motion_get_raw_sample fixture_g7_sample
+#endif
 #define SDL_GameControllerGetVendor fixture_vendor
 #define SDL_GameControllerGetProduct fixture_product
 #define SDL_GameControllerGetAttached attached
@@ -65,7 +100,10 @@ static Uint16 fixture_product(SDL_GameController* p) { (void)p;return 0; }
 #define SDL_LockJoysticks update
 #define SDL_UnlockJoysticks update
 #define SDL_GameControllerRumble rumble
-#include "../libs/input/cellPad.c"
+#ifndef PAD_FIXTURE_CELL_PAD_SOURCE
+#define PAD_FIXTURE_CELL_PAD_SOURCE "../libs/input/cellPad.c"
+#endif
+#include PAD_FIXTURE_CELL_PAD_SOURCE
 uint8_t* vm_base;
 uint32_t ppu_vm_size=0x20000;
 int g_resv_store_active;

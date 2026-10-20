@@ -27,16 +27,25 @@ typedef struct g7_motion_sample {
     g7_motion_state state;
 } g7_motion_sample;
 
-/* Start launches one worker. The caller supplies the already matched VID/PID.
-   Start/stop are serialized by the owner; polling may occur on another thread.
-   Return 1 for a launched worker, 0 for rejection/failure. */
+/* Start launches one worker for the already matched VID/PID. The owner must
+   serialize start, stop, service, and install_io; polling may run concurrently.
+   Start reaps completed workers and rejects any previous active worker,
+   including one with a pending stop. Returns 1 for launch, 0 for rejection or
+   failure. Terminal errors persist until explicit stop or restart.
+   The backend never retries automatically. */
 int g7_motion_start(uint16_t vendor_id, uint16_t product_id);
+/* Immediately invalidate samples and request stop, without waiting on I/O.
+   A stalled worker retains its resources until it finishes. */
 void g7_motion_stop(void);
+/* Reap only a worker proven finished after all I/O cleanup and state writes.
+   Returns 1 when no worker remains, 0 while any worker is active. Never waits
+   for running/stalled I/O. Call again later before an explicit restart. */
+int g7_motion_service(void);
 /* Returns 1 only for a valid report no older than 100 ms. Always fills out.
    A stale/failed sample contains zero raw fields and fresh_valid=0. */
 int g7_motion_get_raw_sample(g7_motion_sample *out);
 
-/* I/O seam for isolated fixtures; production callers use the three APIs above. */
+/* I/O seam for isolated fixtures; production uses the lifecycle APIs above. */
 typedef struct g7_motion_io {
     /* select: 1 unique, 0 absent, -2 ambiguous, -1 I/O error. */
     int (*select)(uint16_t, uint16_t, char *, size_t);
@@ -47,7 +56,8 @@ typedef struct g7_motion_io {
     uint64_t (*now_us)(void);
 } g7_motion_io;
 #ifdef G7_MOTION_TESTING
-/* Install only while stopped, before start. Intended for CPU-only fixtures. */
+/* Install only when service reports idle (completed workers may be reaped).
+   Rejected while any worker is active, including after stop. CPU-only fixtures. */
 int g7_motion_test_install_io(const g7_motion_io *io);
 int g7_motion_test_decode(const unsigned char *data, size_t size,
                           g7_motion_sample *out);

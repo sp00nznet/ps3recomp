@@ -135,10 +135,14 @@ static PadMotionSDL s_sdl_motion[PAD_MAX_HOST_PORTS];
 static SDL_JoystickID s_sdl_instance[PAD_MAX_HOST_PORTS];
 static int s_g7_port = -1;
 static SDL_JoystickID s_g7_instance = -1;
+static unsigned s_g7_attempts;
+static int s_g7_started;
+static Uint64 s_g7_retry_ms;
 static int pad_g7_candidate(SDL_GameController *gc)
 {
     return gc && SDL_GameControllerGetVendor(gc) == 0x3537 &&
-        SDL_GameControllerGetProduct(gc) == 0x10c6 &&
+        (SDL_GameControllerGetProduct(gc) == 0x10c5 ||
+         SDL_GameControllerGetProduct(gc) == 0x10c6) &&
         !SDL_GameControllerHasSensor(gc, SDL_SENSOR_ACCEL) &&
         !SDL_GameControllerHasSensor(gc, SDL_SENSOR_GYRO);
 }
@@ -410,9 +414,25 @@ static void pad_poll_sdl2(void)
         g7_motion_stop();
         s_g7_port = g7_port;
         s_g7_instance = g7_instance;
-        if (g7_port >= 0) {
-            int started = g7_motion_start(0x3537, 0x10c6);
-            printf("[cellPad] G7 accelerometer port=%d started=%d; yaw uncalibrated\n", g7_port, started);
+        s_g7_attempts = 0;
+        s_g7_started = 0;
+        s_g7_retry_ms = 0;
+    }
+    /* Reap only a completed HID worker. Do not stall the game on disconnect.
+     * Retry transient enumeration absence at most twice; I/O/permission errors
+     * and ambiguous devices require a deliberate reconnect, not a retry loop. */
+    int g7_idle = g7_motion_service();
+    if (g7_port >= 0 && g7_idle && s_g7_attempts < 3 &&
+        SDL_GetTicks64() >= s_g7_retry_ms) {
+        g7_motion_sample health;
+        g7_motion_get_raw_sample(&health);
+        if (!s_g7_attempts || health.state == G7_MOTION_NO_DEVICE) {
+            uint16_t pid = SDL_GameControllerGetProduct(s_sdl_controllers[g7_port]);
+            s_g7_started = g7_motion_start(0x3537, pid);
+            ++s_g7_attempts;
+            s_g7_retry_ms = SDL_GetTicks64() + 1000;
+            printf("[cellPad] G7 accelerometer port=%d pid=%04x started=%d; yaw uncalibrated\n",
+                   g7_port, pid, s_g7_started);
         }
     }
 
@@ -434,10 +454,12 @@ static void pad_poll_sdl2(void)
         s_host_state[i].connected = 1;
         if (i == s_g7_port) {
             g7_motion_sample raw;
-            s_host_state[i].motion_capable = 1;
+            int fresh = g7_motion_get_raw_sample(&raw);
+            s_host_state[i].motion_capable = s_g7_started &&
+                (raw.state == G7_MOTION_STARTING || raw.state == G7_MOTION_RUNNING);
             s_host_state[i].motion_valid =
                 (s_port_setting[i] & CELL_PAD_SETTING_SENSOR_ON) &&
-                g7_motion_get_raw_sample(&raw);
+                s_host_state[i].motion_capable && fresh;
             memset(s_host_state[i].motion, 0, sizeof(s_host_state[i].motion));
             if (s_host_state[i].motion_valid)
                 pad_motion_g7_map(&raw, s_host_state[i].motion);
