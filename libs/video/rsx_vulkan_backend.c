@@ -3812,15 +3812,21 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
         s_epipe[s_e2.pipeline - 1].folklore_composite) {
         static int enabled = -1;
         static u64 applied;
+        static const char* off_file;
         if (enabled < 0) {
             const char* e = getenv("FOLKLORE_COMPOSITE_SHARP");
             enabled = !(e && e[0] == '0' && !e[1]);
-            VK_LOG("Folklore composite: in-focus resolve floor %s at render scale %u\n",
+            /* Diagnostic same-run A/B: the guest floor while this file exists. */
+            off_file = getenv("FOLKLORE_COMPOSITE_SHARP_OFF_FILE");
+            if (off_file && !*off_file) off_file = NULL;
+            VK_LOG("Folklore composite: in-focus resolve floor %s at render scale %u%s\n",
                    enabled ? "follows host pixels" : "kept in guest pixels (FOLKLORE_COMPOSITE_SHARP=0)",
-                   s_render_scale);
+                   s_render_scale, off_file ? " (switch file armed)" : "");
         }
-        if (enabled && rsx_folklore_composite_sharpen(s_e2.constant_shadow + s_g.ps_off, bytes,
-                                                      (float)s_render_scale) && ++applied == 1)
+        int on = enabled;
+        if (on && off_file) { FILE* f = fopen(off_file, "rb"); if (f) { fclose(f); on = 0; } }
+        if (on && rsx_folklore_composite_sharpen(s_e2.constant_shadow + s_g.ps_off, bytes,
+                                                 (float)s_render_scale) && ++applied == 1)
             VK_LOG("Folklore composite: floor 0.3 -> %.4f guest pixels\n", 0.3 / s_render_scale);
     }
 }
