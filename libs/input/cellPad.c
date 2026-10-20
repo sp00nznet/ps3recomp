@@ -57,6 +57,7 @@
   #include "pad_motion_sdl.h"
   #include "g7_motion_backend.h"
   #include "pad_motion_g7.h"
+  #include "ds3_motion_backend.h"
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -138,6 +139,18 @@ static SDL_JoystickID s_g7_instance = -1;
 static unsigned s_g7_attempts;
 static int s_g7_started;
 static Uint64 s_g7_retry_ms;
+static int s_ds3_port = -1;
+static SDL_JoystickID s_ds3_instance = -1;
+static unsigned s_ds3_attempts;
+static int s_ds3_started;
+static Uint64 s_ds3_retry_ms;
+static int pad_ds3_candidate(SDL_GameController *gc)
+{
+    return gc && SDL_GameControllerGetVendor(gc) == 0x054c &&
+        SDL_GameControllerGetProduct(gc) == 0x0268 &&
+        !SDL_GameControllerHasSensor(gc, SDL_SENSOR_ACCEL) &&
+        !SDL_GameControllerHasSensor(gc, SDL_SENSOR_GYRO);
+}
 static int pad_g7_candidate(SDL_GameController *gc)
 {
     return gc && SDL_GameControllerGetVendor(gc) == 0x3537 &&
@@ -436,6 +449,36 @@ static void pad_poll_sdl2(void)
         }
     }
 
+    /* DsHidMini SXS supplies the original PS3 counts independently of SDL's
+     * button/stick interface. Never attach an ambiguous raw device to a port. */
+    int ds3_port = -1, ds3_count = 0;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; ++i) {
+        if (pad_ds3_candidate(s_sdl_controllers[i])) { ds3_port = i; ++ds3_count; }
+    }
+    if (ds3_count != 1) ds3_port = -1;
+    SDL_JoystickID ds3_instance = ds3_port >= 0 ? s_sdl_instance[ds3_port] : -1;
+    if (ds3_port != s_ds3_port || ds3_instance != s_ds3_instance) {
+        ds3_motion_stop();
+        s_ds3_port = ds3_port;
+        s_ds3_instance = ds3_instance;
+        s_ds3_attempts = 0;
+        s_ds3_started = 0;
+        s_ds3_retry_ms = 0;
+    }
+    int ds3_idle = ds3_motion_service();
+    if (ds3_port >= 0 && ds3_idle && s_ds3_attempts < 3 &&
+        SDL_GetTicks64() >= s_ds3_retry_ms) {
+        ds3_motion_sample health;
+        ds3_motion_get_sample(&health);
+        if (!s_ds3_attempts || health.state == DS3_MOTION_NO_DEVICE) {
+            s_ds3_started = ds3_motion_start(0x054c, 0x0268);
+            ++s_ds3_attempts;
+            s_ds3_retry_ms = SDL_GetTicks64() + 1000;
+            printf("[cellPad] DS3 SXS native motion port=%d started=%d\n",
+                   ds3_port, s_ds3_started);
+        }
+    }
+
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
 
         SDL_GameController* gc = s_sdl_controllers[i];
@@ -463,6 +506,17 @@ static void pad_poll_sdl2(void)
             memset(s_host_state[i].motion, 0, sizeof(s_host_state[i].motion));
             if (s_host_state[i].motion_valid)
                 pad_motion_g7_map(&raw, s_host_state[i].motion);
+        } else if (i == s_ds3_port) {
+            ds3_motion_sample raw;
+            int fresh = ds3_motion_get_sample(&raw);
+            s_host_state[i].motion_capable = s_ds3_started &&
+                (raw.state == DS3_MOTION_STARTING || raw.state == DS3_MOTION_RUNNING);
+            s_host_state[i].motion_valid =
+                (s_port_setting[i] & CELL_PAD_SETTING_SENSOR_ON) &&
+                s_host_state[i].motion_capable && fresh;
+            memset(s_host_state[i].motion, 0, sizeof(s_host_state[i].motion));
+            if (s_host_state[i].motion_valid)
+                memcpy(s_host_state[i].motion, raw.sensor, sizeof(raw.sensor));
         } else {
         s_host_state[i].motion_capable = pad_motion_sdl_capable(gc);
         if ((s_port_setting[i] & CELL_PAD_SETTING_SENSOR_ON) &&
@@ -541,6 +595,8 @@ static void pad_shutdown_backend(void)
 {
     g7_motion_stop();
     s_g7_port = -1; s_g7_instance = -1;
+    ds3_motion_stop();
+    s_ds3_port = -1; s_ds3_instance = -1;
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         if (s_sdl_controllers[i]) {
             pad_motion_sdl_set_enabled(&s_sdl_motion[i],s_sdl_controllers[i],0);
@@ -612,7 +668,8 @@ static void pad_poll_stick_motion(int keyboard)
         PadHostState* hs = &s_host_state[i];
         int physical = 0;
 #if PAD_BACKEND_SDL2
-        physical = i == s_g7_port || pad_motion_sdl_capable(s_sdl_controllers[i]);
+        physical = i == s_g7_port || i == s_ds3_port ||
+                   pad_motion_sdl_capable(s_sdl_controllers[i]);
 #endif
         int active = hs->connected && s_stick_mode &&
                      (!physical || s_stick_mode == 2);
@@ -1345,7 +1402,7 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
     pad_backend_lock();
 #if PAD_BACKEND_SDL2
     if (port_no < PAD_MAX_HOST_PORTS && !s_stick_mapped[port_no] && s_host_state[port_no].motion_capable) {
-        int ok=(int)port_no == s_g7_port ? 1 : pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],
+        int ok=((int)port_no == s_g7_port || (int)port_no == s_ds3_port) ? 1 : pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],
                                         !!(port_setting & CELL_PAD_SETTING_SENSOR_ON));
         s_host_state[port_no].motion_valid=0;
         if (!ok) {
@@ -1442,7 +1499,7 @@ s32 cellPadSetSensorMode(u32 port_no, u32 mode)
     }
 #if PAD_BACKEND_SDL2
     if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].motion_capable) {
-        int ok=(int)port_no == s_g7_port ? 1 : pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],(int)mode);
+        int ok=((int)port_no == s_g7_port || (int)port_no == s_ds3_port) ? 1 : pad_motion_sdl_set_enabled(&s_sdl_motion[port_no],s_sdl_controllers[port_no],(int)mode);
         s_host_state[port_no].motion_valid=0;
         if (ok) {
             if (mode) s_port_setting[port_no] |= CELL_PAD_SETTING_SENSOR_ON;

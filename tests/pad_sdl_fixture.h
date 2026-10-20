@@ -18,10 +18,12 @@ static HWND fake_foreground(void) { return NULL; }
 #endif
 typedef struct { int attached,capable,on[2],read_fail,disable_fail; Uint64 ts; float accel[3],gyro[3]; } Fixture;
 static Fixture fixture={1,1,{0,0},0,0,1234,{0,9.80665f,0},{0,1.57079632679f,0}};
+static Fixture fixture_second;
 static SDL_GameController* controller(void) { return (SDL_GameController*)(void*)&fixture; }
+static SDL_GameController* second_controller(void) { return (SDL_GameController*)(void*)&fixture_second; }
 static int sensor_index(SDL_SensorType t) { return t==SDL_SENSOR_GYRO; }
-static SDL_bool attached(SDL_GameController* p) { return p==controller() && fixture.attached; }
-static SDL_bool capable(SDL_GameController* p,SDL_SensorType t) { (void)t;return attached(p)&&fixture.capable; }
+static SDL_bool attached(SDL_GameController* p) { return p==controller()?fixture.attached:p==second_controller()&&fixture_second.attached; }
+static SDL_bool capable(SDL_GameController* p,SDL_SensorType t) { (void)t;return attached(p)&&(p==controller()?fixture.capable:fixture_second.capable); }
 static int enable(SDL_GameController* p,SDL_SensorType t,SDL_bool on)
 { if(!capable(p,t)||(!on&&fixture.disable_fail))return -1;fixture.on[sensor_index(t)]=on;return 0; }
 static SDL_bool fixture_enabled(SDL_GameController* p,SDL_SensorType t)
@@ -31,9 +33,10 @@ static int sensor(SDL_GameController* p,SDL_SensorType t,Uint64* ts,float* value
 static void update(void) {}
 static int leading_unmapped, fixture_opens, fixture_closes, fixture_open_fail;
 static SDL_JoystickID fixture_instance = 42;
-static SDL_bool is_controller(int i) { return i==leading_unmapped&&fixture.attached; }
-static SDL_JoystickID device_instance(int i) { return is_controller(i)?fixture_instance:-1; }
-static SDL_GameController* open_controller(int i) { if(!is_controller(i)||fixture_open_fail)return NULL; ++fixture_opens;return controller(); }
+static SDL_JoystickID fixture_second_instance = 84;
+static SDL_bool is_controller(int i) { return (i==leading_unmapped&&fixture.attached)||(i==leading_unmapped+fixture.attached&&fixture_second.attached); }
+static SDL_JoystickID device_instance(int i) { return !is_controller(i)?-1:i==leading_unmapped&&fixture.attached?fixture_instance:fixture_second_instance; }
+static SDL_GameController* open_controller(int i) { if(!is_controller(i)||fixture_open_fail)return NULL; ++fixture_opens;return i==leading_unmapped&&fixture.attached?controller():second_controller(); }
 static void close_controller(SDL_GameController* p) { (void)p;++fixture_closes; }
 static uint32_t fixture_buttons;
 static Sint16 fixture_axes[SDL_CONTROLLER_AXIS_MAX];
@@ -41,11 +44,12 @@ static Uint8 button(SDL_GameController* p,SDL_GameControllerButton b) { (void)p;
 static Sint16 axis(SDL_GameController* p,SDL_GameControllerAxis a) { (void)p;return fixture_axes[a]; }
 static Uint32 was_init(Uint32 flags) { return flags; }
 static int init(Uint32 flags) { (void)flags;return 0; }
-static int joysticks(void) { return leading_unmapped+fixture.attached; }
+static int joysticks(void) { return leading_unmapped+fixture.attached+fixture_second.attached; }
 static int rumble(SDL_GameController* p,Uint16 a,Uint16 b,Uint32 t) { (void)p;(void)a;(void)b;(void)t;return 0; }
 static Uint16 fixture_vid,fixture_pid;
-static Uint16 fixture_vendor(SDL_GameController* p) { (void)p;return fixture_vid; }
-static Uint16 fixture_product(SDL_GameController* p) { (void)p;return fixture_pid; }
+static Uint16 fixture_second_vid,fixture_second_pid;
+static Uint16 fixture_vendor(SDL_GameController* p) { return p==second_controller()?fixture_second_vid:fixture_vid; }
+static Uint16 fixture_product(SDL_GameController* p) { return p==second_controller()?fixture_second_pid:fixture_pid; }
 #ifdef PAD_FIXTURE_G7_MOCK
 #include "../libs/input/g7_motion_backend.h"
 static Uint64 fixture_ticks=100;
@@ -79,6 +83,32 @@ static int fixture_g7_sample(g7_motion_sample *out) {
 #define g7_motion_stop fixture_g7_stop
 #define g7_motion_service fixture_g7_service
 #define g7_motion_get_raw_sample fixture_g7_sample
+#endif
+#ifdef PAD_FIXTURE_DS3_MOCK
+#include "ds3_motion_backend.h"
+static int fixture_ds3_starts,fixture_ds3_stops,fixture_ds3_services;
+static int fixture_ds3_idle=1,fixture_ds3_start_ok=1,fixture_ds3_hold_stop;
+static Uint16 fixture_ds3_started_vid,fixture_ds3_started_pid;
+static ds3_motion_sample fixture_ds3_raw;
+static ds3_motion_state fixture_ds3_start_state=DS3_MOTION_RUNNING;
+static int fixture_ds3_start(uint16_t vid,uint16_t pid) {
+    ++fixture_ds3_starts;fixture_ds3_started_vid=vid;fixture_ds3_started_pid=pid;
+    if(!fixture_ds3_idle||!fixture_ds3_start_ok)return 0;
+    fixture_ds3_idle=0;fixture_ds3_raw.state=fixture_ds3_start_state;return 1;
+}
+static void fixture_ds3_stop(void) {
+    ++fixture_ds3_stops;memset(&fixture_ds3_raw,0,sizeof(fixture_ds3_raw));
+    fixture_ds3_raw.state=DS3_MOTION_STOPPED;
+    if(!fixture_ds3_hold_stop)fixture_ds3_idle=1;
+}
+static int fixture_ds3_service(void) { ++fixture_ds3_services;return fixture_ds3_idle; }
+static int fixture_ds3_sample(ds3_motion_sample *out) {
+    *out=fixture_ds3_raw;return out->fresh_valid&&out->state==DS3_MOTION_RUNNING;
+}
+#define ds3_motion_start fixture_ds3_start
+#define ds3_motion_stop fixture_ds3_stop
+#define ds3_motion_service fixture_ds3_service
+#define ds3_motion_get_sample fixture_ds3_sample
 #endif
 #define SDL_GameControllerGetVendor fixture_vendor
 #define SDL_GameControllerGetProduct fixture_product
