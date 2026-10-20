@@ -111,6 +111,9 @@ static int fake_get_data(SDL_GameController* gc, SDL_SensorType type, Uint64* ti
 #define PAD_MOTION_SET_ENABLED fake_set_enabled
 #define PAD_MOTION_IS_ENABLED fake_is_enabled
 #define PAD_MOTION_GET_DATA fake_get_data
+static Uint64 fake_now_ms;
+static Uint64 fake_clock(void) { return fake_now_ms; }
+#define PAD_MOTION_NOW_MS fake_clock
 #include "../pad_motion_sdl.h"
 
 #define G 9.80665f
@@ -591,6 +594,39 @@ static void test_two_adapters(void)
     CHECK(pa.bad_args == 0 && pb.bad_args == 0);
 }
 
+static void test_freshness(void)
+{
+    FakePad p;
+    PadMotionSDL s;
+    fake_now_ms=100;
+    setup_valid(&p,&s);
+    fake_now_ms=350;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==1);
+    fake_now_ms=351;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==0 && state_clear(&s));
+    p.ts[FAKE_GYRO]++;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==0 && state_clear(&s));
+    p.ts[FAKE_ACCEL]++;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==1);
+    fake_now_ms=602;
+    p.ts[FAKE_ACCEL]++;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==0 && state_clear(&s));
+    p.ts[FAKE_GYRO]++;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==1);
+    /* Missing metadata is allowed even during long stationary intervals. */
+    p.ts[FAKE_ACCEL]=p.ts[FAKE_GYRO]=0;
+    fake_now_ms=10000;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==1 && s.timestamp==0);
+    fake_now_ms=20000;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==1);
+    p.ts[FAKE_ACCEL]=p.ts[FAKE_GYRO]=10;
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==1);
+    CHECK(pad_motion_sdl_set_enabled(&s,gc_of(&p),0)==1);
+    fake_now_ms=30000;
+    CHECK(pad_motion_sdl_set_enabled(&s,gc_of(&p),1)==1);
+    CHECK(pad_motion_sdl_poll(&s,gc_of(&p))==1);
+}
+
 int main(void)
 {
     test_capable();
@@ -608,6 +644,7 @@ int main(void)
     test_is_enabled_failure();
     test_disable();
     test_two_adapters();
+    test_freshness();
     printf("pad_motion_sdl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

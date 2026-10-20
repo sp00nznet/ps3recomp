@@ -10,7 +10,7 @@
  * SDL_SENSOR_ACCEL and SDL_SENSOR_GYRO are published. There is no neutral or
  * default fallback: on any failure valid is 0 and sample/timestamp are zero.
  *
- * No internal locking, threads, globals, allocations or clocks. The caller
+ * No internal locking, threads, globals or allocations. The caller
  * serializes all calls (cellPad backend lock). PadMotionSDL is
  * zero-initializable.
  *
@@ -20,6 +20,7 @@
  *   PAD_MOTION_SET_ENABLED SDL_GameControllerSetSensorEnabled
  *   PAD_MOTION_IS_ENABLED  SDL_GameControllerIsSensorEnabled
  *   PAD_MOTION_GET_DATA    SDL_GameControllerGetSensorDataWithTimestamp
+ *   PAD_MOTION_NOW_MS      SDL_GetTicks64
  * No other SDL function is called.
  *
  * sample[0..2]: accelerometer X/Y/Z, sample[3]: gyroscope Y; 0..1023, 512 centre.
@@ -54,6 +55,13 @@
 #ifndef PAD_MOTION_GET_DATA
 #define PAD_MOTION_GET_DATA SDL_GameControllerGetSensorDataWithTimestamp
 #endif
+#ifndef PAD_MOTION_NOW_MS
+#define PAD_MOTION_NOW_MS SDL_GetTicks64
+#endif
+
+/* Check each sensor independently: advancing gyro data must not hide a frozen
+ * accelerometer. Zero timestamps remain supported, as required by SDL. */
+#define PAD_MOTION_STALE_MS 250u
 
 /* Single-precision constants as in the reference f32 path and SDL's own
  * SDL_STANDARD_GRAVITY, so exactly 1 g or pi/2 rad/s reported as float maps to
@@ -65,6 +73,7 @@ typedef struct PadMotionSDL {
     int enabled, valid;
     uint16_t sample[4];
     uint64_t timestamp;
+    uint64_t source_timestamp[2], source_changed_ms[2];
 } PadMotionSDL;
 
 static inline void pad_motion_sdl_clear(PadMotionSDL* state)
@@ -78,6 +87,24 @@ static inline void pad_motion_sdl_reset(PadMotionSDL* state)
 {
     pad_motion_sdl_clear(state);
     state->enabled = 0;
+    memset(state->source_timestamp, 0, sizeof state->source_timestamp);
+    memset(state->source_changed_ms, 0, sizeof state->source_changed_ms);
+}
+
+static inline int pad_motion_sdl_fresh(PadMotionSDL* state, int sensor,
+                                     uint64_t timestamp, uint64_t now)
+{
+    if (!timestamp) {
+        state->source_timestamp[sensor] = 0;
+        state->source_changed_ms[sensor] = now;
+        return 1;
+    }
+    if (timestamp != state->source_timestamp[sensor]) {
+        state->source_timestamp[sensor] = timestamp;
+        state->source_changed_ms[sensor] = now;
+        return 1;
+    }
+    return now - state->source_changed_ms[sensor] <= PAD_MOTION_STALE_MS;
 }
 
 /* Clamp to 0..1023 before conversion; the cast truncates toward zero. */
@@ -171,6 +198,12 @@ static inline int pad_motion_sdl_poll(PadMotionSDL* state, SDL_GameController* g
     for (i = 0; i < 3; ++i)
         if (!isfinite(accel[i]) || !isfinite(gyro[i]))
             return 0;
+
+    uint64_t now = PAD_MOTION_NOW_MS();
+    int accel_fresh = pad_motion_sdl_fresh(state, 0, accel_ts, now);
+    int gyro_fresh = pad_motion_sdl_fresh(state, 1, gyro_ts, now);
+    if (!accel_fresh || !gyro_fresh)
+        return 0;
 
     /* SDL accel is m/s^2 including gravity; gyro is rad/s. */
     for (i = 0; i < 3; ++i)

@@ -43,6 +43,10 @@ static Uint32 was_init(Uint32 flags) { return flags; }
 static int init(Uint32 flags) { (void)flags;return 0; }
 static int joysticks(void) { return leading_unmapped+fixture.attached; }
 static int rumble(SDL_GameController* p,Uint16 a,Uint16 b,Uint32 t) { (void)p;(void)a;(void)b;(void)t;return 0; }
+static Uint16 fixture_vendor(SDL_GameController* p) { (void)p;return 0; }
+static Uint16 fixture_product(SDL_GameController* p) { (void)p;return 0; }
+#define SDL_GameControllerGetVendor fixture_vendor
+#define SDL_GameControllerGetProduct fixture_product
 #define SDL_GameControllerGetAttached attached
 #define SDL_GameControllerHasSensor capable
 #define SDL_GameControllerSetSensorEnabled enable
