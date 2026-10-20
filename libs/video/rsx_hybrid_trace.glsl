@@ -182,20 +182,20 @@ float hybridVisibility(vec3 position,vec3 normal,vec3 direction,float maximum){
 float hybridFar(){float f=p.projection.w/(1.0-p.projection.z);return f>0.0&&!isinf(f)?f:10000.0;}
 // CPU-selected key light: fp+2 view-space vector toward the light (w=0
 // directional), fp+3 radiance with w=1 when valid.
-// A directional shadow ray reaches fp+8.w times the receiver's camera
-// distance (at least 3 units, at most half the far plane). Folklore's areas
-// are enclosed by hills and tree walls that the game's own shadows never
-// include; with a low sun an unbounded ray hit them from nearly every pixel
-// and the whole frame went dark. Local casters (trees, rocks, characters)
-// stay inside the range.
+// A directional shadow ray reaches fp+8.w world units (at most half the far
+// plane). Folklore's areas are enclosed by hills and tree walls that the
+// game's own shadows never include; with a low sun an unbounded ray hit them
+// from nearly every pixel and the whole frame went dark. Local casters
+// (trees, rocks, characters) stay inside the range, and a fixed world range
+// never moves a shadow in or out as the camera moves.
 bool hybridKey(vec3 position,out vec3 direction,out float distance,out vec3 radiance){
     vec4 l=hybridFp(2u),c=hybridFp(3u);
     direction=vec3(0,0,1);distance=0.0;radiance=vec3(0);
     if(c.w!=1.0)return false;
     vec3 v=l.w==0.0?l.xyz:l.xyz/l.w-position;float d=length(v);
     if(isnan(d)||isinf(d)||d<=1e-5)return false;
-    float range=hybridFp(8u).w>0.0?hybridFp(8u).w:3.0;
-    direction=v/d;distance=l.w==0.0?min(max(3.0,range*length(position)),.5*hybridFar()):d;radiance=clamp(c.rgb,vec3(0),vec3(4));
+    float range=hybridFp(8u).w>0.0?hybridFp(8u).w:150.0;
+    direction=v/d;distance=l.w==0.0?min(range,.5*hybridFar()):d;radiance=clamp(c.rgb,vec3(0),vec3(4));
     return finite3(direction)&&finite3(radiance);
 }
 // Shadowed and unshadowed irradiance share the same ambient term; only the key
@@ -405,6 +405,36 @@ void hybridTemporal(uvec2 pixel){
     hybridStore(5u,index,M,A);
     uvec3 v=hybridPack(M,A);
     history.value[bank*n+index]=uvec4(v,floatBitsToUint(depth));
+}
+// Asynchronous transport: this frame's raster takes the lighting the previous
+// frame's trace finished (the history bank it wrote, 1-fp+8.y), reprojected
+// through fp+4..7 as in hybridTemporal. Missing or mismatched history keeps
+// the raster unchanged for this frame.
+void hybridLateComposite(uvec2 texel,inout vec4 original,out vec4 raw){
+    raw=original;
+    vec4 flags=hybridFp(8u);if(flags.z!=0.0)return;
+    vec3 position=hybridTexelPosition(ivec2(texel));if(position.z<=0.0)return;
+    vec4 world=vec4(position,1.0);
+    vec4 clip=vec4(dot(hybridFp(4u),world),dot(hybridFp(5u),world),dot(hybridFp(6u),world),dot(hybridFp(7u),world));
+    if(!(clip.w>1e-5)||!finite3(clip.xyz))return;
+    vec2 ndc=clip.xy/clip.w;vec2 uv=vec2(ndc.x*.5+.5,.5-ndc.y*.5);
+    float offset=p.counts.z==2u?.75:.5;
+    ivec2 c=ivec2(floor(uv*vec2(p.dims.xy)-offset+.5));
+    uint n=pixelCount(),bank=flags.y!=0.0?0u:1u;
+    const ivec2 offsets[5]=ivec2[5](ivec2(0),ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+    float best=1e30;uvec4 chosen=uvec4(0);
+    for(int k=0;k<5;k++){
+        ivec2 q=c+offsets[k];
+        if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(p.dims.xy))))continue;
+        uvec4 h=history.value[bank*n+uint(q.y)*p.dims.x+uint(q.x)];
+        float d=uintBitsToFloat(h.w);if(!(d>0.0))continue;
+        float e=abs(d-clip.w);if(e<best){best=e;chosen=h;}
+    }
+    if(best>max(.02,clip.w*.02))return;
+    vec3 M,A;hybridUnpack(chosen.xyz,M,A);
+    if(!finite3(M)||!finite3(A)){countRay(6);return;}
+    original.rgb=clamp(original.rgb*M+A,vec3(0),vec3(1));raw=original;
+    if(max(max(original.r,original.g),original.b)>.001)countRay(7);
 }
 void hybridComposite(uvec2 texel,inout vec4 original,out vec4 raw){
     raw=original;

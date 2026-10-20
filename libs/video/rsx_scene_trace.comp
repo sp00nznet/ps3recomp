@@ -653,7 +653,8 @@ void main(){
     // the filtered lighting over time before the composite reads it.
     if(phase.mode==7u){if(all(equal(pixel,uvec2(0))))hybridSkyUpdate();return;}
     if(phase.mode==6u){if(all(lessThan(pixel,p.dims.xy)))hybridTemporal(pixel);return;}
-    if(phase.mode>=2u){if(all(lessThan(pixel,p.dims.xy)))filterTransport(pixel);return;}
+    // 8: hybrid late composite (asynchronous transport); 1: composite.
+    if(phase.mode>=2u && phase.mode!=8u){if(all(lessThan(pixel,p.dims.xy)))filterTransport(pixel);return;}
     uvec2 expanded=uvec2(p.dims.z*p.counts.z,p.dims.w);
     if(any(greaterThanEqual(pixel,expanded)))return;
     vec4 original=texelFetch(worldColor,ivec2(pixel),0);
@@ -664,7 +665,8 @@ void main(){
     // Hybrid composites even a rejected frame: its temporal pass already
     // replaced that frame's lighting with the reprojected previous result.
     if((RSX_TRANSPORT_FLAGS&32u)!=0u){
-        hybridComposite(pixel,original,raw);
+        if(phase.mode==8u)hybridLateComposite(pixel,original,raw);
+        else hybridComposite(pixel,original,raw);
     }else if((validity.flags&~2u)==0u && (RSX_TRANSPORT_FLAGS&4u)!=0u){
         uint index=pixel.y*p.dims.x+pixel.x;vec3 delta;
         for(uint c=0u;c<3u;c++)delta[c]=uintBitsToFloat(ao.value[pixelCount()*(7u+c)+index]);

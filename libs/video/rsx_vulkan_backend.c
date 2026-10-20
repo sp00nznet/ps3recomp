@@ -105,7 +105,7 @@
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
-    X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) \
+    X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
@@ -634,8 +634,53 @@ static struct {
 #define VK_GRAVE_MAX 256u
 static struct { vk_image im[VK_GRAVE_MAX]; u32 n; } s_grave;
 
+/* Asynchronous ray transport (rsx_vulkan_ray_ao.inc): a second queue of the
+ * graphics family traces one frame while the next frame renders. Its
+ * submissions are not covered by s_vk.fence, so anything that destroys an
+ * image the trace may still sample drains it first. */
+static struct {
+    VkQueue queue; VkCommandBuffer cmd; VkFence fence; int available, inflight;
+    /* ready: the transport's main submission -> the async trace (its inputs).
+     * done: the async trace -> the next transport main submission (history).
+     * attach: the next vk_submit_and_wait carries them (transport only). */
+    VkSemaphore ready, done; int attach, done_pending;
+    /* recorded: a trace waiting for the frame's present to be submitted
+     * (recorded_ok: its command buffer is valid; otherwise the submission only
+     * consumes the ready signal). */
+    int recorded, recorded_ok;
+    u64 kicked;
+} s_async;
+/* Submit the recorded trace: right after the frame's present, it overlaps the
+ * next frame's command processing instead of delaying this frame's present. */
+static void vk_async_kick(void)
+{
+    if (!s_async.recorded) return;
+    s_async.recorded = 0;
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &s_async.ready, .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = s_async.recorded_ok ? 1u : 0u, .pCommandBuffers = &s_async.cmd,
+        .signalSemaphoreCount = s_async.recorded_ok ? 1u : 0u, .pSignalSemaphores = &s_async.done };
+    if (pvkResetFences(s_vk.device, 1, &s_async.fence) != VK_SUCCESS ||
+        pvkQueueSubmit(s_async.queue, 1, &si, s_async.fence) != VK_SUCCESS) {
+        VK_LOG("asynchronous ray transport submission failed; transport stays synchronous\n");
+        pvkDeviceWaitIdle(s_vk.device);
+        s_async.available = 0; s_async.inflight = 0; s_async.done_pending = 0;
+        return;
+    }
+    s_async.inflight = 1; s_async.done_pending = s_async.recorded_ok; s_async.kicked++;
+}
+static void vk_async_drain(void)
+{
+    vk_async_kick();
+    if (!s_async.inflight) return;
+    pvkWaitForFences(s_vk.device, 1, &s_async.fence, VK_TRUE, UINT64_MAX);
+    s_async.inflight = 0;
+}
+
 static void vk_grave_empty(void)
 {
+    if (s_grave.n) vk_async_drain();
     for (u32 i = 0; i < s_grave.n; i++) {
         vk_image* im = &s_grave.im[i];
         if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
@@ -684,6 +729,15 @@ static int vk_submit_and_wait_impl(const char* site)
     if (r == VK_SUCCESS) {
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                             .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
+        const VkPipelineStageFlags async_wait = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        if (s_async.attach) {
+            s_async.attach = 0;
+            if (s_async.done_pending) {
+                si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s_async.done;
+                si.pWaitDstStageMask = &async_wait; s_async.done_pending = 0;
+            }
+            si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s_async.ready;
+        }
         r = pvkResetFences(s_vk.device, 1, &s_vk.fence);
         if (r == VK_SUCCESS) r = pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence);
         hp_queued = vhp_tick();
@@ -2612,6 +2666,7 @@ static void vk_eng_cacao_shutdown(void);
 
 static void vk_eng_release(void* user, u32 handle)
 {   (void)user;
+    vk_async_drain();
     /* A plain texture pending commands may still sample goes to the
      * graveyard, destroyed once the next submission has completed; anything
      * else (targets, their views and framebuffers) waits as before. */
@@ -2835,7 +2890,13 @@ static void vk_eng_set_present_aspect(void* user,float aspect)
     s_vk.present_aspect=isfinite(aspect) && aspect>=16.0f/9.0f && aspect<=32.0f/9.0f ? aspect : 0;
 }
 
+static void vk_eng_present_impl(void* user, u32 surface);
 static void vk_eng_present(void* user, u32 surface)
+{
+    vk_eng_present_impl(user, surface);
+    vk_async_kick();
+}
+static void vk_eng_present_impl(void* user, u32 surface)
 { vk_flush_pending(0);
     if(s_vk.rt_enabled)vk_rt_capture_present();
     (void)user;
@@ -4320,10 +4381,27 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 
     vk_advanced_probe(app.apiVersion);
 
-    float prio = 1.0f;
+    /* A second queue of the same family for the asynchronous ray transport
+     * (no ownership transfers), unless PS3RECOMP_RSX_ASYNC_PT=0. */
+    float prio[2] = { 1.0f, 1.0f };
+    u32 queue_count = 1;
+    {
+        const char* async = getenv("PS3RECOMP_RSX_ASYNC_PT");
+        u32 families = 0;
+        pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &families, NULL);
+        VkQueueFamilyProperties* fp = families && families <= 64 ?
+            (VkQueueFamilyProperties*)calloc(families, sizeof *fp) : NULL;
+        if (fp) {
+            pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &families, fp);
+            if (s_vk.rt_requested && !(async && async[0] == '0') && s_vk.queue_family < families &&
+                fp[s_vk.queue_family].queueCount >= 2 && (fp[s_vk.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                queue_count = 2;
+            free(fp);
+        }
+    }
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
-                                    .queueCount = 1, .pQueuePriorities = &prio };
+                                    .queueCount = queue_count, .pQueuePriorities = prio };
     const char* dev_exts[64] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
     /* DXT (BC1-3) is how PS3 titles ship most textures; Vulkan gates it
      * behind a feature, enabled only when the device reports it. */
@@ -4438,6 +4516,17 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.cmd), "vkAllocateCommandBuffers");
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.fence), "vkCreateFence");
+    memset(&s_async, 0, sizeof s_async);
+    if (queue_count == 2) {
+        pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 1, &s_async.queue);
+        VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        if (s_async.queue && pvkAllocateCommandBuffers(s_vk.device, &cai, &s_async.cmd) == VK_SUCCESS &&
+            pvkCreateFence(s_vk.device, &fci, NULL, &s_async.fence) == VK_SUCCESS &&
+            pvkCreateSemaphore(s_vk.device, &sci, NULL, &s_async.ready) == VK_SUCCESS &&
+            pvkCreateSemaphore(s_vk.device, &sci, NULL, &s_async.done) == VK_SUCCESS)
+            s_async.available = 1;
+        VK_LOG("asynchronous ray transport queue: %s\n", s_async.available ? "family queue 1" : "unavailable");
+    }
 
     if (vk_pick_depth_format()) return -1;
     if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
@@ -4607,6 +4696,10 @@ void rsx_vulkan_backend_shutdown(void)
         vk_destroy_buffer(&s_vk.vertices);
         vk_destroy_buffer(&s_vk.readback);
         if (s_vk.fence) pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
+        if (s_async.fence) pvkDestroyFence(s_vk.device, s_async.fence, NULL);
+        if (s_async.ready) pvkDestroySemaphore(s_vk.device, s_async.ready, NULL);
+        if (s_async.done) pvkDestroySemaphore(s_vk.device, s_async.done, NULL);
+        memset(&s_async, 0, sizeof s_async);
         if (s_vk.pool)  pvkDestroyCommandPool(s_vk.device, s_vk.pool, NULL);
         vk_pcache_shutdown(s_vk.device);
         pvkDestroyDevice(s_vk.device, NULL);

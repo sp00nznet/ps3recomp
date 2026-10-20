@@ -55,6 +55,9 @@ static struct {
     float key_view[3],key_light[3],key_rgb[3];
     int cam_valid;u64 cam_frame;float cam_view[12],cam_projection[4];
     u32 history_bank;u64 held_frames,dlss_frames;
+    /* Asynchronous transport: this frame's color and depth, copied for the
+     * trace on the second queue (the originals change during the next frame). */
+    vk_image async_color,async_depth;u32 async_w,async_h;VkFormat async_format;int async_fresh;u64 async_frames;
 } s_ray_ao;
 static u64 s_ray_device_generation;
 static void vk_ray_destroy_buffer(vk_buffer *b)
@@ -296,6 +299,7 @@ static void vk_rt_ao_shutdown(void)
     if(!s_vk.device)return;
     // Backend shutdown owns the drain. No module allocation retires early.
     pvkDeviceWaitIdle(s_vk.device);vk_ray_alpha_reset();
+    vk_destroy_image(&s_ray_ao.async_color);vk_destroy_image(&s_ray_ao.async_depth);
     if(s_ray_ao.color)vk_eng_release(NULL,s_ray_ao.color);
     if(s_ray_ao.raw_color)vk_eng_release(NULL,s_ray_ao.raw_color);
     if(s_ray_ao.tlas)s_ray_ao.destroy_as(s_vk.device,s_ray_ao.tlas,NULL);if(s_ray_ao.blas)s_ray_ao.destroy_as(s_vk.device,s_ray_ao.blas,NULL);
@@ -546,6 +550,9 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
 {
     (void)user;u64 start=SDL_GetPerformanceCounter(),record_start=0,submit_start=0;u64 token=0;int recorded=0,submitted=0;u32 replacement=0;
     int hybrid_have_camera=0;float hybrid_view[12]={0};u64 hybrid_camera_key=0;u32 dlss_view=0;
+    /* The previous frame's asynchronous trace reads every buffer, descriptor
+     * and sampler this call rewrites; it has normally finished long ago. */
+    vk_async_drain();
     const char *failure="epoch/projection qualification";
     rsx_scene_epoch *epoch=vk_rt_epoch(depth);s_ray_ao.attempted++;
     if(epoch && epoch->reason!=RSX_SCENE_EPOCH_OK){
@@ -592,6 +599,20 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
      * MSAA samples; the other modes trace every sample. */
     u32 aw=hybrid_mode?width:authored_mode?width*gx:(width<320?width:320),ah=authored_mode?height:(height<180?height:180);
     const int dlss_ready=hybrid_mode && vk_dlss_prepare(epoch->vertex_count);
+    /* Asynchronous transport (default with a second queue; PS3RECOMP_RSX_ASYNC_PT=0
+     * disables): this frame composites the previous trace's lighting and its
+     * own trace runs on the second queue while the next frame renders. */
+    const char *async_env=getenv("PS3RECOMP_RSX_ASYNC_PT");
+    const u32 async_mode=hybrid_mode && !trace_off && s_async.available && !(async_env && async_env[0]=='0');
+    if(async_mode && (s_ray_ao.async_w!=width*gx || s_ray_ao.async_h!=height || s_ray_ao.async_format!=source->fmt || !s_ray_ao.async_color.img)){
+        vk_destroy_image(&s_ray_ao.async_color);vk_destroy_image(&s_ray_ao.async_depth);s_ray_ao.async_w=0;
+        failure="asynchronous transport copies";
+        if(vk_create_image(&s_ray_ao.async_color,source->fmt,width*gx,height,VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,VK_IMAGE_ASPECT_COLOR_BIT) ||
+           vk_create_image(&s_ray_ao.async_depth,VK_FORMAT_R32_SFLOAT,width*gx,height,VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,VK_IMAGE_ASPECT_COLOR_BIT)){
+            vk_destroy_image(&s_ray_ao.async_color);vk_destroy_image(&s_ray_ao.async_depth);goto fail;
+        }
+        s_ray_ao.async_w=width*gx;s_ray_ao.async_h=height;s_ray_ao.async_format=source->fmt;s_ray_ao.async_fresh=1;
+    }
     if(trace_off && !dlss_ready){failure="DLSS unavailable for the trace-off scene path";goto fail;}
     // All resources/samplers retire after the prior synchronous submission.
     vk_ray_alpha_reset();
@@ -761,9 +782,10 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         int reset=0;vk_ray_reprojection(projection,hybrid_have_camera,hybrid_view,epoch->frame,&block[2][0],&reset);
         if(s_ray_ao.history_w!=aw || s_ray_ao.history_h!=ah)reset=1;
         block[6][1]=(float)s_ray_ao.history_bank;block[6][2]=reset?1.0f:0.0f;
-        /* Directional shadow range as a multiple of receiver distance. */
-        const char *range_env=getenv("PS3RECOMP_RSX_SHADOW_RANGE");float range=range_env?strtof(range_env,NULL):3.0f;
-        block[6][3]=isfinite(range)&&range>0.0f&&range<=1000.0f?range:3.0f;
+        /* Directional shadow reach in world units (Folklore: a point light's
+         * authored range is 19..94 units; the camera sits ~50 units back). */
+        const char *range_env=getenv("PS3RECOMP_RSX_SHADOW_RANGE");float range=range_env?strtof(range_env,NULL):150.0f;
+        block[6][3]=isfinite(range)&&range>0.0f&&range<=100000.0f?range:150.0f;
         if(fp_used+sizeof block>s_ray_ao.fp.size)goto fail;
         memcpy((u8*)s_ray_ao.fp.ptr+fp_used,block,sizeof block);fp_used+=sizeof block;
     }
@@ -815,7 +837,8 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     VkWriteDescriptorSet writes[50];u32 wn=0;for(u32 i=0;i<8;i++)writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=i,.descriptorCount=1,.descriptorType=i==7?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]};
     VkWriteDescriptorSetAccelerationStructureKHR wa={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,.accelerationStructureCount=1,.pAccelerationStructures=&s_ray_ao.tlas};
     writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.pNext=&wa,.dstSet=s_ray_ao.set,.dstBinding=8,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR};
-    VkDescriptorImageInfo images[3]={{s_vk.sampler,source->im.view,VK_IMAGE_LAYOUT_GENERAL},{s_vk.sampler,snapshot->im.view,VK_IMAGE_LAYOUT_GENERAL},{VK_NULL_HANDLE,out->im.view,VK_IMAGE_LAYOUT_GENERAL}};
+    VkDescriptorImageInfo images[3]={{s_vk.sampler,async_mode?s_ray_ao.async_color.view:source->im.view,VK_IMAGE_LAYOUT_GENERAL},
+        {s_vk.sampler,async_mode?s_ray_ao.async_depth.view:snapshot->im.view,VK_IMAGE_LAYOUT_GENERAL},{VK_NULL_HANDLE,out->im.view,VK_IMAGE_LAYOUT_GENERAL}};
     for(u32 i=0;i<3;i++)writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=9+i,.descriptorCount=1,.descriptorType=i==2?VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&images[i]};
     VkDescriptorImageInfo raw_image={VK_NULL_HANDLE,s_eobj[s_ray_ao.raw_color].im.view,VK_IMAGE_LAYOUT_GENERAL};
     writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=12,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.pImageInfo=&raw_image};
@@ -837,7 +860,23 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     s_ray_ao.build(s_vk.cmd,1,&bb,&brp);vk_ray_memory(VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     s_ray_ao.build(s_vk.cmd,1,&tb,&trp);vk_ray_memory(VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);vk_ray_stamp(3,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
     u32 mode=0;
-    if(!trace_off){
+    if(async_mode){
+        /* Copies for the asynchronous trace, then this frame's raster with
+         * the previous trace's lighting (hybridLateComposite). */
+        vk_barrier_image(s_ray_ao.async_color.img,VK_IMAGE_ASPECT_COLOR_BIT,s_ray_ao.async_fresh?VK_IMAGE_LAYOUT_UNDEFINED:VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(s_ray_ao.async_depth.img,VK_IMAGE_ASPECT_COLOR_BIT,s_ray_ao.async_fresh?VK_IMAGE_LAYOUT_UNDEFINED:VK_IMAGE_LAYOUT_GENERAL);
+        s_ray_ao.async_fresh=0;
+        vk_barrier_image(source->im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(snapshot->im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
+        VkImageCopy region={.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.extent={width*gx,height,1}};
+        pvkCmdCopyImage(s_vk.cmd,source->im.img,VK_IMAGE_LAYOUT_GENERAL,s_ray_ao.async_color.img,VK_IMAGE_LAYOUT_GENERAL,1,&region);
+        pvkCmdCopyImage(s_vk.cmd,snapshot->im.img,VK_IMAGE_LAYOUT_GENERAL,s_ray_ao.async_depth.img,VK_IMAGE_LAYOUT_GENERAL,1,&region);
+        vk_ray_memory(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
+        pvkCmdBindPipeline(s_vk.cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s_ray_ao.trace[source->fmt==VK_FORMAT_R16G16B16A16_SFLOAT]);
+        mode=8;pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);s_ray_ao.dispatch(s_vk.cmd,(width*gx+7)/8,(height+7)/8,1);
+        vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
+        vk_ray_stamp(4,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }else if(!trace_off){
         pvkCmdBindPipeline(s_vk.cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s_ray_ao.trace[source->fmt==VK_FORMAT_R16G16B16A16_SFLOAT]);
         if(hybrid_mode){
             /* 7: smoothed sky estimate, read by every trace below. */
@@ -875,12 +914,46 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     // Existing synchronous boundary: validity, four query counters, and the
     // first alpha and depth failures' bounded diagnostic fields. No vertex readback.
     vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT);
-    VkBufferCopy flag_copy={.size=4};s_ray_ao.copy_buffer(s_vk.cmd,batch.validity,s_ray_ao.flag_readback.buf,1,&flag_copy);
-    VkBufferCopy counter_copy={.srcOffset=(VkDeviceSize)aw*ah*40,.dstOffset=4,.size=128};s_ray_ao.copy_buffer(s_vk.cmd,s_ray_ao.ao.buf,s_ray_ao.flag_readback.buf,1,&counter_copy);
+    VkBufferCopy flag_copy={.size=4};
+    VkBufferCopy counter_copy={.srcOffset=(VkDeviceSize)aw*ah*40,.dstOffset=4,.size=128};
+    if(!async_mode){
+        s_ray_ao.copy_buffer(s_vk.cmd,batch.validity,s_ray_ao.flag_readback.buf,1,&flag_copy);
+        s_ray_ao.copy_buffer(s_vk.cmd,s_ray_ao.ao.buf,s_ray_ao.flag_readback.buf,1,&counter_copy);
+    }
     vk_ray_memory(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_HOST_READ_BIT);
     failure="synchronous integration submission";submit_start=SDL_GetPerformanceCounter();
+    if(async_mode)s_async.attach=1;
     if(vk_submit_and_wait())goto abandon;
     vk_dlss_complete(1,trace_off?source_color:s_ray_ao.color);
+    if(async_mode){
+        /* The trace for this frame: sky, trace, filter, temporal (history
+         * bank for the next frame's late composite), counters. */
+        VkCommandBuffer main_cmd=s_vk.cmd;s_vk.cmd=s_async.cmd;
+        VkCommandBufferBeginInfo begin_info={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        int ok=pvkResetCommandBuffer(s_async.cmd,0)==VK_SUCCESS && pvkBeginCommandBuffer(s_async.cmd,&begin_info)==VK_SUCCESS;
+        if(ok){
+            vk_ray_memory(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_TRANSFER_READ_BIT);
+            pvkCmdBindDescriptorSets(s_vk.cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s_ray_ao.pipeline_layout,0,1,&s_ray_ao.set,0,NULL);
+            pvkCmdBindPipeline(s_vk.cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s_ray_ao.trace[source->fmt==VK_FORMAT_R16G16B16A16_SFLOAT]);
+            static const u32 sequence[]={7,0,5,2,3,6};
+            for(u32 i=0;i<sizeof sequence/sizeof sequence[0];i++){
+                mode=sequence[i];
+                if((mode==2 || mode==3) && !denoise)continue;
+                pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);
+                if(mode==7 || mode==5)s_ray_ao.dispatch(s_vk.cmd,1,1,1);else s_ray_ao.dispatch(s_vk.cmd,(aw+7)/8,(ah+7)/8,1);
+                vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
+            }
+            vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT);
+            s_ray_ao.copy_buffer(s_vk.cmd,batch.validity,s_ray_ao.flag_readback.buf,1,&flag_copy);
+            s_ray_ao.copy_buffer(s_vk.cmd,s_ray_ao.ao.buf,s_ray_ao.flag_readback.buf,1,&counter_copy);
+            vk_ray_memory(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT|VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_HOST_READ_BIT|VK_ACCESS_MEMORY_READ_BIT);
+            ok=pvkEndCommandBuffer(s_vk.cmd)==VK_SUCCESS;
+        }
+        s_vk.cmd=main_cmd;
+        /* Submitted after this frame's present (vk_async_kick); even a failed
+         * recording is submitted, to consume the ready signal. */
+        s_async.recorded=1;s_async.recorded_ok=ok;if(ok)s_ray_ao.async_frames++;
+    }
     submitted=1;if(rsx_vulkan_scene_batch_mark_submitted(token) || rsx_vulkan_scene_batch_reset(token))goto fail;recorded=0;token=0;
     memcpy(&s_ray_ao.last_flags,s_ray_ao.flag_readback.ptr,4);s_ray_ao.traced++;
     memcpy(s_ray_ao.gpu_stats,(unsigned char*)s_ray_ao.flag_readback.ptr+4,128);
@@ -928,7 +1001,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     }
     double copy_ms=(double)(s_rt_capture.copy_ticks-s_ray_ao.last_copy_ticks)*1000.0/(double)SDL_GetPerformanceFrequency();
     u64 copied=s_rt_capture.copied_bytes-s_ray_ao.last_copy_bytes;s_ray_ao.last_copy_ticks=s_rt_capture.copy_ticks;s_ray_ao.last_copy_bytes=s_rt_capture.copied_bytes;
-    if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))VK_LOG("ray transport mode=%s denoiser=%s frame=%llu epoch=%llu requested=%llu traced=%llu validFrames=%llu fallback=%llu flags=0x%x reasonCounts(pos/alpha/depth/numeric)=%llu/%llu/%llu/%llu draws=%u vertices=%u triangles=%u traceGrid=%ux%u paths=%u maxBounces=%u alphaLOD=ray-cone copied=%llu copyCPU=%.3fms totalCPU=%.3fms prepare/record/wait=%.3f/%.3f/%.3fms GPU(VS/gather/AS/trace/composite/DLSS)=%.3f/%.3f/%.3f/%.3f/%.3f/%.3fms dlssPrep=%.3fms heldFrames=%llu dlssFrames=%llu key=%d timestampBits=%u\n",trace_off?"dlss-scene-only":transport_mode,denoise?"spatial":"off",(unsigned long long)epoch->frame,(unsigned long long)epoch->generation,(unsigned long long)s_ray_ao.attempted,(unsigned long long)s_ray_ao.traced,(unsigned long long)s_ray_ao.completed,(unsigned long long)s_ray_ao.rejected,s_ray_ao.last_flags,(unsigned long long)s_ray_ao.invalid_position,(unsigned long long)s_ray_ao.invalid_alpha,(unsigned long long)s_ray_ao.invalid_depth,(unsigned long long)s_ray_ao.invalid_numeric,epoch->draw_count,epoch->vertex_count,triangles,aw,ah,authored_mode?1u:path_preview?8u:4u,authored_mode?1u:path_preview?4u:1u,(unsigned long long)copied,copy_ms,s_ray_ao.cpu_ms,(double)(record_start-start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(submit_start-record_start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(SDL_GetPerformanceCounter()-submit_start)*1000.0/(double)SDL_GetPerformanceFrequency(),s_ray_ao.gpu_ms[0],s_ray_ao.gpu_ms[1],s_ray_ao.gpu_ms[2],s_ray_ao.gpu_ms[3],s_ray_ao.gpu_ms[4],s_ray_ao.gpu_ms[5],s_ray_ao.gpu_ms[6],(unsigned long long)s_ray_ao.held_frames,(unsigned long long)s_ray_ao.dlss_frames,s_ray_ao.key_valid,s_ray_ao.timestamp_bits);
+    if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))VK_LOG("ray transport mode=%s denoiser=%s frame=%llu epoch=%llu requested=%llu traced=%llu validFrames=%llu fallback=%llu flags=0x%x reasonCounts(pos/alpha/depth/numeric)=%llu/%llu/%llu/%llu draws=%u vertices=%u triangles=%u traceGrid=%ux%u paths=%u maxBounces=%u alphaLOD=ray-cone copied=%llu copyCPU=%.3fms totalCPU=%.3fms prepare/record/wait=%.3f/%.3f/%.3fms GPU(VS/gather/AS/trace/composite/DLSS)=%.3f/%.3f/%.3f/%.3f/%.3f/%.3fms dlssPrep=%.3fms heldFrames=%llu dlssFrames=%llu key=%d timestampBits=%u\n",trace_off?"dlss-scene-only":async_mode?"hybrid-path-tracing-async":transport_mode,denoise?"spatial":"off",(unsigned long long)epoch->frame,(unsigned long long)epoch->generation,(unsigned long long)s_ray_ao.attempted,(unsigned long long)s_ray_ao.traced,(unsigned long long)s_ray_ao.completed,(unsigned long long)s_ray_ao.rejected,s_ray_ao.last_flags,(unsigned long long)s_ray_ao.invalid_position,(unsigned long long)s_ray_ao.invalid_alpha,(unsigned long long)s_ray_ao.invalid_depth,(unsigned long long)s_ray_ao.invalid_numeric,epoch->draw_count,epoch->vertex_count,triangles,aw,ah,authored_mode?1u:path_preview?8u:4u,authored_mode?1u:path_preview?4u:1u,(unsigned long long)copied,copy_ms,s_ray_ao.cpu_ms,(double)(record_start-start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(submit_start-record_start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(SDL_GetPerformanceCounter()-submit_start)*1000.0/(double)SDL_GetPerformanceFrequency(),s_ray_ao.gpu_ms[0],s_ray_ao.gpu_ms[1],s_ray_ao.gpu_ms[2],s_ray_ao.gpu_ms[3],s_ray_ao.gpu_ms[4],s_ray_ao.gpu_ms[5],s_ray_ao.gpu_ms[6],(unsigned long long)s_ray_ao.held_frames,(unsigned long long)s_ray_ao.dlss_frames,s_ray_ao.key_valid,s_ray_ao.timestamp_bits);
     if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))VK_LOG("ray AO actual queries primary=%u matched=%u secondary=%u alphaRejected=%u emptyFrames=%llu\n",s_ray_ao.gpu_stats[0],s_ray_ao.gpu_stats[1],s_ray_ao.gpu_stats[2],s_ray_ao.gpu_stats[3],(unsigned long long)s_ray_ao.empty_ao);
     if(!hybrid_mode && s_ray_ao.gpu_stats[4] && (s_ray_ao.traced<=4 || s_ray_ao.traced%120==0)){
         float numeric_value;memcpy(&numeric_value,&s_ray_ao.gpu_stats[11],4);
