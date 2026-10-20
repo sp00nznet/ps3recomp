@@ -578,9 +578,21 @@ static void pad_poll_sdl2(void)
 
 static void pad_init_backend(void)
 {
-    /* PS3 prompts refer to face-button positions. Nintendo labels otherwise
-     * swap A/B and X/Y, including GameSir controllers in Switch mode. */
-    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
+    /* Switch-mode pads: SDL maps face buttons by label by default, so the
+     * button a third-party pad labels A (bottom on Xbox/PlayStation-shaped
+     * pads, e.g. GameSir in Switch mode) is Cross, as players of this port
+     * had it. PS3RECOMP_PAD_FACE_BUTTONS=position maps by Nintendo position
+     * instead (A on the right becomes Circle), for genuine Nintendo pads. */
+    {
+        const char* face = getenv("PS3RECOMP_PAD_FACE_BUTTONS");
+        const int position = face && !strcmp(face, "position");
+        SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, position ? "0" : "1");
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            printf("[cellPad] Switch-mode face buttons by %s\n", position ? "Nintendo position" : "label (A = Cross)");
+        }
+    }
     if (!s_sdl_inited) {
         if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
             if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) return;
