@@ -2436,6 +2436,7 @@ typedef struct vk_eng_obj {
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
+    u8       upload_failed;          /* TEXTURE: a mip upload could not stage */
     /* Multisample target: what its expansion pass reuses (rsx_vulkan_msaa.inc). */
     VkImageView     exp_view;
     VkFramebuffer   exp_fb;
@@ -3096,6 +3097,7 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
         vk_eng_make_view(o->im.img, vf, mips, vk_remap(remap, rsx_fmt), cube, &o->im.view))
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube;
+    o->upload_failed = 0;
     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
     if (vk_begin()) goto fail;
@@ -3116,11 +3118,23 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     if (!s_batch.defer) vk_flush_pending(0);
     (void)user;
     vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
-    if (!o || !src || !row_bytes || !rows || face >= (o->cube ? 6u : 1u)) return;
+    if (!o) return;
+    if (!src || !row_bytes || !rows || face >= (o->cube ? 6u : 1u)) {
+        o->upload_failed = 1;
+        return;
+    }
     if(s_vk.rt_enabled)vk_rt_capture_resource(texture);
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
-    vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);
+    if (vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes))
+        o->upload_failed = 1;
+}
+
+static int vk_eng_texture_upload_valid(void* user, u32 texture)
+{
+    (void)user;
+    const vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+    return o && !o->upload_failed;
 }
 
 /* A colour target sampled with a unit's crossbar: an extra view of the same
@@ -4239,6 +4253,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .submit_and_wait      = vk_eng_submit_and_wait,
     .texture_create       = vk_eng_texture_create,
     .texture_upload       = vk_eng_texture_upload,
+    .texture_upload_valid = vk_eng_texture_upload_valid,
     .texture_release      = vk_eng_release,
     .color_target_create  = vk_eng_color_target_create,
     .color_target_release = vk_eng_release,
