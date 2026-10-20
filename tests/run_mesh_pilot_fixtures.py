@@ -17,10 +17,11 @@ def main():
     cases={'valid':p,'truncated':p[:-1],'trailing':p+b'x',
            'nan':p[:108]+struct.pack('<I',0x7fc00000)+p[112:],
            'bad_index':p[:156]+struct.pack('<I',3)+p[160:],
-           'oversize':p[:12]+struct.pack('<I',0xffffffff)+p[16:]}
+           'oversize':p[:12]+struct.pack('<I',0xffffffff)+p[16:],
+           'too_many_records':p[:8]+struct.pack('<I',65)+p[12:]}
     for name,data in cases.items():
         path=root/f'pilot-fixture-{name}.bin'
         path.write_bytes(data)
         subprocess.run([str(exe),str(path),'accept' if name=='valid' else 'reject'],check=True)
-    print('6 fixture cases passed')
+    print(f'{len(cases)} fixture cases passed')
 if __name__=='__main__':main()

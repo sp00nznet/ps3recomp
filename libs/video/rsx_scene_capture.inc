@@ -9,6 +9,11 @@ static void pd_alpha_textures(const rsx_be_render_state* rs,u32 draw,u32 mask)
 {
     const char* selected=getenv("RSX_ENGINE_PASS_DUMP_TEXTURE_MASK");
     if(!selected || !*selected)return;
+    const char* draw_filter=getenv("RSX_ENGINE_PASS_DUMP_TEXTURE_DRAW");
+    if(draw_filter && *draw_filter){
+        char* end=NULL;unsigned long wanted=strtoul(draw_filter,&end,10);
+        if(end==draw_filter || *end || wanted>127u || draw!=(u32)wanted)return;
+    }
     const int all=!strcmp(selected,"all");
     if(!all) {
         if(!rs->alpha_test_enable)return;

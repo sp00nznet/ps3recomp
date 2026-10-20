@@ -1,4 +1,4 @@
-/* Explicit, bounded experimental replacement of exact captured rigid draws.
+/* Explicit, bounded experimental replacement of exact captured draws.
  * FMP1 is little endian; original bytes and attribute IDs must match in full.
  * No guest memory, animation, collision, shaders or default settings change. */
 #ifndef RSX_MESH_PILOT_H
@@ -14,12 +14,13 @@ typedef struct {
     size_t original_size, replacement_size;
     unsigned hits;
 } rsx_mesh_pilot_record;
-typedef struct { int initialized; unsigned count, gate_poll; rsx_mesh_pilot_record records[4]; } rsx_mesh_pilot_state;
+#define RSX_MESH_PILOT_MAX_RECORDS 64u
+typedef struct { int initialized; unsigned count, gate_poll; rsx_mesh_pilot_record records[RSX_MESH_PILOT_MAX_RECORDS]; } rsx_mesh_pilot_state;
 static uint32_t rsx_mesh_pilot_u32(const unsigned char *p) {
     return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
 }
 static void rsx_mesh_pilot_free(rsx_mesh_pilot_state *s) {
-    for(unsigned i=0;i<4;i++){free(s->records[i].original);free(s->records[i].replacement);}
+    for(unsigned i=0;i<RSX_MESH_PILOT_MAX_RECORDS;i++){free(s->records[i].original);free(s->records[i].replacement);}
     memset(s,0,sizeof *s);
 }
 static int rsx_mesh_pilot_validate(const unsigned char *p,uint32_t nv,uint32_t ni,uint32_t stride) {
@@ -31,7 +32,7 @@ static int rsx_mesh_pilot_load(rsx_mesh_pilot_state *s,const char *path) {
     unsigned char h[100];size_t total=0;int ok=0;
     FILE *f=fopen(path,"rb");if(!f)return 0;
     if(fread(h,1,12,f)!=12 || memcmp(h,"FMP1",4) || rsx_mesh_pilot_u32(h+4)!=1)goto done;
-    unsigned count=rsx_mesh_pilot_u32(h+8);if(!count || count>4)goto done;
+    unsigned count=rsx_mesh_pilot_u32(h+8);if(!count || count>RSX_MESH_PILOT_MAX_RECORDS)goto done;
     for(unsigned k=0;k<count;k++){
         if(fread(h,1,96,f)!=96)goto done;
         rsx_mesh_pilot_record *r=&s->records[k];
