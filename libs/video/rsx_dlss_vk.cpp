@@ -388,8 +388,8 @@ extern "C" RSX_DLSS_API rsx_dlss_status rsx_dlss_optimal_size(
     return RSX_DLSS_OK;
 }
 
-extern "C" RSX_DLSS_API rsx_dlss_status rsx_dlss_configure(
-    rsx_dlss_vk *c, VkCommandBuffer command, const rsx_dlss_config *cfg)
+static rsx_dlss_status configure_feature(
+    rsx_dlss_vk *c, VkCommandBuffer command, const rsx_dlss_config *cfg, bool hdr)
 {
     if (!c || !cfg || command == VK_NULL_HANDLE || c->report.configured ||
         c->creation_failed ||
@@ -413,8 +413,8 @@ extern "C" RSX_DLSS_API rsx_dlss_status rsx_dlss_configure(
            static_cast<int>(cfg->quality));
     p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
     p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
-    int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+    if (hdr) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     if (cfg->auto_exposure) flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
     p->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
@@ -442,6 +442,23 @@ extern "C" RSX_DLSS_API rsx_dlss_status rsx_dlss_configure(
     c->report.configured = 1;
     c->force_reset = true;
     return RSX_DLSS_OK;
+}
+
+extern "C" RSX_DLSS_API rsx_dlss_status rsx_dlss_configure(
+    rsx_dlss_vk *c, VkCommandBuffer command, const rsx_dlss_config *cfg)
+{
+    return configure_feature(c, command, cfg, true);
+}
+
+extern "C" RSX_DLSS_API rsx_dlss_status rsx_dlss_configure2(
+    rsx_dlss_vk *c, VkCommandBuffer command, const rsx_dlss_config2 *cfg)
+{
+    if (!cfg || cfg->struct_size != sizeof(rsx_dlss_config2) ||
+        cfg->color > RSX_DLSS_COLOR_LDR_PERCEPTUAL ||
+        (cfg->color == RSX_DLSS_COLOR_LDR_PERCEPTUAL && cfg->base.auto_exposure))
+        return RSX_DLSS_BAD_ARGUMENT;
+    return configure_feature(c, command, &cfg->base,
+                             cfg->color == RSX_DLSS_COLOR_LINEAR_HDR);
 }
 
 extern "C" RSX_DLSS_API rsx_dlss_status rsx_dlss_evaluate(

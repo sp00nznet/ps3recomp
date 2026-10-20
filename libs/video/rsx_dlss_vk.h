@@ -121,6 +121,26 @@ RSX_DLSS_API rsx_dlss_status rsx_dlss_configure(
     rsx_dlss_vk *context, VkCommandBuffer command,
     const rsx_dlss_config *config);
 
+/* Optional export (bridges built before it lack it; resolve it optionally).
+ * rsx_dlss_configure is rsx_dlss_configure2 with RSX_DLSS_COLOR_LINEAR_HDR.
+ * LDR_PERCEPTUAL creates NGX without IsHDR, per the DLSS programming guide's
+ * LDR mode: input in [0,1], perceptually encoded (e.g. sRGB), never linear.
+ * LDR requires auto_exposure 0; exposure inputs are HDR-mode parameters. */
+typedef enum rsx_dlss_color {
+    RSX_DLSS_COLOR_LINEAR_HDR = 0,
+    RSX_DLSS_COLOR_LDR_PERCEPTUAL = 1
+} rsx_dlss_color;
+
+typedef struct rsx_dlss_config2 {
+    uint32_t struct_size;            /* Exactly sizeof(rsx_dlss_config2). */
+    uint32_t color;                  /* rsx_dlss_color. */
+    rsx_dlss_config base;
+} rsx_dlss_config2;
+
+RSX_DLSS_API rsx_dlss_status rsx_dlss_configure2(
+    rsx_dlss_vk *context, VkCommandBuffer command,
+    const rsx_dlss_config2 *config);
+
 typedef struct rsx_dlss_image {
     VkImage image;
     VkImageView view;

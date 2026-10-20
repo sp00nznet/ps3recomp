@@ -30,22 +30,28 @@ static struct {
     int have_motion_counters;
     u64 motion_counter_frame;
     u32 last_nonfinite;
-    u32 color_linear,transfer;int float_logged;
+    u32 color_mode,transfer;int float_logged;
 } s_dlss_frame;
-/* PS3RECOMP_DLSS_COLOR: "display" (default) passes the world's stored values
- * to the bridge unchanged; "linear" decodes an 8-bit sRGB-encoded world to
- * linear light first and encodes the result back. The bridge always creates
- * NGX with IsHDR and the caller enables AutoExposure, and the bridge ABI
- * documents linear input; Folklore's world is a display-referred RGBA8 target
- * shown on a UNORM swapchain as stored. Decided once per session. */
-static u32 vk_dlss_color_linear(void)
+/* PS3RECOMP_DLSS_COLOR. Folklore's world is a display-referred RGBA8 target
+ * shown on a UNORM swapchain as stored. "display" (default) hands the stored
+ * values to NGX created with IsHDR+AutoExposure, as before. "linear" decodes
+ * an 8-bit sRGB-encoded world to linear light for that HDR contract and
+ * encodes the result back. "ldr" creates NGX in LDR mode (no IsHDR, no
+ * exposure) through the optional rsx_dlss_configure2 and passes the stored
+ * perceptual values through; a bridge without it keeps "display".
+ * Decided once per session. */
+enum {VK_DLSS_COLOR_DISPLAY,VK_DLSS_COLOR_LINEAR,VK_DLSS_COLOR_LDR};
+static u32 vk_dlss_color_mode(void)
 {
     const char *m=getenv("PS3RECOMP_DLSS_COLOR");
-    if(!m || !*m || !strcmp(m,"display"))return 0;
-    if(!strcmp(m,"linear"))return 1;
+    if(!m || !*m || !strcmp(m,"display"))return VK_DLSS_COLOR_DISPLAY;
+    if(!strcmp(m,"linear"))return VK_DLSS_COLOR_LINEAR;
+    if(!strcmp(m,"ldr"))return VK_DLSS_COLOR_LDR;
     VK_LOG("PS3RECOMP_DLSS_COLOR '%s' unknown; using display\n",m);
-    return 0;
+    return VK_DLSS_COLOR_DISPLAY;
 }
+static const char *vk_dlss_color_name(u32 mode)
+{return mode==VK_DLSS_COLOR_LINEAR?"linear":mode==VK_DLSS_COLOR_LDR?"ldr":"display";}
 static const char *vk_dlss_quality_name(rsx_dlss_quality q)
 {
     switch(q){case RSX_DLSS_PERFORMANCE:return "performance";case RSX_DLSS_BALANCED:return "balanced";
@@ -71,7 +77,7 @@ static int vk_dlss_world_extent(u32 *w,u32 *h)
     if(!s_dlss_frame.extent_known){
         s_dlss_frame.extent_known=1;
         s_dlss_frame.quality=vk_dlss_mode();
-        s_dlss_frame.color_linear=vk_dlss_color_linear();
+        s_dlss_frame.color_mode=vk_dlss_color_mode();
         s_dlss_frame.out_w=1280u*s_render_scale;s_dlss_frame.out_h=720u*s_render_scale;
         /* The guest still samples an expanded two-lane texture. Validate the
          * physical allocation, not only NGX's logical output dimensions. */
@@ -96,9 +102,6 @@ static int vk_dlss_world_extent(u32 *w,u32 *h)
         VK_LOG("DLSS extent contract guest=1280x720 sampleLanes=2 reconstruction=%ux%u expandedStorage=%ux%u canvas=%ux%u presentation=%ux%u finalComposite=guest-layout nativeDisplayDLAA=unverified\n",
             s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.out_w*2u,s_dlss_frame.out_h,
             s_vk.width,s_vk.height,s_vk.sc_extent.width,s_vk.sc_extent.height);
-        VK_LOG("DLSS color contract requested=%s bridgeFlags=IsHDR+AutoExposure input=RGBA16F output=RGBA8-clamped transfer=%s\n",
-            s_dlss_frame.color_linear?"linear":"display",
-            s_dlss_frame.color_linear?"srgb-decode-in/encode-out (8-bit UNORM world only)":"stored-values-passthrough");
     }
     if(!s_dlss_frame.in_w)return 0;
     *w=s_dlss_frame.in_w;*h=s_dlss_frame.in_h;return 1;
@@ -221,8 +224,24 @@ static int vk_dlss_prepare(u32 vertices)
     if(!vk_dlss_frame_initialize()||!vk_dlss_frame_images())goto fail;
     if(!s_dlss_frame.configured){
         if(vk_begin())goto fail;
-        rsx_dlss_config config={1,s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.quality,1};
-        if(s_dlss.loader.configure(s_dlss.context,s_vk.cmd,&config)!=RSX_DLSS_OK){vk_submit_and_wait();goto fail;}
+        const u32 requested=s_dlss_frame.color_mode;
+        if(requested==VK_DLSS_COLOR_LDR && !s_dlss.loader.configure2){
+            VK_LOG("DLSS color: bridge lacks rsx_dlss_configure2 (LDR mode); using display\n");
+            s_dlss_frame.color_mode=VK_DLSS_COLOR_DISPLAY;
+        }
+        const int ldr=s_dlss_frame.color_mode==VK_DLSS_COLOR_LDR;
+        rsx_dlss_config config={1,s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.quality,ldr?0u:1u};
+        rsx_dlss_config2 config2={sizeof config2,ldr?RSX_DLSS_COLOR_LDR_PERCEPTUAL:RSX_DLSS_COLOR_LINEAR_HDR,config};
+        rsx_dlss_status configured=ldr?s_dlss.loader.configure2(s_dlss.context,s_vk.cmd,&config2):
+                                       s_dlss.loader.configure(s_dlss.context,s_vk.cmd,&config);
+        if(configured!=RSX_DLSS_OK){
+            VK_LOG("DLSS configure color=%s status=%d\n",vk_dlss_color_name(s_dlss_frame.color_mode),configured);
+            vk_submit_and_wait();goto fail;
+        }
+        VK_LOG("DLSS color contract requested=%s effective=%s bridgeFlags=%s input=RGBA16F output=RGBA8-clamped transfer=%s\n",
+            vk_dlss_color_name(requested),vk_dlss_color_name(s_dlss_frame.color_mode),
+            ldr?"LDR(no IsHDR, no AutoExposure)":"IsHDR+AutoExposure",
+            s_dlss_frame.color_mode==VK_DLSS_COLOR_LINEAR?"srgb-decode-in/encode-out (8-bit UNORM world only)":"stored-values-passthrough");
         if(vk_submit_and_wait())goto fail;
         s_dlss_frame.configured=1;
     }
@@ -299,8 +318,9 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
      * values. A transfer change invalidates the history's color space. */
     const VkFormat source_format=s_eobj[source].fmt;
     const int fixed_point=source_format==VK_FORMAT_R8G8B8A8_UNORM || source_format==VK_FORMAT_B8G8R8A8_UNORM;
-    const u32 transfer=s_dlss_frame.color_linear && fixed_point;
-    if(s_dlss_frame.color_linear && !fixed_point && !s_dlss_frame.float_logged){
+    const int linear=s_dlss_frame.color_mode==VK_DLSS_COLOR_LINEAR;
+    const u32 transfer=linear && fixed_point;
+    if(linear && !fixed_point && !s_dlss_frame.float_logged){
         s_dlss_frame.float_logged=1;VK_LOG("DLSS color: world format %d is not 8-bit UNORM; stored values passed through\n",(int)source_format);
     }
     if(s_dlss_frame.completed && transfer!=s_dlss_frame.transfer)reset=1;

@@ -43,6 +43,7 @@ typedef rsx_dlss_status (*rsx_dlss_loader_get_report_fn)(const rsx_dlss_vk *, rs
 typedef rsx_dlss_status (*rsx_dlss_loader_optimal_size_fn)(rsx_dlss_vk *, uint32_t, uint32_t, rsx_dlss_quality, rsx_dlss_size *);
 typedef rsx_dlss_status (*rsx_dlss_loader_configure_fn)(rsx_dlss_vk *, VkCommandBuffer, const rsx_dlss_config *);
 typedef rsx_dlss_status (*rsx_dlss_loader_evaluate_fn)(rsx_dlss_vk *, VkCommandBuffer, const rsx_dlss_frame *);
+typedef rsx_dlss_status (*rsx_dlss_loader_configure2_fn)(rsx_dlss_vk *, VkCommandBuffer, const rsx_dlss_config2 *);
 typedef rsx_dlss_status (*rsx_dlss_loader_fg_instance_extensions_fn)(const rsx_dlss_identity *, rsx_dlss_extensions *, rsx_dlss_fg_report *);
 typedef rsx_dlss_status (*rsx_dlss_loader_fg_device_extensions_fn)(const rsx_dlss_identity *, VkInstance, VkPhysicalDevice, rsx_dlss_extensions *, rsx_dlss_fg_report *);
 typedef rsx_dlss_status (*rsx_dlss_loader_fg_capability_fn)(rsx_dlss_vk *, rsx_dlss_fg_report *);
@@ -65,6 +66,7 @@ typedef struct rsx_dlss_loader {
     rsx_dlss_loader_optimal_size_fn optimal_size;
     rsx_dlss_loader_configure_fn configure;
     rsx_dlss_loader_evaluate_fn evaluate;
+    rsx_dlss_loader_configure2_fn configure2; /* Optional; NULL on older bridges. */
     rsx_dlss_loader_fg_instance_extensions_fn fg_instance_extensions;
     rsx_dlss_loader_fg_device_extensions_fn fg_device_extensions;
     rsx_dlss_loader_fg_capability_fn fg_capability;
@@ -309,6 +311,9 @@ static inline int rsx_dlss_loader_open(rsx_dlss_loader *loader, const wchar_t *b
     loader->optimal_size = (rsx_dlss_loader_optimal_size_fn)procs[5];
     loader->configure = (rsx_dlss_loader_configure_fn)procs[6];
     loader->evaluate = (rsx_dlss_loader_evaluate_fn)procs[7];
+
+    /* Optional colour-mode configuration; older bridges lack it. */
+    loader->configure2 = (rsx_dlss_loader_configure2_fn)rsx_dlss_loader__proc(loader->module, "rsx_dlss_configure2");
 
     /* Older SR-only bridges remain valid. Never expose a partial FG API. */
     for (i = 0; i < 6; ++i) {
