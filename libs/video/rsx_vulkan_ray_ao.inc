@@ -751,10 +751,12 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         if((tested && rs->alpha_func!=0x204u) || ((tested || coverage || rs->blend_enable) &&
             (!alpha_contract || draw.ps_bytes!=pipeline->scene_alpha_fp_bytes || tested!=rsx_scene_alpha_contract_has_threshold(alpha_contract)))){if(hybrid_mode){contract=-1;alpha_contract=NULL;}else goto fail;}
         if(!trace_off && fp_used+draw.ps_bytes>s_ray_ao.fp.size)goto fail;
-        // Motion-only DLSS needs captured geometry/depth, not PT materials
-        // or authored light recovery. Keep the gather metadata below intact.
-        int light_contract=trace_off?-1:rsx_authored__pair(pipeline->scene_vs_sha256,pipeline->scene_ps_sha256);
-        u32 position_proof=trace_off?0:vk_ray_unit_position(&draw,light_contract);
+        // Authored light recovery also yields the frame camera (light_to_view,
+        // vk_ray_frame_camera). Motion-only DLSS needs it: without a camera
+        // every DLSS evaluation was a history reset. PT materials and their
+        // textures below stay skipped when tracing is off.
+        int light_contract=rsx_authored__pair(pipeline->scene_vs_sha256,pipeline->scene_ps_sha256);
+        u32 position_proof=vk_ray_unit_position(&draw,light_contract);
         if(light_contract>=0){s_ray_ao.authored_known[light_contract]++;if(!position_proof)s_ray_ao.authored_nonunit[light_contract]++;}
         if(position_proof && rsx_authored_lights_recover(pipeline->scene_vs_sha256,pipeline->scene_ps_sha256,
             (const float(*)[4])draw.vs_constants,draw.vs_bytes,draw.ps_constants,draw.ps_bytes,projection,
@@ -772,14 +774,14 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
          * this material's exact original raster RGB, without omitting geometry. */
         const rsx_authored_lights *a=&s_ray_ao.authored_lights[i];
         u32 rgb_mask=light_contract==0?7u:light_contract==1?127u:31u,rgb_count=light_contract==0?3u:light_contract==1?7u:5u;
-        if(authored_mode && light_contract>=0 && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE &&
+        if(authored_mode && !trace_off && light_contract>=0 && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE &&
            (rs->color_mask&255u) && ((rs->color_mask>>8)&255u) && ((rs->color_mask>>16)&255u) &&
            !rs->blend_enable && !coverage && (draw.texture_mask&rgb_mask)==rgb_mask){
             int ready=1;for(u32 u=0;u<rgb_count&&ready;u++)if(!vk_ray_texture(draw.textures[u],&draw.samplers[u],&material.rgb_textures[u],light_contract==1&&u==3))ready=0;
             if(ready){s_ray_ao.authored_ready[light_contract]++;memcpy(material.light_to_view,a->light_to_view,sizeof material.light_to_view);material.authored[2]=rsx_authored__hash(pipeline->scene_ps_sha256,"7dd199ec45df75fe28c630e58143257605cf911e84c98f0841f31db7d1fc8fe4");material.authored[0]=(u32)light_contract+1;for(u32 l=0;l<4;l++){memcpy(material.light_view[l],a->lights[l].view,16);memcpy(material.light_rgb[l],a->lights[l].rgb,12);material.light_rgb[l][3]=s_ray_ao.test_disable_authored_sources?0:(float)a->lights[l].status;}}
             else s_ray_ao.authored_texture_failed[light_contract]++;
         }
-        else if(authored_mode && light_contract>=0 && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE)s_ray_ao.authored_state_failed[light_contract]++;
+        else if(authored_mode && !trace_off && light_contract>=0 && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE)s_ray_ao.authored_state_failed[light_contract]++;
         if(hybrid_mode && !trace_off){
             /* Generic base selection: avoid two-channel normal maps and LUTs;
              * prefer a color-sized unit 1 when unit 0 is the normal source. */
