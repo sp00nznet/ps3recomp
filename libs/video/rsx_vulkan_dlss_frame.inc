@@ -377,17 +377,45 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
 }
 /* Next evaluation starts a new DLSS history (its input content changed). */
 static void vk_dlss_history_reset(void){s_dlss_frame.completed=0;}
+/* Camera-fallback pixels of the frame just completed, by why its owner draw
+ * had no previous-frame mapping: pixels[] and draws[] are noIdentity (no
+ * geometry/slot identity), duplicateKey (key repeats this frame, so matching
+ * skips it), unmatched (no unique previous key: new, changed or count
+ * differs), matchedInvalid (mapped, rejected per pixel); pixels[4] is
+ * pixels with no owner hit or an owner beyond the mapped draws. */
+static void vk_dlss_fallback_attribution(u32 pixels[5],u32 draws[4])
+{
+    const u32 (*rows)[4]=s_dlss_frame.draws[s_dlss_frame.bank].ptr;
+    const vk_dlss_draw_key *k=s_dlss_frame.current;const u32 n=s_dlss_frame.current_count;
+    memset(pixels,0,5*sizeof *pixels);memset(draws,0,4*sizeof *draws);
+    for(u32 i=0;i<n;i++){
+        const u32 count=rows[i][3];if(!count)continue;
+        u32 category=3;
+        if(!k[i].geometry || !k[i].slots)category=0;
+        else if(!rows[i][2]){
+            category=2;
+            for(u32 j=0;j<n;j++)if(j!=i && k[j].geometry==k[i].geometry && k[j].slots==k[i].slots && k[j].topology==k[i].topology){category=1;break;}
+        }
+        pixels[category]+=count;draws[category]++;
+    }
+    pixels[4]=rows[VK_DLSS_DRAWS+1][3];
+}
 /* After the transport's submission: commit history state and diagnostics. */
 static void vk_dlss_complete(int submitted,u32 source)
 {
     if(!s_dlss_frame.recorded)return;
     s_dlss_frame.recorded=0;
     if(!submitted){s_dlss_frame.completed=0;return;}
+    /* This frame's submission has completed (synchronous wait), so its
+     * draw rows are final; read them before the bank flips. */
+    const int log_due=!s_dlss_frame.last_log || s_dlss_frame.record_ticks-s_dlss_frame.last_log>=SDL_GetPerformanceFrequency();
+    u32 fallback_pixels[5]={0},fallback_draws[4]={0};
+    if(log_due)vk_dlss_fallback_attribution(fallback_pixels,fallback_draws);
     s_dlss_frame.completed++;s_dlss_frame.frame=s_dlss_frame.record_frame;s_dlss_frame.ticks=s_dlss_frame.record_ticks;s_dlss_frame.bank=1-s_dlss_frame.bank;
     memcpy(s_dlss_frame.previous,s_dlss_frame.current,sizeof s_dlss_frame.current);s_dlss_frame.previous_count=s_dlss_frame.current_count;
     memcpy(s_dlss_frame.camera,s_dlss_frame.record_camera,sizeof s_dlss_frame.camera);s_dlss_frame.have_camera=s_dlss_frame.record_have_camera;s_dlss_frame.camera_key=s_dlss_frame.record_camera_key;
     const u64 ticks=s_dlss_frame.record_ticks;
-    if(!s_dlss_frame.last_log || ticks-s_dlss_frame.last_log>=SDL_GetPerformanceFrequency()){
+    if(log_due){
         const rsx_dlss_motion_counts c=s_dlss_frame.last_motion;
         const rsx_dlss_motion_stats coverage=rsx_dlss_summarize_motion(c,s_dlss_frame.in_w,s_dlss_frame.in_h);
         VK_LOG("DLSS SR %s frame=%llu input=%ux%u output=%ux%u completedEvaluations=%llu motionCounterFrame=%llu matchedMotionPixels=%u cameraFallbackPixels=%u reset=%d nonfinite=%u worldReplacement=1 HUD=guest-composite\n",
@@ -398,6 +426,9 @@ static void vk_dlss_complete(int submitted,u32 source)
             s_dlss_frame.have_motion_counters && coverage.valid,s_dlss_frame.have_motion_counters && coverage.coverage_available,
             (unsigned long long)coverage.eligible,c.matched,c.fallback,c.background,c.reset,c.disoccluded,
             coverage.matched_percent,coverage.fallback_percent);
+        VK_LOG("DLSS fallback attribution frame=%llu mappedDraws=%u pixels/draws noIdentity=%u/%u duplicateKey=%u/%u unmatched=%u/%u matchedInvalid=%u/%u noOwner=%u\n",
+            (unsigned long long)s_dlss_frame.frame,s_dlss_frame.current_count,fallback_pixels[0],fallback_draws[0],fallback_pixels[1],fallback_draws[1],
+            fallback_pixels[2],fallback_draws[2],fallback_pixels[3],fallback_draws[3],fallback_pixels[4]);
         s_dlss_frame.last_log=ticks;
     }
     const char *pair=getenv("PS3RECOMP_DLSS_PAIR"),*request=getenv("PS3RECOMP_DLSS_PAIR_REQUEST");
