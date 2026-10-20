@@ -33,18 +33,21 @@ static struct {
     u32 color_mode,transfer;int float_logged;
 } s_dlss_frame;
 /* PS3RECOMP_DLSS_COLOR. Folklore's world is a display-referred RGBA8 target
- * shown on a UNORM swapchain as stored. "display" (default) hands the stored
- * values to NGX created with IsHDR+AutoExposure, as before. "linear" decodes
- * an 8-bit sRGB-encoded world to linear light for that HDR contract and
- * encodes the result back. "ldr" creates NGX in LDR mode (no IsHDR, no
- * exposure) through the optional rsx_dlss_configure2 and passes the stored
- * perceptual values through; a bridge without it keeps "display".
- * Decided once per session. */
+ * shown on a UNORM swapchain as stored. "ldr" (default) creates NGX in LDR
+ * mode (no IsHDR, no exposure) through the optional rsx_dlss_configure2 and
+ * passes the stored perceptual values through, as NVIDIA's guide places such
+ * input; a bridge without configure2 uses "display". "display" hands the
+ * stored values to NGX created with IsHDR+AutoExposure (the earlier
+ * default). "linear" decodes an 8-bit sRGB-encoded world to linear light for
+ * that HDR contract and encodes the result back. Measured at 3440x1440 the
+ * three differ by under 1/255 in mean luma and not in FPS or motion
+ * coverage. Decided once per session. */
 enum {VK_DLSS_COLOR_DISPLAY,VK_DLSS_COLOR_LINEAR,VK_DLSS_COLOR_LDR};
 static u32 vk_dlss_color_mode(void)
 {
     const char *m=getenv("PS3RECOMP_DLSS_COLOR");
-    if(!m || !*m || !strcmp(m,"display"))return VK_DLSS_COLOR_DISPLAY;
+    if(!m || !*m)return VK_DLSS_COLOR_LDR;
+    if(!strcmp(m,"display"))return VK_DLSS_COLOR_DISPLAY;
     if(!strcmp(m,"linear"))return VK_DLSS_COLOR_LINEAR;
     if(!strcmp(m,"ldr"))return VK_DLSS_COLOR_LDR;
     VK_LOG("PS3RECOMP_DLSS_COLOR '%s' unknown; using display\n",m);
