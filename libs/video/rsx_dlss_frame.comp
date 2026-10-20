@@ -13,7 +13,7 @@ layout(std140,binding=7) uniform Parameters {
     mat4 reprojection;vec4 projection;vec4 jitter;
     uvec4 sizes;   // input width/height, vertex count, reset
     uvec4 history; // previous/current vertex bank offsets, output width/height
-    uvec4 layout_; // depth history offset, output sample lanes, mapped draw count
+    uvec4 layout_; // depth history offset, output sample lanes, mapped draw count, color transfer
 } p;
 layout(rgba16f,binding=8) writeonly uniform image2D colorInput;
 layout(r32f,binding=9) writeonly uniform image2D depthInput;
@@ -27,6 +27,20 @@ layout(push_constant) uniform Phase {uint mode;} phase;
 // Draw slots 0..255 map draws; 256 holds eligible/disoccluded/matched/fallback.
 // Slot 257 holds nonfinite output samples/background pixels/reset pixels.
 bool finite4(vec4 v){return !any(isnan(v))&&!any(isinf(v));}
+// Color transfer (layout_.w): 0 passes stored values through; 1 decodes a
+// display-referred sRGB-encoded 8-bit world to linear light for the bridge's
+// linear-HDR contract and encodes the result back before the RGBA8 store.
+// Scalar and clamped so tests compile them unchanged.
+float dlssSrgbToLinear(float c){
+    c=min(max(c,0.0),1.0);
+    return c<=0.04045?c/12.92:pow((c+0.055)/1.055,2.4);
+}
+float dlssLinearToSrgb(float l){
+    l=min(max(l,0.0),1.0);
+    return l<=0.0031308?l*12.92:1.055*pow(l,1.0/2.4)-0.055;
+}
+vec4 dlssDecode(vec4 c){return p.layout_.w==1u?vec4(dlssSrgbToLinear(c.r),dlssSrgbToLinear(c.g),dlssSrgbToLinear(c.b),c.a):c;}
+vec4 dlssEncode(vec4 c){return p.layout_.w==1u?vec4(dlssLinearToSrgb(c.r),dlssLinearToSrgb(c.g),dlssLinearToSrgb(c.b),c.a):c;}
 float dlssInverseHomogeneousScale(float cx,float cy,float cw,float vx,float vy,float vz,float px,float py){
     if(isnan(cx)||isinf(cx)||isnan(cy)||isinf(cy)||isnan(cw)||isinf(cw)||
        isnan(vx)||isinf(vx)||isnan(vy)||isinf(vy)||isnan(vz)||isinf(vz)||
@@ -65,7 +79,7 @@ void main(){
         if(pixel.x<p.history.z*lanes && pixel.y<p.history.w){
             vec4 c=texelFetch(dlssOutput,ivec2(pixel.x/lanes,pixel.y),0);
             if(!finite4(c))atomicAdd(draws.value[257].x,1);
-            imageStore(expandedOutput,ivec2(pixel),finite4(c)?clamp(c,vec4(0),vec4(1)):vec4(0,0,0,1));
+            imageStore(expandedOutput,ivec2(pixel),finite4(c)?dlssEncode(clamp(c,vec4(0),vec4(1))):vec4(0,0,0,1));
         }
         return;
     }
@@ -74,7 +88,8 @@ void main(){
     float a=texelFetch(sourceDepth,q,0).r,b=texelFetch(sourceDepth,q+ivec2(1,0),0).r;
     uint sampleIndex=b<a?1u:0u;float z=min(a,b);
     if(isnan(z)||isinf(z))z=1;
-    vec4 color=(texelFetch(sourceColor,q,0)+texelFetch(sourceColor,q+ivec2(1,0),0))*.5;
+    // Decode each sample before the two-sample resolve so mode 1 averages light.
+    vec4 color=(dlssDecode(texelFetch(sourceColor,q,0))+dlssDecode(texelFetch(sourceColor,q+ivec2(1,0),0)))*.5;
     imageStore(colorInput,ivec2(pixel),finite4(color)?color:vec4(0,0,0,1));
     imageStore(depthInput,ivec2(pixel),vec4(z));
     vec2 motion=vec2(0);float bias=1;

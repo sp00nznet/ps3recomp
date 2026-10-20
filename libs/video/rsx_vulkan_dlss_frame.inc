@@ -30,7 +30,22 @@ static struct {
     int have_motion_counters;
     u64 motion_counter_frame;
     u32 last_nonfinite;
+    u32 color_linear,transfer;int float_logged;
 } s_dlss_frame;
+/* PS3RECOMP_DLSS_COLOR: "display" (default) passes the world's stored values
+ * to the bridge unchanged; "linear" decodes an 8-bit sRGB-encoded world to
+ * linear light first and encodes the result back. The bridge always creates
+ * NGX with IsHDR and the caller enables AutoExposure, and the bridge ABI
+ * documents linear input; Folklore's world is a display-referred RGBA8 target
+ * shown on a UNORM swapchain as stored. Decided once per session. */
+static u32 vk_dlss_color_linear(void)
+{
+    const char *m=getenv("PS3RECOMP_DLSS_COLOR");
+    if(!m || !*m || !strcmp(m,"display"))return 0;
+    if(!strcmp(m,"linear"))return 1;
+    VK_LOG("PS3RECOMP_DLSS_COLOR '%s' unknown; using display\n",m);
+    return 0;
+}
 static const char *vk_dlss_quality_name(rsx_dlss_quality q)
 {
     switch(q){case RSX_DLSS_PERFORMANCE:return "performance";case RSX_DLSS_BALANCED:return "balanced";
@@ -56,6 +71,7 @@ static int vk_dlss_world_extent(u32 *w,u32 *h)
     if(!s_dlss_frame.extent_known){
         s_dlss_frame.extent_known=1;
         s_dlss_frame.quality=vk_dlss_mode();
+        s_dlss_frame.color_linear=vk_dlss_color_linear();
         s_dlss_frame.out_w=1280u*s_render_scale;s_dlss_frame.out_h=720u*s_render_scale;
         /* The guest still samples an expanded two-lane texture. Validate the
          * physical allocation, not only NGX's logical output dimensions. */
@@ -80,6 +96,9 @@ static int vk_dlss_world_extent(u32 *w,u32 *h)
         VK_LOG("DLSS extent contract guest=1280x720 sampleLanes=2 reconstruction=%ux%u expandedStorage=%ux%u canvas=%ux%u presentation=%ux%u finalComposite=guest-layout nativeDisplayDLAA=unverified\n",
             s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.out_w*2u,s_dlss_frame.out_h,
             s_vk.width,s_vk.height,s_vk.sc_extent.width,s_vk.sc_extent.height);
+        VK_LOG("DLSS color contract requested=%s bridgeFlags=IsHDR+AutoExposure input=RGBA16F output=RGBA8-clamped transfer=%s\n",
+            s_dlss_frame.color_linear?"linear":"display",
+            s_dlss_frame.color_linear?"srgb-decode-in/encode-out (8-bit UNORM world only)":"stored-values-passthrough");
     }
     if(!s_dlss_frame.in_w)return 0;
     *w=s_dlss_frame.in_w;*h=s_dlss_frame.in_h;return 1;
@@ -276,6 +295,16 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
         if(maximum>.35f || (camera_key!=s_dlss_frame.camera_key && maximum>.05f))reset=1;
         for(u32 r=0;r<4;r++)for(u32 c=0;c<4;c++){float value=0;for(u32 k=0;k<4;k++)value+=s_dlss_frame.camera[r*4+k]*inverse[k*4+c];p.reprojection[c*4+r]=value;}
     }else for(u32 i=0;i<4;i++)p.reprojection[i*5]=1;
+    /* Linearize only a fixed-point world: float targets already hold linear
+     * values. A transfer change invalidates the history's color space. */
+    const VkFormat source_format=s_eobj[source].fmt;
+    const int fixed_point=source_format==VK_FORMAT_R8G8B8A8_UNORM || source_format==VK_FORMAT_B8G8R8A8_UNORM;
+    const u32 transfer=s_dlss_frame.color_linear && fixed_point;
+    if(s_dlss_frame.color_linear && !fixed_point && !s_dlss_frame.float_logged){
+        s_dlss_frame.float_logged=1;VK_LOG("DLSS color: world format %d is not 8-bit UNORM; stored values passed through\n",(int)source_format);
+    }
+    if(s_dlss_frame.completed && transfer!=s_dlss_frame.transfer)reset=1;
+    s_dlss_frame.transfer=transfer;p.layout[3]=transfer;
     p.sizes[3]=reset;memcpy(s_dlss_frame.params[bank].ptr,&p,sizeof p);
     VkDescriptorBufferInfo buffers[]={{vertices,0,vertex_bytes},{s_ray_ao.indices.buf,0,(VkDeviceSize)epoch->index_count/3*16},{s_dlss_frame.clips.buf,0,s_dlss_frame.clips.size},{s_dlss_frame.draws[bank].buf,0,(VK_DLSS_DRAWS+2u)*16u},{s_dlss_frame.params[bank].buf,0,sizeof p}};
     VkDescriptorImageInfo images[]={{s_dlss_frame.sampler,s_eobj[source].im.view,VK_IMAGE_LAYOUT_GENERAL},{s_dlss_frame.sampler,s_eobj[depth].im.view,VK_IMAGE_LAYOUT_GENERAL},
