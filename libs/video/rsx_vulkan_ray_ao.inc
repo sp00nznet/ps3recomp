@@ -17,6 +17,10 @@ static int vk_dlss_prepare(u32 vertices);
 static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize vertex_bytes,const rsx_scene_epoch *epoch,
                           const float projection[16],const float camera[16],int have_camera,u64 camera_key,u32 remap,u32 format);
 static void vk_dlss_complete(int submitted,u32 source);
+static void vk_dlss_history_reset(void);
+static int vk_dlss_requested(void);
+/* Trace kernel state per output format (0 rgba8, 1 rgba16f). */
+enum {VK_TRACE_ABSENT,VK_TRACE_COMPILING,VK_TRACE_READY,VK_TRACE_FAILED};
 typedef struct vk_ray_material {u32 alpha[4],raster[4],textures[4];float depth_range[4];u32 authored[4],rgb_textures[8];float light_view[4][4],light_rgb[4][4],light_to_view[3][4];} vk_ray_material;
 typedef struct vk_ray_parameters {float projection[4];u32 dims[4],counts[4];float settings[4];} vk_ray_parameters;
 _Static_assert(sizeof(vk_ray_material)==288 && offsetof(vk_ray_material,depth_range)==48,"GLSL std430 material layout");
@@ -31,6 +35,7 @@ static struct {
     int test_disable_authored_sources,test_disable_authored_bounce,test_disable_authored_reflections;
     int ready,failed,warned;u32 color,raw_color,cw,ch,aw,ah;VkFormat format;u64 device_generation;
     VkDescriptorSetLayout layout;VkPipelineLayout pipeline_layout;VkDescriptorPool pool;VkDescriptorSet set;
+    SDL_Thread *trace_thread;SDL_atomic_t trace_state[2];VkShaderModule trace_module[2];u64 trace_start[2];int trace_seen_ready,trace_wait_logged;
     VkPipeline gather,trace[2];u64 last_hybrid_log,hybrid_nonfinite,hybrid_black_frames;u32 history_w,history_h;VkAccelerationStructureKHR blas,tlas;
     vk_buffer history;vk_buffer indices,materials,fp,params,triangles,ao,instances,blas_store,tlas_store,bscratch,tscratch,flag_readback;
     PFN_vkCreateComputePipelines create_compute;PFN_vkCmdDispatch dispatch;
@@ -120,24 +125,62 @@ static char *vk_ray_replace(const char *source,const char *marker,const char *re
     char *out=(char*)malloc(before+tail+add+1);if(!out)return NULL;
     memcpy(out,source,before);memcpy(out+before,replacement,add);memcpy(out+before+add,at+strlen(marker),tail+1);return out;
 }
-static VkPipeline vk_ray_pipeline(const char *source)
+/* GLSL to SPIR-V and the shader module: fast, render thread only. */
+static VkShaderModule vk_ray_module(const char *source,u64 *compile_start)
 {
-    u32 *words=(u32*)malloc(262144u*4),count=0;char log[2048];VkShaderModule module=VK_NULL_HANDLE;VkPipeline pipeline=VK_NULL_HANDLE;
+    u32 *words=(u32*)malloc(262144u*4),count=0;char log[2048];VkShaderModule module=VK_NULL_HANDLE;
     if(!words)return VK_NULL_HANDLE;
-    u64 compile_start=SDL_GetPerformanceCounter();
+    *compile_start=SDL_GetPerformanceCounter();
     VK_LOG("ray pipeline GLSL translation started\n");
-    if(rsx_glsl_compute_to_spirv(source,words,262144,&count,log,sizeof log) || !count || count>262144){VK_LOG("ray AO shader rejected: %s\n",log);goto done;}
+    if(rsx_glsl_compute_to_spirv(source,words,262144,&count,log,sizeof log) || !count || count>262144){VK_LOG("ray AO shader rejected: %s\n",log);free(words);return VK_NULL_HANDLE;}
     VK_LOG("ray pipeline GLSL translation completed in %.3fms; driver compilation started (words=%u)\n",
-        (double)(SDL_GetPerformanceCounter()-compile_start)*1000.0/(double)SDL_GetPerformanceFrequency(),count);
+        (double)(SDL_GetPerformanceCounter()-*compile_start)*1000.0/(double)SDL_GetPerformanceFrequency(),count);
     VkShaderModuleCreateInfo sm={.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,.codeSize=(size_t)count*4,.pCode=words};
-    if(pvkCreateShaderModule(s_vk.device,&sm,NULL,&module)!=VK_SUCCESS)goto done;
+    if(pvkCreateShaderModule(s_vk.device,&sm,NULL,&module)!=VK_SUCCESS)module=VK_NULL_HANDLE;
+    free(words);return module;
+}
+/* Driver compilation. Safe on a worker thread: vkCreateComputePipelines and
+ * the internally synchronized pipeline cache need no external locking; the
+ * cache file is written only by whoever wins the existing saving flag. */
+static VkPipeline vk_ray_compile(VkShaderModule module,u64 compile_start)
+{
+    VkPipeline pipeline=VK_NULL_HANDLE;if(!module)return VK_NULL_HANDLE;
     VkComputePipelineCreateInfo pc={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=module,.pName="main"},.layout=s_ray_ao.pipeline_layout};
     if(s_ray_ao.create_compute(s_vk.device,vk_pcache(),1,&pc,NULL,&pipeline)!=VK_SUCCESS){if(pipeline)pvkDestroyPipeline(s_vk.device,pipeline,NULL);pipeline=VK_NULL_HANDLE;}
     else {vk_pcache_created();
-        if(s_pcache.cache && !SDL_AtomicGet(&s_pcache.saving) && vk_pcache_save_now(s_vk.device)==0)SDL_AtomicSet(&s_pcache.dirty,0);
+        if(s_pcache.cache && SDL_AtomicCAS(&s_pcache.saving,0,1)){
+            if(vk_pcache_save_now(s_vk.device)==0)SDL_AtomicSet(&s_pcache.dirty,0);
+            SDL_AtomicSet(&s_pcache.saving,0);
+        }
         VK_LOG("ray pipeline ready after %.3fms total\n",
         (double)(SDL_GetPerformanceCounter()-compile_start)*1000.0/(double)SDL_GetPerformanceFrequency());}
-done:if(module)pvkDestroyShaderModule(s_vk.device,module,NULL);free(words);return pipeline;
+    return pipeline;
+}
+static VkPipeline vk_ray_pipeline(const char *source)
+{
+    u64 start=0;VkShaderModule module=vk_ray_module(source,&start);
+    VkPipeline pipeline=vk_ray_compile(module,start);
+    if(module)pvkDestroyShaderModule(s_vk.device,module,NULL);return pipeline;
+}
+static int SDLCALL vk_ray_trace_worker(void *unused)
+{
+    (void)unused;
+    for(unsigned i=0;i<2;i++){
+        if(SDL_AtomicGet(&s_ray_ao.trace_state[i])!=VK_TRACE_COMPILING)continue;
+        VkPipeline pipeline=vk_ray_compile(s_ray_ao.trace_module[i],s_ray_ao.trace_start[i]);
+        s_ray_ao.trace[i]=pipeline;
+        SDL_AtomicSet(&s_ray_ao.trace_state[i],pipeline?VK_TRACE_READY:VK_TRACE_FAILED);
+        VK_LOG("ray trace kernel %s %s on the background compile thread\n",i?"rgba16f":"rgba8",pipeline?"ready":"failed");
+    }
+    return 0;
+}
+/* Join the compile thread; called before any trace module or device teardown. */
+static void vk_ray_trace_join(void)
+{
+    if(!s_ray_ao.trace_thread)return;
+    for(unsigned i=0;i<2;i++)if(SDL_AtomicGet(&s_ray_ao.trace_state[i])==VK_TRACE_COMPILING){
+        VK_LOG("ray trace kernels still compiling; waiting for the driver before shutdown\n");break;}
+    SDL_WaitThread(s_ray_ao.trace_thread,NULL);s_ray_ao.trace_thread=NULL;
 }
 static int vk_ray_initialize(void)
 {
@@ -212,12 +255,30 @@ static int vk_ray_initialize(void)
             denoise_compile && !strcmp(denoise_compile,"off")?"#define RSX_TRANSPORT_FLAGS 52u":"#define RSX_TRANSPORT_FLAGS 54u");
         free(with_rgb);with_rgb=specialized;if(!with_rgb)goto fail;
     }
+    /* Each 101k-word trace kernel takes the NVIDIA driver about ten minutes
+     * to compile cold. Folklore's world target is RGBA8, so only that variant
+     * is built unless PS3RECOMP_RSX_TRACE_FP16=1; an RGBA16F world keeps its
+     * raster colour. Kernels compile on a worker thread while frames keep
+     * raster (or DLSS-only) output, unless PS3RECOMP_RAY_SYNC_COMPILE=1 or a
+     * prewarm-only run asks for them before returning. */
+    const char *fp16_env=getenv("PS3RECOMP_RSX_TRACE_FP16"),*sync_env=getenv("PS3RECOMP_RAY_SYNC_COMPILE");
+    const int want_fp16=fp16_env && !strcmp(fp16_env,"1");
+    const int sync_compile=(sync_env && !strcmp(sync_env,"1")) || getenv("PS3RECOMP_RAY_PREWARM_ONLY");
     for(unsigned i=0;i<2;i++) {
+        SDL_AtomicSet(&s_ray_ao.trace_state[i],VK_TRACE_ABSENT);
+        if(i && !want_fp16)continue;
         char *output_text=vk_ray_replace(with_rgb,"/*RSX_SCENE_OUTPUT_FORMAT*/",i?"rgba16f":"rgba8");
         char *text=output_text?vk_ray_replace(output_text,"/*RSX_SCENE_RAW_FORMAT*/",i?"rgba16f":"rgba8"):NULL;
-        free(output_text);if(text){s_ray_ao.trace[i]=vk_ray_pipeline(text);free(text);}
+        free(output_text);if(!text){free(with_rgb);goto fail;}
+        s_ray_ao.trace_module[i]=vk_ray_module(text,&s_ray_ao.trace_start[i]);free(text);
+        if(!s_ray_ao.trace_module[i]){free(with_rgb);goto fail;}
+        SDL_AtomicSet(&s_ray_ao.trace_state[i],VK_TRACE_COMPILING);
     }
-    free(with_rgb);if(!s_ray_ao.trace[0] || !s_ray_ao.trace[1])goto fail;
+    free(with_rgb);
+    if(!sync_compile)s_ray_ao.trace_thread=SDL_CreateThread(vk_ray_trace_worker,"ray-trace-compile",NULL);
+    if(s_ray_ao.trace_thread)VK_LOG("ray trace kernels (%s) compiling on a background thread; raster%s output until ready\n",
+        want_fp16?"rgba8+rgba16f":"rgba8",vk_dlss_requested()?"/DLSS-only":"");
+    else{vk_ray_trace_worker(NULL);if(SDL_AtomicGet(&s_ray_ao.trace_state[0])!=VK_TRACE_READY)goto fail;}
     }
     s_ray_ao.create_queries=(PFN_vkCreateQueryPool)pvkGetDeviceProcAddr(s_vk.device,"vkCreateQueryPool");s_ray_ao.destroy_queries=(PFN_vkDestroyQueryPool)pvkGetDeviceProcAddr(s_vk.device,"vkDestroyQueryPool");
     s_ray_ao.reset_queries=(PFN_vkCmdResetQueryPool)pvkGetDeviceProcAddr(s_vk.device,"vkCmdResetQueryPool");s_ray_ao.timestamp=(PFN_vkCmdWriteTimestamp)pvkGetDeviceProcAddr(s_vk.device,"vkCmdWriteTimestamp");s_ray_ao.query_results=(PFN_vkGetQueryPoolResults)pvkGetDeviceProcAddr(s_vk.device,"vkGetQueryPoolResults");
@@ -297,6 +358,8 @@ static int vk_ray_screen(u32 width,u32 height,VkFormat format)
 static void vk_rt_ao_shutdown(void)
 {
     if(!s_vk.device)return;
+    vk_ray_trace_join();
+    for(unsigned i=0;i<2;i++)if(s_ray_ao.trace_module[i])pvkDestroyShaderModule(s_vk.device,s_ray_ao.trace_module[i],NULL);
     // Backend shutdown owns the drain. No module allocation retires early.
     pvkDeviceWaitIdle(s_vk.device);vk_ray_alpha_reset();
     vk_destroy_image(&s_ray_ao.async_color);vk_destroy_image(&s_ray_ao.async_depth);
@@ -596,7 +659,24 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     /* PS3RECOMP_RSX_TRACE=0: capture and rebuild the scene only for DLSS
      * motion vectors, with no ray-traced lighting (DLSS without PT). */
     const char *trace_env=getenv("PS3RECOMP_RSX_TRACE");
-    const u32 trace_off=trace_env && !strcmp(trace_env,"0");
+    const u32 trace_requested=!(trace_env && !strcmp(trace_env,"0"));
+    const int kernel_state=SDL_AtomicGet(&s_ray_ao.trace_state[source->fmt==VK_FORMAT_R16G16B16A16_SFLOAT]);
+    const u32 trace_pending=trace_requested && kernel_state!=VK_TRACE_READY;
+    if(trace_requested && kernel_state==VK_TRACE_READY && !s_ray_ao.trace_seen_ready){
+        // First traced frame: no lighting history, and DLSS's input changes
+        // from raster to the traced composite.
+        s_ray_ao.trace_seen_ready=1;s_ray_ao.history_w=s_ray_ao.history_h=0;vk_dlss_history_reset();
+        VK_LOG("ray trace kernel ready; traced lighting starts with fresh history\n");
+    }
+    if(trace_pending && !vk_dlss_requested()){
+        failure=kernel_state==VK_TRACE_COMPILING?"trace kernel compiling (raster retained)":
+                kernel_state==VK_TRACE_ABSENT?"no trace kernel for this world format":"trace kernel compilation failed";
+        goto fail;
+    }
+    if(trace_pending && !s_ray_ao.trace_wait_logged){
+        s_ray_ao.trace_wait_logged=1;VK_LOG("trace kernel not ready (state=%d); DLSS runs on the raster world until it is\n",kernel_state);
+    }
+    const u32 trace_off=!trace_requested || trace_pending;
     const u32 hybrid_mode=trace_off || (hybrid_env && !strcmp(hybrid_env,"1"));
     const u32 authored_mode=hybrid_mode || (authored_env && !strcmp(authored_env,"1"));
     /* Hybrid lighting is traced once per logical pixel and shared by its

@@ -372,6 +372,8 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
     memcpy(s_dlss_frame.record_camera,camera,sizeof s_dlss_frame.record_camera);s_dlss_frame.record_have_camera=invertible;s_dlss_frame.record_camera_key=camera_key;
     return vk_eng_surface_view(NULL,s_dlss_frame.expanded,remap,format);
 }
+/* Next evaluation starts a new DLSS history (its input content changed). */
+static void vk_dlss_history_reset(void){s_dlss_frame.completed=0;}
 /* After the transport's submission: commit history state and diagnostics. */
 static void vk_dlss_complete(int submitted,u32 source)
 {
@@ -427,4 +429,5 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
                           const float projection[16],const float camera[16],int have_camera,u64 camera_key,u32 remap,u32 format)
 {(void)source;(void)depth;(void)vertices;(void)vertex_bytes;(void)epoch;(void)projection;(void)camera;(void)have_camera;(void)camera_key;(void)remap;(void)format;return 0;}
 static void vk_dlss_complete(int submitted,u32 source){(void)submitted;(void)source;}
+static void vk_dlss_history_reset(void){}
 #endif
