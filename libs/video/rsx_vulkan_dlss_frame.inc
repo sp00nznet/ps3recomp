@@ -258,7 +258,7 @@ static int vk_dlss_prepare(u32 vertices,VkFormat world_format)
     }
     /* The reactive snapshot is always bound (the shader samples it as a
      * two-sample image), so it exists whenever DLSS records. */
-    if(s_dlss_layer.enabled<0){const char *e=getenv("PS3RECOMP_DLSS_REACTIVE");s_dlss_layer.enabled=!(e && !strcmp(e,"0"));}
+    if(s_dlss_layer.enabled<0){const char *e=getenv("PS3RECOMP_DLSS_REACTIVE");s_dlss_layer.enabled=e && !strcmp(e,"1");}
     if(!vk_dlss_layer_image(world_format,s_dlss_frame.in_w,s_dlss_frame.in_h))goto fail;
     int grown=0;if(!vk_dlss_clip_capacity(vertices,&grown))goto fail;
     if(grown)s_dlss_frame.completed=0;
@@ -285,10 +285,11 @@ static int vk_dlss_layer_image(VkFormat format,u32 w,u32 h)
  * keeps depth after any depth-writing draw this frame, the two-sample world
  * target is copied as is into a private image, so the snapshot predates the
  * last run of such layers. Engine state (expansion, render-target flags) is
- * not touched. PS3RECOMP_DLSS_REACTIVE=0 disables it. */
+ * not touched. Opt-in (PS3RECOMP_DLSS_REACTIVE=1): on Faerypool pairs it did
+ * not measurably change sparkle retention. */
 static void vk_dlss_reactive_before_draw(u32 target,const vk_eng_pipe *pipe)
 {
-    if(s_dlss_layer.enabled<0){const char *e=getenv("PS3RECOMP_DLSS_REACTIVE");s_dlss_layer.enabled=!(e && !strcmp(e,"0"));}
+    if(s_dlss_layer.enabled<0){const char *e=getenv("PS3RECOMP_DLSS_REACTIVE");s_dlss_layer.enabled=e && !strcmp(e,"1");}
     if(!s_dlss_layer.enabled || !s_dlss_frame.configured || s_dlss_frame.failed || !pipe)return;
     const vk_eng_obj *o=vk_eng_get(target,VK_ENG_COLOR);
     if(!o || !o->dlss_world || o->samples!=2)return;
