@@ -468,8 +468,9 @@ static int vk_ray_normalize3(float v[3])
  * kept while any draw still carries it, survives a short absence (in world
  * space when the camera is known), and yields to a clearly brighter light
  * only after it has stayed brighter for a quarter of a second. */
-static void vk_ray_select_key(u32 draw_count,int have_camera,const float view[12],float light[4],float rgb[4])
+static int vk_ray_select_key(u32 draw_count,int have_camera,const float view[12],float light[4],float rgb[4])
 {
+    const int was_valid=s_ray_ao.key_valid;
     struct {float view[3],rgb[3],score;u32 count;} c[8];u32 n=0;
     for(u32 i=0;i<draw_count && i<RSX_SCENE_EPOCH_MAX_DRAWS;i++)for(u32 l=0;l<4;l++){
         const rsx_authored_light *a=&s_ray_ao.authored_lights[i].lights[l];
@@ -518,6 +519,9 @@ static void vk_ray_select_key(u32 draw_count,int have_camera,const float view[12
     }
     memset(light,0,16);memset(rgb,0,16);
     if(s_ray_ao.key_valid){memcpy(light,s_ray_ao.key_view,12);memcpy(rgb,s_ray_ao.key_rgb,12);rgb[3]=1;}
+    // History describes the old key's visibility. Camera reprojection alone
+    // cannot make those shadows valid after changing the source light.
+    return was_valid!=s_ray_ao.key_valid || (adopt>=0 && adopt!=match);
 }
 /* DLSS's camera: clip from the world light space (projection times camera). */
 static const float *hybrid_dlss_camera(const float projection[16],int have_camera,const float view[12])
@@ -603,7 +607,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
      * disables): this frame composites the previous trace's lighting and its
      * own trace runs on the second queue while the next frame renders. */
     const char *async_env=getenv("PS3RECOMP_RSX_ASYNC_PT");
-    const u32 async_mode=hybrid_mode && !trace_off && s_async.available && !(async_env && async_env[0]=='0');
+    u32 async_mode=hybrid_mode && !trace_off && s_async.available && !(async_env && async_env[0]=='0');
     if(async_mode && (s_ray_ao.async_w!=width*gx || s_ray_ao.async_h!=height || s_ray_ao.async_format!=source->fmt || !s_ray_ao.async_color.img)){
         vk_destroy_image(&s_ray_ao.async_color);vk_destroy_image(&s_ray_ao.async_depth);s_ray_ao.async_w=0;
         failure="asynchronous transport copies";
@@ -666,9 +670,11 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         if(!hybrid_mode && contract<0 && (strstr(pipeline->scene_ps,"discard;") || strstr(pipeline->scene_ps,"clip(")))goto fail;
         if((tested && rs->alpha_func!=0x204u) || ((tested || coverage || rs->blend_enable) &&
             (!alpha_contract || draw.ps_bytes!=pipeline->scene_alpha_fp_bytes || tested!=rsx_scene_alpha_contract_has_threshold(alpha_contract)))){if(hybrid_mode){contract=-1;alpha_contract=NULL;}else goto fail;}
-        if(fp_used+draw.ps_bytes>s_ray_ao.fp.size)goto fail;
-        int light_contract=rsx_authored__pair(pipeline->scene_vs_sha256,pipeline->scene_ps_sha256);
-        u32 position_proof=vk_ray_unit_position(&draw,light_contract);
+        if(!trace_off && fp_used+draw.ps_bytes>s_ray_ao.fp.size)goto fail;
+        // Motion-only DLSS needs captured geometry/depth, not PT materials
+        // or authored light recovery. Keep the gather metadata below intact.
+        int light_contract=trace_off?-1:rsx_authored__pair(pipeline->scene_vs_sha256,pipeline->scene_ps_sha256);
+        u32 position_proof=trace_off?0:vk_ray_unit_position(&draw,light_contract);
         if(light_contract>=0){s_ray_ao.authored_known[light_contract]++;if(!position_proof)s_ray_ao.authored_nonunit[light_contract]++;}
         if(position_proof && rsx_authored_lights_recover(pipeline->scene_vs_sha256,pipeline->scene_ps_sha256,
             (const float(*)[4])draw.vs_constants,draw.vs_bytes,draw.ps_constants,draw.ps_bytes,projection,
@@ -681,7 +687,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         /* A depth-only prepass is shadow geometry, never the RGB owner.
          * Preserve partial masks as possible ambiguous color writers. */
         material.authored[1]=rs->color_mask&0x00ffffffu;
-        if(contract>=0)for(u32 unit=0;unit<2;unit++)if(pipeline->scene_alpha_mask&(1u<<unit))if(!(draw.texture_mask&(1u<<unit)) || !vk_ray_alpha_texture(draw.textures[unit],&draw.samplers[unit],&material.textures[unit])){if(hybrid_mode)material.alpha[0]=UINT32_MAX;else goto fail;}
+        if(!trace_off && contract>=0)for(u32 unit=0;unit<2;unit++)if(pipeline->scene_alpha_mask&(1u<<unit))if(!(draw.texture_mask&(1u<<unit)) || !vk_ray_alpha_texture(draw.textures[unit],&draw.samplers[unit],&material.textures[unit])){if(hybrid_mode)material.alpha[0]=UINT32_MAX;else goto fail;}
         /* Exact recovered source pairs only. Unknown/resource failures keep
          * this material's exact original raster RGB, without omitting geometry. */
         const rsx_authored_lights *a=&s_ray_ao.authored_lights[i];
@@ -694,7 +700,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
             else s_ray_ao.authored_texture_failed[light_contract]++;
         }
         else if(authored_mode && light_contract>=0 && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE)s_ray_ao.authored_state_failed[light_contract]++;
-        if(hybrid_mode){
+        if(hybrid_mode && !trace_off){
             /* Generic base selection: avoid two-channel normal maps and LUTs;
              * prefer a color-sized unit 1 when unit 0 is the normal source. */
             int unit=-1;u64 score=0;
@@ -726,8 +732,10 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
                 material.light_rgb[l][3]=(float)a->lights[l].status;
             }
         }
-        if(draw.ps_bytes)memcpy((unsigned char*)s_ray_ao.fp.ptr+fp_used,draw.ps_constants,draw.ps_bytes);
-        fp_used+=draw.ps_bytes;
+        if(!trace_off){
+            if(draw.ps_bytes)memcpy((unsigned char*)s_ray_ao.fp.ptr+fp_used,draw.ps_constants,draw.ps_bytes);
+            fp_used+=draw.ps_bytes;
+        }
         // Exact captured source supplies h, avoiding projection cancellation.
         // Scale metadata is used only after the full shared-position proof.
         /* Hybrid geometry comes from the captured post-transform clip output,
@@ -747,7 +755,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
             destination[3]=i;scales[3]=0;primitive++;
         }
     }
-    if(hybrid_mode){
+    if(hybrid_mode && !trace_off){
         vk_ray_material *all=(vk_ray_material*)s_ray_ao.materials.ptr;int light_source=-1;
         for(u32 i=0;i<epoch->draw_count && light_source<0;i++)for(u32 l=0;l<4;l++)
             if(all[i].light_rgb[l][3]==1.0f && all[i].light_view[l][3]==0.0f){light_source=(int)i;break;}
@@ -757,7 +765,8 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         }
     }
     u32 hybrid_fog_index=(u32)(fp_used/16);
-    if(hybrid_mode){
+    if(hybrid_mode)hybrid_have_camera=vk_ray_frame_camera(epoch,hybrid_view,&hybrid_camera_key);
+    if(hybrid_mode && !trace_off){
         float fog[4]={.08f,.08f,.08f,1.0f};int found=0;
         vk_ray_material *all=(vk_ray_material*)s_ray_ao.materials.ptr;
         for(u32 i=0;i<epoch->draw_count && !found;i++){
@@ -777,10 +786,15 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         /* fp+2 key light (view space, w=0 directional), fp+3 its radiance
          * (w=1 valid), fp+4..7 reprojection rows, fp+8 (0, bank, reset, 0). */
         float block[7][4];memset(block,0,sizeof block);
-        hybrid_have_camera=vk_ray_frame_camera(epoch,hybrid_view,&hybrid_camera_key);
-        vk_ray_select_key(epoch->draw_count,hybrid_have_camera,hybrid_view,block[0],block[1]);
+        const int light_changed=vk_ray_select_key(epoch->draw_count,hybrid_have_camera,hybrid_view,block[0],block[1]);
         int reset=0;vk_ray_reprojection(projection,hybrid_have_camera,hybrid_view,epoch->frame,&block[2][0],&reset);
+        if(light_changed)reset=1;
         if(s_ray_ao.history_w!=aw || s_ray_ao.history_h!=ah)reset=1;
+        // With no usable history, trace this frame before compositing it.
+        // Subsequent continuous frames return to asynchronous transport.
+        // This removes the initial raster-only frame without stale lighting
+        // after a camera cut or resolution change.
+        if(reset)async_mode=0;
         block[6][1]=(float)s_ray_ao.history_bank;block[6][2]=reset?1.0f:0.0f;
         /* Directional shadow reach in world units (Folklore: a point light's
          * authored range is 19..94 units; the camera sits ~50 units back). */
@@ -800,7 +814,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     const char *transport_mode=hybrid_mode?"hybrid-path-tracing":authored_mode?"authored-source-preview":path_preview?"diffuse-path-preview":"ray-AO";
     vk_ray_parameters parameters={{projection[0],projection[5],projection[10],projection[14]},{aw,ah,width,height},{triangles,epoch->vertex_count,gx,(hybrid_mode?32u:0u)|path_preview|(denoise?2u:0u)|(authored_mode?4u:0u)|(s_ray_ao.test_disable_authored_bounce?8u:0u)|(s_ray_ao.test_disable_authored_reflections?0u:16u)},{radius,fmaxf(.00001f,radius*.001f),strength,.005f}};
     if(authored_mode && !hybrid_mode && s_ray_ao.traced==0)VK_LOG("authored-source preview: contract0/pool91/terrain90 exact source subsets; full sample resolution; per-source shadows plus one colored bounce using bounded source diffuse proxies at both surfaces, source-directed mirror reflections on qualified hits, original cube on misses; no physical BRDF/roughness/emission; explicit cone LOD plus primary raster agreement; per-vertex source homogeneous scales with translated per-hit light correction; unknown materials unchanged; NOT full PT or DLSS\n");
-    if(hybrid_mode && s_ray_ao.traced==0)VK_LOG("Hybrid path tracing (raster primary, traced shadows/bounce/reflections, generic materials where the original shader is not yet decoded)\n");
+    if(hybrid_mode && !trace_off && s_ray_ao.traced==0)VK_LOG("Hybrid path tracing (raster primary, traced shadows/bounce/reflections, generic materials where the original shader is not yet decoded)\n");
     if(hybrid_mode)parameters.settings[3]=(float)hybrid_fog_index;
     if(path_preview && s_ray_ao.traced==0)VK_LOG("diffuse path preview: current-frame geometry, 8 paths/pixel, 4 diffuse bounces, neutral secondary reflectance 0.65, uniform environment; original primary color retained; NOT recovered physical game materials/lights\n");
     if(s_ray_ao.traced==0)VK_LOG("ray transport mode=%s denoiser=%s current-frame depth/normal guided; no temporal history or DLSS Ray Reconstruction\n",transport_mode,denoise?"spatial-atrous-3-pass":"off");
@@ -988,7 +1002,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
             s_ray_ao.gpu_ms[6]=(double)((prepared-times[5])&mask_bits)*s_ray_ao.properties.limits.timestampPeriod/1000000.0;
         }else s_ray_ao.gpu_ms[6]=0;}
     s_ray_ao.cpu_ms=(double)(SDL_GetPerformanceCounter()-start)*1000.0/(double)SDL_GetPerformanceFrequency();
-    if(hybrid_mode && SDL_GetTicks64()-s_ray_ao.last_hybrid_log>=1000){
+    if(hybrid_mode && !trace_off && SDL_GetTicks64()-s_ray_ao.last_hybrid_log>=1000){
         u32 world=s_ray_ao.gpu_stats[0],traced=s_ray_ao.gpu_stats[24],hits=s_ray_ao.gpu_stats[5];
         VK_LOG("hybrid PT frame=%llu world=%u traced=%u (%.2f%%) rasterFallback=%u genericHits=%.2f%% bounceHits=%u reflectionHits=%u shadows=%u primaryShadowed=%.1f%% far=%.1f PT=%.3fms flags=0x%x reflectionRays=%u nonfinite=%u nonblack=%u owners=%u families=%u/%u/%u/%u\n",
             (unsigned long long)epoch->frame,world,traced,world?100.0*traced/world:0.0,world-traced,

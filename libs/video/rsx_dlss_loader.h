@@ -43,6 +43,12 @@ typedef rsx_dlss_status (*rsx_dlss_loader_get_report_fn)(const rsx_dlss_vk *, rs
 typedef rsx_dlss_status (*rsx_dlss_loader_optimal_size_fn)(rsx_dlss_vk *, uint32_t, uint32_t, rsx_dlss_quality, rsx_dlss_size *);
 typedef rsx_dlss_status (*rsx_dlss_loader_configure_fn)(rsx_dlss_vk *, VkCommandBuffer, const rsx_dlss_config *);
 typedef rsx_dlss_status (*rsx_dlss_loader_evaluate_fn)(rsx_dlss_vk *, VkCommandBuffer, const rsx_dlss_frame *);
+typedef rsx_dlss_status (*rsx_dlss_loader_fg_instance_extensions_fn)(const rsx_dlss_identity *, rsx_dlss_extensions *, rsx_dlss_fg_report *);
+typedef rsx_dlss_status (*rsx_dlss_loader_fg_device_extensions_fn)(const rsx_dlss_identity *, VkInstance, VkPhysicalDevice, rsx_dlss_extensions *, rsx_dlss_fg_report *);
+typedef rsx_dlss_status (*rsx_dlss_loader_fg_capability_fn)(rsx_dlss_vk *, rsx_dlss_fg_report *);
+typedef rsx_dlss_status (*rsx_dlss_loader_fg_get_report_fn)(const rsx_dlss_vk *, rsx_dlss_fg_report *);
+typedef rsx_dlss_status (*rsx_dlss_loader_fg_configure_fn)(rsx_dlss_vk *, VkCommandBuffer, const rsx_dlss_fg_config *);
+typedef rsx_dlss_status (*rsx_dlss_loader_fg_evaluate_fn)(rsx_dlss_vk *, VkCommandBuffer, const rsx_dlss_fg_frame *);
 
 typedef struct rsx_dlss_loader {
     HMODULE module;
@@ -59,6 +65,12 @@ typedef struct rsx_dlss_loader {
     rsx_dlss_loader_optimal_size_fn optimal_size;
     rsx_dlss_loader_configure_fn configure;
     rsx_dlss_loader_evaluate_fn evaluate;
+    rsx_dlss_loader_fg_instance_extensions_fn fg_instance_extensions;
+    rsx_dlss_loader_fg_device_extensions_fn fg_device_extensions;
+    rsx_dlss_loader_fg_capability_fn fg_capability;
+    rsx_dlss_loader_fg_get_report_fn fg_get_report;
+    rsx_dlss_loader_fg_configure_fn fg_configure;
+    rsx_dlss_loader_fg_evaluate_fn fg_evaluate;
 } rsx_dlss_loader;
 
 typedef void (*rsx_dlss_loader_proc)(void);
@@ -188,7 +200,11 @@ static inline int rsx_dlss_loader_open(rsx_dlss_loader *loader, const wchar_t *b
     static const char *const names[8] = {
         "rsx_dlss_instance_extensions", "rsx_dlss_device_extensions", "rsx_dlss_create", "rsx_dlss_destroy",
         "rsx_dlss_get_report", "rsx_dlss_optimal_size", "rsx_dlss_configure", "rsx_dlss_evaluate"};
+    static const char *const fg_names[6] = {
+        "rsx_dlss_fg_instance_extensions", "rsx_dlss_fg_device_extensions", "rsx_dlss_fg_capability",
+        "rsx_dlss_fg_get_report", "rsx_dlss_fg_configure", "rsx_dlss_fg_evaluate"};
     rsx_dlss_loader_proc procs[8];
+    rsx_dlss_loader_proc fg_procs[6];
     wchar_t *scratch = NULL;
     const wchar_t *module_name;
     size_t len, i;
@@ -293,6 +309,20 @@ static inline int rsx_dlss_loader_open(rsx_dlss_loader *loader, const wchar_t *b
     loader->optimal_size = (rsx_dlss_loader_optimal_size_fn)procs[5];
     loader->configure = (rsx_dlss_loader_configure_fn)procs[6];
     loader->evaluate = (rsx_dlss_loader_evaluate_fn)procs[7];
+
+    /* Older SR-only bridges remain valid. Never expose a partial FG API. */
+    for (i = 0; i < 6; ++i) {
+        fg_procs[i] = rsx_dlss_loader__proc(loader->module, fg_names[i]);
+        if (!fg_procs[i]) break;
+    }
+    if (i == 6) {
+        loader->fg_instance_extensions = (rsx_dlss_loader_fg_instance_extensions_fn)fg_procs[0];
+        loader->fg_device_extensions = (rsx_dlss_loader_fg_device_extensions_fn)fg_procs[1];
+        loader->fg_capability = (rsx_dlss_loader_fg_capability_fn)fg_procs[2];
+        loader->fg_get_report = (rsx_dlss_loader_fg_get_report_fn)fg_procs[3];
+        loader->fg_configure = (rsx_dlss_loader_fg_configure_fn)fg_procs[4];
+        loader->fg_evaluate = (rsx_dlss_loader_fg_evaluate_fn)fg_procs[5];
+    }
 
     /* Identity pointers reference the final loader storage directly. */
     memcpy(loader->uuid, uuid, 36);

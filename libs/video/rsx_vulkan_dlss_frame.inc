@@ -9,7 +9,8 @@
  * host data is double-buffered; counters the GPU writes are read one frame
  * later, once that frame's submission has completed. */
 #if defined(_WIN32)
-typedef struct vk_dlss_draw_key {u64 geometry,slots,topology;u32 base,count;} vk_dlss_draw_key;
+#include "rsx_dlss_motion_match.h"
+typedef rsx_dlss_draw_key vk_dlss_draw_key;
 typedef struct vk_dlss_frame_params {float reprojection[16],projection[4],jitter[4];u32 sizes[4],history[4],layout[4];} vk_dlss_frame_params;
 _Static_assert(sizeof(vk_dlss_frame_params)==144,"GLSL std140 DLSS parameters layout");
 #define VK_DLSS_DRAWS 256u
@@ -240,14 +241,9 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
         for(u32 k=0;k<draw.index_count;k++)topology=(topology^draw.indices[k])*1099511628211ull;
         topology=(topology^draw.pipeline)*1099511628211ull;
         current[i]=(vk_dlss_draw_key){draw.geometry_identity,draw.constant_slots,topology,base,draw.vertex_count};
-        map[i][1]=base;u32 matches=0,found=0,duplicates=0;
-        if(draw.geometry_identity && draw.constant_slots && !reset){
-            for(u32 j=0;j<s_dlss_frame.previous_count;j++)if(s_dlss_frame.previous[j].geometry==draw.geometry_identity && s_dlss_frame.previous[j].slots==draw.constant_slots && s_dlss_frame.previous[j].topology==topology && s_dlss_frame.previous[j].count==draw.vertex_count){matches++;found=j;}
-            for(u32 j=0;j<i;j++)if(current[j].geometry==draw.geometry_identity && current[j].slots==draw.constant_slots && current[j].topology==topology){duplicates++;map[j][2]=0;}
-            if(matches==1 && !duplicates){map[i][0]=s_dlss_frame.previous[found].base;map[i][2]=1;}
-        }
         base+=draw.vertex_count;
     }
+    if(!rsx_dlss_match_draws(s_dlss_frame.previous,s_dlss_frame.previous_count,current,draws,reset,map))return 0;
     float inverse[16];int invertible=have_camera && vk_dlss_inverse(camera,inverse);
     if(!invertible || !s_dlss_frame.have_camera)reset=1;
     if(invertible && s_dlss_frame.have_camera){

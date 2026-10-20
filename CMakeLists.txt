@@ -802,6 +802,8 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
         add_executable(test_rsx_hud_geometry EXCLUDE_FROM_ALL libs/video/tests/test_rsx_hud_geometry.c)
         target_compile_options(test_rsx_hud_geometry PRIVATE -Wall -Wextra -Werror)
         target_link_libraries(test_rsx_hud_geometry PRIVATE m)
+        add_executable(test_dlss_motion_match EXCLUDE_FROM_ALL tests/test_dlss_motion_match.c)
+        target_compile_options(test_dlss_motion_match PRIVATE -UNDEBUG -Wall -Wextra -Werror)
         add_executable(test_vulkan_display_gpu EXCLUDE_FROM_ALL
             tests/test_vulkan_display_gpu.c runtime/host/host_stubs.c runtime/host/host_fixture_symbols.c)
         target_include_directories(test_vulkan_display_gpu PRIVATE

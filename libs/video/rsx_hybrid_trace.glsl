@@ -79,22 +79,18 @@ void hybridSkyUpdate(){
     vec3 value=reset?current:mix(previous,current,.08);
     history.value[hybridSkySlot()]=uvec4(floatBitsToUint(value.r),floatBitsToUint(value.g),floatBitsToUint(value.b),1u);
 }
+bool hybridCutoutKeep(uint primitive,vec2 bary);
 bool hybridNearest(vec3 origin,vec3 direction,float minimum,float maximum,
                    bool colorOwner,out uint hit,out vec2 bary,out float distance){
     countRay(2);hit=0xffffffffu;distance=maximum;bary=vec2(0);
     rayQueryEXT q;
-    if(!colorOwner){
-        // Plain closest hit (bounce, reflection): opaque hardware traversal.
-        rayQueryInitializeEXT(q,scene,gl_RayFlagsOpaqueEXT,255,origin,minimum,direction,maximum);
-        while(rayQueryProceedEXT(q)){}
-        if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return false;
-        hit=rayQueryGetIntersectionPrimitiveIndexEXT(q,true);distance=rayQueryGetIntersectionTEXT(q,true);
-        bary=rayQueryGetIntersectionBarycentricsEXT(q,true);
-        return true;
-    }
+    // Secondary rays use the same cutout visibility as shadows. Forcing
+    // opaque traversal made foliage holes into solid reflection/bounce cards.
     rayQueryInitializeEXT(q,scene,0,255,origin,minimum,direction,maximum);
     while(rayQueryProceedEXT(q))if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
         uint candidate=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
+        vec2 candidateBary=rayQueryGetIntersectionBarycentricsEXT(q,false);
+        if(!colorOwner && !hybridCutoutKeep(candidate,candidateBary))continue;
         Material candidateMaterial=materials.value[indices.triangle[candidate].w];
         if(colorOwner && candidateMaterial.authored.y==0u)continue;
         float t=rayQueryGetIntersectionTEXT(q,false);
@@ -106,7 +102,7 @@ bool hybridNearest(vec3 origin,vec3 direction,float minimum,float maximum,
                 ((candidateMaterial.authored.x!=0u)==(known!=0u) && candidate<hit);
         }
         if(choose){
-            hit=candidate;distance=t;bary=rayQueryGetIntersectionBarycentricsEXT(q,false);
+            hit=candidate;distance=t;bary=candidateBary;
             if(!colorOwner)rayQueryConfirmIntersectionEXT(q);
         }
     }
@@ -144,7 +140,7 @@ vec3 hybridBase(uint primitive,vec2 bary,vec3 direction,float radius,out bool ge
     vec3 base=texel.rgb*vertex;
     return finite3(base)?clamp(base,vec3(0),vec3(.95)):vec3(.5);
 }
-// Alpha-tested cutouts (foliage, fences) keep their holes in shadow rays
+// Alpha-tested cutouts (foliage, fences) keep their holes in secondary rays
 // instead of casting solid quads. Coarse LOD: shadows are filtered anyway.
 bool hybridCutoutKeep(uint primitive,vec2 bary){
     Material m=materials.value[indices.triangle[primitive].w];
@@ -288,8 +284,8 @@ void hybridTrace(uvec2 pixel){
         // modulation. A decoded base stays additive, independent of texels.
         if(generic)M+=incoming/luminance;else A+=known*incoming;
     }
-    // Roughness 0.8 for generic diffuse materials; explicit source cube
-    // materials use a single glossy reflection ray (roughness 0.18).
+    // Explicit source cube materials use one ideal specular reflection ray.
+    // No roughness distribution has been recovered from the original shader.
     if(primaryGloss){
         vec3 reflection=reflect(view,normal);countRay(29);
         uint hit;vec2 b;float d;vec3 radiance=hybridSky();

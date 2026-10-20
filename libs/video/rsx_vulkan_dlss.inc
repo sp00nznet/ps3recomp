@@ -8,14 +8,20 @@ static struct {
     rsx_dlss_loader loader;
     rsx_dlss_vk *context;
     rsx_dlss_extensions instance_extensions, device_extensions;
+    rsx_dlss_extensions fg_instance_extensions, fg_device_extensions;
     VkPhysicalDeviceVulkan11Features f11;
     VkPhysicalDeviceVulkan12Features f12;
     int device_ready;
+    int fg_instance_ready, fg_device_ready;
 } s_dlss;
 
 static int vk_dlss_requested(void)
 {
     const char *v=getenv("PS3RECOMP_DLSS");return v && !strcmp(v,"1");
+}
+static int vk_dlss_fg_requested(void)
+{
+    const char *v=getenv("PS3RECOMP_DLSS_FG");return vk_dlss_requested() && v && !strcmp(v,"1");
 }
 static int vk_dlss_wide_env(const char *name,wchar_t *out,size_t count)
 {
@@ -34,6 +40,8 @@ static int vk_dlss_merge(const rsx_dlss_extensions *required,const char **names,
 }
 static int vk_dlss_instance_prepare(VkInstanceCreateInfo *ci,const char **names,u32 capacity,u32 api)
 {
+    s_dlss.fg_instance_ready=0;
+    s_dlss.fg_device_ready=0;
     if(!vk_dlss_requested())return 0;
     if(api<VK_API_VERSION_1_2){VK_LOG("DLSS initialization requires Vulkan1.2\n");return 0;}
     wchar_t bridge[32768],runtime[32768],logs[32768];char error[256];
@@ -52,25 +60,44 @@ static int vk_dlss_instance_prepare(VkInstanceCreateInfo *ci,const char **names,
     u32 count=0;VkExtensionProperties *available=NULL;int good=0;
     if(status==RSX_DLSS_OK && enumerate && enumerate(NULL,&count,NULL)==VK_SUCCESS && count && count<=4096){
         available=(VkExtensionProperties*)calloc(count,sizeof *available);
-        if(available && enumerate(NULL,&count,available)==VK_SUCCESS){
+        if(available && enumerate(NULL,&count,available)==VK_SUCCESS &&
+           s_dlss.instance_extensions.count<=RSX_DLSS_MAX_EXTENSIONS){
             good=1;
             for(u32 i=0;i<s_dlss.instance_extensions.count;i++)
                 if(!vk_advanced_has(available,count,s_dlss.instance_extensions.items[i].extensionName))good=0;
         }
     }
-    free(available);
     u32 used=ci->enabledExtensionCount;
     if(good && used<=capacity){
         for(u32 i=0;i<used;i++)names[i]=ci->ppEnabledExtensionNames[i];
         good=vk_dlss_merge(&s_dlss.instance_extensions,names,&used,capacity);
     }else good=0;
-    if(!good){VK_LOG("DLSS instance requirements unavailable status=%d ngx=0x%x\n",status,(unsigned)ngx);rsx_dlss_loader_close(&s_dlss.loader);return 0;}
+    if(!good){free(available);VK_LOG("DLSS instance requirements unavailable status=%d ngx=0x%x\n",status,(unsigned)ngx);rsx_dlss_loader_close(&s_dlss.loader);return 0;}
+    if(vk_dlss_fg_requested()){
+        if(!s_dlss.loader.fg_instance_extensions){
+            VK_LOG("DLSS FG diagnostic: bridge lacks complete FG export group; SR remains available\n");
+        }else{
+            rsx_dlss_fg_report fg={0};
+            rsx_dlss_status fs=s_dlss.loader.fg_instance_extensions(
+                &s_dlss.loader.identity,&s_dlss.fg_instance_extensions,&fg);
+            int supported=fs==RSX_DLSS_OK && s_dlss.fg_instance_extensions.count<=RSX_DLSS_MAX_EXTENSIONS && available;
+            if(supported)for(u32 i=0;i<s_dlss.fg_instance_extensions.count;i++)
+                if(!vk_advanced_has(available,count,s_dlss.fg_instance_extensions.items[i].extensionName))supported=0;
+            u32 candidate=used;
+            if(supported)supported=vk_dlss_merge(&s_dlss.fg_instance_extensions,names,&candidate,capacity);
+            if(supported){used=candidate;s_dlss.fg_instance_ready=1;}
+            VK_LOG("DLSS FG diagnostic: instance status=%d cause=%d ngx=0x%x required=%u extensionsMerged=%d; configured=0 evaluations=0 presents=0\n",
+                fs,fg.cause,(unsigned)fg.ngx_result,s_dlss.fg_instance_extensions.count,supported);
+        }
+    }
+    free(available);
     ci->enabledExtensionCount=used;ci->ppEnabledExtensionNames=names;
     VK_LOG("DLSS explicit bridge loaded; instance requirements=%u\n",s_dlss.instance_extensions.count);
     return 1;
 }
 static int vk_dlss_device_prepare(VkDeviceCreateInfo *ci,const char **names,u32 capacity)
 {
+    s_dlss.fg_device_ready=0;
     if(!s_dlss.loader.module)return 0;
     if(s_advanced.device_api<VK_API_VERSION_1_2){rsx_dlss_loader_close(&s_dlss.loader);return 0;}
     int32_t ngx=0;rsx_dlss_status status=s_dlss.loader.device_extensions(
@@ -80,6 +107,19 @@ static int vk_dlss_device_prepare(VkDeviceCreateInfo *ci,const char **names,u32 
         if(!vk_has_device_extension(s_vk.phys,s_dlss.device_extensions.items[i].extensionName))goto fail;
     u32 count=ci->enabledExtensionCount;
     if(!vk_dlss_merge(&s_dlss.device_extensions,names,&count,capacity))goto fail;
+    if(s_dlss.fg_instance_ready){
+        rsx_dlss_fg_report fg={0};
+        rsx_dlss_status fs=s_dlss.loader.fg_device_extensions(
+            &s_dlss.loader.identity,s_vk.instance,s_vk.phys,&s_dlss.fg_device_extensions,&fg);
+        int supported=fs==RSX_DLSS_OK && s_dlss.fg_device_extensions.count<=RSX_DLSS_MAX_EXTENSIONS;
+        if(supported)for(u32 i=0;i<s_dlss.fg_device_extensions.count;i++)
+            if(!vk_has_device_extension(s_vk.phys,s_dlss.fg_device_extensions.items[i].extensionName))supported=0;
+        u32 candidate=count;
+        if(supported)supported=vk_dlss_merge(&s_dlss.fg_device_extensions,names,&candidate,capacity);
+        if(supported){count=candidate;s_dlss.fg_device_ready=1;}
+        VK_LOG("DLSS FG diagnostic: device status=%d cause=%d ngx=0x%x required=%u extensionsMerged=%d; configured=0 evaluations=0 presents=0\n",
+            fs,fg.cause,(unsigned)fg.ngx_result,s_dlss.fg_device_extensions.count,supported);
+    }
     PFN_vkGetPhysicalDeviceFeatures2 query=(PFN_vkGetPhysicalDeviceFeatures2)
         pvkGetInstanceProcAddr(s_vk.instance,"vkGetPhysicalDeviceFeatures2");
     if(!query)goto fail;
@@ -104,7 +144,15 @@ static void vk_dlss_device_created(void)
     VK_LOG("DLSS game-device context status=%d available=%u support=0x%x ngx=0x%x; evaluatedFrames=0\n",
         status,report.available,report.support_flags,(unsigned)report.ngx_result);
     if(status!=RSX_DLSS_OK){s_dlss.context=NULL;s_dlss.device_ready=0;}
-    else vk_dlss_frame_initialize();
+    else {
+        if(s_dlss.fg_device_ready){
+            rsx_dlss_fg_report fg={0};
+            rsx_dlss_status fs=s_dlss.loader.fg_capability(s_dlss.context,&fg);
+            VK_LOG("DLSS FG diagnostic: capability status=%d cause=%d available=%u support=0x%x driverUpdate=%u ngx=0x%x; configured=0 evaluations=0 presents=0\n",
+                fs,fg.cause,fg.available,fg.support_flags,fg.needs_driver_update,(unsigned)fg.ngx_result);
+        }
+        vk_dlss_frame_initialize();
+    }
 }
 static void vk_dlss_device_selected(int enabled){s_dlss.device_ready=enabled;}
 static void vk_dlss_shutdown(void)
