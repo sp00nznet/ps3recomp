@@ -4,7 +4,9 @@
  * rsx_dlss_vk.cpp, vulkan-1.lib and nvsdk_ngx_d.lib. The latter is also used
  * by the reused fixture translation unit below; never invoke its old wmain.
  * Usage: test_vulkan_dlss_consumer OUTPUT_PREFIX LOG_DIR RUNTIME_DIR
- *        PROJECT_UUID WIDTH HEIGHT FRAMES (FRAMES >= 16)
+ *        PROJECT_UUID WIDTH HEIGHT FRAMES [hdr|ldr] (FRAMES >= 16)
+ * hdr (default) configures through rsx_dlss_configure (IsHDR+AutoExposure);
+ * ldr through rsx_dlss_configure2 with LDR_PERCEPTUAL and no exposure.
  */
 #define wmain old_dlss_sr_wmain_never_call
 #include "test_vulkan_dlss_sr.cpp"
@@ -126,15 +128,26 @@ static void expectRejected(rsx_dlss_vk *consumer,VkCommandBuffer command,
     require(rsx_dlss_evaluate(consumer,command,&frame)==RSX_DLSS_BAD_ARGUMENT,label,1);
 }
 static void runMoving(App &a,Consumer &consumer,const fs::path &prefix,
-                      uint32_t width,uint32_t height,uint32_t frames)
+                      uint32_t width,uint32_t height,uint32_t frames,bool ldr)
 {
     rsx_dlss_size size{};
     consumerCheck(rsx_dlss_optimal_size(consumer.value,width,height,RSX_DLSS_QUALITY,&size),
                   "optimal size",77);
     const uint32_t iw=size.input_width,ih=size.input_height;
     require(iw && ih && iw<=width && ih<=height,"invalid input size",77);
-    rsx_dlss_config cfg{1,iw,ih,width,height,RSX_DLSS_QUALITY,1};
-    a.begin();consumerCheck(rsx_dlss_configure(consumer.value,a.command,&cfg),"configure",77);
+    rsx_dlss_config cfg{1,iw,ih,width,height,RSX_DLSS_QUALITY,ldr?0u:1u};
+    if(ldr){
+        // Argument validation happens before any NGX call.
+        rsx_dlss_config2 wrong{sizeof(rsx_dlss_config2)-4,RSX_DLSS_COLOR_LDR_PERCEPTUAL,cfg};
+        require(rsx_dlss_configure2(consumer.value,a.command,&wrong)==RSX_DLSS_BAD_ARGUMENT,"configure2 accepted a wrong struct size",1);
+        wrong.struct_size=sizeof(rsx_dlss_config2);wrong.base.auto_exposure=1;
+        require(rsx_dlss_configure2(consumer.value,a.command,&wrong)==RSX_DLSS_BAD_ARGUMENT,"configure2 accepted LDR with auto-exposure",1);
+        wrong.base.auto_exposure=0;wrong.color=2;
+        require(rsx_dlss_configure2(consumer.value,a.command,&wrong)==RSX_DLSS_BAD_ARGUMENT,"configure2 accepted an unknown colour mode",1);
+    }
+    rsx_dlss_config2 cfg2{sizeof(rsx_dlss_config2),RSX_DLSS_COLOR_LDR_PERCEPTUAL,cfg};
+    a.begin();consumerCheck(ldr?rsx_dlss_configure2(consumer.value,a.command,&cfg2):
+                               rsx_dlss_configure(consumer.value,a.command,&cfg),"configure",77);
     a.finish();
     a.makeImage(a.images[0],iw,ih,VK_FORMAT_R16G16B16A16_SFLOAT);
     a.makeImage(a.images[1],iw,ih,VK_FORMAT_R32_SFLOAT);
@@ -168,6 +181,7 @@ static void runMoving(App &a,Consumer &consumer,const fs::path &prefix,
     rsx_dlss_report report{};consumerCheck(rsx_dlss_get_report(consumer.value,&report),"report");
     require(report.evaluation_count==0,"rejected frame reached NGX",1);
     std::vector<float> first(outputCount*4),last(outputCount*4);
+    double inputLuma=0;
     for(uint32_t frame=0;frame<frames;frame++) {
         const float jx=halton(frame+1,2)-.5f,jy=halton(frame+1,3)-.5f;
         auto bytes=static_cast<unsigned char*>(a.upload.mapped);
@@ -181,6 +195,7 @@ static void runMoving(App &a,Consumer &consumer,const fs::path &prefix,
             const size_t i=static_cast<size_t>(y)*iw+x;
             depth[i]=sample.pixel.depth;
             for(unsigned c=0;c<4;c++)color[i*4+c]=half(sample.pixel.color[c]);
+            if(frame+1==frames)inputLuma+=.2126*sample.pixel.color[0]+.7152*sample.pixel.color[1]+.0722*sample.pixel.color[2];
             // Previous minus current positions in unjittered input pixels.
             motion[i*2]=frame?(sample.object?(.003f-.007f)*iw:.003f*iw):0;
             motion[i*2+1]=frame&&sample.object?-.003f*ih:0;
@@ -248,6 +263,11 @@ static void runMoving(App &a,Consumer &consumer,const fs::path &prefix,
         change+=std::fabs(last[i+c]-first[i+c]);
     change/=outputCount*3;
     require(change>1e-5,"moving fixture produced no temporal RGB change",1);
+    double outputLuma=0;
+    for(size_t i=0;i<last.size();i+=4)outputLuma+=.2126*last[i]+.7152*last[i+1]+.0722*last[i+2];
+    inputLuma/=inputCount;outputLuma/=outputCount;
+    std::printf("consumer colour: mode=%s meanLumaIn=%.6f meanLumaOut=%.6f ratio=%.6f\n",
+                ldr?"ldr":"hdr",inputLuma,outputLuma,inputLuma>0?outputLuma/inputLuma:0.0);
     consumerCheck(rsx_dlss_get_report(consumer.value,&report),"final report");
     require(report.evaluation_count==frames && report.last_frame_serial==frames,
             "consumer evaluation count/serial mismatch",1);
@@ -264,7 +284,9 @@ static void runMoving(App &a,Consumer &consumer,const fs::path &prefix,
 }
 int wmain(int argc,wchar_t **argv) {
     try {
-        if(argc!=8) {std::fputs("Usage: test_vulkan_dlss_consumer OUTPUT_PREFIX LOG_DIR RUNTIME_DIR PROJECT_UUID WIDTH HEIGHT FRAMES\n",stderr);return 2;}
+        if(argc!=8 && argc!=9) {std::fputs("Usage: test_vulkan_dlss_consumer OUTPUT_PREFIX LOG_DIR RUNTIME_DIR PROJECT_UUID WIDTH HEIGHT FRAMES [hdr|ldr]\n",stderr);return 2;}
+        const std::wstring mode=argc==9?argv[8]:L"hdr";
+        require(mode==L"hdr" || mode==L"ldr","colour mode must be hdr or ldr",2);
         const fs::path prefix=fs::absolute(argv[1]),logs=fs::absolute(argv[2]);
         const fs::path runtime=fs::absolute(argv[3]);const std::string project=uuid(argv[4]);
         require(fs::is_directory(prefix.parent_path()),"output parent must exist",2);
@@ -275,7 +297,7 @@ int wmain(int argc,wchar_t **argv) {
         const uint32_t frames=number(argv[7],16,64);
         App app;Consumer consumer;
         initializeConsumer(app,logs,runtime,project,consumer);
-        runMoving(app,consumer,prefix,width,height,frames);
+        runMoving(app,consumer,prefix,width,height,frames,mode==L"ldr");
         return 0;
     } catch(const Failure &f) {
         std::fprintf(stderr,"%s: %s\n",f.code==77?"UNAVAILABLE":"FAILED",f.message.c_str());
