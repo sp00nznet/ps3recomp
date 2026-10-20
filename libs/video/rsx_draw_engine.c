@@ -2749,6 +2749,8 @@ static void pd_first_draw_state(u32 pipeline)
  * endian. Attribute IDs occupy words8..23; words24..28 describe culling and
  * source reference/cut counts. No guest state is changed or synthesized. */
 #include "rsx_scene_capture.inc"
+#include "rsx_mesh_pilot.h"
+static rsx_mesh_pilot_state s_mesh_pilot;
 
 static void pd_geometry(const rsx_be_render_state* rs, u32 topology,
                         int indexed, u32 draw_count, u32 draw, u32 pipeline, u32 tex_mask)
@@ -3199,7 +3201,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.be->set_temporal_identity(g.be->user,geometry,slots);
     }
     hp_start = hp_tick();
-    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+    const rsx_mesh_pilot_record *mesh_pilot=rsx_mesh_pilot_match(&s_mesh_pilot,
+        (u32)topology,dc.verts,uploaded,layout.stride,indexed?g.indices:NULL,
+        indexed?n_draw:0,layout.attrs,layout.count);
+    if(mesh_pilot)g.be->draw(g.be->user,topology,mesh_pilot->replacement,
+        mesh_pilot->out_nv,layout.stride,
+        (const u32*)(mesh_pilot->replacement+(size_t)mesh_pilot->out_nv*layout.stride),mesh_pilot->out_ni);
+    else g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
     hp_end(HP_DRAW, hp_start);
     /* Counted only when the draw ran the guest's OWN programs, which is what
@@ -3458,6 +3466,7 @@ void rsx_draw_engine_shutdown(void)
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);
     free(dc.refs); free(dc.cuts); free(dc.verts);
+    rsx_mesh_pilot_free(&s_mesh_pilot);
     rsx_draw_batch_destroy(&dc.arr);
     rsx_draw_batch_destroy(&dc.idx);
     rsx_vertex_remap_destroy(&dc.ref_remap);
