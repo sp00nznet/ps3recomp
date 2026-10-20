@@ -3194,8 +3194,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
             geometry=(geometry^dc.refs[k].vertex_id)*1099511628211ull;
             geometry=(geometry^dc.refs[k].base_index)*1099511628211ull;
         }
+        /* Unrecognized position rows used to leave the draw without identity,
+         * so DLSS gave it camera-only motion. Its motion comes from the same
+         * draw's previous clip positions, which do not need the rows; the
+         * program/state key names it consistently from frame to frame.
+         * PS3RECOMP_DLSS_PIPELINE_IDENTITY=0 restores the old behaviour. */
+        static int pipeline_identity=-1;
+        if(pipeline_identity<0){const char *e=getenv("PS3RECOMP_DLSS_PIPELINE_IDENTITY");pipeline_identity=!(e && !strcmp(e,"0"));}
         if(pipeline_metadata && pipeline_metadata->position_known){
             for(u32 k=0;k<4;k++)slots=(slots^pipeline_metadata->position_rows[k])*1099511628211ull;
+        }else if(pipeline_identity && pipeline_metadata && !pipeline_is_fixed){
+            slots=(slots^0x7069706549444e54ull)*1099511628211ull; /* separate domain from row keys */
+            slots=(slots^pipeline_metadata->key)*1099511628211ull;
+            if(!slots)slots=1;
         }else slots=0;
         if(dc.inl)slots=0;
         g.be->set_temporal_identity(g.be->user,geometry,slots);
