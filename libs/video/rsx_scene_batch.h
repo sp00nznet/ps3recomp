@@ -38,6 +38,9 @@ typedef struct rsx_scene_batch_input {
     uint32_t vertex_count;
     const void *constants;          /* immutable snapshot copied by append */
     size_t constant_bytes;          /* exactly 514 float4 values */
+    /* Nonzero: the caller keeps vertices and constants unchanged and alive
+     * until record, which uploads them directly; append makes no CPU copy. */
+    int borrowed;
 } rsx_scene_batch_input;
 typedef struct rsx_scene_batch_output {
     uint64_t token,device_generation;

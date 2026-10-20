@@ -45,7 +45,7 @@ int main(int argc,char **argv)
     CHECK(!rsx_scene_batch_compute_source(huge,&layout));free(huge);
     rsx_sb_cpu cpu={0};float vertices[12]={1,2,3,1,4,5,6,1,7,8,9,1};
     unsigned char constants[RSX_SCENE_BATCH_CONSTANT_BYTES];memset(constants,0x5a,sizeof constants);
-    rsx_scene_batch_input in={fixture,layout,vertices,sizeof vertices,3,constants,sizeof constants};uint32_t base=UINT32_MAX;
+    rsx_scene_batch_input in={fixture,layout,vertices,sizeof vertices,3,constants,sizeof constants,0};uint32_t base=UINT32_MAX;
     CHECK(!rsx_sb_cpu_append(&cpu,&in,7,&base) && base==0 && cpu.vertex_count==3);
     CHECK(cpu.draw[0].cache==7 && cpu.draw[0].input_offset==0);
     float saved=vertices[0];vertices[0]=99;constants[0]=0;
@@ -54,6 +54,15 @@ int main(int argc,char **argv)
     CHECK(((float*)(cpu.input+cpu.draw[1].input_offset))[0]==99 && cpu.constants[RSX_SCENE_BATCH_CONSTANT_BYTES]==0);
     in.constant_bytes--;CHECK(rsx_sb_cpu_append(&cpu,&in,0,&base)==RSX_SCENE_BATCH_INVALID && cpu.draw_count==2);in.constant_bytes++;
     in.vertex_bytes--;CHECK(rsx_sb_cpu_append(&cpu,&in,0,&base)==RSX_SCENE_BATCH_INVALID && cpu.draw_count==2);in.vertex_bytes++;
+    /* Borrowed: no CPU copy; the draw keeps the caller's pointers and still
+     * advances the input offset and vertex base like a copied draw. */
+    size_t used=cpu.input_used;in.borrowed=1;
+    CHECK(!rsx_sb_cpu_append(&cpu,&in,9,&base) && base==6 && cpu.draw_count==3 && cpu.vertex_count==9);
+    CHECK(cpu.draw[2].vertices==(const void*)vertices && cpu.draw[2].constants==(const void*)constants && cpu.draw[2].cache==9);
+    CHECK(cpu.draw[2].input_offset==used && cpu.draw[2].input_bytes==sizeof vertices && cpu.input_used==used+sizeof vertices);
+    CHECK(!cpu.draw[0].vertices && !cpu.draw[0].constants && cpu.draw[1].input_bytes==sizeof vertices);
+    in.vertex_bytes--;CHECK(rsx_sb_cpu_append(&cpu,&in,0,&base)==RSX_SCENE_BATCH_INVALID && cpu.draw_count==3);in.vertex_bytes++;
+    in.borrowed=0;
     rsx_sb_cpu_dispose(&cpu);in.vertex_count=1;in.vertex_bytes=16;
     for(unsigned i=0;i<RSX_SCENE_BATCH_MAX_DRAWS;i++)CHECK(!rsx_sb_cpu_append(&cpu,&in,0,&base) && base==i);
     CHECK(rsx_sb_cpu_append(&cpu,&in,0,&base)==RSX_SCENE_BATCH_CAPACITY && cpu.draw_count==RSX_SCENE_BATCH_MAX_DRAWS);

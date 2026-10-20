@@ -62,7 +62,9 @@ fail:
     free(out);return NULL;
 }
 
-typedef struct rsx_sb_draw {uint32_t cache,count,base;size_t input_offset;} rsx_sb_draw;
+/* vertices/constants: the caller's memory for a borrowed draw, else NULL
+ * (the draw's bytes are in the CPU copy at input_offset / its constant slot). */
+typedef struct rsx_sb_draw {uint32_t cache,count,base;size_t input_offset,input_bytes;const void *vertices,*constants;} rsx_sb_draw;
 typedef struct rsx_sb_cpu {
     unsigned char *input,*constants;
     size_t input_used,input_capacity,constant_capacity;
@@ -91,13 +93,16 @@ static int rsx_sb_cpu_preflight(const rsx_sb_cpu *cpu,const rsx_scene_batch_inpu
 static int rsx_sb_cpu_append(rsx_sb_cpu *cpu,const rsx_scene_batch_input *in,uint32_t cache,uint32_t *base)
 {
     int result=rsx_sb_cpu_preflight(cpu,in);if(result)return result;
-    result=rsx_sb_reserve(&cpu->input,&cpu->input_capacity,cpu->input_used+in->vertex_bytes,RSX_SCENE_BATCH_MAX_INPUT_BYTES);
-    if(result)return result;
-    result=rsx_sb_reserve(&cpu->constants,&cpu->constant_capacity,(size_t)(cpu->draw_count+1)*RSX_SCENE_BATCH_CONSTANT_BYTES,(size_t)RSX_SCENE_BATCH_MAX_DRAWS*RSX_SCENE_BATCH_CONSTANT_BYTES);
-    if(result)return result;
-    memcpy(cpu->input+cpu->input_used,in->vertices,in->vertex_bytes);
-    memcpy(cpu->constants+(size_t)cpu->draw_count*RSX_SCENE_BATCH_CONSTANT_BYTES,in->constants,RSX_SCENE_BATCH_CONSTANT_BYTES);
-    cpu->draw[cpu->draw_count++]=(rsx_sb_draw){cache,in->vertex_count,cpu->vertex_count,cpu->input_used};
+    if(!in->borrowed){
+        result=rsx_sb_reserve(&cpu->input,&cpu->input_capacity,cpu->input_used+in->vertex_bytes,RSX_SCENE_BATCH_MAX_INPUT_BYTES);
+        if(result)return result;
+        result=rsx_sb_reserve(&cpu->constants,&cpu->constant_capacity,(size_t)(cpu->draw_count+1)*RSX_SCENE_BATCH_CONSTANT_BYTES,(size_t)RSX_SCENE_BATCH_MAX_DRAWS*RSX_SCENE_BATCH_CONSTANT_BYTES);
+        if(result)return result;
+        memcpy(cpu->input+cpu->input_used,in->vertices,in->vertex_bytes);
+        memcpy(cpu->constants+(size_t)cpu->draw_count*RSX_SCENE_BATCH_CONSTANT_BYTES,in->constants,RSX_SCENE_BATCH_CONSTANT_BYTES);
+    }
+    cpu->draw[cpu->draw_count++]=(rsx_sb_draw){cache,in->vertex_count,cpu->vertex_count,cpu->input_used,in->vertex_bytes,
+        in->borrowed?in->vertices:NULL,in->borrowed?in->constants:NULL};
     if(base)*base=cpu->vertex_count;
     cpu->input_used+=in->vertex_bytes;cpu->vertex_count+=in->vertex_count;return 0;
 }
@@ -281,10 +286,12 @@ int rsx_vulkan_scene_batch_record(uint64_t token,VkCommandBuffer command,VkFence
     if(!result)result=rsx_sb_device_buffer(b,&b->output,out_bytes,&b->output_address);
     if(!result)result=rsx_sb_device_buffer(b,&b->validity,4,&b->validity_address);
     if(result){b->state=RSX_SB_REJECTED;b->error=result;return result;}
-    memcpy(b->input.ptr,b->cpu.input,b->cpu.input_used);memset(b->constants.ptr,0,(size_t)constant_bytes);
+    memset(b->constants.ptr,0,(size_t)constant_bytes);
     for(uint32_t i=0;i<b->cpu.draw_count;i++) {
+        const rsx_sb_draw *d=&b->cpu.draw[i];
+        memcpy((unsigned char*)b->input.ptr+d->input_offset,d->vertices?d->vertices:b->cpu.input+d->input_offset,d->input_bytes);
         unsigned char *target=(unsigned char*)b->constants.ptr+(size_t)stride*i;
-        memcpy(target,b->cpu.constants+(size_t)i*RSX_SCENE_BATCH_CONSTANT_BYTES,RSX_SCENE_BATCH_CONSTANT_BYTES);
+        memcpy(target,d->constants?d->constants:b->cpu.constants+(size_t)i*RSX_SCENE_BATCH_CONSTANT_BYTES,RSX_SCENE_BATCH_CONSTANT_BYTES);
         uint32_t parameters[4]={b->cpu.draw[i].count,(uint32_t)(b->cpu.draw[i].input_offset/16),b->cpu.draw[i].base*14,0};
         memcpy(target+(size_t)param_offset,parameters,sizeof parameters);
     }

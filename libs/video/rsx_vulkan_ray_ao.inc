@@ -321,9 +321,9 @@ static int vk_ray_texture(u32 texture,const rsx_be_sampler_desc *d,u32 *slot,int
     s_ray_ao.alpha_images[index]=(VkDescriptorImageInfo){s_ray_ao.alpha_samplers[index],object->im.view,VK_IMAGE_LAYOUT_GENERAL};s_ray_ao.alpha_sampler_info[index]=si;if(cube)s_ray_ao.cube_count++;else s_ray_ao.texture_count++;*slot=cube?index-VK_RAY_TEXTURES:index;return 1;
 }
 static int vk_ray_alpha_texture(u32 t,const rsx_be_sampler_desc *d,u32 *slot){return vk_ray_texture(t,d,slot,0);}
-static int vk_ray_as(VkAccelerationStructureTypeKHR type,VkAccelerationStructureGeometryKHR *geometry,u32 count,VkAccelerationStructureKHR *handle,vk_buffer *store,vk_buffer *scratch,VkAccelerationStructureBuildGeometryInfoKHR *build)
+static int vk_ray_as(VkAccelerationStructureTypeKHR type,VkAccelerationStructureGeometryKHR *geometry,u32 count,VkAccelerationStructureKHR *handle,vk_buffer *store,vk_buffer *scratch,VkAccelerationStructureBuildGeometryInfoKHR *build,VkBuildAccelerationStructureFlagsKHR flags)
 {
-    *build=(VkAccelerationStructureBuildGeometryInfoKHR){.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,.type=type,.flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,.mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,.geometryCount=1,.pGeometries=geometry};
+    *build=(VkAccelerationStructureBuildGeometryInfoKHR){.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,.type=type,.flags=flags,.mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,.geometryCount=1,.pGeometries=geometry};
     VkAccelerationStructureBuildSizesInfoKHR size={.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};s_ray_ao.sizes(s_vk.device,VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,build,&count,&size);
     u32 alignment=s_ray_ao.as_properties.minAccelerationStructureScratchOffsetAlignment;
     if(!size.accelerationStructureSize || !size.buildScratchSize || s_ray_ao.max_allocation<alignment ||
@@ -825,7 +825,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
          * weights are not a substitute for that captured homogeneous scale. */
         material.authored[3]=!hybrid_mode && position_proof && a->lights[0].status!=RSX_AUTHORED_UNAVAILABLE;
         ((vk_ray_material*)s_ray_ao.materials.ptr)[i]=material;
-        rsx_scene_batch_input input={pipeline->scene_vs,draw.layout,draw.vertices,(size_t)draw.vertex_count*draw.layout.stride,draw.vertex_count,draw.vs_constants,draw.vs_bytes};u32 base=0;
+        rsx_scene_batch_input input={pipeline->scene_vs,draw.layout,draw.vertices,(size_t)draw.vertex_count*draw.layout.stride,draw.vertex_count,draw.vs_constants,draw.vs_bytes,1};u32 base=0;
         failure="batch immutable upload/cache";
         if(rsx_vulkan_scene_batch_append(token,&input,&base))goto fail;
         for(u32 j=0;j<draw.index_count;j+=3){
@@ -908,12 +908,16 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     VkAccelerationStructureGeometryKHR bg={.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,.geometryType=VK_GEOMETRY_TYPE_TRIANGLES_KHR};
     bg.geometry.triangles=(VkAccelerationStructureGeometryTrianglesDataKHR){.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,.vertexFormat=VK_FORMAT_R32G32B32_SFLOAT,.vertexData.deviceAddress=triangle_address,.vertexStride=12,.maxVertex=triangles*3-1,.indexType=VK_INDEX_TYPE_NONE_KHR};
     VkAccelerationStructureBuildGeometryInfoKHR bb,tb;
-    if(!vk_ray_as(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,&bg,triangles,&s_ray_ao.blas,&s_ray_ao.blas_store,&s_ray_ao.bscratch,&bb))goto fail;
+    /* Rebuilt every frame. Without traced lighting it serves only DLSS's one
+     * owner query per pixel, so build time outweighs trace time there. */
+    const VkBuildAccelerationStructureFlagsKHR as_flags=trace_off?VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR:
+                                                               VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    if(!vk_ray_as(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,&bg,triangles,&s_ray_ao.blas,&s_ray_ao.blas_store,&s_ray_ao.bscratch,&bb,as_flags))goto fail;
     VkAccelerationStructureDeviceAddressInfoKHR as_info={.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,.accelerationStructure=s_ray_ao.blas};
     VkDeviceAddress blas_address=s_ray_ao.as_address(s_vk.device,&as_info);if(!blas_address)goto fail;
     VkAccelerationStructureInstanceKHR instance={.transform={.matrix={{1,0,0,0},{0,1,0,0},{0,0,1,0}}},.mask=255,.flags=VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR,.accelerationStructureReference=blas_address};memcpy(s_ray_ao.instances.ptr,&instance,sizeof instance);
     VkAccelerationStructureGeometryKHR tg={.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,.geometryType=VK_GEOMETRY_TYPE_INSTANCES_KHR};tg.geometry.instances=(VkAccelerationStructureGeometryInstancesDataKHR){.sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,.data.deviceAddress=instance_address};
-    if(!vk_ray_as(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,&tg,1,&s_ray_ao.tlas,&s_ray_ao.tlas_store,&s_ray_ao.tscratch,&tb))goto fail;
+    if(!vk_ray_as(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,&tg,1,&s_ray_ao.tlas,&s_ray_ao.tlas_store,&s_ray_ao.tscratch,&tb,as_flags))goto fail;
     failure="command recording";record_start=SDL_GetPerformanceCounter();
     if(vk_begin() || pvkResetFences(s_vk.device,1,&s_vk.fence)!=VK_SUCCESS)goto fail;
     if(s_ray_ao.queries){s_ray_ao.reset_queries(s_vk.cmd,s_ray_ao.queries,0,8);vk_ray_stamp(0,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);}

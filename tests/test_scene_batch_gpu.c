@@ -12,7 +12,7 @@ static int batch_checks(void)
     CHECK(!rsx_vulkan_backend_replay_outputs(synthetic_shader,&layout,vertices,3,constants,sizeof constants,expected,3));
     uint64_t token=0;uint32_t base=99;
     CHECK(!rsx_vulkan_scene_batch_begin(1,s_vk.rt_enabled,&token));
-    rsx_scene_batch_input input={synthetic_shader,layout,vertices,sizeof vertices,3,constants,sizeof constants};
+    rsx_scene_batch_input input={synthetic_shader,layout,vertices,sizeof vertices,3,constants,sizeof constants,0};
     CHECK(!rsx_vulkan_scene_batch_append(token,&input,&base) && base==0);
     constants[0][0]=2;input.vertex_count=1;input.vertex_bytes=layout.stride;
     CHECK(!rsx_vulkan_backend_replay_outputs(synthetic_shader,&layout,vertices,1,constants,sizeof constants,expected+3,1));

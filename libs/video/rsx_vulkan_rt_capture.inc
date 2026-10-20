@@ -90,14 +90,41 @@ static void vk_rt_capture_pipeline(u32 pipeline)
             rsx_scene_epoch_invalidate(e,RSX_SCENE_EPOCH_RESOURCE_CHANGED);
     }
 }
+/* Mode switches for the capture path, read once per frame instead of per draw. */
+static struct {u64 frame;int valid,hybrid,authored;} s_rt_capture_env;
+static void vk_rt_capture_env(void)
+{
+    if(s_rt_capture_env.valid && s_rt_capture_env.frame==s_rt_capture.frame)return;
+    const char *hybrid=getenv("PS3RECOMP_RSX_HYBRID_PT"),*authored=getenv("PS3RECOMP_RSX_AUTHORED_LIGHTS");
+    s_rt_capture_env.hybrid=hybrid && !strcmp(hybrid,"1");
+    s_rt_capture_env.authored=authored && !strcmp(authored,"1");
+    s_rt_capture_env.frame=s_rt_capture.frame;s_rt_capture_env.valid=1;
+}
+/* Units in `units` whose bound texture is a live color/depth target's surface
+ * or expansion, in one pass over the object table (was one pass per unit). */
+static u32 vk_rt_snapshot_units(u32 units)
+{
+    u32 found=0;
+    if(!units)return 0;
+    for(unsigned j=1;j<VK_ENG_MAX_OBJ;++j) {
+        const vk_eng_obj* o=&s_eobj[j];
+        if(o->kind!=VK_ENG_COLOR && o->kind!=VK_ENG_DEPTH)continue;
+        for(u32 left=units&~found;left;left&=left-1) {
+            unsigned u=(unsigned)__builtin_ctz(left);
+            if(o->surface==s_e2.tex[u] || o->expanded==s_e2.tex[u])found|=1u<<u;
+        }
+        if(found==units)break;
+    }
+    return found;
+}
 static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const void* vertices,
     u32 vertex_count,u32 stride,const u32* indices,u32 index_count)
 {
     if(!s_vk.rt_enabled || !pipeline || pipeline>VK_ENG_MAX_PIPE)return;
     const vk_eng_pipe* p=&s_epipe[pipeline-1];
     if(!p->rs.depth_test || !p->rs.depth_write)return;
-    const char *hybrid_env=getenv("PS3RECOMP_RSX_HYBRID_PT");
-    const int hybrid=hybrid_env && !strcmp(hybrid_env,"1");
+    vk_rt_capture_env();
+    const int hybrid=s_rt_capture_env.hybrid;
     if(hybrid && p->rs.blend_enable)return; // Opaque/cutout BVH; raster retains blended layers.
     rsx_scene_epoch* e=vk_rt_epoch(s_eng_bound.depth);
     if(!e || e->reason!=RSX_SCENE_EPOCH_OK)return;
@@ -140,12 +167,13 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
         rsx_scene_epoch_invalidate(e,RSX_SCENE_EPOCH_UNSUPPORTED);++s_rt_capture.rejected;return;
     }
     if(hybrid)in.texture_mask=s_e2.tex_mask;
+    int light_contract=rsx_authored__pair(p->scene_vs_sha256,p->scene_ps_sha256);
+    const int authored_rgb=s_rt_capture_env.authored && light_contract>=0;
+    const u32 rgb_mask=light_contract==0?7u:light_contract==1?127u:31u,rgb_count=light_contract==0?3u:light_contract==1?7u:5u;
+    const u32 snapshots=vk_rt_snapshot_units((in.texture_mask|(authored_rgb?rgb_mask&s_e2.tex_mask:0u))&0xffffu);
     for(unsigned u=0;u<16;++u)if(in.texture_mask&(1u<<u)) {
         const vk_eng_obj* t=vk_eng_get(s_e2.tex[u],VK_ENG_TEXTURE);
-        int snapshot=0;
-        for(unsigned j=1;j<VK_ENG_MAX_OBJ;++j)
-            if((s_eobj[j].kind==VK_ENG_COLOR || s_eobj[j].kind==VK_ENG_DEPTH) &&
-               (s_eobj[j].surface==s_e2.tex[u] || s_eobj[j].expanded==s_e2.tex[u]))snapshot=1;
+        const int snapshot=(snapshots>>u)&1u;
         if(!t || t->surface || t->expanded || t->cube || snapshot) {
             if(hybrid){in.texture_mask&=~(1u<<u);continue;}
             if(!s_rt_capture.rejected_pipeline_logged[pipeline-1]){
@@ -155,15 +183,11 @@ static void vk_rt_capture_draw_impl(u32 pipeline,rsx_topology topology,const voi
             rsx_scene_epoch_invalidate(e,RSX_SCENE_EPOCH_UNSUPPORTED);++s_rt_capture.rejected;return;
         }
     }
-    const char *authored=getenv("PS3RECOMP_RSX_AUTHORED_LIGHTS");
-    int light_contract=rsx_authored__pair(p->scene_vs_sha256,p->scene_ps_sha256);
-    if(authored && !strcmp(authored,"1") && light_contract>=0){
-        u32 rgb_mask=light_contract==0?7u:light_contract==1?127u:31u,rgb_count=light_contract==0?3u:light_contract==1?7u:5u;
+    if(authored_rgb){
         int ready=(s_e2.tex_mask&rgb_mask)==rgb_mask;
         for(u32 u=0;u<rgb_count&&ready;u++){
             const vk_eng_obj *t=vk_eng_get(s_e2.tex[u],VK_ENG_TEXTURE);
-            if(!t || t->surface || t->expanded || t->cube!=(light_contract==1&&u==3))ready=0;
-            for(u32 j=1;j<VK_ENG_MAX_OBJ&&ready;j++)if((s_eobj[j].kind==VK_ENG_COLOR||s_eobj[j].kind==VK_ENG_DEPTH)&&(s_eobj[j].surface==s_e2.tex[u]||s_eobj[j].expanded==s_e2.tex[u]))ready=0;
+            if(!t || t->surface || t->expanded || t->cube!=(light_contract==1&&u==3) || ((snapshots>>u)&1u))ready=0;
         }
         if(ready)in.texture_mask|=rgb_mask;
     }
