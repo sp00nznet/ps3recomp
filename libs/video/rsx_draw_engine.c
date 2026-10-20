@@ -13,6 +13,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_draw_batches.h"
 #include "texture_pack.h"
+#include "texture_pack_stream.h"
 #include "rsx_depth_clip.h"
 #include "rsx_capture_depth.h"
 #include "rsx_depth_guest.h"
@@ -149,6 +150,8 @@ typedef struct {
     u64 content_hash;
     u32 last_hash_frame;
     u64 last_use_serial;
+    u32 pack_ticket;       /* replacement still loading (texture_pack_stream) */
+    u32 pack_poll_frame;
 } eng_texture;
 
 typedef struct {
@@ -194,6 +197,9 @@ static struct {
 
     u32 frames;
     u64 texture_use_serial;
+    u32 pack_budget_frame;      /* replacement upload budget (eng_pack_budget) */
+    u64 pack_budget_used;
+    u32 pack_deferred;
     u32 guest_draws;
     u32 last_guest_draws;
     u32 last_present_surface;
@@ -1082,12 +1088,92 @@ static void eng_texture_dump(u32 offset, u32 fmt, u32 w, u32 h, u32 remap,
     fclose(f);
 }
 
+/* FOLKLORE_TEXTURE_SCALE: the replacement tier's scale, 0 without one. */
+static u32 eng_pack_scale(void)
+{
+    const char* s = getenv("FOLKLORE_TEXTURE_SCALE");
+    return s && strcmp(s, "2") == 0 ? 2u : s && strcmp(s, "4") == 0 ? 4u : 0u;
+}
+
+/* FOLKLORE_TEXTURE_PACK_SYNC=1: load replacements on the render thread at
+ * first use, as before streaming (comparisons, deterministic captures). */
+static int eng_pack_sync(void)
+{
+    static int sync = -1;
+    if (sync < 0) { const char* e = getenv("FOLKLORE_TEXTURE_PACK_SYNC"); sync = e && e[0] == '1'; }
+    return sync;
+}
+
+static u64 eng_pack_bytes(const texture_pack* pack)
+{
+    u64 bytes = 0;
+    for (u32 m = 0; m < pack->levels; m++) bytes += (u64)pack->row_bytes[m] * pack->level_height[m];
+    return bytes;
+}
+
+/* Replacement uploads per guest frame: always one, then up to 64 MiB, so a
+ * burst of new artwork spreads over frames instead of stalling one. */
+static int eng_pack_budget(u64 bytes)
+{
+    if (g.pack_budget_frame != g.frames) { g.pack_budget_frame = g.frames; g.pack_budget_used = 0; }
+    if (g.pack_budget_used && g.pack_budget_used + bytes > (64ull << 20)) { g.pack_deferred++; return 0; }
+    g.pack_budget_used += bytes;
+    return 1;
+}
+
+/* A decoded replacement as a backend texture, or 0 when it does not fit the
+ * guest texture or the upload failed. */
+static u32 eng_pack_texture(const texture_pack* pack, u32 w, u32 h, u32 nlv, u32 pack_scale,
+                            u32 remap, u32 fmt)
+{
+    if (pack->levels < nlv || pack->width != w * pack_scale || pack->height != h * pack_scale) return 0;
+    /* Keep one-level UI textures one-level. Mipmapped artwork
+     * needs the extra levels down to 1x1 at its larger base size. */
+    const u32 replacement_levels = nlv > 1u ? pack->levels : 1u;
+    const u32 replacement = g.be->texture_create(g.be->user,
+        RSX_BE_FMT_R8G8B8A8, pack->width, pack->height, replacement_levels,
+        1u, remap, fmt);
+    if (!replacement) return 0;
+    for (u32 m = 0; m < replacement_levels; m++)
+        g.be->texture_upload(g.be->user, replacement, 0u, m,
+            pack->level_width[m], pack->level_height[m],
+            pack->level[m], pack->row_bytes[m],
+            pack->level_height[m]);
+    if (!g.be->texture_upload_valid(g.be->user, replacement)) {
+        g.be->texture_release(g.be->user, replacement);
+        return 0;
+    }
+    static u32 logged_replacements;
+    if (logged_replacements < 8u) {
+        logged_replacements++;
+        fprintf(stderr, "[texture-pack] %ux%u -> %ux%u (%ux), original format=0x%02X\n",
+                w, h, pack->width, pack->height, pack_scale, fmt & 0x9Fu);
+    }
+    {   /* A stream line now and then, while replacements keep arriving. */
+        static u32 swaps;
+        if ((++swaps & 255u) == 0u) {
+            texture_pack_stream_stats st;
+            texture_pack_stream_get_stats(&st);
+            fprintf(stderr, "[texture-pack] stream: %u swaps, requests %llu absent %llu loads %llu "
+                    "failures %llu evictions %llu, load avg %.1f ms max %.1f ms, cached %llu MiB, deferred %u\n",
+                    swaps, (unsigned long long)st.requests, (unsigned long long)st.absent,
+                    (unsigned long long)st.loads, (unsigned long long)st.failures,
+                    (unsigned long long)st.evictions,
+                    st.loads ? (double)st.load_ns_total / st.loads / 1e6 : 0.0, (double)st.load_ns_max / 1e6,
+                    (unsigned long long)(st.cached_bytes >> 20), g.pack_deferred);
+        }
+    }
+    return replacement;
+}
+
 /* Decode a guest texture out of guest memory and hand every face and level to
- * the backend. Returns the backend handle, or 0. */
+ * the backend. Returns the backend handle, or 0. When its replacement is still
+ * loading, the original is returned and *pack_ticket names the load. */
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap,
-                              u32 dimension)
+                              u32 dimension, u32* pack_ticket)
 {
+    *pack_ticket = 0;
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!nlv || !lv[0].tl.face_bytes) return 0;
@@ -1106,41 +1192,29 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 pack_fmt = base_fmt == 0x86u ? 1u :
                          base_fmt == 0x87u ? 2u :
                          base_fmt == 0x88u ? 3u : 0u;
-    const char* pack_scale_text = getenv("FOLKLORE_TEXTURE_SCALE");
-    const u32 pack_scale = pack_scale_text && strcmp(pack_scale_text, "2") == 0 ? 2u :
-                           pack_scale_text && strcmp(pack_scale_text, "4") == 0 ? 4u : 0u;
+    const u32 pack_scale = eng_pack_scale();
     if (g.be->texture_upload_valid && pack_scale && dimension == 2u && !cube && pack_fmt && pack_root && *pack_root &&
         lv[0].tl.compressed && w <= ENG_MAX_TEX_DIM && h <= ENG_MAX_TEX_DIM) {
         texture_pack pack;
-        if (texture_pack_load(pack_root, src, lv[0].tl.face_bytes,
-                              pack_fmt, w, h, &pack)) {
-            if (pack.levels >= nlv && pack.width == w * pack_scale && pack.height == h * pack_scale) {
-                /* Keep one-level UI textures one-level. Mipmapped artwork
-                 * needs the extra levels down to 1x1 at its larger base size. */
-                const u32 replacement_levels = nlv > 1u ? pack.levels : 1u;
-                const u32 replacement = g.be->texture_create(g.be->user,
-                    RSX_BE_FMT_R8G8B8A8, pack.width, pack.height, replacement_levels,
-                    1u, remap, fmt);
-                if (replacement) {
-                    for (u32 m = 0; m < replacement_levels; m++)
-                        g.be->texture_upload(g.be->user, replacement, 0u, m,
-                            pack.level_width[m], pack.level_height[m],
-                            pack.level[m], pack.row_bytes[m],
-                            pack.level_height[m]);
-                    if (g.be->texture_upload_valid(g.be->user, replacement)) {
-                        static u32 logged_replacements;
-                        if (logged_replacements < 8u) {
-                            logged_replacements++;
-                            fprintf(stderr, "[texture-pack] %ux%u -> %ux%u (%ux), original format=0x%02X\n",
-                                    w, h, pack.width, pack.height, pack_scale, base_fmt);
-                        }
-                        texture_pack_free(&pack);
-                        return replacement;
-                    }
-                    g.be->texture_release(g.be->user, replacement);
-                }
+        if (eng_pack_sync()) {
+            if (texture_pack_load(pack_root, src, lv[0].tl.face_bytes, pack_fmt, w, h, &pack)) {
+                const u32 replacement = eng_pack_texture(&pack, w, h, nlv, pack_scale, remap, fmt);
+                texture_pack_free(&pack);
+                if (replacement) return replacement;
             }
-            texture_pack_free(&pack);
+        } else {
+            u32 ticket = 0;
+            const int r = texture_pack_stream_request(pack_root, src, lv[0].tl.face_bytes,
+                                                      pack_fmt, w, h, &ticket, &pack);
+            if (r == TEXTURE_PACK_READY) {
+                const int fits = eng_pack_budget(eng_pack_bytes(&pack));
+                const u32 replacement = fits ? eng_pack_texture(&pack, w, h, nlv, pack_scale, remap, fmt) : 0u;
+                texture_pack_stream_release(ticket);
+                if (replacement) return replacement;
+                if (!fits) *pack_ticket = ticket;   /* cached: swap in a later frame */
+            } else if (r == TEXTURE_PACK_PENDING) {
+                *pack_ticket = ticket;
+            }
         }
     }
 
@@ -1270,15 +1344,41 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->last_hash_frame = g.frames;
             if (readable && hash != e->content_hash) {
                 const u64 hp_upload_started=hp_tick();
+                u32 ticket = 0;
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap,
-                                                     dimension);
+                                                     dimension, &ticket);
                 hp_end(HP_UPLOAD,hp_upload_started);
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
                     e->content_hash = hash;
+                    e->pack_ticket = ticket;
                 }
+            }
+        }
+        /* A replacement that finished loading takes the original's place,
+         * within the frame's upload budget. */
+        if (e->handle && e->pack_ticket && e->pack_poll_frame != g.frames) {
+            e->pack_poll_frame = g.frames;
+            texture_pack pack;
+            const int r = texture_pack_stream_poll(e->pack_ticket, &pack);
+            if (r == TEXTURE_PACK_READY) {
+                rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+                const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
+                const int fits = eng_pack_budget(eng_pack_bytes(&pack));
+                const u64 hp_upload_started = hp_tick();
+                const u32 replacement = fits && nlv ?
+                    eng_pack_texture(&pack, w, h, nlv, eng_pack_scale(), remap, fmt) : 0u;
+                hp_end(HP_UPLOAD, hp_upload_started);
+                texture_pack_stream_release(e->pack_ticket);
+                if (replacement) {
+                    g.be->texture_release(g.be->user, e->handle);
+                    e->handle = replacement;
+                }
+                if (fits) e->pack_ticket = 0;
+            } else if (r == TEXTURE_PACK_NONE) {
+                e->pack_ticket = 0;
             }
         }
         e->last_use_serial = ++g.texture_use_serial;
@@ -1309,7 +1409,8 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
     const u64 hp_upload_started=hp_tick();
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
-                                  cube, remap, dimension);
+                                  cube, remap, dimension, &e.pack_ticket);
+    e.pack_poll_frame = g.frames;
     hp_end(HP_UPLOAD,hp_upload_started);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) {

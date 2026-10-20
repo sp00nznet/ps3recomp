@@ -22,6 +22,10 @@ typedef struct texture_pack {
 int texture_pack_load(const char *root, const void *base, size_t base_len,
                       uint32_t source_format, uint32_t source_w,
                       uint32_t source_h, texture_pack *out);
+/* The same, for a caller that already has the base bytes' SHA256. */
+int texture_pack_load_hashed(const char *root, const uint8_t base_sha256[32],
+                             uint32_t source_format, uint32_t source_w,
+                             uint32_t source_h, texture_pack *out);
 void texture_pack_free(texture_pack *pack);
 void texture_pack_sha256(const void *data, size_t len, uint8_t digest[32]);
 #endif

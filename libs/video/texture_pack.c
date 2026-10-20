@@ -99,18 +99,28 @@ static int read_compressed(FILE *f, uint8_t **data, size_t *size)
 int texture_pack_load(const char *root, const void *base, size_t base_len,
                       uint32_t format, uint32_t sw, uint32_t sh, texture_pack *out)
 {
+    uint8_t hash[32];
+    size_t expected;
+    if (!out) return 0;
+    memset(out,0,sizeof *out);
+    if (!base || format<1 || format>3 || !sw || !sh || sw>4096 || sh>4096) return 0;
+    expected=(size_t)((sw+3u)/4u)*((sh+3u)/4u)*(format==1?8u:16u);
+    if (base_len!=expected) return 0;
+    texture_pack_sha256(base,base_len,hash);
+    return texture_pack_load_hashed(root,hash,format,sw,sh,out);
+}
+int texture_pack_load_hashed(const char *root, const uint8_t hash[32],
+                             uint32_t format, uint32_t sw, uint32_t sh, texture_pack *out)
+{
     static const char hex[]="0123456789abcdef";
-    uint8_t hash[32], hdr[HEADER]; char name[128], path[4096];
-    size_t expected, pos=0; uint64_t body=0; FILE *f=NULL;
+    uint8_t hdr[HEADER]; char name[128], path[4096];
+    size_t pos=0; uint64_t body=0; FILE *f=NULL;
     uint32_t w,h,levels,version; uint64_t bytes;
     uint8_t *compressed=NULL; size_t compressed_size=0;
     if (!out) return 0;
     memset(out,0,sizeof *out);
-    if (!root || !*root || !base || format<1 || format>3 || !sw || !sh || sw>4096 || sh>4096) return 0;
+    if (!root || !*root || !hash || format<1 || format>3 || !sw || !sh || sw>4096 || sh>4096) return 0;
     if (strlen(root)>3900) return 0;
-    expected=(size_t)((sw+3u)/4u)*((sh+3u)/4u)*(format==1?8u:16u);
-    if (base_len!=expected) return 0;
-    texture_pack_sha256(base,base_len,hash);
     for (unsigned i=0;i<32;i++){name[2*i]=hex[hash[i]>>4];name[2*i+1]=hex[hash[i]&15];}
     snprintf(name+64,sizeof name-64,"-f%u-%ux%u.frp",format,sw,sh);
     if (snprintf(path,sizeof path,"%s/%s",root,name)>=(int)sizeof path) return 0;
