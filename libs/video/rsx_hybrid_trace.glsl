@@ -275,25 +275,30 @@ void hybridTrace(uvec2 pixel){
     vec3 bounce;float pdf;
     float bias=max(p.settings.y,.00005*position.z);
     vec3 origin=position+normal*bias;
-    if(rsx_pt_cosine_sample(normal,pathRandom(seed),pathRandom(seed),bounce,pdf)){
-        uint hit;vec2 b;float d;vec3 incoming;
-        if(hybridNearest(origin,bounce,bias,10000.0,false,hit,b,d)){
-            countRay(26);incoming=hybridRadiance(hit,b,origin,bounce,d,d*.001,!primaryGloss)*.5;
-        }else incoming=hybridSky()*.15;
+    bool sampled=rsx_pt_cosine_sample(normal,pathRandom(seed),pathRandom(seed),bounce,pdf);
+    // k=0: diffuse bounce; k=1: explicit source cube materials' one ideal
+    // specular reflection ray (no roughness distribution has been recovered).
+    // One loop body so the driver instantiates the cutout-aware nearest-hit
+    // traversal and its shading once rather than once per ray kind: every
+    // inlined copy carries the 32-texture alpha switch inside a ray-query
+    // loop, which made the cold driver compile exceed ten minutes.
+    [[dont_unroll]] for(uint k=0u;k<2u;k++){
+        const bool gloss=k==1u;
+        if(gloss?!primaryGloss:!sampled)continue;
+        vec3 direction=gloss?reflect(view,normal):bounce;
+        if(gloss)countRay(29);
+        uint hit;vec2 b;float d;
+        vec3 incoming=gloss?hybridSky():hybridSky()*.15;
+        if(hybridNearest(origin,direction,bias,10000.0,false,hit,b,d)){
+            countRay(gloss?30:26);
+            incoming=hybridRadiance(hit,b,origin,direction,d,d*(gloss?.0007:.001),!gloss && !primaryGloss)*(gloss?1.0:.5);
+        }
+        if(gloss){
+            float fresnel=min(.6,.04+.96*pow(1-max(dot(-view,normal),0),5));
+            M*=1.0-fresnel;A=A*(1.0-fresnel)+incoming*fresnel;
         // Generic base is raster/luminance: the bounce is then a pure
         // modulation. A decoded base stays additive, independent of texels.
-        if(generic)M+=incoming/luminance;else A+=known*incoming;
-    }
-    // Explicit source cube materials use one ideal specular reflection ray.
-    // No roughness distribution has been recovered from the original shader.
-    if(primaryGloss){
-        vec3 reflection=reflect(view,normal);countRay(29);
-        uint hit;vec2 b;float d;vec3 radiance=hybridSky();
-        if(hybridNearest(origin,reflection,bias,10000.0,false,hit,b,d)){
-            countRay(30);radiance=hybridRadiance(hit,b,origin,reflection,d,d*.0007,false);
-        }
-        float fresnel=min(.6,.04+.96*pow(1-max(dot(-view,normal),0),5));
-        M*=1.0-fresnel;A=A*(1.0-fresnel)+radiance*fresnel;
+        }else if(generic)M+=incoming/luminance;else A+=known*incoming;
     }
     if(!finite3(M)||!finite3(A)){countRay(6);return;}
     M=clamp(M,vec3(0),vec3(8));A=clamp(A,vec3(0),vec3(1));
