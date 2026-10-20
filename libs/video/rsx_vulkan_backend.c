@@ -52,6 +52,7 @@
 #include "rsx_resolution_scale.h"
 #include "rsx_display_geometry.h"
 #include "rsx_vulkan_anisotropy.h"
+#include "rsx_folklore_composite.h"
 #include "rsx_depth_clip.h"
 #include "rsx_frame_dump.h"
 #ifdef PS3RECOMP_RSX_CACAO
@@ -3323,6 +3324,7 @@ typedef struct vk_eng_pipe {
     u32                 nslots, stride, rt_count;
     VkFormat            rt_fmt;          /* picks the render pass it is built against */
     u32                 cube_mask;       /* TextureCube units: the split set layout */
+    int                 folklore_composite; /* rsx_folklore_composite.h, at scale > 1 */
     VkPipeline          variant[3][VK_ENG_TOPOLOGIES];
 } vk_eng_pipe;
 
@@ -3576,6 +3578,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     P->rt_count = rt_count;
     P->rt_fmt = cf;
     P->cube_mask = vk_eng_cube_units(ps_hlsl);
+    P->folklore_composite = s_render_scale > 1 && rsx_folklore_composite_program(ps_hlsl);
     if(s_vk.rt_enabled) {
         const size_t vl=strlen(vs_hlsl),pl=strlen(ps_hlsl);
         if(vl<262144 && pl<262144) {
@@ -3804,6 +3807,22 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
     if (!vk_eng_constant_shadow()) { s_e2.ps_bytes = 0; return; }
     memcpy(s_e2.constant_shadow + s_g.ps_off, data, bytes);
     s_e2.ps_bytes = bytes;
+    /* The engine binds the pipeline first, so its composite mark is current. */
+    if (s_e2.pipeline && s_e2.pipeline <= VK_ENG_MAX_PIPE &&
+        s_epipe[s_e2.pipeline - 1].folklore_composite) {
+        static int enabled = -1;
+        static u64 applied;
+        if (enabled < 0) {
+            const char* e = getenv("FOLKLORE_COMPOSITE_SHARP");
+            enabled = !(e && e[0] == '0' && !e[1]);
+            VK_LOG("Folklore composite: in-focus resolve floor %s at render scale %u\n",
+                   enabled ? "follows host pixels" : "kept in guest pixels (FOLKLORE_COMPOSITE_SHARP=0)",
+                   s_render_scale);
+        }
+        if (enabled && rsx_folklore_composite_sharpen(s_e2.constant_shadow + s_g.ps_off, bytes,
+                                                      (float)s_render_scale) && ++applied == 1)
+            VK_LOG("Folklore composite: floor 0.3 -> %.4f guest pixels\n", 0.3 / s_render_scale);
+    }
 }
 static void vk_eng_bind_textures(void* user, const u32* textures,
                                  const rsx_be_sampler_desc* samplers, u32 mask)
@@ -3895,10 +3914,33 @@ static int vk_eng_ensure_indices(VkDeviceSize bytes)
 
 /* rsx_be_sampler_desc is the registers decoded the D3D12 way; the wrap codes
  * stay the guest's 1..8, which vk_gcm_wrap already translates. */
-static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
+/* DLSS rebuilds the world at the output extent from fewer pixels, so draws
+ * into the DLSS world take NGX's texture mip bias log2(input/output width):
+ * their textures keep the detail of the output resolution instead of the
+ * input's. PS3RECOMP_DLSS_MIP_BIAS=0 turns it off. */
+static float vk_eng_world_lod_bias(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("PS3RECOMP_DLSS_MIP_BIAS");
+        enabled = !(e && e[0] == '0' && !e[1]);
+    }
+    const u32 handle = s_eng_bound.nrt ? s_eng_bound.rt[0] : s_eng_bound.depth;
+    u32 iw = 0, ih = 0;
+    if (!enabled || !handle || handle >= VK_ENG_MAX_OBJ || !s_eobj[handle].dlss_world ||
+        !vk_dlss_world_extent(&iw, &ih) || !iw)
+        return 0.0f;
+    const float bias = log2f((float)iw / (float)(1280u * s_render_scale));
+    static int logged;
+    if (!logged) { logged = 1; VK_LOG("DLSS world texture mip bias %.3f (input width %u)\n", bias, iw); }
+    return bias < 0.0f ? bias : 0.0f;
+}
+
+static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d, float lod_bias)
 {
     float min_lod = d->min_lod, max_lod = d->mip_present ? d->max_lod : d->min_lod;
     if (max_lod < min_lod) max_lod = min_lod;
+    if (!d->mip_present || d->vertex_sampler) lod_bias = 0.0f;
     VkSamplerCreateInfo sci = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = d->mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
@@ -3906,6 +3948,7 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
         .mipmapMode = d->mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = vk_gcm_wrap(d->wrap_s), .addressModeV = vk_gcm_wrap(d->wrap_t),
         .addressModeW = vk_gcm_wrap(d->wrap_r),
+        .mipLodBias = lod_bias,
         .minLod = min_lod, .maxLod = max_lod,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
     rsx_vk_anisotropy_apply(&sci, d->vertex_sampler ? 0u : d->anisotropy_code,
@@ -3917,7 +3960,7 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
     for (u32 i = 0; i < s_esamp_count; i++) {
         const VkSamplerCreateInfo* p = &s_esamp[i].info;
         if (p->magFilter == sci.magFilter && p->minFilter == sci.minFilter &&
-            p->mipmapMode == sci.mipmapMode &&
+            p->mipmapMode == sci.mipmapMode && p->mipLodBias == sci.mipLodBias &&
             p->addressModeU == sci.addressModeU &&
             p->addressModeV == sci.addressModeV &&
             p->addressModeW == sci.addressModeW &&
@@ -3978,11 +4021,12 @@ static VkDescriptorSet vk_eng_write_descriptors_into(const vk_eng_pipe* P, VkDes
         { ubo, ps_off, s_e2.ps_bytes ? s_e2.ps_bytes : 16u },
     };
     VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
+    const float lod_bias = vk_eng_world_lod_bias();
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
         const int cube = (P->cube_mask >> u) & 1u;
         VkImageView v = ((s_e2.tex_mask >> u) & 1u) ? vk_eng_sample_view(s_e2.tex[u], cube)
                                                      : VK_NULL_HANDLE;
-        VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
+        VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u], lod_bias) : s_vk.sampler;
         ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE,
                                          v ? v : (cube ? dummy_cube : s_vk.dummy.view),
                                          VK_IMAGE_LAYOUT_GENERAL };

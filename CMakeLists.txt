@@ -790,6 +790,9 @@ if(UNIX OR (WIN32 AND PS3RECOMP_RSX_VULKAN))
             libs/video/rsx_resolution_scale.c libs/video/tests/test_rsx_resolution_scale.c)
         target_include_directories(test_rsx_resolution_scale PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
         target_link_libraries(test_rsx_resolution_scale PRIVATE m)
+        add_executable(test_rsx_folklore_composite EXCLUDE_FROM_ALL
+            libs/video/tests/test_rsx_folklore_composite.c)
+        target_link_libraries(test_rsx_folklore_composite PRIVATE m)
         add_executable(test_rsx_vulkan_anisotropy EXCLUDE_FROM_ALL
             libs/video/rsx_vulkan_anisotropy.c libs/video/tests/test_rsx_vulkan_anisotropy.c)
         target_include_directories(test_rsx_vulkan_anisotropy PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
