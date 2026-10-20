@@ -22,13 +22,19 @@ layout(r8,binding=11) writeonly uniform image2D biasInput;
 layout(binding=12) uniform sampler2D dlssOutput;
 layout(rgba8,binding=13) writeonly uniform image2D expandedOutput;
 layout(push_constant) uniform Phase {uint mode;} phase;
-// Draw slots 0..255 map draws; 256 holds motion counters, 257 output checks.
+// Draw slots 0..255 map draws; 256 holds eligible/disoccluded/matched/fallback.
+// Slot 257 holds nonfinite output samples/background pixels/reset pixels.
 bool finite4(vec4 v){return !any(isnan(v))&&!any(isinf(v));}
 // Motion counters (slot 256) for every pixel: one atomic per subgroup.
 void countMotion(uint lane,bool hit){
     if(!hit)return;
     uint n=subgroupBallotBitCount(subgroupBallot(true));
     if(subgroupElect())atomicAdd(draws.value[256][lane],n);
+}
+void countExcluded(uint lane,bool hit){
+    if(!hit)return;
+    uint n=subgroupBallotBitCount(subgroupBallot(true));
+    if(subgroupElect())atomicAdd(draws.value[257][lane],n);
 }
 void main(){
     uvec2 pixel=gl_GlobalInvocationID.xy;
@@ -60,7 +66,10 @@ void main(){
     vec2 sampleOffset=sampleIndex==0u?vec2(.75):vec2(.25);
     vec2 uv=(vec2(pixel)+sampleOffset-p.jitter.xy)/vec2(p.sizes.xy);
     vec4 current=vec4(uv.x*2-1,1-uv.y*2,z,1);
-    bool tracked=z>=0 && z<1 && p.sizes.w==0u;
+    bool surface=z>=0 && z<1;
+    bool tracked=surface && p.sizes.w==0u;
+    countExcluded(1u,!surface);
+    countExcluded(2u,surface && p.sizes.w!=0u);
     float viewDepth=tracked?p.projection.w/(z-p.projection.z):0.0;
     float oldDepth=tracked?clips.value[p.layout_.x+pixel.y*p.sizes.x+pixel.x].x:0.0;
     countMotion(0u,tracked);countMotion(1u,tracked && oldDepth>0 && abs(oldDepth-viewDepth)>max(.1,viewDepth*.1));
@@ -82,7 +91,10 @@ void main(){
             owner=rayQueryGetIntersectionPrimitiveIndexEXT(ray,true);bary=rayQueryGetIntersectionBarycentricsEXT(ray,true);
         }
         if(owner!=0xffffffffu){
-            uvec4 tri=indices.value[owner],map=draws.value[tri.w];
+            uvec4 tri=indices.value[owner];
+            // Keep unmatched geometry on camera motion; never interpret
+            // diagnostics slots or an unowned draw as a vertex mapping.
+            uvec4 map=tri.w<min(p.layout_.z,256u)?draws.value[tri.w]:uvec4(0);
             if(map.z!=0u){
                 vec3 weights=vec3(1-bary.x-bary.y,bary);
                 // BVH is in reconstructed view coordinates, so its barycentrics
@@ -111,6 +123,6 @@ void main(){
     }
     if(any(isnan(motion))||any(isinf(motion))||any(greaterThan(abs(motion),vec2(p.sizes.xy)))){motion=vec2(0);bias=1;}
     imageStore(motionInput,ivec2(pixel),vec4(motion,0,0));
-    countMotion(2u,bias==0);countMotion(3u,bias!=0);
+    countMotion(2u,tracked && bias==0);countMotion(3u,tracked && bias!=0);
     imageStore(biasInput,ivec2(pixel),vec4(bias));
 }

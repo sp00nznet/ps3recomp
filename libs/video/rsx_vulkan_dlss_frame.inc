@@ -10,6 +10,7 @@
  * later, once that frame's submission has completed. */
 #if defined(_WIN32)
 #include "rsx_dlss_motion_match.h"
+#include "rsx_dlss_motion_stats.h"
 typedef rsx_dlss_draw_key vk_dlss_draw_key;
 typedef struct vk_dlss_frame_params {float reprojection[16],projection[4],jitter[4];u32 sizes[4],history[4],layout[4];} vk_dlss_frame_params;
 _Static_assert(sizeof(vk_dlss_frame_params)==144,"GLSL std140 DLSS parameters layout");
@@ -25,7 +26,10 @@ static struct {
     vk_buffer clips,draws[2],params[2];
     VkDescriptorSetLayout layout;VkPipelineLayout pipeline_layout;
     VkDescriptorPool pool;VkDescriptorSet set;VkPipeline pipeline;VkSampler sampler;
-    u32 last_matched,last_fallback,last_nonfinite;
+    rsx_dlss_motion_counts last_motion;
+    int have_motion_counters;
+    u64 motion_counter_frame;
+    u32 last_nonfinite;
 } s_dlss_frame;
 static const char *vk_dlss_quality_name(rsx_dlss_quality q)
 {
@@ -53,6 +57,12 @@ static int vk_dlss_world_extent(u32 *w,u32 *h)
         s_dlss_frame.extent_known=1;
         s_dlss_frame.quality=vk_dlss_mode();
         s_dlss_frame.out_w=1280u*s_render_scale;s_dlss_frame.out_h=720u*s_render_scale;
+        /* The guest still samples an expanded two-lane texture. Validate the
+         * physical allocation, not only NGX's logical output dimensions. */
+        if(s_dlss_frame.out_w>vk_max_dim()/2u || s_dlss_frame.out_h>vk_max_dim()){
+            VK_LOG("DLSS output exceeds expanded-world image limit; raster retained\n");
+            s_dlss_frame.failed=1;return 0;
+        }
         rsx_dlss_size size;memset(&size,0,sizeof size);
         rsx_dlss_status status=s_dlss.loader.optimal_size(s_dlss.context,s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.quality,&size);
         if(status!=RSX_DLSS_OK || !size.input_width || !size.input_height ||
@@ -67,6 +77,9 @@ static int vk_dlss_world_extent(u32 *w,u32 *h)
         u32 phases=(u32)ceil(8.0*ratio);s_dlss_frame.phases=phases<8?8:phases>64?64:phases;
         VK_LOG("DLSS %s: world input %ux%u -> output %ux%u, %u jitter phases\n",vk_dlss_quality_name(s_dlss_frame.quality),
             s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.phases);
+        VK_LOG("DLSS extent contract guest=1280x720 sampleLanes=2 reconstruction=%ux%u expandedStorage=%ux%u canvas=%ux%u presentation=%ux%u finalComposite=guest-layout nativeDisplayDLAA=unverified\n",
+            s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.out_w*2u,s_dlss_frame.out_h,
+            s_vk.width,s_vk.height,s_vk.sc_extent.width,s_vk.sc_extent.height);
     }
     if(!s_dlss_frame.in_w)return 0;
     *w=s_dlss_frame.in_w;*h=s_dlss_frame.in_h;return 1;
@@ -219,8 +232,17 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
      * frame's transport began (single queue, synchronous submission). */
     u32 (*last)[4]=s_dlss_frame.draws[1-bank].ptr;
     int reset=!s_dlss_frame.completed || epoch->frame!=s_dlss_frame.frame+1;
+    if(!s_dlss_frame.completed){
+        memset(&s_dlss_frame.last_motion,0,sizeof s_dlss_frame.last_motion);
+        s_dlss_frame.have_motion_counters=0;s_dlss_frame.motion_counter_frame=0;
+    }
     if(s_dlss_frame.completed){
-        s_dlss_frame.last_matched=last[VK_DLSS_DRAWS][2];s_dlss_frame.last_fallback=last[VK_DLSS_DRAWS][3];
+        s_dlss_frame.last_motion=(rsx_dlss_motion_counts){
+            last[VK_DLSS_DRAWS][0],last[VK_DLSS_DRAWS][1],
+            last[VK_DLSS_DRAWS][2],last[VK_DLSS_DRAWS][3],
+            last[VK_DLSS_DRAWS+1][1],last[VK_DLSS_DRAWS+1][2]};
+        s_dlss_frame.have_motion_counters=1;
+        s_dlss_frame.motion_counter_frame=s_dlss_frame.frame;
         if(last[VK_DLSS_DRAWS+1][0]){s_dlss_frame.last_nonfinite+=last[VK_DLSS_DRAWS+1][0];reset=1;
             VK_LOG("DLSS output nonfinite samples=%u; history reset\n",last[VK_DLSS_DRAWS+1][0]);}
         if(last[VK_DLSS_DRAWS][0] && last[VK_DLSS_DRAWS][1]>last[VK_DLSS_DRAWS][0]/2)reset=1;
@@ -234,6 +256,7 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
     u32 (*map)[4]=s_dlss_frame.draws[bank].ptr;memset(map,0,(VK_DLSS_DRAWS+2u)*16u);
     vk_dlss_draw_key *current=s_dlss_frame.current;memset(current,0,sizeof s_dlss_frame.current);
     u32 base=0,draws=epoch->draw_count<VK_DLSS_DRAWS?epoch->draw_count:VK_DLSS_DRAWS;
+    p.layout[2]=draws;
     if(epoch->draw_count>VK_DLSS_DRAWS)reset=1;
     for(u32 i=0;i<draws;i++){
         rsx_scene_draw_input draw;if(!rsx_scene_epoch_get(epoch,i,&draw))return 0;
@@ -309,9 +332,16 @@ static void vk_dlss_complete(int submitted,u32 source)
     memcpy(s_dlss_frame.camera,s_dlss_frame.record_camera,sizeof s_dlss_frame.camera);s_dlss_frame.have_camera=s_dlss_frame.record_have_camera;s_dlss_frame.camera_key=s_dlss_frame.record_camera_key;
     const u64 ticks=s_dlss_frame.record_ticks;
     if(!s_dlss_frame.last_log || ticks-s_dlss_frame.last_log>=SDL_GetPerformanceFrequency()){
-        VK_LOG("DLSS SR %s frame=%llu input=%ux%u output=%ux%u completedEvaluations=%llu matchedMotionPixels=%u cameraFallbackPixels=%u reset=%d nonfinite=%u worldReplacement=1 HUD=output-resolution\n",
+        const rsx_dlss_motion_counts c=s_dlss_frame.last_motion;
+        const rsx_dlss_motion_stats coverage=rsx_dlss_summarize_motion(c,s_dlss_frame.in_w,s_dlss_frame.in_h);
+        VK_LOG("DLSS SR %s frame=%llu input=%ux%u output=%ux%u completedEvaluations=%llu motionCounterFrame=%llu matchedMotionPixels=%u cameraFallbackPixels=%u reset=%d nonfinite=%u worldReplacement=1 HUD=guest-composite\n",
             vk_dlss_quality_name(s_dlss_frame.quality),(unsigned long long)s_dlss_frame.frame,s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,
-            (unsigned long long)s_dlss_frame.completed,s_dlss_frame.last_matched,s_dlss_frame.last_fallback,s_dlss_frame.record_reset,s_dlss_frame.last_nonfinite);
+            (unsigned long long)s_dlss_frame.completed,(unsigned long long)s_dlss_frame.motion_counter_frame,c.matched,c.fallback,s_dlss_frame.record_reset,s_dlss_frame.last_nonfinite);
+        VK_LOG("DLSS motion coverage countersReady=%d counterFrame=%llu valid=%d available=%d eligible=%llu matched=%u cameraFallback=%u background=%u resetExcluded=%u disoccluded=%u matchedPercent=%.3f fallbackPercent=%.3f\n",
+            s_dlss_frame.have_motion_counters,(unsigned long long)s_dlss_frame.motion_counter_frame,
+            s_dlss_frame.have_motion_counters && coverage.valid,s_dlss_frame.have_motion_counters && coverage.coverage_available,
+            (unsigned long long)coverage.eligible,c.matched,c.fallback,c.background,c.reset,c.disoccluded,
+            coverage.matched_percent,coverage.fallback_percent);
         s_dlss_frame.last_log=ticks;
     }
     const char *pair=getenv("PS3RECOMP_DLSS_PAIR"),*request=getenv("PS3RECOMP_DLSS_PAIR_REQUEST");

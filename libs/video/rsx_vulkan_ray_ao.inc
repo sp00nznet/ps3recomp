@@ -817,7 +817,9 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     if(hybrid_mode && !trace_off && s_ray_ao.traced==0)VK_LOG("Hybrid path tracing (raster primary, traced shadows/bounce/reflections, generic materials where the original shader is not yet decoded)\n");
     if(hybrid_mode)parameters.settings[3]=(float)hybrid_fog_index;
     if(path_preview && s_ray_ao.traced==0)VK_LOG("diffuse path preview: current-frame geometry, 8 paths/pixel, 4 diffuse bounces, neutral secondary reflectance 0.65, uniform environment; original primary color retained; NOT recovered physical game materials/lights\n");
-    if(s_ray_ao.traced==0)VK_LOG("ray transport mode=%s denoiser=%s current-frame depth/normal guided; no temporal history or DLSS Ray Reconstruction\n",transport_mode,denoise?"spatial-atrous-3-pass":"off");
+    if(s_ray_ao.traced==0)VK_LOG("ray transport mode=%s spatialFilterPasses=%u temporalHistory=%s DLSSRayReconstruction=off\n",
+        trace_off?"dlss-scene-only":transport_mode,trace_off||!denoise?0u:hybrid_mode?2u:3u,
+        hybrid_mode&&!trace_off?"camera-reprojected-custom":"off");
     memcpy(s_ray_ao.params.ptr,&parameters,sizeof parameters);
     failure="AS sizes/address preparation";
     VkDeviceAddress triangle_address=vk_ray_address(&s_ray_ao.triangles),instance_address=vk_ray_address(&s_ray_ao.instances);if(!triangle_address || !instance_address)goto fail;
@@ -995,13 +997,20 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     }
     else if(!(s_ray_ao.last_flags&~2u) && s_ray_ao.gpu_stats[1] && (authored_mode?s_ray_ao.gpu_stats[24]:s_ray_ao.gpu_stats[2])){out->scale=scale;out->grid_x=gx;out->grid_y=1;replacement=vk_eng_surface_view(NULL,s_ray_ao.color,remap,rsx_format);if(replacement)s_ray_ao.completed++;}
     if(!replacement)s_ray_ao.rejected++;
-    if(s_ray_ao.queries){u64 times[7];if(s_ray_ao.query_results(s_vk.device,s_ray_ao.queries,0,7,sizeof times,times,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){u64 mask_bits=s_ray_ao.timestamp_bits>=64?UINT64_MAX:(1ull<<s_ray_ao.timestamp_bits)-1;for(unsigned i=0;i<6;i++)s_ray_ao.gpu_ms[i]=(double)((times[i+1]-times[i])&mask_bits)*s_ray_ao.properties.limits.timestampPeriod/1000000.0;}
+    int gpu_timing_valid=0,dlss_prep_valid=0;
+    memset(s_ray_ao.gpu_ms,0,sizeof s_ray_ao.gpu_ms);
+    if(s_ray_ao.queries){u64 times[7];gpu_timing_valid=s_ray_ao.query_results(s_vk.device,s_ray_ao.queries,0,7,sizeof times,times,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS;
+        if(gpu_timing_valid){u64 mask_bits=s_ray_ao.timestamp_bits>=64?UINT64_MAX:(1ull<<s_ray_ao.timestamp_bits)-1;for(unsigned i=0;i<6;i++)s_ray_ao.gpu_ms[i]=(double)((times[i+1]-times[i])&mask_bits)*s_ray_ao.properties.limits.timestampPeriod/1000000.0;}
         /* DLSS split: input/motion preparation, then NGX evaluation and output. */
-        u64 prepared;if(dlss_view && s_ray_ao.query_results(s_vk.device,s_ray_ao.queries,7,1,sizeof prepared,&prepared,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){
+        u64 prepared;if(gpu_timing_valid && dlss_view && s_ray_ao.query_results(s_vk.device,s_ray_ao.queries,7,1,sizeof prepared,&prepared,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){
             u64 mask_bits=s_ray_ao.timestamp_bits>=64?UINT64_MAX:(1ull<<s_ray_ao.timestamp_bits)-1;
             s_ray_ao.gpu_ms[6]=(double)((prepared-times[5])&mask_bits)*s_ray_ao.properties.limits.timestampPeriod/1000000.0;
+            dlss_prep_valid=1;
         }else s_ray_ao.gpu_ms[6]=0;}
     s_ray_ao.cpu_ms=(double)(SDL_GetPerformanceCounter()-start)*1000.0/(double)SDL_GetPerformanceFrequency();
+    if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))
+        VK_LOG("ray GPU timing frame=%llu stageSamplesAvailable=%d dlssPrepAvailable=%d unavailableValues=zero-not-measured\n",
+            (unsigned long long)epoch->frame,gpu_timing_valid,dlss_prep_valid);
     if(hybrid_mode && !trace_off && SDL_GetTicks64()-s_ray_ao.last_hybrid_log>=1000){
         u32 world=s_ray_ao.gpu_stats[0],traced=s_ray_ao.gpu_stats[24],hits=s_ray_ao.gpu_stats[5];
         VK_LOG("hybrid PT frame=%llu world=%u traced=%u (%.2f%%) rasterFallback=%u genericHits=%.2f%% bounceHits=%u reflectionHits=%u shadows=%u primaryShadowed=%.1f%% far=%.1f PT=%.3fms flags=0x%x reflectionRays=%u nonfinite=%u nonblack=%u owners=%u families=%u/%u/%u/%u\n",
