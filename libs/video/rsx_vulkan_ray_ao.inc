@@ -13,7 +13,7 @@
 #define VK_RAY_ALL_TEXTURES (VK_RAY_TEXTURES+VK_RAY_CUBES)
 #include "rsx_authored_lights.h"
 #include "rsx_ray_memory.h"
-static int vk_dlss_prepare(u32 vertices);
+static int vk_dlss_prepare(u32 vertices,VkFormat world_format);
 static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize vertex_bytes,const rsx_scene_epoch *epoch,
                           const float projection[16],const float camera[16],int have_camera,u64 camera_key,u32 remap,u32 format);
 static void vk_dlss_complete(int submitted,u32 source);
@@ -682,7 +682,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     /* Hybrid lighting is traced once per logical pixel and shared by its
      * MSAA samples; the other modes trace every sample. */
     u32 aw=hybrid_mode?width:authored_mode?width*gx:(width<320?width:320),ah=authored_mode?height:(height<180?height:180);
-    const int dlss_ready=hybrid_mode && vk_dlss_prepare(epoch->vertex_count);
+    const int dlss_ready=hybrid_mode && vk_dlss_prepare(epoch->vertex_count,source->fmt);
     /* Asynchronous transport (default with a second queue; PS3RECOMP_RSX_ASYNC_PT=0
      * disables): this frame composites the previous trace's lighting and its
      * own trace runs on the second queue while the next frame renders. */

@@ -22,6 +22,7 @@ _Static_assert(sizeof(vk_dlss_frame_params)==144,"GLSL std140 DLSS parameters la
  * glows). Those layers have no captured geometry, so without this they take
  * the surface's motion and DLSS accumulates them away. */
 static struct {vk_image image;u32 w,h;VkFormat fmt;u64 frame;int enabled,valid,after_opaque;u32 snapshots,frame_snapshots;} s_dlss_layer={.enabled=-1};
+static int vk_dlss_layer_image(VkFormat format,u32 w,u32 h);
 static struct {
     int initialized,failed,configured,have_camera,extent_known,recorded;
     rsx_dlss_quality quality;u32 in_w,in_h,out_w,out_h,phases;
@@ -227,7 +228,7 @@ static int vk_dlss_clip_capacity(u32 vertices,int *reset)
 }
 /* Everything that needs its own submission happens here, before the hybrid
  * transport begins recording. Returns 1 when vk_dlss_record may be called. */
-static int vk_dlss_prepare(u32 vertices)
+static int vk_dlss_prepare(u32 vertices,VkFormat world_format)
 {
     u32 w,h;
     if(!s_dlss.context || s_dlss_frame.failed || !vk_dlss_world_extent(&w,&h))return 0;
@@ -255,16 +256,36 @@ static int vk_dlss_prepare(u32 vertices)
         if(vk_submit_and_wait())goto fail;
         s_dlss_frame.configured=1;
     }
+    /* The reactive snapshot is always bound (the shader samples it as a
+     * two-sample image), so it exists whenever DLSS records. */
+    if(s_dlss_layer.enabled<0){const char *e=getenv("PS3RECOMP_DLSS_REACTIVE");s_dlss_layer.enabled=!(e && !strcmp(e,"0"));}
+    if(!vk_dlss_layer_image(world_format,s_dlss_frame.in_w,s_dlss_frame.in_h))goto fail;
     int grown=0;if(!vk_dlss_clip_capacity(vertices,&grown))goto fail;
     if(grown)s_dlss_frame.completed=0;
     return 1;
 fail:
     s_dlss_frame.failed=1;VK_LOG("DLSS SR setup failed; raster/PT retained, evaluations=%llu\n",(unsigned long long)s_dlss_frame.completed);return 0;
 }
+/* The private two-sample snapshot image, (re)created at the world target's
+ * format and extent; a fresh image is moved to GENERAL in the open command
+ * buffer. Returns 0 when it cannot exist (the mask is then disabled). */
+static int vk_dlss_layer_image(VkFormat format,u32 w,u32 h)
+{
+    if(s_dlss_layer.image.img && s_dlss_layer.w==w && s_dlss_layer.h==h && s_dlss_layer.fmt==format)return 1;
+    vk_destroy_image(&s_dlss_layer.image);s_dlss_layer.valid=0;
+    if(vk_create_image_levels_samples(&s_dlss_layer.image,format,w,h,1,VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,VK_IMAGE_ASPECT_COLOR_BIT,2)){
+        vk_destroy_image(&s_dlss_layer.image);s_dlss_layer.enabled=0;VK_LOG("DLSS reactive layer snapshot unavailable; disabled\n");return 0;
+    }
+    s_dlss_layer.w=w;s_dlss_layer.h=h;s_dlss_layer.fmt=format;
+    if(vk_begin())return 0;
+    vk_barrier_image(s_dlss_layer.image.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_UNDEFINED);
+    return 1;
+}
 /* Before a draw into `target` is recorded. On the first blended draw that
- * keeps depth after any depth-writing draw this frame, the expanded world is
- * copied, so the snapshot predates the last run of such layers.
- * PS3RECOMP_DLSS_REACTIVE=0 disables it. */
+ * keeps depth after any depth-writing draw this frame, the two-sample world
+ * target is copied as is into a private image, so the snapshot predates the
+ * last run of such layers. Engine state (expansion, render-target flags) is
+ * not touched. PS3RECOMP_DLSS_REACTIVE=0 disables it. */
 static void vk_dlss_reactive_before_draw(u32 target,const vk_eng_pipe *pipe)
 {
     if(s_dlss_layer.enabled<0){const char *e=getenv("PS3RECOMP_DLSS_REACTIVE");s_dlss_layer.enabled=!(e && !strcmp(e,"0"));}
@@ -277,22 +298,11 @@ static void vk_dlss_reactive_before_draw(u32 target,const vk_eng_pipe *pipe)
     if(!pipe->rs.blend_enable || pipe->rs.depth_write){s_dlss_layer.after_opaque=1;return;}
     if(!s_dlss_layer.after_opaque)return;
     s_dlss_layer.after_opaque=0;s_dlss_layer.valid=0;
-    const u32 expanded=vk_eng_expand_samples(target);
-    const vk_eng_obj *e=expanded?vk_eng_get(expanded,VK_ENG_TEXTURE):NULL;
-    if(!e)return;
-    int fresh=0;
-    if(!s_dlss_layer.image.img || s_dlss_layer.w!=e->w || s_dlss_layer.h!=e->h || s_dlss_layer.fmt!=e->fmt){
-        vk_destroy_image(&s_dlss_layer.image);
-        if(vk_create_image(&s_dlss_layer.image,e->fmt,e->w,e->h,VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,VK_IMAGE_ASPECT_COLOR_BIT)){
-            vk_destroy_image(&s_dlss_layer.image);s_dlss_layer.enabled=0;VK_LOG("DLSS reactive layer snapshot unavailable; disabled\n");return;
-        }
-        s_dlss_layer.w=e->w;s_dlss_layer.h=e->h;s_dlss_layer.fmt=e->fmt;fresh=1;
-    }
-    if(vk_begin())return;
-    vk_barrier_image(e->im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
-    vk_barrier_image(s_dlss_layer.image.img,VK_IMAGE_ASPECT_COLOR_BIT,fresh?VK_IMAGE_LAYOUT_UNDEFINED:VK_IMAGE_LAYOUT_GENERAL);
-    VkImageCopy region={.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.extent={e->w,e->h,1}};
-    pvkCmdCopyImage(s_vk.cmd,e->im.img,VK_IMAGE_LAYOUT_GENERAL,s_dlss_layer.image.img,VK_IMAGE_LAYOUT_GENERAL,1,&region);
+    if(!vk_dlss_layer_image(o->fmt,o->w,o->h) || vk_begin())return;
+    vk_barrier_image(o->im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(s_dlss_layer.image.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy region={.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.extent={o->w,o->h,1}};
+    pvkCmdCopyImage(s_vk.cmd,o->im.img,VK_IMAGE_LAYOUT_GENERAL,s_dlss_layer.image.img,VK_IMAGE_LAYOUT_GENERAL,1,&region);
     if(vk_submit_or_defer())return;
     s_dlss_layer.valid=1;s_dlss_layer.snapshots++;s_dlss_layer.frame_snapshots++;
 }
@@ -374,7 +384,7 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
      * traced composite differs from that snapshot everywhere. */
     const vk_eng_obj *src=&s_eobj[source];
     const int layer=s_dlss_layer.valid && s_dlss_layer.frame==s_rt_capture.frame && src->kind==VK_ENG_TEXTURE &&
-        s_dlss_layer.w==src->w && s_dlss_layer.h==src->h && s_dlss_layer.fmt==src->fmt;
+        s_dlss_layer.w*2u==src->w && s_dlss_layer.h==src->h && s_dlss_layer.fmt==src->fmt;
     p.jitter[2]=layer?1.0f:0.0f;
     p.sizes[3]=reset;memcpy(s_dlss_frame.params[bank].ptr,&p,sizeof p);
     VkDescriptorBufferInfo buffers[]={{vertices,0,vertex_bytes},{s_ray_ao.indices.buf,0,(VkDeviceSize)epoch->index_count/3*16},{s_dlss_frame.clips.buf,0,s_dlss_frame.clips.size},{s_dlss_frame.draws[bank].buf,0,VK_DLSS_ROWS*16u},{s_dlss_frame.params[bank].buf,0,sizeof p}};
@@ -390,7 +400,7 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
     for(u32 i=0;i<6;i++)writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=8+i,.descriptorCount=1,.descriptorType=i==4?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.pImageInfo=&images[2+i]};
     VkDescriptorBufferInfo gathered={s_ray_ao.triangles.buf,0,(VkDeviceSize)(epoch->index_count/3u)*36u};
     writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=14,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&gathered};
-    VkDescriptorImageInfo layer_image={s_dlss_frame.sampler,layer?s_dlss_layer.image.view:src->im.view,VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo layer_image={s_dlss_frame.sampler,s_dlss_layer.image.view,VK_IMAGE_LAYOUT_GENERAL};
     writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=15,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&layer_image};
     pvkUpdateDescriptorSets(s_vk.device,wi,writes,0,NULL);
     vk_image *input[]={&s_dlss_frame.color,&s_dlss_frame.depth,&s_dlss_frame.motion,&s_dlss_frame.bias};
@@ -495,6 +505,7 @@ static void vk_dlss_frame_destroy(void)
 {
     vk_ray_destroy_buffer(&s_dlss_frame.clips);
     for(u32 b=0;b<2;b++){vk_ray_destroy_buffer(&s_dlss_frame.draws[b]);vk_ray_destroy_buffer(&s_dlss_frame.params[b]);}
+    vk_destroy_image(&s_dlss_layer.image);s_dlss_layer.valid=0;s_dlss_layer.w=s_dlss_layer.h=0;
     vk_destroy_image(&s_dlss_frame.color);vk_destroy_image(&s_dlss_frame.depth);vk_destroy_image(&s_dlss_frame.motion);vk_destroy_image(&s_dlss_frame.bias);vk_destroy_image(&s_dlss_frame.output);
     if(s_dlss_frame.expanded)vk_eng_release(NULL,s_dlss_frame.expanded);
     if(s_dlss_frame.pipeline)pvkDestroyPipeline(s_vk.device,s_dlss_frame.pipeline,NULL);
@@ -509,7 +520,7 @@ static void vk_dlss_frame_destroy(void)
 static int vk_dlss_world_extent(u32 *w,u32 *h){(void)w;(void)h;return 0;}
 static void vk_dlss_jitter(float out[2]){out[0]=out[1]=0;}
 static void vk_dlss_jitter_upload(void *constants,size_t bytes){(void)constants;(void)bytes;}
-static int vk_dlss_prepare(u32 vertices){(void)vertices;return 0;}
+static int vk_dlss_prepare(u32 vertices,VkFormat world_format){(void)vertices;(void)world_format;return 0;}
 static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize vertex_bytes,const rsx_scene_epoch *epoch,
                           const float projection[16],const float camera[16],int have_camera,u64 camera_key,u32 remap,u32 format)
 {(void)source;(void)depth;(void)vertices;(void)vertex_bytes;(void)epoch;(void)projection;(void)camera;(void)have_camera;(void)camera_key;(void)remap;(void)format;return 0;}

@@ -2808,7 +2808,7 @@ static u32 vk_eng_target_multisample(void* user, rsx_be_format fmt, u32 w, u32 h
     const VkImageAspectFlags aspect = depth ? s_vk.depth_aspect : VK_IMAGE_ASPECT_COLOR_BIT;
     if (vk_create_image_levels_samples(&o->im, vf, w, h, 1,
             (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, aspect, samples)) {
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, aspect, samples)) {
         vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
     }
     o->kind = depth ? VK_ENG_DEPTH : VK_ENG_COLOR;
