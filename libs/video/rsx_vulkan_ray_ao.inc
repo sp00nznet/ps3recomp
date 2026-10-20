@@ -62,7 +62,7 @@ static void vk_ray_destroy_buffer(vk_buffer *b)
     if(b->ptr)pvkUnmapMemory(s_vk.device,b->mem);if(b->buf)pvkDestroyBuffer(s_vk.device,b->buf,NULL);
     if(b->mem)pvkFreeMemory(s_vk.device,b->mem,NULL);memset(b,0,sizeof *b);
 }
-static int vk_ray_buffer(vk_buffer *b,VkDeviceSize bytes,VkBufferUsageFlags usage,int host,int bda)
+static int vk_ray_buffer_impl(vk_buffer *b,VkDeviceSize bytes,VkBufferUsageFlags usage,int host,int bda)
 {
     if(!bytes || bytes>s_ray_ao.max_allocation)return 0;
     if((usage&VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && s_ray_ao.properties.limits.maxStorageBufferRange &&
@@ -73,7 +73,12 @@ static int vk_ray_buffer(vk_buffer *b,VkDeviceSize bytes,VkBufferUsageFlags usag
     if(pvkCreateBuffer(s_vk.device,&ci,NULL,&b->buf)!=VK_SUCCESS)goto fail;
     VkMemoryRequirements r;pvkGetBufferMemoryRequirements(s_vk.device,b->buf,&r);u32 type;
     VkMemoryPropertyFlags flags=host?VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT:VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    if(vk_find_memory_type(r.memoryTypeBits,flags,&type))goto fail;
+    /* host==2: written by the CPU, read per pixel by the GPU (indices,
+     * materials, constants). Plain host-visible memory is system RAM on a
+     * discrete GPU, so every shader read crossed PCIe; prefer the
+     * device-local host-visible (resizable BAR) type when there is one. */
+    if(host==2 && !vk_find_memory_type(r.memoryTypeBits,flags|VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,&type))flags|=VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    else if(vk_find_memory_type(r.memoryTypeBits,flags,&type))goto fail;
     u32 heap=s_vk.memprops.memoryTypes[type].heapIndex;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 memory={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,.pNext=&budget};
@@ -87,6 +92,13 @@ static int vk_ray_buffer(vk_buffer *b,VkDeviceSize bytes,VkBufferUsageFlags usag
     if(host && pvkMapMemory(s_vk.device,b->mem,0,VK_WHOLE_SIZE,0,&b->ptr)!=VK_SUCCESS)goto fail;
     b->size=bytes;b->coherent=host;return 1;
 fail:vk_ray_destroy_buffer(b);return 0;
+}
+/* host: 0 device-local, 1 host-visible (CPU reads it back), 2 host-written
+ * and GPU-read, placed in device-local host-visible memory when it fits. */
+static int vk_ray_buffer(vk_buffer *b,VkDeviceSize bytes,VkBufferUsageFlags usage,int host,int bda)
+{
+    if(host==2 && vk_ray_buffer_impl(b,bytes,usage,2,bda))return 1;
+    return vk_ray_buffer_impl(b,bytes,usage,host==2?1:host,bda);
 }
 static VkDeviceAddress vk_ray_address(vk_buffer *b)
 {
@@ -585,11 +597,11 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     vk_ray_alpha_reset();
     failure="bounded resident allocation";
     if(!vk_ray_screen(width*gx,height,source->fmt) ||
-       !vk_ray_buffer(&s_ray_ao.indices,(VkDeviceSize)triangles*32,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
-       !vk_ray_buffer(&s_ray_ao.materials,(VkDeviceSize)epoch->draw_count*sizeof(vk_ray_material),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
-       !vk_ray_buffer(&s_ray_ao.fp,16u*1024u*1024u,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
+       !vk_ray_buffer(&s_ray_ao.indices,(VkDeviceSize)triangles*32,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,2,0) ||
+       !vk_ray_buffer(&s_ray_ao.materials,(VkDeviceSize)epoch->draw_count*sizeof(vk_ray_material),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,2,0) ||
+       !vk_ray_buffer(&s_ray_ao.fp,16u*1024u*1024u,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,2,0) ||
        !vk_ray_buffer(&s_ray_ao.history,(VkDeviceSize)aw*ah*32+16,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,0,0) ||
-       !vk_ray_buffer(&s_ray_ao.params,sizeof(vk_ray_parameters),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,1,0) ||
+       !vk_ray_buffer(&s_ray_ao.params,sizeof(vk_ray_parameters),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,2,0) ||
        !vk_ray_buffer(&s_ray_ao.triangles,(VkDeviceSize)triangles*36,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,0,1) ||
        !vk_ray_buffer(&s_ray_ao.ao,(VkDeviceSize)aw*ah*40+128,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,0,0) ||
        !vk_ray_buffer(&s_ray_ao.instances,sizeof(VkAccelerationStructureInstanceKHR),VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,1,1) ||
@@ -674,10 +686,17 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
             if(unit>=0)vk_ray_texture(draw.textures[unit],&draw.samplers[unit],&material.textures[2],0);
             material.textures[3]=(u32)(unit<0?0:unit);
             material.depth_range[2]=rs->alpha_test_enable?(float)rs->alpha_ref_raw/255.0f:0.0f;
-            /* Alpha-tested cutouts (GREATER/GEQUAL, the foliage case) keep
-             * their holes in shadow rays; see hybridCutoutKeep. */
-            if(rs->alpha_test_enable && (rs->alpha_func==0x204u || rs->alpha_func==0x206u) && material.textures[2]<VK_RAY_TEXTURES)
+            /* Cutouts keep their holes in shadow rays (hybridCutoutKeep):
+             * alpha-tested GREATER/GEQUAL draws at their reference, and
+             * alpha-to-coverage draws (Faerypool's leaf cards) at half
+             * coverage. Solid quads there made the canopy one opaque roof. */
+            const int cutout_test=rs->alpha_test_enable && (rs->alpha_func==0x204u || rs->alpha_func==0x206u);
+            const int to_coverage=(rs->antialias_control&0x10u)!=0;
+            if((cutout_test || to_coverage) && material.textures[2]<VK_RAY_TEXTURES){
                 material.textures[3]|=0x200u;
+                if(!cutout_test)material.depth_range[2]=.5f;
+                else if(to_coverage)material.depth_range[2]=fmaxf(material.depth_range[2],.5f);
+            }
             material.depth_range[3]=(float)epoch->frame;
             /* An exact pool source explicitly carries a cube reflection. */
             if(light_contract==1 || strstr(pipeline->scene_ps,"TextureCube "))material.textures[3]|=0x100u;
@@ -742,6 +761,9 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         int reset=0;vk_ray_reprojection(projection,hybrid_have_camera,hybrid_view,epoch->frame,&block[2][0],&reset);
         if(s_ray_ao.history_w!=aw || s_ray_ao.history_h!=ah)reset=1;
         block[6][1]=(float)s_ray_ao.history_bank;block[6][2]=reset?1.0f:0.0f;
+        /* Directional shadow range as a multiple of receiver distance. */
+        const char *range_env=getenv("PS3RECOMP_RSX_SHADOW_RANGE");float range=range_env?strtof(range_env,NULL):3.0f;
+        block[6][3]=isfinite(range)&&range>0.0f&&range<=1000.0f?range:3.0f;
         if(fp_used+sizeof block>s_ray_ao.fp.size)goto fail;
         memcpy((u8*)s_ray_ao.fp.ptr+fp_used,block,sizeof block);fp_used+=sizeof block;
     }
@@ -895,9 +917,11 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     s_ray_ao.cpu_ms=(double)(SDL_GetPerformanceCounter()-start)*1000.0/(double)SDL_GetPerformanceFrequency();
     if(hybrid_mode && SDL_GetTicks64()-s_ray_ao.last_hybrid_log>=1000){
         u32 world=s_ray_ao.gpu_stats[0],traced=s_ray_ao.gpu_stats[24],hits=s_ray_ao.gpu_stats[5];
-        VK_LOG("hybrid PT frame=%llu world=%u traced=%u (%.2f%%) rasterFallback=%u genericHits=%.2f%% bounceHits=%u reflectionHits=%u shadows=%u PT=%.3fms flags=0x%x reflectionRays=%u nonfinite=%u nonblack=%u owners=%u families=%u/%u/%u/%u\n",
+        VK_LOG("hybrid PT frame=%llu world=%u traced=%u (%.2f%%) rasterFallback=%u genericHits=%.2f%% bounceHits=%u reflectionHits=%u shadows=%u primaryShadowed=%.1f%% far=%.1f PT=%.3fms flags=0x%x reflectionRays=%u nonfinite=%u nonblack=%u owners=%u families=%u/%u/%u/%u\n",
             (unsigned long long)epoch->frame,world,traced,world?100.0*traced/world:0.0,world-traced,
             hits?100.0*s_ray_ao.gpu_stats[4]/hits:0.0,s_ray_ao.gpu_stats[26],s_ray_ao.gpu_stats[30],s_ray_ao.gpu_stats[28],
+            s_ray_ao.gpu_stats[13]+s_ray_ao.gpu_stats[14]?100.0*s_ray_ao.gpu_stats[14]/(s_ray_ao.gpu_stats[13]+s_ray_ao.gpu_stats[14]):0.0,
+            projection[10]>1.0f?(double)(projection[14]/(1.0f-projection[10])):0.0,
             s_ray_ao.gpu_ms[1]+s_ray_ao.gpu_ms[2]+s_ray_ao.gpu_ms[3]+s_ray_ao.gpu_ms[4],s_ray_ao.last_flags,s_ray_ao.gpu_stats[29],s_ray_ao.gpu_stats[6],s_ray_ao.gpu_stats[7],s_ray_ao.gpu_stats[8],s_ray_ao.gpu_stats[9],s_ray_ao.gpu_stats[10],s_ray_ao.gpu_stats[11],s_ray_ao.gpu_stats[12]);
         s_ray_ao.last_hybrid_log=SDL_GetTicks64();
         VK_LOG("hybrid PT cumulative nonfinite=%llu blackWorldFrames=%llu completedFrames=%llu; max diffuse bounces=1 max specular rays/path=1\n",(unsigned long long)s_ray_ao.hybrid_nonfinite,(unsigned long long)s_ray_ao.hybrid_black_frames,(unsigned long long)s_ray_ao.completed);

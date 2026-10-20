@@ -82,7 +82,17 @@ void hybridSkyUpdate(){
 bool hybridNearest(vec3 origin,vec3 direction,float minimum,float maximum,
                    bool colorOwner,out uint hit,out vec2 bary,out float distance){
     countRay(2);hit=0xffffffffu;distance=maximum;bary=vec2(0);
-    rayQueryEXT q;rayQueryInitializeEXT(q,scene,0,255,origin,minimum,direction,maximum);
+    rayQueryEXT q;
+    if(!colorOwner){
+        // Plain closest hit (bounce, reflection): opaque hardware traversal.
+        rayQueryInitializeEXT(q,scene,gl_RayFlagsOpaqueEXT,255,origin,minimum,direction,maximum);
+        while(rayQueryProceedEXT(q)){}
+        if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return false;
+        hit=rayQueryGetIntersectionPrimitiveIndexEXT(q,true);distance=rayQueryGetIntersectionTEXT(q,true);
+        bary=rayQueryGetIntersectionBarycentricsEXT(q,true);
+        return true;
+    }
+    rayQueryInitializeEXT(q,scene,0,255,origin,minimum,direction,maximum);
     while(rayQueryProceedEXT(q))if(rayQueryGetIntersectionTypeEXT(q,false)==gl_RayQueryCandidateIntersectionTriangleEXT){
         uint candidate=rayQueryGetIntersectionPrimitiveIndexEXT(q,false);
         Material candidateMaterial=materials.value[indices.triangle[candidate].w];
@@ -168,15 +178,24 @@ float hybridVisibility(vec3 position,vec3 normal,vec3 direction,float maximum){
     if(blocked)countRay(28);
     return blocked?0.0:1.0;
 }
+// View distance of the far plane: z_ndc=1 at p14/(1-p10).
+float hybridFar(){float f=p.projection.w/(1.0-p.projection.z);return f>0.0&&!isinf(f)?f:10000.0;}
 // CPU-selected key light: fp+2 view-space vector toward the light (w=0
 // directional), fp+3 radiance with w=1 when valid.
+// A directional shadow ray reaches fp+8.w times the receiver's camera
+// distance (at least 3 units, at most half the far plane). Folklore's areas
+// are enclosed by hills and tree walls that the game's own shadows never
+// include; with a low sun an unbounded ray hit them from nearly every pixel
+// and the whole frame went dark. Local casters (trees, rocks, characters)
+// stay inside the range.
 bool hybridKey(vec3 position,out vec3 direction,out float distance,out vec3 radiance){
     vec4 l=hybridFp(2u),c=hybridFp(3u);
     direction=vec3(0,0,1);distance=0.0;radiance=vec3(0);
     if(c.w!=1.0)return false;
     vec3 v=l.w==0.0?l.xyz:l.xyz/l.w-position;float d=length(v);
     if(isnan(d)||isinf(d)||d<=1e-5)return false;
-    direction=v/d;distance=l.w==0.0?10000.0:d;radiance=clamp(c.rgb,vec3(0),vec3(4));
+    float range=hybridFp(8u).w>0.0?hybridFp(8u).w:3.0;
+    direction=v/d;distance=l.w==0.0?min(max(3.0,range*length(position)),.5*hybridFar()):d;radiance=clamp(c.rgb,vec3(0),vec3(4));
     return finite3(direction)&&finite3(radiance);
 }
 // Shadowed and unshadowed irradiance share the same ambient term; only the key
@@ -248,6 +267,8 @@ void hybridTrace(uvec2 pixel){
     vec3 raster=texelFetch(worldColor,texel,0).rgb;
     if(!finite3(raster)){countRay(6);return;}
     vec3 lit,unshadowed;hybridIrradiance(position,normal,true,lit,unshadowed);
+    // 13: primary pixels the key light reaches, 14: primary pixels it shadows.
+    if(any(greaterThan(unshadowed-lit,vec3(1e-4))))countRay(14);else countRay(13);
     float luminance=max(dot(unshadowed,vec3(.2126,.7152,.0722)),.15);
     // Preserve the game's primary shading and apply traced light visibility.
     vec3 M=mix(vec3(1),clamp(lit/max(unshadowed,vec3(.025)),vec3(0),vec3(1)),p.settings.z),A=vec3(0);

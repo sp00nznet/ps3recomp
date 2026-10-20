@@ -156,8 +156,8 @@ static int vk_dlss_frame_images(void)
     o->kind=VK_ENG_COLOR;o->fmt=VK_FORMAT_R8G8B8A8_UNORM;o->bpp=4;o->w=ow*2u;o->h=oh;o->scale=s_render_scale;o->grid_x=2;o->grid_y=1;
     s_dlss_frame.expanded=expanded;
     for(u32 b=0;b<2;b++)
-        if(!vk_ray_buffer(&s_dlss_frame.draws[b],(VK_DLSS_DRAWS+2u)*16u,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0)||
-           !vk_ray_buffer(&s_dlss_frame.params[b],sizeof(vk_dlss_frame_params),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,1,0))return 0;
+        if(!vk_ray_buffer(&s_dlss_frame.draws[b],(VK_DLSS_DRAWS+2u)*16u,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,2,0)||
+           !vk_ray_buffer(&s_dlss_frame.params[b],sizeof(vk_dlss_frame_params),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,2,0))return 0;
     for(u32 b=0;b<2;b++)memset(s_dlss_frame.draws[b].ptr,0,(VK_DLSS_DRAWS+2u)*16u);
     if(vk_begin())return 0;
     vk_image *images[]={&s_dlss_frame.color,&s_dlss_frame.depth,&s_dlss_frame.motion,&s_dlss_frame.bias,&s_dlss_frame.output,&o->im};

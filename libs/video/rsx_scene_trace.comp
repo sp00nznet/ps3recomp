@@ -1,6 +1,7 @@
 #version 460
 #define RSX_TRANSPORT_FLAGS p.counts.w
 #extension GL_EXT_ray_query : require
+#extension GL_KHR_shader_subgroup_ballot : require
 layout(local_size_x=8,local_size_y=8) in;
 layout(std430,binding=0) readonly buffer Outputs {vec4 value[];} vs;
 layout(std430,binding=1) readonly buffer Indices {uvec4 triangle[];} indices;
@@ -67,7 +68,19 @@ uvec2 alphaTextureSize(uint slot){
 #undef SIZE
 }
 uint statsBase(){return pixelCount()*10u;}
-void countRay(uint counter){atomicAdd(ao.value[statsBase()+counter],1u);}
+// Diagnostic counters: every pixel bumps several of the same ~30 words, and
+// one global atomic per bump serialized the whole trace. Lanes of a subgroup
+// that count the same counter add once, through one elected lane.
+void countRay(uint counter){
+    for(;;){
+        uint first=subgroupBroadcastFirst(counter);
+        if(counter==first){
+            uint n=subgroupBallotBitCount(subgroupBallot(true));
+            if(subgroupElect())atomicAdd(ao.value[statsBase()+first],n);
+            break;
+        }
+    }
+}
 vec3 point(uint primitive,uint corner){uint i=primitive*9+corner*3;return vec3(positions.xyz[i],positions.xyz[i+1],positions.xyz[i+2]);}
 bool finite3(vec3 v);
 // Gather divides each source homogeneous position by h before building the
