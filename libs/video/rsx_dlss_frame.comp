@@ -24,6 +24,10 @@ layout(binding=12) uniform sampler2D dlssOutput;
 layout(rgba8,binding=13) writeonly uniform image2D expandedOutput;
 // Exact view-space triangle positions used by the current frame's BLAS.
 layout(std430,binding=14) readonly buffer GatheredPositions {float xyz[];} gathered;
+// The expanded world before the frame's last run of blended, depth-keeping
+// layers (valid when jitter.z is 1). Pixels those layers changed get the
+// reactive bias: they have no captured geometry and no motion of their own.
+layout(binding=15) uniform sampler2D layerBase;
 layout(push_constant) uniform Phase {uint mode;} phase;
 // Draw slots 0..255 map draws; 256 holds eligible/disoccluded/matched/fallback.
 // Slot 257 holds nonfinite output samples/background pixels/reset pixels.
@@ -172,5 +176,16 @@ void main(){
     if(any(isnan(motion))||any(isinf(motion))||any(greaterThan(abs(motion),vec2(p.sizes.xy)))){motion=vec2(0);bias=1;}
     imageStore(motionInput,ivec2(pixel),vec4(motion,0,0));
     countMotion(2u,tracked && bias==0);countMotion(3u,tracked && bias!=0);
-    imageStore(biasInput,ivec2(pixel),vec4(bias));
+    float reactive=0.0;
+    if(p.jitter.z>0.5){
+        vec3 d0=abs(texelFetch(sourceColor,q,0).rgb-texelFetch(layerBase,q,0).rgb);
+        vec3 d1=abs(texelFetch(sourceColor,q+ivec2(1,0),0).rgb-texelFetch(layerBase,q+ivec2(1,0),0).rgb);
+        vec3 d=max(d0,d1);float change=max(d.r,max(d.g,d.b));
+        reactive=isnan(change)||isinf(change)?0.0:smoothstep(2.0/255.0,24.0/255.0,change);
+    }
+    if(reactive>0.0){
+        uint n=subgroupBallotBitCount(subgroupBallot(true));
+        if(subgroupElect())atomicAdd(draws.value[258].x,n);
+    }
+    imageStore(biasInput,ivec2(pixel),vec4(max(bias,reactive)));
 }

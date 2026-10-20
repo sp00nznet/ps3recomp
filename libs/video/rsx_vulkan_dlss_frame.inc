@@ -15,6 +15,13 @@ typedef rsx_dlss_draw_key vk_dlss_draw_key;
 typedef struct vk_dlss_frame_params {float reprojection[16],projection[4],jitter[4];u32 sizes[4],history[4],layout[4];} vk_dlss_frame_params;
 _Static_assert(sizeof(vk_dlss_frame_params)==144,"GLSL std140 DLSS parameters layout");
 #define VK_DLSS_DRAWS 256u
+/* Draw rows, then 256 motion counters, 257 exclusions/no-owner, 258 reactive. */
+#define VK_DLSS_ROWS (VK_DLSS_DRAWS+3u)
+/* Reactive mask source: the world target, sample-expanded, as it stood
+ * before the frame's last run of blended draws that keep depth (particles,
+ * glows). Those layers have no captured geometry, so without this they take
+ * the surface's motion and DLSS accumulates them away. */
+static struct {vk_image image;u32 w,h;VkFormat fmt;u64 frame;int enabled,valid,after_opaque;u32 snapshots,frame_snapshots;} s_dlss_layer={.enabled=-1};
 static struct {
     int initialized,failed,configured,have_camera,extent_known,recorded;
     rsx_dlss_quality quality;u32 in_w,in_h,out_w,out_h,phases;
@@ -148,17 +155,17 @@ static int vk_dlss_frame_initialize(void)
 {
     if(s_dlss_frame.initialized)return 1;
     if(s_dlss_frame.failed || !s_dlss.context)return 0;
-    VkDescriptorSetLayoutBinding bindings[15];
-    for(u32 i=0;i<15;i++)bindings[i]=(VkDescriptorSetLayoutBinding){i,
-        i==0||i==1||i==12?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    VkDescriptorSetLayoutBinding bindings[16];
+    for(u32 i=0;i<16;i++)bindings[i]=(VkDescriptorSetLayoutBinding){i,
+        i==0||i==1||i==12||i==15?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
         (i>=2&&i<=5)||i==14?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i==6?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
         i==7?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,NULL};
-    VkDescriptorSetLayoutCreateInfo layout={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=15,.pBindings=bindings};
+    VkDescriptorSetLayoutCreateInfo layout={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=16,.pBindings=bindings};
     if(pvkCreateDescriptorSetLayout(s_vk.device,&layout,NULL,&s_dlss_frame.layout)!=VK_SUCCESS)goto fail;
     VkPushConstantRange push={VK_SHADER_STAGE_COMPUTE_BIT,0,4};
     VkPipelineLayoutCreateInfo pl={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&s_dlss_frame.layout,.pushConstantRangeCount=1,.pPushConstantRanges=&push};
     if(pvkCreatePipelineLayout(s_vk.device,&pl,NULL,&s_dlss_frame.pipeline_layout)!=VK_SUCCESS)goto fail;
-    VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,3},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,5},{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,5}};
+    VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,5},{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,5}};
     VkDescriptorPoolCreateInfo pool={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=5,.pPoolSizes=sizes};
     if(pvkCreateDescriptorPool(s_vk.device,&pool,NULL,&s_dlss_frame.pool)!=VK_SUCCESS)goto fail;
     VkDescriptorSetAllocateInfo set={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=s_dlss_frame.pool,.descriptorSetCount=1,.pSetLayouts=&s_dlss_frame.layout};
@@ -195,9 +202,9 @@ static int vk_dlss_frame_images(void)
     o->kind=VK_ENG_COLOR;o->fmt=VK_FORMAT_R8G8B8A8_UNORM;o->bpp=4;o->w=ow*2u;o->h=oh;o->scale=s_render_scale;o->grid_x=2;o->grid_y=1;
     s_dlss_frame.expanded=expanded;
     for(u32 b=0;b<2;b++)
-        if(!vk_ray_buffer(&s_dlss_frame.draws[b],(VK_DLSS_DRAWS+2u)*16u,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,2,0)||
+        if(!vk_ray_buffer(&s_dlss_frame.draws[b],VK_DLSS_ROWS*16u,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,2,0)||
            !vk_ray_buffer(&s_dlss_frame.params[b],sizeof(vk_dlss_frame_params),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,2,0))return 0;
-    for(u32 b=0;b<2;b++)memset(s_dlss_frame.draws[b].ptr,0,(VK_DLSS_DRAWS+2u)*16u);
+    for(u32 b=0;b<2;b++)memset(s_dlss_frame.draws[b].ptr,0,VK_DLSS_ROWS*16u);
     if(vk_begin())return 0;
     vk_image *images[]={&s_dlss_frame.color,&s_dlss_frame.depth,&s_dlss_frame.motion,&s_dlss_frame.bias,&s_dlss_frame.output,&o->im};
     for(u32 i=0;i<6;i++)vk_barrier_image(images[i]->img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_UNDEFINED);
@@ -254,6 +261,41 @@ static int vk_dlss_prepare(u32 vertices)
 fail:
     s_dlss_frame.failed=1;VK_LOG("DLSS SR setup failed; raster/PT retained, evaluations=%llu\n",(unsigned long long)s_dlss_frame.completed);return 0;
 }
+/* Before a draw into `target` is recorded. On the first blended draw that
+ * keeps depth after any depth-writing draw this frame, the expanded world is
+ * copied, so the snapshot predates the last run of such layers.
+ * PS3RECOMP_DLSS_REACTIVE=0 disables it. */
+static void vk_dlss_reactive_before_draw(u32 target,const vk_eng_pipe *pipe)
+{
+    if(s_dlss_layer.enabled<0){const char *e=getenv("PS3RECOMP_DLSS_REACTIVE");s_dlss_layer.enabled=!(e && !strcmp(e,"0"));}
+    if(!s_dlss_layer.enabled || !s_dlss_frame.configured || s_dlss_frame.failed || !pipe)return;
+    const vk_eng_obj *o=vk_eng_get(target,VK_ENG_COLOR);
+    if(!o || !o->dlss_world || o->samples!=2)return;
+    if(s_dlss_layer.frame!=s_rt_capture.frame){
+        s_dlss_layer.frame=s_rt_capture.frame;s_dlss_layer.valid=0;s_dlss_layer.after_opaque=1;s_dlss_layer.frame_snapshots=0;
+    }
+    if(!pipe->rs.blend_enable || pipe->rs.depth_write){s_dlss_layer.after_opaque=1;return;}
+    if(!s_dlss_layer.after_opaque)return;
+    s_dlss_layer.after_opaque=0;s_dlss_layer.valid=0;
+    const u32 expanded=vk_eng_expand_samples(target);
+    const vk_eng_obj *e=expanded?vk_eng_get(expanded,VK_ENG_TEXTURE):NULL;
+    if(!e)return;
+    int fresh=0;
+    if(!s_dlss_layer.image.img || s_dlss_layer.w!=e->w || s_dlss_layer.h!=e->h || s_dlss_layer.fmt!=e->fmt){
+        vk_destroy_image(&s_dlss_layer.image);
+        if(vk_create_image(&s_dlss_layer.image,e->fmt,e->w,e->h,VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,VK_IMAGE_ASPECT_COLOR_BIT)){
+            vk_destroy_image(&s_dlss_layer.image);s_dlss_layer.enabled=0;VK_LOG("DLSS reactive layer snapshot unavailable; disabled\n");return;
+        }
+        s_dlss_layer.w=e->w;s_dlss_layer.h=e->h;s_dlss_layer.fmt=e->fmt;fresh=1;
+    }
+    if(vk_begin())return;
+    vk_barrier_image(e->im.img,VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(s_dlss_layer.image.img,VK_IMAGE_ASPECT_COLOR_BIT,fresh?VK_IMAGE_LAYOUT_UNDEFINED:VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy region={.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.extent={e->w,e->h,1}};
+    pvkCmdCopyImage(s_vk.cmd,e->im.img,VK_IMAGE_LAYOUT_GENERAL,s_dlss_layer.image.img,VK_IMAGE_LAYOUT_GENERAL,1,&region);
+    if(vk_submit_or_defer())return;
+    s_dlss_layer.valid=1;s_dlss_layer.snapshots++;s_dlss_layer.frame_snapshots++;
+}
 static rsx_dlss_image vk_dlss_image(vk_image *im,VkFormat format,u32 w,u32 h,VkImageLayout layout)
 {return (rsx_dlss_image){im->img,im->view,format,w,h,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},layout};}
 /* Records DLSS input preparation, evaluation and the expanded output into the
@@ -294,7 +336,7 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
     const u32 capacity=s_dlss_frame.vertex_capacity;
     p.history[0]=(1-bank)*capacity;p.history[1]=bank*capacity;p.history[2]=ow;p.history[3]=oh;
     p.layout[0]=2u*capacity;p.layout[1]=2u;
-    u32 (*map)[4]=s_dlss_frame.draws[bank].ptr;memset(map,0,(VK_DLSS_DRAWS+2u)*16u);
+    u32 (*map)[4]=s_dlss_frame.draws[bank].ptr;memset(map,0,VK_DLSS_ROWS*16u);
     vk_dlss_draw_key *current=s_dlss_frame.current;memset(current,0,sizeof s_dlss_frame.current);
     u32 base=0,draws=epoch->draw_count<VK_DLSS_DRAWS?epoch->draw_count:VK_DLSS_DRAWS;
     p.layout[2]=draws;
@@ -328,12 +370,18 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
     }
     if(s_dlss_frame.completed && transfer!=s_dlss_frame.transfer)reset=1;
     s_dlss_frame.transfer=transfer;p.layout[3]=transfer;
+    /* Reactive layers only against the raster world it was taken from: a
+     * traced composite differs from that snapshot everywhere. */
+    const vk_eng_obj *src=&s_eobj[source];
+    const int layer=s_dlss_layer.valid && s_dlss_layer.frame==s_rt_capture.frame && src->kind==VK_ENG_TEXTURE &&
+        s_dlss_layer.w==src->w && s_dlss_layer.h==src->h && s_dlss_layer.fmt==src->fmt;
+    p.jitter[2]=layer?1.0f:0.0f;
     p.sizes[3]=reset;memcpy(s_dlss_frame.params[bank].ptr,&p,sizeof p);
-    VkDescriptorBufferInfo buffers[]={{vertices,0,vertex_bytes},{s_ray_ao.indices.buf,0,(VkDeviceSize)epoch->index_count/3*16},{s_dlss_frame.clips.buf,0,s_dlss_frame.clips.size},{s_dlss_frame.draws[bank].buf,0,(VK_DLSS_DRAWS+2u)*16u},{s_dlss_frame.params[bank].buf,0,sizeof p}};
+    VkDescriptorBufferInfo buffers[]={{vertices,0,vertex_bytes},{s_ray_ao.indices.buf,0,(VkDeviceSize)epoch->index_count/3*16},{s_dlss_frame.clips.buf,0,s_dlss_frame.clips.size},{s_dlss_frame.draws[bank].buf,0,VK_DLSS_ROWS*16u},{s_dlss_frame.params[bank].buf,0,sizeof p}};
     VkDescriptorImageInfo images[]={{s_dlss_frame.sampler,s_eobj[source].im.view,VK_IMAGE_LAYOUT_GENERAL},{s_dlss_frame.sampler,s_eobj[depth].im.view,VK_IMAGE_LAYOUT_GENERAL},
         {0,s_dlss_frame.color.view,VK_IMAGE_LAYOUT_GENERAL},{0,s_dlss_frame.depth.view,VK_IMAGE_LAYOUT_GENERAL},{0,s_dlss_frame.motion.view,VK_IMAGE_LAYOUT_GENERAL},{0,s_dlss_frame.bias.view,VK_IMAGE_LAYOUT_GENERAL},
         {s_dlss_frame.sampler,s_dlss_frame.output.view,VK_IMAGE_LAYOUT_GENERAL},{0,s_eobj[s_dlss_frame.expanded].im.view,VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet writes[15];memset(writes,0,sizeof writes);u32 wi=0;
+    VkWriteDescriptorSet writes[16];memset(writes,0,sizeof writes);u32 wi=0;
     for(u32 i=0;i<2;i++)writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&images[i]};
     for(u32 i=0;i<4;i++)writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=2+i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&buffers[i]};
     VkWriteDescriptorSetAccelerationStructureKHR as={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,.accelerationStructureCount=1,.pAccelerationStructures=&s_ray_ao.tlas};
@@ -342,6 +390,8 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
     for(u32 i=0;i<6;i++)writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=8+i,.descriptorCount=1,.descriptorType=i==4?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.pImageInfo=&images[2+i]};
     VkDescriptorBufferInfo gathered={s_ray_ao.triangles.buf,0,(VkDeviceSize)(epoch->index_count/3u)*36u};
     writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=14,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&gathered};
+    VkDescriptorImageInfo layer_image={s_dlss_frame.sampler,layer?s_dlss_layer.image.view:src->im.view,VK_IMAGE_LAYOUT_GENERAL};
+    writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=15,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&layer_image};
     pvkUpdateDescriptorSets(s_vk.device,wi,writes,0,NULL);
     vk_image *input[]={&s_dlss_frame.color,&s_dlss_frame.depth,&s_dlss_frame.motion,&s_dlss_frame.bias};
     if(s_dlss_frame.completed)for(u32 i=0;i<4;i++)vk_dlss_layout(input[i],VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL);
@@ -411,6 +461,7 @@ static void vk_dlss_complete(int submitted,u32 source)
     const int log_due=!s_dlss_frame.last_log || s_dlss_frame.record_ticks-s_dlss_frame.last_log>=SDL_GetPerformanceFrequency();
     u32 fallback_pixels[5]={0},fallback_draws[4]={0};
     if(log_due)vk_dlss_fallback_attribution(fallback_pixels,fallback_draws);
+    const u32 reactive_pixels=log_due?((const u32 (*)[4])s_dlss_frame.draws[s_dlss_frame.bank].ptr)[VK_DLSS_DRAWS+2][0]:0u;
     s_dlss_frame.completed++;s_dlss_frame.frame=s_dlss_frame.record_frame;s_dlss_frame.ticks=s_dlss_frame.record_ticks;s_dlss_frame.bank=1-s_dlss_frame.bank;
     memcpy(s_dlss_frame.previous,s_dlss_frame.current,sizeof s_dlss_frame.current);s_dlss_frame.previous_count=s_dlss_frame.current_count;
     memcpy(s_dlss_frame.camera,s_dlss_frame.record_camera,sizeof s_dlss_frame.camera);s_dlss_frame.have_camera=s_dlss_frame.record_have_camera;s_dlss_frame.camera_key=s_dlss_frame.record_camera_key;
@@ -426,9 +477,9 @@ static void vk_dlss_complete(int submitted,u32 source)
             s_dlss_frame.have_motion_counters && coverage.valid,s_dlss_frame.have_motion_counters && coverage.coverage_available,
             (unsigned long long)coverage.eligible,c.matched,c.fallback,c.background,c.reset,c.disoccluded,
             coverage.matched_percent,coverage.fallback_percent);
-        VK_LOG("DLSS fallback attribution frame=%llu mappedDraws=%u pixels/draws noIdentity=%u/%u duplicateKey=%u/%u unmatched=%u/%u matchedInvalid=%u/%u noOwner=%u\n",
+        VK_LOG("DLSS fallback attribution frame=%llu mappedDraws=%u pixels/draws noIdentity=%u/%u duplicateKey=%u/%u unmatched=%u/%u matchedInvalid=%u/%u noOwner=%u reactiveLayerPixels=%u layerSnapshots=%u\n",
             (unsigned long long)s_dlss_frame.frame,s_dlss_frame.current_count,fallback_pixels[0],fallback_draws[0],fallback_pixels[1],fallback_draws[1],
-            fallback_pixels[2],fallback_draws[2],fallback_pixels[3],fallback_draws[3],fallback_pixels[4]);
+            fallback_pixels[2],fallback_draws[2],fallback_pixels[3],fallback_draws[3],fallback_pixels[4],reactive_pixels,s_dlss_layer.frame_snapshots);
         s_dlss_frame.last_log=ticks;
     }
     const char *pair=getenv("PS3RECOMP_DLSS_PAIR"),*request=getenv("PS3RECOMP_DLSS_PAIR_REQUEST");
@@ -464,4 +515,5 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
 {(void)source;(void)depth;(void)vertices;(void)vertex_bytes;(void)epoch;(void)projection;(void)camera;(void)have_camera;(void)camera_key;(void)remap;(void)format;return 0;}
 static void vk_dlss_complete(int submitted,u32 source){(void)submitted;(void)source;}
 static void vk_dlss_history_reset(void){}
+static void vk_dlss_reactive_before_draw(u32 target,const vk_eng_pipe *pipe){(void)target;(void)pipe;}
 #endif

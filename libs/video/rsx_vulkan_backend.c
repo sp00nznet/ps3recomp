@@ -4046,6 +4046,7 @@ static int vk_batch_ready(void)
     return 1;
 }
 
+static void vk_dlss_reactive_before_draw(u32 target,const vk_eng_pipe *pipe);
 static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                         u32 stride, const u32* indices, u32 index_count)
 {
@@ -4094,6 +4095,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
 
     const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
     const VkDeviceSize ibytes = (indices && index_count) ? (VkDeviceSize)index_count * 4u : 0;
+    /* Before this draw is recorded: the reactive layer snapshot (DLSS). */
+    if (s_vk.rt_enabled) vk_dlss_reactive_before_draw(s_eng_bound.rt[0], P);
     vk_batch_configure();
     if (!vk_eng_constant_shadow()) return;
     const int batched = s_batch.on && vk_batch_ready() && s_g.ubo.ptr;
