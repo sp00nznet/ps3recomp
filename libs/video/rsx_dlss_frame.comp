@@ -13,7 +13,7 @@ layout(std140,binding=7) uniform Parameters {
     mat4 reprojection;vec4 projection;vec4 jitter;
     uvec4 sizes;   // input width/height, vertex count, reset
     uvec4 history; // previous/current vertex bank offsets, output width/height
-    uvec4 layout_; // per-pixel depth history offset, output sample lanes
+    uvec4 layout_; // depth history offset, output sample lanes, mapped draw count
 } p;
 layout(rgba16f,binding=8) writeonly uniform image2D colorInput;
 layout(r32f,binding=9) writeonly uniform image2D depthInput;
@@ -21,10 +21,25 @@ layout(rg32f,binding=10) writeonly uniform image2D motionInput;
 layout(r8,binding=11) writeonly uniform image2D biasInput;
 layout(binding=12) uniform sampler2D dlssOutput;
 layout(rgba8,binding=13) writeonly uniform image2D expandedOutput;
+// Exact view-space triangle positions used by the current frame's BLAS.
+layout(std430,binding=14) readonly buffer GatheredPositions {float xyz[];} gathered;
 layout(push_constant) uniform Phase {uint mode;} phase;
 // Draw slots 0..255 map draws; 256 holds eligible/disoccluded/matched/fallback.
 // Slot 257 holds nonfinite output samples/background pixels/reset pixels.
 bool finite4(vec4 v){return !any(isnan(v))&&!any(isinf(v));}
+float dlssInverseHomogeneousScale(float cx,float cy,float cw,float vx,float vy,float vz,float px,float py){
+    if(isnan(cx)||isinf(cx)||isnan(cy)||isinf(cy)||isnan(cw)||isinf(cw)||
+       isnan(vx)||isinf(vx)||isnan(vy)||isinf(vy)||isnan(vz)||isinf(vz)||
+       isnan(px)||isinf(px)||isnan(py)||isinf(py)||px==0.0||py==0.0)return 0.0;
+    // Q=(cx/Px,cy/Py,cw)/h. Recover 1/h from Q's strongest component,
+    // inheriting gather's depth-range and authored homogeneous-scale rules.
+    float q=vx,u=cx/px;
+    if(abs(vy)>abs(q)){q=vy;u=cy/py;}
+    if(abs(vz)>abs(q)){q=vz;u=cw;}
+    if(q==0.0||u==0.0||isnan(u)||isinf(u))return 0.0;
+    float inverseScale=q/u;
+    return isnan(inverseScale)||isinf(inverseScale)||inverseScale<=0.0?0.0:inverseScale;
+}
 // Motion counters (slot 256) for every pixel: one atomic per subgroup.
 void countMotion(uint lane,bool hit){
     if(!hit)return;
@@ -90,23 +105,28 @@ void main(){
         if(rayQueryGetIntersectionTypeEXT(ray,true)==gl_RayQueryCommittedIntersectionTriangleEXT){
             owner=rayQueryGetIntersectionPrimitiveIndexEXT(ray,true);bary=rayQueryGetIntersectionBarycentricsEXT(ray,true);
         }
-        if(owner!=0xffffffffu){
+        if(owner!=0xffffffffu && owner<uint(indices.value.length()) && owner<uint(gathered.xyz.length())/9u){
             uvec4 tri=indices.value[owner];
             // Keep unmatched geometry on camera motion; never interpret
             // diagnostics slots or an unowned draw as a vertex mapping.
             uvec4 map=tri.w<min(p.layout_.z,256u)?draws.value[tri.w]:uvec4(0);
-            if(map.z!=0u){
+            if(map.z!=0u && all(lessThan(tri.xyz,uvec3(p.sizes.z)))){
                 vec3 weights=vec3(1-bary.x-bary.y,bary);
                 // BVH is in reconstructed view coordinates, so its barycentrics
                 // are affine view-space weights, not screen-space weights.
-                vec4 prev=vec4(0),now=vec4(0);bool valid=true;
+                vec4 prev=vec4(0),now=vec4(0);bool valid=true;vec3 inverseScale=vec3(0);
                 for(uint i=0;i<3;i++){
                     vec4 cc=vertices.value[tri[i]*14u];
-                    float h=(cc.z-p.projection.z*cc.w)/p.projection.w;
-                    if(isnan(h)||isinf(h)||h<=1e-6)valid=false;else weights[i]/=h;
+                    uint v=owner*9u+i*3u;
+                    inverseScale[i]=dlssInverseHomogeneousScale(cc.x,cc.y,cc.w,
+                        gathered.xyz[v],gathered.xyz[v+1u],gathered.xyz[v+2u],
+                        p.projection.x,p.projection.y);
+                    if(inverseScale[i]<=0.0)valid=false;
                 }
+                float maximum=max(inverseScale.x,max(inverseScale.y,inverseScale.z));
+                if(maximum>0.0)weights*=inverseScale/maximum;else valid=false;
                 float sumWeights=weights.x+weights.y+weights.z;
-                if(sumWeights<=1e-6)valid=false;else weights/=sumWeights;
+                if(isnan(sumWeights)||isinf(sumWeights)||sumWeights<=0.0)valid=false;else weights/=sumWeights;
                 for(uint i=0;i<3;i++){
                     uint local=tri[i]-map.y;
                     vec4 pc=clips.value[p.history.x+map.x+local];

@@ -123,17 +123,17 @@ static int vk_dlss_frame_initialize(void)
 {
     if(s_dlss_frame.initialized)return 1;
     if(s_dlss_frame.failed || !s_dlss.context)return 0;
-    VkDescriptorSetLayoutBinding bindings[14];
-    for(u32 i=0;i<14;i++)bindings[i]=(VkDescriptorSetLayoutBinding){i,
+    VkDescriptorSetLayoutBinding bindings[15];
+    for(u32 i=0;i<15;i++)bindings[i]=(VkDescriptorSetLayoutBinding){i,
         i==0||i==1||i==12?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-        i>=2&&i<=5?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i==6?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+        (i>=2&&i<=5)||i==14?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i==6?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
         i==7?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,NULL};
-    VkDescriptorSetLayoutCreateInfo layout={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=14,.pBindings=bindings};
+    VkDescriptorSetLayoutCreateInfo layout={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=15,.pBindings=bindings};
     if(pvkCreateDescriptorSetLayout(s_vk.device,&layout,NULL,&s_dlss_frame.layout)!=VK_SUCCESS)goto fail;
     VkPushConstantRange push={VK_SHADER_STAGE_COMPUTE_BIT,0,4};
     VkPipelineLayoutCreateInfo pl={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&s_dlss_frame.layout,.pushConstantRangeCount=1,.pPushConstantRanges=&push};
     if(pvkCreatePipelineLayout(s_vk.device,&pl,NULL,&s_dlss_frame.pipeline_layout)!=VK_SUCCESS)goto fail;
-    VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,3},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,4},{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,5}};
+    VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,3},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,5},{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,5}};
     VkDescriptorPoolCreateInfo pool={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=5,.pPoolSizes=sizes};
     if(pvkCreateDescriptorPool(s_vk.device,&pool,NULL,&s_dlss_frame.pool)!=VK_SUCCESS)goto fail;
     VkDescriptorSetAllocateInfo set={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=s_dlss_frame.pool,.descriptorSetCount=1,.pSetLayouts=&s_dlss_frame.layout};
@@ -281,13 +281,15 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
     VkDescriptorImageInfo images[]={{s_dlss_frame.sampler,s_eobj[source].im.view,VK_IMAGE_LAYOUT_GENERAL},{s_dlss_frame.sampler,s_eobj[depth].im.view,VK_IMAGE_LAYOUT_GENERAL},
         {0,s_dlss_frame.color.view,VK_IMAGE_LAYOUT_GENERAL},{0,s_dlss_frame.depth.view,VK_IMAGE_LAYOUT_GENERAL},{0,s_dlss_frame.motion.view,VK_IMAGE_LAYOUT_GENERAL},{0,s_dlss_frame.bias.view,VK_IMAGE_LAYOUT_GENERAL},
         {s_dlss_frame.sampler,s_dlss_frame.output.view,VK_IMAGE_LAYOUT_GENERAL},{0,s_eobj[s_dlss_frame.expanded].im.view,VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet writes[14];memset(writes,0,sizeof writes);u32 wi=0;
+    VkWriteDescriptorSet writes[15];memset(writes,0,sizeof writes);u32 wi=0;
     for(u32 i=0;i<2;i++)writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&images[i]};
     for(u32 i=0;i<4;i++)writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=2+i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&buffers[i]};
     VkWriteDescriptorSetAccelerationStructureKHR as={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,.accelerationStructureCount=1,.pAccelerationStructures=&s_ray_ao.tlas};
     writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.pNext=&as,.dstSet=s_dlss_frame.set,.dstBinding=6,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR};
     writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=7,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,.pBufferInfo=&buffers[4]};
     for(u32 i=0;i<6;i++)writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=8+i,.descriptorCount=1,.descriptorType=i==4?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.pImageInfo=&images[2+i]};
+    VkDescriptorBufferInfo gathered={s_ray_ao.triangles.buf,0,(VkDeviceSize)(epoch->index_count/3u)*36u};
+    writes[wi++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_dlss_frame.set,.dstBinding=14,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&gathered};
     pvkUpdateDescriptorSets(s_vk.device,wi,writes,0,NULL);
     vk_image *input[]={&s_dlss_frame.color,&s_dlss_frame.depth,&s_dlss_frame.motion,&s_dlss_frame.bias};
     if(s_dlss_frame.completed)for(u32 i=0;i<4;i++)vk_dlss_layout(input[i],VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL);
