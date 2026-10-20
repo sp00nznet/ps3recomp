@@ -17,7 +17,7 @@ layout(binding=9) uniform sampler2D worldColor;
 layout(binding=10) uniform sampler2D rasterDepth;
 layout(/*RSX_SCENE_OUTPUT_FORMAT*/,binding=11) writeonly uniform image2D outputColor;
 layout(/*RSX_SCENE_RAW_FORMAT*/,binding=12) writeonly uniform image2D rawColor;
-layout(std430,binding=13) buffer History {vec4 value[];} history;
+layout(std430,binding=13) buffer History {uvec4 value[];} history;
 layout(push_constant) uniform Phase {uint mode;} phase;
 // Individual descriptors and literal switch indices avoid descriptor indexing
 // features and nonuniformEXT. Every descriptor is populated, including dummies.
@@ -636,6 +636,10 @@ void main(){
         }
         return;
     }
+    // Hybrid only: 7 smooths the sky estimate before tracing, 6 accumulates
+    // the filtered lighting over time before the composite reads it.
+    if(phase.mode==7u){if(all(equal(pixel,uvec2(0))))hybridSkyUpdate();return;}
+    if(phase.mode==6u){if(all(lessThan(pixel,p.dims.xy)))hybridTemporal(pixel);return;}
     if(phase.mode>=2u){if(all(lessThan(pixel,p.dims.xy)))filterTransport(pixel);return;}
     uvec2 expanded=uvec2(p.dims.z*p.counts.z,p.dims.w);
     if(any(greaterThanEqual(pixel,expanded)))return;
@@ -644,7 +648,9 @@ void main(){
     // A separate dispatch and shader-write/read barrier make EVERY trace's
     // validity writes visible before ANY color is selected. Sparse unmatched
     // samples retain original color; invalid scenes reject the entire pass.
-    if((validity.flags&~2u)==0u && (RSX_TRANSPORT_FLAGS&32u)!=0u){
+    // Hybrid composites even a rejected frame: its temporal pass already
+    // replaced that frame's lighting with the reprojected previous result.
+    if((RSX_TRANSPORT_FLAGS&32u)!=0u){
         hybridComposite(pixel,original,raw);
     }else if((validity.flags&~2u)==0u && (RSX_TRANSPORT_FLAGS&4u)!=0u){
         uint index=pixel.y*p.dims.x+pixel.x;vec3 delta;

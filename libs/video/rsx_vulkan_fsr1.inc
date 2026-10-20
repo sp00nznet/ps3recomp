@@ -349,6 +349,20 @@ static void vk_fsr1_record(vk_fsr1_pass* p, VkImage source,
     pvkCmdEndRenderPass(s_vk.cmd);
 }
 
+/* Point a ready pass at another source of the same size. The game flips
+ * between display buffers, so the source alternates every frame; rebuilding
+ * every pass object for that cost a pipeline and a GPU wait per frame. The
+ * backend waits for each submission, so the set is not in use here. */
+static void vk_fsr1_rebind(vk_fsr1_pass* p, const vk_image* src)
+{
+    VkDescriptorImageInfo ii = { p->sampler, src->view, VK_IMAGE_LAYOUT_GENERAL };
+    VkWriteDescriptorSet wr = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = p->set,
+        .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &ii };
+    pvkUpdateDescriptorSets(s_vk.device, 1, &wr, 0, NULL);
+    p->src_view = src->view;
+}
+
 /* Returns -1 without changing *output on failure. Caller may use the original
  * image and its ordinary presentation filter. No guest image is overwritten. */
 static int vk_fsr1_apply(const vk_image* source, u32 iw, u32 ih, u32 ow, u32 oh,
@@ -360,6 +374,9 @@ static int vk_fsr1_apply(const vk_image* source, u32 iw, u32 ih, u32 ow, u32 oh,
         rsx_fsr1_make_constants(&constants, iw, ih, ow, oh, sharpness))
         return -1;
     vk_fsr1_pass* p = &s_fsr1[0];
+    if (p->ready && s_fsr1[1].ready && p->width == ow && p->height == oh &&
+        p->input_width == iw && p->input_height == ih && p->src_view != source->view)
+        vk_fsr1_rebind(p, source);
     if (!p->ready || !s_fsr1[1].ready || p->width != ow || p->height != oh ||
         p->input_width != iw || p->input_height != ih || p->src_view != source->view) {
         /* The backend waits for every draw/blit submission before returning.
@@ -379,4 +396,52 @@ static int vk_fsr1_apply(const vk_image* source, u32 iw, u32 ih, u32 ow, u32 oh,
     if (vk_submit_and_wait()) return -1;
     *output = s_fsr1[1].out.img;
     return 0;
+}
+
+/* RCAS alone at display resolution (PS3RECOMP_SHARPEN), for frames that need
+ * no FSR1 upscale: native output, a downscaled render scale, or DLSS output
+ * stretched by the ordinary blit. Same AMD RCAS kernel as FSR1's second pass. */
+static vk_fsr1_pass s_rcas;
+static void vk_rcas_shutdown(void) { vk_fsr1_pass_shutdown(&s_rcas); }
+static int vk_rcas_apply(const vk_image* source, u32 w, u32 h, float sharpness, VkImage* output)
+{
+    rsx_fsr1_constants constants;
+    if (!output || !source || !source->img || !source->view || !s_vk.device ||
+        source->img == s_rcas.out.img || rsx_fsr1_make_constants(&constants, w, h, w, h, sharpness))
+        return -1;
+    if (s_rcas.ready && s_rcas.width == w && s_rcas.height == h && s_rcas.src_view != source->view)
+        vk_fsr1_rebind(&s_rcas, source);
+    if (!s_rcas.ready || s_rcas.width != w || s_rcas.height != h || s_rcas.src_view != source->view) {
+        vk_rcas_shutdown();
+        if (vk_fsr1_pass_init(&s_rcas, source, w, h, w, h,
+                rsx_fsr1_rcas_spv, sizeof(rsx_fsr1_rcas_spv), sizeof(constants.rcas))) {
+            vk_rcas_shutdown();
+            return -1;
+        }
+    }
+    if (vk_begin()) return -1;
+    vk_fsr1_record(&s_rcas, source->img, constants.rcas, sizeof(constants.rcas));
+    if (vk_submit_and_wait()) return -1;
+    *output = s_rcas.out.img;
+    return 0;
+}
+
+/* PS3RECOMP_SHARPEN strength 0..1 as RCAS stops (0 strongest): 1 -> 0,
+ * 0.9 -> 0.2 (FSR1's default here), 0.5 -> 1.0. Unset: FSR1 keeps 0.2 and
+ * no separate RCAS pass runs. Returns the stops, or -1 for off. */
+static float vk_sharpen_stops(void)
+{
+    static int parsed; static float stops = -1.0f;
+    if (!parsed) {
+        parsed = 1;
+        const char* v = getenv("PS3RECOMP_SHARPEN");
+        if (v && *v) {
+            char* end = NULL; float s = strtof(v, &end);
+            if (!end || *end || !isfinite(s) || s < 0.0f || s > 1.0f)
+                VK_LOG("PS3RECOMP_SHARPEN must be 0..1; sharpening off\n");
+            else if (s > 0.0f) stops = 2.0f * (1.0f - s);
+            VK_LOG("sharpening: %s (RCAS %.2f stops)\n", stops >= 0 ? "on" : "off", stops >= 0 ? stops : 0.0f);
+        }
+    }
+    return stops;
 }

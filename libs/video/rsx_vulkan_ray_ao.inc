@@ -13,7 +13,10 @@
 #define VK_RAY_ALL_TEXTURES (VK_RAY_TEXTURES+VK_RAY_CUBES)
 #include "rsx_authored_lights.h"
 #include "rsx_ray_memory.h"
-static u32 vk_dlss_world(u32 source,u32 depth,VkBuffer vertices,const rsx_scene_epoch *epoch,const float projection[16],u32 remap,u32 format);
+static int vk_dlss_prepare(u32 vertices);
+static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize vertex_bytes,const rsx_scene_epoch *epoch,
+                          const float projection[16],const float camera[16],int have_camera,u64 camera_key,u32 remap,u32 format);
+static void vk_dlss_complete(int submitted,u32 source);
 typedef struct vk_ray_material {u32 alpha[4],raster[4],textures[4];float depth_range[4];u32 authored[4],rgb_textures[8];float light_view[4][4],light_rgb[4][4],light_to_view[3][4];} vk_ray_material;
 typedef struct vk_ray_parameters {float projection[4];u32 dims[4],counts[4];float settings[4];} vk_ray_parameters;
 _Static_assert(sizeof(vk_ray_material)==288 && offsetof(vk_ray_material,depth_range)==48,"GLSL std430 material layout");
@@ -45,7 +48,13 @@ static struct {
     VkSampler alpha_samplers[VK_RAY_ALL_TEXTURES];VkDescriptorImageInfo alpha_images[VK_RAY_ALL_TEXTURES];u32 texture_count,cube_count,authored_pixels,authored_changes;
     VkSamplerCreateInfo alpha_sampler_info[VK_RAY_ALL_TEXTURES];
     u64 attempted,completed,traced,rejected,last_copy_ticks,last_copy_bytes;u32 last_flags;
-    u64 invalid_position,invalid_alpha,invalid_depth,invalid_numeric,empty_ao;u32 gpu_stats[32];double cpu_ms,gpu_ms[5];
+    u64 invalid_position,invalid_alpha,invalid_depth,invalid_numeric,empty_ao;u32 gpu_stats[32];double cpu_ms,gpu_ms[7];
+    /* Hybrid frame state (CPU side of rsx_hybrid_trace.glsl): the stable key
+     * light, the previous camera for temporal reprojection, history bank. */
+    int key_valid,key_in_light;u32 key_missing,key_challenge;
+    float key_view[3],key_light[3],key_rgb[3];
+    int cam_valid;u64 cam_frame;float cam_view[12],cam_projection[4];
+    u32 history_bank;u64 held_frames,dlss_frames;
 } s_ray_ao;
 static u64 s_ray_device_generation;
 static void vk_ray_destroy_buffer(vk_buffer *b)
@@ -170,6 +179,10 @@ static int vk_ray_initialize(void)
     VkDescriptorSetAllocateInfo da={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=s_ray_ao.pool,.descriptorSetCount=1,.pSetLayouts=&s_ray_ao.layout};
     if(pvkAllocateDescriptorSets(s_vk.device,&da,&s_ray_ao.set)!=VK_SUCCESS)goto fail;
     s_ray_ao.gather=vk_ray_pipeline(rsx_scene_gather_glsl);if(!s_ray_ao.gather)goto fail;
+    /* DLSS without PT (PS3RECOMP_RSX_TRACE=0) rebuilds the scene for motion
+     * vectors only and never compiles the trace kernels. */
+    const char *trace_setting=getenv("PS3RECOMP_RSX_TRACE");
+    if(!(trace_setting && !strcmp(trace_setting,"0"))){
     char *hybrid_text=vk_ray_replace(rsx_scene_trace_glsl,"/*RSX_HYBRID_HELPER*/",rsx_hybrid_trace_glsl);if(!hybrid_text)goto fail;
     char *with_transport=vk_ray_replace(hybrid_text,"/*RSX_PATH_TRANSPORT_HELPER*/",rsx_path_transport_glsl);free(hybrid_text);if(!with_transport)goto fail;
     char *with_footprint=vk_ray_replace(with_transport,"/*RSX_RAY_FOOTPRINT_HELPER*/",rsx_ray_footprint_glsl);free(with_transport);if(!with_footprint)goto fail;
@@ -190,12 +203,13 @@ static int vk_ray_initialize(void)
         free(output_text);if(text){s_ray_ao.trace[i]=vk_ray_pipeline(text);free(text);}
     }
     free(with_rgb);if(!s_ray_ao.trace[0] || !s_ray_ao.trace[1])goto fail;
+    }
     s_ray_ao.create_queries=(PFN_vkCreateQueryPool)pvkGetDeviceProcAddr(s_vk.device,"vkCreateQueryPool");s_ray_ao.destroy_queries=(PFN_vkDestroyQueryPool)pvkGetDeviceProcAddr(s_vk.device,"vkDestroyQueryPool");
     s_ray_ao.reset_queries=(PFN_vkCmdResetQueryPool)pvkGetDeviceProcAddr(s_vk.device,"vkCmdResetQueryPool");s_ray_ao.timestamp=(PFN_vkCmdWriteTimestamp)pvkGetDeviceProcAddr(s_vk.device,"vkCmdWriteTimestamp");s_ray_ao.query_results=(PFN_vkGetQueryPoolResults)pvkGetDeviceProcAddr(s_vk.device,"vkGetQueryPoolResults");
     u32 queues=0;pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys,&queues,NULL);VkQueueFamilyProperties *q=queues && queues<=1024?(VkQueueFamilyProperties*)calloc(queues,sizeof *q):NULL;
     if(q){pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys,&queues,q);if(s_vk.queue_family<queues)s_ray_ao.timestamp_bits=q[s_vk.queue_family].timestampValidBits;free(q);}
     if(s_ray_ao.timestamp_bits && s_ray_ao.create_queries && s_ray_ao.destroy_queries && s_ray_ao.reset_queries && s_ray_ao.timestamp && s_ray_ao.query_results){
-        VkQueryPoolCreateInfo qc={.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryType=VK_QUERY_TYPE_TIMESTAMP,.queryCount=6};
+        VkQueryPoolCreateInfo qc={.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryType=VK_QUERY_TYPE_TIMESTAMP,.queryCount=8};
         if(s_ray_ao.create_queries(s_vk.device,&qc,NULL,&s_ray_ao.queries)!=VK_SUCCESS)s_ray_ao.queries=VK_NULL_HANDLE;
     }
     if(s_ray_device_generation==UINT64_MAX)goto fail;
@@ -377,9 +391,149 @@ static void vk_ray_capture_pair(u32 source,u32 output,u32 width,u32 height,u32 g
     if(ok)vk_ray_capture_lights(prefix,frame,epoch);
     free(before);free(after);free(raw);
 }
+/* ---- Hybrid frame helpers ------------------------------------------------ */
+static int vk_ray_invert4(const float m[16],float inverse[16])
+{
+    double a[4][8];for(u32 r=0;r<4;r++)for(u32 c=0;c<8;c++)a[r][c]=c<4?m[r*4+c]:(c-4==r);
+    for(u32 k=0;k<4;k++){
+        u32 pivot=k;for(u32 r=k+1;r<4;r++)if(fabs(a[r][k])>fabs(a[pivot][k]))pivot=r;
+        if(fabs(a[pivot][k])<1e-12)return 0;
+        for(u32 c=0;c<8;c++){double t=a[k][c];a[k][c]=a[pivot][c];a[pivot][c]=t;}
+        double d=a[k][k];for(u32 c=0;c<8;c++)a[k][c]/=d;
+        for(u32 r=0;r<4;r++)if(r!=k){d=a[r][k];for(u32 c=0;c<8;c++)a[r][c]-=d*a[k][c];}
+    }
+    for(u32 r=0;r<4;r++)for(u32 c=0;c<4;c++){inverse[r*4+c]=(float)a[r][c+4];if(!isfinite(inverse[r*4+c]))return 0;}
+    return 1;
+}
+static void vk_ray_mul4(const float a[16],const float b[16],float out[16])
+{
+    float t[16];
+    for(u32 r=0;r<4;r++)for(u32 c=0;c<4;c++){double v=0;for(u32 k=0;k<4;k++)v+=(double)a[r*4+k]*b[k*4+c];t[r*4+c]=(float)v;}
+    memcpy(out,t,sizeof t);
+}
+static void vk_ray_view4(const float view[12],float out[16])
+{memcpy(out,view,48);out[12]=out[13]=out[14]=0;out[15]=1;}
+static void vk_ray_projection4(const float p[4],float out[16])
+{memset(out,0,64);out[0]=p[0];out[5]=p[1];out[10]=p[2];out[11]=p[3];out[14]=1;}
+/* The frame camera. The terrain contract's light space is the game's world
+ * space, shared by every terrain draw, so its light_to_view is the camera. */
+static int vk_ray_frame_camera(const rsx_scene_epoch *epoch,float view[12],u64 *key)
+{
+    for(u32 i=0;i<epoch->draw_count && i<RSX_SCENE_EPOCH_MAX_DRAWS;i++){
+        const rsx_authored_lights *l=&s_ray_ao.authored_lights[i];
+        if(l->contract_id!=2 || l->lights[0].status==RSX_AUTHORED_UNAVAILABLE)continue;
+        const float *v=&l->light_to_view[0][0];int finite=1;
+        for(u32 k=0;k<12;k++)finite&=isfinite(v[k])!=0;
+        if(!finite)continue;
+        memcpy(view,v,48);
+        rsx_scene_draw_input draw;*key=rsx_scene_epoch_get(epoch,i,&draw)?draw.geometry_identity:0;
+        return 1;
+    }
+    return 0;
+}
+static float vk_ray_luma(const float c[3]){return .2126f*c[0]+.7152f*c[1]+.0722f*c[2];}
+static int vk_ray_same_rgb(const float a[3],const float b[3])
+{
+    float m=fmaxf(fmaxf(fabsf(a[0]),fabsf(a[1])),fmaxf(fabsf(a[2]),1e-4f));
+    for(u32 c=0;c<3;c++)if(fabsf(a[c]-b[c])>.05f*m+1e-4f)return 0;
+    return 1;
+}
+static int vk_ray_normalize3(float v[3])
+{
+    float n=sqrtf(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+    if(!(n>1e-12f) || !isfinite(n))return 0;
+    v[0]/=n;v[1]/=n;v[2]/=n;return 1;
+}
+/* One key light owns every traced direct shadow. Each draw carries its own
+ * recovered light list, and which draws are visible (and in which order)
+ * changes as the camera moves; picking the first lit draw's light made the
+ * shadow owner, and with it every shadow, jump between frames. The key is
+ * the brightest directional light by luminance and draw coverage. It is
+ * kept while any draw still carries it, survives a short absence (in world
+ * space when the camera is known), and yields to a clearly brighter light
+ * only after it has stayed brighter for a quarter of a second. */
+static void vk_ray_select_key(u32 draw_count,int have_camera,const float view[12],float light[4],float rgb[4])
+{
+    struct {float view[3],rgb[3],score;u32 count;} c[8];u32 n=0;
+    for(u32 i=0;i<draw_count && i<RSX_SCENE_EPOCH_MAX_DRAWS;i++)for(u32 l=0;l<4;l++){
+        const rsx_authored_light *a=&s_ray_ao.authored_lights[i].lights[l];
+        if(a->status!=RSX_AUTHORED_ACTIVE || a->type!=RSX_AUTHORED_DIRECTIONAL || a->view[3]!=0)continue;
+        float d[3]={a->view[0],a->view[1],a->view[2]};
+        if(!vk_ray_normalize3(d))continue;
+        float luma=vk_ray_luma(a->rgb);if(!(luma>1e-4f) || !isfinite(luma))continue;
+        u32 k=0;
+        for(;k<n;k++)if(c[k].view[0]*d[0]+c[k].view[1]*d[1]+c[k].view[2]*d[2]>.995f && vk_ray_same_rgb(c[k].rgb,a->rgb))break;
+        if(k==n){if(n==8)continue;memcpy(c[k].view,d,12);memcpy(c[k].rgb,a->rgb,12);c[k].count=0;n++;}
+        c[k].count++;
+    }
+    int best=-1;
+    for(u32 k=0;k<n;k++){c[k].score=vk_ray_luma(c[k].rgb)*sqrtf((float)c[k].count);if(best<0 || c[k].score>c[best].score)best=(int)k;}
+    /* Where the previous key should appear in this frame's view space. */
+    float expect[3]={s_ray_ao.key_view[0],s_ray_ao.key_view[1],s_ray_ao.key_view[2]};
+    if(s_ray_ao.key_valid && s_ray_ao.key_in_light && have_camera){
+        for(u32 r=0;r<3;r++)expect[r]=view[r*4]*s_ray_ao.key_light[0]+view[r*4+1]*s_ray_ao.key_light[1]+view[r*4+2]*s_ray_ao.key_light[2];
+        if(!vk_ray_normalize3(expect))memcpy(expect,s_ray_ao.key_view,12);
+    }
+    int match=-1;
+    if(s_ray_ao.key_valid)for(u32 k=0;k<n;k++)
+        if(vk_ray_same_rgb(c[k].rgb,s_ray_ao.key_rgb) && c[k].view[0]*expect[0]+c[k].view[1]*expect[1]+c[k].view[2]*expect[2]>.97f &&
+           (match<0 || c[k].score>c[match].score))match=(int)k;
+    int adopt=-1;
+    if(match>=0){
+        s_ray_ao.key_missing=0;adopt=match;
+        if(best>=0 && best!=match && c[best].score>1.5f*c[match].score){
+            if(++s_ray_ao.key_challenge>=15){adopt=best;s_ray_ao.key_challenge=0;}
+        }else s_ray_ao.key_challenge=0;
+    }else if(s_ray_ao.key_valid && s_ray_ao.key_missing<45){
+        s_ray_ao.key_missing++;memcpy(s_ray_ao.key_view,expect,12);
+    }else if(best>=0){adopt=best;s_ray_ao.key_missing=0;s_ray_ao.key_challenge=0;}
+    else s_ray_ao.key_valid=0;
+    if(adopt>=0){
+        s_ray_ao.key_valid=1;memcpy(s_ray_ao.key_view,c[adopt].view,12);memcpy(s_ray_ao.key_rgb,c[adopt].rgb,12);
+        s_ray_ao.key_in_light=0;
+        if(have_camera){
+            /* World direction: solve R*w=v with R the camera's 3x3 part. */
+            float m[16],inverse[16];vk_ray_view4(view,m);m[3]=m[7]=m[11]=0;
+            if(vk_ray_invert4(m,inverse)){
+                for(u32 r=0;r<3;r++)s_ray_ao.key_light[r]=inverse[r*4]*c[adopt].view[0]+inverse[r*4+1]*c[adopt].view[1]+inverse[r*4+2]*c[adopt].view[2];
+                s_ray_ao.key_in_light=vk_ray_normalize3(s_ray_ao.key_light);
+            }
+        }
+    }
+    memset(light,0,16);memset(rgb,0,16);
+    if(s_ray_ao.key_valid){memcpy(light,s_ray_ao.key_view,12);memcpy(rgb,s_ray_ao.key_rgb,12);rgb[3]=1;}
+}
+/* DLSS's camera: clip from the world light space (projection times camera). */
+static const float *hybrid_dlss_camera(const float projection[16],int have_camera,const float view[12])
+{
+    static float camera[16];memset(camera,0,sizeof camera);
+    if(!have_camera)return camera;
+    const float p[4]={projection[0],projection[5],projection[10],projection[14]};
+    float p4[16],v4[16];vk_ray_projection4(p,p4);vk_ray_view4(view,v4);vk_ray_mul4(p4,v4,camera);
+    return camera;
+}
+/* Rows mapping this frame's view position to the previous frame's clip
+ * space, for temporal reprojection. Without a camera on both frames this is
+ * the current projection (same-pixel history) and a camera appearing,
+ * vanishing or cutting resets the history. */
+static void vk_ray_reprojection(const float projection[16],int have_camera,const float view[12],u64 frame,float rows[16],int *reset)
+{
+    const float now_p[4]={projection[0],projection[5],projection[10],projection[14]};
+    vk_ray_projection4(now_p,rows);*reset=0;
+    if(have_camera && s_ray_ao.cam_valid && s_ray_ao.cam_frame+1==frame){
+        float maximum=0;
+        for(u32 i=0;i<12;i++)maximum=fmaxf(maximum,fabsf(view[i]-s_ray_ao.cam_view[i])/fmaxf(1,fabsf(s_ray_ao.cam_view[i])));
+        float now4[16],inverse[16],prev4[16],prev_p[16];
+        vk_ray_view4(view,now4);vk_ray_view4(s_ray_ao.cam_view,prev4);vk_ray_projection4(s_ray_ao.cam_projection,prev_p);
+        if(maximum>.35f || !vk_ray_invert4(now4,inverse)){*reset=1;return;}
+        vk_ray_mul4(prev_p,prev4,rows);vk_ray_mul4(rows,inverse,rows);
+        for(u32 i=0;i<16;i++)if(!isfinite(rows[i])){vk_ray_projection4(now_p,rows);*reset=1;return;}
+    }else if(have_camera || s_ray_ao.cam_valid)*reset=1;
+}
 static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 logical_h,const float projection[16],u32 remap,u32 rsx_format,float radius,float strength)
 {
     (void)user;u64 start=SDL_GetPerformanceCounter(),record_start=0,submit_start=0;u64 token=0;int recorded=0,submitted=0;u32 replacement=0;
+    int hybrid_have_camera=0;float hybrid_view[12]={0};u64 hybrid_camera_key=0;u32 dlss_view=0;
     const char *failure="epoch/projection qualification";
     rsx_scene_epoch *epoch=vk_rt_epoch(depth);s_ray_ao.attempted++;
     if(epoch && epoch->reason!=RSX_SCENE_EPOCH_OK){
@@ -416,9 +570,17 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     if(!source || !snapshot || source->w!=width*gx || source->h!=height || snapshot->w!=width*gx || snapshot->h!=height || snapshot->fmt!=VK_FORMAT_R32_SFLOAT)goto fail;
     const char *authored_env=getenv("PS3RECOMP_RSX_AUTHORED_LIGHTS");
     const char *hybrid_env=getenv("PS3RECOMP_RSX_HYBRID_PT");
-    const u32 hybrid_mode=hybrid_env && !strcmp(hybrid_env,"1");
+    /* PS3RECOMP_RSX_TRACE=0: capture and rebuild the scene only for DLSS
+     * motion vectors, with no ray-traced lighting (DLSS without PT). */
+    const char *trace_env=getenv("PS3RECOMP_RSX_TRACE");
+    const u32 trace_off=trace_env && !strcmp(trace_env,"0");
+    const u32 hybrid_mode=trace_off || (hybrid_env && !strcmp(hybrid_env,"1"));
     const u32 authored_mode=hybrid_mode || (authored_env && !strcmp(authored_env,"1"));
-    u32 aw=authored_mode?width*gx:(width<320?width:320),ah=authored_mode?height:(height<180?height:180);
+    /* Hybrid lighting is traced once per logical pixel and shared by its
+     * MSAA samples; the other modes trace every sample. */
+    u32 aw=hybrid_mode?width:authored_mode?width*gx:(width<320?width:320),ah=authored_mode?height:(height<180?height:180);
+    const int dlss_ready=hybrid_mode && vk_dlss_prepare(epoch->vertex_count);
+    if(trace_off && !dlss_ready){failure="DLSS unavailable for the trace-off scene path";goto fail;}
     // All resources/samplers retire after the prior synchronous submission.
     vk_ray_alpha_reset();
     failure="bounded resident allocation";
@@ -426,7 +588,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
        !vk_ray_buffer(&s_ray_ao.indices,(VkDeviceSize)triangles*32,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
        !vk_ray_buffer(&s_ray_ao.materials,(VkDeviceSize)epoch->draw_count*sizeof(vk_ray_material),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
        !vk_ray_buffer(&s_ray_ao.fp,16u*1024u*1024u,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,1,0) ||
-       !vk_ray_buffer(&s_ray_ao.history,(VkDeviceSize)aw*ah*32,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,0,0) ||
+       !vk_ray_buffer(&s_ray_ao.history,(VkDeviceSize)aw*ah*32+16,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,0,0) ||
        !vk_ray_buffer(&s_ray_ao.params,sizeof(vk_ray_parameters),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,1,0) ||
        !vk_ray_buffer(&s_ray_ao.triangles,(VkDeviceSize)triangles*36,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,0,1) ||
        !vk_ray_buffer(&s_ray_ao.ao,(VkDeviceSize)aw*ah*40+128,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,0,0) ||
@@ -512,6 +674,10 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
             if(unit>=0)vk_ray_texture(draw.textures[unit],&draw.samplers[unit],&material.textures[2],0);
             material.textures[3]=(u32)(unit<0?0:unit);
             material.depth_range[2]=rs->alpha_test_enable?(float)rs->alpha_ref_raw/255.0f:0.0f;
+            /* Alpha-tested cutouts (GREATER/GEQUAL, the foliage case) keep
+             * their holes in shadow rays; see hybridCutoutKeep. */
+            if(rs->alpha_test_enable && (rs->alpha_func==0x204u || rs->alpha_func==0x206u) && material.textures[2]<VK_RAY_TEXTURES)
+                material.textures[3]|=0x200u;
             material.depth_range[3]=(float)epoch->frame;
             /* An exact pool source explicitly carries a cube reflection. */
             if(light_contract==1 || strstr(pipeline->scene_ps,"TextureCube "))material.textures[3]|=0x100u;
@@ -568,6 +734,16 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         float jitter[4]={0};vk_dlss_jitter(jitter);
         if(fp_used+16>s_ray_ao.fp.size)goto fail;
         memcpy((u8*)s_ray_ao.fp.ptr+fp_used,jitter,16);fp_used+=16;
+        /* fp+2 key light (view space, w=0 directional), fp+3 its radiance
+         * (w=1 valid), fp+4..7 reprojection rows, fp+8 (0, bank, reset, 0). */
+        float block[7][4];memset(block,0,sizeof block);
+        hybrid_have_camera=vk_ray_frame_camera(epoch,hybrid_view,&hybrid_camera_key);
+        vk_ray_select_key(epoch->draw_count,hybrid_have_camera,hybrid_view,block[0],block[1]);
+        int reset=0;vk_ray_reprojection(projection,hybrid_have_camera,hybrid_view,epoch->frame,&block[2][0],&reset);
+        if(s_ray_ao.history_w!=aw || s_ray_ao.history_h!=ah)reset=1;
+        block[6][1]=(float)s_ray_ao.history_bank;block[6][2]=reset?1.0f:0.0f;
+        if(fp_used+sizeof block>s_ray_ao.fp.size)goto fail;
+        memcpy((u8*)s_ray_ao.fp.ptr+fp_used,block,sizeof block);fp_used+=sizeof block;
     }
     if(primitive!=triangles || !rsx_scene_epoch_seal(epoch,s_rt_capture.frame,epoch->serial))goto fail;
     /* Opaque shaders can have no fragment constants. Vulkan still requires
@@ -598,7 +774,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     if(!vk_ray_as(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,&tg,1,&s_ray_ao.tlas,&s_ray_ao.tlas_store,&s_ray_ao.tscratch,&tb))goto fail;
     failure="command recording";record_start=SDL_GetPerformanceCounter();
     if(vk_begin() || pvkResetFences(s_vk.device,1,&s_vk.fence)!=VK_SUCCESS)goto fail;
-    if(s_ray_ao.queries){s_ray_ao.reset_queries(s_vk.cmd,s_ray_ao.queries,0,6);vk_ray_stamp(0,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);}
+    if(s_ray_ao.queries){s_ray_ao.reset_queries(s_vk.cmd,s_ray_ao.queries,0,8);vk_ray_stamp(0,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);}
     rsx_scene_batch_output batch;if(rsx_vulkan_scene_batch_record(token,s_vk.cmd,s_vk.fence,&batch))goto abandon;recorded=1;
     if(hybrid_mode){
         /* Invalid post-VS vertices were replaced with zero. Gather discards
@@ -622,11 +798,12 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     VkDescriptorImageInfo raw_image={VK_NULL_HANDLE,s_eobj[s_ray_ao.raw_color].im.view,VK_IMAGE_LAYOUT_GENERAL};
     writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=12,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.pImageInfo=&raw_image};
     for(u32 i=0;i<VK_RAY_ALL_TEXTURES;i++)writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=16+i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&s_ray_ao.alpha_images[i]};
-    VkDescriptorBufferInfo history_info={s_ray_ao.history.buf,0,(VkDeviceSize)aw*ah*32};
+    /* Two history banks per trace pixel plus the smoothed sky slot. */
+    VkDescriptorBufferInfo history_info={s_ray_ao.history.buf,0,(VkDeviceSize)aw*ah*32+16};
     writes[wn++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=s_ray_ao.set,.dstBinding=13,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&history_info};
     pvkUpdateDescriptorSets(s_vk.device,wn,writes,0,NULL);
     if(s_ray_ao.history_w!=aw || s_ray_ao.history_h!=ah){
-        s_ray_ao.fill_buffer(s_vk.cmd,s_ray_ao.history.buf,0,(VkDeviceSize)aw*ah*32,0);
+        s_ray_ao.fill_buffer(s_vk.cmd,s_ray_ao.history.buf,0,(VkDeviceSize)aw*ah*32+16,0);
         s_ray_ao.history_w=aw;s_ray_ao.history_h=ah;
     }
     s_ray_ao.fill_buffer(s_vk.cmd,s_ray_ao.ao.buf,(VkDeviceSize)aw*ah*40,128,0);
@@ -637,18 +814,42 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     VkAccelerationStructureBuildRangeInfoKHR br={.primitiveCount=triangles},tr={.primitiveCount=1};const VkAccelerationStructureBuildRangeInfoKHR *brp=&br,*trp=&tr;
     s_ray_ao.build(s_vk.cmd,1,&bb,&brp);vk_ray_memory(VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     s_ray_ao.build(s_vk.cmd,1,&tb,&trp);vk_ray_memory(VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);vk_ray_stamp(3,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
-    u32 mode=0;pvkCmdBindPipeline(s_vk.cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s_ray_ao.trace[source->fmt==VK_FORMAT_R16G16B16A16_SFLOAT]);pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);s_ray_ao.dispatch(s_vk.cmd,(aw+7)/8,(ah+7)/8,1);
-    vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);vk_ray_stamp(4,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-    mode=5;pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);
-    s_ray_ao.dispatch(s_vk.cmd,1,1,1);
-    vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
-    if(denoise)for(mode=2;mode<=4;mode++){
-        pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);
-        s_ray_ao.dispatch(s_vk.cmd,(aw+7)/8,(ah+7)/8,1);
+    u32 mode=0;
+    if(!trace_off){
+        pvkCmdBindPipeline(s_vk.cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s_ray_ao.trace[source->fmt==VK_FORMAT_R16G16B16A16_SFLOAT]);
+        if(hybrid_mode){
+            /* 7: smoothed sky estimate, read by every trace below. */
+            mode=7;pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);s_ray_ao.dispatch(s_vk.cmd,1,1,1);
+            vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
+        }
+        mode=0;pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);s_ray_ao.dispatch(s_vk.cmd,(aw+7)/8,(ah+7)/8,1);
+        vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);vk_ray_stamp(4,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        mode=5;pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);
+        s_ray_ao.dispatch(s_vk.cmd,1,1,1);
         vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
+        /* Hybrid filters twice (steps 1, 2: planes 0->5->0); the scalar modes three times. */
+        if(denoise)for(mode=2;mode<=(hybrid_mode?3u:4u);mode++){
+            pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);
+            s_ray_ao.dispatch(s_vk.cmd,(aw+7)/8,(ah+7)/8,1);
+            vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
+        }
+        if(hybrid_mode){
+            /* 6: temporal accumulation (plane 0 -> plane 5 and history). */
+            mode=6;pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);s_ray_ao.dispatch(s_vk.cmd,(aw+7)/8,(ah+7)/8,1);
+            vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
+        }
+        mode=1;pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);s_ray_ao.dispatch(s_vk.cmd,(width*gx+7)/8,(height+7)/8,1);
+        vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
+    }else vk_ray_stamp(4,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    vk_ray_stamp(5,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    /* DLSS joins this submission: input from the traced composite (or the
+     * raw world when tracing is off), recorded before the one wait below. */
+    if(dlss_ready){
+        dlss_view=vk_dlss_record(trace_off?source_color:s_ray_ao.color,source_depth,batch.vertices,batch.vertex_bytes,epoch,projection,
+                                 hybrid_dlss_camera(projection,hybrid_have_camera,hybrid_view),hybrid_have_camera,hybrid_camera_key,remap,rsx_format);
+        if(dlss_view==UINT32_MAX){dlss_view=0;failure="DLSS evaluation recording";goto abandon;}
     }
-    mode=1;pvkCmdPushConstants(s_vk.cmd,s_ray_ao.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&mode);s_ray_ao.dispatch(s_vk.cmd,(width*gx+7)/8,(height+7)/8,1);
-    vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);vk_ray_stamp(5,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    vk_ray_stamp(6,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     // Existing synchronous boundary: validity, four query counters, and the
     // first alpha and depth failures' bounded diagnostic fields. No vertex readback.
     vk_ray_memory(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT);
@@ -657,6 +858,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     vk_ray_memory(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_HOST_READ_BIT);
     failure="synchronous integration submission";submit_start=SDL_GetPerformanceCounter();
     if(vk_submit_and_wait())goto abandon;
+    vk_dlss_complete(1,trace_off?source_color:s_ray_ao.color);
     submitted=1;if(rsx_vulkan_scene_batch_mark_submitted(token) || rsx_vulkan_scene_batch_reset(token))goto fail;recorded=0;token=0;
     memcpy(&s_ray_ao.last_flags,s_ray_ao.flag_readback.ptr,4);s_ray_ao.traced++;
     memcpy(s_ray_ao.gpu_stats,(unsigned char*)s_ray_ao.flag_readback.ptr+4,128);
@@ -669,9 +871,27 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     if(s_ray_ao.last_flags&1u)s_ray_ao.invalid_position++;if(s_ray_ao.last_flags&4u)s_ray_ao.invalid_alpha++;if(s_ray_ao.last_flags&8u)s_ray_ao.invalid_depth++;if(s_ray_ao.last_flags&16u)s_ray_ao.invalid_numeric++;
     if(authored_mode && !hybrid_mode)VK_LOG("authored source frame=%llu qualifiedDraws=%u/%u rasterAgreed=%u changedSamples=%u coloredBounceSamples=%u ambiguousOwners=%u shadowedSources=%u reflectionDirections=%u reflectedHits=%u\n",(unsigned long long)epoch->frame,s_ray_ao.authored_draws,epoch->draw_count,s_ray_ao.gpu_stats[24],s_ray_ao.gpu_stats[25],s_ray_ao.gpu_stats[26],s_ray_ao.gpu_stats[27],s_ray_ao.gpu_stats[28],s_ray_ao.gpu_stats[29],s_ray_ao.gpu_stats[30]);
     if(!s_ray_ao.gpu_stats[1] || !s_ray_ao.gpu_stats[2])s_ray_ao.empty_ao++;
-    if(!(s_ray_ao.last_flags&~2u) && s_ray_ao.gpu_stats[1] && (authored_mode?s_ray_ao.gpu_stats[24]:s_ray_ao.gpu_stats[2])){out->scale=scale;out->grid_x=gx;out->grid_y=1;replacement=vk_eng_surface_view(NULL,s_ray_ao.color,remap,rsx_format);if(replacement)s_ray_ao.completed++;}
+    if(hybrid_mode){
+        /* The decision is on the GPU: a rejected gather/trace frame composited
+         * the previous frame's reprojected lighting (hybridTemporal). */
+        if(s_ray_ao.last_flags&~2u)s_ray_ao.held_frames++;
+        if(dlss_view){replacement=dlss_view;s_ray_ao.dlss_frames++;}
+        else if(!trace_off){out->scale=scale;out->grid_x=gx;out->grid_y=1;replacement=vk_eng_surface_view(NULL,s_ray_ao.color,remap,rsx_format);}
+        if(!trace_off){
+            s_ray_ao.history_bank^=1u;s_ray_ao.cam_valid=hybrid_have_camera;s_ray_ao.cam_frame=epoch->frame;
+            memcpy(s_ray_ao.cam_view,hybrid_view,sizeof s_ray_ao.cam_view);
+            s_ray_ao.cam_projection[0]=projection[0];s_ray_ao.cam_projection[1]=projection[5];s_ray_ao.cam_projection[2]=projection[10];s_ray_ao.cam_projection[3]=projection[14];
+        }
+        if(replacement)s_ray_ao.completed++;
+    }
+    else if(!(s_ray_ao.last_flags&~2u) && s_ray_ao.gpu_stats[1] && (authored_mode?s_ray_ao.gpu_stats[24]:s_ray_ao.gpu_stats[2])){out->scale=scale;out->grid_x=gx;out->grid_y=1;replacement=vk_eng_surface_view(NULL,s_ray_ao.color,remap,rsx_format);if(replacement)s_ray_ao.completed++;}
     if(!replacement)s_ray_ao.rejected++;
-    if(s_ray_ao.queries){u64 times[6];if(s_ray_ao.query_results(s_vk.device,s_ray_ao.queries,0,6,sizeof times,times,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){u64 mask_bits=s_ray_ao.timestamp_bits>=64?UINT64_MAX:(1ull<<s_ray_ao.timestamp_bits)-1;for(unsigned i=0;i<5;i++)s_ray_ao.gpu_ms[i]=(double)((times[i+1]-times[i])&mask_bits)*s_ray_ao.properties.limits.timestampPeriod/1000000.0;}}
+    if(s_ray_ao.queries){u64 times[7];if(s_ray_ao.query_results(s_vk.device,s_ray_ao.queries,0,7,sizeof times,times,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){u64 mask_bits=s_ray_ao.timestamp_bits>=64?UINT64_MAX:(1ull<<s_ray_ao.timestamp_bits)-1;for(unsigned i=0;i<6;i++)s_ray_ao.gpu_ms[i]=(double)((times[i+1]-times[i])&mask_bits)*s_ray_ao.properties.limits.timestampPeriod/1000000.0;}
+        /* DLSS split: input/motion preparation, then NGX evaluation and output. */
+        u64 prepared;if(dlss_view && s_ray_ao.query_results(s_vk.device,s_ray_ao.queries,7,1,sizeof prepared,&prepared,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS){
+            u64 mask_bits=s_ray_ao.timestamp_bits>=64?UINT64_MAX:(1ull<<s_ray_ao.timestamp_bits)-1;
+            s_ray_ao.gpu_ms[6]=(double)((prepared-times[5])&mask_bits)*s_ray_ao.properties.limits.timestampPeriod/1000000.0;
+        }else s_ray_ao.gpu_ms[6]=0;}
     s_ray_ao.cpu_ms=(double)(SDL_GetPerformanceCounter()-start)*1000.0/(double)SDL_GetPerformanceFrequency();
     if(hybrid_mode && SDL_GetTicks64()-s_ray_ao.last_hybrid_log>=1000){
         u32 world=s_ray_ao.gpu_stats[0],traced=s_ray_ao.gpu_stats[24],hits=s_ray_ao.gpu_stats[5];
@@ -684,7 +904,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
     }
     double copy_ms=(double)(s_rt_capture.copy_ticks-s_ray_ao.last_copy_ticks)*1000.0/(double)SDL_GetPerformanceFrequency();
     u64 copied=s_rt_capture.copied_bytes-s_ray_ao.last_copy_bytes;s_ray_ao.last_copy_ticks=s_rt_capture.copy_ticks;s_ray_ao.last_copy_bytes=s_rt_capture.copied_bytes;
-    if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))VK_LOG("ray transport mode=%s denoiser=%s frame=%llu epoch=%llu requested=%llu traced=%llu validFrames=%llu fallback=%llu flags=0x%x reasonCounts(pos/alpha/depth/numeric)=%llu/%llu/%llu/%llu draws=%u vertices=%u triangles=%u traceGrid=%ux%u paths=%u maxBounces=%u alphaLOD=ray-cone copied=%llu copyCPU=%.3fms totalCPU=%.3fms prepare/record/wait=%.3f/%.3f/%.3fms GPU(VS/gather/AS/trace/composite)=%.3f/%.3f/%.3f/%.3f/%.3fms timestampBits=%u\n",transport_mode,denoise?"spatial":"off",(unsigned long long)epoch->frame,(unsigned long long)epoch->generation,(unsigned long long)s_ray_ao.attempted,(unsigned long long)s_ray_ao.traced,(unsigned long long)s_ray_ao.completed,(unsigned long long)s_ray_ao.rejected,s_ray_ao.last_flags,(unsigned long long)s_ray_ao.invalid_position,(unsigned long long)s_ray_ao.invalid_alpha,(unsigned long long)s_ray_ao.invalid_depth,(unsigned long long)s_ray_ao.invalid_numeric,epoch->draw_count,epoch->vertex_count,triangles,aw,ah,authored_mode?1u:path_preview?8u:4u,authored_mode?1u:path_preview?4u:1u,(unsigned long long)copied,copy_ms,s_ray_ao.cpu_ms,(double)(record_start-start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(submit_start-record_start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(SDL_GetPerformanceCounter()-submit_start)*1000.0/(double)SDL_GetPerformanceFrequency(),s_ray_ao.gpu_ms[0],s_ray_ao.gpu_ms[1],s_ray_ao.gpu_ms[2],s_ray_ao.gpu_ms[3],s_ray_ao.gpu_ms[4],s_ray_ao.timestamp_bits);
+    if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))VK_LOG("ray transport mode=%s denoiser=%s frame=%llu epoch=%llu requested=%llu traced=%llu validFrames=%llu fallback=%llu flags=0x%x reasonCounts(pos/alpha/depth/numeric)=%llu/%llu/%llu/%llu draws=%u vertices=%u triangles=%u traceGrid=%ux%u paths=%u maxBounces=%u alphaLOD=ray-cone copied=%llu copyCPU=%.3fms totalCPU=%.3fms prepare/record/wait=%.3f/%.3f/%.3fms GPU(VS/gather/AS/trace/composite/DLSS)=%.3f/%.3f/%.3f/%.3f/%.3f/%.3fms dlssPrep=%.3fms heldFrames=%llu dlssFrames=%llu key=%d timestampBits=%u\n",trace_off?"dlss-scene-only":transport_mode,denoise?"spatial":"off",(unsigned long long)epoch->frame,(unsigned long long)epoch->generation,(unsigned long long)s_ray_ao.attempted,(unsigned long long)s_ray_ao.traced,(unsigned long long)s_ray_ao.completed,(unsigned long long)s_ray_ao.rejected,s_ray_ao.last_flags,(unsigned long long)s_ray_ao.invalid_position,(unsigned long long)s_ray_ao.invalid_alpha,(unsigned long long)s_ray_ao.invalid_depth,(unsigned long long)s_ray_ao.invalid_numeric,epoch->draw_count,epoch->vertex_count,triangles,aw,ah,authored_mode?1u:path_preview?8u:4u,authored_mode?1u:path_preview?4u:1u,(unsigned long long)copied,copy_ms,s_ray_ao.cpu_ms,(double)(record_start-start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(submit_start-record_start)*1000.0/(double)SDL_GetPerformanceFrequency(),(double)(SDL_GetPerformanceCounter()-submit_start)*1000.0/(double)SDL_GetPerformanceFrequency(),s_ray_ao.gpu_ms[0],s_ray_ao.gpu_ms[1],s_ray_ao.gpu_ms[2],s_ray_ao.gpu_ms[3],s_ray_ao.gpu_ms[4],s_ray_ao.gpu_ms[5],s_ray_ao.gpu_ms[6],(unsigned long long)s_ray_ao.held_frames,(unsigned long long)s_ray_ao.dlss_frames,s_ray_ao.key_valid,s_ray_ao.timestamp_bits);
     if(s_ray_ao.traced<=4 || s_ray_ao.traced%120==0 || (!replacement && s_ray_ao.rejected<=8))VK_LOG("ray AO actual queries primary=%u matched=%u secondary=%u alphaRejected=%u emptyFrames=%llu\n",s_ray_ao.gpu_stats[0],s_ray_ao.gpu_stats[1],s_ray_ao.gpu_stats[2],s_ray_ao.gpu_stats[3],(unsigned long long)s_ray_ao.empty_ao);
     if(!hybrid_mode && s_ray_ao.gpu_stats[4] && (s_ray_ao.traced<=4 || s_ray_ao.traced%120==0)){
         float numeric_value;memcpy(&numeric_value,&s_ray_ao.gpu_stats[11],4);
@@ -694,10 +914,10 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         float z,expected,nearest;memcpy(&z,&s_ray_ao.gpu_stats[17],4);memcpy(&expected,&s_ray_ao.gpu_stats[18],4);memcpy(&nearest,&s_ray_ao.gpu_stats[19],4);
         VK_LOG("ray AO depth failure pixel=%u,%u raster=%u,%u sample=0 z=%g expected=%g candidate=%u nearest=%g primitive=%u material=%u coverage=%u alphaContract=%u\n",s_ray_ao.gpu_stats[13],s_ray_ao.gpu_stats[14],s_ray_ao.gpu_stats[15],s_ray_ao.gpu_stats[16],z,expected,s_ray_ao.gpu_stats[20]!=UINT32_MAX,nearest,s_ray_ao.gpu_stats[20],s_ray_ao.gpu_stats[21],s_ray_ao.gpu_stats[22],s_ray_ao.gpu_stats[23]);
     }
-    if(replacement)vk_ray_capture_pair(source_color,s_ray_ao.color,width*gx,height,gx,epoch->frame,epoch->generation,transport_mode,denoise,strength);
-    if(replacement){u32 sr=vk_dlss_world(s_ray_ao.color,source_depth,batch.vertices,epoch,projection,remap,rsx_format);if(sr)replacement=sr;}
+    if(replacement && !trace_off)vk_ray_capture_pair(source_color,s_ray_ao.color,width*gx,height,gx,epoch->frame,epoch->generation,transport_mode,denoise,strength);
     return replacement;
 abandon:
+    vk_dlss_complete(0,0);
     // If submission failed, drain before invalidating recorded command storage.
     if(pvkDeviceWaitIdle(s_vk.device)==VK_SUCCESS){
         pvkResetCommandBuffer(s_vk.cmd,0);s_batch.recording=0;s_batch.pending=0;
@@ -706,6 +926,7 @@ abandon:
         if(recorded && !submitted){rsx_vulkan_scene_batch_discard_recording(token);recorded=0;}
     } else s_ray_ao.failed=1; // Retain batch ownership until device teardown.
 fail:
+    vk_dlss_complete(0,0);
     if(token && !recorded)rsx_vulkan_scene_batch_reset(token);
     if(epoch)rsx_scene_epoch_invalidate(epoch,RSX_SCENE_EPOCH_UNSUPPORTED);s_ray_ao.rejected++;
     if(!s_ray_ao.warned || s_ray_ao.rejected<=8 || s_ray_ao.rejected%120==0){VK_LOG("ray AO CPU fallback reason=%s requested=%llu traced=%llu validAO=%llu fallback=%llu frame=%llu epoch=%llu; original world color retained\n",failure,(unsigned long long)s_ray_ao.attempted,(unsigned long long)s_ray_ao.traced,(unsigned long long)s_ray_ao.completed,(unsigned long long)s_ray_ao.rejected,(unsigned long long)(epoch?epoch->frame:0),(unsigned long long)(epoch?epoch->generation:0));s_ray_ao.warned=1;}

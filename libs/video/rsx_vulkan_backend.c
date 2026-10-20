@@ -170,6 +170,8 @@ typedef struct vk_state {
     u64              fxaa_frames;
     int              fsr1_enabled, fsr1_failed, fsr1_scale_fallback;
     u64              fsr1_frames;
+    int              fsr1_sharpened, rcas_failed;   /* this frame's FSR1 ran RCAS; RCAS pass broken */
+    u64              rcas_frames;
     VkImage          display_image;
     vk_image         color;           /* R8G8B8A8_UNORM                 */
     vk_image         depth;           /* D32_SFLOAT or fallback         */
@@ -2288,6 +2290,21 @@ static void vk_cb_present(void* ud, u32 buffer_id)
         if (++s_vk.fxaa_frames <= 4)
             VK_LOG("FXAA frame %llu filtered at %ux%u\n", (unsigned long long)s_vk.fxaa_frames, s_vk.width, s_vk.height);
     }
+    /* Sharpen at display resolution unless FSR1's own RCAS already ran. */
+    const float sharpen = vk_sharpen_stops();
+    if (sharpen >= 0.0f && !s_vk.fsr1_sharpened && !s_vk.rcas_failed) {
+        const vk_image* src = s_vk.fxaa_enabled ? &s_fxaa.out : &s_vk.color;
+        VkImage sharpened = VK_NULL_HANDLE;
+        if (vk_rcas_apply(src, s_vk.width, s_vk.height, sharpen, &sharpened)) {
+            s_vk.rcas_failed = 1;
+            VK_LOG("RCAS sharpening unavailable; presenting unsharpened\n");
+        } else {
+            display = sharpened;
+            if (++s_vk.rcas_frames <= 2)
+                VK_LOG("RCAS frame %llu sharpened at %ux%u\n", (unsigned long long)s_vk.rcas_frames, s_vk.width, s_vk.height);
+        }
+    }
+    s_vk.fsr1_sharpened = 0;
     s_vk.display_image = display;
     /* The whole frame comes back to host memory for the frame dump, the
      * vtable path's centre-pixel probe and the offscreen GPU suites. A
@@ -2378,6 +2395,7 @@ typedef struct vk_eng_obj {
     VkFramebuffer   argb_fb;
     VkDescriptorSet argb_set;
     u32             argb_src;
+    u8              dlss_world;      /* COLOR/DEPTH: the world target at DLSS input extent */
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -2396,6 +2414,7 @@ static u64 s_temporal_geometry,s_temporal_slots;
 static void vk_eng_temporal_identity(void* user,u64 geometry,u64 slots){(void)user;s_temporal_geometry=geometry;s_temporal_slots=slots;}
 static void vk_dlss_jitter(float out[2]);
 static void vk_dlss_jitter_upload(void *constants,size_t bytes);
+static int vk_dlss_world_extent(u32 *w,u32 *h);
 static void vk_rt_capture_draw(u32 pipeline,rsx_topology topology,const void* vertices,
     u32 vertex_count,u32 stride,const u32* indices,u32 index_count);
 /* Defined with the E2 pipeline state further down. */
@@ -2720,9 +2739,10 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
 static u32 vk_eng_target_multisample(void* user, rsx_be_format fmt, u32 w, u32 h, u32 samples, int depth)
 {
     const u32 guest_w=w,guest_h=h;
-    const int quality=vk_eng_quality_world(w,h,samples);
+    u32 quality_w=0,quality_h=0;
+    const int quality=vk_eng_quality_world(w,h,samples,&quality_w,&quality_h);
     if ((samples != 2 && samples != 4) || vk_eng_scale_extent(&w,&h,samples)) return 0;
-    if(quality){w=1707;h=960;}
+    if(quality){w=quality_w;h=quality_h;}
     u32 bpp = 0;
     const VkFormat vf = depth ? s_vk.depth_format : vk_eng_format(fmt, &bpp);
     if (!depth && vk_eng_rt_index(vf) < 0) return 0;
@@ -2737,7 +2757,7 @@ static u32 vk_eng_target_multisample(void* user, rsx_be_format fmt, u32 w, u32 h
     }
     o->kind = depth ? VK_ENG_DEPTH : VK_ENG_COLOR;
     o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h; o->scale=s_render_scale; o->samples = samples;
-    if(quality){o->guest_w=guest_w;o->guest_h=guest_h;}
+    if(quality){o->guest_w=guest_w;o->guest_h=guest_h;o->dlss_world=1;}
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkImageSubresourceRange range = {aspect, 0, 1, 0, 1};
@@ -2842,10 +2862,12 @@ static void vk_eng_present(void* user, u32 surface)
             s_vk.fsr1_scale_fallback = 1;
         } else {
             s_vk.fsr1_scale_fallback = 0;
-            if (vk_fsr1_apply(&o->im, o->w, o->h, fit_w, fit_h, 0.2f, &display)) {
+            const float stops = vk_sharpen_stops();
+            if (vk_fsr1_apply(&o->im, o->w, o->h, fit_w, fit_h, stops >= 0.0f ? stops : 0.2f, &display)) {
                 s_vk.fsr1_failed = 1;
                 VK_LOG("FSR1 unavailable: using ordinary display blit for this session\n");
             } else {
+                s_vk.fsr1_sharpened = 1;
                 display_width = fit_w;
                 display_height = fit_h;
                 if (++s_vk.fsr1_frames <= 4)
@@ -3462,8 +3484,9 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
         scaled_ps=(char*)malloc(length+512u);
         if (!scaled_ps) { pvkDestroyShaderModule(s_vk.device,P->vs,NULL); memset(P,0,sizeof *P);return 0; }
         memcpy(scaled_ps,ps_hlsl,length+1u);
-        const int quality=rs->depth_test && vk_eng_quality_world(1280,720,2);
-        if (rsx_fp_apply_resolution_scale(scaled_ps,(u32)length+512u,quality?1280:1,quality?720:1,quality?1707:s_render_scale,quality?960:s_render_scale)<0) {
+        u32 quality_w=0,quality_h=0;
+        const int quality=rs->depth_test && vk_eng_quality_world(1280,720,2,&quality_w,&quality_h);
+        if (rsx_fp_apply_resolution_scale(scaled_ps,(u32)length+512u,quality?1280:1,quality?720:1,quality?quality_w:s_render_scale,quality?quality_h:s_render_scale)<0) {
             free(scaled_ps);pvkDestroyShaderModule(s_vk.device,P->vs,NULL);memset(P,0,sizeof *P);return 0;
         }
     }
@@ -4578,6 +4601,7 @@ void rsx_vulkan_backend_shutdown(void)
         vk_destroy_image(&s_vk.dummy);
         vk_destroy_image(&s_vk.depth);
         vk_fsr1_shutdown();
+        vk_rcas_shutdown();
         vk_fxaa_shutdown();
         vk_destroy_image(&s_vk.color);
         vk_destroy_buffer(&s_vk.vertices);

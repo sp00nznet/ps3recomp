@@ -4,10 +4,15 @@
 static u32 s_render_scale = 1;
 static int vk_eng_readback_rows_raw(u32,u32,u32,u32,u32,void*,u32);
 static int vk_eng_depth_readback_raw(u32,u32,u32,u32,u32,void*,u32);
-static int vk_eng_quality_world(u32 w,u32 h,u32 samples)
+/* The game's 1280x720 two-sample world target, rendered at DLSS's input
+ * extent when DLSS runs (rsx_vulkan_dlss_frame.inc decides the extent). */
+static int vk_eng_quality_world(u32 w,u32 h,u32 samples,u32 *host_w,u32 *host_h)
 {
-    const char *enabled=getenv("PS3RECOMP_DLSS");
-    return enabled && !strcmp(enabled,"1") && w==1280 && h==720 && samples==2;
+    u32 iw,ih;
+    if(w!=1280 || h!=720 || samples!=2 || !vk_dlss_world_extent(&iw,&ih))return 0;
+    if(host_w)*host_w=iw;
+    if(host_h)*host_h=ih;
+    return 1;
 }
 static void vk_eng_bound_scale(float *x,float *y)
 {

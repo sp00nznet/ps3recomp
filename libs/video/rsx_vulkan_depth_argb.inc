@@ -21,7 +21,7 @@ static struct {
     VkPipelineLayout layout;
     VkShaderModule vs;
     VkRenderPass pass;
-    struct { u32 key; VkShaderModule fs; VkPipeline pipeline; } variant[VK_DARGB_MAX_VARIANTS];
+    struct { u32 key, hw, hh, gw, gh; VkShaderModule fs; VkPipeline pipeline; } variant[VK_DARGB_MAX_VARIANTS];
     u32 nvariant;
 } s_dargb;
 
@@ -40,11 +40,14 @@ static void vk_eng_depth_argb_shutdown(void)
 }
 
 /* key: raster scale k, sample grid gx/gy (vk_eng_scaled_read's texel choice),
- * bit 12 rsx_texture_argb_is_rgba, bit 13 D8R8G8B8 (alpha reads 255). */
-static VkPipeline vk_eng_depth_argb_pipeline(u32 key)
+ * bit 12 rsx_texture_argb_is_rgba, bit 13 D8R8G8B8 (alpha reads 255),
+ * bit 14 fractional extent: hw/hh/gw/gh are the per-sample host and guest
+ * extents and the texel choice is vk_eng_fractional_transfer's read mapping. */
+static VkPipeline vk_eng_depth_argb_pipeline(u32 key, u32 hw, u32 hh, u32 gw, u32 gh)
 {
     for (u32 i = 0; i < s_dargb.nvariant; ++i)
-        if (s_dargb.variant[i].key == key) return s_dargb.variant[i].pipeline;
+        if (s_dargb.variant[i].key == key && s_dargb.variant[i].hw == hw && s_dargb.variant[i].hh == hh &&
+            s_dargb.variant[i].gw == gw && s_dargb.variant[i].gh == gh) return s_dargb.variant[i].pipeline;
     if (s_dargb.nvariant == VK_DARGB_MAX_VARIANTS) return VK_NULL_HANDLE;
     if (!s_dargb.layout) {
         VkDescriptorSetLayoutBinding binding = { RSX_SPIRV_TEXTURE_BINDING, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
@@ -72,16 +75,26 @@ static VkPipeline vk_eng_depth_argb_pipeline(u32 key)
         if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_dargb.pass) != VK_SUCCESS) return VK_NULL_HANDLE;
     }
     const u32 k = key & 15u, gx = (key >> 4) & 15u, gy = (key >> 8) & 15u;
-    const int rgba = (key >> 12) & 1u, d8 = (key >> 13) & 1u;
+    const int rgba = (key >> 12) & 1u, d8 = (key >> 13) & 1u, fractional = (key >> 14) & 1u;
     /* Guest bytes A,R,G,B = v>>16, v>>8, v, 0; the decoder's host order. */
     const char* order = rgba ? (d8 ? "A,R,G,255u" : "A,R,G,B") : (d8 ? "R,G,B,255u" : "R,G,B,A");
+    char select[256];
+    if (fractional)
+        snprintf(select, sizeof select,
+            "uint hx=((2u*(l.x/%uu)+1u)*%uu/%uu)*%uu+l.x%%%uu;"
+            "uint hy=((2u*(l.y/%uu)+1u)*%uu/%uu)*%uu+l.y%%%uu;",
+            gx, hw, 2u * gw, gx, gx, gy, hh, 2u * gh, gy, gy);
+    else
+        snprintf(select, sizeof select,
+            "uint hx=(l.x/%uu)*%uu+%uu+l.x%%%uu;"
+            "uint hy=(l.y/%uu)*%uu+%uu+l.y%%%uu;",
+            gx, gx * k, (k / 2u) * gx, gx, gy, gy * k, (k / 2u) * gy, gy);
     char fs[1024];
     snprintf(fs, sizeof fs,
         "Texture2D<float> source:register(t0);"
         "uint main(float4 pos:SV_Position):SV_Target0 {"
         "uint2 l=uint2(pos.xy);"
-        "uint hx=(l.x/%uu)*%uu+%uu+l.x%%%uu;"
-        "uint hy=(l.y/%uu)*%uu+%uu+l.y%%%uu;"
+        "%s"
         "float d=source.Load(int3(hx,hy,0));"
         "if(!(d>0.0f)) d=0.0f;"
         "if(d>1.0f) d=1.0f;"
@@ -91,7 +104,7 @@ static VkPipeline vk_eng_depth_argb_pipeline(u32 key)
         "uint A=(v>>16)&255u,R=(v>>8)&255u,G=v&255u,B=0u;"
         "uint4 h=uint4(%s);"
         "return h.x|(h.y<<8)|(h.z<<16)|(h.w<<24);}",
-        gx, gx * k, (k / 2u) * gx, gx, gy, gy * k, (k / 2u) * gy, gy, order);
+        select, order);
     VkShaderModule module = VK_NULL_HANDLE;
     if (vk_eng_translate(fs, RSX_SHADER_STAGE_FRAGMENT, &module)) return VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo stages[2] = {
@@ -124,6 +137,10 @@ static VkPipeline vk_eng_depth_argb_pipeline(u32 key)
     }
     vk_pcache_created();
     s_dargb.variant[s_dargb.nvariant].key = key;
+    s_dargb.variant[s_dargb.nvariant].hw = hw;
+    s_dargb.variant[s_dargb.nvariant].hh = hh;
+    s_dargb.variant[s_dargb.nvariant].gw = gw;
+    s_dargb.variant[s_dargb.nvariant].gh = gh;
     s_dargb.variant[s_dargb.nvariant].fs = module;
     s_dargb.variant[s_dargb.nvariant].pipeline = pipeline;
     s_dargb.nvariant++;
@@ -207,9 +224,18 @@ static u32 vk_eng_depth_to_argb(void* user, u32 depth, u32 w, u32 h, u32 remap, 
     if (!src) return 0;
     z = vk_eng_get(depth, VK_ENG_DEPTH);
     const u32 k = src->scale ? src->scale : 1u, gx = src->grid_x ? src->grid_x : 1u, gy = src->grid_y ? src->grid_y : 1u;
-    if (k > 15u || gx > 2u || gy > 2u || w > src->w / k || h > src->h / k) return 0;
-    const u32 key = k | (gx << 4) | (gy << 8) | ((flags & 1u) << 12) | ((base == 0x9Eu ? 1u : 0u) << 13);
-    const VkPipeline pipeline = vk_eng_depth_argb_pipeline(key);
+    /* A fractional (DLSS input) extent maps guest texels exactly as the CPU
+     * transfer does; without this every frame fell back to a full readback. */
+    const int fractional = src->guest_w && src->guest_h;
+    if (k > 15u || gx > 2u || gy > 2u) return 0;
+    if (fractional ? (w > src->guest_w || h > src->guest_h || src->w % gx || src->h % gy ||
+                      src->guest_w % gx || src->guest_h % gy)
+                   : (w > src->w / k || h > src->h / k)) return 0;
+    const u32 key = k | (gx << 4) | (gy << 8) | ((flags & 1u) << 12) | ((base == 0x9Eu ? 1u : 0u) << 13) |
+                    ((u32)fractional << 14);
+    const VkPipeline pipeline = fractional
+        ? vk_eng_depth_argb_pipeline(key, src->w / gx, src->h / gy, src->guest_w / gx, src->guest_h / gy)
+        : vk_eng_depth_argb_pipeline(key, 0, 0, 0, 0);
     if (!pipeline) {
         static int warned;
         if (!warned) { VK_LOG("engine: depth-as-ARGB pass unavailable; storing through guest memory\n"); warned = 1; }

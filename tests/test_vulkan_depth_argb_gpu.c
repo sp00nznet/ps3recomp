@@ -49,15 +49,88 @@ static u32 run_values(u32 depth, u32 w, u32 h, const float* values, u32 rsx_fmt,
     return bad;
 }
 
-int main(void)
+/* Fractional extents exercise the actual converter, CPU scaled depth reader,
+ * guest Z24 store and texture decoder together. The source has distinct sample
+ * lanes and a nonuniform depth field; a constant clear cannot detect mapping
+ * or lane errors. x/y are absolute guest coordinates for readback, not origins
+ * accepted by depth_to_argb (that interface converts a top-left rectangle). */
+static int fractional_case(u32 hw, u32 hh, u32 gw, u32 gh, u32 samples)
+{
+    s_render_scale = 1;
+    const u32 depth = vk_eng_depth_multisample(NULL, hw, hh, samples);
+    CHECK(depth != 0);
+    vk_eng_obj* d = &s_eobj[depth];
+    d->guest_w = gw; d->guest_h = gh; d->scale = 2;
+    const u32 expanded = vk_eng_expand_samples(depth);
+    CHECK(expanded != 0);
+    vk_eng_obj* src = &s_eobj[expanded];
+    const u32 gx = 2, gy = samples == 4 ? 2 : 1;
+    const u32 W = gw * gx, H = gh * gy, SW = hw * gx, SH = hh * gy;
+    CHECK(src->w == SW && src->h == SH && src->guest_w == W && src->guest_h == H);
+    float* field = malloc((size_t)SW * SH * sizeof(float));
+    float* reference = malloc((size_t)W * H * sizeof(float));
+    u8* guest = malloc((size_t)W * H * 4);
+    u8* want = malloc((size_t)W * H * 4);
+    const u32 pitch = W * 4 + 32;
+    u8* got = malloc((size_t)pitch * H);
+    CHECK(field && reference && guest && want && got);
+    for (u32 y = 0; y < SH; y++) for (u32 x = 0; x < SW; x++) {
+        u32 hash = (x * 73856093u) ^ (y * 19349663u) ^ ((x % gx + gx * (y % gy)) * 83492791u);
+        field[(size_t)y * SW + x] = .01f + .98f * (float)(hash & 0xFFFFFFu) / 16777215.0f;
+    }
+    /* Raw initialization avoids the guest-coordinate upload adapter itself. */
+    CHECK(vk_eng_upload_region(src->im.img, 0, 0, 0, 0, SW, SH,
+                              (size_t)SW * 4, SH, field, SW * 4) == 0);
+    const u32 regions[][4] = {{0,0,W,H}, {1,1,W-2,H-2}, {W-3,H-3,3,3}, {1,0,1,H}, {0,1,W,1}};
+    for (u32 rgba = 0; rgba < 2; rgba++) for (u32 d8 = 0; d8 < 2; d8++) {
+        const u32 format = (d8 ? 0x9Eu : 0x85u) | 0x20u;
+        const u32 tex = vk_eng_depth_to_argb(NULL, depth, W, H, 0xAAE4u, format, rgba);
+        CHECK(tex != 0);
+        for (u32 r = 0; r < sizeof regions / sizeof regions[0]; r++) {
+            u32 x = regions[r][0], y = regions[r][1], w = regions[r][2], h = regions[r][3];
+            CHECK(vk_eng_depth_readback(NULL, depth, x, y, w, h, reference, w * 4) == 0);
+            cpu_texels(reference, w, h, format, rgba, guest, want);
+            memset(got, 0xCD, (size_t)pitch * H);
+            CHECK(vk_eng_readback_rows_raw(tex, x, y, w, h, got, pitch) == 0);
+            for (u32 row = 0; row < h; row++) {
+                CHECK(memcmp(got + (size_t)row * pitch, want + (size_t)row * w * 4, w * 4) == 0);
+                for (u32 p = w * 4; p < pitch; p++) CHECK(got[(size_t)row * pitch + p] == 0xCD);
+            }
+            checks += (unsigned long long)w * h;
+        }
+        /* Smaller converted textures retain full-surface mapping, rather than
+         * stretching the requested rectangle across the host image. */
+        const u32 cw = W - 3, ch = H - 3;
+        const u32 crop = vk_eng_depth_to_argb(NULL, depth, cw, ch, 0xAAE4u, format, rgba);
+        CHECK(crop != 0);
+        CHECK(vk_eng_depth_readback(NULL, depth, 0, 0, cw, ch, reference, cw * 4) == 0);
+        cpu_texels(reference, cw, ch, format, rgba, guest, want);
+        CHECK(vk_eng_readback_rows_raw(crop, 0, 0, cw, ch, got, cw * 4) == 0);
+        CHECK(memcmp(got, want, (size_t)cw * ch * 4) == 0);
+        checks += (unsigned long long)cw * ch;
+    }
+    /* Incomplete guest lane groups have no safe mapping in this GPU path.
+     * Explicit rejection also covers Astra's host6/guest5/grid2 edge case. */
+    const u32 saved_guest_w = src->guest_w;
+    src->guest_w = 5;
+    CHECK(vk_eng_depth_to_argb(NULL, depth, 5, H, 0xAAE4u, 0x85u | 0x20u, 0) == 0);
+    src->guest_w = saved_guest_w;
+    free(field); free(reference); free(guest); free(want); free(got);
+    vk_eng_release(NULL, depth);
+    printf("fractional depth: host %ux%u guest %ux%u samples %u passed\n", SW, SH, W, H, samples);
+    return 0;
+}
+
+int main(int argc, char** argv)
 {
     SDL_SetMainReady();
     CHECK(rsx_vulkan_backend_init(64, 64, "depth-as-ARGB regression") == 0);
     if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT && s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT)
         printf("note: depth format %d\n", (int)s_vk.depth_format);
 
+    const int fractional_only = argc == 2 && !strcmp(argv[1], "--fractional-only");
     /* 1. Every non-negative float up to 1.0, then the special values. */
-    {
+    if (!fractional_only) {
         const u32 W = 4096, H = 2048, N = W * H;
         const u32 depth = vk_eng_depth_multisample(NULL, W / 2u, H, 2);
         CHECK(depth != 0);
@@ -156,6 +229,15 @@ int main(void)
         vk_eng_release(NULL, depth);
     }
     vk_eng_shutdown(NULL);
+    /* Separate lifetimes keep the bounded pipeline-variant cache from making
+     * unrelated extents/output formats exhaust each other's test capacity. */
+    const u32 fractional[][5] = {{1707,960,1280,720,2}, {106,78,160,90,4}, {3,7,2,5,2}};
+    for (u32 i = 0; i < sizeof fractional / sizeof fractional[0]; i++) {
+        CHECK(rsx_vulkan_backend_init(64, 64, "fractional depth regression") == 0);
+        CHECK(fractional_case(fractional[i][0], fractional[i][1], fractional[i][2],
+                              fractional[i][3], fractional[i][4]) == 0);
+        vk_eng_shutdown(NULL);
+    }
     printf("depth-as-ARGB on the GPU: %llu checks passed\n", checks);
     return 0;
 }
