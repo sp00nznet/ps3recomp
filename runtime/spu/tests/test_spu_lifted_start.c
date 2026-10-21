@@ -44,6 +44,7 @@
  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
  */
 
+#include "spu_interp.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -411,6 +412,69 @@ static void test_resident_code_regions(void)
     free(ctx);
 }
 
+
+/* Streamed code owns an LS interval even when its registry has a hole.
+ * Rejoining a different image at that hole executes stale guest code. */
+static void rejoin_primary(spu_context* c) { c->gpr[7]._u32[0] = 11; }
+static void rejoin_overlay(spu_context* c) { c->gpr[7]._u32[0] = 22; }
+static void rejoin_task(spu_context* c) { c->gpr[7]._u32[0] = 33; }
+static void rejoin_region(spu_context* c) { c->gpr[7]._u32[0] = 44; }
+static void test_resident_interpreter_rejoin(void)
+{
+    const uint32_t a = 0x18000, hole = a + 4, outside = a + 0x100;
+    spu_context* c = calloc(1, sizeof *c);
+    if (!c) { check(0, "allocate rejoin context"); return; }
+    spu_context_init(c, 0);
+    spu_begin_image(91);
+    spu_register_function(a, rejoin_primary);
+    spu_register_function(hole, rejoin_primary);
+    spu_register_function(outside, rejoin_primary);
+    spu_begin_image(92); spu_register_function(a, rejoin_overlay);
+    spu_register_function(hole, rejoin_overlay);
+    spu_begin_image(93); spu_register_function(a, rejoin_task);
+    spu_begin_image(94); spu_register_function(a, rejoin_region);
+    spu_begin_image(0);
+    c->image_id = 91;
+    check(spu_lifted_lookup(c, a) == rejoin_primary, "no resident identity preserves primary rejoin");
+    c->resident_ovl = 92;
+    check(spu_lifted_lookup(c, a) == rejoin_overlay, "overlay rejoin wins over same-LSA primary");
+    c->gpr[7]._u32[0] = 0; spu_dispatch(c, a);
+    check(c->gpr[7]._u32[0] == 22, "dispatcher actually executes resident overlay");
+    c->resident_task = 93;
+    check(spu_lifted_lookup(c, a) == rejoin_task, "task rejoin wins over overlay and primary");
+    check(spu_lifted_lookup(c, hole) == rejoin_overlay, "task registry hole falls through to overlay");
+    spu_overlay_register_region(0x810000, 0x100, 94);
+    spu_overlay_note_get(c, 0x810000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_region, "resident code rejoin wins all identities");
+    c->gpr[7]._u32[0] = 0; spu_dispatch(c, a);
+    check(c->gpr[7]._u32[0] == 44, "dispatcher actually executes authoritative resident code");
+    check(spu_lifted_lookup(c, hole) == NULL, "authoritative resident-code hole never rejoins stale images");
+    check(spu_lifted_lookup(c, outside) == rejoin_primary, "exclusive region end leaves primary eligible");
+    check(spu_lifted_lookup(c, a-4) == NULL, "address before region is not its code");
+    /* IL r8,123; only real interpreter execution can set this register. */
+    const uint32_t il = 0x40800000u | (123u << 7) | 8u;
+    c->ls[hole] = (uint8_t)(il >> 24); c->ls[hole+1] = (uint8_t)(il >> 16);
+    c->ls[hole+2] = (uint8_t)(il >> 8); c->ls[hole+3] = (uint8_t)il;
+    c->status = 0; c->gpr[8]._u32[0] = 0;
+    uint32_t next = spu_interp_run_until(c, hole, hole + 4);
+    check(next == hole+4 && c->gpr[8]._u32[0] == 123,
+          "owner miss executes actual LS instruction instead of stale-primary rejoin");
+    c->pc = a; c->status = 0;
+    check(spu_interp_run_until(c, a, a+4) == a && c->pc == a,
+          "interpreter rejoins correct resident entry before guest execution");
+    spu_overlay_note_get(c, 0x810010, c->ls + a + 16, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_region, "continuation DMA preserves code owner");
+    spu_overlay_note_get(c, 0x820000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_task, "conflicting DMA invalidation exposes task again");
+    c->resident_task = 0;
+    check(spu_lifted_lookup(c, a) == rejoin_overlay, "cleared task exposes overlay");
+    c->resident_ovl = 0;
+    check(spu_lifted_lookup(c, a) == rejoin_primary, "cleared resident identities expose primary");
+    check(spu_lifted_lookup(c, 0x19000) == NULL, "all registry misses stay unlifted");
+    g_spu_trampoline_fn = 0;
+    free(c);
+}
+
 /* A real taskset also stores 0xA70 in its API table. That address alone
  * cannot distinguish Sony's resident scheduler from a synthetic HLE task. */
 static void test_lle_taskset_syscall(void)
@@ -767,6 +831,7 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_resident_interpreter_rejoin();
     test_lle_taskset_syscall();
     test_taskset_resume_identity();
     test_guest_stack_reset();
