@@ -47,7 +47,7 @@ static int vk_rt_depth_range(float n,float f)
     return isfinite(n) && isfinite(f) && n>=0.0f && f<=1.0f && f-n>0.000001f;
 }
 #define VK_RT_EPOCHS 4u
-#define VK_RT_TOTAL_BYTES (128u*1024u*1024u)
+#define VK_RT_TOTAL_BYTES (512u*1024u*1024u)
 static struct {
     rsx_scene_epoch* epochs[VK_RT_EPOCHS];
     u64 frame,generation;
