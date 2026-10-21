@@ -428,6 +428,13 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:     v = 0; break; /* No DST */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:           v = 0; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT: v = 0; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_LICENSE_AREA: {
+        /* The console's licence area (a game picks region variants of its assets by it). $PS3_LICENSE_AREA (a number,
+         * the CELL_SYSUTIL_LICENSE_AREA_* values) wins; ASSUMPTION: without it, North America. */
+        const char* e = getenv("PS3_LICENSE_AREA");
+        v = (e && *e) ? (s32)atoi(e) : CELL_SYSUTIL_LICENSE_AREA_A;
+        break;
+    }
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:   v = 1; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:  v = 0; break; /* 60Hz */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:     v = 1; break; /* Rumble on */
