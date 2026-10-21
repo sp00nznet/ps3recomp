@@ -620,7 +620,7 @@ target_link_libraries(my_game PRIVATE
 cp -r ps3recomp/templates/project/ my_game/
 
 # Edit configuration
-# - config.toml: set elf_path, module settings, graphics/audio backends
+# - config.toml: reference only, not read by the tools yet
 # - CMakeLists.txt: set project name, add ps3recomp path
 # - stubs.cpp: add game-specific function overrides
 
@@ -642,12 +642,12 @@ cmake --build build
 |------|---------|
 | `main.cpp` | Entry point — initializes runtime subsystems, loads function table, creates main PPU thread |
 | `stubs.cpp` | Game-specific NID overrides and custom function implementations |
-| `config.toml` | Recompiler and runtime configuration |
+| `config.toml` | Reference only: not read by the tools yet |
 | `CMakeLists.txt` | Build configuration — links against ps3recomp_runtime |
 
 ### Configuration Reference (config.toml)
 
-See `templates/project/config.toml` for the full reference with comments. Key sections:
+Reference only: no tool or CMake file reads `config.toml` yet, so these settings have no effect. See `templates/project/config.toml` for the full reference with comments. Key sections:
 
 ```toml
 [input]

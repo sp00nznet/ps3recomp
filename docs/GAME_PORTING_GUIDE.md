@@ -301,7 +301,7 @@ cp -r ps3recomp/templates/project/ my_game/
 
 ### Configure
 
-Edit `my_game/config.toml`:
+Edit `my_game/config.toml` (reference only: nothing reads it yet, so the paths also go on the tool command lines):
 
 ```toml
 [input]

@@ -1,6 +1,9 @@
 # ps3recomp -- Game recompilation project configuration
 #
 # Copy this file to your project and adjust the paths and settings.
+#
+# Reference only: nothing in tools/, runtime/, libs/, cmake/ or the template's
+# CMakeLists.txt reads this file yet. Pass paths on the command lines instead.
 
 [input]
 # Path to the decrypted PS3 ELF (EBOOT.BIN after SELF decryption)
