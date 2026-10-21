@@ -12,7 +12,7 @@ static inline void spu_fp_control_fail(spu_context*ctx,uint32_t pc,const char*re
 }
 static inline u128 spu_fp_read_control(spu_context*ctx,uint32_t pc)
 {
-    if(ctx->fp_status_untracked&&ps3_strict_boot_enabled())
+    if(ctx->fp_status_untracked&&ps3_strict_boot_latched())
         spu_fp_control_fail(ctx,pc,"arithmetic-status-not-yet-tracked");
     u128 result;spu_fpscr_read(&ctx->fpscr,result._u32);return result;
 }
@@ -23,7 +23,7 @@ static inline void spu_fp_write_control(spu_context*ctx,u128 value)
 }
 static inline void spu_fp_note_arithmetic(spu_context*ctx,uint32_t pc,int double_precision)
 {
-    if(double_precision&&ps3_strict_boot_enabled()&&
+    if(double_precision&&ps3_strict_boot_latched()&&
        (spu_fpscr_get_rounding(&ctx->fpscr,0)!=SPU_FPSCR_RN_NEAR||
         spu_fpscr_get_rounding(&ctx->fpscr,1)!=SPU_FPSCR_RN_NEAR||
         fegetround()!=FE_TONEAREST))

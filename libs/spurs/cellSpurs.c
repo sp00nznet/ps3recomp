@@ -2494,7 +2494,9 @@ static int jc_run_one_job(struct SpursChain* chain,u64 raw_job_ea, int idx, u32 
         dispatched=spu_workload_dispatch_job(snapshot.image,snapshot.image_size,snapshot.job_ea,snapshot.descriptor_size);
     }else if(native.status==SPURS_NATIVE_JOB_RETURNED){
         static atomic_uint native_return_logs;
-        if(atomic_fetch_add_explicit(&native_return_logs,1,memory_order_relaxed)<8||getenv("FOLKLORE_AOT_TRACE"))
+        static int aot_trace=-1;   /* every returned job passes here; read the environment once */
+        if(aot_trace<0)aot_trace=getenv("FOLKLORE_AOT_TRACE")?1:0;
+        if(atomic_fetch_add_explicit(&native_return_logs,1,memory_order_relaxed)<8||aot_trace)
             fprintf(stderr,"[spurs-native-job] RETURNED owner=0x%08X worker=0 job=0x%08X fp=0x%016llX pc=0x%05X gets=%u\n",
                 chain->owner.ea,snapshot.job_ea,(unsigned long long)snapshot.fingerprint,native.pc,native.completed_gets);
         dispatched=1;

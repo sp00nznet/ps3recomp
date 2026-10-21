@@ -1045,7 +1045,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     else if (channel == SPU_RdEventStat && ctx->event_mask != 0)
         spu_ch_wait(ctx, channel, "rdch");
 
-    if (ps3_strict_boot_enabled() &&
+    if (ps3_strict_boot_latched() &&
         (channel == SPU_RdInMbox || channel == SPU_RdSigNotify1 ||
          channel == SPU_RdSigNotify2 ||
          (channel == SPU_RdEventStat && ctx->event_mask != 0)) &&

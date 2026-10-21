@@ -195,7 +195,9 @@ spurs_native_job_result spurs_native_job_dispatch(
  else if(frame.pending)result.status=SPURS_NATIVE_JOB_INPUT_MISMATCH;
  else if(ctx->event_mask||!spu_mfc_context_quiescent(ctx))result.status=SPURS_NATIVE_JOB_PENDING;
  else result.status=SPURS_NATIVE_JOB_RETURNED;
- if(getenv("FOLKLORE_AOT_TRACE"))
+ static int s_aot_trace=-1;   /* every dispatch passes here; read the environment once */
+ if(s_aot_trace<0)s_aot_trace=getenv("FOLKLORE_AOT_TRACE")?1:0;
+ if(s_aot_trace)
   fprintf(stderr,"[spurs-aot-audit] pc=0x%05X lr=0x%05X spu=%u interpreter_entries=%llu status=%u gets=%u puts=%u\n",
       ctx->pc,ctx->gpr[0]._u32[0],ctx->spu_id,(unsigned long long)spu_interpreter_fallback_count(),(unsigned)result.status,frame.completed_gets,frame.completed_puts);
  active_native=NULL;g_spu_trampoline_fn=NULL;

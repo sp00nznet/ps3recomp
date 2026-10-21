@@ -374,7 +374,7 @@ failed:
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
-    if (ps3_strict_boot_enabled()) return mfc_strict_transfer(spu, lsa, ea, size, cmd);
+    if (ps3_strict_boot_latched()) return mfc_strict_transfer(spu, lsa, ea, size, cmd);
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -1072,7 +1072,7 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  */
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
-    if (ps3_strict_boot_enabled() && mfc_strict_ordinary(cmd)) {
+    if (ps3_strict_boot_latched() && mfc_strict_ordinary(cmd)) {
         uint32_t tag = spu->mfc_tag & 31u;
         mfc->tag_completed &= ~(1u << tag);
         int result = mfc_do_transfer(spu, spu->mfc_lsa,
@@ -1080,7 +1080,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         if (result == 0) mfc->tag_completed |= 1u << tag;
         return result;
     }
-    if (ps3_strict_boot_enabled() && cmd != MFC_BARRIER_CMD && cmd != MFC_EIEIO_CMD && cmd != MFC_SYNC_CMD) {
+    if (ps3_strict_boot_latched() && cmd != MFC_BARRIER_CMD && cmd != MFC_EIEIO_CMD && cmd != MFC_SYNC_CMD) {
         ps3_strict_boot_guard("spu-mfc-unsupported-command", "cmd=0x%X", cmd);
         return -1;
     }

@@ -18,6 +18,20 @@ static inline int ps3_strict_boot_enabled(void)
     return value && strcmp(value, "1") == 0;
 }
 
+/* For per-operation SPU paths (every DMA, channel read and FP status check).
+ * getenv takes the CRT environment lock and scans every variable; there it
+ * cost more than Folklore's audio job itself and starved the audio ring.
+ * Strict mode is opted into before launch and never revoked inside a process,
+ * so once seen it is remembered; until then the environment is read each time. */
+static inline int ps3_strict_boot_latched(void)
+{
+    static volatile int s_seen;
+    if (s_seen) return 1;
+    if (!ps3_strict_boot_enabled()) return 0;
+    s_seen = 1;
+    return 1;
+}
+
 static inline void ps3_strict_boot_guard(const char* category,
                                          const char* format, ...)
 {
