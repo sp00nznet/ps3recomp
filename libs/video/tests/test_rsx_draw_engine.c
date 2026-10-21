@@ -14,6 +14,7 @@
  */
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
+#include "rsx_test_programs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1385,6 +1386,73 @@ static void test_antialiased_surface(void)
     }
 }
 
+/* A guest program pair whose fragment program reads WPOS (MOV r0, WPOS), on
+ * targets of each sample grid: WPOS must count pixels, not the samples the
+ * target is held at. */
+#define WPOS_FP_OFFSET 0x00030000u       /* main memory */
+static char g_wpos_ps[65536];
+static u32 wpos_capture_pipeline(void* u, const char* vs, const char* ps,
+                                 const rsx_be_render_state* rs,
+                                 const rsx_vertex_layout_plan* layout,
+                                 u32 stride, rsx_be_format rt, u32 rt_count)
+{
+    snprintf(g_wpos_ps, sizeof g_wpos_ps, "%s", ps ? ps : "");
+    return stub_pipeline_create(u, vs, ps, rs, layout, stride, rt, rt_count);
+}
+
+static void test_antialiased_wpos(void)
+{
+    printf("-- WPOS on an antialiased surface\n");
+    static const struct { u32 aa; const char* line; } cases[] = {
+        { 0, NULL },
+        { 3, "    input.position.xy = floor(input.position.xy / float2(2, 1)) + 0.5;\n" },
+        { 4, "    input.position.xy = floor(input.position.xy / float2(2, 2)) + 0.5;\n" },
+        { 5, "    input.position.xy = floor(input.position.xy / float2(2, 2)) + 0.5;\n" },
+    };
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.pipeline_create = wpos_capture_pipeline;
+    rsx_draw_engine_set_backend(&be);
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);                                    /* TRANSFORM_PROGRAM_LOAD */
+    for (u32 i = 0; i < 4; i++) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);                                    /* TRANSFORM_PROGRAM_START */
+    rsx_test_fp_instr(vm_base + WPOS_FP_OFFSET,
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC(0) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    m(0x08E4, WPOS_FP_OFFSET | 2u);                  /* SHADER_PROGRAM, main */
+    m(0x1D60, 0x40u);                                /* SHADER_CONTROL: fp32 exports */
+    u32 handles[4];
+    for (u32 i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        m(M_SURFACE_FORMAT, 8u | (cases[i].aa << 12));
+        const int before = stub.n_pipeline_create;
+        draw_triangle();
+        handles[i] = stub.bound_pipeline;
+        /* SQUARE_ROTATED_4 has SQUARE_CENTERED_4's 2x2 grid, and its pipeline. */
+        const int built = cases[i].aa == 5 ? 0 : 1;
+        CHECK(stub.n_pipeline_create == before + built && stub.n_draw &&
+              strstr(g_wpos_ps, "(input.position)."),
+              "antialias %u: the WPOS program draws (%d new pipeline)", cases[i].aa, built);
+        if (cases[i].line)
+            CHECK(strstr(g_wpos_ps, cases[i].line) != NULL,
+                  "antialias %u: WPOS is the centre of the pixel, not of the sample", cases[i].aa);
+        else
+            CHECK(strstr(g_wpos_ps, "input.position.xy =") == NULL,
+                  "antialias 0: WPOS is the host position as before");
+    }
+    CHECK(handles[0] != handles[1] && handles[1] != handles[2] && handles[2] == handles[3],
+          "the sample grid is part of the pipeline key");
+    m(M_SURFACE_FORMAT, 8u | (3u << 12));
+    const int before = stub.n_pipeline_create;
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == before && stub.bound_pipeline == handles[1],
+          "back on the 2x1 grid, its pipeline is reused");
+    m(0x08E4, 0);
+    engine_down();
+}
+
 /* ---- 10. a zeta or a target read in a texture format of its own --------- */
 
 static void test_depth_read_as_color(void)
@@ -1623,6 +1691,7 @@ int main(void)
     test_inline_array();
     test_depth_clear_value();
     test_antialiased_surface();
+    test_antialiased_wpos();
     test_depth_read_as_color();
     test_color_read_as_float();
     test_immediate_compositor();

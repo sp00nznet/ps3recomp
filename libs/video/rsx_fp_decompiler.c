@@ -1716,6 +1716,50 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
     return patched;
 }
 
+/*
+ * WPOS on an antialiased surface (see the header).
+ *
+ * A backend that keeps a DIAGONAL_CENTERED_2 or SQUARE_*_4 target at its sample
+ * resolution maps the viewport over the sample grid, so a pixel program runs
+ * once per sample and SV_POSITION.x of a 960-pixel 2x1 target runs to 1920. A
+ * program that addresses a screen-sized texture by WPOS then reads it at twice
+ * the position: Resistance 3's material pass fetches its light and SSAO
+ * buffers that way and drew its lighting shifted on the left half of the frame
+ * and clamped to one edge column, full-width streaks, on the right half.
+ *
+ * Every sample of a pixel gets that pixel's centre, floor(pos / grid) + 0.5,
+ * the half-pixel centre SV_POSITION already gives on a 1x1 grid. The line goes
+ * first in main, before any read; z and w (the _rsx_inv_w source) are kept.
+ * WPOS reaches the body only as the emitter's "(input.position)." source, so
+ * a program without it stays byte-identical.
+ */
+int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy)
+{
+    static const char wpos_read[] = "(input.position).";
+    static const char* const entries[] = { "main(PSInput input) : SV_TARGET {\n",
+                                           "main(PSInput input) {\n" };
+    if (!hlsl || !capacity || !sx || !sy) return -1;
+    if (sx == 1 && sy == 1) return 0;
+    size_t len = 0;
+    while (len < capacity && hlsl[len]) ++len;
+    if (len == capacity) return -1;
+    if (!strstr(hlsl, wpos_read)) return 0;
+    if (strstr(hlsl, "input.position.xy = floor(")) return -1;
+    char* body = NULL;
+    for (size_t i = 0; i < sizeof entries / sizeof entries[0] && !body; ++i) {
+        char* at = strstr(hlsl, entries[i]);
+        if (at) body = at + strlen(entries[i]);
+    }
+    if (!body) return -1;
+    char line[128];
+    const int n = snprintf(line, sizeof line,
+        "    input.position.xy = floor(input.position.xy / float2(%u, %u)) + 0.5;\n", sx, sy);
+    if (n < 0 || (size_t)n >= sizeof line || len + (size_t)n + 1 > capacity) return -1;
+    memmove(body + n, body, len - (size_t)(body - hlsl) + 1);
+    memcpy(body, line, (size_t)n);
+    return 1;
+}
+
 /* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and
  * 32-bit exports bypass the integer framebuffer's RGB transfer function. */
 int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format)

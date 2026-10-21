@@ -92,6 +92,15 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                               const u32 dim[][2], u32 cube_mask);
 
+/* WPOS on an antialiased surface held at its sample resolution (sx x sy
+ * samples a pixel, as in guest memory). The RSX runs the program once a pixel
+ * and WPOS is that pixel's window position; the host shades each sample and
+ * SV_POSITION counts samples. Rewrites the program's WPOS to the centre of the
+ * pixel its sample belongs to. Returns 1 when patched, 0 when there is nothing
+ * to do (a 1x1 grid, or no WPOS read), or -1 without mutation when the entry
+ * point is not found, the grid is already applied, or the buffer is short. */
+int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy);
+
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
  * half float and X32/W32Z32Y32X32 use a 32-bit float. */
