@@ -15,6 +15,7 @@
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
 #include "audio_pacer.h"
+#include "audio_grace.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
@@ -128,6 +129,7 @@ typedef struct {
     /* For address reporting to guest */
     u64                  port_addr;      /* guest-visible buffer address */
     u64                  read_idx_addr;  /* guest-visible read index address */
+    AudioGraceState      grace;          /* mixer-owned, protected by audio mutex */
 } AudioPortSlot;
 
 static int            s_audio_initialized = 0;
@@ -150,6 +152,9 @@ static unsigned long long g_audio_submit_failures, g_audio_submitted;
  * dry: the engine played zeros) and blocks produced more than one engine
  * period after their deadline (late submissions). */
 static unsigned long long g_audio_underruns, g_audio_late, g_audio_notify_full, g_audio_reprimes;
+#if AUDIO_BACKEND_WASAPI
+static unsigned s_grace_waited_mask, s_grace_wait_us, s_grace_recovered_mask;
+#endif
 static atomic_int    s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -555,6 +560,17 @@ static unsigned audio_ring_lead(void)
     return lead;
 }
 
+/* This is only a silence heuristic. Guest PCM has no atomic ready marker. */
+static int audio_slot_has_pcm(const AudioPortSlot *port)
+{
+    const u32 count = CELL_AUDIO_BLOCK_SAMPLES * (u32)port->param.nChannel;
+    const u32 slot = (u32)(port->read_index % port->param.nBlock);
+    const float *src = port->buffer + slot * count;
+    for (u32 i = 0; i < count; ++i)
+        if (ld_be_f32(src + i) != 0.0f) return 1;
+    return 0;
+}
+
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
@@ -597,6 +613,7 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+        const int audible = audio_slot_has_pcm(port);
 #if AUDIO_BACKEND_WASAPI
         audio_pcm_probe_slot((unsigned)p,port,block_idx,src,CELL_AUDIO_BLOCK_SAMPLES*nch);
 #endif
@@ -649,6 +666,13 @@ static void audio_mix_one_block(void)
         /* Firmware clears a ring-buffer block after consuming it. Besides
          * preventing stale PCM from replaying when a producer stalls, the
          * cleared block is an observable consumption signal for producers. */
+        audio_grace_finish(&port->grace, audible,
+#if AUDIO_BACKEND_WASAPI
+                           (s_grace_waited_mask & (1u << p)) != 0
+#else
+                           0
+#endif
+        );
         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
 
         /* Keep the monotonic counter for tags/timestamps, but publish the
@@ -707,6 +731,47 @@ static void audio_wait_clock(HANDLE timer, uint64_t ticks, uint64_t frequency)
     Sleep(1);
 }
 
+/* Experimental, opt-in until matched combat runs establish a benefit.
+ * Do not hold the port mutex while sleeping: guest audio queries need it.
+ * Reacquire and rescan all ports after each wait; retain no buffer pointers.
+ * One soft scheduling deadline covers every port; OS wake latency may exceed
+ * it and is recorded as grace_wait_us. Never alter the published cursor.
+ * Nonzero PCM does not prove completion, so allow a final 250us settling
+ * interval inside the same deadline before consuming newly observed data. */
+static void audio_guest_grace(HANDLE timer, uint64_t frequency, int enabled)
+{
+    s_grace_waited_mask = s_grace_wait_us = s_grace_recovered_mask = 0;
+    if (!enabled || !timer) return;
+    const uint64_t start = audio_pcm_probe_now();
+    while (s_mix_thread_running) {
+        const uint64_t now = audio_pcm_probe_now();
+        if (!audio_grace_before_deadline(start, now, AUDIO_GRACE_BUDGET_US)) break;
+        const int room = audio_backend_room();
+        const unsigned frames = audio_backend_buffer_frames();
+        const unsigned padding = room >= 0 && (unsigned)room <= frames ? frames - (unsigned)room : 0;
+        if (padding < 768u) break; /* 16ms at the fixed 48kHz mixer rate */
+        unsigned pending = 0;
+        mutex_lock(&s_audio_mutex);
+        for (unsigned p = 0; p < CELL_AUDIO_PORT_MAX; ++p) {
+            const AudioPortSlot *port = &s_ports[p];
+            if (!port->in_use || !port->running || !port->buffer) continue;
+            if (audio_grace_budget_us(&port->grace, enabled, padding, CELL_AUDIO_SAMPLE_RATE) &&
+                !audio_slot_has_pcm(port)) pending |= 1u << p;
+        }
+        mutex_unlock(&s_audio_mutex);
+        if (!pending && !s_grace_waited_mask) break;
+        s_grace_recovered_mask = s_grace_waited_mask & ~pending;
+        s_grace_waited_mask |= pending;
+        const uint64_t elapsed = audio_pcm_probe_now() - start;
+        if (elapsed >= AUDIO_GRACE_BUDGET_US) break;
+        const uint64_t remaining = AUDIO_GRACE_BUDGET_US - elapsed;
+        const uint64_t wait_us = remaining < 250 ? remaining : 250;
+        audio_wait_clock(timer, (frequency * wait_us + 999999) / 1000000, frequency);
+        if (!pending) break;
+    }
+    if (s_grace_waited_mask) s_grace_wait_us = (unsigned)(audio_pcm_probe_now() - start);
+}
+
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -756,7 +821,11 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     s_pcm_probe_poll=0;
     memset(&s_pcm_probe,0,sizeof(s_pcm_probe));
     s_pcm_probe_frequency=(uint64_t)qf.QuadPart;
-    if (trace) fprintf(trace, "block,qpc_us,room,peak,silent,dropped,submitted,submit_failures,rebases,mix_us,capture_submit_us,previous_tail_us,padding,target,late_us,underruns,late,trim_us,notify_full,lead,reprimes,pcm_valid,pcm_port,pcm_slot,pcm_read_index,pcm_begin_us,pcm_end_us,pcm_nonzero,pcm_nonfinite,pcm_peak\n");
+    const char *grace_env = getenv("FOLKLORE_AUDIO_GRACE");
+    const int grace_enabled = grace_env && strcmp(grace_env, "1") == 0;
+    fprintf(stderr, "[cellAudio] guest grace %s (budget 3000us, minimum padding 16ms, max 2 consecutive waits)\n",
+            grace_enabled ? "enabled" : "off");
+    if (trace) fprintf(trace, "block,qpc_us,room,peak,silent,dropped,submitted,submit_failures,rebases,mix_us,capture_submit_us,previous_tail_us,padding,target,late_us,underruns,late,trim_us,notify_full,lead,reprimes,pcm_valid,pcm_port,pcm_slot,pcm_read_index,pcm_begin_us,pcm_end_us,pcm_nonzero,pcm_nonfinite,pcm_peak,grace_wait_us,grace_waited_mask,grace_recovered_mask\n");
     uint64_t late_ticks = 0;
     unsigned long long seen_rebases = 0;
     uint64_t previous_tail_us = 0;
@@ -806,6 +875,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         /* Mix and submit one block */
         LARGE_INTEGER mix_begin = {0}, mix_end = {0};
         if (trace) QueryPerformanceCounter(&mix_begin);
+        audio_guest_grace(timer, (uint64_t)qf.QuadPart, grace_enabled);
         audio_mix_one_block();
         if (trace) QueryPerformanceCounter(&mix_end);
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
@@ -839,11 +909,12 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 (unsigned long long)previous_tail_us, (unsigned)padding, (unsigned)fill.target,
                 (unsigned long long)(late_ticks*1000000ULL/qf.QuadPart), g_audio_underruns, g_audio_late,
                 (long long)(fill.trim_ticks*1000000LL/qf.QuadPart), g_audio_notify_full, audio_ring_lead(), g_audio_reprimes);
-            fprintf(trace,",%u,%u,%u,%llu,%llu,%llu,%u,%u,%.9g\n",
+            fprintf(trace,",%u,%u,%u,%llu,%llu,%llu,%u,%u,%.9g,%u,%u,%u\n",
                 s_pcm_probe.valid,s_pcm_probe.port,s_pcm_probe.slot,
                 (unsigned long long)s_pcm_probe.read_index,
                 (unsigned long long)s_pcm_probe.begin_us,(unsigned long long)s_pcm_probe.end_us,
-                s_pcm_probe.nonzero,s_pcm_probe.nonfinite,s_pcm_probe.peak);
+                s_pcm_probe.nonzero,s_pcm_probe.nonfinite,s_pcm_probe.peak,
+                s_grace_wait_us,s_grace_waited_mask,s_grace_recovered_mask);
         }
         /* One line a minute, only when the device ran dry in that minute. */
         if (GetTickCount64() >= report_at) {
@@ -1077,6 +1148,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->param.nBlock   = nblk;
     port->read_index  = 0;
     port->write_index = 0;
+    memset(&port->grace, 0, sizeof(port->grace));
 
     /* Allocate the audio buffer in GUEST memory so portAddr/readIndexAddr are
      * real guest addresses (the game's mixer -- FMOD here -- writes PCM there
@@ -1154,6 +1226,7 @@ s32 cellAudioPortStart(u32 portNum)
 
     mutex_lock(&s_audio_mutex);
     s_ports[portNum].running = 1;
+    memset(&s_ports[portNum].grace, 0, sizeof(s_ports[portNum].grace));
     mutex_unlock(&s_audio_mutex);
 
     return CELL_OK;
