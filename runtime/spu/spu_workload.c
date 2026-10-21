@@ -196,12 +196,67 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 
 /* ---- dispatch ---------------------------------------------------------- */
 
+/* Dispatch fingerprints the whole image on the calling PPU thread, one byte at
+ * a time, for every task it starts: about a millisecond per task start, and
+ * a retail title starts two or three a frame. Remember recent results by
+ * address and size, and reuse one only while a word-wise content hash --
+ * several times faster than the byte-serial fingerprint -- still matches the
+ * bytes. */
+static uint64_t spu_workload_content_hash(const uint8_t* p, size_t n)
+{
+    uint64_t h[4] = { 0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull };
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (int k = 0; k < 4; ++k) {
+            uint64_t w;
+            memcpy(&w, p + i + 8 * k, 8);
+            h[k] = (h[k] ^ w) * 0x100000001B3ull;
+            h[k] ^= h[k] >> 29;
+        }
+    uint64_t r = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7) ^ n;
+    for (; i < n; ++i) r = (r ^ p[i]) * 0x100000001B3ull;
+    return r;
+}
+static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
+{
+    enum { SLOTS = 8 };
+    static struct { const uint8_t* image; size_t n; uint64_t content, fp; } s_fp[SLOTS];
+    static unsigned s_next;
+#ifdef _WIN32
+    static SRWLOCK s_fp_lock = SRWLOCK_INIT;
+#define FP_LOCK()   AcquireSRWLockExclusive(&s_fp_lock)
+#define FP_UNLOCK() ReleaseSRWLockExclusive(&s_fp_lock)
+#else
+    static pthread_mutex_t s_fp_lock = PTHREAD_MUTEX_INITIALIZER;
+#define FP_LOCK()   pthread_mutex_lock(&s_fp_lock)
+#define FP_UNLOCK() pthread_mutex_unlock(&s_fp_lock)
+#endif
+    const uint64_t content = spu_workload_content_hash(image, n);
+    FP_LOCK();
+    for (unsigned i = 0; i < SLOTS; ++i)
+        if (s_fp[i].image == image && s_fp[i].n == n && s_fp[i].content == content) {
+            const uint64_t fp = s_fp[i].fp;
+            FP_UNLOCK();
+            return fp;
+        }
+    FP_UNLOCK();
+    const uint64_t fp = spu_workload_fingerprint(image, n);
+    FP_LOCK();
+    const unsigned slot = s_next++ % SLOTS;
+    s_fp[slot].image = image; s_fp[slot].n = n; s_fp[slot].content = content; s_fp[slot].fp = fp;
+    FP_UNLOCK();
+#undef FP_LOCK
+#undef FP_UNLOCK
+    return fp;
+}
+
+
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea)
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -884,7 +939,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -1299,7 +1354,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
