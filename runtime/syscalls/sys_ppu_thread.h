@@ -52,6 +52,7 @@ typedef struct ppu_thread_info {
     uint64_t     entry_addr;   /* guest entry point */
     uint64_t     tls_addr;
     uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
+    int          blocked;      /* reached a blocking call (ppu_thread_note_block); atomic access only */
 
 #ifdef _WIN32
     HANDLE       host_thread;
@@ -89,6 +90,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx);
  * Call before the first sys_ppu_thread_create so no created thread aliases
  * main (thread_id 0 broke every owner-tracking sync primitive). */
 uint64_t ppu_thread_register_main(void);
+
+/* The blocking syscalls call this on entry: thread `tid` is about to wait, where lv2 would schedule another thread.
+ * With PS3_PRIO_START=1, sys_ppu_thread_create waits for it on a thread it has just made at a higher priority than
+ * the creator's, as lv2's scheduler would run that thread first. */
+void ppu_thread_note_block(uint64_t tid);
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

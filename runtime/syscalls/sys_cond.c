@@ -6,6 +6,7 @@
  * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
  */
 #include "sys_cond.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -120,6 +121,7 @@ int64_t sys_cond_destroy(ppu_context* ctx)
 
 int64_t sys_cond_wait(ppu_context* ctx)
 {
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
     const char* peek = getenv("PS3_COND_PEEK");

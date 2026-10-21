@@ -208,6 +208,8 @@ static HANDLE lwm_sem(uint32_t addr)
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
  * logging during that window only (park hunts: gate on state, not counts). */
 volatile int g_nd_inpump = 0;
+/* syscalls/sys_ppu_thread.c: this thread is about to wait (PS3_PRIO_START). */
+extern "C" void ppu_thread_note_block(uint64_t tid);
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
@@ -239,6 +241,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 long h = sl ? sl->holder : 0; long long held = (sl && h) ? (lwm_now_us() - sl->acq_us) : 0;
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
+            ppu_thread_note_block(ctx->thread_id);
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
@@ -359,6 +362,7 @@ static void sys_lwcond_wait(ppu_context* ctx)
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
+        ppu_thread_note_block(ctx->thread_id);
         ReleaseSemaphore(s, 1, NULL);
         Sleep(1);
         WaitForSingleObject(s, INFINITE);

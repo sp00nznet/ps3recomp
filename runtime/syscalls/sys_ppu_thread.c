@@ -99,6 +99,68 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
 }
 
 /* ---------------------------------------------------------------------------
+ * Priority at thread start (PS3_PRIO_START=1, off by default)
+ *
+ * On lv2 a thread created with a higher priority (a lower number) than its creator preempts the creator and runs
+ * until it blocks. SDK libraries rely on it: the SurMixer thread (prio 400, typically created by a prio 1000 thread)
+ * creates the event queue whose key its creator passes to cellAudioSetNotifyEventQueue right after the create
+ * returns, with no synchronisation of their own. Host threads run side by side, so the creator can read the key
+ * before it is written, and the mixer is never notified. With PS3_PRIO_START=1 sys_ppu_thread_create waits until
+ * such a thread reaches a blocking call (ppu_thread_note_block), for at most PRIO_START_TIMEOUT_MS so that a thread
+ * which blocks somewhere not reported, or never blocks, cannot hold its creator up for long.
+ *
+ * Off by default: it changes thread interleaving for every title, and the regression gate's goldens are recorded
+ * without it.
+ * -----------------------------------------------------------------------*/
+#define PPU_DEFAULT_PRIORITY   1000   /* what sys_ppu_thread_get_priority reports for a thread not in the table */
+#define PRIO_START_TIMEOUT_MS  200
+#define PRIO_START_SPIN_MS     2      /* yield instead of sleeping for this long: Sleep(1) is ~15 ms on Windows */
+
+static int prio_start_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PS3_PRIO_START") ? 1 : 0;
+    return on;
+}
+
+void ppu_thread_note_block(uint64_t tid)
+{
+    if (tid == 0 || tid > PPU_THREAD_MAX) return;
+    int* blocked = &g_ppu_threads[tid - 1].blocked;
+    /* Load first: the wait syscalls call this on every wait, and most threads blocked long ago. */
+    if (!__atomic_load_n(blocked, __ATOMIC_RELAXED))
+        __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
+}
+
+/* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
+ * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
+static int32_t creator_priority(uint64_t tid)
+{
+    const ppu_thread_info* c = find_thread(tid);
+    if (!c || (c == &g_ppu_threads[0] && c->priority == 0)) return PPU_DEFAULT_PRIORITY;
+    return c->priority;
+}
+
+/* Called without the table lock, right after the creator made `t`. The acquire load pairs with the release store in
+ * ppu_thread_note_block, so whatever `t` wrote before it blocked (the event queue key above) is visible here. */
+static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
+{
+    const ULONGLONG start = GetTickCount64();
+    for (;;) {
+        if (__atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE)) return;
+        const int state = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+        /* Ended before blocking (a detached thread is DETACHED while it still runs). */
+        if (state == PPU_THREAD_STATE_FINISHED || state == PPU_THREAD_STATE_FREE) return;
+        const ULONGLONG waited = GetTickCount64() - start;
+        if (waited >= PRIO_START_TIMEOUT_MS) break;
+        if (waited < PRIO_START_SPIN_MS) SwitchToThread();
+        else                             Sleep(1);
+    }
+    fprintf(stderr, "[SYS] PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
+            (unsigned long long)tid, t->name, t->priority, PRIO_START_TIMEOUT_MS);
+}
+
+/* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
@@ -524,7 +586,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     if (!t->joinable) pthread_detach(t->host_thread);   /* nobody pthread_joins it */
 #endif
 
+    const int preempts = prio_start_enabled() && priority < creator_priority(ctx->thread_id);
     table_unlock();
+    if (preempts) wait_first_block(t, thread_id);
     return CELL_OK;
 }
 
@@ -582,6 +646,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
     { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -1131,7 +1196,7 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
          * "Error initializing PSSG"). Report a sane default priority + success. */
         table_unlock();
         if (prio_addr != 0) {
-            int32_t prio = 1000;
+            int32_t prio = PPU_DEFAULT_PRIORITY;
             int32_t* out = (int32_t*)vm_to_host(prio_addr);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
             uint32_t u = (uint32_t)prio;

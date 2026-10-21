@@ -6,6 +6,7 @@
 #define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
 #endif
 #include "sys_timer.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include <time.h>
 #include "sys_event.h"
 #include "../memory/vm.h"
@@ -112,6 +113,7 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     { extern unsigned long long ps3_qpc_us(void);
       static int n=0; if (PS3_LOG_FIRST(n, 60))
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
@@ -269,6 +271,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 int64_t sys_timer_sleep(ppu_context* ctx)
 {
     uint32_t sec = LV2_ARG_U32(ctx, 0);
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
 #ifdef _WIN32
     Sleep(sec * 1000);

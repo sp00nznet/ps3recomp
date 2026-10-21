@@ -51,6 +51,7 @@ static HANDLE lwm_sem(uint32_t lwmutex) { s_asked = lwmutex; return nullptr; }
 static void ReleaseSemaphore(HANDLE, long, void*) {}
 static void Sleep(unsigned) {}
 static unsigned WaitForSingleObject(HANDLE, unsigned) { return 0; }
+static void ppu_thread_note_block(uint64_t) {}
 %s
 %s
 int main() {
