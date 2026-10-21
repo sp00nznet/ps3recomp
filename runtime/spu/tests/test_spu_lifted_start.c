@@ -110,6 +110,7 @@ typedef void (*test_spu_fn)(spu_context*);
 void spu_begin_image(int image_id);
 void spu_register_function(uint32_t addr, test_spu_fn fn);
 test_spu_fn spu_lookup(uint32_t addr, int image_id);
+test_spu_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 void spu_stop(spu_context* ctx);
 
 /* ---------------------------------------------------------------------------
@@ -407,6 +408,31 @@ static void test_resident_code_regions(void)
     check(ctx->gpr[3]._u32[0] != 81, "overwriting a code buffer invalidates its old image");
     ctx->pc = b; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 82, "overwriting one buffer preserves the other");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
+/* Dispatch memoizes registry lookups per host thread, misses included. An
+ * image whose functions register after its address was first dispatched
+ * (and missed) must still be found: registration invalidates the memo. */
+static void test_registry_lookup_memo(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate lookup memo context"); return; }
+    spu_context_init(ctx, 0);
+    const uint32_t a = 0x13000;
+    spu_begin_image(92); spu_register_function(a, code_b);
+    spu_begin_image(0);
+    ctx->image_id = 91;
+    check(spu_lifted_lookup(ctx, a) == NULL, "another image's function is not served");
+    check(spu_lifted_lookup(ctx, a) == NULL, "a repeated miss stays a miss");
+    spu_begin_image(91); spu_register_function(a, code_a);
+    spu_begin_image(0);
+    check(spu_lifted_lookup(ctx, a) == code_a, "registration invalidates a memoized miss");
+    ctx->pc = a; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 81, "indirect dispatch reaches the newly registered function");
+    ctx->image_id = 92;
+    check(spu_lifted_lookup(ctx, a) == code_b, "memo entries are keyed by image");
     g_spu_trampoline_fn = 0;
     free(ctx);
 }
@@ -767,6 +793,7 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_registry_lookup_memo();
     test_lle_taskset_syscall();
     test_taskset_resume_identity();
     test_guest_stack_reset();

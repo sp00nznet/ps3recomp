@@ -72,7 +72,9 @@ class Pipeline(unittest.TestCase):
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
                             channels.index('/* Which image registered')]
-        (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + channels)
+        # SPU_TLS is defined earlier in spu_channels.c, outside the extracted block.
+        tls = '#if defined(_MSC_VER)\n#define SPU_TLS __declspec(thread)\n#else\n#define SPU_TLS __thread\n#endif\n'
+        (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + tls + channels)
         return runtime
 
     def test_exact_dedup_and_same_address_isolation(self):

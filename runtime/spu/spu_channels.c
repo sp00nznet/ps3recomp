@@ -1485,6 +1485,29 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
     return NULL;
 }
 
+/* Indirect dispatch resolves the same (address, image) pairs on every guest
+ * indirect branch. Each resolution walks the address's hash chain -- one entry
+ * per image registered there, which reaches dozens where streamed job modules
+ * share one code buffer. Memoize the result per host thread. Registration only
+ * appends, so the registry count is a complete generation: any new function
+ * invalidates every cached entry, including cached misses. The generation is
+ * read before the walk, so a registration that races the walk leaves the entry
+ * stale and the next lookup redoes it. */
+typedef struct { uint32_t addr, gen; int image; spu_fn fn; } spu_lookup_memo;
+#define SPU_LOOKUP_MEMO_SIZE 512   /* power of two */
+static SPU_TLS spu_lookup_memo t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
+static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
+{
+    spu_lookup_memo* m = &t_lookup_memo[((addr >> 2) ^ ((uint32_t)image_id * 0x9E3779B1u)) &
+                                        (SPU_LOOKUP_MEMO_SIZE - 1)];
+    const uint32_t gen = s_registry_count + 1;   /* +1: zero-init never matches */
+    if (m->gen != gen || m->addr != addr || m->image != image_id) {
+        m->fn = spu_lookup(addr, image_id);
+        m->addr = addr; m->image = image_id; m->gen = gen;
+    }
+    return m->fn;
+}
+
 /* Which image registered a function at this LS address, or -1 if none did.
  *
  * Deliberately NOT spu_lookup(addr, 0): that call means "dispatch here in a
@@ -1514,7 +1537,7 @@ int spu_have_function(uint32_t addr)
  * spu_fn_registry.c before the registry was consolidated into this TU. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
-    return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
+    return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx ? ctx->image_id : 0);
 }
 
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
@@ -2282,17 +2305,17 @@ void spu_indirect_branch(spu_context* ctx)
         if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
             ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
             code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
+            fn = spu_lookup_memoized(ctx->pc, code_owner);
             break;
         }
     }
     if (!code_owner && ctx->resident_task)
-        fn = spu_lookup(ctx->pc, ctx->resident_task);
+        fn = spu_lookup_memoized(ctx->pc, ctx->resident_task);
     /* Resident overlay next: streamed code overwrote that LS range, so its lift
      * is the truth there -- the base image's stale bytes at the same addresses
      * may also be registered (historical junk lifts) and must lose. */
-    if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
-    if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup_memoized(ctx->pc, ctx->resident_ovl);
+    if (!code_owner && !fn) fn = spu_lookup_memoized(ctx->pc, ctx->image_id);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
