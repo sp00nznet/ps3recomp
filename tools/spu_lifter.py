@@ -544,12 +544,23 @@ class SPULifter:
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
 
+        # Chunks merged into this function (--merge-chunks) are otherwise entered
+        # through the drain loop, which delivers a pending SPU interrupt before
+        # every transfer. As gotos they would not, and a job waiting in a loop
+        # for its interrupt handler (DMA-list stall-and-notify) never wakes. So
+        # each merged chunk entry hands back to the drain when one is pending.
+        merged_starts = {a for a in getattr(self, "func_starts", ()) if start < a < end}
         last_insn = None
         for insn in insns:
             if insn.addr < start or insn.addr >= end:
                 continue
-            if insn.addr in internal:
+            if insn.addr in internal or insn.addr in merged_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
+            if insn.addr in merged_starts:
+                func.body_lines.append(
+                    f"    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
+                    f"{{ ctx->pc = 0x{insn.addr:X}; g_spu_trampoline_fn = "
+                    f"{self.prefix}spu_func_{insn.addr:08X}; return; }}")
             c = self._translate(insn, func)
             if c:
                 if self.trace:
