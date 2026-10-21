@@ -90,6 +90,7 @@ typedef struct spu_coh_entry {
     struct spu_coh_entry* next;
 } spu_coh_entry;
 static spu_coh_entry* s_coh_ctxs;
+static spu_coh_watch* s_coh_watches;
 
 unsigned long g_spu_lr_raise = 0;
 
@@ -111,6 +112,35 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     entry->ctx = ctx;
     entry->next = s_coh_ctxs;
     s_coh_ctxs = entry;
+}
+
+void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
+                       void (*wake)(void*), void* opaque)
+{
+    /* Arming the existing bitmap makes PPU stores/CAS and MFC writes use
+     * the same serialized commit/notify path as SPU reservations. */
+    spu_coh_reserve(NULL, ea);
+    watch->line = ea & ~127u;
+    watch->wake = wake;
+    watch->opaque = opaque;
+    watch->next = s_coh_watches;
+    s_coh_watches = watch;
+}
+
+void spu_coh_watch_remove(spu_coh_watch* watch)
+{
+    for (spu_coh_watch** link = &s_coh_watches; *link; link = &(*link)->next) {
+        if (*link != watch) continue;
+        *link = watch->next;
+        watch->next = NULL;
+        return;
+    }
+}
+
+static void spu_coh_wake_watches(uint32_t line)
+{
+    for (spu_coh_watch* w = s_coh_watches; w; w = w->next)
+        if (w->line == line) w->wake(w->opaque);
 }
 
 /* Drop a context from the reserving set.
@@ -203,6 +233,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
+    spu_coh_wake_watches(line);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c || (const void*)c == self) continue;
@@ -219,6 +250,7 @@ void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
+    spu_coh_wake_watches(line);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c) continue;

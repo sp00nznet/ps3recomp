@@ -975,6 +975,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
  * The bitset is guest state (SPU-visible); the host lock/condvar exist only
  * to block and wake the task's host thread. */
 #include "../../libs/spurs/spurs_taskset.h"
+#include "spu_coherency.h"
 
 #ifdef _WIN32
 static SRWLOCK            s_sig_lock = SRWLOCK_INIT;
@@ -1127,21 +1128,31 @@ static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
     spu_lockline_unlock();
 }
 
-/* Deliver a signal to a task (callable from any PPU/host thread). */
-void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+/* Wake WAIT_SIGNAL sleepers when the signalled line is written, including by
+ * guest SPU/PPU atomics that bypass spu_taskset_signal_task. Coherence calls
+ * this with lock-line held; the guest bit remains the only predicate. */
+static void spu_taskset_wake_written(void* opaque)
 {
-    if (!taskset_ea || taskId >= 128) return;
+    (void)opaque;
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
-    spu_signalled_update(taskset_ea, taskId, 1);
     WakeAllConditionVariable(&s_sig_cv);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
-    spu_signalled_update(taskset_ea, taskId, 1);
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
+}
+
+/* Deliver a signal to a task (callable from any PPU/host thread). */
+void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+{
+    if (!taskset_ea || taskId >= 128) return;
+    /* Update before taking s_sig_lock: watched-line notifications run under
+     * lock-line and take s_sig_lock, so lock-line must never nest inside it. */
+    spu_signalled_update(taskset_ea, taskId, 1);
+    spu_taskset_wake_written(NULL);
     { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
@@ -1257,6 +1268,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */
     spu_serial_release();
+    spu_coh_watch watch;
+    spu_lockline_lock();
+    spu_coh_watch_add(&watch, taskset_ea + CSTS_SIGNALLED, spu_taskset_wake_written, NULL);
+    spu_lockline_unlock();
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
@@ -1268,7 +1283,6 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
@@ -1282,9 +1296,13 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
+    spu_lockline_lock();
+    spu_coh_watch_remove(&watch);
+    spu_lockline_unlock();
+    /* Signals coalesce in the bit, so consuming it outside s_sig_lock loses none. */
+    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }

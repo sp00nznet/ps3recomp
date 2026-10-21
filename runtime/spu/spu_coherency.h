@@ -70,6 +70,20 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
  * write does not cost it its reservation on hardware. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self);
 
+/* Scoped host waiters for real writes to a guest 128-byte line. Add, remove,
+ * and callbacks all run under the lock-line lock. A watch remains caller-owned
+ * until remove returns; callbacks must not re-enter coherence or alter watches.
+ * They may wake a host waiter, but must not manufacture guest state. */
+typedef struct spu_coh_watch {
+    uint32_t line;
+    void (*wake)(void* opaque);
+    void* opaque;
+    struct spu_coh_watch* next;
+} spu_coh_watch;
+void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
+                       void (*wake)(void*), void* opaque);
+void spu_coh_watch_remove(spu_coh_watch* watch);
+
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */
 extern unsigned long g_spu_lr_raise;
