@@ -2331,6 +2331,53 @@ static void vk_dump_ppm(const unsigned char* rgba)
         VK_LOG("cannot publish complete frame dump %s\n",s_vk.dump_path);
 }
 
+/* PS3RECOMP_VK_DUMP_SEQ=<dir>: while <dir>/arm exists, the centre half of every
+ * presented frame goes to <dir>/<present>.ppm and its present number and
+ * performance-counter time to <dir>/index.csv, so motion can be compared frame
+ * by frame against time (the 30 vs 60 FPS cloth test). Diagnostic only. */
+static const char* vk_seq_dir(void)
+{
+    static int checked;
+    static const char* dir;
+    if (!checked) { checked = 1; dir = getenv("PS3RECOMP_VK_DUMP_SEQ"); if (dir && !*dir) dir = NULL; }
+    return dir;
+}
+
+static int vk_seq_armed(void)
+{
+    const char* dir = vk_seq_dir();
+    if (!dir) return 0;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/arm", dir);
+    FILE* f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+static void vk_dump_sequence(const unsigned char* rgba)
+{
+    const char* dir = vk_seq_dir();
+    const u32 w = s_vk.width / 2, h = s_vk.height / 2, x0 = s_vk.width / 4, y0 = s_vk.height / 4;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%06llu.ppm", dir, (unsigned long long)s_vk.presented);
+    FILE* f = fopen(path, "wb");
+    unsigned char* row = (unsigned char*)malloc((size_t)w * 3);
+    int failed = !f || !row || fprintf(f, "P6\n%u %u\n255\n", w, h) < 0;
+    for (u32 y = 0; y < h && !failed; ++y) {
+        const unsigned char* src = rgba + ((size_t)(y0 + y) * s_vk.width + x0) * 4;
+        for (u32 x = 0; x < w; ++x) memcpy(row + (size_t)x * 3, src + (size_t)x * 4, 3);
+        failed = fwrite(row, 3, w, f) != w;
+    }
+    if (f && fclose(f)) failed = 1;
+    free(row);
+    snprintf(path, sizeof path, "%s/index.csv", dir);
+    if (!failed && (f = fopen(path, "ab"))) {
+        fprintf(f, "%llu,%llu,%llu\n", (unsigned long long)s_vk.presented,
+                (unsigned long long)SDL_GetPerformanceCounter(), (unsigned long long)SDL_GetPerformanceFrequency());
+        fclose(f);
+    }
+}
+
 static void vk_cb_present(void* ud, u32 buffer_id)
 { vk_flush_pending(0);
     (void)ud; (void)buffer_id;
@@ -2365,7 +2412,8 @@ static void vk_cb_present(void* ud, u32 buffer_id)
      * vtable path's centre-pixel probe and the offscreen GPU suites. A
      * windowed draw-engine session needs it only on dump frames (the engine
      * keeps its own probe), so it skips a 3.7 MB copy and a GPU wait. */
-    const int dump_due = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
+    const int seq_due = vk_seq_armed();
+    const int dump_due = seq_due || (s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0);
     if (s_vk.windowed && s_vk.eng_active && !dump_due) {
         s_vk.presented++;
         s_g.last_draws = s_g.draws;
@@ -2400,6 +2448,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
     if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
+    if (seq_due) vk_dump_sequence(px);
     vk_present_window();
 }
 
