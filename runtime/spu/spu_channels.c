@@ -19,6 +19,7 @@
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -317,14 +318,65 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
     }
 }
 
+/* Default-off memoization of the last virtual owner used by this host thread.
+ * Engines remain registry-owned, not host-thread or physical-SPU-owned. A hit
+ * borrows exactly the same pointer as the locked path; both require the owner
+ * to stop before release/range cleanup. No context layout or memory is touched.
+ *
+ * Cleanup publishes a new generation before freeing any slot. A stale TLS
+ * pointer is compared only after an acquire generation load and is never
+ * dereferenced on mismatch. Other owners' cleanup conservatively drops hits.
+ * Capture generations under the registry lock so a miss cannot bless an old
+ * pointer with a generation published by concurrent cleanup. Saturation disables
+ * hits permanently rather than permitting a generation-wrap ABA. */
+static _Atomic(uint64_t) s_mfc_cache_generation = 1;
+static SPU_TLS struct {
+    spu_context* ctx;
+    mfc_engine* engine;
+    uint64_t generation;
+} s_mfc_recent;
+static int spu_mfc_cache_enabled(void)
+{
+    static atomic_int cached;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (!value) {
+        const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
+        value = flag && !strcmp(flag, "1") ? 2 : 1;
+        atomic_store_explicit(&cached, value, memory_order_relaxed);
+    }
+    return value == 2;
+}
+static void spu_mfc_cache_remember(spu_context* ctx, mfc_engine* engine)
+{
+    /* Caller holds either registry lock; removal cannot interleave here. */
+    s_mfc_recent.ctx = ctx;
+    s_mfc_recent.engine = engine;
+    s_mfc_recent.generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_relaxed);
+}
+static void spu_mfc_cache_invalidate(void)
+{
+    /* Caller holds the writer lock. Keep UINT64_MAX as a permanent slow mode. */
+    uint64_t generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_relaxed);
+    if (generation != UINT64_MAX)
+        atomic_store_explicit(&s_mfc_cache_generation, generation + 1, memory_order_release);
+}
+
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    int cache_enabled = spu_mfc_cache_enabled();
+    if (cache_enabled) {
+        uint64_t generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_acquire);
+        if (generation != UINT64_MAX && generation == s_mfc_recent.generation &&
+            ctx == s_mfc_recent.ctx)
+            return s_mfc_recent.engine;
+    }
     { static volatile LONG started = 0; const char* e;
       if (!started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
           CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL); }
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
+            if (cache_enabled) spu_mfc_cache_remember(ctx, &slot->mfc);
             ReleaseSRWLockShared(&s_mfc_claim_lock);
             return &slot->mfc;
         }
@@ -336,6 +388,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
+            if (cache_enabled) spu_mfc_cache_remember(ctx, &slot->mfc);
             ReleaseSRWLockExclusive(&s_mfc_claim_lock);
             return &slot->mfc;
         }
@@ -350,6 +403,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
     mfc_engine_init(&slot->mfc);
     slot->next = s_mfc_slots;
     s_mfc_slots = slot;
+    if (cache_enabled) spu_mfc_cache_remember(ctx, &slot->mfc);
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
     return &slot->mfc;
 }
@@ -362,6 +416,7 @@ void spu_mfc_release(spu_context* ctx)
         if ((*link)->ctx != ctx) continue;
         spu_mfc_slot* slot = *link;
         *link = slot->next;
+        spu_mfc_cache_invalidate();
         free(slot);
         break;
     }
@@ -378,6 +433,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t owner = (uintptr_t)slot->ctx;
         if (owner >= lo && owner < hi) {
             *link = slot->next;
+            spu_mfc_cache_invalidate();
             free(slot);
         } else {
             link = &slot->next;
