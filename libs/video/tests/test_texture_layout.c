@@ -479,6 +479,32 @@ static void test_decode_argb_linear(void)
     CHECK_EQ(dst[2], 0x33); CHECK_EQ(dst[3], 0x44);
 }
 
+/* Linear 32-bit colour has its own fast path on little-endian hosts; it must
+ * produce the same bytes as the per-texel decode. A one-row swizzled image is
+ * stored in raster order and still takes the per-texel path, so it is the
+ * reference. */
+static void test_decode_linear_argb_matches_texel_path(void)
+{
+    const u32 fmts[2] = { FMT_A8R8G8B8, FMT_D8R8G8B8 };
+    u8 src[64 * 4];
+    for (u32 i = 0; i < sizeof src; i++) src[i] = (u8)(i * 37u + 11u);
+
+    for (int f = 0; f < 2; f++)
+        for (int as_rgba = 0; as_rgba < 2; as_rgba++) {
+            rsx_tex_layout lin, swz;
+            rsx_texture_layout(fmts[f] | FMT_LN, 64, 1, &lin);
+            rsx_texture_layout(fmts[f], 64, 1, &swz);
+            CHECK(!lin.swizzled);
+            CHECK(swz.swizzled);
+            u8 a[64 * 4 + 8], b[64 * 4 + 8];
+            memset(a, 0xA5, sizeof a);
+            memset(b, 0xA5, sizeof b);
+            rsx_texture_decode(a, sizeof a, src, 64, 1, &lin, as_rgba);
+            rsx_texture_decode(b, sizeof b, src, 64, 1, &swz, as_rgba);
+            CHECK(memcmp(a, b, sizeof a) == 0);
+        }
+}
+
 /* A swizzled image must come out in raster order. Build the source so that
  * texel (x,y) holds a known value AT ITS MORTON OFFSET, then check the decode
  * lays it back out row by row. */
@@ -780,6 +806,7 @@ int main(void)
     test_swizzle_offset();
     test_log2_ceil();
     test_decode_argb_linear();
+    test_decode_linear_argb_matches_texel_path();
     test_decode_swizzled();
     test_decode_g8b8_swizzled();
     test_decode_compressed_is_verbatim();

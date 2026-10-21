@@ -300,6 +300,29 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
         return;
     }
 
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    /* Linear A8R8G8B8 / D8R8G8B8 is a byte rotation per texel (guest A,R,G,B
+     * to host R,G,B,A), which the compiler vectorizes; through decode_texel
+     * it was most of the cost of re-uploading a full-screen render target
+     * read back as a texture. Same bytes as decode_texel. */
+    if (!tl->swizzled && (tl->base_format == 0x85u || tl->base_format == 0x9Eu) &&
+        sbpp == 4u && dbpp == 4u) {
+        const u32 alpha = tl->base_format == 0x9Eu ? 0xFF000000u : 0u;
+        for (u32 y = 0; y < h; y++) {
+            const u8* srow = src + (size_t)y * tl->row_bytes;
+            u8* drow = d + (size_t)y * dst_pitch;
+            for (u32 x = 0; x < w; x++) {
+                u32 v;
+                memcpy(&v, srow + (size_t)x * 4u, 4);
+                if (!argb_as_rgba) v = (v >> 8) | (v << 24);
+                v |= alpha;
+                memcpy(drow + (size_t)x * 4u, &v, 4);
+            }
+        }
+        return;
+    }
+#endif
+
     /* Morton order interleaves the low bits of x and y, so a swizzled image
      * has to be walked texel by texel; so does anything the host cannot take
      * as stored. */
