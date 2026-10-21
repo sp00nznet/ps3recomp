@@ -4813,10 +4813,21 @@ int rsx_vulkan_backend_pump_messages(void)
             continue; /* Alt+Enter must not also press the guest Start button. */
         }
         if (e.type==SDL_WINDOWEVENT && e.window.windowID==window_id) {
-            if (e.window.event==SDL_WINDOWEVENT_SIZE_CHANGED ||
-                e.window.event==SDL_WINDOWEVENT_RESTORED ||
-                e.window.event==SDL_WINDOWEVENT_MINIMIZED)
+            if (e.window.event==SDL_WINDOWEVENT_MINIMIZED)
                 s_vk.swapchain_dirty=1;
+            else if (e.window.event==SDL_WINDOWEVENT_SIZE_CHANGED ||
+                     e.window.event==SDL_WINDOWEVENT_RESTORED) {
+                /* The startup fullscreen switch queues a SIZE_CHANGED for the
+                 * size the first swapchain already has. Rebuilding it then
+                 * (device wait + new swapchain at the first guest flip) left
+                 * Folklore's opening movie without its first picture in most
+                 * fullscreen boots. Rebuild only for a real change; the driver
+                 * still reports OUT_OF_DATE/SUBOPTIMAL for anything else. */
+                int w=0,h=0;
+                SDL_Vulkan_GetDrawableSize(s_vk.window,&w,&h);
+                if (!s_vk.swapchain || (u32)w!=s_vk.sc_extent.width || (u32)h!=s_vk.sc_extent.height)
+                    s_vk.swapchain_dirty=1;
+            }
             if (e.window.event==SDL_WINDOWEVENT_CLOSE) quit=1;
         }
         ps3_pad_keyboard_sdl_event(&e,SDL_GetWindowID(s_vk.window));
