@@ -353,7 +353,23 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
 static inline u128 spu_shlqby(u128 a, u128 b){ int sh=b._u32[0]&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
+#if defined(__SSE4_1__)
+/* pshufb version: the data-dependent rotate sits in lifted audio resample
+ * loops next to shufb. The result's SPU byte i is a's SPU byte (i+sh)&15; with
+ * host byte h holding SPU byte SPU_W(h), that is host byte W((W(h)+sh)&15),
+ * built as one control from the W table itself. */
+static inline u128 spu_rotqby(u128 a, u128 b){
+    const __m128i w = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+    const __m128i src = _mm_and_si128(_mm_add_epi8(w, _mm_set1_epi8((char)(b._u32[0]&0x0F))), _mm_set1_epi8(0x0F));
+    __m128i A; memcpy(&A, &a, 16);
+    A = _mm_shuffle_epi8(A, _mm_shuffle_epi8(w, src));
+    u128 r; memcpy(&r, &A, 16); return r; }
+/* The byte loop stays as the reference (tests/test_spu_rotqby.c checks both). */
+static inline u128 spu_rotqby_ref(u128 a, u128 b){ int sh=b._u32[0]&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
+#else
 static inline u128 spu_rotqby(u128 a, u128 b){ int sh=b._u32[0]&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
+#define spu_rotqby_ref spu_rotqby
+#endif
 static inline u128 spu_shlqbybi(u128 a, u128 b){ int sh=(b._u32[0]>>3)&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 static inline u128 spu_rotqbybi(u128 a, u128 b){ int sh=(b._u32[0]>>3)&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
 
