@@ -309,16 +309,16 @@ static int spu_step(spu_context* ctx) {
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
     case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    /* bi/iret carry the interrupt enable/disable bits (E = 0x40000 sets
-     * int_enable, D = 0x80000 clears it), effective when the branch is taken,
-     * exactly as the lifter decodes them. */
+    /* Every taken indirect branch (bi, bisl, bisled, iret and the conditional
+     * bi* forms) carries the interrupt enable/disable bits (E = 0x40000 sets
+     * int_enable, D = 0x80000 clears it), exactly as the lifter decodes them. */
     #define SPU_IED_BITS() do { \
         if (insn & 0x40000u) ctx->int_enable = 1; \
         else if (insn & 0x80000u) ctx->int_enable = 0; \
     } while (0)
     case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
     case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
-        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; break; }
+        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; SPU_IED_BITS(); break; }
     case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;   /* branch when an enabled event is pending */
         DST = spu_link((pc + 4) & 0x3FFFC);
         if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
@@ -337,10 +337,10 @@ static int spu_step(spu_context* ctx) {
             ctx->irq_saved = 0;
         }
         break;
-    case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
+    case SPU_biz:  if (PREF(DST) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_binz: if (PREF(DST) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
     case SPU_stop: case SPU_stopd:
         ctx->pc = next; ctx->stop_code = (d.op == SPU_stopd) ? 0x3FFFu : (uint32_t)I;   /* stopd carries no code field: RPCS3 reports 0x3FFF */
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
