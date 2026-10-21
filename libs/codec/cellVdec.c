@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "vdec_ffmpeg.h"
 #include "ps3emu/strict_boot.h"
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
@@ -188,6 +189,8 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
     if (!type || !handle)
         return (s32)CELL_VDEC_ERROR_ARG;
 
+    struct timespec t0, t1;
+    timespec_get(&t0, TIME_UTC);
     for (int i = 0; i < MAX_VDEC; i++) {
         if (!s_vdec[i].in_use) {
             memset(&s_vdec[i], 0, sizeof(VdecSlot));
@@ -196,6 +199,7 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
             s_vdec[i].cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
             s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
             s_vdec[i].ff = vdec_ff_open(codec_type);
+            timespec_get(&t1, TIME_UTC);
             if (!s_vdec[i].ff) {
                 memset(&s_vdec[i], 0, sizeof(VdecSlot));
                 ps3_strict_boot_guard("vdec-decoder-unavailable",
@@ -204,7 +208,9 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
                 return (s32)CELL_VDEC_ERROR_FATAL;
             }
             vm_write32((u32)(uintptr_t)handle, (u32)i);
-            printf("[cellVdec] Open -> handle=%u\n", i);
+            /* How long Open took matters to titles that race it (cellSysmodule). */
+            printf("[cellVdec] Open -> handle=%u in %.1f ms\n", i,
+                   (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6);
             if (s_vdec[i].ff)
                 printf("[cellVdec] decoding with libavcodec\n");
             return CELL_OK;

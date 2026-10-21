@@ -6,6 +6,7 @@
 
 #ifdef PS3RECOMP_FFMPEG_RUNTIME
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -139,6 +140,26 @@ const PS3FFmpeg* ps3_ffmpeg_get(void)
     pthread_once(&s_once, ff_once);
 #endif
     return s_state > 0 ? &s_ff : NULL;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI ff_prefetch_main(LPVOID p) { (void)p; ps3_ffmpeg_get(); return 0; }
+#else
+static void* ff_prefetch_main(void* p) { (void)p; ps3_ffmpeg_get(); return NULL; }
+#endif
+
+void ps3_ffmpeg_prefetch(void)
+{
+    static atomic_flag started = ATOMIC_FLAG_INIT;
+    if (atomic_flag_test_and_set(&started)) return;
+    /* If no thread can be made, the first decoder open loads FFmpeg, as before. */
+#ifdef _WIN32
+    HANDLE t = CreateThread(NULL, 0, ff_prefetch_main, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, ff_prefetch_main, NULL) == 0) pthread_detach(t);
+#endif
 }
 
 #else

@@ -4,6 +4,9 @@
 
 #include "cellSysmodule.h"
 #include <stdio.h>
+#ifdef PS3RECOMP_FFMPEG_RUNTIME
+#include "../codec/ffmpeg_runtime.h"
+#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -97,6 +100,18 @@ s32 cellSysmoduleLoadModule(u16 id)
         return CELL_OK;  /* Already loaded — return success (some games treat DUPLICATED as fatal) */
 
     s_module_loaded[slot] = 1;
+#ifdef PS3RECOMP_FFMPEG_RUNTIME
+    /* Loading the decoder PRX is when its code arrives on hardware, so start
+     * loading FFmpeg now rather than inside the first cellVdecOpen. A slow
+     * Open is not harmless: Folklore polls a "decoder ready" flag from its
+     * movie controller and its input thread every 10 ms, and if the
+     * controller sees it first it starts playback before the input thread's
+     * flush handshake, which leaves the picture thread asleep forever (the
+     * logo movie freezes with the picture queue full). */
+    if (id == CELL_SYSMODULE_VDEC || id == CELL_SYSMODULE_VDEC_MPEG2 ||
+        id == CELL_SYSMODULE_VDEC_AVC || id == CELL_SYSMODULE_VDEC_AL)
+        ps3_ffmpeg_prefetch();
+#endif
     return CELL_OK;
 }
 

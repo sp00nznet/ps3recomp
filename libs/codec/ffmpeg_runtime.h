@@ -58,6 +58,13 @@ typedef struct PS3FFmpeg {
  * outcome is printed once and then cached. */
 const PS3FFmpeg* ps3_ffmpeg_get(void);
 
+/* Start that load on a host thread and return at once; a later
+ * ps3_ffmpeg_get waits for it instead of loading again. The first load of the
+ * codec DLL chain can take most of a second with a cold file cache, while
+ * cellVdecOpen takes milliseconds on hardware; cellSysmodule calls this when a
+ * title loads a VDEC module so Open costs about what it does there. */
+void ps3_ffmpeg_prefetch(void);
+
 #ifdef __cplusplus
 }
 #endif
