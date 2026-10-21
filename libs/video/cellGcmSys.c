@@ -1726,12 +1726,17 @@ static int gcm_get_eq_put(void)
     return eq;
 }
 
+/* The diagnostic switches below are tested on every drain pass, and GCM_RECDBG
+ * on every semaphore method. getenv walks the whole environment and showed in
+ * RSX-thread profiles, so each is read once and cached, like the other knobs. */
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      static int rate = -1;
+      if (rate < 0) rate = getenv("GCM_RATE") ? 1 : 0;
+      if (rate) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -1772,7 +1777,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    static int s_ctxdbg = -1;
+    if (s_ctxdbg < 0) s_ctxdbg = getenv("GCM_CTXDBG") ? 1 : 0;
+    if (s_ctxdbg && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -1792,7 +1799,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
     static int s_drain_every = -1;
     if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
                              s_drain_every = (e && atoi(e) > 0) ? atoi(e) : 60; }
-    if (getenv("GCM_DRAINDBG")) {
+    static int s_draindbg = -1;
+    if (s_draindbg < 0) s_draindbg = getenv("GCM_DRAINDBG") ? 1 : 0;
+    if (s_draindbg) {
         static int n = 0;
         if (n++ % s_drain_every == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -1804,8 +1813,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * present in 0..put. "The title waits for a fence we never published" has
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
-    { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+    { static int scanned = 0, scanref = -1;
+      if (scanref < 0) scanref = getenv("GCM_SCANREF") ? 1 : 0;
+      if (!scanned && scanref && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
@@ -2078,7 +2088,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
+                    { static int sn = 0, recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+                      if (recdbg && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
@@ -2403,7 +2414,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
-    if (getenv("GCM_DRAINDBG")) {
+    if (s_draindbg) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
