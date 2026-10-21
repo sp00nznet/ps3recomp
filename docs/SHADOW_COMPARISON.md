@@ -7,8 +7,13 @@ non-depth textures and alpha-kill keep the existing raw sampling behavior.
 
 TEX compares source z with stored red-channel depth. TXP divides xyz by w
 before comparison. The reference is clamped to [0,1], and the scalar comparison
-is replicated into all four lanes. Comparisons are reference <, ==, <=, >, !=,
-and >= stored depth in control order. Linear sampling compares four texel
+is replicated into all four lanes. Comparisons are stored depth <, ==, <=, >,
+!=, and >= the reference in control order (`depth FUNC reference`). That is
+the reverse of ARB_shadow's `reference FUNC depth`: a shadow map sampled with
+GREATER is lit where the stored occluder depth is beyond the fragment's
+reference. The first implementation (#302) used
+the ARB_shadow order, which inverted every shadow; #403 has the titles that
+settled the direction. Linear sampling compares four texel
 centers separately before interpolating visibility; it does not compare a
 filtered depth value. The existing sampler supplies address/border behavior.
 
@@ -45,5 +50,9 @@ Contract references:
   https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/RSX/RSXThread.cpp
 - RPCS3 FragmentProgramDecompiler.cpp: TEX/TXP shadow reference and replication.
   https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/RSX/Program/FragmentProgramDecompiler.cpp
-- OpenGL ARB_shadow: reference direction/clamp and comparison before filtering.
+- RPCS3 VKDraw.cpp: the sampler compare op is `get_compare_func(zfunc, true)`,
+  the reversed function, so `reference OP texel` becomes `depth FUNC reference`.
+  https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/RSX/VK/VKDraw.cpp
+- OpenGL ARB_shadow: reference clamp and comparison before filtering. Its
+  comparison direction is the reverse of the RSX's (see above).
   https://registry.khronos.org/OpenGL/extensions/ARB/ARB_shadow.txt

@@ -483,9 +483,11 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
 {
     char tex[32], text[4096];
     snprintf(tex, sizeof tex, cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", unit);
-    const char* cmp[] = { "0.0", "reference < depth", "reference == depth",
-        "reference <= depth", "reference > depth", "reference != depth",
-        "reference >= depth", "1.0" };
+    /* The RSX compares the stored depth with the reference (depth FUNC reference), the reverse of
+     * the ARB_shadow order (reference FUNC depth). See docs/SHADOW_COMPARISON.md. */
+    const char* cmp[] = { "0.0", "depth < reference", "depth == reference",
+        "depth <= reference", "depth > reference", "depth != reference",
+        "depth >= reference", "1.0" };
     snprintf(text, sizeof text,
         "float _rsx_shadow_cmp%u(float reference, float depth) { return (float)(%s); }\n"
         "float4 _rsx_shadow%u(float3 coordinate) {\n"

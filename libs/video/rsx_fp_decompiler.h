@@ -124,7 +124,8 @@ int rsx_fp_decompile_buffered_ex(
 /* Native depth texture comparison metadata. Disabled descriptors preserve the
  * original shader byte-for-byte. enabled=2 marks an active unsupported layout.
  * RSX ADDRESS zfunc0/7 and texture alpha-kill bypass comparison; modes1..6
- * compare the source reference against stored depth. R32 color snapshots are
+ * compare stored depth against the source reference (depth FUNC reference,
+ * the reverse of ARB_shadow's order). R32 color snapshots are
  * sampled explicitly, so no native depth texture/SampleCmp binding is needed.
  * Supported: decoded D24_D8/D16, 2D TEX/TXP, one level, matching nearest or
  * linear min/mag filters. Float-depth formats, cubes/3D, multiple levels and
