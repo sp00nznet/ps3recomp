@@ -22,10 +22,9 @@ extern "C" {
 /* A lifted SPU function: void f(spu_context*). Matches the lifter's signature. */
 typedef void (*spu_lifted_fn)(spu_context*);
 
-/* Registered lifted-function lookup by local-store entry address for the image
- * currently selected in ctx->image_id. Weak: the default returns NULL (pure
- * interpretation). The lifted image's generated spu_function_table registration
- * overrides this so computed branches reach compiled code. */
+/* Resolve this LSA using runtime ownership: bounded resident code (including
+ * authoritative misses), then task, overlay, and primary image. This is the
+ * same resolver used by indirect dispatch. NULL ctx retains wildcard lookup. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 
 /* Interpret from `start_lsa` until the SPU stops (`stop`/`stopd`/halt) or a

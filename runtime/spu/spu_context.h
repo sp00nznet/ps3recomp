@@ -289,6 +289,9 @@ typedef struct spu_context {
     struct {
         uint32_t lsa, size, source_ea;
         int image_id;
+        /* 0: unchecked legacy region; otherwise SPU_OVERLAY_* state of a
+         * region registered with its code bytes (spu_overlay_residency.h). */
+        int verify_state, source_index;
     } resident_code[4];
 
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
