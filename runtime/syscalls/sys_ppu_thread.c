@@ -79,12 +79,19 @@ static void table_unlock(void)
 #endif
 }
 
-/* Find a free slot. Returns index or -1. Must be called under lock. */
+/* Find a free slot. Returns index or -1. Must be called under lock.
+ * The thread id is the slot + 1. A title that polls sys_ppu_thread_get_priority(id) until it returns ESRCH (to see a
+ * worker finish) only gets its answer if the next thread does not take that slot, and so that id, at once. So the
+ * search continues after the slot used last (next-fit): an id comes back only after the other slots were used. */
 static int find_free_slot(void)
 {
-    for (int i = 0; i < PPU_THREAD_MAX; i++) {
-        if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE)
+    static int s_next = 0;
+    for (int n = 0; n < PPU_THREAD_MAX; n++) {
+        int i = (s_next + n) % PPU_THREAD_MAX;
+        if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE) {
+            s_next = (i + 1) % PPU_THREAD_MAX;
             return i;
+        }
     }
     return -1;
 }
@@ -1124,6 +1131,12 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
+    if (!t && tid >= 1 && tid <= PPU_THREAD_MAX && g_ppu_threads[tid - 1].entry_addr != 0) {
+        /* A thread created by sys_ppu_thread_create that has exited and been freed (the slot keeps its entry address):
+         * it is gone (ESRCH). */
+        table_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
     if (!t) {
         /* The main thread (and any thread we didn't spawn via sys_ppu_thread_create)
          * isn't in our table. Returning ESRCH here is fatal for engines that query
