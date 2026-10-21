@@ -842,7 +842,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * long-missing producer for event_status (previously only ever cleared
          * via WrEventAck -> RdEventStat waits could never complete). */
         if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
+            spu_lockline_lock();
             ctx->event_status |= 0x1u;
+            spu_lockline_unlock();
             spu_ch_wake(ctx);
         }
         return;

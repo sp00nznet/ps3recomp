@@ -45,6 +45,7 @@
  */
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -415,6 +416,58 @@ static void test_ack_keeps_a_concurrent_raise(void)
     CHECK(g_a.resv_valid == 0);
 }
 
+
+/* Hold the reservation-writer lock while a real MFC producer starts. Its
+ * event update must wait: otherwise a peer's LR read/modify/write can overwrite
+ * the DMA notification. Atomic fixture flags synchronize the host threads. */
+static atomic_int g_raise_entered, g_raise_done;
+static unsigned g_raise_mode;
+static void* raise_thread(void* ignored)
+{
+    (void)ignored;
+    atomic_store(&g_raise_entered, 1);
+    if (g_raise_mode == 2) {
+        /* One zero-length, stall-and-notify list element, tag five. */
+        g_a.ls[0x1000] = 0x80;
+        mfc_run_list(&g_a, 0x1000, 1, 0, 0, MFC_GET_CMD, 5);
+    } else {
+        wrch(&g_a, MFC_WrTagMask, 1);
+        wrch(&g_a, MFC_WrTagUpdate, 1);
+    }
+    atomic_store(&g_raise_done, 1);
+    return NULL;
+}
+static void test_producer_keeps_peer_event(unsigned bit)
+{
+    reset_pair();
+    g_a.event_mask = bit;
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+    g_a.event_status = 0;
+    g_raise_mode = bit;
+    atomic_store(&g_raise_entered, 0);
+    atomic_store(&g_raise_done, 0);
+    spu_lockline_lock();
+    pthread_t t;
+    if (pthread_create(&t, NULL, raise_thread, NULL)) {
+        spu_lockline_unlock(); CHECK(0); return;
+    }
+    while (!atomic_load(&g_raise_entered)) YieldProcessor();
+    Sleep(10);
+    TEST("MFC producer serializes with concurrent reservation writer");
+    CHECK(atomic_load(&g_raise_done) == 0);
+    CHECK_EQ_U32(g_a.event_status, 0);
+    spu_coh_notify_write(LINE_A);
+    spu_lockline_unlock();
+    pthread_join(t, NULL);
+    TEST("MFC notification retains the concurrent reservation event");
+    CHECK_EQ_U32(g_a.event_status, bit | SPU_EVENT_LR);
+    if (bit == 2) {
+        TEST("actual stalled tag remains pending for handler");
+        CHECK_EQ_U32(g_a.list_stall_stat, 0x20);
+        CHECK_EQ_U32(g_a.list_stall_mask, 0x20);
+    }
+}
+
 /* ===========================================================================
  * main
  * ===========================================================================*/
@@ -427,6 +480,8 @@ int main(void)
     test_plain_put_elsewhere_is_quiet();
     test_wide_put_finds_the_reserved_line();
     test_ack_keeps_a_concurrent_raise();
+    test_producer_keeps_peer_event(2);
+    test_producer_keeps_peer_event(1);
 
     printf("\nSPU-to-SPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);

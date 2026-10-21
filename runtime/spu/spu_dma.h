@@ -795,7 +795,12 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             spu->list_stall_cmd[t]       = base_cmd;
             spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
             spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
-            spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
+            /* Reservation invalidation can publish LR from another thread.
+             * Serialize this RMW with that writer and WrEventAck so neither
+             * can replace a freshly raised DMA notification with stale bits. */
+            spu_lockline_lock();
+            spu->event_status |= 0x2u;          /* SPU_EVENT_SN stall-and-notify */
+            spu_lockline_unlock();
             /* Real MFC runs a queued list asynchronously, so the notify lands
              * AFTER the arming code finishes. We run it inline here, so hold the
              * resulting interrupt off for a few drain ticks -- otherwise the WWS
