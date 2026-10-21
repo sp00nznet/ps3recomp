@@ -164,6 +164,52 @@ whatever word it read, which is the next trampoline's own first instruction:
 `ps3_hle_call(<nid>, ctx)`, so both direct `bl` and indirect calls to it reach
 the HLE handler.
 
+### Step 4b: Lift SPU programs (only if the title has SPU code)
+
+Skip this if the title never starts SPU programs. Otherwise the SPU ELFs are
+embedded in the PPU binary (and sometimes in other decrypted files), and each
+one is lifted to C separately from the PPU code. `tools/extract_spu_images.py`
+finds them, `tools/spu_lifter.py` lifts one image, and
+`tools/build_spu_workloads.py` runs the lifter over a directory of images and
+writes the registration file:
+
+```bash
+python ../tools/extract_spu_images.py game/EBOOT.ELF --output spu/images
+python ../tools/build_spu_workloads.py \
+    --images spu/images --lifted spu --out spu/spu_workloads.c --constructor
+```
+
+`build_spu_workloads.py --input FILE` (repeatable) does the discovery itself,
+so the first command is only needed if you want to look at the images.
+`tools/lift_jobmods.py` does the same for SPURS job modules (raw code and
+data blobs, not ELFs; `SPU_DUMP_MISS=<dir>` collects the ones that only exist
+at run time) once they are saved as `.bin` files (`--jobmods DIR --out spu`, optionally
+`--merge-chunks`); see [Game Porting Guide](GAME_PORTING_GUIDE.md#lifting-spu-programs).
+
+**The project template can run the discovery and lift at configure time.**
+`PORT_ENABLE_SPU` (default `ON`) and `PORT_SPU_INPUTS` (a semicolon-separated
+list of decrypted ELF/PRX files to scan) are in `templates/project/CMakeLists.txt`;
+the helper is `cmake/PS3RecompSPU.cmake`:
+
+```bash
+cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp -DRECOMP_DIR=$PWD/recompiled \
+    '-DPORT_SPU_INPUTS=game/EBOOT.ELF'
+```
+
+Without `PORT_SPU_INPUTS`, the template compiles any `spu/*/spu_recomp.c` it
+finds, plus `spu_workloads.c`, `jobmods_register.c` and
+`taskset_policy_bytes.c` when they exist.
+
+The generated file registers each lifted image with the runtime by content
+fingerprint (`spu_workload_register` / `spu_workload_register_img` in
+`runtime/spu/spu_workload.c`); cellSpurs then runs the lifted code when the
+game hands it a matching image. SPU code that is not lifted (for example a job
+body the game DMAs into local store at run time) is not an error: it runs in
+the SPU interpreter (`runtime/spu/spu_interp.c`), slower, and when it branches
+to a lifted entry the lifted code resumes
+([SPU_INTERPRETER_LIFTED_HANDOFF.md](SPU_INTERPRETER_LIFTED_HANDOFF.md)).
+The lifter itself is documented in [SPU_LIFTER.md](SPU_LIFTER.md).
+
 ### Step 5: Generate the HLE handler table
 
 Lifting produces the game's own code. It does **not** produce the bridge from
