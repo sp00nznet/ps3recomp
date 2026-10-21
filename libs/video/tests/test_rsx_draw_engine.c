@@ -1385,6 +1385,38 @@ static void test_antialiased_surface(void)
     }
 }
 
+/* A smaller clip reuses the surface only on the same sample grid. An
+ * antialiased target is stored at sample resolution, so the same memory
+ * declared without antialiasing must not draw into the left part of it. */
+static void test_surface_reuse_antialias(void)
+{
+    printf("-- surface reuse across antialias modes\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 2048u);
+    m(M_SURFACE_FORMAT, 8u | (3u << 12));      /* DIAGONAL_CENTERED_2 */
+    m(M_SURFACE_CLIP_H, 128u << 16);
+    m(M_SURFACE_CLIP_V, 64u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_color_create == 1 && stub.color_w == 256 && stub.color_h == 64,
+          "the antialiased 128x64 target is created at 256x64 (%d, %ux%u)",
+          stub.n_color_create, stub.color_w, stub.color_h);
+
+    m(M_SURFACE_CLIP_H, 64u << 16);
+    m(M_SURFACE_CLIP_V, 32u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_color_create == 1,
+          "a smaller clip on the same grid reuses the target (%d)", stub.n_color_create);
+
+    m(M_SURFACE_FORMAT, 8u);                   /* CENTER_1 */
+    m(M_SURFACE_CLIP_H, 128u << 16);
+    m(M_SURFACE_CLIP_V, 64u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_color_create == 2 && stub.color_w == 128 && stub.color_h == 64,
+          "the same memory without antialiasing is a 128x64 target (%d, %ux%u)",
+          stub.n_color_create, stub.color_w, stub.color_h);
+    engine_down();
+}
+
 /* ---- 10. a zeta or a target read in a texture format of its own --------- */
 
 static void test_depth_read_as_color(void)
@@ -1623,6 +1655,7 @@ int main(void)
     test_inline_array();
     test_depth_clear_value();
     test_antialiased_surface();
+    test_surface_reuse_antialias();
     test_depth_read_as_color();
     test_color_read_as_float();
     test_immediate_compositor();

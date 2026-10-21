@@ -95,6 +95,7 @@ typedef struct {
     u32 location, offset;
     u32 w, h;
     u32 pitch;              /* guest bytes per row, from SET_SURFACE_PITCH */
+    u32 aa_grid;            /* samples per pixel, aa_sx | aa_sy << 8          */
     rsx_be_format fmt;
     u32 handle;
     u32 feedback;          /* last immutable own-target copy, engine-owned */
@@ -555,9 +556,14 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
  * there. God of War: Ascension renders its scene into a 1280x720 target, then
  * runs a 640x360 pass at the same address and pitch and copies the full
  * 1280x720 out for its SPU anti-aliasing; recreating the target at 640x360
- * lost the scene and left that quarter of the frame black. */
+ * lost the scene and left that quarter of the frame black.
+ *
+ * Only on the same sample grid, though: an antialiased target is stored at
+ * sample resolution, so the same memory declared without antialiasing is a
+ * different layout, and drawing it into the larger target would squeeze the
+ * frame into its left part. */
 static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
-                          rsx_be_format want_fmt, u32 pitch)
+                          rsx_be_format want_fmt, u32 pitch, u32 aa_grid)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
@@ -568,7 +574,8 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
             const eng_surface* s = &g.surfaces[i];
             if (s->fmt == want_fmt &&
                 ((s->w == want_w && s->h == want_h) ||
-                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
+                 (pitch && s->pitch == pitch && s->aa_grid == aa_grid &&
+                  s->w >= want_w && s->h >= want_h)))
                 return i;
             slot = i;
             break;
@@ -601,7 +608,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
-    s->w = want_w; s->h = want_h; s->fmt = want_fmt;
+    s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
     s->handle = handle;
     s->color_serial = 0;
     s->guest_dirty = 0;
@@ -627,8 +634,9 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
      * A, and the MRT selectors add B, C and D on top of it. */
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
     const rsx_be_format fmt = eng_surface_format(sf.color_format);
+    const u32 aa_grid = sf.aa_sx | (sf.aa_sy << 8);
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
-                                      sf.clip_w, sf.clip_h, fmt, sf.color_pitch[sel]);
+                                      sf.clip_w, sf.clip_h, fmt, sf.color_pitch[sel], aa_grid);
     if (first == ENG_INVALID) return 0;
     g.surfaces[first].pitch = sf.color_pitch[sel];
     slots[0] = first;
@@ -645,7 +653,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
         const u32 slot = eng_surface_get(sf.color_location[i + 1],
                                          sf.color_offset[i + 1],
                                          g.surfaces[first].w, g.surfaces[first].h, fmt,
-                                         sf.color_pitch[i + 1]);
+                                         sf.color_pitch[i + 1], aa_grid);
         if (slot == ENG_INVALID) break;
         g.surfaces[slot].pitch = sf.color_pitch[i + 1];
         /* A set naming one buffer twice would attach the same target twice,
