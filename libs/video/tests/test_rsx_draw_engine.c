@@ -1456,6 +1456,50 @@ static void test_color_read_as_float(void)
     engine_down();
 }
 
+/* A cached texture over a colour target the engine stores to guest memory
+ * again: the new bytes reach the texture at its next use, and once the
+ * stores stop the cache settles instead of re-decoding every frame. */
+static void test_engine_rewrite_reuploads(void)
+{
+    printf("-- texture over a re-stored colour target\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 256u * 4u);
+    m(M_CLEAR_BUFFERS, 0xF0u);                   /* a colour write at 0x40000 */
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((0x9Cu | 0x20u) << 8) | (1u << 16));
+    draw_triangle();
+    const int first = stub.n_texture_create;
+    const u32 first_tex = stub.bound_tex[0];
+
+    /* The target is written again with other pixels and stored once more. */
+    rsx_draw_engine_present();
+    const u8 saved[4] = { g_stub_pixel[0], g_stub_pixel[1], g_stub_pixel[2], g_stub_pixel[3] };
+    g_stub_pixel[0] = 0x55;
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    draw_triangle();
+    const u8* p = vm_base + GUEST_LOCAL_EA + 0x40000u;
+    CHECK(p[1] == 0x55, "the target was stored to guest memory again (%02X)", p[1]);
+    CHECK(stub.n_texture_create == first + 1 && stub.alive[first_tex] == 0 &&
+          stub.bound_tex[0] == stub.last_created_texture,
+          "the texture over it is re-decoded from the new bytes (%d creates)",
+          stub.n_texture_create - first);
+
+    /* No more stores: at most one more decode, then none. */
+    const int settled = stub.n_texture_create;
+    for (int f = 0; f < 3; f++) { rsx_draw_engine_present(); draw_triangle(); }
+    const int after = stub.n_texture_create;
+    rsx_draw_engine_present();
+    for (int f = 0; f < 12; f++) { rsx_draw_engine_present(); draw_triangle(); }
+    CHECK(after - settled <= 1 && stub.n_texture_create == after,
+          "unchanged bytes settle (%d then %d more decodes)",
+          after - settled, stub.n_texture_create - after);
+    memcpy(g_stub_pixel, saved, sizeof saved);
+    engine_down();
+}
+
 /* The register-based fullscreen compositor has no array or inline stream.
  * Capture each position completion with the attributes current at that time. */
 static void immediate_vertex(float x, float y, float u, float v)
@@ -1625,6 +1669,7 @@ int main(void)
     test_antialiased_surface();
     test_depth_read_as_color();
     test_color_read_as_float();
+    test_engine_rewrite_reuploads();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
 
