@@ -667,6 +667,47 @@ static void test_texture_cache(void)
     engine_down();
 }
 
+/* The cache remembers where each key was last found. Two keys that share a
+ * remembered slot (these two offsets do, with every other field equal) must
+ * still each find their own entry, however their binds interleave. */
+#define TEX_OFFSET_SHARING_MEMO 0x00120100u
+static void test_texture_lookup_memo(void)
+{
+    printf("-- texture lookup memo\n");
+    engine_up();
+    memset(vm_base + TEX_OFFSET, 0x11, 4 * 4 * 4);
+    memset(vm_base + TEX_OFFSET_SHARING_MEMO, 0x33, 4 * 4 * 4);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    const u32 a = stub.bound_tex[0];
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET_SHARING_MEMO);
+    draw_triangle();
+    const u32 b = stub.bound_tex[0];
+    CHECK(stub.n_texture_create == 2 && a && b && a != b,
+          "two keys sharing a memo slot are two entries (%d creates)",
+          stub.n_texture_create);
+
+    int wrong = 0;
+    for (int i = 0; i < 6; i++) {
+        if (i == 3) rsx_draw_engine_present();
+        bind_texture_unit(RSX_LOCATION_MAIN, (i & 1) ? TEX_OFFSET_SHARING_MEMO : TEX_OFFSET);
+        draw_triangle();
+        if (stub.bound_tex[0] != ((i & 1) ? b : a)) wrong++;
+    }
+    CHECK(stub.n_texture_create == 2 && wrong == 0,
+          "interleaved binds each find their own entry (%d creates, %d wrong)",
+          stub.n_texture_create, wrong);
+
+    /* A change to one is still seen through the memo. */
+    rsx_draw_engine_present();
+    memset(vm_base + TEX_OFFSET_SHARING_MEMO, 0x44, 4 * 4 * 4);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET_SHARING_MEMO);
+    draw_triangle();
+    CHECK(stub.n_texture_create == 3 && stub.alive[b] == 0,
+          "changed bytes behind a memoized entry are re-decoded");
+    engine_down();
+}
+
 /* A 128x128 A8R8G8B8 linear texture on unit 0: 64 KB, past the size that is
  * hashed in full every frame. */
 #define BIG_TEX_OFFSET 0x00100000u
@@ -1609,6 +1650,7 @@ int main(void)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_texture_lookup_memo();
     test_texture_sparse_rehash();
     test_pipeline_key();
     test_restart_expansion();

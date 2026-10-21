@@ -1128,13 +1128,32 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                : eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
-    for (u32 i = 0; i < g.n_textures; i++) {
-        eng_texture* e = &g.textures[i];
-        if (e->location != location || e->offset != offset ||
-            e->format != fmt || e->width != w || e->height != h ||
-            e->pitch != pitch || e->remap != remap ||
-            e->cubemap != (u32)(cube != 0) || e->depth != depth)
-            continue;
+    /* A scene binds the same few hundred textures every frame, and a linear
+     * scan of the whole cache per bind averaged several hundred entries.
+     * Remember where each key was last found; a remembered slot is used only
+     * if its entry still matches, otherwise the scan runs as before. Keys are
+     * unique in the cache, so the result is the same either way. */
+    static u16 s_slot_memo[4096];
+    const u32 memo = (offset >> 4 ^ offset >> 16 ^ fmt * 0x9E37u ^ w * 31u ^ h ^
+                      location << 11) & 4095u;
+#define ENG_TEXTURE_KEY_MATCHES(e) ((e)->location == location && (e)->offset == offset && \
+        (e)->format == fmt && (e)->width == w && (e)->height == h && \
+        (e)->pitch == pitch && (e)->remap == remap && \
+        (e)->cubemap == (u32)(cube != 0) && (e)->depth == depth)
+    eng_texture* hit = NULL;
+    if (s_slot_memo[memo] < g.n_textures && ENG_TEXTURE_KEY_MATCHES(&g.textures[s_slot_memo[memo]])) {
+        hit = &g.textures[s_slot_memo[memo]];
+    } else {
+        for (u32 i = 0; i < g.n_textures; i++)
+            if (ENG_TEXTURE_KEY_MATCHES(&g.textures[i])) {
+                hit = &g.textures[i];
+                s_slot_memo[memo] = (u16)i;
+                break;
+            }
+    }
+#undef ENG_TEXTURE_KEY_MATCHES
+    if (hit) {
+        eng_texture* e = hit;
         if (e->handle && e->last_hash_frame != g.frames) {
             /* Every cached texture used to be hashed in full every frame;
              * in a big scene that is hundreds of MB a second for the few
