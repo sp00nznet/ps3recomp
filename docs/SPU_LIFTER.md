@@ -17,6 +17,23 @@ what still needs doing to actually execute SPU code.
 - CLI prints a coverage summary including a per-mnemonic list of any
   unsupported instructions encountered.
 
+Related pieces:
+
+- `docs/SPU_INTERPRETER_LIFTED_HANDOFF.md` describes how execution returns to
+  lifted code after the interpreter ran an unlifted region
+  ([SPU_INTERPRETER_LIFTED_HANDOFF.md](SPU_INTERPRETER_LIFTED_HANDOFF.md)).
+- `tools/lift_jobmods.py --merge-chunks` (PR #386) passes `--merge-chunks` to
+  `spu_lifter.py`: each run of chunks between call targets becomes one C
+  function with gotos instead of chunks linked by trampolines.
+- `SPU_INTERP_STATS=<seconds>` (PR #394) is read in `runtime/spu/spu_interp.c`
+  (`getenv`, about line 454). While set, the interpreter reports how much SPU
+  code runs interpreted, by image and 1 KB page of local store.
+- SPURS workload registration: `spu_workload_register()` and
+  `spu_workload_register_img()` in `runtime/spu/spu_workload.c` take a content
+  fingerprint and a lifted entry function; `cellSpurs` calls
+  `spu_workload_dispatch()` to run the matching image. `tools/build_spu_workloads.py`
+  generates the registration table.
+
 Targets the ABI in `runtime/spu/spu_context.h` (`u128 gpr[128]`, 256 KB
 local store, channels, MFC staging) and the `u128` union in
 `include/ps3emu/ps3types.h`.
@@ -132,8 +149,10 @@ helpers. Verified on the Uncharted SPU image:
 - Halfword/byte immediate logic (`andhi`/`andbi`/`orhi`/`orbi`/`xorhi`).
 - OR-across (`orx`).
 - `bgx` (borrow-generate extended) — reads `rt` as carry-in like `addx`.
-- Halt-conditionals (`hgti`/`hlgti`/`heqi`/`hgt`/`hlgt`/`heq`) → emitted as
-  no-ops (recompiled code does not honor SPU halt semantics).
+- Halt-conditionals (`hgti`/`hlgti`/`heqi`/`hgt`/`hlgt`/`heq`) → compare the
+  preferred word slots and, if the condition holds, print a `HALT-ASSERT`
+  line to stderr, set the context status to stopped-by-halt and call
+  `spu_halt()` (see "Known stubs" for the details).
 - `stopd` → same as `stop`.
 - `lqr`/`stqr` → LS load/store at PC-relative target (same as `lqa`/`stqa`).
 - `mfspr` → stub (returns 0; SPU SPRs are not modeled).
@@ -145,17 +164,12 @@ Result on the Uncharted SPU image after Phase 3:
   linker). Eliminating them is §4 work — split text from data using the
   ELF section table and function-boundary detection.
 
-Future — not yet hit by any image we've measured:
-- Register-variable shifts/rotates: shl, shlh, rot, roth, shlqbi(i),
-  rotqbi(i), shlqby(bi), rotqby(bi), rotqbybi
-- Float: fi (interpolate), frest/frsqest (+ the Newton-Raphson step pairs),
-  fcmeq/fcmgt, fscrrd/fscrwr, double-precision (dfa/dfs/dfm/dfma…)
-- Integer extras: addx/sfx/cg/bg (extended add/sub with carry/borrow),
-  mpyh/mpys/mpyhh*, mpyhha, cntb edge cases, gb/gbh/gbb (gather bits), fsmb/fsm
-- Conversions: cuflt/csflt/cflts/cfltu (int↔float), fesd/frds (sp↔dp)
-- form-select/extend: fsmbi, cbd/chd/cwd/cdd (generate insertion masks for
-  scalar stores — needed for the standard "load-quad / insert / store-quad"
-  unaligned scalar access idiom)
+Mnemonics once listed here as not yet hit (`fi`, `frest`, `frsqest`, `fcmeq`,
+`fcmgt`, `cuflt`/`csflt`/`cflts`/`cfltu`, `fesd`/`frds`, `sfx`/`cg`/`bg`/`cgx`,
+`mpyhha`, `gbb`, the double-precision ops) are also handled now. The only
+instructions the lifter still does not translate fall through to
+`spu_unsupported()` and show up in the coverage summary. See "Known stubs"
+below for what is accepted but not modeled.
 
 ### 2b. Disassembler — **rewritten against the RPCS3 authoritative table**
 The original `spu_disasm.py` had systemic errors: `IL`/`ILH`/`ILHU` listed as
@@ -252,13 +266,34 @@ Still open:
   with a clean diagnostic. Without the stubs, those calls were unresolved
   externs and the link failed.
 
-  Harness follow-up (`Extracoes/spu_uncharted1/uncharted_run/`): halts
+  Harness follow-up (a private test harness, not in this repo): halts
   from `spu_indirect_branch` were not actually terminal — the C call
   returned into its caller's fallthrough, which often re-entered the
   same bad indirect (timeout loop). The harness now `setjmp`s in `main`
   and `longjmp`s from inside the halt path, so a HALT really stops the
   SPU instead of unwinding a stack frame at a time.
-- Wire `spu_lifter.py` into the build alongside `ppu_lifter.py` (CMake).
+- **CMake integration - done.** `cmake/PS3RecompSPU.cmake` provides
+  `ps3recomp_generate_spu()`, and `templates/project/CMakeLists.txt` calls it
+  when `PORT_ENABLE_SPU` is on and `PORT_SPU_INPUTS` is set (see "Discovery and
+  registration coverage" below).
+
+## Known stubs
+
+Instructions the lifter accepts but does not fully model:
+
+- **Halt conditionals** (`hgt`, `hgti`, `heq`, `heqi`, `hlgt`, `hlgti`): not
+  no-ops. The lifter emits `if (cond) { fprintf(stderr, "[spu] HALT-ASSERT ...");
+  ctx->status = SPU_STATUS_STOPPED_BY_HALT; spu_halt(ctx); return; }`. The
+  compare uses word slot 0 of `ra` (and `rb` or the immediate). A taken halt
+  stops the SPU through `spu_halt()`; a not-taken one falls through
+  (`tools/spu_lifter.py`).
+- **`fscrrd`** returns zero (`spu_fscrrd` in `runtime/spu/spu_helpers.h`).
+  **`fscrwr`** emits a no-op comment. There is no FPSCR model.
+- **`mfspr`** returns zero (`spu_mfspr` in `runtime/spu/spu_helpers.h`);
+  **`mtspr`** emits a no-op comment.
+- **Double precision** (`dfa`, `dfs`, `dfm`, `dfma`, `dfms`, `dfnma`, `dfnms`,
+  `dfceq`, `dfcgt`, `dfcmeq`, `dfcmgt`, `dftsv`, `fesd`, `frds`) is lifted to
+  helpers in `runtime/spu/spu_helpers.h`; it is not a stub.
 
 ## Tracing (for §3 diff vs RPCS3)
 
