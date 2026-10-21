@@ -19,6 +19,7 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
 static void vk_dlss_complete(int submitted,u32 source);
 static void vk_dlss_history_reset(void);
 static int vk_dlss_requested(void);
+static int vk_sr_requested(void);
 /* Trace kernel state per output format (0 rgba8, 1 rgba16f). */
 enum {VK_TRACE_ABSENT,VK_TRACE_COMPILING,VK_TRACE_READY,VK_TRACE_FAILED};
 typedef struct vk_ray_material {u32 alpha[4],raster[4],textures[4];float depth_range[4];u32 authored[4],rgb_textures[8];float light_view[4][4],light_rgb[4][4],light_to_view[3][4];} vk_ray_material;
@@ -277,7 +278,7 @@ static int vk_ray_initialize(void)
     free(with_rgb);
     if(!sync_compile)s_ray_ao.trace_thread=SDL_CreateThread(vk_ray_trace_worker,"ray-trace-compile",NULL);
     if(s_ray_ao.trace_thread)VK_LOG("ray trace kernels (%s) compiling on a background thread; raster%s output until ready\n",
-        want_fp16?"rgba8+rgba16f":"rgba8",vk_dlss_requested()?"/DLSS-only":"");
+        want_fp16?"rgba8+rgba16f":"rgba8",vk_sr_requested()?"/upscaler-only":"");
     else{vk_ray_trace_worker(NULL);if(SDL_AtomicGet(&s_ray_ao.trace_state[0])!=VK_TRACE_READY)goto fail;}
     }
     s_ray_ao.create_queries=(PFN_vkCreateQueryPool)pvkGetDeviceProcAddr(s_vk.device,"vkCreateQueryPool");s_ray_ao.destroy_queries=(PFN_vkDestroyQueryPool)pvkGetDeviceProcAddr(s_vk.device,"vkDestroyQueryPool");
@@ -668,7 +669,7 @@ static u32 vk_eng_ray_world(void *user,u32 color,u32 depth,u32 logical_w,u32 log
         s_ray_ao.trace_seen_ready=1;s_ray_ao.history_w=s_ray_ao.history_h=0;vk_dlss_history_reset();
         VK_LOG("ray trace kernel ready; traced lighting starts with fresh history\n");
     }
-    if(trace_pending && !vk_dlss_requested()){
+    if(trace_pending && !vk_sr_requested()){
         failure=kernel_state==VK_TRACE_COMPILING?"trace kernel compiling (raster retained)":
                 kernel_state==VK_TRACE_ABSENT?"no trace kernel for this world format":"trace kernel compilation failed";
         goto fail;

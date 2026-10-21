@@ -40,6 +40,10 @@ static struct {
     u32 last_nonfinite;
     u32 color_mode,transfer;int float_logged;
 } s_dlss_frame;
+/* World SR runs through whichever bridge created a context: DLSS, or FSR3
+ * when only its bridge loaded (rsx_vulkan_fsr3.inc). */
+static int vk_sr_context(void){return s_dlss.context!=NULL || s_fsr3.context!=NULL;}
+static const char *vk_sr_name(void){return s_fsr3.context?"FSR3":"DLSS";}
 /* PS3RECOMP_DLSS_COLOR. Folklore's world is a display-referred RGBA8 target
  * shown on a UNORM swapchain as stored. "ldr" (default) creates NGX in LDR
  * mode (no IsHDR, no exposure) through the optional rsx_dlss_configure2 and
@@ -84,7 +88,7 @@ static rsx_dlss_quality vk_dlss_mode(void)
  * cannot run (no context, NGX refused the size). Decided once per session. */
 static int vk_dlss_world_extent(u32 *w,u32 *h)
 {
-    if(!s_dlss.context || s_dlss_frame.failed)return 0;
+    if(!vk_sr_context() || s_dlss_frame.failed)return 0;
     if(!s_dlss_frame.extent_known){
         s_dlss_frame.extent_known=1;
         s_dlss_frame.quality=vk_dlss_mode();
@@ -96,6 +100,21 @@ static int vk_dlss_world_extent(u32 *w,u32 *h)
             VK_LOG("DLSS output exceeds expanded-world image limit; raster retained\n");
             s_dlss_frame.failed=1;return 0;
         }
+        if(s_fsr3.context){
+            /* FSR's render size and its own phase count (8 x area ratio). */
+            s_fsr3.quality=vk_fsr3_mode();
+            uint32_t w=0,h=0,phases=0;float jx=0,jy=0;
+            if(s_fsr3.render_size(s_dlss_frame.out_w,s_dlss_frame.out_h,s_fsr3.quality,&w,&h)!=RSX_FSR3_OK ||
+               !w || !h || w>s_dlss_frame.out_w || h>s_dlss_frame.out_h ||
+               s_fsr3.jitter(w,s_dlss_frame.out_w,0,&jx,&jy,&phases)!=RSX_FSR3_OK || !phases){
+                VK_LOG("FSR3 %s has no render size for %ux%u; world stays at the raster scale\n",
+                    vk_fsr3_mode_name(s_fsr3.quality),s_dlss_frame.out_w,s_dlss_frame.out_h);
+                s_dlss_frame.failed=1;return 0;
+            }
+            s_dlss_frame.in_w=w;s_dlss_frame.in_h=h;s_dlss_frame.phases=phases;
+            VK_LOG("FSR3 %s: world input %ux%u -> output %ux%u, %u jitter phases\n",vk_fsr3_mode_name(s_fsr3.quality),
+                s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.phases);
+        }else{
         rsx_dlss_size size;memset(&size,0,sizeof size);
         rsx_dlss_status status=s_dlss.loader.optimal_size(s_dlss.context,s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.quality,&size);
         if(status!=RSX_DLSS_OK || !size.input_width || !size.input_height ||
@@ -110,7 +129,8 @@ static int vk_dlss_world_extent(u32 *w,u32 *h)
         u32 phases=(u32)ceil(8.0*ratio);s_dlss_frame.phases=phases<8?8:phases>64?64:phases;
         VK_LOG("DLSS %s: world input %ux%u -> output %ux%u, %u jitter phases\n",vk_dlss_quality_name(s_dlss_frame.quality),
             s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.phases);
-        VK_LOG("DLSS extent contract guest=1280x720 sampleLanes=2 reconstruction=%ux%u expandedStorage=%ux%u canvas=%ux%u presentation=%ux%u finalComposite=guest-layout nativeDisplayDLAA=unverified\n",
+        }
+        VK_LOG("%s extent contract guest=1280x720 sampleLanes=2 reconstruction=%ux%u expandedStorage=%ux%u canvas=%ux%u presentation=%ux%u finalComposite=guest-layout nativeDisplayDLAA=unverified\n",vk_sr_name(),
             s_dlss_frame.out_w,s_dlss_frame.out_h,s_dlss_frame.out_w*2u,s_dlss_frame.out_h,
             s_vk.width,s_vk.height,s_vk.sc_extent.width,s_vk.sc_extent.height);
     }
@@ -121,7 +141,7 @@ static float vk_dlss_halton(u64 index,u32 base){float value=0,f=1;while(index){f
 static void vk_dlss_jitter(float out[2])
 {
     out[0]=out[1]=0;
-    if(!s_dlss.context || s_dlss_frame.failed || !s_dlss_frame.in_w)return;
+    if(!vk_sr_context() || s_dlss_frame.failed || !s_dlss_frame.in_w)return;
     u64 index=s_rt_capture.frame%(s_dlss_frame.phases?s_dlss_frame.phases:8)+1;
     out[0]=vk_dlss_halton(index,2)-.5f;out[1]=vk_dlss_halton(index,3)-.5f;
 }
@@ -155,7 +175,7 @@ static void vk_dlss_layout(vk_image *image,VkImageLayout old,VkImageLayout next)
 static int vk_dlss_frame_initialize(void)
 {
     if(s_dlss_frame.initialized)return 1;
-    if(s_dlss_frame.failed || !s_dlss.context)return 0;
+    if(s_dlss_frame.failed || !vk_sr_context())return 0;
     VkDescriptorSetLayoutBinding bindings[16];
     for(u32 i=0;i<16;i++)bindings[i]=(VkDescriptorSetLayoutBinding){i,
         i==0||i==1||i==12||i==15?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
@@ -231,8 +251,21 @@ static int vk_dlss_clip_capacity(u32 vertices,int *reset)
 static int vk_dlss_prepare(u32 vertices,VkFormat world_format)
 {
     u32 w,h;
-    if(!s_dlss.context || s_dlss_frame.failed || !vk_dlss_world_extent(&w,&h))return 0;
+    if(!vk_sr_context() || s_dlss_frame.failed || !vk_dlss_world_extent(&w,&h))return 0;
     if(!vk_dlss_frame_initialize()||!vk_dlss_frame_images())goto fail;
+    if(!s_dlss_frame.configured && s_fsr3.context){
+        /* No command recording: FSR uploads its tables inside the first
+         * evaluation. LINEAR decodes to linear light (HDR contract); the
+         * default and DISPLAY pass Folklore's display-referred values. */
+        const int linear=s_dlss_frame.color_mode==VK_DLSS_COLOR_LINEAR;
+        rsx_fsr3_config config={1,s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,
+                                linear?RSX_FSR3_COLOR_LINEAR_HDR:RSX_FSR3_COLOR_LDR,0,0,0};
+        rsx_fsr3_status configured=s_fsr3.configure(s_fsr3.context,&config);
+        if(configured!=RSX_FSR3_OK){VK_LOG("FSR3 configure color=%s status=%d\n",vk_dlss_color_name(s_dlss_frame.color_mode),configured);goto fail;}
+        VK_LOG("FSR3 color contract effective=%s input=RGBA16F output=RGBA8-clamped depth=[0,1]-not-inverted sharpness=%.2f reactive=%d\n",
+            linear?"linear-hdr":"ldr",vk_fsr3_sharpness(),vk_fsr3_reactive());
+        s_dlss_frame.configured=1;
+    }
     if(!s_dlss_frame.configured){
         if(vk_begin())goto fail;
         const u32 requested=s_dlss_frame.color_mode;
@@ -264,7 +297,7 @@ static int vk_dlss_prepare(u32 vertices,VkFormat world_format)
     if(grown)s_dlss_frame.completed=0;
     return 1;
 fail:
-    s_dlss_frame.failed=1;VK_LOG("DLSS SR setup failed; raster/PT retained, evaluations=%llu\n",(unsigned long long)s_dlss_frame.completed);return 0;
+    s_dlss_frame.failed=1;VK_LOG("%s SR setup failed; raster/PT retained, evaluations=%llu\n",vk_sr_name(),(unsigned long long)s_dlss_frame.completed);return 0;
 }
 /* The private two-sample snapshot image, (re)created at the world target's
  * format and extent; a fresh image is moved to GENERAL in the open command
@@ -317,7 +350,7 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
                           const float projection[16],const float camera[16],int have_camera,u64 camera_key,u32 remap,u32 format)
 {
     s_dlss_frame.recorded=0;
-    if(!s_dlss.context || s_dlss_frame.failed || !s_dlss_frame.configured || !epoch)return 0;
+    if(!vk_sr_context() || s_dlss_frame.failed || !s_dlss_frame.configured || !epoch)return 0;
     const u32 iw=s_dlss_frame.in_w,ih=s_dlss_frame.in_h,ow=s_dlss_frame.out_w,oh=s_dlss_frame.out_h;
     if(s_eobj[source].w!=iw*2u || s_eobj[source].h!=ih || s_eobj[depth].w!=iw*2u || s_eobj[depth].h!=ih)return 0;
     if(epoch->vertex_count>s_dlss_frame.vertex_capacity)return 0;
@@ -414,6 +447,23 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
     for(u32 i=0;i<4;i++)vk_dlss_layout(input[i],VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     vk_ray_stamp(7,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT); /* inputs and motion ready; NGX follows */
     u64 ticks=SDL_GetPerformanceCounter();float dt=s_dlss_frame.ticks?(float)(1000.0*(ticks-s_dlss_frame.ticks)/SDL_GetPerformanceFrequency()):33.333f;
+    if(s_fsr3.context){
+        rsx_fsr3_frame f;memset(&f,0,sizeof f);
+        f.config_generation=1;f.frame_serial=f.motion_frame_serial=epoch->frame;f.motion_provenance=RSX_FSR3_MOTION_CAMERA_AND_OBJECT_UNJITTERED;
+        f.render_width=iw;f.render_height=ih;
+        f.color=vk_fsr3_image(&s_dlss_frame.color,VK_FORMAT_R16G16B16A16_SFLOAT,iw,ih,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        f.depth=vk_fsr3_image(&s_dlss_frame.depth,VK_FORMAT_R32_SFLOAT,iw,ih,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        f.motion=vk_fsr3_image(&s_dlss_frame.motion,VK_FORMAT_R32G32_SFLOAT,iw,ih,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        f.output=vk_fsr3_image(&s_dlss_frame.output,VK_FORMAT_R16G16B16A16_SFLOAT,ow,oh,VK_IMAGE_LAYOUT_GENERAL);
+        if(vk_fsr3_reactive())f.reactive=vk_fsr3_image(&s_dlss_frame.bias,VK_FORMAT_R8_UNORM,iw,ih,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        f.jitter_x=p.jitter[0];f.jitter_y=p.jitter[1];f.delta_milliseconds=fmaxf(.01f,dt);f.pre_exposure=1;
+        vk_fsr3_camera(projection,&f.camera_near,&f.camera_far,&f.vertical_fov_radians);
+        f.sharpness=vk_fsr3_sharpness();f.reset=reset;
+        rsx_fsr3_status fsr_status=s_fsr3.evaluate(s_fsr3.context,s_vk.cmd,&f);
+        if(fsr_status!=RSX_FSR3_OK){
+            VK_LOG("FSR3 evaluate rejected status=%d\n",fsr_status);s_dlss_frame.failed=1;return UINT32_MAX;
+        }
+    }else{
     rsx_dlss_frame frame;memset(&frame,0,sizeof frame);frame.config_generation=1;frame.frame_serial=epoch->frame;frame.motion_frame_serial=epoch->frame;frame.motion_provenance=RSX_DLSS_MOTION_CAMERA_AND_OBJECT_UNJITTERED;
     frame.color=vk_dlss_image(&s_dlss_frame.color,VK_FORMAT_R16G16B16A16_SFLOAT,iw,ih,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     frame.depth=vk_dlss_image(&s_dlss_frame.depth,VK_FORMAT_R32_SFLOAT,iw,ih,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -426,6 +476,7 @@ static u32 vk_dlss_record(u32 source,u32 depth,VkBuffer vertices,VkDeviceSize ve
         /* NGX may have recorded part of a command; the caller discards the
          * whole transport recording and this session stops using DLSS. */
         VK_LOG("DLSS evaluate rejected status=%d\n",status);s_dlss_frame.failed=1;return UINT32_MAX;
+    }
     }
     vk_ray_memory(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT);
     pvkCmdBindPipeline(s_vk.cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s_dlss_frame.pipeline);pvkCmdBindDescriptorSets(s_vk.cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s_dlss_frame.pipeline_layout,0,1,&s_dlss_frame.set,0,NULL);
@@ -480,16 +531,16 @@ static void vk_dlss_complete(int submitted,u32 source)
     if(log_due){
         const rsx_dlss_motion_counts c=s_dlss_frame.last_motion;
         const rsx_dlss_motion_stats coverage=rsx_dlss_summarize_motion(c,s_dlss_frame.in_w,s_dlss_frame.in_h);
-        VK_LOG("DLSS SR %s frame=%llu input=%ux%u output=%ux%u completedEvaluations=%llu motionCounterFrame=%llu matchedMotionPixels=%u cameraFallbackPixels=%u reset=%d nonfinite=%u worldReplacement=1 HUD=guest-composite\n",
-            vk_dlss_quality_name(s_dlss_frame.quality),(unsigned long long)s_dlss_frame.frame,s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,
+        VK_LOG("%s SR %s frame=%llu input=%ux%u output=%ux%u completedEvaluations=%llu motionCounterFrame=%llu matchedMotionPixels=%u cameraFallbackPixels=%u reset=%d nonfinite=%u worldReplacement=1 HUD=guest-composite\n",
+            vk_sr_name(),s_fsr3.context?vk_fsr3_mode_name(s_fsr3.quality):vk_dlss_quality_name(s_dlss_frame.quality),(unsigned long long)s_dlss_frame.frame,s_dlss_frame.in_w,s_dlss_frame.in_h,s_dlss_frame.out_w,s_dlss_frame.out_h,
             (unsigned long long)s_dlss_frame.completed,(unsigned long long)s_dlss_frame.motion_counter_frame,c.matched,c.fallback,s_dlss_frame.record_reset,s_dlss_frame.last_nonfinite);
-        VK_LOG("DLSS motion coverage countersReady=%d counterFrame=%llu valid=%d available=%d eligible=%llu matched=%u cameraFallback=%u background=%u resetExcluded=%u disoccluded=%u matchedPercent=%.3f fallbackPercent=%.3f\n",
-            s_dlss_frame.have_motion_counters,(unsigned long long)s_dlss_frame.motion_counter_frame,
+        VK_LOG("%s motion coverage countersReady=%d counterFrame=%llu valid=%d available=%d eligible=%llu matched=%u cameraFallback=%u background=%u resetExcluded=%u disoccluded=%u matchedPercent=%.3f fallbackPercent=%.3f\n",
+            vk_sr_name(),s_dlss_frame.have_motion_counters,(unsigned long long)s_dlss_frame.motion_counter_frame,
             s_dlss_frame.have_motion_counters && coverage.valid,s_dlss_frame.have_motion_counters && coverage.coverage_available,
             (unsigned long long)coverage.eligible,c.matched,c.fallback,c.background,c.reset,c.disoccluded,
             coverage.matched_percent,coverage.fallback_percent);
-        VK_LOG("DLSS fallback attribution frame=%llu mappedDraws=%u pixels/draws noIdentity=%u/%u duplicateKey=%u/%u unmatched=%u/%u matchedInvalid=%u/%u noOwner=%u reactiveLayerPixels=%u layerSnapshots=%u\n",
-            (unsigned long long)s_dlss_frame.frame,s_dlss_frame.current_count,fallback_pixels[0],fallback_draws[0],fallback_pixels[1],fallback_draws[1],
+        VK_LOG("%s fallback attribution frame=%llu mappedDraws=%u pixels/draws noIdentity=%u/%u duplicateKey=%u/%u unmatched=%u/%u matchedInvalid=%u/%u noOwner=%u reactiveLayerPixels=%u layerSnapshots=%u\n",
+            vk_sr_name(),(unsigned long long)s_dlss_frame.frame,s_dlss_frame.current_count,fallback_pixels[0],fallback_draws[0],fallback_pixels[1],fallback_draws[1],
             fallback_pixels[2],fallback_draws[2],fallback_pixels[3],fallback_draws[3],fallback_pixels[4],reactive_pixels,s_dlss_layer.frame_snapshots);
         s_dlss_frame.last_log=ticks;
     }

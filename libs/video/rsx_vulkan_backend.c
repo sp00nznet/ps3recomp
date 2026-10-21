@@ -4361,6 +4361,7 @@ static rsx_backend s_vulkan_backend = {
 #include "rsx_vulkan_rt_capture.inc"
 #include "rsx_vulkan_ray_ao.inc"
 #include "rsx_vulkan_dlss.inc"
+#include "rsx_vulkan_fsr3.inc"
 #include "rsx_vulkan_dlss_frame.inc"
 
 static int vk_init_all(u32 width, u32 height, const char* title)
@@ -4404,7 +4405,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         app.apiVersion=VK_API_VERSION_1_1;s_vk.cacao_api_ok=1;
     }
 #endif
-    if (s_vk.rt_requested || vk_dlss_requested()) {
+    if (s_vk.rt_requested || vk_sr_requested()) {
         PFN_vkEnumerateInstanceVersion rt_enum=(PFN_vkEnumerateInstanceVersion)
             pvkGetInstanceProcAddr(VK_NULL_HANDLE,"vkEnumerateInstanceVersion");
         u32 version=VK_API_VERSION_1_0;
@@ -4421,6 +4422,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkResult ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
     if (ir != VK_SUCCESS && s_vk.windowed) {
         vk_window_drop("vkCreateInstance with the surface extensions failed");
+        vk_fsr3_shutdown();
         vk_dlss_shutdown();
         ci.enabledExtensionCount = 0;
         ci.ppEnabledExtensionNames = NULL;
@@ -4547,7 +4549,14 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         want.shaderStorageImageExtendedFormats=have.shaderStorageImageExtendedFormats;
         want.shaderInt16=have.shaderInt16;
     }
+    /* FSR3 only when DLSS is not prepared: two core features, no chain. */
+    int enable_fsr3=!enable_dlss && vk_fsr3_device_prepare(&want,app.apiVersion);
     VkResult device_result=pvkCreateDevice(s_vk.phys,&dci,NULL,&s_vk.device);
+    if(device_result!=VK_SUCCESS && enable_fsr3){
+        VK_LOG("FSR3 device creation failed (%d); retaining prior rendering requirements\n",(int)device_result);
+        enable_fsr3=0;want=baseline_want;vk_fsr3_shutdown();
+        device_result=pvkCreateDevice(s_vk.phys,&dci,NULL,&s_vk.device);
+    }
     if(device_result!=VK_SUCCESS && enable_dlss){
         VK_LOG("DLSS device creation failed (%d); retaining prior rendering requirements\n",(int)device_result);
         enable_dlss=0;dci=baseline_dci;want=baseline_want;rt_rq.pNext=&rt_bda;
@@ -4566,6 +4575,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (vk_load_device_functions()) return -1;
     vk_dlss_device_selected(enable_dlss);
     vk_dlss_device_created();
+    vk_fsr3_device_created(enable_fsr3);
     vk_pcache_init(s_vk.instance, s_vk.phys, s_vk.device);
     VK_LOG("anisotropy: supported=%d device_limit=%g override=%u (0=guest,1=off)\n",
            s_vk.anisotropy_ok, (double)s_vk.max_anisotropy, s_vk.anisotropy_override);
@@ -4737,6 +4747,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         if (pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
+        vk_fsr3_shutdown();
         vk_dlss_shutdown();
         vk_rt_ao_shutdown();
         vk_rt_capture_shutdown();
@@ -4772,6 +4783,7 @@ void rsx_vulkan_backend_shutdown(void)
         vk_pcache_shutdown(s_vk.device);
         pvkDestroyDevice(s_vk.device, NULL);
     }
+    vk_fsr3_shutdown();
     vk_dlss_shutdown();
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
     rsx_vk_library_close(s_vk.lib);
