@@ -8,11 +8,14 @@ Step-by-step guide to recompiling your first PS3 game.
 
 - **CMake** 3.20 or later: [cmake.org](https://cmake.org/download/)
 - **C/C++ compiler** with C17 and C++20 support:
-  - Windows: Visual Studio 2022 (MSVC 17+) or Clang 14+
-  - Linux: GCC 12+ or Clang 14+
-  - macOS: Xcode 14+ (Apple Clang)
-- **Python** 3.9+: Required for the recompiler tools
-- **Ninja** (recommended): Faster than Make/MSBuild -- `pip install ninja`
+  - Windows: Visual Studio 2022 with clang-cl. Plain `cl` builds the runtime library (see BUILDING.md), but a lifted game needs clang-cl (Step 6)
+  - Linux: GCC or Clang
+  - macOS: Xcode (Apple Clang)
+  - CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
+- **Python** 3.10+ (CI uses 3.12): Required for the recompiler tools
+- **Ninja**: Faster than Make/MSBuild and what the commands in this guide use -- `pip install ninja`
+
+Prefer not to build from source? Each [release](https://github.com/sp00nznet/ps3recomp/releases/latest) includes a prebuilt SDK bundle per platform (see the README's Downloads paragraph).
 
 ### Required Game Files
 
@@ -25,7 +28,7 @@ Step-by-step guide to recompiling your first PS3 game.
 ### Python Dependencies
 
 ```bash
-pip install -r tools/requirements.txt
+pip install -r requirements.txt   # run from the repository root
 ```
 
 ## Installation

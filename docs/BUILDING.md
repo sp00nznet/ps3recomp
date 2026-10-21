@@ -28,29 +28,31 @@ Complete guide to building the ps3recomp runtime library and game projects.
 | **CMake** | 3.20 | Build system generator |
 | **C Compiler** | C17 support | Compile runtime and HLE modules |
 | **C++ Compiler** | C++20 support | Compile templates, module registration |
-| **Python** | 3.9+ | Recompiler tools |
+| **Python** | 3.10+ (CI uses 3.12) | Recompiler tools |
 
 ### Recommended
 
 | Tool | Purpose |
 |------|---------|
-| **Ninja** | Faster builds than Make/MSBuild (`pip install ninja`) |
+| **Ninja** | Faster builds than Make/MSBuild; CI and the commands in these docs use it (`pip install ninja`) |
 | **ccache** | Compiler cache for faster rebuilds |
 
 ### Platform-Specific Requirements
 
+CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
+
 **Windows:**
-- Visual Studio 2022 (MSVC 17.x) or Clang/LLVM 14+
+- clang-cl (LLVM) with Visual Studio 2022 (MSVC 17.x) for the headers and libraries (what CI uses); plain MSVC `cl` builds the runtime library (see the Windows notes below), but lifted game code needs clang-cl
 - Windows SDK 10.0.19041+
 - System libraries (auto-linked): `ws2_32.lib`, `xinput.lib`, `ole32.lib`, `bcrypt.lib`
 
 **Linux:**
-- GCC 12+ or Clang 14+
+- GCC or Clang
 - Development headers: `libpthread`, `libm`
 - Optional: SDL2 development package (`libsdl2-dev`) for input/audio
 
 **macOS:**
-- Xcode 14+ (Apple Clang 14+)
+- Xcode (Apple Clang)
 - Optional: SDL2 via Homebrew (`brew install sdl2`)
 
 ---

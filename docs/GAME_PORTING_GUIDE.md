@@ -32,7 +32,7 @@ Porting a PS3 game with ps3recomp is a **per-game project**. Unlike emulation (w
 
 - A legally obtained copy of the PS3 game
 - Decryption keys or a fSELF version of the game binary
-- Python 3.9+ for the recompiler tools
+- Python 3.10+ for the recompiler tools
 - CMake 3.20+ and a C17/C++20 compiler
 - RPCS3 as a reference (for testing and behavior verification)
 - Patience and debugging skills

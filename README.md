@@ -287,7 +287,7 @@ includes a prebuilt SDK bundle per platform (`ps3recomp-<version>-win-x64.zip`,
 runtime library, its headers and the Python pipeline. `VERSION.txt` inside it
 says what that platform can and cannot do yet.
 
-> **Prerequisites (building from source)**: Python 3.10+, CMake 3.20+, a C17/C++20 compiler (MSVC 19.x / clang-cl, GCC 12+, or Clang 15+)
+> **Prerequisites (building from source)**: Python 3.10+ (CI uses 3.12), CMake 3.20+, Ninja, and a C17/C++20 compiler: clang-cl with Visual Studio 2022 on Windows (plain MSVC builds the runtime library, but lifted game code needs clang-cl), GCC or Clang on Linux, Apple Clang (Xcode) on macOS. CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
 
 ```bash
 git clone https://github.com/sp00nznet/ps3recomp.git

@@ -667,7 +667,7 @@ the table names handlers from the revision it was generated against.
 
 ### Python Requirements
 
-Listed in `tools/requirements.txt`:
+Listed in `requirements.txt` (repository root):
 
 | Package | Purpose |
 |---------|---------|
@@ -680,9 +680,9 @@ Listed in `tools/requirements.txt`:
 ### Installation
 
 ```bash
-pip install -r tools/requirements.txt
+pip install -r requirements.txt
 ```
 
 ### Python Version
 
-Python 3.9+ required (uses `match/case` in some tools, f-strings throughout).
+Python 3.10+ required (CI uses 3.12); some tools use `X | None` annotations that are evaluated at import time.
