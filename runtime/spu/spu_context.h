@@ -392,6 +392,12 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+
+    /* Nonzero while this context is in spu_coherency.c's list of reservation
+     * holders, so its GETLLAR can skip the lock-line lock (see
+     * spu_coh_reserve_fast). Written under that lock, read by the context's
+     * own thread. */
+    int coh_listed;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
