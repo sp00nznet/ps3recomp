@@ -4,7 +4,8 @@
  * Reads real gamepad input from the host and translates to PS3 pad format.
  *
  * Backend selection:
- *   - Windows default: XInput (no extra dependencies)
+ *   - Windows default: XInput, loaded at run time from System32 (XInput1_4.dll,
+ *     XInput1_3.dll, XInput9_1_0.dll); no XInput DLL means no pads
  *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
  *
  * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
@@ -53,8 +54,11 @@ static double pad_clock(unsigned long long t0_ms)
     #define WIN32_LEAN_AND_MEAN
   #endif
   #include <windows.h>
+  /* Types only. The exe must not import an XInput DLL: MinGW's libxinput is
+   * xinput1_3.dll, which only the DirectX June 2010 redistributable installs,
+   * so on a stock Windows 10/11 the exe did not start (0xC0000135). The DLL is
+   * loaded at run time instead, see pad_xinput_load(). */
   #include <xinput.h>
-  #pragma comment(lib, "xinput.lib")
 #endif
 
 #if PAD_BACKEND_SDL2
@@ -142,6 +146,39 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
 /* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
 #define PAD_STICK_DEADZONE  7849
 #define PAD_TRIGGER_THRESHOLD 30
+
+/* XInput is resolved at run time. Only XInputGetState and XInputSetState are
+ * called, and XInput9_1_0.dll exports both, so any of the three DLLs serves.
+ * Loaded once, from System32 only (not the exe folder, the working directory
+ * or PATH), and kept loaded until exit. No DLL, or one without the two entry
+ * points, means every slot reads as unplugged. */
+typedef DWORD (WINAPI *pad_xi_get_state_fn)(DWORD, XINPUT_STATE*);
+typedef DWORD (WINAPI *pad_xi_set_state_fn)(DWORD, XINPUT_VIBRATION*);
+static pad_xi_get_state_fn p_xi_get_state;
+static pad_xi_set_state_fn p_xi_set_state;
+static int s_xi_tried;
+
+static int pad_xinput_load(void)
+{
+    static const wchar_t* const names[] = { L"XInput1_4.dll", L"XInput1_3.dll", L"XInput9_1_0.dll" };
+    if (s_xi_tried) return p_xi_get_state != NULL;
+    s_xi_tried = 1;
+    for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
+        HMODULE m = LoadLibraryExW(names[k], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        pad_xi_get_state_fn g;
+        pad_xi_set_state_fn st;
+        if (!m) continue;
+        g  = (pad_xi_get_state_fn)(void (*)(void))GetProcAddress(m, "XInputGetState");
+        st = (pad_xi_set_state_fn)(void (*)(void))GetProcAddress(m, "XInputSetState");
+        if (!g || !st) { FreeLibrary(m); continue; }
+        p_xi_get_state = g;
+        p_xi_set_state = st;
+        printf("[cellPad] XInput from %ls\n", names[k]);
+        return 1;
+    }
+    printf("[cellPad] no XInput DLL (XInput1_4, XInput1_3, XInput9_1_0): no XInput pads\n");
+    return 0;
+}
 
 static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
 {
@@ -240,7 +277,8 @@ static void pad_poll_xinput(void)
         XINPUT_STATE state;
         memset(&state, 0, sizeof(state));
 
-        DWORD result = XInputGetState((DWORD)i, &state);
+        DWORD result = p_xi_get_state ? p_xi_get_state((DWORD)i, &state)
+                                      : ERROR_DEVICE_NOT_CONNECTED;
         if (result != ERROR_SUCCESS) {
             s_host_state[i].connected = 0;
             continue;
@@ -299,7 +337,8 @@ static void pad_poll_xinput(void)
 
 static void pad_init_backend(void)
 {
-    /* XInput needs no explicit init */
+    /* XInput needs no explicit init, only the run-time load of the DLL */
+    pad_xinput_load();
 }
 
 static void pad_shutdown_backend(void)
@@ -1151,7 +1190,7 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
         XINPUT_VIBRATION vib;
         vib.wLeftMotorSpeed  = (WORD)lo;
         vib.wRightMotorSpeed = (WORD)hi;
-        XInputSetState((DWORD)port_no, &vib);
+        if (p_xi_set_state) p_xi_set_state((DWORD)port_no, &vib);
     }
 #endif
 
