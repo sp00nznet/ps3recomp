@@ -652,10 +652,18 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * snapshot against a line this copy has already replaced and commits
          * over it, and a peer parked on RdEventStat sleeps through the write.
          *
-         * So when the span touches a reserved line the copy and the notify run
-         * as ONE critical section under the lock-line lock -- the same contract
-         * the PPU store path and the PUTLLC commit keep, and the only way the
-         * copy cannot land inside a peer's compare-and-commit window. Spans
+         * So a reserved line's copy and its notify run as ONE critical section
+         * under the lock-line lock -- the same contract the PPU store path and
+         * the PUTLLC commit keep, and the only way the copy cannot land inside
+         * a peer's compare-and-commit window. Only the reserved lines need it:
+         * in a multi-line span the others are copied first, without the lock,
+         * exactly as an unreserved span is, and the locked pass then copies the
+         * lines it skipped and notifies every reserved one. A line reserved
+         * after its unlocked copy is notified there but NOT copied again: a
+         * peer may already have reserved and committed it on top of our bytes,
+         * and a second copy would write that commit back over. A wide PUT that
+         * touches one queue line no longer holds every other SPU's atomics off
+         * for the whole copy. Spans
          * that touch no reserved line keep the lock-free copy: bulk asset PUTs
          * are large and hot, and the scan is a bitmap bit per 128 bytes against
          * a global that stays zero until an SPU reserves its first line.
@@ -679,7 +687,34 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
                 if (a == a1) break;
             }
-            if (span_reserved) {
+            /* Lines the unlocked pass left for the locked one: a 16 KiB
+             * transfer spans at most 129 lines. */
+            uint64_t locked_lines[3] = {0, 0, 0};
+            if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u) {
+                const uint32_t ea32 = (uint32_t)ea;
+                uint32_t i = 0;
+                for (uint32_t a = a0; ; a += 128u, i++) {
+                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
+                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
+                    if (spu_coh_is_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
+                    else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                    if (a == a1) break;
+                }
+                spu_lockline_lock();
+                i = 0;
+                for (uint32_t a = a0; ; a += 128u, i++) {
+                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
+                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
+                    if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
+                        memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                        spu_coh_notify_write_except(a, spu);
+                    } else if (spu_coh_is_reserved(a)) {
+                        spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
+                    }
+                    if (a == a1) break;
+                }
+                spu_lockline_unlock();
+            } else if (span_reserved) {
                 spu_lockline_lock();
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {

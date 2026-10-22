@@ -347,6 +347,34 @@ static void test_wide_put_finds_the_reserved_line(void)
     CHECK(mem_is(LINE_D, 0xB0, 0x200));
 }
 
+/* The reserved line is copied under the lock and the rest of the span outside
+ * it, so the partial first and last lines are their own pieces: each has to
+ * land exactly, and nothing either side of the span may move. */
+static void test_unaligned_wide_put_around_a_reserved_line(void)
+{
+    reset_pair();
+    memset(g_guest_mem + LINE_D, 0xEE, 0x200);
+    unsigned long raised = g_spu_lr_raise;
+
+    spu_atomic(&g_a, LSA_A, LINE_D + 0x80, MFC_GETLLAR_CMD);    /* the middle line */
+
+    TEST("an unaligned PUT over a reserved line raises once");
+    stage(&g_b, LSA_B, 0xC0, 0x100);
+    spu_put(&g_b, LSA_B, LINE_D + 0x40, 0x100);
+    CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_a.resv_valid == 0);
+    CHECK(g_spu_lr_raise == raised + 1);
+
+    TEST("...the span landed, partial lines included");
+    CHECK(mem_is(LINE_D + 0x40, 0xC0, 0x100));
+
+    TEST("...and the bytes either side of it did not move");
+    int untouched = 1;
+    for (uint32_t i = 0; i < 0x40; i++)    untouched &= g_guest_mem[LINE_D + i] == 0xEE;
+    for (uint32_t i = 0x140; i < 0x200; i++) untouched &= g_guest_mem[LINE_D + i] == 0xEE;
+    CHECK(untouched);
+}
+
 /* ===========================================================================
  * The event acknowledge against a concurrent raise
  *
@@ -426,6 +454,7 @@ int main(void)
     test_plain_put_breaks_peer();
     test_plain_put_elsewhere_is_quiet();
     test_wide_put_finds_the_reserved_line();
+    test_unaligned_wide_put_around_a_reserved_line();
     test_ack_keeps_a_concurrent_raise();
 
     printf("\nSPU-to-SPU lock-line coherence tests: %d passed, %d failed\n",
