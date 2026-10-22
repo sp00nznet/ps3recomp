@@ -319,9 +319,16 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    { static volatile LONG started = 0; const char* e;
-      if (!started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
-          CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL); }
+    /* Read SPU_PCSAMPLE once. mfc_for runs on every DMA and channel access,
+     * and with the variable unset `started` never left 0, so every one called
+     * getenv -- which takes the CRT environment lock and scans every variable.
+     * All SPU threads queued on that lock: God of War HD's SCREAM mixer jobs
+     * fell to a third of real time (two thirds of the audio blocks empty). */
+    { static volatile LONG checked = 0;
+      if (!checked && !InterlockedExchange(&checked, 1)) {
+          const char* e = getenv("SPU_PCSAMPLE");
+          if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+      } }
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
