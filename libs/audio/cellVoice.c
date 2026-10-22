@@ -162,3 +162,55 @@ s32 cellVoiceSetCallback(CellVoiceEventCallback callback, void* arg)
     if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
     return CELL_OK;
 }
+
+/* Port control (RPCS3 rpcs3/Emu/Cell/Modules/cellVoice.cpp semantics).
+ *
+ * A port that does not exist is CELL_VOICE_ERROR_TOPOLOGY there (its
+ * access_port check), not PORT_NOT_FOUND as the older calls above return. No
+ * voice data flows here, so there is nothing to flush on a reset and no signal
+ * to measure: each call logs once so the missing audio path stays visible. */
+
+static int voice_port_valid(CellVoicePortId portId)
+{
+    return portId < CELL_VOICE_PORT_MAX && s_ports[portId].in_use;
+}
+
+s32 cellVoiceResetPort(CellVoicePortId portId)
+{
+    static int logged = 0;
+    if (!logged) { logged = 1; printf("[cellVoice] ResetPort(%u): no voice buffers to flush (stub)\n", portId); }
+    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
+    if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
+    return CELL_OK;
+}
+
+s32 cellVoiceUpdatePort(CellVoicePortId portId, const CellVoicePortParam* param)
+{
+    static int logged = 0;
+    if (!logged) { logged = 1; printf("[cellVoice] UpdatePort(%u): parameters stored, no voice processing\n", portId); }
+    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
+    if (!param) return (s32)CELL_VOICE_ERROR_ARGUMENT_INVALID;
+    if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
+    /* s_ports[].param holds the guest's bytes as CreatePort copied them.
+     * Like RPCS3, update threshold, bMute and volume (bytes 4..11) and, for
+     * voice ports (IN_VOICE 2 / OUT_VOICE 4), the bitrate (bytes 12..15);
+     * the port type and PCM format stay as created. */
+    uint8_t* dst = (uint8_t*)&s_ports[portId].param;
+    const uint8_t* src = GUEST_PTR(param, const uint8_t*);
+    u32 type = ((u32)dst[0] << 24) | ((u32)dst[1] << 16) | ((u32)dst[2] << 8) | dst[3];
+    memcpy(dst + 4, src + 4, 8);
+    if (type == 2 || type == 4)
+        memcpy(dst + 12, src + 12, 4);
+    return CELL_OK;
+}
+
+s32 cellVoiceGetSignalState(CellVoicePortId portId, u32 attr, void* attrValue)
+{
+    static int logged = 0;
+    if (!logged) { logged = 1; printf("[cellVoice] GetSignalState(%u, attr=%u): no microphone -> DEVICE_NOT_PRESENT\n", portId, attr); }
+    (void)attrValue;
+    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
+    if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
+    /* RPCS3 reports a detached microphone and does not write attrValue. */
+    return (s32)CELL_VOICE_ERROR_DEVICE_NOT_PRESENT;
+}
