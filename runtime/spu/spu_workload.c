@@ -1003,19 +1003,44 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined 
 #define SPU_PARKED_MAX 64
 static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
 static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
+/* Bounds for spu_taskset_line_committed, which runs after every successful
+ * PUTLLC/PUTLLUC on every SPU. Both are hints in the same racy sense as the
+ * table, but err only towards visiting more:
+ *  - s_parked_count: entries published and not yet removed. Raised after the
+ *    key is stored and lowered only by the remove that clears that key, so a
+ *    task that is parked is always counted. (Two adds racing for one free slot
+ *    lose a key and leave the count one high for good; that costs scans, not
+ *    wakes.)
+ *  - s_parked_hw: one past the highest slot ever used. Raised before the key
+ *    is stored and never lowered, so every parked task is below it whatever
+ *    else is being parked or unparked at the same time. Slots are taken
+ *    first-free, so it stays at the peak number of tasks parked at once. */
+static volatile int s_parked_count;
+static volatile int s_parked_hw;
 
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
+        if (s_parked[i] == 0) {
+            int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
+            while (hw <= i && !__atomic_compare_exchange_n(&s_parked_hw, &hw, i + 1, 1,
+                                                           __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+            s_parked_obj[i] = wait_obj; s_parked[i] = key;
+            __atomic_fetch_add(&s_parked_count, 1, __ATOMIC_RELAXED);
+            return;
+        }
 }
 
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == key) { s_parked[i] = 0; return; }
+        if (s_parked[i] == key) {
+            s_parked[i] = 0;
+            __atomic_fetch_sub(&s_parked_count, 1, __ATOMIC_RELAXED);
+            return;
+        }
 }
 
 /* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
@@ -1182,7 +1207,13 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * re-checks. */
 void spu_taskset_line_committed(uint32_t line)
 {
-    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+    /* Nothing parked -- the whole run, for a title that never parks a taskset
+     * task -- costs one load instead of a 64-slot scan; otherwise only the
+     * slots below the high-water mark can hold a parked task. Slot order, and
+     * so the first match, is that of the full scan. */
+    if (!__atomic_load_n(&s_parked_count, __ATOMIC_RELAXED)) return;
+    const int n = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
+    for (int i = 0; i < n; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
 #ifdef _WIN32
