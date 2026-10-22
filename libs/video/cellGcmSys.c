@@ -1551,9 +1551,52 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             gcm_ref_push_at(vm_read32(dea), io);
             rescued++;
         }
-        if (rescued) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
-            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
-                    " 0x%08X..0x%08X\n", rescued, from, land); }
+        /* Fences are not the only sync writes a title waits on. Walk the
+         * skipped range as a command stream (each header and its data; NOPs,
+         * flip markers and self-JUMP parks stepped over, forward JUMPs inside the range
+         * followed; stopping at anything else that is not a method header) and
+         * replay the label releases in it as well: NV406E SEMAPHORE_RELEASE
+         * (0x6C, at the offset 0x64 set) and the NV4097 back-end and
+         * texture-read releases (0x1D70/0x1D74 at the 0x1D6C offset, in the
+         * 0x01A4 context), the latter through rsx_process_method so they land
+         * exactly where the walker would have written them. inFAMOUS 2 waits
+         * on a 0x1D74 release from an SPU-filled command block; a resync that
+         * skipped it left the title waiting for the rest of the run. Draws in
+         * the range are still lost. */
+        static rsx_state s_resync_state;   /* the sync methods do not touch it */
+        unsigned labels = 0;
+        for (u32 io = from; io + 4 <= land; ) {
+            const u32 ea = gcm_io2ea(io); if (!ea) break;
+            const u32 w = vm_read32(ea), type = w >> 29;
+            if (w == 0 || (w & 0xFFFFFF00u) == GCM_FLIP_MARKER) { io += 4; continue; }   /* NOP, flip (counted above) */
+            if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {   /* JUMP */
+                const u32 tgt = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
+                if (tgt == io) { io += 4; continue; }   /* a park */
+                if (tgt > io && tgt < land) { io = tgt; continue; }
+                break;
+            }
+            if (type != 0 && type != 2) break;          /* CALL, RETURN, or not a header */
+            const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
+            if (!count || io + 4 + count * 4 > land) break;
+            for (u32 i = 0; i < count; i++) {
+                const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) break;
+                const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
+                if (subch != 0) continue;
+                if (m == 0x64u) s_sema_offset = v;
+                else if (m == 0x6Cu) {
+                    atomic_thread_fence(memory_order_release);
+                    vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
+                    labels++;
+                } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
+                    rsx_process_method(&s_resync_state, m, v);
+                    labels += (m == 0x1D70u || m == 0x1D74u);
+                }
+            }
+            io += 4 + count * 4;
+        }
+        if (rescued || labels) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
+            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) and %u label"
+                    " write(s) from 0x%08X..0x%08X\n", rescued, labels, from, land); }
     }
     *getoff = land;
 }
@@ -2003,7 +2046,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - park_since >= GCM_PARK_GRACE_MS &&
+                                 /* Read the park again before giving up on it.
+                                  * An SPU job that fills a command-buffer hole
+                                  * (Edge geometry reserves them as self-JUMPs)
+                                  * can land between this pass's read and the
+                                  * resync, which would then jump over the
+                                  * commands it just wrote. */
+                                 vm_read32(gcm_io2ea(s_fifo_getoff)) == w) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
