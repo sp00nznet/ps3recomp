@@ -159,6 +159,22 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* lv2 refuses to destroy a mutex that is held or has waiters (EBUSY).
+     * Destroying it anyway freed the host mutex under a thread blocked on it,
+     * and the next sys_mutex_create in the same slot initialised a new one
+     * over it: everyone else then used the new mutex and the blocked thread
+     * waited on the dead one for good. */
+    if (m->lock_count > 0 || __atomic_load_n(&m->waiters, __ATOMIC_SEQ_CST) > 0) {
+        static int n = 0;
+        if (n++ < 16)
+            fprintf(stderr, "[mutex] destroy of mutex %u '%.8s' refused: owner tid=%llu "
+                    "count=%d waiters=%d (EBUSY)\n", mutex_id, m->name,
+                    (unsigned long long)m->owner_tid, m->lock_count,
+                    __atomic_load_n(&m->waiters, __ATOMIC_SEQ_CST));
+        mtx_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+
 #ifdef _WIN32
     DeleteCriticalSection(&m->cs);
     if (m->wait_handle) CloseHandle(m->wait_handle);
@@ -195,6 +211,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
+    __atomic_add_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);   /* see sys_mutex_destroy */
 #ifdef _WIN32
     if (timeout_us == 0) {
         /* Infinite wait */
@@ -210,6 +227,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         int64_t deadline = lv2_usec_deadline(timeout_us);
         while (!TryEnterCriticalSection(&m->cs)) {
             if (lv2_deadline_passed(deadline)) {
+                __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
             if (timeout_us < 1000) SwitchToThread();
@@ -230,10 +248,12 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         }
         int rc = pthread_mutex_timedlock(&m->mtx, &ts);
         if (rc == ETIMEDOUT) {
+            __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
     }
 #endif
+    __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
 
     m->owner_tid = caller_tid;
     m->lock_count++;

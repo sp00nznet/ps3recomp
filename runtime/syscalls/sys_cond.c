@@ -195,7 +195,10 @@ int64_t sys_cond_wait(ppu_context* ctx)
     while (*link != &waiter) link = &(*link)->next;
     *link = waiter.next;
     cond_unlock(c);
+    /* Re-acquiring counts as waiting on the mutex (sys_mutex_destroy). */
+    __atomic_add_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < depth; ++i) guest_lock(m);
+    __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
     return result;

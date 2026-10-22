@@ -89,6 +89,27 @@ set_tests_properties(sync_stress PROPERTIES
     TIMEOUT 120
 )
 
+# sys_mutex_destroy: EBUSY while the mutex is held or a thread is blocked
+# acquiring it. Win32 host threads, through the shim off Windows.
+add_executable(test_mutex_destroy
+    test_mutex_destroy.c test_shims.c
+    "${RUNTIME_SYNC_DIR}/sys_mutex.c"
+    "${RUNTIME_SYNC_DIR}/sys_cond.c")
+if(NOT WIN32)
+    target_sources(test_mutex_destroy PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_mutex_destroy PRIVATE Threads::Threads)
+endif()
+target_include_directories(test_mutex_destroy PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+    "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
+if(MSVC)
+    target_compile_definitions(test_mutex_destroy PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME mutex_destroy COMMAND test_mutex_destroy)
+set_tests_properties(mutex_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
+
 # The focused condition tests use Win32 host threads. POSIX execution also
 # needs the waitable-handle implementation supplied by the native host port.
 if(WIN32)
