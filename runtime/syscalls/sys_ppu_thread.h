@@ -80,6 +80,12 @@ extern vm_stack_alloc g_vm_stack_alloc;
 /* Callback to invoke recompiled code - must be set by the runtime */
 extern ppu_thread_entry_fn g_ppu_thread_entry_trampoline;
 
+/* The main thread's stack as sys_ppu_thread_get_stack_information reports it,
+ * set by a host before ppu_run. Size 0 (the default) reports VM_STACK_BASE +
+ * VM_PPU_STACK_SIZE. */
+extern uint32_t g_ppu_main_stack_addr;
+extern uint32_t g_ppu_main_stack_size;
+
 /* ---------------------------------------------------------------------------
  * Syscall handlers
  * -----------------------------------------------------------------------*/

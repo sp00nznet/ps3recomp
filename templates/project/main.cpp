@@ -75,6 +75,11 @@ void     ps3_load_prx_modules(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 
+/* sys_ppu_thread.c: the main thread's stack, as sys_ppu_thread_get_stack_information
+ * reports it. Left at 0 it names VM_STACK_BASE, the first created thread's stack. */
+extern uint32_t g_ppu_main_stack_addr;
+extern uint32_t g_ppu_main_stack_size;
+
 /* The status the guest handed to sys_process_exit. A title that exits that way
  * never returns through ppu_run, so this is only read on the path where the
  * entry function unwound instead. */
@@ -143,6 +148,7 @@ extern "C" int  rsx_null_backend_pump_messages(void);
  * smaller arena makes every spawned thread's stack access out of bounds. */
 #define VM_SIZE       0x100010000ull   /* the full 32-bit guest space + a 64K guard */
 #define STACK_TOP     0x0FF00000u      /* main-thread stack, below the 0x10000000 segment */
+#define STACK_SIZE    0x00100000u      /* what the main thread is told it has */
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
 
@@ -369,6 +375,11 @@ int main(int argc, char** argv)
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
+
+    /* A title that reads its own stack bounds (to find data its parent left
+     * below the top, say) gets the stack it really runs on. */
+    g_ppu_main_stack_addr = STACK_TOP - STACK_SIZE;
+    g_ppu_main_stack_size = STACK_SIZE;
 
     int rc = ppu_run(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);

@@ -1250,54 +1250,64 @@ int64_t sys_ppu_thread_get_join_state(ppu_context* ctx)
  * r3 = pointer to receive stack info struct
  *   struct { u32 addr; u32 size; }
  * -----------------------------------------------------------------------*/
+/* The main thread's stack, for a host that runs it on one of its own (the
+ * template's STACK_TOP, say). ppu_run takes only a stack top, so the host sets
+ * these before it; a size of 0 keeps the default below. */
+uint32_t g_ppu_main_stack_addr = 0;
+uint32_t g_ppu_main_stack_size = 0;
+
+/* What the main thread is told. The default names the first allocation in the
+ * thread stack region (VM_STACK_BASE), which is where a host that gives main an
+ * lv2-style stack puts it (boot_main.cpp, PS3_MAIN_STACK_LV2). */
+static void main_stack_info(uint32_t* addr, uint32_t* size)
+{
+    if (g_ppu_main_stack_size) {
+        *addr = g_ppu_main_stack_addr;
+        *size = g_ppu_main_stack_size;
+    } else {
+        *addr = VM_STACK_BASE;
+        *size = VM_PPU_STACK_SIZE;
+    }
+}
+
 int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 {
     uint32_t out_addr = LV2_ARG_PTR(ctx, 0);
     uint64_t tid = ctx->thread_id;
+    uint32_t sa, ss;
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
-    if (!t) {
-        table_unlock();
-        /* For the main thread, return sensible defaults */
-        if (out_addr != 0) {
-            uint32_t* out = (uint32_t*)vm_to_host(out_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-            /* byteswap both fields */
-            uint32_t sa = VM_STACK_BASE;
-            uint32_t ss = VM_PPU_STACK_SIZE;
-            sa = ((sa >> 24) & 0xFF) | ((sa >> 8) & 0xFF00) |
-                 ((sa <<  8) & 0xFF0000) | ((sa << 24) & 0xFF000000u);
-            ss = ((ss >> 24) & 0xFF) | ((ss >> 8) & 0xFF00) |
-                 ((ss <<  8) & 0xFF0000) | ((ss << 24) & 0xFF000000u);
-            out[0] = sa;
-            out[1] = ss;
-#else
-            out[0] = VM_STACK_BASE;
-            out[1] = VM_PPU_STACK_SIZE;
-#endif
-        }
-        return CELL_OK;
+    /* The main thread is in the table (ppu_thread_register_main, slot 0) but
+     * has no recorded stack. Reporting its 0 + 0 sent a title that looks for
+     * data at (addr + size - 0x1000) to 0xFFFFF000. A context with no table
+     * entry at all gets the same main-thread answer, as before. */
+    if (t && t->stack_size) {
+        sa = t->stack_addr;
+        ss = t->stack_size;
+    } else {
+        main_stack_info(&sa, &ss);
     }
+    table_unlock();
+
+    static int s_log = -1;
+    if (s_log < 0) s_log = getenv("PPU_STACKINFO_LOG") ? 1 : 0;
+    if (s_log)
+        fprintf(stderr, "[ppu_thread] get_stack_information tid=%llu -> 0x%08X+0x%X\n",
+                (unsigned long long)tid, sa, ss);
 
     if (out_addr != 0) {
         uint32_t* out = (uint32_t*)vm_to_host(out_addr);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        uint32_t sa = t->stack_addr;
-        uint32_t ss = t->stack_size;
+        /* byteswap both fields */
         sa = ((sa >> 24) & 0xFF) | ((sa >> 8) & 0xFF00) |
              ((sa <<  8) & 0xFF0000) | ((sa << 24) & 0xFF000000u);
         ss = ((ss >> 24) & 0xFF) | ((ss >> 8) & 0xFF00) |
              ((ss <<  8) & 0xFF0000) | ((ss << 24) & 0xFF000000u);
+#endif
         out[0] = sa;
         out[1] = ss;
-#else
-        out[0] = t->stack_addr;
-        out[1] = t->stack_size;
-#endif
     }
-
-    table_unlock();
     return CELL_OK;
 }
 
