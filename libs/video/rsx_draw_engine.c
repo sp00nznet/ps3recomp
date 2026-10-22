@@ -107,6 +107,7 @@ typedef struct {
     u32 w, h;
     u32 handle;
     u32 snapshot;          /* sampleable copy, or 0                        */
+    u32 snap_w, snap_h;    /* the region that copy holds                    */
     int cleared;
     int had_write;
     int snapshot_valid;
@@ -874,6 +875,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
     eng_zdepth* z = &g.zdepths[slot];
+    /* The old size's snapshot goes with it: it can never be valid again. */
+    if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
@@ -892,15 +895,35 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
  * a depth-WRITING draw: a write-enable bit alone does not prove the pass
  * produced a usable depth map, and a clear-only zeta falls through to guest
  * memory instead (rsx_live_draw.c:6016-6018, 6265-6269). */
-static u32 eng_zdepth_snapshot(u32 slot)
+static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
 {
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !z->had_write) return 0;
-    if (z->snapshot_valid && z->snapshot) return z->snapshot;
+    /* The texture covers the top-left tex_w x tex_h of the zeta. The host
+     * depth target is at least canvas-sized (eng_zdepth_get), so a 128x160
+     * shadow map lives in the corner of a 1280x720 image; resolving all of it
+     * stretched the texture's normalized coordinates over the whole canvas
+     * and the lookups landed outside the map. The snapshot is the region the
+     * texture names, copied 1:1 from the top-left (as the Vulkan backend's
+     * copy already does). */
+    const u32 w = (tex_w && tex_w < z->w) ? tex_w : z->w;
+    const u32 h = (tex_h && tex_h < z->h) ? tex_h : z->h;
+    if (z->snapshot_valid && z->snapshot && z->snap_w == w && z->snap_h == h)
+        return z->snapshot;
     if (!g.be->depth_snapshot) return 0;
-    const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
+    const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, w, h);
     if (!tex) return 0;
+    /* The stale copy goes. A depth clear invalidates the snapshot and the
+     * next read takes a new one, so a shadow map cleared and read every frame
+     * used to leak one backend texture a frame per depth target, until the
+     * backend's object table filled and new textures came back as 0. The
+     * Metal backend keeps a released object until no recorded draw can still
+     * name it; the Vulkan one hands back the same handle, refilled. */
+    if (z->snapshot && z->snapshot != tex && g.be->texture_release)
+        g.be->texture_release(g.be->user, z->snapshot);
     z->snapshot = tex;
+    z->snap_w = w;
+    z->snap_h = h;
     z->snapshot_valid = 1;
     return tex;
 }
@@ -2117,7 +2140,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             /* DEPTH24_D8 keeps the backend's own snapshot when it has one;
              * anything else goes through guest memory. */
             if (base_fmt == RSX_TEX_FMT_DEPTH24_D8 && current_zslot != (u32)zsrc) {
-                const u32 snap = eng_zdepth_snapshot((u32)zsrc);
+                const u32 snap = eng_zdepth_snapshot((u32)zsrc, t.width, t.height);
                 if (snap) { textures[u] = snap; continue; }
             }
             if (eng_zdepth_to_guest((u32)zsrc)) {
@@ -2176,7 +2199,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset && current_zslot != i) {
-                    const u32 snap = eng_zdepth_snapshot(i);
+                    const u32 snap = eng_zdepth_snapshot(i, t.width, t.height);
                     if (snap) textures[u] = snap;
                     break;
                 }

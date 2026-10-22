@@ -2464,7 +2464,7 @@ static NSString* const kEngHelperMSL = @
 "fragment float eng_depth_fs(BOut i [[stage_in]],\n"
 "                            depth2d<float> src [[texture(0)]],\n"
 "                            sampler s [[sampler(0)]]) {\n"
-"    return src.sample(s, i.uv);\n"
+"    return src.read(uint2(i.pos.xy));\n"   /* 1:1, top-left region */
 "}\n";
 
 static u32 eng_obj_add(id<MTLTexture> t)
