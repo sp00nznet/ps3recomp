@@ -405,17 +405,22 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
+    /* The pending-transfer slot is thread-local, and on Darwin every access
+     * to a thread-local is a call to the TLV resolver. The slot's address is
+     * fixed for the life of this host thread, and a drain never leaves its
+     * thread, so resolve it once per drain instead of once per access. */
+    void (**const tramp)(spu_context*) = &g_spu_trampoline_fn;
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
-        while (g_spu_trampoline_fn) {
-            if (g_spu_trampoline_fn == spu_indirect_branch &&
+        while (*tramp) {
+            if (*tramp == spu_indirect_branch &&
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
-                g_spu_trampoline_fn = 0;
+                *tramp = 0;
                 SPU_DRAIN_POP_IRQ();
                 return;
             }
-            void (*fn)(spu_context*) = g_spu_trampoline_fn;
-            g_spu_trampoline_fn = 0;
+            void (*fn)(spu_context*) = *tramp;
+            *tramp = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             yz_lockstep_tick(ctx);
             spu_task_launch_check(ctx, (void*)fn);
@@ -436,7 +441,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         /* iret fired deeper: registers restored, pc = srr0 */
                         ctx->host_depth = f.depth;
                         ctx->image_id = f.image_id;
-                        g_spu_trampoline_fn = spu_indirect_branch;
+                        *tramp = spu_indirect_branch;
                         SPU_DRAIN_POP_IRQ();
                     }
                     continue;
@@ -457,7 +462,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
                             (int)ctx->resident_ovl); }
-                g_spu_trampoline_fn = spu_indirect_branch;
+                *tramp = spu_indirect_branch;
                 continue;
             }
         }
