@@ -50,6 +50,14 @@ static uint64_t spu_host_ns(void)
     return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
          + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
            / (uint64_t)s_freq.QuadPart;
+#elif defined(__APPLE__)
+    /* SPU_RdDec reads this on every decrementer read. Darwin builds
+     * CLOCK_MONOTONIC from gettimeofday and the boot time, at microsecond
+     * resolution; CLOCK_MONOTONIC_RAW is the mach continuous-time counter in
+     * nanoseconds, at about half the cost. Both are monotonic, count across
+     * sleep and start from an arbitrary origin, and the decrementer only ever
+     * subtracts two readings of this one function. */
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
