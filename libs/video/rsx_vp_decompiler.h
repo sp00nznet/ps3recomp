@@ -57,6 +57,12 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
  * to the ucode pointer handed in. Defaults to 0. */
 void rsx_vp_set_branch_base(u32 start_slot);
 
+/* SET_TRANSFORM_BRANCH_BITS for the next program decompiled. BRB and CLB
+ * branch on one of these bits; the decompiler bakes the outcome in, so a
+ * program that rsx_vp_uses_branch_bits() must be keyed on them too. */
+void rsx_vp_set_branch_bits(u32 bits);
+int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes);
+
 /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).
  * Unmasked units retain the defined-zero fallback. */

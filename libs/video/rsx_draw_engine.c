@@ -1631,6 +1631,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 cube_mask = eng_cube_mask();
     const u32 vol_mask = eng_volume_mask();
     const u32 vtex_mask = eng_vtex_mask();
+    /* BRB/CLB outcomes are baked into the program: the branch bits are
+     * identity only for a program that tests them. */
+    const int vp_branch_bits_used = !fixed && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
+    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
     u32 shadow_mask = 0;
     const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
@@ -1686,6 +1690,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
         key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+        if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
         if (!key) return 0;
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
@@ -1727,6 +1732,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
     } else {
+        rsx_vp_set_branch_bits(vp_branch_bits);
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);

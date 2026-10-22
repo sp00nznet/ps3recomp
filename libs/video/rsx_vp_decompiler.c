@@ -132,10 +132,26 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
 }
 
 /* ---- flow control -------------------------------------------------------- */
-#define RSX_VP_MAX_INSTR 512
+/* The transform program memory holds 544 slots (RSX_DSP_VP_INSTR), not 512:
+ * a branch target or block leader past slot 511 must still open a block. */
+#define RSX_VP_MAX_INSTR 544
 
 static u32 s_vp_branch_base = 0;   /* VP slot the program being decompiled starts at */
 void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
+
+static u32 s_vp_branch_bits = 0;   /* SET_TRANSFORM_BRANCH_BITS, tested by BRB/CLB */
+void rsx_vp_set_branch_bits(u32 bits) { s_vp_branch_bits = bits; }
+
+int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0;
+    for (u32 off = 0; off + 16 <= max_bytes; off += 16) {
+        const u32 sca_op = (rd_le(ucode + off + 4) >> 27) & 0x1Fu;
+        if (sca_op == 0x11 || sca_op == 0x12) return 1;   /* BRB, CLB */
+        if (rd_le(ucode + off + 12) & 1u) break;          /* D3.end */
+    }
+    return 0;
+}
 
 /* BRA BRI CAL CLI RET BRB CLB (scalar opcodes). */
 static int vp_is_flow(u32 sca_op)
@@ -500,10 +516,20 @@ static int rsx_vp_decompile_impl(
                 snprintf(flow_term, sizeof flow_term,
                          "        if (%s) { if (_csp > 0) { _csp--; _pc = _cs[_csp]; } else _pc = -1; } else _pc = %d;\n",
                          c, next);
-            else {                                         /* BRB/CLB: boolean-register branches */
-                n_flow_skipped++;
-                snprintf(flow_term, sizeof flow_term,
-                         "        _pc = %d; /* TODO: %s not modelled */\n", next, rsx_vp_sca_name(sca_op));
+            else {                                         /* BRB, CLB */
+                /* A boolean branch tests bit D3[23:27] of the transform
+                 * branch bits against D3[28] and ignores the CC condition
+                 * (RPCS3's GetOptionalBranchCond). The bits are baked in:
+                 * the caller keys the program on them. */
+                const u32 bit = (s_vp_branch_bits >> ((d3 >> 23) & 0x1Fu)) & 1u;
+                const int taken = bit == ((d3 >> 28) & 1u);
+                if (!taken)
+                    snprintf(flow_term, sizeof flow_term, "        _pc = %d;\n", next);
+                else if (sca_op == 0x11)
+                    snprintf(flow_term, sizeof flow_term, "        _pc = %u;\n", tgt);
+                else
+                    snprintf(flow_term, sizeof flow_term,
+                             "        _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u;\n", next, tgt);
             }
         }
         /* ---- scalar ALU (reads SRC2) ---- */
