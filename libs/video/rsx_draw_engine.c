@@ -1829,6 +1829,64 @@ static int dc_push_ref(u32 vertex_id, u32 base_index)
     return 1;
 }
 
+/* Room for `more` references past dc.n_refs, grown as dc_push_ref grows. */
+static int dc_reserve_refs(u32 more)
+{
+    const u64 want = (u64)dc.n_refs + more;
+    if (want <= dc.cap_refs) return 1;
+    if (want > 0xFFFFFFFFull) return 0;
+    u64 next = dc.cap_refs ? dc.cap_refs : 4096u;
+    while (next < want) next *= 2u;
+    if (next > 0xFFFFFFFFull) next = want;
+    rsx_vertex_ref* r = (rsx_vertex_ref*)realloc(dc.refs, (size_t)next * sizeof(*r));
+    if (!r) return 0;
+    dc.refs = r;
+    dc.cap_refs = (u32)next;
+    return 1;
+}
+
+/* A run of big-endian indices appended as references in one pass: the
+ * capacity is reserved up front and the loop works on locals, which the
+ * per-index dc_push_ref (reloading dc after every store) could not. A
+ * restart sentinel still cuts the strip where it stands. */
+static int dc_push_index_run(const u8* run, u32 count, int is_u32, u32 base_index,
+                             int restart_en, u32 restart_val)
+{
+    if (!dc_reserve_refs(count)) return 0;
+    rsx_vertex_ref* out = dc.refs;
+    u32 n = dc.n_refs;
+    if (is_u32) {
+        for (u32 i = 0; i < count; i++) {
+            const u8* p = run + (size_t)i * 4u;
+            const u32 index = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+            if (restart_en && index == restart_val) {
+                dc.n_refs = n;
+                if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) return 0;
+                continue;
+            }
+            out[n].vertex_id = index; out[n].base_index = base_index; n++;
+        }
+    } else if (!restart_en) {
+        for (u32 i = 0; i < count; i++) {
+            out[n + i].vertex_id = (u32)((run[2u * i] << 8) | run[2u * i + 1u]);
+            out[n + i].base_index = base_index;
+        }
+        n += count;
+    } else {
+        for (u32 i = 0; i < count; i++) {
+            const u32 index = (u32)((run[2u * i] << 8) | run[2u * i + 1u]);
+            if (index == restart_val) {
+                dc.n_refs = n;
+                if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) return 0;
+                continue;
+            }
+            out[n].vertex_id = index; out[n].base_index = base_index; n++;
+        }
+    }
+    dc.n_refs = n;
+    return 1;
+}
+
 static int dc_reserve_verts(u64 bytes)
 {
     if (bytes <= dc.verts_cap) return 1;
@@ -1895,6 +1953,11 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             if (count && start <= 0xFFFFFFFFull && bytes <= 0xFFFFFFFFull &&
                 start + bytes <= 0x100000000ull)
                 run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
+            if (run) {
+                if (!dc_push_index_run(run, count, ia.is_u32, base_index, restart_en, restart_val))
+                    dc.fetch_ok = 0;
+                continue;
+            }
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
                 const u8* p = run ? run + (size_t)i * esz
                     : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);

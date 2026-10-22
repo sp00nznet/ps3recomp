@@ -1241,6 +1241,73 @@ static void test_transfer_reads_fp16(void)
     engine_down();
 }
 
+/* ---- indexed draws: big-endian index runs, restart sentinels ------------ */
+
+#define IDX_OFFSET 0x00030000u
+static void put_be(u8* p, u32 v, u32 bytes)
+{
+    for (u32 i = 0; i < bytes; i++) p[i] = (u8)(v >> (8u * (bytes - 1u - i)));
+}
+/* The x of the draw's k-th vertex, through its index list when it has one
+ * (a list of distinct vertices is drawn without). */
+static float drawn_x(u32 k)
+{
+    float x;
+    memcpy(&x, stub.captured_vertices[stub.draw_indices ? stub.captured_indices[k] : k], 4);
+    return x;
+}
+static int triangles_are(const u32* want, u32 n)
+{
+    if ((stub.draw_indices ? stub.draw_indices : stub.draw_vertices) != n) return 0;
+    for (u32 k = 0; k < n; k++) if (drawn_x(k) != (float)want[k]) return 0;
+    return 1;
+}
+static void indexed_case(const u32* idx, u32 n, int u32_indices, int restart, u32 sentinel,
+                         u32 prim, const u32* want, u32 nwant, const char* what)
+{
+    engine_up();
+    u8 saved[8 * 16]; memcpy(saved, vm_base + VTX_OFFSET, sizeof saved);
+    for (u32 i = 0; i < 8; i++) {
+        const float f[4] = { (float)i, 0.0f, 0.0f, 1.0f };
+        for (u32 c = 0; c < 4; c++) { u32 w; memcpy(&w, &f[c], 4); put_be(vm_base + VTX_OFFSET + i * 16 + c * 4, w, 4); }
+    }
+    const u32 esz = u32_indices ? 4u : 2u;
+    for (u32 i = 0; i < n; i++) put_be(vm_base + IDX_OFFSET + 8 + i * esz, idx[i], esz);
+    m(0x181C, IDX_OFFSET);                                 /* index array offset */
+    m(0x1820, 1u | ((u32_indices ? 0u : 1u) << 4));       /* main memory, type */
+    m(0x1DAC, restart ? 1u : 0u);
+    m(0x1DB0, sentinel);
+    m(M_BEGIN_END, prim);
+    m(0x1824, (8u / esz) | ((n - 1u) << 24));             /* first index past 8 bytes */
+    m(M_BEGIN_END, 0u);
+    CHECK(stub.n_draw == 1 && triangles_are(want, nwant), "%s (%u indices, %u vertices drawn)", what, stub.draw_indices, stub.draw_vertices);
+    memcpy(vm_base + VTX_OFFSET, saved, sizeof saved);
+    memset(vm_base + IDX_OFFSET, 0, 64);
+    m(0x1DAC, 0u);
+    engine_down();
+}
+static void test_indexed_runs(void)
+{
+    printf("-- indexed runs\n");
+    static const u32 strip[] = { 0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7 };
+    static const u32 strip_tris[] = { 0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7 };
+    indexed_case(strip, 9, 0, 1, 0xFFFF, RSX_PRIMITIVE_TRIANGLE_STRIP, strip_tris, 12,
+                 "16-bit strip cut by its restart sentinel");
+    static const u32 strip32[] = { 0, 1, 2, 3, 0xFFFFFFFFu, 4, 5, 6, 7 };
+    indexed_case(strip32, 9, 1, 1, 0xFFFFFFFFu, RSX_PRIMITIVE_TRIANGLE_STRIP, strip_tris, 12,
+                 "32-bit strip cut by its restart sentinel");
+    static const u32 tris[] = { 3, 1, 2, 7, 0, 5 };
+    indexed_case(tris, 6, 0, 0, 0xFFFF, RSX_PRIMITIVE_TRIANGLES, tris, 6,
+                 "16-bit triangle list in index order");
+    static const u32 tris32[] = { 0x0003, 0x0001, 0x0002, 0x0007, 0x0000, 0x0005 };
+    indexed_case(tris32, 6, 1, 0, 0xFFFFFFFFu, RSX_PRIMITIVE_TRIANGLES, tris, 6,
+                 "32-bit triangle list in index order");
+    /* A 16-bit buffer ignores a sentinel that does not fit in 16 bits. */
+    static const u32 big_sentinel_tris[] = { 3, 1, 2 };
+    indexed_case(big_sentinel_tris, 3, 0, 1, 0x10002u, RSX_PRIMITIVE_TRIANGLES, big_sentinel_tris, 3,
+                 "16-bit restart off when the sentinel is wider than 16 bits");
+}
+
 static unsigned custom_reads;
 static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
 {
@@ -1612,6 +1679,7 @@ int main(void)
     test_texture_sparse_rehash();
     test_pipeline_key();
     test_restart_expansion();
+    test_indexed_runs();
     test_indexed_draws();
     test_scissor();
     test_readback();
