@@ -2279,6 +2279,14 @@ static u32 s_eng_dropped;
 
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
+/* The staging arena is the contents of a shared MTLBuffer, handed to the
+ * command buffer that reads it instead of being copied into a new one at
+ * every commit. A committed arena goes back to this pool when the GPU has
+ * finished with it; recording continues in another. */
+static id<MTLBuffer> s_eng_stage_buf;
+static NSMutableArray<id<MTLBuffer>>* s_eng_stage_pool;
+static pthread_mutex_t s_eng_stage_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+enum { ENG_STAGE_POOL_KEEP = 8 };
 
 /* What the bind_* calls have accumulated for the next draw. */
 static EngRecord s_eng_pending;
@@ -2539,6 +2547,44 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 
 static void eng_encode_and_commit(id<MTLTexture> present_dst);
 
+static id<MTLBuffer> eng_stage_buffer_acquire(u32 cap)
+{
+    id<MTLBuffer> buf = nil;
+    pthread_mutex_lock(&s_eng_stage_pool_lock);
+    for (NSUInteger i = 0; i < [s_eng_stage_pool count]; ++i)
+        if ([s_eng_stage_pool[i] length] >= cap) {
+            buf = s_eng_stage_pool[i];
+            [s_eng_stage_pool removeObjectAtIndex:i];
+            break;
+        }
+    pthread_mutex_unlock(&s_eng_stage_pool_lock);
+    if (!buf) buf = [s_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
+    return buf;
+}
+
+static void eng_stage_buffer_release(id<MTLBuffer> buf)
+{
+    if (!buf) return;
+    pthread_mutex_lock(&s_eng_stage_pool_lock);
+    if (!s_eng_stage_pool) s_eng_stage_pool = [NSMutableArray new];
+    if ([s_eng_stage_pool count] < ENG_STAGE_POOL_KEEP) [s_eng_stage_pool addObject:buf];
+    pthread_mutex_unlock(&s_eng_stage_pool_lock);
+}
+
+/* The committed command buffer owns the arena from here; recording starts
+ * in a fresh one. */
+static void eng_stage_hand_off(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+{
+    if (!stage) return;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+        (void)_unused;
+        eng_stage_buffer_release(stage);
+    }];
+    s_eng_stage_buf = nil;
+    s_eng_stage = NULL;
+    s_eng_stage_cap = 0;
+}
+
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
     const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
@@ -2551,10 +2597,21 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
     if (start + bytes > s_eng_stage_cap) {
         u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
         while (start + bytes > cap) cap *= 2u;
-        u8* n = (u8*)realloc(s_eng_stage, cap);
-        if (!n) return 0;
-        s_eng_stage = n;
-        s_eng_stage_cap = cap;
+        /* A pool of its own: the caller is the FIFO walker, a PPU host thread
+         * with no autorelease pool, and the driver's -contents autoreleases
+         * the buffer. Without the pool that reference stayed until the thread
+         * exited, so every arena the full pool dropped at completion stayed
+         * allocated: a retail title leaked 4 MB per such commit, some GB a
+         * minute, until the Mac ran out of memory. */
+        @autoreleasepool {
+            id<MTLBuffer> n = eng_stage_buffer_acquire(cap);
+            if (!n) return 0;
+            if (s_eng_stage_used) memcpy([n contents], s_eng_stage, s_eng_stage_used);
+            eng_stage_buffer_release(s_eng_stage_buf);   /* never committed */
+            s_eng_stage_buf = n;
+            s_eng_stage = (u8*)[n contents];
+            s_eng_stage_cap = (u32)[n length];
+        }
     }
     *out_off = start;
     s_eng_stage_used = start + bytes;
@@ -2609,8 +2666,11 @@ static void eng_shutdown(void* user)
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
-    free(s_eng_stage); s_eng_stage = NULL;
+    s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
+    pthread_mutex_lock(&s_eng_stage_pool_lock);
+    [s_eng_stage_pool removeAllObjects];
+    pthread_mutex_unlock(&s_eng_stage_pool_lock);
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
@@ -3587,9 +3647,9 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
 /* Encode everything recorded so far and commit it.
  *
  * The staging arena is recycled the moment this returns, which is safe
- * without a wait: newBufferWithBytes COPIES, so what the GPU reads is the
- * MTLBuffer and not the arena, and a command buffer retains every resource it
- * uses. So only headless waits, where the readback has to observe a finished
+ * without a wait: the arena's MTLBuffer goes with the command buffer, back to
+ * the pool only once the GPU has finished with it, and recording continues in
+ * another. So only headless waits, where the readback has to observe a finished
  * frame -- there the stall is the point. A windowed present is paced by the
  * in-flight semaphore instead, the same bound the vtable path uses, because
  * waiting on every frame is the one pattern where a driver cannot hide its
@@ -3618,10 +3678,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             }
         }
 
-        id<MTLBuffer> stage = nil;
-        if (s_eng_stage_used)
-            stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
-                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> stage = s_eng_stage_used ? s_eng_stage_buf : nil;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         if (!cb || (s_eng_stage_used && !stage)) {
             s_eng_encoding_failed = 1;
@@ -3640,9 +3697,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 (void)_unused;
                 dispatch_semaphore_signal(sem);
             }];
+            eng_stage_hand_off(cb, stage);
             [cb commit];
         } else {
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+            eng_stage_hand_off(cb, stage);
             [cb commit];
             [cb waitUntilCompleted];
             if (ft_w0) {
