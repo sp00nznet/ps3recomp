@@ -392,6 +392,12 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+
+    /* Set by another host thread to stop this SPU from outside: a raw SPU's
+     * PPU writing SPU_RunCntl = 0 (spu_raw.c). Lifted code never looks at it;
+     * the channel layer does, at every rdch/rchcnt and inside its blocking
+     * waits, and halts the SPU there (spu_halt). Cleared by spu_context_init. */
+    volatile int stop_request;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
