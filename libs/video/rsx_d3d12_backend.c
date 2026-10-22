@@ -481,6 +481,17 @@ static int perf_on(void)
     if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
     return v;
 }
+/* Debug switches read on every draw, quad or bind go through this: getenv
+ * takes the CRT environment lock and scans every variable, and a dozen of
+ * them per draw was a quarter of God of War HD's drain-thread time (ucrtbase
+ * in PS3_SAMPLE_DRAIN). Read once, like the switches that already cache. */
+static int env_on(const char* name, int* cache)
+{
+    if (*cache < 0) *cache = getenv(name) ? 1 : 0;
+    return *cache;
+}
+static int s_env_noalphatest = -1, s_env_vp_nofixproj = -1, s_env_vp_fixproj = -1,
+           s_env_vp_attrs = -1, s_env_vtx_dump = -1, s_env_movie_bind = -1;
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
  * texture), so the debug camera can follow it. The ducks are driven by the
  * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
@@ -2007,7 +2018,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         u32 usz = rsx_fp_program_size(vm_base + off, 4096);
         if (usz == 0) usz = 64;
         s_perf_pso_hashbytes += (int)usz;
-        if (getenv("FP_CONSTBUF") && getenv("FP_CONSTBUF")[0] == '0') {
+        static int consts_inline = -1;
+        if (consts_inline < 0) { const char* e = getenv("FP_CONSTBUF");
+                                 consts_inline = (e && e[0] == '0') ? 1 : 0; }
+        if (consts_inline) {
             uhash = 2166136261u;
             const u8* up = vm_base + off;
             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
@@ -3100,7 +3114,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
          * has no fixed alpha test; guest FPs discard on it dynamically
          * (wave's colour wheel is a disc via alpha test -- without it the
          * palette drew as an opaque square). */
-        if (dr && !getenv("NO_ALPHATEST")) {
+        if (dr && !env_on("NO_ALPHATEST", &s_env_noalphatest)) {
             { static int _at = 0;
               if (((dr->alpha_ctl >> 16) & 1u) && PS3_LOG_FIRST(_at, 4))
                   printf("[ALPHATEST] enable func=%u ref=%u\n",
@@ -3224,8 +3238,8 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     float* c = (float*)dst;
     float c00 = c[0];
     int garbage = !(c00 > 0.0f && c00 < 8.0f);
-    if (getenv("VP_NOFIXPROJ")) garbage = 0;
-    if ((garbage && uses_c03) || getenv("VP_FIXPROJ")) {
+    if (env_on("VP_NOFIXPROJ", &s_env_vp_nofixproj)) garbage = 0;
+    if ((garbage && uses_c03) || env_on("VP_FIXPROJ", &s_env_vp_fixproj)) {
         { static int _fb = 0; if (PS3_LOG_FIRST(_fb, 6))
             printf("[VPFB] fallback proj on draw slot %u (c00=%g vs_idx=%d)\n",
                    slot, c00, vs_idx); }
@@ -5506,7 +5520,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
 
 static void vp_attrs_dbg(const rsx_state* state)
 {
-    if (!getenv("VP_ATTRS")) return;
+    if (!env_on("VP_ATTRS", &s_env_vp_attrs)) return;
     /* VP_ATTRS_FP=<hex shader_program>: dump only the draws that use one
      * fragment program. Without it the first six draws are whatever the frame
      * happens to start with, which is never the mesh being investigated. */
@@ -5630,7 +5644,7 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
         /* quad -> two triangles (perimeter winding) */
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
-        if (getenv("VTX_DUMP")) { static int _n=0; if (PS3_LOG_FIRST(_n, 4)) {
+        if (env_on("VTX_DUMP", &s_env_vtx_dump)) { static int _n=0; if (PS3_LOG_FIRST(_n, 4)) {
             FILE* f = fopen("vtx_dump.txt", _n==1 ? "w" : "a");
             if (f) { for (u32 k = 0; k < 4; k++)
                 fprintf(f, "q%02d v%u a0=(%.3f,%.3f,%.3f,%.3f) a8=(%.3f,%.3f)\n", _n, k,
@@ -5691,7 +5705,7 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
           fprintf(stderr, "  | constants: %d non-zero, slots %d..%d", nz, lo, hi); }
         fprintf(stderr, "%c", 10);
       } }
-    if (getenv("VTX_DUMP") && state->surface_color_offset[0] == 0xCC0000) {
+    if (env_on("VTX_DUMP", &s_env_vtx_dump) && state->surface_color_offset[0] == 0xCC0000) {
         static int _n=0; if (PS3_LOG_FIRST(_n, 1)) {
         FILE* f = fopen("vtx_dump.txt", "w");
         if (f) { fprintf(f, "G-buffer draw surf0=0x%X count=%u first=%u\n",
@@ -5772,7 +5786,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
             read_vp_vertex(state, read_guest_index(state, first + q*4 + k), c[k]);
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
-        if (getenv("VTX_DUMP")) { static int _n=0; if (PS3_LOG_FIRST(_n, 6)) {
+        if (env_on("VTX_DUMP", &s_env_vtx_dump)) { static int _n=0; if (PS3_LOG_FIRST(_n, 6)) {
             FILE* f = fopen("vtx_dump.txt", _n==1 ? "w" : "a");
             if (f) {
                 const float* vs_ = state->viewport_scale;
@@ -6435,7 +6449,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * resolved EA + a content probe -- used to diagnose the Bink frame-buffer
      * ring mismatch (the draw binds a cleared buffer 0x4D80 before the one the
      * decoder actually fills). */
-    if (getenv("MOVIE_BIND") &&
+    if (env_on("MOVIE_BIND", &s_env_movie_bind) &&
         ((width == 640 && height == 360) || (width == 320 && height == 180))) {
         extern u32 cellGcmResolveLocated(int local, u32 offset);
         static int _mv = 0; if (PS3_LOG_FIRST(_mv, 24)) {
