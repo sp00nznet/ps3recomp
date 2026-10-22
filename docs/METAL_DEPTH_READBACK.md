@@ -6,7 +6,9 @@ as A8R8G8B8 to reconstruct positions. Metal previously left the optional
 `depth_readback` callback unset, so this path sampled the existing guest bytes.
 
 The callback resolves the full depth attachment through the existing R32Float
-snapshot shader, then blits the requested rectangle into a shared buffer. It
+snapshot shader, then blits the requested rectangle into a shared buffer. The
+buffer is kept between calls and grown to the largest copy seen; each call
+waits for its blit before returning, so one buffer serves every call. It
 checks command-buffer completion and errors before copying floats to the
 caller. The full-source resolve preserves offset rectangle coordinates.
 Output padding is left untouched. Invalid requests and allocation/submission

@@ -2595,6 +2595,11 @@ static int eng_init(void* user, u32 width, u32 height)
     return s_eng_point_sampler && s_eng_linear_sampler ? 0 : -1;
 }
 
+/* Shared staging for eng_depth_readback, grown to the largest copy seen. A
+ * readback waits for its blit before returning, so one buffer serves every
+ * call; a fresh allocation per call paid for zero-filling the whole copy. */
+static id<MTLBuffer> s_eng_depth_staging;
+
 static void eng_shutdown(void* user)
 {
     (void)user;
@@ -2621,6 +2626,7 @@ static void eng_shutdown(void* user)
     s_eng_active = 0;
     s_eng_encoding_failed = 0;
     s_eng_checked_completed = 0;
+    s_eng_depth_staging = nil;
 }
 
 static u32 s_ft_flush_reason;   /* PS3_FTRACE: why the commit in progress was asked for */
@@ -3760,8 +3766,10 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
         (size_t)(h - 1u) > (SIZE_MAX - row_bytes) / out_pitch)
         return -1;
     @autoreleasepool {
-        id<MTLBuffer> staging = [s_dev newBufferWithLength:copy_pitch * h
-                                                 options:MTLResourceStorageModeShared];
+        if (!s_eng_depth_staging || [s_eng_depth_staging length] < copy_pitch * h)
+            s_eng_depth_staging = [s_dev newBufferWithLength:copy_pitch * h
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = s_eng_depth_staging;
         if (!staging || ![staging contents]) return -1;
         const u32 snap = eng_depth_snapshot(user, depth, (u32)[src width],
                                                         (u32)[src height]);
