@@ -572,8 +572,7 @@ class SPULifter:
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
+                f"    {{ SPU_DIRECT(ctx, 0x{end:X}, {self.prefix}spu_func_{end:08X}); }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -930,10 +929,11 @@ class SPULifter:
             if func.start_addr <= tgt < func.end_addr:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
-            # Cross-function conditional branch = conditional tail: hand the
-            # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
-            return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+            # Cross-function conditional branch = conditional tail: a direct
+            # tail call when the drain has nothing to do on this step, else
+            # the trampoline and unwind (SPU_DIRECT, spu_context.h).
+            return (f"if ({cond}) {{ SPU_DIRECT(ctx, 0x{tgt:X}, "
+                    f"{self.prefix}spu_func_{tgt:08X}); }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1042,10 +1042,11 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        # Cross-function unconditional tail: hand the target to the trampoline
-        # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
-        return (f"{{ ctx->pc = 0x{tgt:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+        # Cross-function unconditional tail: a direct tail call when the
+        # drain has nothing to do on this step, else hand the target to the
+        # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
+        # host-stack growth either way; SPU_DIRECT, spu_context.h).
+        return (f"{{ SPU_DIRECT(ctx, 0x{tgt:X}, {self.prefix}spu_func_{tgt:08X}); }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:

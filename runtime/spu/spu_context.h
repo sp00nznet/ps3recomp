@@ -884,6 +884,46 @@ static inline void spu_pchist_tick(const spu_context* ctx)
         }                                                      \
     } while (0)
 
+/* A lifted cross-function branch with a known target (br, the conditional
+ * branches, a fall-through into the next function). It used to set the
+ * trampoline and return, and the enclosing drain loop called the target: a
+ * host return, a loop pass and an indirect call per transfer. SPU_DIRECT
+ * tail-calls the target instead (no host stack growth) when nothing the drain
+ * loop does per step applies: the target is not LS 0 (a job's end), this is
+ * not the run's first transfer (the LS 0 check counts steps from there), the
+ * target is not in the stack-reset hint table, and no interrupt is pending
+ * with interrupts enabled. Anything else takes the trampoline as before. Tail calls need
+ * clang's musttail; other compilers always take the trampoline.
+ * PS3_SPU_DIRECT=0 = always the trampoline; the diagnostics that watch each
+ * drain step (SPU_LOCKSTEP, SPU_STEPTRACE, SPURS_PM_FLOW, ...) turn it off
+ * too (spu_drain.c). */
+extern volatile int g_spu_direct;                /* spu_drain.c: -1 unread, 0 off, 1 on */
+extern uint8_t g_spu_stack_reset_hint[1024];     /* spu_channels.c, by (entry >> 2) & 1023 */
+void spu_direct_init(void);
+#if defined(__clang__) && defined(__has_attribute)
+#  if __has_attribute(musttail)
+#    define SPU_DIRECT_TAILCALLS 1
+#  endif
+#endif
+#ifdef SPU_DIRECT_TAILCALLS
+#define SPU_DIRECT(ctx, PC, FN) do {                                          \
+        const uint32_t _dpc = (uint32_t)(PC);                                 \
+        (ctx)->pc = _dpc;                                                     \
+        if (__builtin_expect(g_spu_direct > 0, 1) && (_dpc & SPU_LS_MASK) &&  \
+            (ctx)->steps && !g_spu_stack_reset_hint[(_dpc >> 2) & 1023u] &&    \
+            !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask))) \
+            __attribute__((musttail)) return FN(ctx);                         \
+        g_spu_trampoline_fn = FN;                                             \
+        return;                                                               \
+    } while (0)
+#else
+#define SPU_DIRECT(ctx, PC, FN) do {                                          \
+        (ctx)->pc = (PC);                                                     \
+        g_spu_trampoline_fn = FN;                                             \
+        return;                                                               \
+    } while (0)
+#endif
+
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful

@@ -219,6 +219,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * an earlier run would be restored over this job's arguments. */
     { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
     ctx->steps = 0;   /* fresh run: step 0 is the entry */
+    if (g_spu_direct < 0) spu_direct_init();   /* PS3_SPU_DIRECT, spu_context.h */
     /* The host stack is empty here by definition, so no lifted caller frame
      * is live. A persistent context (a SPURS policy module re-entered every
      * scheduling quantum) otherwise carries the depth its last quantum
@@ -1553,11 +1554,16 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 static unsigned s_stack_reset_count;
+/* Nonzero at (entry >> 2) & 1023 of every registered entry, so SPU_DIRECT
+ * (spu_context.h) can tell with one load that a transfer needs the drain's
+ * stack-reset check. Collisions only cost a trampoline step. */
+uint8_t g_spu_stack_reset_hint[1024];
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
     if (s_stack_reset_count < 16) {
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
+        g_spu_stack_reset_hint[((entry & SPU_LS_MASK) >> 2) & 1023u] = 1;
     }
 }
 

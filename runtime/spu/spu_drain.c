@@ -58,6 +58,33 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
+/* SPU_DIRECT (spu_context.h) skips the per-step work of the drain loops, so
+ * PS3_SPU_DIRECT=0 and the diagnostics that watch every step keep it off:
+ * SPU_LOCKSTEP (the quantum tick), SPU_TAILRET (SPU_DRAIN's return check),
+ * SPU_PCHIST, SPU_NO_LS0_END, SPU_EXITTRACE, SPU_STEPTRACE, SPU_JOBDRAIN and
+ * SPURS_PM_FLOW. */
+volatile int g_spu_direct = -1;
+void spu_direct_init(void)
+{
+    if (g_spu_direct >= 0) return;
+    static const char* const diag[] = {
+        "SPU_LOCKSTEP", "SPU_TAILRET", "SPU_PCHIST", "SPU_NO_LS0_END", "SPU_EXITTRACE",
+        "SPU_STEPTRACE", "SPU_JOBDRAIN", "SPURS_PM_FLOW",
+    };
+    const char* e = getenv("PS3_SPU_DIRECT");
+    int on = !(e && e[0] == '0' && !e[1]);
+    const char* why = on ? NULL : "PS3_SPU_DIRECT=0";
+    for (unsigned i = 0; on && i < sizeof diag / sizeof diag[0]; i++) {
+        const char* d = getenv(diag[i]);
+        if (d && *d && strcmp(d, "0")) { on = 0; why = diag[i]; }
+    }
+#ifndef SPU_DIRECT_TAILCALLS
+    on = 0; why = "no musttail in this compiler";
+#endif
+    if (!on) fprintf(stderr, "[spu] direct tail calls off (%s)\n", why);
+    g_spu_direct = on;
+}
+
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
@@ -398,14 +425,20 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
+    if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
     spu_depth_guard(ctx);
+    /* On the way out, the enclosing drain's return pc is the innermost one
+     * again. It used to be 0 until that drain's next step re-set it, and with
+     * SPU_DIRECT the code after a call can tail-call on for a long while
+     * before it takes a step. */
+    const uint32_t outer_ret_pc = ctx->drain_ret_pc;
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
      * running as trampolines of this loop -- until its iret fires or the
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
             if (g_spu_trampoline_fn == spu_indirect_branch &&
