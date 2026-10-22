@@ -2089,7 +2089,18 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
 
         int sampled = -1, own = 0, surface_at = -1;
-        for (u32 i = 0; i < g.n_surfaces; i++) {
+        /* DXT data is never a render target's output: no surface colour
+         * format is block-compressed, so whatever a compressed texture names
+         * came from memory. Matching it against a target at the same offset
+         * found the current colour target and dropped the draw as an
+         * incompatible feedback read (a 16x16 DXT1 texture over a 1280x720
+         * target in Resistance: Fall of Man). Neither colour nor depth
+         * surfaces are looked up for it. */
+        const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+        const int compressed = base_fmt == RSX_TEX_FMT_DXT1 ||
+                               base_fmt == RSX_TEX_FMT_DXT23 ||
+                               base_fmt == RSX_TEX_FMT_DXT45;
+        for (u32 i = 0; i < g.n_surfaces && !compressed; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
                 continue;
@@ -2101,11 +2112,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             sampled = (int)i;
             break;
         }
-        const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
         /* The depth at this address, when it was written after any colour
          * there: a depth-only pass names its zeta as a colour target too. */
         int zsrc = -1;
-        for (u32 i = 0; i < g.n_zdepths; i++) {
+        for (u32 i = 0; i < g.n_zdepths && !compressed; i++) {
             const eng_zdepth* z = &g.zdepths[i];
             if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
                 continue;

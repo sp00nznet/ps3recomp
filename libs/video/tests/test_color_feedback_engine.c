@@ -29,6 +29,8 @@ int main(void){vm_base=calloc(1,GUEST_BYTES);ppu_vm_size=GUEST_BYTES;
  up();m(M_COLOR_TARGET,CELL_GCM_SURFACE_TARGET_MRT1);m(M_CONTEXT_DMA_COLOR_B,DMA_LOCAL);m(M_COLOR_B_OFFSET,0x50000);m(0x021C,1024);for(u32 a=0;a<0x20;a+=4)m(M_TEX_UNIT+0x20+a,rsx_dsp_reg(&g.rsx,M_TEX_UNIT+a));m(0x1844,1024);m(M_TEX_UNIT+0x20,0x50000);nt=eng_current_target_set(targets);memset(tx,0,sizeof tx);T(nt==2&&sink_bind_textures(targets,nt,ENG_INVALID,3,tx,ss)==3&&copies==2&&tx[0]!=tx[1],"MRT feedback snapshots every owned member independently");down();
  up();feedback_backend.surface_view=NULL;draw_triangle();T(copies==1&&stub.n_draw==1&&stub.bound_tex[0]==snapshot_seen,"absent view allows identity copy");down();
  up();feedback_backend.surface_view=NULL;m(M_TEX_UNIT+0x10,0xAA6C);draw_triangle();T(copies==1&&!stub.n_draw,"absent remap view rejects instead of silently changing channels");down();
+ /* A compressed texture over the current target is memory, not feedback. */
+ up();m(M_TEX_UNIT+4,1|(2<<4)|(0xA6<<8)|(1<<16));m(M_TEX_UNIT+0x18,(16<<16)|16);draw_triangle();T(copies==0&&stub.n_draw==1,"DXT1 at the target's offset uploads from memory instead of dropping the draw");down();
  /* Independently newer depth at the same address keeps its established route. */
  up();nt=eng_current_target_set(targets);u32 zs=eng_zdepth_get(RSX_LOCATION_LOCAL,0x40000,256,256);g.zdepths[zs].depth_serial=2;g.zdepths[zs].had_write=1;g.zdepths[zs].snapshot_valid=0;m(M_TEX_UNIT+4,1|(2<<4)|(0xB0<<8)|(1<<16));memset(tx,0,sizeof tx);T(sink_bind_textures(targets,nt,ENG_INVALID,1,tx,ss)==1&&copies==0&&stub.n_depth_snapshot==1,"newer depth wins over own color metadata");down();
  /* Full physical layouts and matching formats, without reinterpretation. */
