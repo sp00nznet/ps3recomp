@@ -97,9 +97,48 @@ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
 
 #if PAD_BACKEND_SDL2
+/* PS3 port i's controller, by SDL instance id (-1 = none); the port keeps the
+ * GUID of the last one it had so that pad gets the same port back. */
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
+static SDL_JoystickID      s_sdl_ids[PAD_MAX_HOST_PORTS] = { -1, -1, -1, -1 };
+static SDL_JoystickGUID    s_sdl_last_guid[PAD_MAX_HOST_PORTS];
+static int                 s_sdl_had[PAD_MAX_HOST_PORTS];
+static unsigned long long  s_sdl_scan_ms;   /* last device-list scan (pad_now_ms) */
 static int s_sdl_inited = 0;
 #endif
+
+/* One poll at a time: the guest polls from several threads, and a poll that
+ * opens or closes a controller must not race another one using it.
+ * cellPadSetActDirect takes it too (it talks to the controller). */
+#ifdef _WIN32
+  #define pad_yield() Sleep(0)
+#else
+  #include <sched.h>
+  #define pad_yield() sched_yield()
+#endif
+static volatile char s_poll_lock;
+static int  pad_lock_try(void) { return !__atomic_test_and_set(&s_poll_lock, __ATOMIC_ACQUIRE); }
+static void pad_lock(void)     { while (!pad_lock_try()) pad_yield(); }
+static void pad_unlock(void)   { __atomic_clear(&s_poll_lock, __ATOMIC_RELEASE); }
+
+/* CELL_PAD_STATUS_ASSIGN_CHANGES: a port whose reported connection changed
+ * since the title last asked (cellPadGetInfo/GetInfo2/PeriphGetInfo), as
+ * libpad reports a controller plugged in or taken away. */
+static int s_port_reported[PAD_MAX_HOST_PORTS];
+static int s_port_changed[PAD_MAX_HOST_PORTS];
+static void pad_track_assign(void)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        const int on = s_host_state[i].connected || i == 0;   /* port 0: the virtual pad */
+        if (on != s_port_reported[i]) { s_port_reported[i] = on; s_port_changed[i] = 1; }
+    }
+}
+static u32 pad_status_take(u32 port)
+{
+    if (port >= PAD_MAX_HOST_PORTS) return 0;
+    const int ch = __atomic_exchange_n(&s_port_changed[port], 0, __ATOMIC_RELAXED);
+    return ch ? CELL_PAD_STATUS_ASSIGN_CHANGES : 0;
+}
 
 /* ---------------------------------------------------------------------------
  * Rumble (cellPadSetActDirect)
@@ -344,25 +383,121 @@ static void pad_sdl_rumble_send(int i)
     r->sent_ms = on ? pad_now_ms() : 0;
 }
 
+/* ---- hot-plug ------------------------------------------------------------
+ * A DualSense over Bluetooth drops off when it is switched off or idles, and
+ * comes back as a NEW SDL device (a new instance id, maybe another index).
+ * This used to open controllers by device index == PS3 port and ask
+ * SDL_IsGameController(port) again on every poll. With Homebrew's SDL2, which
+ * is sdl2-compat over SDL3, a device index is resolved through a list that is
+ * refreshed only by SDL_NumJoysticks() or by the SDL2 event filter (installed
+ * with an SDL window, which the Metal build never makes): the list kept the
+ * switched-off pad's instance id, SDL_IsGameController(0) stayed false, and
+ * the pad that came back was never opened until the game was restarted.
+ *
+ * Now each poll drains SDL's joystick/controller events (nothing else here
+ * reads them, and without a window nothing else does either, so they piled up
+ * in the queue), closes a controller SDL says is gone, by its own handle, and
+ * on a device event -- or every PAD_SDL_RESCAN_MS while a port is free, in
+ * case a window's event loop ate the event -- walks the device list from
+ * SDL_NumJoysticks() and opens every game controller that is not open yet:
+ * into the port its GUID had last (the same pad reconnecting gets its port
+ * back), else the lowest free one. A new controller starts with its motors
+ * off and no rumble left over. The port reads connected again on the next
+ * poll, and cellPadGetInfo/GetInfo2/PeriphGetInfo flag the change once with
+ * CELL_PAD_STATUS_ASSIGN_CHANGES (port 0 is the virtual pad and never reads
+ * disconnected). */
+#define PAD_SDL_RESCAN_MS 1000
+
+static int pad_sdl_port_of(SDL_JoystickID id)
+{
+    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++)
+        if (s_sdl_controllers[p] && s_sdl_ids[p] == id) return p;
+    return -1;
+}
+
+/* Close port p's controller (gone, or shutting down). */
+static void pad_sdl_close(int p, int gone)
+{
+    SDL_GameController* gc = s_sdl_controllers[p];
+    if (!gc) return;
+    if (gone) fprintf(stderr, "[cellPad] SDL controller on port %d disconnected (instance %d)\n", p, (int)s_sdl_ids[p]);
+    else      SDL_GameControllerRumble(gc, 0, 0, 0);
+    SDL_GameControllerClose(gc);
+    s_sdl_controllers[p] = NULL;
+    s_sdl_ids[p] = -1;
+    memset(&s_rumble[p], 0, sizeof s_rumble[p]);
+    s_host_state[p].connected = 0;
+}
+
+/* Open every game controller SDL lists that no port has yet. */
+static void pad_sdl_scan(void)
+{
+    const int n = SDL_NumJoysticks();   /* also refreshes sdl2-compat's index list */
+    for (int idx = 0; idx < n; idx++) {
+        if (!SDL_IsGameController(idx)) continue;
+        const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(idx);
+        if (id < 0 || pad_sdl_port_of(id) >= 0) continue;
+        const SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(idx);
+        int port = -1, back = 0;
+        for (int p = 0; p < PAD_MAX_HOST_PORTS && port < 0; p++)
+            if (!s_sdl_controllers[p] && s_sdl_had[p] && !memcmp(&s_sdl_last_guid[p], &guid, sizeof guid)) { port = p; back = 1; }
+        for (int p = 0; p < PAD_MAX_HOST_PORTS && port < 0; p++)
+            if (!s_sdl_controllers[p]) port = p;
+        if (port < 0) return;                 /* every port has a controller */
+        SDL_GameController* gc = SDL_GameControllerOpen(idx);
+        if (!gc) {
+            fprintf(stderr, "[cellPad] SDL controller %d: open failed: %s\n", idx, SDL_GetError());
+            continue;
+        }
+        s_sdl_controllers[port] = gc;
+        s_sdl_ids[port] = id;
+        s_sdl_last_guid[port] = guid;
+        s_sdl_had[port] = 1;
+        memset(&s_rumble[port], 0, sizeof s_rumble[port]);   /* nothing left over from before */
+        SDL_GameControllerRumble(gc, 0, 0, 0);
+        const char* name = SDL_GameControllerName(gc);
+        fprintf(stderr, "[cellPad] SDL controller %s on port %d: %s (instance %d)%s\n",
+                back ? "reconnected" : "connected", port, name ? name : "?", (int)id,
+                SDL_GameControllerHasRumble(gc) ? "" : " (no rumble)");
+    }
+}
+
+/* Device changes since the last poll; force = scan now (init). */
+static void pad_sdl_hotplug(int force)
+{
+    int changed = force;
+    SDL_Event ev[32];
+    int got;
+    /* SDL_JOYAXISMOTION (0x600) up to the touch events (0x700): every
+     * joystick and game controller event, which only this file uses. */
+    while ((got = SDL_PeepEvents(ev, 32, SDL_GETEVENT, SDL_JOYAXISMOTION, SDL_JOYAXISMOTION + 0xFF)) > 0)
+        for (int i = 0; i < got; i++)
+            if (ev[i].type == SDL_JOYDEVICEADDED || ev[i].type == SDL_JOYDEVICEREMOVED ||
+                ev[i].type == SDL_CONTROLLERDEVICEADDED || ev[i].type == SDL_CONTROLLERDEVICEREMOVED)
+                changed = 1;
+    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++)
+        if (s_sdl_controllers[p] && !SDL_GameControllerGetAttached(s_sdl_controllers[p])) {
+            pad_sdl_close(p, 1);
+            changed = 1;
+        }
+    int free_port = 0;
+    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) if (!s_sdl_controllers[p]) free_port = 1;
+    if (!free_port) return;
+    const unsigned long long now = pad_now_ms();
+    if (!changed && s_sdl_scan_ms && now - s_sdl_scan_ms < PAD_SDL_RESCAN_MS) return;
+    s_sdl_scan_ms = now;
+    pad_sdl_scan();
+}
+
 static void pad_poll_sdl2(void)
 {
     SDL_GameControllerUpdate();
+    pad_sdl_hotplug(0);
 
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        if (!s_sdl_controllers[i]) {
-            /* Try to open newly connected controllers */
-            if (SDL_IsGameController(i)) {
-                s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-            }
-        }
-
         SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc || !SDL_GameControllerGetAttached(gc)) {
+        if (!gc) {
             s_host_state[i].connected = 0;
-            if (gc) {
-                SDL_GameControllerClose(gc);
-                s_sdl_controllers[i] = NULL;
-            }
             memset(&s_rumble[i], 0, sizeof s_rumble[i]);
             continue;
         }
@@ -430,25 +565,15 @@ static void pad_init_backend(void)
         s_sdl_inited = 1;
     }
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
+    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) s_sdl_ids[p] = -1;
 
     /* Open any controllers already connected */
-    int num = SDL_NumJoysticks();
-    for (int i = 0; i < num && i < PAD_MAX_HOST_PORTS; i++) {
-        if (SDL_IsGameController(i)) {
-            s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-        }
-    }
+    pad_sdl_hotplug(1);
 }
 
 static void pad_shutdown_backend(void)
 {
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        if (s_sdl_controllers[i]) {
-            SDL_GameControllerRumble(s_sdl_controllers[i], 0, 0, 0);
-            SDL_GameControllerClose(s_sdl_controllers[i]);
-            s_sdl_controllers[i] = NULL;
-        }
-    }
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) pad_sdl_close(i, 0);
     memset(s_rumble, 0, sizeof s_rumble);
 }
 
@@ -487,11 +612,10 @@ static unsigned long long pad_now_ms(void)
 
 static void pad_poll_backend(void)
 {
-    /* Benign race: two threads may poll in the same tick. That costs one extra
-     * sweep, never a missed or stale-forever read. */
     static unsigned long long s_last_ms = 0;
     unsigned long long now = pad_now_ms();
     if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) return;
+    if (!pad_lock_try()) return;   /* another thread is polling: its result serves this read */
     s_last_ms = now;
     /* A real pad streams reports at roughly this rate whether or not anything
      * changed, and libpad buffers them; a fresh sweep is a fresh report for
@@ -506,6 +630,8 @@ static void pad_poll_backend(void)
 #ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
+    pad_track_assign();
+    pad_unlock();
 }
 
 /* ---------------------------------------------------------------------------
@@ -531,10 +657,18 @@ s32 cellPadInit(u32 max_connect)
     memset(s_port_setting, 0, sizeof(s_port_setting));
     memset(s_host_state, 0, sizeof(s_host_state));
 
+    pad_lock();
     pad_init_backend();
+    pad_unlock();
 
     /* Do an initial poll to detect connected controllers */
     pad_poll_backend();
+    /* What is there at start is the baseline; only later changes are
+     * flagged CELL_PAD_STATUS_ASSIGN_CHANGES. */
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        s_port_reported[i] = s_host_state[i].connected || i == 0;
+        s_port_changed[i] = 0;
+    }
 
     return CELL_OK;
 }
@@ -546,7 +680,9 @@ s32 cellPadEnd(void)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
+    pad_lock();
     pad_shutdown_backend();
+    pad_unlock();
 
     s_pad_initialized = 0;
     s_max_connect = 0;
@@ -946,7 +1082,7 @@ s32 cellPadGetInfo(CellPadInfo2* info)
                   (s_host_state[i].connected || i == 0));
         vm_write16(gaddr + 0x00C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
         vm_write16(gaddr + 0x10A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
-        vm_write8(gaddr + 0x208 + i, on ? CELL_PAD_STATUS_CONNECTED : 0);
+        vm_write8(gaddr + 0x208 + i, (u8)((on ? CELL_PAD_STATUS_CONNECTED : 0) | pad_status_take(i)));
     }
     return CELL_OK;
 }
@@ -973,7 +1109,7 @@ s32 cellPadGetInfo2(CellPadInfo2* info_guest)
          * boot flows that block until a controller is connected can proceed even
          * with no physical device attached. */
         if (s_host_state[i].connected || i == 0) {
-            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED;
+            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED | pad_status_take(i);
             info->port_setting[i]      = s_port_setting[i];
             info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
                                        | CELL_PAD_CAPABILITY_PRESS_MODE
@@ -983,7 +1119,7 @@ s32 cellPadGetInfo2(CellPadInfo2* info_guest)
             info->device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
             connected++;
         } else {
-            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED;
+            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED | pad_status_take(i);
         }
     }
     info->now_connect = connected;
@@ -1028,7 +1164,7 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
         /* Same virtual-pad-on-port-0 rule as cellPadGetInfo2, so both views of
          * the ports agree (a game that cross-checks them must see one truth). */
         if ((i < PAD_MAX_HOST_PORTS && s_host_state[i].connected) || i == 0) {
-            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED;
+            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED | pad_status_take(i);
             info->port_setting[i]      = s_port_setting[i];
             info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
                                        | CELL_PAD_CAPABILITY_PRESS_MODE
@@ -1040,7 +1176,7 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
             info->pclass_profile[i]    = 0;
             connected++;
         } else {
-            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED;
+            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED | pad_status_take(i);
         }
     }
     info->now_connect = connected;
@@ -1156,7 +1292,9 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 #endif
 
 #if PAD_BACKEND_SDL2
+    pad_lock();
     pad_sdl_rumble_send((int)port_no);
+    pad_unlock();
 #endif
 
     return CELL_OK;

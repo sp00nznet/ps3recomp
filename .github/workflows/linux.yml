@@ -171,6 +171,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs) -lm
           /tmp/test_pad_rumble
 
+      # cellPad SDL hot-plug: a controller switched off and on again is
+      # reopened into its old port (fake SDL that behaves like sdl2-compat).
+      - name: Run the pad hot-plug test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_hotplug
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler

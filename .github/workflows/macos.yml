@@ -133,6 +133,13 @@ jobs:
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs)
           /tmp/test_pad_rumble
 
+      # cellPad SDL hot-plug: a controller switched off and on again is
+      # reopened into its old port (fake SDL that behaves like sdl2-compat).
+      - name: Run the pad hot-plug test
+        run: |
+          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
+          /tmp/test_pad_hotplug
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge
