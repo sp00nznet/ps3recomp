@@ -1255,6 +1255,35 @@ static int eng_surface_to_guest(u32 slot)
 static float* s_depth_rows;
 static u32 s_depth_cap;
 
+/* One row of depth values, clamped to [0, 1] (NaN to 0), quantized and stored
+ * big-endian: Z16 as 16 bits, Z24S8 as 24 bits of depth and a zero stencil
+ * byte. The format test is hoisted out of the pixel loops and the clamps are
+ * selects, so both loops vectorize; a large depth target can be read back
+ * several times a frame. */
+static void eng_depth_row_to_guest(u8* dst, const float* src, u32 w, u32 bpp)
+{
+    if (bpp == 2u) {
+        for (u32 c = 0; c < w; c++) {
+            float d = src[c];
+            d = d > 0.0f ? d : 0.0f;
+            d = d < 1.0f ? d : 1.0f;
+            const u32 v = (u32)(d * 65535.0f + 0.5f);
+            dst[2u * c] = (u8)(v >> 8); dst[2u * c + 1u] = (u8)v;
+        }
+        return;
+    }
+    for (u32 c = 0; c < w; c++) {
+        float d = src[c];
+        d = d > 0.0f ? d : 0.0f;
+        d = d < 1.0f ? d : 1.0f;
+        /* Float32 rounding at this magnitude can turn depth 1 into
+         * 0x1000000. Quantize in double before storing the 24-bit value. */
+        const u32 v = (u32)((double)d * 16777215.0 + 0.5);
+        dst[4u * c] = (u8)(v >> 16); dst[4u * c + 1u] = (u8)(v >> 8);
+        dst[4u * c + 2u] = (u8)v; dst[4u * c + 3u] = 0;
+    }
+}
+
 /* Store a depth target into guest memory as its zeta format lays it out:
  * Z16 as one big-endian 16-bit value, Z24S8 as a big-endian word with the
  * depth in the top 24 bits. The stencil byte is written as 0: the host depth
@@ -1281,22 +1310,7 @@ static int eng_zdepth_to_guest(u32 slot)
     for (u32 r = 0; r < h; r++) {
         u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
         if (!dst) return 0;
-        const float* src = s_depth_rows + (size_t)r * w;
-        for (u32 c = 0; c < w; c++) {
-            float d = src[c];
-            if (!(d > 0.0f)) d = 0.0f;
-            if (d > 1.0f) d = 1.0f;
-            if (bpp == 2u) {
-                const u32 v = (u32)(d * 65535.0f + 0.5f);
-                dst[0] = (u8)(v >> 8); dst[1] = (u8)v;
-            } else {
-                /* Float32 rounding at this magnitude can turn depth 1 into
-                 * 0x1000000. Quantize in double before storing the 24-bit value. */
-                const u32 v = (u32)((double)d * 16777215.0 + 0.5);
-                dst[0] = (u8)(v >> 16); dst[1] = (u8)(v >> 8); dst[2] = (u8)v; dst[3] = 0;
-            }
-            dst += bpp;
-        }
+        eng_depth_row_to_guest(dst, s_depth_rows + (size_t)r * w, w, bpp);
     }
     z->guest_dirty = 0;
     eng_textures_touch(z->location, z->offset, z->pitch * h);
