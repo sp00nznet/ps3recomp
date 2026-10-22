@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_env_once.h"   /* getenv("...") once per call site */
 #ifdef _WIN32
 #include <windows.h>
 #else
