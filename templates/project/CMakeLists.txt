@@ -249,6 +249,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         # The lift spells PPC arithmetic as signed C arithmetic, which must wrap;
         # without this, clang exploits overflow UB (e.g. folds "x*x < 0" to false).
         -fwrapv
+        # The target-wide -O1 the SPU note above relies on, for a build whose
+        # configuration sets no optimisation level (no CMAKE_BUILD_TYPE, or one
+        # CMake has no defaults for). Without it every lifted PPU TU compiled at
+        # -O0: each static inline helper (ppc_rlw64, vmx_w, vm_read32_inl) is a
+        # real call that spills to the stack, and those calls were most of the
+        # PPU thread's profile. -O1 keeps the huge TUs' build time sane. Debug
+        # and the optimised configurations keep their own levels.
+        $<$<NOT:$<CONFIG:Debug,Release,RelWithDebInfo,MinSizeRel>>:-O1>
     )
 elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE

@@ -325,7 +325,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
-        $<$<CONFIG:Release,RelWithDebInfo>:-O2>
+        # Every configuration but Debug, including none: a port configured
+        # without CMAKE_BUILD_TYPE matched neither name and compiled the whole
+        # runtime -- the FIFO walker, the draw engine, the MFC -- at -O0.
+        $<$<NOT:$<CONFIG:Debug>>:-O2>
     )
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
     # hottest SPU op in lifted audio code. Probed rather than assumed: recent
