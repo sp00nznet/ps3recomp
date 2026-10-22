@@ -47,6 +47,11 @@
 #include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
 #endif
 
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>   /* the main thread's run loop, see run_guest */
+#include <pthread.h>
+#endif
+
 #ifdef _WIN32
 /* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
  * excludes the multimedia timer API, so it is asked for by name -- and after
@@ -323,6 +328,55 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
     ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
+/* ---------------------------------------------------------------------------
+ * Running the guest
+ * -----------------------------------------------------------------------*/
+#if defined(__APPLE__)
+/* AppKit only runs on the process's main thread. The Metal backend creates
+ * its window and pumps its events with dispatch_sync onto the main queue
+ * when it is called from any other thread, as it is from the frame clock.
+ * With the guest on the main thread nothing ever serviced that queue: the
+ * frame clock blocked in its first rsx_backend_init, no vblank or flip was
+ * ever delivered and the FIFO never drained. A title that waits for a flip
+ * hangs there. So the guest runs on a thread of its own, with the same
+ * 256 MB host stack every guest thread gets (sys_ppu_thread.c), and the
+ * main thread turns the run loop until ppu_run returns. Headless runs never
+ * touch the main queue, which is why CI does not see the difference. */
+struct guest_run { uint32_t entry, stack_top; int rc; volatile int done; };
+
+static void* guest_thread(void* arg)
+{
+    guest_run* g = (guest_run*)arg;
+    g->rc = ppu_run(g->entry, g->stack_top);
+    __atomic_store_n(&g->done, 1, __ATOMIC_RELEASE);
+    CFRunLoopStop(CFRunLoopGetMain());
+    return nullptr;
+}
+
+static int run_guest(uint32_t entry, uint32_t stack_top)
+{
+    static guest_run g;
+    g.entry = entry; g.stack_top = stack_top; g.rc = 0; g.done = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256u * 1024u * 1024u);
+    pthread_t th;
+    int err = pthread_create(&th, &attr, guest_thread, &g);
+    pthread_attr_destroy(&attr);
+    if (err != 0) {
+        fprintf(stderr, "[boot] could not start the guest thread (%d)\n", err);
+        return -1;
+    }
+    /* Short slices: CFRunLoopStop only ends a run that is already going. */
+    while (!__atomic_load_n(&g.done, __ATOMIC_ACQUIRE))
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+    pthread_join(th, nullptr);
+    return g.rc;
+}
+#else
+static int run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry, stack_top); }
+#endif
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -370,7 +424,7 @@ int main(int argc, char** argv)
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
 
-    int rc = ppu_run(entry, STACK_TOP);
+    int rc = run_guest(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
 
     /* A title that called sys_process_exit never reaches this line: that path
