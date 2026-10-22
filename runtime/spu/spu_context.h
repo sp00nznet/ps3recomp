@@ -802,6 +802,13 @@ int  spu_tailret_enabled(void);
  * unchanged (interrupt not taken) if LS 0 holds no branch instruction. */
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*);
+/* SPU_IRQWAIT_DIAG=1 (spu_drain.c): interrupts enabled with nothing pending to
+ * take. A guest that enables interrupts and spins until its handler runs (a
+ * job manager waiting on an event) reports what it is waiting on every 2^22
+ * such dispatches. g_spu_irqwait_diag is -1 until the first call reads the
+ * variable, then 0/1, so with it off the dispatch loop pays one load. */
+SPU_GATE int g_spu_irqwait_diag = -1;
+void spu_irqwait_diag(spu_context* ctx);
 
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
@@ -877,6 +884,9 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
+            else if (__builtin_expect(g_spu_irqwait_diag != 0, 0) && \
+                     (ctx)->int_enable)                         \
+                spu_irqwait_diag(ctx);                         \
             spu_pchist_tick(ctx);                              \
             g_spu_pch[g_spu_pch_n++ & 7u] =                    \
                 (uint32_t)((ctx)->pc & SPU_LS_MASK);           \

@@ -281,6 +281,43 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
     return 0;
 }
 
+/* SPU_IRQWAIT_DIAG=1: an SPU with interrupts enabled and nothing pending to
+ * take, every 2^22 such dispatches on a host thread (24 lines at most): pc,
+ * event status and mask, and the MFC list-stall mask and status, which is
+ * enough to see which event the guest is waiting for and that it never
+ * arrives. SPU_IRQWAIT_LS=<hex LS address> adds the 16 bytes there (the
+ * waiter's own state, once its layout is known). */
+void spu_irqwait_diag(spu_context* ctx)
+{
+    if (g_spu_irqwait_diag < 0) {
+        const char* e = getenv("SPU_IRQWAIT_DIAG");
+        g_spu_irqwait_diag = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (!g_spu_irqwait_diag) return;
+    static _Thread_local unsigned long long s_n = 0;
+    static int s_printed = 0;
+    if ((++s_n & ((1ull << 22) - 1)) != 0 || s_printed >= 24) return;
+    s_printed++;
+    static long s_ls = -2;
+    if (s_ls == -2) {
+        const char* e = getenv("SPU_IRQWAIT_LS");
+        s_ls = e && *e ? (long)(strtoul(e, NULL, 16) & (SPU_LS_SIZE - 16) & ~0xFul) : -1;
+    }
+    char extra[64] = "";
+    if (s_ls >= 0) {
+        const uint8_t* p = ctx->ls + s_ls;
+        snprintf(extra, sizeof extra, " LS[%05lX]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                 "%02X%02X%02X%02X %02X%02X%02X%02X", s_ls,
+                 p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+                 p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+    }
+    fprintf(stderr, "[irq-wait] img=%d pc=0x%05X dispatches=%llu status=0x%X mask=0x%X "
+            "list_stall_mask=0x%X list_stall_stat=0x%X%s\n",
+            ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), s_n, ctx->event_status,
+            ctx->event_mask, ctx->list_stall_mask, ctx->list_stall_stat, extra);
+    fflush(stderr);
+}
+
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
 {
