@@ -5489,6 +5489,49 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
     }
 }
 
+/* Per-draw vertex cache for the paths that expand one guest vertex into
+ * several output vertices: indexed lists (shared vertices), strips and fans
+ * (each vertex in up to three triangles) and indexed quads. Fetching all 16
+ * attributes of a vertex costs far more than copying its 256 converted bytes,
+ * and God of War HD's gameplay frames expand ~370k vertices through these
+ * paths; converting each one every time it was referenced was a third of the
+ * frame. Direct-mapped on the low index bits (meshes reference nearby
+ * indices), and dropped at every draw because attribute state and the guest
+ * arrays may change between draws. VTX_NOCACHE=1 disables it. */
+#define VC_BITS 13
+#define VC_N (1u << VC_BITS)
+static VPSlot (*s_vc)[16];
+static u32 s_vc_tag[VC_N], s_vc_gen[VC_N], s_vc_cur;
+
+static void vc_begin_draw(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("VTX_NOCACHE") ? 0 : 1;
+    if (!on) return;
+    if (!s_vc) s_vc = malloc(sizeof(*s_vc) * VC_N);
+    if (++s_vc_cur == 0) { memset(s_vc_gen, 0, sizeof s_vc_gen); s_vc_cur = 1; }
+}
+
+static void read_vp_vertex_cached(const rsx_state* state, u32 vi, VPSlot* out16)
+{
+    if (!s_vc || !s_vc_cur) { read_vp_vertex(state, vi, out16); return; }
+    u32 h = vi & (VC_N - 1);
+    if (s_vc_gen[h] != s_vc_cur || s_vc_tag[h] != vi) {
+        read_vp_vertex(state, vi, s_vc[h]);
+        s_vc_gen[h] = s_vc_cur;
+        s_vc_tag[h] = vi;
+    }
+    memcpy(out16, s_vc[h], sizeof(VPSlot) * 16);
+    /* VTX_CACHE_CHECK=1: also refetch on every lookup and count differences
+     * (validation for a new title; the refetch costs what the cache saves). */
+    { static int chk = -1; if (chk < 0) chk = getenv("VTX_CACHE_CHECK") ? 1 : 0;
+      if (chk) { static unsigned long long hits, bad; VPSlot fresh[16];
+        read_vp_vertex(state, vi, fresh); hits++;
+        if (memcmp(fresh, s_vc[h], sizeof fresh)) bad++;
+        if ((hits & 0xFFFFF) == 0)
+            fprintf(stderr, "[vtx-cache-check] %llu lookups, %llu mismatches\n", hits, bad); } }
+}
+
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
  * vertex array that resolves to the wrong memory reads as garbage/denormals, and
  * that is indistinguishable from "the shader is wrong" without seeing the input. */
@@ -5723,14 +5766,15 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
+    vc_begin_draw();
     for (u32 t = 0; t < tris; t++) {
         u32 i0 = fan ? 0 : t;
         /* strip winding alternates per triangle to keep facing consistent */
         u32 i1 = t + 1, i2 = t + 2;
         if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
-        read_vp_vertex(state, first + i0, &out[o*16]); o++;
-        read_vp_vertex(state, first + i1, &out[o*16]); o++;
-        read_vp_vertex(state, first + i2, &out[o*16]); o++;
+        read_vp_vertex_cached(state, first + i0, &out[o*16]); o++;
+        read_vp_vertex_cached(state, first + i1, &out[o*16]); o++;
+        read_vp_vertex_cached(state, first + i2, &out[o*16]); o++;
     }
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
@@ -5766,10 +5810,11 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
+    vc_begin_draw();
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
         for (u32 k = 0; k < 4; k++)
-            read_vp_vertex(state, read_guest_index(state, first + q*4 + k), c[k]);
+            read_vp_vertex_cached(state, read_guest_index(state, first + q*4 + k), c[k]);
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
         if (getenv("VTX_DUMP")) { static int _n=0; if (PS3_LOG_FIRST(_n, 6)) {
@@ -5811,8 +5856,9 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
+      vc_begin_draw();
       for (u32 k = 0; k < count; k++)
-          read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+          read_vp_vertex_cached(state, read_guest_index(state, first + k), &out[k*16]);
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
     /* IDXDBG=<hex shader_program>: index range for that program's draws. An
      * index past the vertex array reads unmapped guest memory as zero, which
@@ -6026,13 +6072,14 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
+    vc_begin_draw();
     for (u32 t = 0; t < tris; t++) {
         u32 i0 = fan ? 0 : t;
         u32 i1 = t + 1, i2 = t + 2;
         if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
-        read_vp_vertex(state, read_guest_index(state, first + i0), &out[o*16]); o++;
-        read_vp_vertex(state, read_guest_index(state, first + i1), &out[o*16]); o++;
-        read_vp_vertex(state, read_guest_index(state, first + i2), &out[o*16]); o++;
+        read_vp_vertex_cached(state, read_guest_index(state, first + i0), &out[o*16]); o++;
+        read_vp_vertex_cached(state, read_guest_index(state, first + i1), &out[o*16]); o++;
+        read_vp_vertex_cached(state, read_guest_index(state, first + i2), &out[o*16]); o++;
     }
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
