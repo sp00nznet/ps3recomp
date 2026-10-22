@@ -728,10 +728,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
-         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash. */
+         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash.
+         * PUTs outside the region are only scanned for the poison word with
+         * SPU_POISON_DMA_WATCH=1 (see below). */
         { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
+          static int s_poison_watch = -1;
+          /* SPU_POISON_DMA_WATCH=1 (any value): scan every PUT payload for the
+           * poison word and also log PUTs that carry it outside the region.
+           * Unset, only PUTs into the region are scanned (their lines are
+           * unchanged): the scan is a second pass over every byte of every PUT. */
+          if (s_poison_watch < 0) s_poison_watch = getenv("SPU_POISON_DMA_WATCH") ? 1 : 0;
+          if (hitregion || s_poison_watch)
           for (uint32_t o = 0; o + 4 <= size; o += 4) {
               uint32_t w; memcpy(&w, (const char*)ls_ptr + o, 4);
               if (w == 0x08C708C7u) { haspoison = 1; break; } /* 0xC708C708 BE in LS bytes */
