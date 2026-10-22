@@ -394,6 +394,22 @@ typedef struct spu_context {
     uint32_t drain_ret_pc;
 } spu_context;
 
+/* event_status is written from more than one host thread: the SPU's own
+ * (Sn from a list stall, Tg, its own Lr poll, WrEventAck) and others (a PPU
+ * store or a peer SPU's PUT/PUTLLC raising Lr through spu_coherency.c). A
+ * plain |= on each side loses bits: the Sn of a stalled DMA list vanished
+ * under a concurrent Lr raise, leaving the list parked (list_stall_stat set)
+ * with Sn clear, and the job manager that armed it waiting for its interrupt
+ * for ever. Every update goes through these. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define SPU_EVENT_SET(c, b)   _InterlockedOr((volatile long*)&(c)->event_status, (long)(uint32_t)(b))
+#define SPU_EVENT_CLEAR(c, b) _InterlockedAnd((volatile long*)&(c)->event_status, (long)~(uint32_t)(b))
+#else
+#define SPU_EVENT_SET(c, b)   __atomic_fetch_or(&(c)->event_status, (uint32_t)(b), __ATOMIC_SEQ_CST)
+#define SPU_EVENT_CLEAR(c, b) __atomic_fetch_and(&(c)->event_status, ~(uint32_t)(b), __ATOMIC_SEQ_CST)
+#endif
+
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
  * base) that the HLE kernel plants as exitToKernelAddr / selectWorkloadAddr in
  * the SpursKernelContext. A policy module branching to them is performing a

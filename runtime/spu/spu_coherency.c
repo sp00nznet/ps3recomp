@@ -207,7 +207,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         spu_context* c = entry->ctx;
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            SPU_EVENT_SET(c, SPU_EVENT_LR);
             c->resv_valid = 0;
             g_spu_lr_raise++;
             spu_ch_wake(c);
@@ -223,7 +223,7 @@ void spu_coh_notify_write(uint32_t ea)
         spu_context* c = entry->ctx;
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            SPU_EVENT_SET(c, SPU_EVENT_LR);
             c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who

@@ -842,7 +842,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * long-missing producer for event_status (previously only ever cleared
          * via WrEventAck -> RdEventStat waits could never complete). */
         if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
-            ctx->event_status |= 0x1u;
+            SPU_EVENT_SET(ctx, 0x1u);
             spu_ch_wake(ctx);
         }
         return;
@@ -899,7 +899,15 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * it still holds a reservation it has already lost, which is the parked
          * SPURS kernel this whole mechanism exists to wake. */
         spu_lockline_lock();
-        ctx->event_status &= ~v;
+        SPU_EVENT_CLEAR(ctx, v);
+        /* A stall-and-notify nobody has read yet stays pending. We run a
+         * resumed list inline, inside the MFC_WrListStallAck that resumes it,
+         * so its next stall can land BEFORE the handler acknowledges the event
+         * it was taken for; on hardware the MFC gets there later, after the
+         * ack. Acking then cleared that new edge while the list stayed parked
+         * (list_stall_stat set, Sn clear). */
+        if ((v & 0x2u) && ctx->list_stall_stat)
+            SPU_EVENT_SET(ctx, 0x2u);
         spu_lockline_unlock();
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
@@ -960,7 +968,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
     if (!vm_base || ctx->resv_ea == 0) return;
     if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
         ctx->resv_valid = 0;
-        ctx->event_status |= 0x400u;
+        SPU_EVENT_SET(ctx, 0x400u);
     }
 }
 
