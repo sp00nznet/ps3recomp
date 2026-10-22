@@ -244,6 +244,21 @@ typedef struct rsx_draw_backend {
                               u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
     void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
                               u32 w, u32 h, const void* src, u32 row_bytes);
+
+    /* Optional. A depth target's top-left w x h read as a texture of base
+     * format `rsx_fmt` reads the bytes the zeta holds: a fresh texture (a
+     * colour target for surface_view) whose texel is what depth_readback,
+     * stored as eng_zdepth_to_guest stores it and decoded, gives.
+     *  - A8R8G8B8 (0x85) of a Z24S8 zeta: R8G8B8A8, R = depth bits 15..8,
+     *    G = bits 7..0, B = 0 (the stencil byte), A = bits 23..16, with
+     *    round(depth * 0xFFFFFF) taken exactly;
+     *  - DEPTH16 (0x92) of a Z16 zeta: R16 unorm of round(depth * 0xFFFF).
+     * Any other format: 0. Made in command order, like
+     * depth_snapshot, so no wait, and from the depth the draws so far left,
+     * which may be the target the current pass still attaches; the engine
+     * owns the handle. 0 when the backend cannot; NULL keeps the store
+     * through guest memory. */
+    u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

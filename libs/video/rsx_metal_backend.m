@@ -2243,7 +2243,7 @@ static u32 s_eng_view_count;
 
 typedef enum {
     ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE,
-    ENG_REC_COLOR_SNAPSHOT
+    ENG_REC_COLOR_SNAPSHOT, ENG_REC_DEPTH_COLOR
 } EngRecKind;
 
 typedef struct {
@@ -2288,6 +2288,9 @@ static id<MTLLibrary>             s_eng_helper_lib;
 static id<MTLRenderPipelineState> s_eng_blit_pso;
 static MTLPixelFormat             s_eng_blit_pso_fmt;
 static id<MTLRenderPipelineState> s_eng_depth_pso;
+/* depth_as_color's passes: [0] A8R8G8B8 bytes into RGBA8, [1] DEPTH16 into R16. */
+static id<MTLRenderPipelineState> s_eng_depth_color_pso[2];
+static int                        s_eng_depth_color_failed;
 static id<MTLSamplerState>        s_eng_point_sampler;
 static id<MTLSamplerState>        s_eng_linear_sampler;   /* FXAA's taps */
 
@@ -2467,6 +2470,41 @@ static NSString* const kEngHelperMSL = @
 "    return src.sample(s, i.uv);\n"
 "}\n";
 
+/* depth_as_color's passes. Their own library: they need 64-bit integers, and
+ * a device that cannot build it loses only this path, not the helpers above.
+ * The value is round(d * (2^bits - 1)) taken exactly, as the engine's
+ * double-precision store takes it: d = m * 2^-s with a 24-bit m, so
+ * d * (2^bits - 1) = (m * 2^bits - m) * 2^-s, rounded by adding half and
+ * shifting. R16 unorm holds v / 0xFFFF back as v: the float quotient is off by
+ * far less than half a step. */
+static const char* kEngDepthColorMSL =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct AOut { float4 pos [[position]]; };\n"
+"vertex AOut eng_depth_color_vs(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    AOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"    return o;\n"
+"}\n"
+"static uint eng_depth_round(float d, uint bits) {\n"
+"    if (d >= 1.0) return (1u << bits) - 1u;\n"
+"    if (!(d > 0.0)) return 0u;\n"
+"    const uint b = as_type<uint>(d);\n"
+"    const uint e = (b >> 23) & 0xFFu;\n"
+"    const ulong m = (ulong)((b & 0x7FFFFFu) | (e ? 0x800000u : 0u));\n"
+"    const uint s = 150u - max(e, 1u);\n"
+"    return s < 64u ? (uint)(((m << bits) - m + (1ul << (s - 1u))) >> s) : 0u;\n"
+"}\n"
+"fragment float4 eng_depth_argb_fs(AOut i [[stage_in]],\n"
+"                                  depth2d<float> src [[texture(0)]]) {\n"
+"    const uint v = eng_depth_round(src.read(uint2(i.pos.xy)), 24u);\n"
+"    return float4(float((v >> 8) & 0xFFu), float(v & 0xFFu), 0.0, float(v >> 16)) / 255.0;\n"
+"}\n"
+"fragment float4 eng_depth_d16_fs(AOut i [[stage_in]],\n"
+"                                 depth2d<float> src [[texture(0)]]) {\n"
+"    return float4(float(eng_depth_round(src.read(uint2(i.pos.xy)), 16u)) / 65535.0, 0.0, 0.0, 1.0);\n"
+"}\n";
+
 static u32 eng_obj_add(id<MTLTexture> t)
 {
     if (!t) return 0;
@@ -2614,6 +2652,8 @@ static void eng_shutdown(void* user)
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
+    s_eng_depth_color_pso[0] = s_eng_depth_color_pso[1] = nil;
+    s_eng_depth_color_failed = 0;
     s_eng_point_sampler = nil;
     s_eng_linear_sampler = nil;
     s_eng_fxaa_pso = nil;
@@ -2828,6 +2868,51 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind = ENG_REC_DEPTH_RESOLVE;
+    r->depth = depth;
+    r->resolve_dst = dst;
+    return dst;
+}
+
+static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
+{
+    (void)user;
+    id<MTLTexture> src = eng_obj(depth);
+    const int k = rsx_fmt == RSX_TEX_FMT_A8R8G8B8 ? 0 : rsx_fmt == RSX_TEX_FMT_DEPTH16 ? 1 : -1;
+    if (k < 0 || !src || !w || !h || w > [src width] || h > [src height] || s_eng_depth_color_failed)
+        return 0;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+    static const MTLPixelFormat formats[2] = { MTLPixelFormatRGBA8Unorm, MTLPixelFormatR16Unorm };
+    if (!s_eng_depth_color_pso[k]) {
+        NSError* err = nil;
+        id<MTLLibrary> lib = [s_dev newLibraryWithSource:
+                                 [NSString stringWithUTF8String:kEngDepthColorMSL]
+                                                 options:nil error:&err];
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [lib newFunctionWithName:@"eng_depth_color_vs"];
+        pd.fragmentFunction = [lib newFunctionWithName:k ? @"eng_depth_d16_fs" : @"eng_depth_argb_fs"];
+        pd.colorAttachments[0].pixelFormat = formats[k];
+        if (lib) s_eng_depth_color_pso[k] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!s_eng_depth_color_pso[k]) {
+            fprintf(stderr, "[rsx engine/metal] depth-as-colour pipeline failed: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            s_eng_depth_color_failed = 1;
+            return 0;
+        }
+    }
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:formats[k]
+                                                           width:w height:h
+                                                       mipmapped:NO];
+    /* PixelFormatView: the unit samples it through surface_view's swizzle. */
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+               MTLTextureUsagePixelFormatView;
+    td.storageMode = MTLStorageModePrivate;
+    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    if (!dst) return 0;
+
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_DEPTH_COLOR;
     r->depth = depth;
     r->resolve_dst = dst;
     return dst;
@@ -3320,6 +3405,27 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             [copy endEncoding];
             continue;
         }
+        if (s_eng_rec[i].kind == ENG_REC_DEPTH_COLOR) {
+            const EngRecord* r = &s_eng_rec[i++];
+            id<MTLTexture> src = eng_obj(r->depth);
+            id<MTLTexture> dst = eng_obj(r->resolve_dst);
+            /* The destination's format names the conversion. */
+            id<MTLRenderPipelineState> pso = !dst ? nil :
+                s_eng_depth_color_pso[[dst pixelFormat] == MTLPixelFormatR16Unorm];
+            if (!src || !pso) { s_eng_encoding_failed = 1; continue; }
+            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture     = dst;
+            rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+            if (!e) { s_eng_encoding_failed = 1; continue; }
+            s_ft_resolves++;
+            [e setRenderPipelineState:pso];
+            [e setFragmentTexture:src atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e endEncoding];
+            continue;
+        }
         if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
@@ -3354,6 +3460,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         u8 cstencil = 0;
         while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
                s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE &&
+               s_eng_rec[i].kind != ENG_REC_DEPTH_COLOR &&
                s_eng_rec[i].kind != ENG_REC_COLOR_SNAPSHOT) {
             const EngRecord* r = &s_eng_rec[i];
             if (r->kind == ENG_REC_CLEAR_COLOR) {
@@ -3810,6 +3917,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_snapshot       = eng_depth_snapshot,
     .depth_readback       = eng_depth_readback,
     .color_snapshot       = eng_color_snapshot,
+    .depth_as_color       = eng_depth_as_color,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,
     .bind_targets         = eng_bind_targets,

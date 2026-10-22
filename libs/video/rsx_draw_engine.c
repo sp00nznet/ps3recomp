@@ -100,6 +100,7 @@ typedef struct {
     u32 feedback;          /* last immutable own-target copy, engine-owned */
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
+    u32 last_use;           /* g.frames when last bound, sampled or presented */
 } eng_surface;
 
 typedef struct {
@@ -114,6 +115,10 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+    u32 conv;              /* depth_as_color of the depth at conv_serial, or 0 */
+    u32 conv_w, conv_h, conv_fmt;
+    u64 conv_serial;
+    u32 last_use;          /* g.frames when last bound or sampled             */
 } eng_zdepth;
 
 typedef struct {
@@ -546,6 +551,33 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
     return g.tex_staging;
 }
 
+/* The surface and zeta tables keep every target a title has rendered to, and
+ * nothing used to take an entry out. A title that runs through enough scenes
+ * fills both 64-entry tables, and a target created after that got no slot: a
+ * shadow map was rendered nowhere and read back as zeros from guest memory, so
+ * every shadow it casts was lost. A full table now gives up the entry used
+ * longest ago, if that was before the previous frame; anything this frame or
+ * the last one used stays, and with nothing older the table is too small for
+ * the frame and the caller gets no slot, as before. What an evicted target
+ * held and guest memory never got is gone, as it is for any address the
+ * engine never saw. Returns the slot, or ENG_INVALID. */
+#define ENG_EVICT_MIN_AGE 2u
+static u32 eng_oldest_slot(const char* what, const u32* last_use, size_t stride, u32 n, u32 keep)
+{
+    u32 best = ENG_INVALID, best_use = 0;
+    for (u32 i = 0; i < n; i++) {
+        const u32 use = *(const u32*)((const u8*)last_use + i * stride);
+        if (i == keep || g.frames - use < ENG_EVICT_MIN_AGE) continue;
+        if (best == ENG_INVALID || use < best_use) { best = i; best_use = use; }
+    }
+    static u32 evict_logs = 0, full_logs = 0;
+    if (best != ENG_INVALID ? PS3_LOG_FIRST(evict_logs, 4) : PS3_LOG_FIRST(full_logs, 8))
+        fprintf(stderr, "[rsx engine] %s table full: %s\n", what,
+                best == ENG_INVALID ? "every entry was used this frame or the last, none evicted"
+                                    : "evicting the least recently used");
+    return best;
+}
+
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690).
@@ -568,8 +600,10 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
             const eng_surface* s = &g.surfaces[i];
             if (s->fmt == want_fmt &&
                 ((s->w == want_w && s->h == want_h) ||
-                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
+                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h))) {
+                g.surfaces[i].last_use = g.frames;
                 return i;
+            }
             slot = i;
             break;
         }
@@ -584,9 +618,16 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                     slot < ENG_MAX_SURFACES ? "existing" : "absent");
         return slot < ENG_MAX_SURFACES ? slot : ENG_INVALID;
     }
+    int evicted = 0;
     if (slot == ENG_MAX_SURFACES) {
-        if (g.n_surfaces >= ENG_MAX_SURFACES) return ENG_INVALID;
-        slot = g.n_surfaces;
+        if (g.n_surfaces < ENG_MAX_SURFACES) {
+            slot = g.n_surfaces;
+        } else {
+            slot = eng_oldest_slot("surface", &g.surfaces[0].last_use, sizeof(eng_surface),
+                                   g.n_surfaces, g.last_present_surface);
+            if (slot == ENG_INVALID) return ENG_INVALID;
+            evicted = 1;
+        }
     }
 
     u32 seed_row = 0;
@@ -595,7 +636,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
                                                  want_w, want_h, seed, seed_row);
     if (!handle)
-        return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
+        return (!evicted && slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 
     eng_surface* s = &g.surfaces[slot];
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
@@ -605,6 +646,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->handle = handle;
     s->color_serial = 0;
     s->guest_dirty = 0;
+    s->last_use = g.frames;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 16))
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
@@ -857,24 +899,34 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     for (u32 i = 0; i < g.n_zdepths; i++) {
         eng_zdepth* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
-            if (z->w >= want_w && z->h >= want_h) return i;
+            if (z->w >= want_w && z->h >= want_h) { z->last_use = g.frames; return i; }
             slot = i;
             if (want_w < z->w) want_w = z->w;
             if (want_h < z->h) want_h = z->h;
             break;
         }
     }
+    int evicted = 0;
     if (slot == ENG_MAX_ZDEPTHS) {
-        if (g.n_zdepths >= ENG_MAX_ZDEPTHS) return ENG_INVALID;
-        slot = g.n_zdepths;
+        if (g.n_zdepths < ENG_MAX_ZDEPTHS) {
+            slot = g.n_zdepths;
+        } else {
+            slot = eng_oldest_slot("zeta", &g.zdepths[0].last_use, sizeof(eng_zdepth),
+                                   g.n_zdepths, ENG_INVALID);
+            if (slot == ENG_INVALID) return ENG_INVALID;
+            evicted = 1;
+        }
     }
 
     const u32 handle = g.be->depth_target_create(g.be->user, want_w, want_h);
     if (!handle)
-        return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
+        return (!evicted && slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
+    if (z->conv) g.be->texture_release(g.be->user, z->conv);
+    if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
+    z->conv = 0;
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
@@ -884,6 +936,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->snapshot_valid = 0;
     z->depth_serial = 0;
     z->guest_dirty = 0;
+    z->last_use = g.frames;
     if (slot == g.n_zdepths) g.n_zdepths++;
     return slot;
 }
@@ -903,6 +956,56 @@ static u32 eng_zdepth_snapshot(u32 slot)
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;
+}
+
+/* PS3RECOMP_ENG_DEPTH_VIA_GUEST=1 (read at engine init): a depth target read
+ * as A8R8G8B8 or DEPTH16 goes through guest memory even when the backend can
+ * convert it itself (eng_zdepth_as_color). */
+static int s_depth_via_guest;
+
+/* A Z24S8 depth target read as a linear A8R8G8B8 texture of its own pitch:
+ * a deferred renderer rebuilding depth from the bytes. Storing it into guest
+ * memory for that (eng_zdepth_to_guest) waits for the GPU, converts on the CPU
+ * and decodes and uploads the texture again, every time the depth changed:
+ * at several reads a frame that is most of the FIFO thread. The backend
+ * converts it on the GPU instead, in command order, into the texels the
+ * decode would give, and the unit samples a view of that with its own
+ * crossbar. Guest memory is left as it was (guest_dirty stays set for any
+ * other reader). That holds for the zeta still bound too: a title may read
+ * its depth with depth writes off and the zeta left in place, and the
+ * conversion, in command order, takes the depth as the draws so far left it,
+ * which is what the store reads back.
+ * A Z16 depth target read as a linear DEPTH16 texture of its own pitch, a
+ * shadow map, takes the same way: without it every read of a freshly
+ * rendered shadow map is a wait for the GPU plus a decode and an upload of
+ * up to 2 MB. Returns the view, or 0 for the store through guest memory. */
+static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+    const int z16 = z->zfmt == 1u;      /* SURFACE_FORMAT Z16 */
+    const int bytes = base_fmt == RSX_TEX_FMT_A8R8G8B8 && !z16 && !rsx_texture_argb_is_rgba();
+    const int d16 = base_fmt == RSX_TEX_FMT_DEPTH16 && z16;
+    if (s_depth_via_guest || !g.be->depth_as_color || !g.be->surface_view ||
+        !z->handle || !(bytes || d16) || !(t->format & RSX_TEX_FMT_LINEAR) ||
+        t->cubemap || t->dimension == 3 || t->mipmaps > 1)
+        return 0;
+    const u32 used_w = z->used_w < z->w ? z->used_w : z->w;
+    const u32 used_h = z->used_h < z->h ? z->used_h : z->h;
+    if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
+        t->pitch != z->pitch)
+        return 0;
+    if (!z->conv || z->conv_serial != z->depth_serial || z->conv_fmt != base_fmt ||
+        z->conv_w != t->width || z->conv_h != t->height) {
+        const u32 tex = g.be->depth_as_color(g.be->user, z->handle, t->width, t->height,
+                                             base_fmt);
+        if (!tex) return 0;
+        if (z->conv) g.be->texture_release(g.be->user, z->conv);
+        z->conv = tex;
+        z->conv_w = t->width; z->conv_h = t->height; z->conv_fmt = base_fmt;
+        z->conv_serial = z->depth_serial;
+    }
+    return g.be->surface_view(g.be->user, z->conv, t->remap & 0xFFFFu, t->format);
 }
 
 /* ---- textures ------------------------------------------------------------ */
@@ -1287,7 +1390,10 @@ static int eng_zdepth_to_guest(u32 slot)
             if (!(d > 0.0f)) d = 0.0f;
             if (d > 1.0f) d = 1.0f;
             if (bpp == 2u) {
-                const u32 v = (u32)(d * 65535.0f + 0.5f);
+                /* Exactly round(d * 0xFFFF), as depth_as_color takes it: in
+                 * float the product rounds first and a value within 0.002 of
+                 * a half could go the other way. */
+                const u32 v = (u32)((double)d * 65535.0 + 0.5);
                 dst[0] = (u8)(v >> 8); dst[1] = (u8)v;
             } else {
                 /* Float32 rounding at this magnitude can turn depth 1 into
@@ -2094,6 +2200,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 g.surfaces[i].offset != t.offset)
                 continue;
             surface_at = (int)i;
+            g.surfaces[i].last_use = g.frames;
             /* A current attachment requires an ordered immutable copy; it
              * cannot be sampled directly while the host pass writes it. */
             for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
@@ -2109,8 +2216,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             const eng_zdepth* z = &g.zdepths[i];
             if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
                 continue;
-            if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial)
+            if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial) {
                 zsrc = (int)i;
+                g.zdepths[i].last_use = g.frames;
+            }
             break;
         }
         if (zsrc >= 0) {
@@ -2120,6 +2229,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
+            const u32 conv = eng_zdepth_as_color((u32)zsrc, &t);
+            if (conv) { textures[u] = conv; continue; }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
@@ -2176,6 +2287,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset && current_zslot != i) {
+                    g.zdepths[i].last_use = g.frames;
                     const u32 snap = eng_zdepth_snapshot(i);
                     if (snap) textures[u] = snap;
                     break;
@@ -2821,6 +2933,7 @@ static void eng_present(u32 buffer_id)
     if (!g.ready) return;
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
+    g.surfaces[target].last_use = g.frames;
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
         u32 current = eng_current_surface();
         fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",
@@ -2883,6 +2996,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
+      s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
@@ -2921,8 +3036,10 @@ void rsx_draw_engine_shutdown(void)
         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     }
-    for (u32 i = 0; i < g.n_zdepths; i++)
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        if (g.zdepths[i].conv) g.be->texture_release(g.be->user, g.zdepths[i].conv);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
+    }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);

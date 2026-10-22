@@ -48,6 +48,7 @@ extern "C" {
 #define RSX_TEX_FMT_DXT45           0x88
 #define RSX_TEX_FMT_G8B8            0x8B
 #define RSX_TEX_FMT_DEPTH24_D8      0x90
+#define RSX_TEX_FMT_DEPTH16         0x92
 #define RSX_TEX_FMT_LINEAR          0x20         /* modifier: no swizzle     */
 #define RSX_TEX_FMT_UNNORM          0x40         /* modifier: texel coords   */
 #define RSX_TEX_FMT_BASE_MASK       0x9F         /* format sans modifiers    */

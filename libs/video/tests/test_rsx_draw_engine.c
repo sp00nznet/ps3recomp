@@ -293,7 +293,9 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
         }
 }
 
-/* Every depth target reads back as 0.5, which Z24S8 stores as 0x800000. */
+/* Every depth target reads back as g_readback_depth, 0.5 unless a test sets
+ * it, which Z24S8 stores as 0x800000. */
+static float g_readback_depth = 0.5f;
 static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
                                float* out, u32 pitch)
 {
@@ -301,7 +303,7 @@ static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
     stub.n_depth_readback++;
     for (u32 r = 0; r < h; r++)
         for (u32 c = 0; c < w; c++)
-            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) = 0.5f;
+            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) = g_readback_depth;
     return 0;
 }
 
@@ -1431,6 +1433,242 @@ static void test_depth_read_as_color(void)
     engine_down();
 }
 
+/* depth_as_color: the zeta's bytes made on the GPU, no store to guest memory. */
+static int g_argb_calls, g_argb_fail;
+static u32 g_argb_w, g_argb_h, g_argb_fmt;
+static u32 stub_depth_as_color(void* u, u32 d, u32 w, u32 h, u32 fmt)
+{
+    (void)u; (void)d;
+    g_argb_calls++;
+    g_argb_w = w; g_argb_h = h; g_argb_fmt = fmt;
+    return g_argb_fail ? 0 : stub_handle();
+}
+
+/* A pass at ZETA_OFFSET (256 x 256) through a zeta of SURFACE_FORMAT depth
+ * field `zfmt` (2 Z24S8, 1 Z16) at its natural pitch, then the zeta moved away
+ * (or, with `keep_zeta`, left bound with depth writes off) and the unit set to
+ * read it as a linear 4x4 texture of format `tex_fmt` and `pitch`. */
+static void depth_pass_then_read_as(u32 zfmt, u32 tex_fmt, u32 pitch, int keep_zeta)
+{
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (zfmt << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * (zfmt == 1u ? 2u : 4u));
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_TEX_UNIT + 0x0C, 0u);                  /* the pass samples nothing */
+    draw_triangle();
+    if (!keep_zeta) m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((tex_fmt | 0x20u) << 8) | (1u << 16));
+    m(0x1840 /* control3: pitch */, pitch);
+}
+
+static void depth_pass_then_read_ex(u32 pitch, int keep_zeta)
+{
+    depth_pass_then_read_as(2u, 0x85u, pitch, keep_zeta);
+}
+
+static void depth_pass_then_read(u32 pitch) { depth_pass_then_read_ex(pitch, 0); }
+
+static void test_depth_read_as_argb_on_gpu(void)
+{
+    printf("-- zeta read as A8R8G8B8, converted by the backend\n");
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.depth_as_color = stub_depth_as_color;
+    rsx_draw_engine_set_backend(&be);
+    g_argb_calls = 0; g_argb_fail = 0;
+    u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
+    memset(z, 0x5A, 16);
+
+    depth_pass_then_read(256u * 4u);
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    const u32 first = stub.bound_tex[0];
+    CHECK(g_argb_calls == 1 && g_argb_w == 4 && g_argb_h == 4 && g_argb_fmt == 0x85u && first,
+          "the backend made the 4x4 A8R8G8B8 texture (%d calls, %ux%u, fmt %02X)",
+          g_argb_calls, g_argb_w, g_argb_h, g_argb_fmt);
+    CHECK(stub.n_depth_readback == 0 && stub.n_texture_create == uploads && z[0] == 0x5A,
+          "nothing was read back, stored or uploaded (%d readbacks)", stub.n_depth_readback);
+
+    draw_triangle();
+    CHECK(g_argb_calls == 1 && stub.bound_tex[0] == first,
+          "no depth write since: the same texture (%d calls)", g_argb_calls);
+
+    depth_pass_then_read(256u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 2 && stub.bound_tex[0] != first && !stub.alive[first],
+          "a new depth write: a new texture, the old one released (%d calls)", g_argb_calls);
+
+    /* Another pitch is not the zeta's layout: guest memory as before. */
+    depth_pass_then_read(512u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 2 && stub.n_depth_readback == 1,
+          "a texture of another pitch goes through guest memory (%d calls, %d readbacks)",
+          g_argb_calls, stub.n_depth_readback);
+
+    /* The zeta still bound, depth writes off: converted all the same, and
+     * kept while no draw writes depth. */
+    depth_pass_then_read_ex(256u * 4u, 1);
+    draw_triangle();
+    const u32 bound = stub.bound_tex[0];
+    CHECK(g_argb_calls == 3 && stub.n_depth_readback == 1 && bound,
+          "the bound zeta is converted too, not read back (%d calls, %d readbacks)",
+          g_argb_calls, stub.n_depth_readback);
+    draw_triangle();
+    CHECK(g_argb_calls == 3 && stub.bound_tex[0] == bound,
+          "and reused while no draw wrote depth (%d calls)", g_argb_calls);
+
+    /* A backend that cannot: guest memory as before. */
+    g_argb_fail = 1;
+    depth_pass_then_read(256u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 4 && stub.n_depth_readback == 2 &&
+          stub.bound_tex[0] == stub.last_created_texture &&
+          z[0] == 0x80 && z[1] == 0x00 && z[2] == 0x00 && z[3] == 0x00,
+          "refused: depth 0.5 stored as Z24S8 and decoded (%d readbacks, %02X %02X %02X %02X)",
+          stub.n_depth_readback, z[0], z[1], z[2], z[3]);
+    engine_down();
+}
+
+static void test_z16_read_as_depth16_on_gpu(void)
+{
+    printf("-- Z16 zeta read as DEPTH16, converted by the backend\n");
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.depth_as_color = stub_depth_as_color;
+    rsx_draw_engine_set_backend(&be);
+    g_argb_calls = 0; g_argb_fail = 0;
+    u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
+    memset(z, 0x5A, 16);
+
+    /* A shadow map: Z16 at pitch 512, read as DEPTH16 of that pitch. */
+    depth_pass_then_read_as(1u, 0x92u, 256u * 2u, 0);
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    const u32 first = stub.bound_tex[0];
+    CHECK(g_argb_calls == 1 && g_argb_fmt == 0x92u && g_argb_w == 4 && g_argb_h == 4 && first,
+          "the backend made the 4x4 DEPTH16 texture (%d calls, fmt %02X)", g_argb_calls, g_argb_fmt);
+    CHECK(stub.n_depth_readback == 0 && stub.n_texture_create == uploads && z[0] == 0x5A,
+          "nothing was read back, stored or uploaded (%d readbacks)", stub.n_depth_readback);
+    draw_triangle();
+    CHECK(g_argb_calls == 1 && stub.bound_tex[0] == first,
+          "no depth write since: the same texture (%d calls)", g_argb_calls);
+
+    /* The other pairings are not what the hook makes: guest memory. */
+    depth_pass_then_read_as(1u, 0x85u, 256u * 2u, 0);
+    draw_triangle();
+    depth_pass_then_read_as(2u, 0x92u, 256u * 4u, 0);
+    draw_triangle();
+    CHECK(g_argb_calls == 1 && stub.n_depth_readback == 2,
+          "Z16 as A8R8G8B8 and Z24S8 as DEPTH16 go through guest memory (%d calls, %d readbacks)",
+          g_argb_calls, stub.n_depth_readback);
+
+    /* Refused: the store rounds d * 0xFFFF exactly, as the hook does. In
+     * float, 0.501953125 * 65535 rounds up to the half and stores 0x8080. */
+    g_argb_fail = 1;
+    g_readback_depth = 0.501953125f;
+    depth_pass_then_read_as(1u, 0x92u, 256u * 2u, 0);
+    draw_triangle();
+    CHECK(g_argb_calls == 2 && stub.n_depth_readback == 3 &&
+          stub.bound_tex[0] == stub.last_created_texture && z[0] == 0x80 && z[1] == 0x7F,
+          "refused: the depth stored as Z16 round(d * 0xFFFF) = 0x807F (%d readbacks, %02X %02X)",
+          stub.n_depth_readback, z[0], z[1]);
+    g_readback_depth = 0.5f;
+    engine_down();
+}
+
+/* A depth-writing draw through a 256x256 Z24S8 zeta at `offset`; returns the
+ * depth target it was given, or 0. */
+static u32 depth_draw_at(u32 offset)
+{
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, offset);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_TEX_UNIT + 0x0C, 0u);
+    stub.bound_depth = 0;
+    draw_triangle();
+    return stub.bound_depth;
+}
+
+/* The zeta and surface tables used to keep every target forever: once 64
+ * addresses had been rendered to, a new one got no slot, and a level loaded
+ * after enough cutscenes rendered its shadow maps nowhere. A full table now
+ * gives up the entry used longest ago, but never one used this frame or the
+ * last, and a texture read counts as a use. */
+static void test_full_tables_evict_the_oldest(void)
+{
+    printf("-- full surface and zeta tables evict the least recently used\n");
+    engine_up();
+#define ZETA_AT(k) (0x00100000u + (u32)(k) * 0x1000u)
+    u32 h[64];
+    for (u32 k = 0; k < 64; k++) h[k] = depth_draw_at(ZETA_AT(k));
+    CHECK(h[0] && h[63], "64 zetas got depth targets");
+    rsx_draw_engine_present();
+    rsx_draw_engine_present();
+
+    /* Zeta 1 is read as a texture this frame, through zeta 63. */
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_AT(1));
+    m(0x1840 /* control3: pitch */, 256u * 4u);
+    draw_triangle();
+
+    int creates = stub.n_depth_create;
+    const u32 n64 = depth_draw_at(ZETA_AT(64));
+    CHECK(n64 && stub.n_depth_create == creates + 1 && !stub.alive[h[0]],
+          "a 65th zeta takes the oldest one's slot (%d creates, zeta 0 %s)",
+          stub.n_depth_create - creates, stub.alive[h[0]] ? "alive" : "released");
+    const u32 n65 = depth_draw_at(ZETA_AT(65));
+    CHECK(n65 && stub.alive[h[1]] && !stub.alive[h[2]] && stub.alive[h[63]],
+          "the next skips the zeta read this frame and the one bound (1 %d, 2 %d, 63 %d)",
+          stub.alive[h[1]], stub.alive[h[2]], stub.alive[h[63]]);
+
+    /* Zetas 3..62 are the only old ones left; after them nothing is evicted. */
+    u32 made = 0;
+    for (u32 k = 66; k < 66 + 61; k++) {
+        creates = stub.n_depth_create;
+        depth_draw_at(ZETA_AT(k));
+        if (stub.n_depth_create == creates + 1) made++;
+    }
+    CHECK(made == 60 && stub.alive[h[1]] && stub.alive[h[63]] && stub.alive[n64],
+          "60 more evict zetas 3..62, then a full table of this frame's zetas refuses (%u)", made);
+#undef ZETA_AT
+
+    /* Colour surfaces: the same rule, and the presented one stays. */
+    const u32 base_color = stub.bound_rt[0];
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_CONTEXT_DMA_ZETA, 0u);
+    u32 c[64];
+    for (u32 k = 0; k < 63; k++) {
+        m(M_COLOR_A_OFFSET, 0x00200000u + k * 0x10000u);
+        draw_triangle();
+        c[k] = stub.bound_rt[0];
+    }
+    rsx_draw_engine_present();
+    rsx_draw_engine_present();
+    creates = stub.n_color_create;
+    m(M_COLOR_A_OFFSET, 0x00200000u + 63u * 0x10000u);
+    draw_triangle();
+    CHECK(stub.n_color_create == creates + 1 && !stub.alive[base_color] &&
+          stub.alive[c[62]] && stub.alive[c[0]],
+          "a 65th surface takes the oldest one's slot, not the presented one's (%d creates)",
+          stub.n_color_create - creates);
+    engine_down();
+}
+
 static void test_color_read_as_float(void)
 {
     printf("-- colour target read as X32_FLOAT\n");
@@ -1624,6 +1862,9 @@ int main(void)
     test_depth_clear_value();
     test_antialiased_surface();
     test_depth_read_as_color();
+    test_depth_read_as_argb_on_gpu();
+    test_z16_read_as_depth16_on_gpu();
+    test_full_tables_evict_the_oldest();
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
