@@ -705,6 +705,28 @@ static void test_remap_x16_lanes(void)
     CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
 }
 
+/* The depth formats decode to one channel and present it on every source,
+ * as RPCS3 maps them (R,R,R,R): a shadow map read through crossbar 0xA900
+ * (R, G and B from A, A forced to one) gets the depth in R, not the
+ * resource's opaque alpha, which made every shadow compare see 1.0. */
+static void test_remap_depth_lanes(void)
+{
+    static const u32 fmts[4] = { 0x90u, 0x91u, 0x92u, 0x93u };
+    for (int f = 0; f < 4; f++) {
+        u8 m[4];
+        rsx_texture_component_remap(0xA900u, fmts[f] | FMT_LN | 0x40u, m);
+        CHECK_EQ(m[A_], RSX_REMAP_ONE); CHECK_EQ(m[R_], 0);
+        CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0);
+        u8 n[4];
+        rsx_texture_component_remap(0xAAE4u, fmts[f], n);
+        for (int i = 0; i < 4; i++) CHECK_EQ(n[i], 0);
+    }
+    /* A8R8G8B8 keeps its own lanes: 0xA900 reads its alpha. */
+    u8 c[4];
+    rsx_texture_component_remap(0xA900u, FMT_A8R8G8B8, c);
+    CHECK_EQ(c[R_], 3); CHECK_EQ(c[A_], RSX_REMAP_ONE);
+}
+
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
  * NOT a bent table cancelling a reversed crossbar, which is how the old bug
  * hid on DXT while breaking everything else. */
@@ -793,6 +815,7 @@ int main(void)
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
     test_remap_dxt_matches_argb();
+    test_remap_depth_lanes();
     test_expand_mask();
     test_remap_rejects_null();
 
