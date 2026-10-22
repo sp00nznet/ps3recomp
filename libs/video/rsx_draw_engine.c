@@ -874,6 +874,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
     eng_zdepth* z = &g.zdepths[slot];
+    /* The old size's snapshot goes with it: it can never be valid again. */
+    if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
@@ -900,6 +902,14 @@ static u32 eng_zdepth_snapshot(u32 slot)
     if (!g.be->depth_snapshot) return 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
     if (!tex) return 0;
+    /* The stale copy goes. A depth clear invalidates the snapshot and the
+     * next read takes a new one, so a shadow map cleared and read every frame
+     * used to leak one backend texture a frame per depth target, until the
+     * backend's object table filled and new textures came back as 0. The
+     * Metal backend keeps a released object until no recorded draw can still
+     * name it; the Vulkan one hands back the same handle, refilled. */
+    if (z->snapshot && z->snapshot != tex && g.be->texture_release)
+        g.be->texture_release(g.be->user, z->snapshot);
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;

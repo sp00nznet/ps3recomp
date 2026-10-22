@@ -1431,6 +1431,70 @@ static void test_depth_read_as_color(void)
     engine_down();
 }
 
+/* A DEPTH24_D8 texture over a written depth target samples the backend's
+ * snapshot of it. A clear invalidates that snapshot and the next read takes a
+ * new one; the old one has to be released, or a shadow map cleared and read
+ * every frame leaks a backend texture a frame. */
+static void depth_pass(void)
+{
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    draw_triangle();
+}
+
+static u32 sample_depth(void)
+{
+    m(M_ZETA_OFFSET, 0x00200000u);            /* another zeta: not the one read */
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((0x90u | 0x20u) << 8) | (1u << 16));
+    draw_triangle();
+    return stub.bound_tex[0];
+}
+
+static void test_depth_snapshot_release(void)
+{
+    printf("-- depth snapshot release\n");
+    engine_up();
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+
+    depth_pass();
+    const u32 first = sample_depth();
+    CHECK(stub.n_depth_snapshot == 1 && first && stub.alive[first],
+          "the first read samples a snapshot (%d, handle %u)", stub.n_depth_snapshot, first);
+    CHECK(sample_depth() == first && stub.n_depth_snapshot == 1,
+          "an unchanged depth target keeps its snapshot");
+
+    depth_pass();
+    const u32 second = sample_depth();
+    CHECK(stub.n_depth_snapshot == 2 && second && second != first,
+          "after a clear and a new depth pass the read takes a new snapshot (%d)",
+          stub.n_depth_snapshot);
+    CHECK(!stub.alive[first], "the stale snapshot was released");
+    CHECK(stub.alive[second], "the current one is alive");
+
+    /* A clip bigger than the canvas recreates the depth target; its
+     * snapshot goes too. */
+    m(M_SURFACE_CLIP_H, 2048u << 16);
+    m(M_SURFACE_CLIP_V, 1024u << 16);
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    draw_triangle();
+    CHECK(stub.n_depth_create >= 3 && !stub.alive[second],
+          "a recreated depth target releases its old snapshot (%d depth targets)",
+          stub.n_depth_create);
+    engine_down();
+}
+
 static void test_color_read_as_float(void)
 {
     printf("-- colour target read as X32_FLOAT\n");
@@ -1624,6 +1688,7 @@ int main(void)
     test_depth_clear_value();
     test_antialiased_surface();
     test_depth_read_as_color();
+    test_depth_snapshot_release();
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
