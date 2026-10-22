@@ -47,6 +47,7 @@ int  rsx_process_method(rsx_state* state, u32 method, u32 data)
     return 0;
 }
 int  rsx_draw_engine_enabled(void) { return 0; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }

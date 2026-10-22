@@ -39,6 +39,7 @@ void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why;
 void rsx_state_init(rsx_state* state) { (void)state; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
 int  rsx_draw_engine_enabled(void) { return 1; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 /* guest_read is defined below: it plays the engine's part. */
