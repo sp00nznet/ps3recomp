@@ -1541,6 +1541,52 @@ static void test_immediate_compositor(void)
     CHECK(stub.n_draw == 5 && stub.captured_vertices[1][3] == 0 &&
           stub.captured_vertices[1][35] == 0,
           "explicit all-zero DATA4F preserves position W and attribute alpha");
+    /* Resistance's movie player: a QUADS group whose positions are DATA2S on
+     * ATTR0 (0x1900, x in the low half), each vertex's ATTR1 written first and
+     * the colour/UV set once as constants. The single ATTR0 word completes the
+     * position, as on hardware; only DATA3F/DATA4F positions used to emit, and
+     * every movie frame drew nothing. */
+    m(M_BEGIN_END, 8u);
+    m(0x1C20, f32_bits(1)); m(0x1C24, f32_bits(1)); m(0x1C28, f32_bits(1)); m(0x1C2C, f32_bits(1));
+    m(0x1898, f32_bits(1)); m(0x189C, f32_bits(0.9f));
+    const u32 quad[4] = { 0x00000000u, 0x02D00000u, 0x02D00500u, 0x00000500u };
+    for (u32 i = 0; i < 4; i++) { m(0x1904, quad[i]); m(0x1900, quad[i]); }
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 6 && stub.draw_vertices == 4 && stub.draw_indices == 6,
+          "DATA2S positions emit a vertex each (draws %d, %u verts)",
+          stub.n_draw, stub.draw_vertices);
+    CHECK(stub.captured_vertices[2][0] == 1280 && stub.captured_vertices[2][1] == 720 &&
+          stub.captured_vertices[2][3] == 1 && stub.captured_vertices[2][4] == 1280,
+          "DATA2S position is (x low half, y high half, 0, 1) with ATTR1 current");
+    /* The other single-word encodings of ATTR0 complete a position too, and a
+     * two-word one completes on its last word only. */
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) m(0x1940, 0x01020304u);           /* DATA4UB */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 7 && stub.draw_vertices == 3, "DATA4UB ATTR0 emits per write");
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) { m(0x1880, f32_bits(1)); m(0x1884, f32_bits(2)); } /* DATA2F */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 8 && stub.draw_vertices == 3, "DATA2F ATTR0 emits on its Y word");
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) m(0x1E40, f32_bits((float)i));    /* DATA1F */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 9 && stub.draw_vertices == 3, "DATA1F ATTR0 emits per write");
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) { m(0x1980, 0x00020001u); m(0x1984, 0x00010000u); } /* DATA4S */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 10 && stub.draw_vertices == 3 &&
+          stub.captured_vertices[2][0] == 1 && stub.captured_vertices[2][1] == 2 &&
+          stub.captured_vertices[2][3] == 1,
+          "DATA4S ATTR0 emits on its second word only (%u verts)", stub.draw_vertices);
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) { m(0x0A80, 0x7FFF7FFFu); m(0x0A84, 0x7FFF0000u); } /* SCALED4S */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 11 && stub.draw_vertices == 3,
+          "SCALED4S ATTR0 emits on its second word only (%u verts)", stub.draw_vertices);
+    /* Outside BEGIN/END the same writes are only current values. */
+    m(0x1900, 0x00100010u); m(0x1940, 0x01020304u);
+    CHECK(stub.n_draw == 11, "ATTR0 writes outside BEGIN/END do not draw");
     engine_down();
 }
 
