@@ -60,12 +60,15 @@ void spu_lockline_unlock(void) {}
 /* The guest callback: record the messages. */
 static u32 s_msgs[4096];
 static int s_nmsg;
+static u32 s_open_handle;       /* the handle cellVdecOpen gave back */
+static VdecSlot* s_open_slot;   /* the slot it opened */
 static void fake_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2,
                             uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
                             uint64_t a7)
 {
-    (void)a0; (void)a2; (void)a4; (void)a5; (void)a6; (void)a7;
+    (void)a2; (void)a4; (void)a5; (void)a6; (void)a7;
     CHECK(opd == CB_OPD && a3 == 0xC0FFEEu);
+    CHECK(a0 == s_open_handle);     /* the callback names the guest's handle */
     if (s_nmsg < 4096) s_msgs[s_nmsg++] = (u32)a1;
 }
 ps3_guest_caller_fn g_ps3_guest_caller = fake_guest_call;
@@ -135,7 +138,16 @@ static u32 open_decoder(u32 codec)
     CHECK(cellVdecOpen((const CellVdecType*)(uintptr_t)G_TYPE, NULL,
                        (const CellVdecCb*)(uintptr_t)G_CB,
                        (CellVdecHandle*)(uintptr_t)G_HANDLE) == CELL_OK);
-    return vm_read32(G_HANDLE);
+    s_open_handle = vm_read32(G_HANDLE);
+    s_open_slot = NULL;
+    for (int i = 0; i < MAX_VDEC; i++)
+        if (s_vdec[i].in_use) { CHECK(!s_open_slot); s_open_slot = &s_vdec[i]; }
+    CHECK(s_open_slot);
+    /* Some titles read a 0 handle as "no decoder open". */
+    CHECK(s_open_handle != 0);
+    CHECK(cellVdecStartSeq(0) == (s32)CELL_VDEC_ERROR_ARG);
+    CHECK(cellVdecStartSeq(0xFFFFFFFFu) == (s32)CELL_VDEC_ERROR_ARG);
+    return s_open_handle;
 }
 
 static u64 au_pts(int i) { return 90000ull + 3600ull * (u64)i; }
@@ -241,7 +253,7 @@ static int mode_stub(int argc, char** argv)
            s_nau = 8; for (int i = 0; i <= 8; i++) s_au_off[i] = (size_t)i * 64; }
 
     u32 h = open_decoder(codec);
-    CHECK(s_vdec[h].ff == NULL);
+    CHECK(s_open_slot->ff == NULL);
     s_nmsg = 0;
     CHECK(cellVdecStartSeq(h) == CELL_OK);
     for (int i = 0; i < 3 && i < s_nau; i++) {
@@ -251,7 +263,7 @@ static int mode_stub(int argc, char** argv)
               && s_msgs[m0 + 1] == CELL_VDEC_MSG_TYPE_PICOUT);
         CHECK(cellVdecGetPicItem(h, (const CellVdecPicItem**)(uintptr_t)G_ITEMPTR) == CELL_OK);
         u32 it = vm_read32(G_ITEMPTR);
-        CHECK(it == VDEC_ITEM_EA(h));
+        CHECK(it == VDEC_ITEM_EA(s_open_slot - s_vdec));
         CHECK(vm_read32(it + 0x00) == codec);
         CHECK(vm_read32(it + 0x04) == G_AU);
         CHECK(vm_read32(it + 0x08) == (u32)(s_au_off[i + 1] - s_au_off[i]));
@@ -259,7 +271,7 @@ static int mode_stub(int argc, char** argv)
         CHECK(vm_read32(it + 0x10) == (u32)(au_pts(i) >> 32) && vm_read32(it + 0x14) == (u32)au_pts(i));
         CHECK(vm_read32(it + 0x18) == 0xFFFFFFFFu && vm_read32(it + 0x1C) == 0xFFFFFFFFu);
         CHECK(vm_read64(it + 0x30) == 0xABCD0000ull + (u64)i);
-        CHECK(vm_read32(it + 0x48) == VDEC_INFO_EA(h));
+        CHECK(vm_read32(it + 0x48) == VDEC_INFO_EA(s_open_slot - s_vdec));
         CHECK(vm_read16(it + 0x80) == 1280 && vm_read16(it + 0x82) == 720);
         for (u32 o = 0x84; o < 0x100; o++) CHECK(vm_read8(it + o) == 0);
         /* GetPictureExt never existed without a decoder: CELL_OK, nothing done. */
@@ -297,7 +309,7 @@ static int mode_decode(int argc, char** argv)
     s_frames = (u8*)malloc((size_t)MAX_AU * 2 * s_frame_size);
 
     u32 h = open_decoder(codec);
-    if (!s_vdec[h].ff) {
+    if (!s_open_slot->ff) {
         /* No loadable libavcodec here (not installed, or not on the loader
          * path): a skip, not a failure. A library that loads but cannot open
          * the decoder is still a failure. */
@@ -373,9 +385,9 @@ static int mode_rgba(int argc, char** argv)
     s_frames = (u8*)malloc((size_t)MAX_AU * 2 * s_frame_size);
     u32 h = open_decoder(codec);
 #ifdef PS3RECOMP_FFMPEG_RUNTIME
-    if (!s_vdec[h].ff && !ps3_ffmpeg_get()) { printf("SKIP: libavcodec not loadable\n"); return 77; }
+    if (!s_open_slot->ff && !ps3_ffmpeg_get()) { printf("SKIP: libavcodec not loadable\n"); return 77; }
 #endif
-    CHECK(s_vdec[h].ff);
+    CHECK(s_open_slot->ff);
 
     /* RGBA32: bytes R G B A. */
     run_sequence(h, codec, es, -1, 1);
