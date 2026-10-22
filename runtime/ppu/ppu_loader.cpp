@@ -620,6 +620,8 @@ static void samp_report(void)
  * guest histogram says nothing about where it loops. */
 static DWORD s_samp_boot_tid;
 static int   s_samp_main = -1;
+static int   s_samp_drain = -1;
+extern "C" volatile unsigned long g_gcm_drain_tid;
 
 static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
 {
@@ -654,6 +656,11 @@ static DWORD WINAPI samp_thread(LPVOID p)
             if (Thread32First(snap, &te)) do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
                 if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
+                /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
+                 * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
+                 * histogram is the drain's own cost, not the spin loops of
+                 * every SPU thread. */
+                if (s_samp_drain > 0 && te.th32ThreadID != g_gcm_drain_tid) continue;
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                       FALSE, te.th32ThreadID);
                 if (!h) continue;
@@ -737,6 +744,7 @@ void ps3_sampler_start(void)
     unsigned ms = (unsigned)atoi(e); if (!ms) ms = 5;
     s_samp_boot_tid = GetCurrentThreadId();
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
+    s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */
