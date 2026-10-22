@@ -117,6 +117,18 @@ jobs:
             echo "no AVX2 on this runner: skipped"
           fi
 
+      # The AVX2 estimate, interpolate and conversion helpers must match the scalar ones bit for bit.
+      - name: Run the SPU estimate/conversion test (AVX2)
+        run: |
+          if grep -q avx2 /proc/cpuinfo; then
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime/spu \
+              -o /tmp/test_spu_float_est runtime/spu/tests/test_spu_float_est.c -lm
+            /tmp/test_spu_float_est
+          else
+            echo "no AVX2 on this runner: skipped"
+          fi
+
       # cellFontInitializeWithRevision initialises the library the way cellFontInit does.
       - name: Run the cellFont init test
         run: |

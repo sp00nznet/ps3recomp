@@ -999,11 +999,11 @@ static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
     const uint32_t v = sh >= 0 ? m << sh : (sh <= -24 ? 0 : m >> -sh);
     return neg ? 0u - v : v;
 }
-static inline u128 spu_cflts(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
-static inline u128 spu_cfltu(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
-static inline u128 spu_csflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
+static inline u128 spu_cflts_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
+static inline u128 spu_cfltu_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
+static inline u128 spu_csflt_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
     r._u32[i] = v ? spu__sf_pack(v < 0 ? 0x80000000u : 0, v < 0 ? 0u - (uint32_t)v : (uint32_t)v, -(155 - (i8 & 0xFF))) : 0; } return r; }
-static inline u128 spu_cuflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
+static inline u128 spu_cuflt_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
     r._u32[i] = v ? spu__sf_pack(0, v, -(155 - (i8 & 0xFF))) : 0; } return r; }
 
 /* fi -- Floating Interpolate (SPU ISA v1.2, p. 219; frest/frsqest output
@@ -1023,7 +1023,7 @@ static inline u128 spu_cuflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i+
  * exponent-0 estimate is a zero operand, and a result whose exponent would
  * drop below 1 underflows -- both give +0, the only zero the SPU produces.
  * Exponent 255 is ordinary extended range, so 1/0 stays at the top of it. */
-static inline u128 spu_fi(u128 a, u128 b) {
+static inline u128 spu_fi_ref(u128 a, u128 b) {
     u128 r;
     for (int i = 0; i < 4; i++) {
         const uint32_t est = b._u32[i];
@@ -1277,7 +1277,7 @@ static const uint32_t spu_frsqest_fraction_lut[64] = {
     0x4180D7, 0x4180D7, 0x3E24CC, 0x3E24CC, 0x3AF4C3, 0x3AF4C3, 0x37E8BA, 0x37E8BA
 };
 
-static inline u128 spu_frsqest(u128 a) {
+static inline u128 spu_frsqest_ref(u128 a) {
     u128 r;
     for (int i = 0; i < 4; i++) {
         uint32_t bits = a._u32[i];
@@ -1292,7 +1292,7 @@ static inline u128 spu_frsqest(u128 a) {
 }
 /* frest: reciprocal estimate (refined by the following spu_fi Newton step).
  * Full-precision 1/x is exact after fi and >= HW-estimate accuracy. */
-static inline u128 spu_frest(u128 a) {
+static inline u128 spu_frest_ref(u128 a) {
     u128 r;
     for (int i = 0; i < 4; i++) {
         uint32_t bits = a._u32[i];
@@ -1307,6 +1307,130 @@ static inline u128 spu_frest(u128 a) {
     }
     return r;
 }
+
+#if defined(__AVX2__) && !defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+/* The estimate, interpolate and conversion instructions four lanes at a time. Every lane rule
+ * above is integer work on the bit fields, so these are exact by construction: no lane falls
+ * back. cuflt/csflt read the integer's top bit and next 23 bits from its (exact) double. test_spu_float_est.c
+ * checks each one against the scalar reference. */
+#include <immintrin.h>
+#define SPU__XE_INLINE static inline __attribute__((always_inline))
+SPU__XE_INLINE __m128i spu__xe_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
+SPU__XE_INLINE u128 spu__xe_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
+/* the low 32 bits of each 64-bit lane */
+SPU__XE_INLINE __m128i spu__xe_narrow(__m256i v) {
+    return _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(v, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6)));
+}
+/* (2^13 | base) * 2^19 - step * y is 2^32 + d with d = base * 2^19 - step * y (base < 2^13,
+ * step * y < 2^29): the magnitude is >= 2^32 exactly when base * 2^19 >= step * y, and its low
+ * 32 bits are d mod 2^32 either way, so 32-bit lanes suffice. */
+SPU__XE_INLINE u128 spu_fi(u128 a, u128 b) {
+    const __m128i est = spu__xe_ld(b), y = _mm_and_si128(spu__xe_ld(a), _mm_set1_epi32(0x7FFFF));
+    const __m128i exp = _mm_and_si128(_mm_srli_epi32(est, 23), _mm_set1_epi32(0xFF));
+    const __m128i b19 = _mm_slli_epi32(_mm_and_si128(_mm_srli_epi32(est, 10), _mm_set1_epi32(0x1FFF)), 19);
+    const __m128i sy = _mm_mullo_epi32(_mm_and_si128(est, _mm_set1_epi32(0x3FF)), y);
+    const __m128i big = _mm_cmpeq_epi32(_mm_max_epu32(b19, sy), b19);           /* magnitude >= 1.0 */
+    const __m128i d = _mm_sub_epi32(b19, sy);
+    const __m128i frac = _mm_and_si128(_mm_blendv_epi8(_mm_srli_epi32(d, 8), _mm_srli_epi32(d, 9), big),
+                                       _mm_set1_epi32(0x7FFFFF));
+    const __m128i e2 = _mm_sub_epi32(exp, _mm_andnot_si128(big, _mm_set1_epi32(1)));   /* normalised: exp - 1 */
+    const __m128i r = _mm_or_si128(_mm_or_si128(_mm_and_si128(est, _mm_set1_epi32((int)0x80000000u)),
+                                                _mm_slli_epi32(e2, 23)), frac);
+    /* an exponent-0 estimate, or a result normalised down to exponent 0, is +0 */
+    const __m128i zero = _mm_or_si128(_mm_cmpeq_epi32(exp, _mm_setzero_si128()), _mm_cmpeq_epi32(e2, _mm_setzero_si128()));
+    return spu__xe_st(_mm_andnot_si128(zero, r));
+}
+/* tbl[idx] for idx < 8 * n, n eight-entry rows: one cross-lane permute per row, then a select
+ * on the row number (a gather is slow on several x86 cores for four lanes). */
+SPU__XE_INLINE __m128i spu__xe_lut(const uint32_t* tbl, int n, __m128i idx) {
+    const __m256i i8 = _mm256_castsi128_si256(idx);
+    const __m128i row = _mm_srli_epi32(idx, 3);
+    __m128i r = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i*)tbl), i8));
+    for (int k = 1; k < n; k++) {
+        const __m128i v = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i*)(tbl + 8 * k)), i8));
+        r = _mm_blendv_epi8(r, v, _mm_cmpeq_epi32(row, _mm_set1_epi32(k)));
+    }
+    return r;
+}
+SPU__XE_INLINE u128 spu_frest(u128 a) {
+    const __m128i x = spu__xe_ld(a);
+    const __m128i exp = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
+    const __m128i idx = _mm_and_si128(_mm_srli_epi32(x, 18), _mm_set1_epi32(0x1F));
+    const __m128i frac = _mm_and_si128(spu__xe_lut(spu_frest_fraction_lut, 4, idx), _mm_set1_epi32(0x7FFFFF));
+    __m128i rexp = _mm_sub_epi32(_mm_set1_epi32(253), exp);
+    rexp = _mm_andnot_si128(_mm_cmpgt_epi32(exp, _mm_set1_epi32(252)), rexp);          /* exp >= 253: 0 */
+    rexp = _mm_blendv_epi8(rexp, _mm_set1_epi32(255), _mm_cmpeq_epi32(exp, _mm_setzero_si128()));
+    return spu__xe_st(_mm_or_si128(_mm_or_si128(_mm_and_si128(x, _mm_set1_epi32((int)0x80000000u)),
+                                                _mm_slli_epi32(rexp, 23)), frac));
+}
+SPU__XE_INLINE u128 spu_frsqest(u128 a) {
+    const __m128i x = spu__xe_ld(a);
+    const __m128i exp = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
+    const __m128i idx = _mm_and_si128(_mm_srli_epi32(x, 18), _mm_set1_epi32(0x3F));
+    const __m128i frac = _mm_and_si128(spu__xe_lut(spu_frsqest_fraction_lut, 8, idx), _mm_set1_epi32(0x7FFFFF));
+    __m128i rexp = _mm_sub_epi32(_mm_set1_epi32(190), _mm_srli_epi32(_mm_add_epi32(exp, _mm_set1_epi32(1)), 1));
+    rexp = _mm_blendv_epi8(rexp, _mm_set1_epi32(255), _mm_cmpeq_epi32(exp, _mm_setzero_si128()));
+    return spu__xe_st(_mm_or_si128(_mm_slli_epi32(rexp, 23), frac));
+}
+/* cflts/cfltu: the 24-bit significand shifted by be - 150 + (173 - i8), saturated. */
+SPU__XE_INLINE __m128i spu__xe_cfl(u128 a, int i8, int is_unsigned) {
+    const __m128i x = spu__xe_ld(a);
+    const __m128i be = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
+    const __m128i m = _mm_or_si128(_mm_and_si128(x, _mm_set1_epi32(0x7FFFFF)), _mm_set1_epi32(0x800000));
+    const __m128i sh = _mm_add_epi32(be, _mm_set1_epi32(23 - (i8 & 0xFF)));     /* be - 150 + 173 - i8 */
+    const __m128i lsh = _mm_max_epi32(sh, _mm_setzero_si128());
+    const __m128i rsh = _mm_max_epi32(_mm_sub_epi32(_mm_setzero_si128(), sh), _mm_setzero_si128());
+    __m128i v = _mm_blendv_epi8(_mm_srlv_epi32(m, rsh), _mm_sllv_epi32(m, lsh),
+                                _mm_cmpgt_epi32(sh, _mm_set1_epi32(-1)));       /* counts >= 32 give 0 */
+    const __m128i neg = _mm_srai_epi32(x, 31), isz = _mm_cmpeq_epi32(be, _mm_setzero_si128());
+    if (is_unsigned) {
+        v = _mm_or_si128(v, _mm_cmpgt_epi32(sh, _mm_set1_epi32(8)));              /* >= 2^32: all ones */
+        return _mm_andnot_si128(_mm_or_si128(neg, isz), v);                       /* negative or zero: 0 */
+    }
+    v = _mm_sub_epi32(_mm_xor_si128(v, neg), neg);                                /* negate the negative lanes */
+    const __m128i sat = _mm_xor_si128(_mm_set1_epi32(0x7FFFFFFF), neg);           /* 0x7FFFFFFF / 0x80000000 */
+    v = _mm_blendv_epi8(v, sat, _mm_cmpgt_epi32(sh, _mm_set1_epi32(7)));
+    return _mm_andnot_si128(isz, v);
+}
+SPU__XE_INLINE u128 spu_cflts(u128 a, int i8) { return spu__xe_st(spu__xe_cfl(a, i8, 0)); }
+SPU__XE_INLINE u128 spu_cfltu(u128 a, int i8) { return spu__xe_st(spu__xe_cfl(a, i8, 1)); }
+/* csflt/cuflt: |v| as an exact double gives top = its exponent and the next 23 bits truncated;
+ * the result exponent is top + i8 - 28 (= top + 127 - (155 - i8)), saturated / flushed. */
+SPU__XE_INLINE __m128i spu__xe_cxflt(__m256d d, __m128i sign, __m128i nz, int i8) {
+    const __m256i u = _mm256_castpd_si256(d);
+    const __m128i top = _mm_sub_epi32(spu__xe_narrow(_mm256_and_si256(_mm256_srli_epi64(u, 52), _mm256_set1_epi64x(0x7FF))),
+                                      _mm_set1_epi32(1023));
+    const __m128i frac = _mm_and_si128(spu__xe_narrow(_mm256_srli_epi64(u, 29)), _mm_set1_epi32(0x7FFFFF));
+    const __m128i biased = _mm_add_epi32(top, _mm_set1_epi32((i8 & 0xFF) - 28));
+    __m128i r = _mm_or_si128(sign, _mm_or_si128(_mm_slli_epi32(biased, 23), frac));
+    r = _mm_blendv_epi8(r, _mm_or_si128(sign, _mm_set1_epi32(0x7FFFFFFF)), _mm_cmpgt_epi32(biased, _mm_set1_epi32(255)));
+    const __m128i flush = _mm_cmpgt_epi32(_mm_set1_epi32(1), biased);
+    return _mm_and_si128(_mm_andnot_si128(flush, r), nz);
+}
+SPU__XE_INLINE u128 spu_csflt(u128 a, int i8) {
+    const __m128i v = spu__xe_ld(a);
+    const __m256d d = _mm256_andnot_pd(_mm256_set1_pd(-0.0), _mm256_cvtepi32_pd(v));          /* |v|, exact */
+    const __m128i sign = _mm_and_si128(v, _mm_set1_epi32((int)0x80000000u));
+    const __m128i nz = _mm_xor_si128(_mm_cmpeq_epi32(v, _mm_setzero_si128()), _mm_set1_epi32(-1));
+    return spu__xe_st(spu__xe_cxflt(d, sign, nz, i8));
+}
+SPU__XE_INLINE u128 spu_cuflt(u128 a, int i8) {
+    const __m128i v = spu__xe_ld(a);
+    /* unsigned -> double: flip the top bit, convert as signed, add 2^31 back (all exact) */
+    const __m256d d = _mm256_add_pd(_mm256_cvtepi32_pd(_mm_xor_si128(v, _mm_set1_epi32((int)0x80000000u))),
+                                    _mm256_set1_pd(2147483648.0));
+    const __m128i nz = _mm_xor_si128(_mm_cmpeq_epi32(v, _mm_setzero_si128()), _mm_set1_epi32(-1));
+    return spu__xe_st(spu__xe_cxflt(d, _mm_setzero_si128(), nz, i8));
+}
+#else
+static inline u128 spu_fi(u128 a, u128 b)      { return spu_fi_ref(a, b); }
+static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }
+static inline u128 spu_frsqest(u128 a)         { return spu_frsqest_ref(a); }
+static inline u128 spu_cflts(u128 a, int i8)   { return spu_cflts_ref(a, i8); }
+static inline u128 spu_cfltu(u128 a, int i8)   { return spu_cfltu_ref(a, i8); }
+static inline u128 spu_csflt(u128 a, int i8)   { return spu_csflt_ref(a, i8); }
+static inline u128 spu_cuflt(u128 a, int i8)   { return spu_cuflt_ref(a, i8); }
+#endif
 
 /* ---- Phase 3: sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word
