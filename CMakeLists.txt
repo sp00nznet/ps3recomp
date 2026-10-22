@@ -405,6 +405,11 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
 
+    add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
+    target_include_directories(test_rsx_present_policy PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME spinlock_word_width

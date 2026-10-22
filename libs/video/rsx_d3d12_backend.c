@@ -19,6 +19,7 @@
 #include <time.h>
 #include "ps3emu/log_first.h"
 #include "rsx_d3d12_backend.h"
+#include "rsx_present_policy.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
@@ -5168,6 +5169,8 @@ static void d3d12_end_frame(void* ud)
 
 static u32 s_dbg_clears_since_present = 0;   /* CELLMARK_BLINKDBG */
 static u32 s_clear_presents = 0;   /* presents issued at clear (frame boundary) */
+static unsigned s_last_clear_boundary_flip = 0;
+static unsigned s_last_clear_presented_flip = 0;
 
 /* FRAME_BUDGET=1: how much geometry a guest frame actually asks for, versus
  * what the per-frame vertex buffer can hold. A frame that overflows is silently
@@ -5290,10 +5293,9 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     if (s_d3d.draw_count > s_frame_draws_max) s_frame_draws_max = s_d3d.draw_count;
     {
         extern unsigned cellGcm_flip_request_count(void);
-        static unsigned s_last_present_flip = 0;
         unsigned fc = cellGcm_flip_request_count();
         if (fc != 0) {
-            if (fc == s_last_present_flip)
+            if (fc == s_last_clear_boundary_flip)
                 return;   /* no flip since last present -> not a real boundary */
             /* A double-buffered title issues several display clears per flip
              * (DeferredShading: clear back-buffer, HUD pass, ...). They can
@@ -5306,7 +5308,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
              * self-scales per title with no fixed threshold. */
             if (s_frame_draws_max > 16 && s_d3d.draw_count < s_frame_draws_max / 4)
                 return;   /* intermediate: keep accumulating, flip stays pending */
-            s_last_present_flip = fc;
+            s_last_clear_boundary_flip = fc;
         }
     }
 
@@ -5324,6 +5326,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
                    s_d3d.draw_count);
         render_frame();
         s_clear_presents++;
+        s_last_clear_presented_flip = s_last_clear_boundary_flip;
     }
     s_dbg_clears_since_present++;
     s_d3d.draw_count   = 0;
@@ -6754,14 +6757,17 @@ void rsx_d3d12_backend_present(void)
                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
     s_dbg_clears_since_present = 0;
 
-    /* Once frame-boundary presents are active (d3d12_clear presents each
-     * completed frame as the drain crosses into the next one), the ticker
-     * present would only ever show the partially-accumulated NEXT frame --
-     * that partial present right after the FIFO ring recycle was the visible
-     * blink. Keep the ticker present solely as the boot-time fallback (before
-     * the first framed clear arrives). */
-    if (s_clear_presents > 0)
-        return;
+    /* A clear boundary may have already rendered this exact guest flip. Skip
+     * only that duplicate. A lifetime `s_clear_presents > 0` gate permanently
+     * disabled flip presentation when a later title phase stopped issuing
+     * display clears, so records accumulated to MAX_DRAWS and were truncated. */
+    {
+        extern unsigned cellGcm_flip_request_count(void);
+        if (rsx_present_flip_already_rendered(
+                s_clear_presents, s_last_clear_presented_flip,
+                cellGcm_flip_request_count()))
+            return;
+    }
 
     /* Same display gate as d3d12_present: a batch of offscreen pass work only
      * (render-to-texture) keeps accumulating until its composite arrives.
