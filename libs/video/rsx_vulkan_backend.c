@@ -214,6 +214,7 @@ typedef struct vk_state {
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              depth_bounds_ok; /* depthBounds enabled                */
+    int              indep_blend_ok;  /* independentBlend: per-target MRT state */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     SDL_Window*      window;
@@ -3062,23 +3063,48 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         s_e2.warned |= 64u;
     }
     /* nv40 COLOR_MASK: B [0:7], G [8:15], R [16:23], A [24:31], any bit set.
-     * Every attachment takes target A's blend and mask (see rsx_draw_engine.h). */
+     * Target A takes COLOR_MASK and BLEND_ENABLE; targets B..D their own
+     * nibble of COLOR_MASK_MRT (A,R,G,B at bits 0..3) and bit of
+     * BLEND_ENABLE_MRT, the hardware rule the Metal backend follows. With A's
+     * state on every target, a light pass that adds into A with B and C
+     * masked off added every light into the G-buffer, and a material pass
+     * that writes B and C's alpha with A's alpha masked left them stale.
+     * PS3RECOMP_VK_MRT_MASK takes the same values as PS3RECOMP_METAL_MRT_MASK:
+     * 1 (default) the hardware rule; 0 target A's state everywhere, the old
+     * behaviour; 2 only a target masked off entirely is off, with per-target
+     * blend. A device without independentBlend keeps A's state everywhere. */
     VkColorComponentFlags wm = 0;
     if ((rs->color_mask >> 16) & 0xFFu) wm |= VK_COLOR_COMPONENT_R_BIT;
     if ((rs->color_mask >>  8) & 0xFFu) wm |= VK_COLOR_COMPONENT_G_BIT;
     if ((rs->color_mask >>  0) & 0xFFu) wm |= VK_COLOR_COMPONENT_B_BIT;
     if ((rs->color_mask >> 24) & 0xFFu) wm |= VK_COLOR_COMPONENT_A_BIT;
+    static int mrt_mode = -1;
+    if (mrt_mode < 0) { const char* e = getenv("PS3RECOMP_VK_MRT_MASK"); mrt_mode = e ? atoi(e) : 1; }
     VkPipelineColorBlendAttachmentState cba[RSX_BE_MAX_COLOR_TARGETS];
-    for (u32 r = 0; r < P->rt_count; r++)
+    for (u32 r = 0; r < P->rt_count; r++) {
+        VkColorComponentFlags twm = wm;
+        int tblend = rs->blend_enable != 0;
+        if (r > 0 && mrt_mode != 0 && s_vk.indep_blend_ok) {
+            const u32 nib = (rs->color_mask_mrt >> (r * 4u)) & 0xFu;
+            if (mrt_mode == 1 || nib == 0) {
+                twm = 0;
+                if (nib & 1u) twm |= VK_COLOR_COMPONENT_A_BIT;
+                if (nib & 2u) twm |= VK_COLOR_COMPONENT_R_BIT;
+                if (nib & 4u) twm |= VK_COLOR_COMPONENT_G_BIT;
+                if (nib & 8u) twm |= VK_COLOR_COMPONENT_B_BIT;
+            }
+            tblend = (rs->blend_mrt >> r) & 1u;
+        }
         cba[r] = (VkPipelineColorBlendAttachmentState){
-            .blendEnable = rs->blend_enable ? VK_TRUE : VK_FALSE,
+            .blendEnable = tblend ? VK_TRUE : VK_FALSE,
             .srcColorBlendFactor = vk_gcm_blend_factor(rs->sf_rgb),
             .dstColorBlendFactor = vk_gcm_blend_factor(rs->df_rgb),
             .colorBlendOp = vk_gcm_blend_op(rs->eq_rgb),
             .srcAlphaBlendFactor = vk_gcm_blend_factor(rs->sf_a),
             .dstAlphaBlendFactor = vk_gcm_blend_factor(rs->df_a),
             .alphaBlendOp = vk_gcm_blend_op(rs->eq_a),
-            .colorWriteMask = wm };
+            .colorWriteMask = twm };
+    }
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = P->rt_count, .pAttachments = cba };
@@ -3550,6 +3576,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * Vulkan; without it the test stays off, as before. */
     want.depthBounds = have.depthBounds;
     s_vk.depth_bounds_ok = have.depthBounds ? 1 : 0;
+    /* Per-target colour mask and blend enable (an MRT set's targets B..D
+     * have their own); without it every target takes target A's. */
+    want.independentBlend = have.independentBlend;
+    s_vk.indep_blend_ok = have.independentBlend ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
