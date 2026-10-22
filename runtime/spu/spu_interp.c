@@ -390,7 +390,77 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
+/* SPU_INTERP_STATS=<seconds>: how much SPU code runs interpreted, by image
+ * and 1 KB page of local store, and where the interpreter was entered. A job
+ * module streamed in at an address nothing was lifted for runs here at a
+ * fraction of the compiled speed, and from the outside that only looks like a
+ * workload that is slow for no reason (late audio, slow decode). The entry
+ * list tells the two causes apart: entries spread over a code body mean its
+ * lift isn't dispatched at all; a few hot entries inside an otherwise lifted
+ * body are function starts the lifter didn't find. Counts are unlocked. */
+enum { IS_N = 64 };
+static long s_is = -1;
+static volatile long long s_is_tot;
+static int s_is_img[IS_N]; static uint32_t s_is_page[IS_N]; static volatile long long s_is_cnt[IS_N];
+static int s_ie_img[IS_N]; static uint32_t s_ie_pc[IS_N]; static volatile long long s_ie_cnt[IS_N];
+static unsigned long long s_is_t0;
+
+static int interp_stats_on(void)
+{
+    if (s_is < 0) { const char* e = getenv("SPU_INTERP_STATS"); s_is = e ? atol(e) : 0; }
+    return s_is > 0;
+}
+
+static void interp_stats_bump(int* img, uint32_t* key, volatile long long* cnt, int image, uint32_t k)
+{
+    int i;
+    for (i = 0; i < IS_N && cnt[i]; i++)
+        if (img[i] == image && key[i] == k) break;
+    if (i < IS_N) {
+        if (!cnt[i]) { img[i] = image; key[i] = k; }
+        cnt[i]++;
+    }
+}
+
+static void interp_stats_top(const char* what, int* img, uint32_t* key, volatile long long* cnt, int n)
+{
+    fprintf(stderr, "  top %s:\n", what);
+    for (int r = 0; r < n; r++) {
+        int best = -1;
+        for (int j = 0; j < IS_N; j++)
+            if (cnt[j] > 0 && (best < 0 || cnt[j] > cnt[best])) best = j;
+        if (best < 0) break;
+        fprintf(stderr, "    img=0x%08X ls=0x%05X  %lld\n", (uint32_t)img[best], key[best], cnt[best]);
+        cnt[best] = -cnt[best];
+    }
+    for (int j = 0; j < IS_N; j++) cnt[j] = 0;
+}
+
+static void interp_stats_step(const spu_context* ctx)
+{
+    interp_stats_bump(s_is_img, s_is_page, s_is_cnt, ctx->image_id, ctx->pc & ~0x3FFu);
+    if ((++s_is_tot & 0xFFFF) != 0) return;
+    struct timespec ts; timespec_get(&ts, TIME_UTC);   /* stdlib: fixtures link this file alone */
+    unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+    if (!s_is_t0) { s_is_t0 = now; return; }
+    if (now - s_is_t0 < (unsigned long long)s_is * 1000ull) return;
+    fprintf(stderr, "[spu-interp] %.1fM steps/s over %lds\n", s_is_tot / 1e6 / (double)s_is, s_is);
+    interp_stats_top("pages (steps)", s_is_img, s_is_page, s_is_cnt, 6);
+    interp_stats_top("entries (calls)", s_ie_img, s_ie_pc, s_ie_cnt, 8);
+    s_is_tot = 0; s_is_t0 = now;
+}
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    if (interp_stats_on()) {
+        /* Credit an entry inside a resident code region to the image that
+         * owns it, so the list names the lift that's missing the entry. */
+        uint32_t pc = start_lsa & 0x3FFFC; int owner = ctx->image_id;
+        for (unsigned s = 0; s < 4; ++s)
+            if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
+                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
+                owner = ctx->resident_code[s].image_id;
+        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, pc);
+    }
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
@@ -445,47 +515,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
-        /* SPU_INTERP_STATS=<seconds>: how much SPU code runs interpreted, by
-         * image and 1 KB page of local store. A job module streamed in at an
-         * address nothing was lifted for runs here at a fraction of the
-         * compiled speed, and from the outside that only looks like a
-         * workload that is slow for no reason (late audio, slow decode). */
-        { static long s_is = -1;
-          if (s_is < 0) { const char* e = getenv("SPU_INTERP_STATS"); s_is = e ? atol(e) : 0; }
-          if (s_is > 0) {
-            enum { IS_N = 64 };
-            static volatile long long s_tot;
-            static int s_img[IS_N]; static uint32_t s_page[IS_N]; static volatile long long s_cnt[IS_N];
-            static unsigned long long s_t0;
-            uint32_t page = ctx->pc & ~0x3FFu;
-            int k;
-            for (k = 0; k < IS_N && s_cnt[k]; k++)
-                if (s_img[k] == ctx->image_id && s_page[k] == page) break;
-            if (k < IS_N) {
-                if (!s_cnt[k]) { s_img[k] = ctx->image_id; s_page[k] = page; }
-                s_cnt[k]++;
-            }
-            s_tot++;
-            if ((s_tot & 0xFFFF) == 0) {
-                struct timespec ts; timespec_get(&ts, TIME_UTC);   /* stdlib: fixtures link this file alone */
-                unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
-                if (!s_t0) s_t0 = now;
-                else if (now - s_t0 >= (unsigned long long)s_is * 1000ull) {
-                    fprintf(stderr, "[spu-interp] %.1fM steps/s over %lds; top pages:\n",
-                            s_tot / 1e6 / (double)s_is, s_is);
-                    for (int r = 0; r < 6; r++) {
-                        int best = -1;
-                        for (int j = 0; j < IS_N; j++)
-                            if (s_cnt[j] > 0 && (best < 0 || s_cnt[j] > s_cnt[best])) best = j;
-                        if (best < 0) break;
-                        fprintf(stderr, "  img=0x%08X ls=0x%05X  %lld steps\n",
-                                (uint32_t)s_img[best], s_page[best], s_cnt[best]);
-                        s_cnt[best] = -s_cnt[best];
-                    }
-                    for (int j = 0; j < IS_N; j++) { s_cnt[j] = 0; }
-                    s_tot = 0; s_t0 = now;
-                }
-            } } }
+        if (interp_stats_on()) interp_stats_step(ctx);
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (_tr>0 && _cap && steps == _cap) {
