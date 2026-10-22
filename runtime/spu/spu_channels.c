@@ -2157,9 +2157,14 @@ void spu_indirect_branch(spu_context* ctx)
             /* cellSpursModulePoll: report "no contention — keep running".
              * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
-                fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]);
+            /* The count restarts with every policy-module run, and a job
+             * manager runs dozens of times a second, so these lines follow the
+             * RUN/END trace: SPURS_PM_TRACE=1. */
+            { static SPU_THREAD_LOCAL int s_t = -1;
+              if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (s_t && (n <= 4 || (n % 4096) == 0))
+                  fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                          n, ctx->gpr[3]._u32[0]); }
             ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;

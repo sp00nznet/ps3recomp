@@ -17,6 +17,7 @@
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
+#include "../../runtime/ps3_log.h"       /* ps3_log_verbose */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -285,9 +286,15 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     au.dts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, dts));
     au.userData  = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, userData));
 
-    printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
-           handle, au.startAddr, au.size,
-           (unsigned long long)au.pts);
+    /* A player whose decoder is full retries the same unit until it is
+     * accepted -- thousands of times a second -- so this line is opt-in:
+     * VDEC_TRACE, or PS3_VERBOSE. */
+    { static int s_log = -1;
+      if (s_log < 0) s_log = (getenv("VDEC_TRACE") || ps3_log_verbose()) ? 1 : 0;
+      if (s_log)
+          printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
+                 handle, au.startAddr, au.size,
+                 (unsigned long long)au.pts); }
 
     if (v->ff) {
         if (v->qCount >= VDEC_BUSY_AT)
