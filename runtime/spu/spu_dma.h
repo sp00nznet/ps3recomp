@@ -1426,14 +1426,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * sequence is exactly what the pipeline diagnosis needs. */
         extern uint32_t g_barrier_sync_watch;
         static int _post = 0;
-        int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
-        if (open) {
-            if (_pn >= 96) _post++;
-            fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
-                    cmd, lsa, (unsigned long long)ea, size, tag);
-        } else if (_pn == 96)
-            fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
-        _pn++;
+        /* Once the trace has closed (96 lines and the suppression notice)
+         * nothing here can print again unless the barrier watch is armed, so
+         * stop advancing the counter: every policy-module DMA on every SPU
+         * thread was writing this one shared word. */
+        if (_pn <= 96 || g_barrier_sync_watch) {
+            int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
+            if (open) {
+                if (_pn >= 96) _post++;
+                fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
+                        cmd, lsa, (unsigned long long)ea, size, tag);
+            } else if (_pn == 96)
+                fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
+            _pn++;
+        }
     }
 
     /* Execute the transfer.
