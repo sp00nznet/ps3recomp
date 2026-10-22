@@ -109,9 +109,11 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_avconf_gamma libs/misc/tests/test_avconf_gamma.c
           /tmp/test_avconf_gamma
 
-      # The draw engine's present with PS3_AA=fxaa and PS3_SHARPEN, on the
-      # runner's GPU: FXAA blends a staircase and nothing flat, CAS steepens
-      # a soft edge by the amount asked, and with both off it is a copy.
+      # The draw engine's present with PS3_AA=fxaa/smaa, PS3_SHARPEN,
+      # PS3_VIBRANCE and PS3_CONTRAST, on the runner's GPU: FXAA and SMAA
+      # blend a staircase and nothing flat, CAS steepens a soft edge by the
+      # amount asked, vibrance and contrast move colours as asked, and with
+      # all of them off it is a copy.
       - name: Run the Metal present post-processing test
         run: |
           clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_present_post.m \
