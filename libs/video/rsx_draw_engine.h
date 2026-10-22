@@ -65,6 +65,14 @@ typedef enum {
 typedef struct rsx_be_sampler_desc {
     u8  min_linear, mag_linear, mip_linear, mip_present;
     u8  wrap_s, wrap_t, wrap_r;
+    /* What the BORDER wrap returns outside 0..1, reduced to the colours
+     * every backend can express: SET_TEXTURE_BORDER_COLOR read the way the
+     * unit's format reads it (a depth format takes its depth from the low 24
+     * bits). 0 transparent black (also the old behaviour), 1 opaque black,
+     * 2 opaque white, 3 any other colour, which the backend clamps to the
+     * edge texel instead -- nearer than black for the colours seen (a video
+     * title's chroma planes border at 0x80, neutral). */
+    u8  border;
     float min_lod, max_lod;
 } rsx_be_sampler_desc;
 

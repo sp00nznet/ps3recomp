@@ -3048,7 +3048,8 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
                   | ((u64)d->wrap_s << 4) | ((u64)d->wrap_t << 8)
                   | ((u64)d->wrap_r << 12)
                   | ((u64)(u32)(d->min_lod * 256.0f) << 16)
-                  | ((u64)(u32)(d->max_lod * 256.0f) << 32);
+                  | ((u64)(u32)(d->max_lod * 256.0f) << 32)
+                  | ((u64)(d->border & 3u) << 56);
     for (u32 i = 0; i < s_eng_samp_count; i++)
         if (s_eng_samp[i].key == key) return (int)i;
     if (s_eng_samp_count >= ENG_MAX_SAMPLERS) return -1;
@@ -3065,7 +3066,18 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
     sd.sAddressMode = gcm_wrap_to_metal(d->wrap_s);
     sd.tAddressMode = gcm_wrap_to_metal(d->wrap_t);
     sd.rAddressMode = gcm_wrap_to_metal(d->wrap_r);
-    sd.borderColor  = MTLSamplerBorderColorTransparentBlack;
+    /* SET_TEXTURE_BORDER_COLOR as far as Metal can say it (see
+     * rsx_be_sampler_desc.border): a depth map's 1.0 border is opaque white,
+     * and a colour Metal has no constant for clamps to the edge texel, which
+     * is nearer to it than black. */
+    if (d->border == 3) {
+        if (sd.sAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        if (sd.tAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        if (sd.rAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
+    }
+    sd.borderColor  = d->border == 2 ? MTLSamplerBorderColorOpaqueWhite
+                    : d->border == 1 ? MTLSamplerBorderColorOpaqueBlack
+                                     : MTLSamplerBorderColorTransparentBlack;
     if (d->min_linear && d->mip_present && eng_aniso() > 1)
         sd.maxAnisotropy = (NSUInteger)eng_aniso();
     id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];

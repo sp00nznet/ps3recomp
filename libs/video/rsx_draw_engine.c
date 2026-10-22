@@ -1334,6 +1334,27 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
  * max LOD at [18:7] and min LOD at [30:19], both 4.8 fixed point. RSX's LOD
  * bias, SET_TEXTURE_FILTER [12:0], is not applied: the reference engine
  * leaves it at zero too. */
+/* SET_TEXTURE_BORDER_COLOR as rsx_be_sampler_desc.border. The colour is
+ * ARGB; a depth texture compares against its low 24 bits as depth. inFAMOUS
+ * 2's sun shadow maps (DEPTH24_D8, wrap BORDER, a depth compare) set
+ * 0x00FFFFFF, depth 1.0, so a lookup outside the map compares against the far
+ * plane; read as transparent black it compared against 0 instead and flipped
+ * the shadow term for everything the map does not cover.
+ * PS3RECOMP_ENG_BORDER=0: always transparent black, the old behaviour. */
+static u8 eng_border_class(u32 format, u32 border)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_BORDER"); on = e ? atoi(e) : 1; }
+    if (!on) return 0u;
+    const u32 base = format & 0x9Fu;               /* without the LN/UN bits */
+    if (base >= 0x90u && base <= 0x93u)            /* DEPTH24_D8(_FLOAT), DEPTH16(_FLOAT) */
+        return (border & 0x00FFFFFFu) == 0x00FFFFFFu ? 2u : 0u;   /* 1.0 -> white, 0 -> black */
+    if (border == 0x00000000u) return 0u;
+    if (border == 0xFF000000u) return 1u;
+    if (border == 0xFFFFFFFFu) return 2u;
+    return 3u;                                     /* not expressible: edge clamp */
+}
+
 static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
                                rsx_be_sampler_desc* out)
 {
@@ -2087,6 +2108,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         if (!t.enabled || !((tex_used >> u) & 1u)) continue;
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
+        samplers[u].border = eng_border_class(t.format, t.border_color);
 
         int sampled = -1, own = 0, surface_at = -1;
         for (u32 i = 0; i < g.n_surfaces; i++) {
@@ -2200,6 +2222,7 @@ static u32 sink_bind_vertex_textures(
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
         eng_decode_sampler(vt.filter, vt.wrap, vt.control0, &samplers[u]);
+        samplers[u].border = eng_border_class(vt.format, vt.border_color);
         /* A vertex unit has no crossbar, so its remap is the identity. */
         textures[u] = eng_texture_slot(vt.location, vt.offset, vt.format,
                                        vt.width, vt.height, vt.mipmaps,

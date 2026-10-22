@@ -176,6 +176,15 @@ jobs:
             echo "--mip-aniso passed without PS3_ANISO; the check is not checking"
             exit 1
           fi
+          # SET_TEXTURE_BORDER_COLOR: a quad sampling only outside [0,1]
+          # with wrap BORDER and a white border colour, blended over the
+          # clear. It must present white, and with PS3RECOMP_ENG_BORDER=0
+          # (every border transparent black, as before) it must fail.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --border
+          if PS3RECOMP_ENG_BORDER=0 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --border; then
+            echo "--border passed with the border colour ignored; the check is not checking"
+            exit 1
+          fi
           # Render-to-texture: a red triangle drawn into a colour surface of
           # the guest's own, then sampled by a full-screen quad through the
           # guest programs. The guest bytes behind that surface are green, so
