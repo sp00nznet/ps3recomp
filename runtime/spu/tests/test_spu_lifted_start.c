@@ -44,6 +44,8 @@
  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
  */
 
+#include "spu_interp.h"
+#include "spu_overlay_residency.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -411,6 +413,184 @@ static void test_resident_code_regions(void)
     free(ctx);
 }
 
+
+/* A streamed region registered with its code bytes dispatches by residency
+ * after one exact comparison per load, never on stale or unverified bytes. */
+static void code_verified(spu_context* ctx) { ctx->gpr[3]._u32[0] = 84; }
+static void test_verified_resident_code_regions(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate verified streamed code context"); return; }
+    spu_context_init(ctx, 0);
+    const uint32_t base = 0x13000, ea = 0x800000;
+    uint8_t code[0x40];
+    for (unsigned i = 0; i < sizeof code; ++i) code[i] = (uint8_t)(0x40 + i);
+    spu_begin_image(84); spu_register_function(base, code_verified);
+    spu_begin_image(85); spu_register_function(base, code_stale);
+    spu_begin_image(0);
+    const spu_overlay_code_segment seg = {base, sizeof code, code};
+    const spu_overlay_code_segment outside = {base + 0x3F0, sizeof code, code};
+    check(!spu_overlay_register_verified_region(ea, base, 0x400, 84, &outside, 1),
+          "verified region rejects code outside its span");
+    check(spu_overlay_register_verified_region(ea, base, 0x400, 84, &seg, 1),
+          "verified region registers");
+    ctx->image_id = 85;
+
+    memcpy(ctx->ls + base, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base, 0x200);
+    check(ctx->resident_code[0].verify_state == 1, "a load leaves the region pending");
+    check(spu_lifted_lookup(ctx, base) == code_verified, "matching load dispatches its lifted code");
+    check(ctx->resident_code[0].verify_state == 2, "first dispatch verifies the load");
+    ctx->ls[base] ^= 0xFF; /* an untracked store is not re-compared per transfer */
+    check(spu_lifted_lookup(ctx, base) == code_verified, "verified load dispatches without recomparison");
+
+    spu_overlay_note_get(ctx, ea + 0x200, ctx->ls + base + 0x200, 0x100);
+    check(ctx->resident_code[0].verify_state == 1, "continuation GET re-arms verification");
+    check(spu_lifted_lookup(ctx, base) == NULL, "mismatching bytes stay interpreted");
+    check(spu_lifted_lookup(ctx, base) == NULL, "rejected load is not compared again");
+
+    memcpy(ctx->ls + base, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base, 0x200);
+    check(spu_lifted_lookup(ctx, base) == code_verified, "a fresh load is verified again");
+
+    spu_overlay_note_get(ctx, 0x900000, ctx->ls + base + 0x80, 0x80);
+    check(spu_lifted_lookup(ctx, base) != code_verified, "foreign DMA into the span clears residency");
+
+    memset(ctx->resident_code, 0, sizeof ctx->resident_code);
+    memcpy(ctx->ls + base + 0x1000, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base + 0x1000, 0x200);
+    check(!ctx->resident_code[0].image_id, "a load at another LS address is not resident");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
+/* Streamed code owns an LS interval even when its registry has a hole.
+ * Rejoining a different image at that hole executes stale guest code. */
+static void rejoin_primary(spu_context* c) { c->gpr[7]._u32[0] = 11; }
+static void rejoin_overlay(spu_context* c) { c->gpr[7]._u32[0] = 22; }
+static void rejoin_task(spu_context* c) { c->gpr[7]._u32[0] = 33; }
+static void rejoin_region(spu_context* c) { c->gpr[7]._u32[0] = 44; }
+static void test_resident_interpreter_rejoin(void)
+{
+    const uint32_t a = 0x18000, hole = a + 4, outside = a + 0x100;
+    spu_context* c = calloc(1, sizeof *c);
+    if (!c) { check(0, "allocate rejoin context"); return; }
+    spu_context_init(c, 0);
+    spu_begin_image(91);
+    spu_register_function(a, rejoin_primary);
+    spu_register_function(hole, rejoin_primary);
+    spu_register_function(outside, rejoin_primary);
+    spu_begin_image(92); spu_register_function(a, rejoin_overlay);
+    spu_register_function(hole, rejoin_overlay);
+    spu_begin_image(93); spu_register_function(a, rejoin_task);
+    spu_begin_image(94); spu_register_function(a, rejoin_region);
+    spu_begin_image(0);
+    c->image_id = 91;
+    check(spu_lifted_lookup(c, a) == rejoin_primary, "no resident identity preserves primary rejoin");
+    c->resident_ovl = 92;
+    check(spu_lifted_lookup(c, a) == rejoin_overlay, "overlay rejoin wins over same-LSA primary");
+    c->gpr[7]._u32[0] = 0; spu_dispatch(c, a);
+    check(c->gpr[7]._u32[0] == 22, "dispatcher actually executes resident overlay");
+    c->resident_task = 93;
+    check(spu_lifted_lookup(c, a) == rejoin_task, "task rejoin wins over overlay and primary");
+    check(spu_lifted_lookup(c, hole) == rejoin_overlay, "task registry hole falls through to overlay");
+    spu_overlay_register_region(0x810000, 0x100, 94);
+    spu_overlay_note_get(c, 0x810000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_region, "resident code rejoin wins all identities");
+    c->gpr[7]._u32[0] = 0; spu_dispatch(c, a);
+    check(c->gpr[7]._u32[0] == 44, "dispatcher actually executes authoritative resident code");
+    check(spu_lifted_lookup(c, hole) == NULL, "authoritative resident-code hole never rejoins stale images");
+    check(spu_lifted_lookup(c, outside) == rejoin_primary, "exclusive region end leaves primary eligible");
+    check(spu_lifted_lookup(c, a-4) == NULL, "address before region is not its code");
+    /* IL r8,123; only real interpreter execution can set this register. */
+    const uint32_t il = 0x40800000u | (123u << 7) | 8u;
+    c->ls[hole] = (uint8_t)(il >> 24); c->ls[hole+1] = (uint8_t)(il >> 16);
+    c->ls[hole+2] = (uint8_t)(il >> 8); c->ls[hole+3] = (uint8_t)il;
+    c->status = 0; c->gpr[8]._u32[0] = 0;
+    uint32_t next = spu_interp_run_until(c, hole, hole + 4);
+    check(next == hole+4 && c->gpr[8]._u32[0] == 123,
+          "owner miss executes actual LS instruction instead of stale-primary rejoin");
+    c->pc = a; c->status = 0;
+    check(spu_interp_run_until(c, a, a+4) == a && c->pc == a,
+          "interpreter rejoins correct resident entry before guest execution");
+    spu_overlay_note_get(c, 0x810010, c->ls + a + 16, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_region, "continuation DMA preserves code owner");
+    spu_overlay_note_get(c, 0x820000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_task, "conflicting DMA invalidation exposes task again");
+    c->resident_task = 0;
+    check(spu_lifted_lookup(c, a) == rejoin_overlay, "cleared task exposes overlay");
+    c->resident_ovl = 0;
+    check(spu_lifted_lookup(c, a) == rejoin_primary, "cleared resident identities expose primary");
+    check(spu_lifted_lookup(c, 0x19000) == NULL, "all registry misses stay unlifted");
+    g_spu_trampoline_fn = 0;
+    free(c);
+}
+
+/* The dispatch cache (on unless SPU_DISPATCH_CACHE=0) must answer exactly as
+ * the resolver would after each input it keys on changes: a registration, a
+ * resident-code change through spu_overlay_note_get, the resident task and
+ * overlay, and a context re-initialised at the same address. */
+static void dc_primary(spu_context* c) { c->gpr[9]._u32[0] = 1; }
+static void dc_overlay(spu_context* c) { c->gpr[9]._u32[0] = 2; }
+static void dc_task(spu_context* c)    { c->gpr[9]._u32[0] = 3; }
+static void dc_region(spu_context* c)  { c->gpr[9]._u32[0] = 4; }
+static void test_dispatch_cache(void)
+{
+    const uint32_t a = 0x1C000;
+    spu_context* c = calloc(1, sizeof *c);
+    spu_context* d = calloc(1, sizeof *d);
+    if (!c || !d) { check(0, "allocate dispatch cache contexts"); free(c); free(d); return; }
+    spu_context_init(c, 0); spu_context_init(d, 1);
+    spu_begin_image(121); spu_register_function(a, dc_primary);
+    spu_begin_image(122); spu_register_function(a, dc_overlay);
+    spu_begin_image(124); spu_register_function(a, dc_region);
+    spu_begin_image(0);
+    c->image_id = 121; d->image_id = 121;
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: first lookup resolves the primary image");
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: repeated lookup gives the same answer");
+
+    c->resident_ovl = 122;
+    check(spu_lifted_lookup(c, a) == dc_overlay, "dcache: a resident overlay changes the answer");
+    c->resident_task = 123;   /* nothing registered for the task here yet */
+    check(spu_lifted_lookup(c, a) == dc_overlay, "dcache: task miss falls through to the overlay");
+    spu_begin_image(123); spu_register_function(a, dc_task); spu_begin_image(0);
+    check(spu_lifted_lookup(c, a) == dc_task, "dcache: a later registration is seen at once");
+    c->resident_task = 0; c->resident_ovl = 0;
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: clearing task and overlay restores the primary");
+
+    spu_overlay_register_region(0x830000, 0x100, 124);
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: a resident region takes over");
+    check(spu_lifted_lookup(d, a) == dc_primary, "dcache: another context on the thread keeps its own answer");
+    spu_overlay_note_get(c, 0x840000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: a foreign GET into the region drops it");
+
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: the region is resident again");
+    spu_context_init(c, 0); c->image_id = 121;   /* same address, new lifetime */
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: a re-initialised context does not inherit entries");
+    /* A fresh lifetime that reaches the same residency count through another
+     * region must not meet the old lifetime's entry either. */
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: region resident in this lifetime");
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_overlay_register_region(0x850000, 0x100, 125);
+    spu_overlay_note_get(c, 0x850000, c->ls + a + 0x800, 16);
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: equal residency count in a new lifetime is a miss");
+
+    if (!getenv("SPU_DISPATCH_CACHE")) {
+        /* Only spu_overlay_note_get may change resident code; a direct write
+         * that bypasses it keeps the cached answer, which shows the cache is
+         * on by default. */
+        spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+        check(spu_lifted_lookup(c, a) == dc_region, "dcache: region resident before the bypass");
+        memset(c->resident_code, 0, sizeof c->resident_code);
+        check(spu_lifted_lookup(c, a) == dc_region, "dcache: on by default (a hit skips the resolver)");
+    }
+    free(c); free(d);
+}
+
 /* A real taskset also stores 0xA70 in its API table. That address alone
  * cannot distinguish Sony's resident scheduler from a synthetic HLE task. */
 static void test_lle_taskset_syscall(void)
@@ -767,6 +947,9 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_verified_resident_code_regions();
+    test_resident_interpreter_rejoin();
+    test_dispatch_cache();
     test_lle_taskset_syscall();
     test_taskset_resume_identity();
     test_guest_stack_reset();
