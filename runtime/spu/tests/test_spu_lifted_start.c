@@ -104,6 +104,8 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 void spu_wrch(spu_context*, uint32_t, u128);
 void spu_overlay_register_region(uint32_t, uint32_t, int);
 void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+void spu_overlay_register_source(uint32_t, int);
+void spu_overlay_register_sig(const uint8_t sig[16], int);
 
 /* The lifted-code registry (spu_channels.c), which the test registers into. */
 typedef void (*test_spu_fn)(spu_context*);
@@ -758,6 +760,84 @@ static void test_nonzero_link_return(void)
     free(ctx);
 }
 
+/* Small GETs (under 512 bytes) can only match an overlay source by EA, and
+ * spu_overlay_note_get skips the source scan for a small GET whose EA it has
+ * never seen registered. That shortcut must never hide a source: every
+ * registered EA still matches at every size, including while another thread
+ * is registering, and only unregistered EAs are skipped. */
+#define PREFILTER_SOURCES 120
+static uint32_t prefilter_ea(unsigned i)
+{
+    /* Dense runs, multiples of large powers of two and zero, so EAs that
+     * agree in their low or high bits all appear. */
+    if (i == 0) return 0;
+    if (i < 40) return 0x00700000u + i * 0x80u;
+    if (i < 80) return (i - 39u) << 23;
+    return 0x0A000000u + (i - 80u) * 0x10000u + 0x10u;
+}
+static volatile int g_prefilter_published;   /* sources registered so far */
+static void* prefilter_reader(void* arg)
+{
+    spu_context* ctx = (spu_context*)arg;
+    uintptr_t misses = 0;
+    for (unsigned round = 0; round < 20000; ++round) {
+        int n = __atomic_load_n(&g_prefilter_published, __ATOMIC_ACQUIRE);
+        if (!n) continue;
+        unsigned i = (round * 2654435761u) % (unsigned)n;
+        ctx->resident_ovl = 0;
+        spu_overlay_note_get(ctx, prefilter_ea(i), ctx->ls + 0x20000, 16);
+        if (ctx->resident_ovl != (int)(200 + i)) misses++;
+        if (n == PREFILTER_SOURCES && round > 10000) break;
+    }
+    return (void*)misses;
+}
+static void test_overlay_source_prefilter(void)
+{
+    spu_context* ctx[3];
+    for (int t = 0; t < 3; ++t) {
+        ctx[t] = (spu_context*)calloc(1, sizeof *ctx[t]);
+        if (!ctx[t]) { check(0, "allocate prefilter context"); return; }
+        spu_context_init(ctx[t], 0);
+    }
+    pthread_t th[3];
+    for (int t = 0; t < 3; ++t) pthread_create(&th[t], NULL, prefilter_reader, ctx[t]);
+    for (unsigned i = 0; i < PREFILTER_SOURCES; ++i) {
+        spu_overlay_register_source(prefilter_ea(i), (int)(200 + i));
+        __atomic_store_n(&g_prefilter_published, (int)(i + 1), __ATOMIC_RELEASE);
+    }
+    uintptr_t misses = 0;
+    for (int t = 0; t < 3; ++t) { void* r; pthread_join(th[t], &r); misses += (uintptr_t)r; }
+    check(misses == 0, "a small GET of an EA registered before it never misses, even mid-registration");
+
+    spu_context* c = ctx[0];
+    int all = 1;
+    static const uint32_t sizes[] = { 4, 16, 128, 511, 512, 0x400 };
+    for (unsigned i = 0; i < PREFILTER_SOURCES; ++i)
+        for (unsigned k = 0; k < sizeof sizes / sizeof sizes[0]; ++k) {
+            c->resident_ovl = 0;
+            spu_overlay_note_get(c, prefilter_ea(i), c->ls + 0x20000, sizes[k]);
+            if (c->resident_ovl != (int)(200 + i)) all = 0;
+        }
+    check(all, "every registered EA matches at every GET size");
+
+    c->resident_ovl = 5;
+    spu_overlay_note_get(c, 0x00700040u, c->ls + 0x20000, 16);
+    spu_overlay_note_get(c, 0x0BFF0000u, c->ls + 0x20000, 16);
+    check(c->resident_ovl == 5, "a small GET of an unregistered EA changes nothing");
+
+    /* Signature entries still need a sizeable GET; the EA set is not used for them. */
+    uint8_t sig[16];
+    for (int b = 0; b < 16; ++b) sig[b] = (uint8_t)(0xA0 + b);
+    spu_overlay_register_sig(sig, 330);
+    memcpy(c->ls + 0x20000, sig, 16);
+    c->resident_ovl = 5;
+    spu_overlay_note_get(c, 0x0C000040u, c->ls + 0x20000, 256);
+    check(c->resident_ovl == 5, "a small GET carrying a signature at an unregistered EA does not match");
+    spu_overlay_note_get(c, 0x0C000040u, c->ls + 0x20000, 512);
+    check(c->resident_ovl == 330, "a 512-byte GET still matches by signature");
+    for (int t = 0; t < 3; ++t) free(ctx[t]);
+}
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -773,6 +853,7 @@ int main(void)
     test_taskset_resume_stack();
     test_alternate_link_return();
     test_nonzero_link_return();
+    test_overlay_source_prefilter();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
