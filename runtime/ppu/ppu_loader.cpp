@@ -1485,9 +1485,18 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 
 extern "C" {
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
+/* -2 until PPU_RWATCH is read, -1 when unset. File scope so the gate below is
+ * one load inlined into every vm_read*, not a call. */
+static int64_t s_rwatch_lo = -2;
+static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra);
 static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
 {
-    static int64_t s_lo = -2; static uint32_t s_len = 0x10;
+    if (__builtin_expect(s_rwatch_lo == -1, 1)) return;
+    ppu_rwatch_hit_slow(a, width, ra);
+}
+static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra)
+{
+    int64_t& s_lo = s_rwatch_lo; static uint32_t s_len = 0x10;
     if (s_lo == -2) {
         const char* e = getenv("PPU_RWATCH");
         s_lo = e ? (int64_t)strtoul(e, 0, 16) : -1;
@@ -1792,8 +1801,18 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
+/* -1 until read; 0 when neither PPU_WVAL nor PPU_WWATCH is set, which with no
+ * sync-line probe armed leaves every guest store one load and one compare. */
+static int s_store_watch = -1;
+static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra);
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    if (__builtin_expect(s_store_watch == 0, 1) && !g_barrier_sync_watch) return;
+    barrier_watch_hit_slow(a, v, width, ra);
+}
+static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
+{
+    if (s_store_watch < 0) s_store_watch = getenv("PPU_WVAL") || getenv("PPU_WWATCH") ? 1 : 0;
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.
