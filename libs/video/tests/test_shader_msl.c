@@ -19,6 +19,7 @@
  *                                          what a character material does
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
  *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
+ *   FP  TEX r0, TC0 unit 0, 3D UN (END)    ... a volume addressed in texels
  *   VP  MOV o0, v0 ; TXL o1, v8 (END)      a vertex texture sampled at t16
  *   FP  MOV r0, COL0 ; MOV r2, COL0.zyxw   two colour targets: what --mrt runs
  *
@@ -362,6 +363,23 @@ int main(int argc, char** argv)
         check("3D TEX FP HLSL", g_hlsl, "rsx_tex0.Sample(rsx_samp[0]");
         if (translate("3D TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
             check("3D TEX FP MSL", g_msl, "texture3d");
+    }
+
+    /* ---- the same, with unnormalised (texel) coordinates ------------------
+     * All three coordinates are texels and are divided by width, height and
+     * depth. A float2 scale on the float3 coordinate does not compile, and
+     * the pipeline was dropped: Resistance 3's 32x32x32 volume lookups. */
+    {
+        u8 fp[16];
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp, sizeof fp, 0x40u, 0, 1u,
+            NULL, NULL, NULL, g_hlsl, sizeof g_hlsl, NULL);
+        const u32 dim[16][3] = { { 8, 4, 2 } };
+        check_count("3D UN TEX FP scale sites",
+                    rsx_fp_apply_unnorm_scale(g_hlsl, sizeof g_hlsl, 1u, dim, 0, 1u), 1);
+        check("3D UN TEX FP HLSL", g_hlsl, ".xyz * float3(0.125, 0.25, 0.5))");
+        if (translate("3D UN TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("3D UN TEX FP MSL", g_msl, "texture3d");
     }
 
     /* ---- fragment program: TEX r0, TC0 with EXP_TEX on a biased unit -----

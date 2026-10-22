@@ -4771,7 +4771,7 @@ static ID3D12PipelineState* get_pso(
      * mode. The divisor is baked into the HLSL, so the sizes are part of the
      * PSO identity and must be in the key. */
     u32 unnorm_mask = 0;
-    u32 unnorm_dim[16][2] = {{0}};
+    u32 unnorm_dim[16][3] = {{0}};
     for (u32 uu = 0; uu < 16; uu++) {
         rsx_dsp_texture ut; rsx_dsp_get_texture(&g.rsx, uu, &ut);
         if (!ut.enabled || !(ut.format & TEX_FMT_UNNORM)) continue;
@@ -4901,7 +4901,7 @@ static ID3D12PipelineState* get_pso(
             fi = -1;
         if (fi > 0) {
             const int np = rsx_fp_apply_unnorm_scale(
-                ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask);
+                ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask, 0u);
             { static int n = 0;
               if (PS3_LOG_FIRST(n, 8))
                   fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
@@ -4921,7 +4921,7 @@ static ID3D12PipelineState* get_pso(
             fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(
                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
-                unnorm_dim, cube_mask) < 0)
+                unnorm_dim, cube_mask, 0u) < 0)
             fi = -1;
     }
 #if defined(YZ_PERF_PROFILE)

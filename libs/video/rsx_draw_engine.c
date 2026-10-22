@@ -1369,18 +1369,19 @@ static u32 eng_vtex_mask(void)
  * dim. No host sampling mode is unnormalised for these, so the fragment
  * program divides the coordinates instead, and the divisor makes the sizes
  * pipeline identity (rsx_live_draw.c keys them the same way). */
-static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
+static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
-        dim[u][0] = dim[u][1] = 0;
+        dim[u][0] = dim[u][1] = dim[u][2] = 0;
         if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || !t.width || !t.height)
             continue;
         mask |= 1u << u;
         dim[u][0] = t.width;
         dim[u][1] = t.height;
+        dim[u][2] = t.depth;
     }
     return mask;
 }
@@ -1662,14 +1663,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(expand_units & (1u << u))) expand_masks[u] = 0;
 
-    u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
+    u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
     /* Shadow helpers normalize against the bound resource themselves. Only
      * sampled ordinary UN units need baked dimensions or cache identity. */
     const u32 unnorm_mask = eng_unnorm_units(unnorm_dim) &
         (fixed ? 0xFFFFu : sampled_units) & ~shadow_mask;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++)
         if (!(unnorm_mask & (1u << u)))
-            unnorm_dim[u][0] = unnorm_dim[u][1] = 0;
+            unnorm_dim[u][0] = unnorm_dim[u][1] = unnorm_dim[u][2] = 0;
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1735,7 +1736,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
-                                                (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
+                                                (const u32 (*)[3])unnorm_dim, cube_mask,
+                                                vol_mask) < 0)
             fi = -1;
         if (fi > 0 && srgb_output &&
             rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)

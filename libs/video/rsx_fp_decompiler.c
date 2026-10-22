@@ -1655,10 +1655,12 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
  * works this way, and leaves every non-UNNORM program byte-identical.
  *
  * Cube units are skipped: their coordinate is a float3 direction, and
- * RSX_TEX_FMT_UNNORM has no meaning for one.
+ * RSX_TEX_FMT_UNNORM has no meaning for one. A volume unit (Texture3D) is
+ * sampled with three coordinates, all in texels, so it is divided by its depth
+ * too (RPCS3's texture cache scales a 3D texture's r by 1/depth the same way).
  */
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
-                              const u32 dim[][2], u32 cube_mask)
+                              const u32 dim[][3], u32 cube_mask, u32 volume_mask)
 {
     if (!hlsl || !unnorm_mask) return 0;
     int patched = 0;
@@ -1666,8 +1668,9 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
     for (u32 u = 0; u < 16; u++) {
         if (!((unnorm_mask >> u) & 1u)) continue;
         if ((cube_mask >> u) & 1u) continue;
-        const u32 w = dim[u][0], h = dim[u][1];
-        if (!w || !h) continue;
+        const u32 w = dim[u][0], h = dim[u][1], d = dim[u][2];
+        const int volume = (volume_mask >> u) & 1u;
+        if (!w || !h || (volume && !d)) continue;
 
         /* Both spellings the emitter produces for a 2D unit. */
         char needles[2][40];
@@ -1693,8 +1696,12 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                 if (*p != ')') break;
 
                 char scale[80];
-                snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
-                         1.0 / (double)w, 1.0 / (double)h);
+                if (volume)
+                    snprintf(scale, sizeof scale, " * float3(%.9g, %.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h, 1.0 / (double)d);
+                else
+                    snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h);
                 const u32 slen = (u32)strlen(scale);
                 const u32 used = (u32)strlen(hlsl);
                 if (used + slen + 1 > hlsl_size) return -1;
