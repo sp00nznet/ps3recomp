@@ -208,11 +208,28 @@ static FILE* g_files[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
+/* Last transfer direction on each fd's stream: 0 none, 1 read, 2 write.
+ *
+ * C allows a read after a write on one stream only once it has been flushed or
+ * repositioned, and a write after a read only once it has been repositioned;
+ * otherwise the result is undefined. cellFs has no such rule, so a title may
+ * write and then read on one fd with nothing in between. FIOS does exactly
+ * that with its HDD cache: it writes a 512-byte header into a new cache.idx
+ * and reads on. On the MSVC CRT that read returned 3584 bytes of stale buffer
+ * and the header never reached the file (size still 0), so the index never
+ * validated and FIOS rebuilt it for good -- ICO stayed on a black screen.
+ * fs_set_dir() repositions in place (SEEK_CUR 0) when the direction changes. */
+static uint8_t g_fd_dir[FS_MAX];
+static void fs_set_dir(int fd, uint8_t dir)
+{
+    if (g_fd_dir[fd] && g_fd_dir[fd] != dir) FS_SEEK64(g_files[fd], 0, SEEK_CUR);
+    g_fd_dir[fd] = dir;
+}
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
 static int fd_alloc_file(FILE* f)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
+    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; g_fd_dir[i] = 0; return i; }
     return -1;
 }
 static int fd_alloc_dir(DIR* d)
@@ -399,7 +416,7 @@ static void cellFsClose(ppu_context* ctx)
         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
-        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
+        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
     }
     ctx->gpr[3] = CELL_OK;
 }
@@ -437,6 +454,7 @@ static void cellFsRead(ppu_context* ctx)
     long fpos_before = ftell(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
+    fs_set_dir(fd, 1);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
@@ -504,6 +522,7 @@ static void cellFsWrite(ppu_context* ctx)
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
+    fs_set_dir(fd, 2);
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
