@@ -101,6 +101,21 @@ static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
 #endif
 
+/* A port with no device behind it: nothing pressed and both sticks CENTRED.
+ * Zero is not neutral for a stick -- 0 is full deflection up / left. Port 0 is
+ * served even with no device (see cellPadGetData), and with the SDL2 backend
+ * and no controller plugged in its state was the zeroed array: every title
+ * read both sticks pushed to the top-left corner. Twisted Metal's car drove
+ * itself in circles and its chase camera pitched up at the sky, so the
+ * player's own vehicle left the screen within seconds of a match starting.
+ * A pad unplugged mid-game kept its last report the same way. */
+static void pad_host_release(PadHostState* hs)
+{
+    memset(hs, 0, sizeof(*hs));
+    hs->analog_lx = hs->analog_ly = 128;
+    hs->analog_rx = hs->analog_ry = 128;
+}
+
 /* ---------------------------------------------------------------------------
  * Rumble (cellPadSetActDirect)
  *
@@ -242,7 +257,7 @@ static void pad_poll_xinput(void)
 
         DWORD result = XInputGetState((DWORD)i, &state);
         if (result != ERROR_SUCCESS) {
-            s_host_state[i].connected = 0;
+            pad_host_release(&s_host_state[i]);
             continue;
         }
 
@@ -358,7 +373,7 @@ static void pad_poll_sdl2(void)
 
         SDL_GameController* gc = s_sdl_controllers[i];
         if (!gc || !SDL_GameControllerGetAttached(gc)) {
-            s_host_state[i].connected = 0;
+            pad_host_release(&s_host_state[i]);
             if (gc) {
                 SDL_GameControllerClose(gc);
                 s_sdl_controllers[i] = NULL;
@@ -529,7 +544,8 @@ s32 cellPadInit(u32 max_connect)
     s_pad_initialized = 1;
     s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
     memset(s_port_setting, 0, sizeof(s_port_setting));
-    memset(s_host_state, 0, sizeof(s_host_state));
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        pad_host_release(&s_host_state[i]);
 
     pad_init_backend();
 

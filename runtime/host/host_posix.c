@@ -1141,8 +1141,9 @@ static int run_thread_check(void)
  * Neither had ever been initialised off Windows -- the Windows build takes
  * WASAPI and XInput -- so nothing said whether they even run. This is not a
  * sound or input test: it is the assertion that init, a few polls and
- * shutdown complete, twice, and that a shutdown with no device open is
- * survivable. With SDL_AUDIODRIVER=dummy and no controller plugged in it
+ * shutdown complete, twice, that a shutdown with no device open is
+ * survivable, and that port 0 with no controller reports a pad at rest
+ * (sticks centred). With SDL_AUDIODRIVER=dummy and no controller plugged in it
  * needs no hardware, which is what lets CI run it.
  * -----------------------------------------------------------------------*/
 static int run_audio_pad_check(void)
@@ -1200,6 +1201,30 @@ static int run_audio_pad_check(void)
             cellPad_poll();
             struct timespec ts = { 0, 2 * 1000 * 1000 };
             nanosleep(&ts, NULL);
+        }
+
+        /* Port 0 is served with no device behind it, and what it reports
+         * then must be a pad at rest: both sticks centred (128), not zero,
+         * which is full deflection up and left -- a title would steer and
+         * turn its camera on its own. */
+        r = cellPadGetData(0, (CellPadData*)(uintptr_t)HEAP_BASE);
+        if (r != CELL_OK) {
+            fprintf(stderr, "[host] cellPadGetData(0) -> 0x%08X\n", (unsigned)r);
+            rc = 6;
+        } else {
+            static const struct { int off; const char* name; } sticks[] = {
+                { CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X, "right x" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y, "right y" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X,  "left x" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y,  "left y" },
+            };
+            for (unsigned k = 0; k < sizeof sticks / sizeof sticks[0]; k++) {
+                const uint8_t* p = vm_base + HEAP_BASE + 4u + 2u * (unsigned)sticks[k].off;
+                unsigned v = ((unsigned)p[0] << 8) | p[1];
+                printf("[host] port 0 %s stick = %u %s\n", sticks[k].name, v,
+                       v == 128 ? "OK" : "NOT CENTRED");
+                if (v != 128) rc = 6;
+            }
         }
 
         r = cellPadEnd();
