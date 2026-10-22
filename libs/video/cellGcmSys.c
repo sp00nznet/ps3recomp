@@ -210,6 +210,13 @@ typedef struct IoMapping {
 
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
+/* One past the highest slot ever handed out since the table was last cleared:
+ * every active slot is below it. Slots are taken first-free, so it stays at
+ * the peak number of simultaneous mappings. Lets gcm_ea2io_range(), which runs
+ * on every SPU PUT, skip the never-used tail of the table. It only grows
+ * between resets, so a reader racing a map or unmap elsewhere in the table
+ * still reaches every mapping that stays active. */
+static int s_io_mapping_hw = 0;
 
 /* Callback handlers — these are GUEST OPD addresses passed by the
  * recompiled game, not host function pointers. Stored as uint32_t and
@@ -445,8 +452,13 @@ static IoMapping* find_mapping_by_io(u32 io)
 static IoMapping* find_free_mapping(void)
 {
     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
-        if (!s_io_mappings[i].active)
+        if (!s_io_mappings[i].active) {
+            /* Raised before the caller activates the slot; a caller that then
+             * fails leaves it one slot high, which only costs a visit. */
+            if (i >= __atomic_load_n(&s_io_mapping_hw, __ATOMIC_RELAXED))
+                __atomic_store_n(&s_io_mapping_hw, i + 1, __ATOMIC_RELAXED);
             return &s_io_mappings[i];
+        }
     }
     return NULL;
 }
@@ -481,6 +493,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(&s_config, 0, sizeof(s_config));
     memset(&s_control, 0, sizeof(s_control));
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
+    __atomic_store_n(&s_io_mapping_hw, 0, __ATOMIC_RELAXED);
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
@@ -533,6 +546,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mappings[0].ea     = ioAddress;
         s_io_mappings[0].io     = 0;
         s_io_mappings[0].size   = ioSize;
+        __atomic_store_n(&s_io_mapping_hw, 1, __ATOMIC_RELAXED);
         s_io_mappings[0].active = 1;
         s_io_mapping_count = 1;
     }
@@ -1451,7 +1465,11 @@ static int s_spu_blk_w = 0;
 /* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
 static u32 gcm_ea2io_range(u32 ea, u32* room)
 {
-    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+    /* Called for every SPU PUT. The table has CELL_GCM_MAX_IO_MAPPINGS slots
+     * and a title uses a handful, all below the high-water mark; the first
+     * match in slot order is the one a full scan returns. */
+    const int n = __atomic_load_n(&s_io_mapping_hw, __ATOMIC_RELAXED);
+    for (int i = 0; i < n; i++) {
         IoMapping* m = &s_io_mappings[i];
         if (!m->active || !m->size) continue;
         if (ea >= m->ea && ea < m->ea + m->size) {
@@ -3688,6 +3706,7 @@ void cellGcmTerminate(void)
     memset(&s_config, 0, sizeof(s_config));
     memset(&s_control, 0, sizeof(s_control));
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
+    __atomic_store_n(&s_io_mapping_hw, 0, __ATOMIC_RELAXED);
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
