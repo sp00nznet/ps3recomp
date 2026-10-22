@@ -2,13 +2,14 @@
 """
 Batch-lift the extracted WWS SPU job modules to C.
 
-Each module is DMA'd into the SPU job code buffer at LS 0x4000 and entered at
-0x4000 + entryOffset. Because only one module is resident in the code buffer at
-a time (the FMOD-overlay model), every module lifts at the SAME base (0x4000);
-the runtime picks the resident one by content signature.
+Each module is DMA'd into the SPU job code buffer and entered at
+base + entryOffset. The base is the link address in the module header (+0x28),
+LS 0x4000 for almost every module (module_base). Because only one module is
+resident in the code buffer at a time (the FMOD-overlay model), modules share
+that base; the runtime picks the resident one by content signature.
 
 For each module:
-  1. wrap the raw bytes as a minimal SPU ELF (base 0x4000, entry 0x4000+entryOff)
+  1. wrap the raw bytes as a minimal SPU ELF (base, entry base+entryOff)
   2. run spu_lifter --auto-functions, which uses find_spu_functions.detect_functions
      to seed from entry + branch/call/jump-table targets -- so rodata past the
      last function is never disassembled (no .word data-as-code).
@@ -123,6 +124,21 @@ def switch_table_targets(raw, base=BASE):
 
 
 
+def module_base(raw):
+    """The LS address the module is linked for. The header carries it at +0x28,
+    after the 0xC0DEC0DE magic at +0x20: 0x4000, the job code buffer, for
+    almost every module, but Resistance: Fall of Man also ships modules linked
+    at 0x7000, and lifting those at 0x4000 put every lifted address 0x3000
+    short of where the job manager runs them. Anything implausible (no magic,
+    0, unaligned, or an image that would run past local store) falls back to
+    BASE."""
+    if len(raw) >= 0x2C and raw[0x20:0x24] == b"\xC0\xDE\xC0\xDE":
+        b = struct.unpack_from(">I", raw, 0x28)[0]
+        if b and b % 0x10 == 0 and b + len(raw) <= 0x40000:
+            return b
+    return BASE
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -157,17 +173,18 @@ def main():
         name = os.path.splitext(os.path.basename(path))[0]         # jobmod_<sha>_e<entry>
         sha  = name.split("_")[1]
         entry_off = struct.unpack_from(">I", raw, 0x10)[0]
-        entry = BASE + entry_off
+        base = module_base(raw)
+        entry = base + entry_off
         prefix = f"{name}_"
         outsub = os.path.join(OUTDIR, name)
         # content signature: first 16 bytes (the 4 ila header uniquely identify a module)
         sig = raw[:16]
 
-        elf = wrap(raw, base=BASE, entry=entry)
+        elf = wrap(raw, base=base, entry=entry)
         with open(tmp_elf, "wb") as f:
             f.write(elf)
 
-        cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(BASE),
+        cmd = [sys.executable, LIFTER, "--auto-functions", tmp_elf, "--base", hex(base),
                "--symbol-prefix", prefix, "-o", outsub,
                "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h"]
         if name in CODE_END:
@@ -175,9 +192,9 @@ def main():
         if args.merge_chunks:
             cmd += ["--merge-chunks"]
         # Only offer addresses that fall inside THIS module's image.
-        inside = [a for a in EXTRA_FUNCS if BASE <= int(a, 0) < BASE + len(raw)]
+        inside = [a for a in EXTRA_FUNCS if base <= int(a, 0) < base + len(raw)]
         # The module's first function starts right after the 0x30-byte header
-        # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
+        # (`4 ila | entry | size | . | . | C0DEC0DE | . | base | .`). Usually it is
         # reached by a branch and found anyway, but in two modules it is a bare
         # `bi $r0` stub reached only through a function pointer the job builds at
         # run time (base + 0x30, relocated via the entry's ila/brsl base probe), so
@@ -186,9 +203,9 @@ def main():
         # corrupted stack (drain-mismatch return_pc=0x50C8 pc=0xA800, jobmod
         # ef33c6c99dc7). Seeding it is exact, not a heuristic: every module's
         # first instruction is at +0x30.
-        inside.append(hex(BASE + 0x30))
-        inside += [hex(a) for a in manual_link_targets(raw)]
-        inside += [hex(a) for a in switch_table_targets(raw)]
+        inside.append(hex(base + 0x30))
+        inside += [hex(a) for a in manual_link_targets(raw, base)]
+        inside += [hex(a) for a in switch_table_targets(raw, base)]
         if inside:
             cmd += ["--extra-funcs", ",".join(inside)]
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -204,7 +221,7 @@ def main():
             if "unsupported instruction(s)" in s:
                 unsup = int(s.split()[0])
         manifest.append({
-            "name": name, "prefix": prefix, "base": BASE, "entry": entry,
+            "name": name, "prefix": prefix, "base": base, "entry": entry,
             "entry_off": entry_off, "sig": sig.hex(), "size": len(raw),
             "funcs": funcs, "unsupported": unsup,
         })
