@@ -18,6 +18,28 @@
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+static SRWLOCK s_vdec_lock = SRWLOCK_INIT;
+#define VDEC_LOCK()   AcquireSRWLockExclusive(&s_vdec_lock)
+#define VDEC_UNLOCK() ReleaseSRWLockExclusive(&s_vdec_lock)
+static u64 vdec_now_ms(void) { return (u64)GetTickCount64(); }
+#else
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+static pthread_mutex_t s_vdec_lock = PTHREAD_MUTEX_INITIALIZER;
+#define VDEC_LOCK()   pthread_mutex_lock(&s_vdec_lock)
+#define VDEC_UNLOCK() pthread_mutex_unlock(&s_vdec_lock)
+static u64 vdec_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
@@ -54,6 +76,9 @@ typedef struct {
     CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
     u32 newPics;        /* pictures queued by the current decode call */
     u64 nextPts;        /* synthesized PTS for an AU that carries none (90 kHz) */
+    u32 picsDecoded;    /* pictures the decoder has given back, this sequence */
+    u64 lastAuMs;       /* when the last AU arrived (idle drain) */
+    int idleDrained;    /* the idle drain already ran since that AU */
 } VdecSlot;
 
 static VdecSlot s_vdec[MAX_VDEC];
@@ -122,15 +147,88 @@ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
     q->item.height    = (u16)pic->height;
     v->qCount++;
     v->newPics++;
+    v->picsDecoded++;
 }
 
-/* PICOUT for each picture the last decoder call queued. */
+/* PICOUT for each picture the last decoder call queued. The count is taken
+ * under the lock; the callbacks run outside it, because a title's PICOUT
+ * handler may call GetPicItem/GetPicture right away. */
 static void vdec_notify_new_pics(CellVdecHandle handle)
 {
+    VDEC_LOCK();
     u32 n = s_vdec[handle].newPics;
     s_vdec[handle].newPics = 0;
+    VDEC_UNLOCK();
     while (n--)
         vdec_notify(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
+}
+
+/* Idle drain. libavcodec holds back the pictures a B-frame stream may still
+ * reorder (has_b_frames of them) until it sees the next AU or the end of the
+ * stream. A title that waits for every picture before it calls EndSeq never
+ * gets the last ones, and EndSeq is where they used to come out: Resistance's
+ * movie player is handed 5583 pictures for its 5584-AU intro and waits for the
+ * last one for ever, so the level behind the movie never loads.
+ *
+ * When a sequence has had no AU for VDEC_IDLE_DRAIN_MS (default 1500, 0 =
+ * off), the title has taken every picture it was given (the queue is empty,
+ * so it is waiting on the decoder, not the other way round) and the decoder
+ * still owes pictures, drain it as EndSeq would and announce them. The drain
+ * flushes the decoder, so if the title was only stalled and sends more AUs,
+ * they decode from the next reference picture on -- a glitch, where not
+ * draining is a hang. Both other conditions matter: Resistance holds back AUs
+ * for over 500 ms while it prebuffers (pictures still queued) and, on a
+ * loaded host, mid-movie. */
+static void* vdec_idle_thread(void* arg)
+{
+    (void)arg;
+    const char* e = getenv("VDEC_IDLE_DRAIN_MS");
+    const u64 idle_ms = e ? (u64)strtoull(e, NULL, 0) : 1500u;
+    if (!idle_ms) return NULL;
+    for (;;) {
+#ifdef _WIN32
+        Sleep(50);
+#else
+        usleep(50 * 1000);
+#endif
+        for (CellVdecHandle h = 0; h < MAX_VDEC; h++) {
+            VDEC_LOCK();
+            VdecSlot* v = &s_vdec[h];
+            int drained = 0;
+            if (v->in_use && v->ff && v->seqStarted && !v->idleDrained &&
+                v->qCount == 0 && v->picsDecoded < v->auCount && v->lastAuMs &&
+                vdec_now_ms() - v->lastAuMs >= idle_ms) {
+                v->idleDrained = 1;
+                vdec_ff_drain(v->ff, vdec_on_picture, v);
+                printf("[cellVdec] handle %u idle %llu ms: drained to %u of %u pictures\n",
+                       h, (unsigned long long)idle_ms, v->picsDecoded, v->auCount);
+                drained = 1;
+            }
+            VDEC_UNLOCK();
+            if (drained)
+                vdec_notify_new_pics(h);
+        }
+    }
+    return NULL;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI vdec_idle_thread_w32(LPVOID arg) { vdec_idle_thread(arg); return 0; }
+#endif
+
+static void vdec_idle_thread_start(void)
+{
+    static int started = 0;
+    if (started) return;
+    started = 1;
+#ifdef _WIN32
+    HANDLE t = CreateThread(NULL, 0, vdec_idle_thread_w32, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, vdec_idle_thread, NULL) == 0)
+        pthread_detach(t);
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -176,16 +274,20 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
 
     for (int i = 0; i < MAX_VDEC; i++) {
         if (!s_vdec[i].in_use) {
+            VDEC_LOCK();
             memset(&s_vdec[i], 0, sizeof(VdecSlot));
             s_vdec[i].in_use = 1;
             s_vdec[i].codecType = codec_type;
             s_vdec[i].cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
             s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
             s_vdec[i].ff = vdec_ff_open(codec_type);
+            VDEC_UNLOCK();
             vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellVdec] Open -> handle=%u\n", i);
-            if (s_vdec[i].ff)
+            if (s_vdec[i].ff) {
                 printf("[cellVdec] decoding with libavcodec\n");
+                vdec_idle_thread_start();
+            }
             return CELL_OK;
         }
     }
@@ -215,12 +317,14 @@ s32 cellVdecClose(CellVdecHandle handle)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
 
+    VDEC_LOCK();
     if (s_vdec[handle].ff) {
         vdec_queue_clear(&s_vdec[handle]);
         vdec_ff_close(s_vdec[handle].ff);
         s_vdec[handle].ff = NULL;
     }
     s_vdec[handle].in_use = 0;
+    VDEC_UNLOCK();
     return CELL_OK;
 }
 
@@ -231,13 +335,19 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
 
+    VDEC_LOCK();
     s_vdec[handle].seqStarted = 1;
     if (s_vdec[handle].ff) {
         /* A new sequence: nothing from the last one is shown. */
         vdec_ff_reset(s_vdec[handle].ff);
         s_vdec[handle].nextPts = 0;
         vdec_queue_clear(&s_vdec[handle]);
+        s_vdec[handle].auCount = 0;
+        s_vdec[handle].picsDecoded = 0;
+        s_vdec[handle].lastAuMs = 0;
+        s_vdec[handle].idleDrained = 0;
     }
+    VDEC_UNLOCK();
     return CELL_OK;
 }
 
@@ -248,14 +358,16 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
 
-    s_vdec[handle].seqStarted = 0;
-
     /* Pictures the decoder still holds for reordering come out now, each
      * with its PICOUT, before SEQDONE. */
-    if (s_vdec[handle].ff) {
+    VDEC_LOCK();
+    s_vdec[handle].seqStarted = 0;
+    const int ff = s_vdec[handle].ff != NULL;
+    if (ff)
         vdec_ff_drain(s_vdec[handle].ff, vdec_on_picture, &s_vdec[handle]);
+    VDEC_UNLOCK();
+    if (ff)
         vdec_notify_new_pics(handle);
-    }
 
     /* Notify sequence done */
     vdec_notify(handle, CELL_VDEC_MSG_TYPE_SEQDONE, CELL_OK);
@@ -290,14 +402,20 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
            (unsigned long long)au.pts);
 
     if (v->ff) {
-        if (v->qCount >= VDEC_BUSY_AT)
+        VDEC_LOCK();
+        if (v->qCount >= VDEC_BUSY_AT) {
+            VDEC_UNLOCK();
             return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
+        }
         v->auCount++;
         v->aus[v->auCount % VDEC_AU_RING] = au;
         v->newPics = 0;
         if (au.size)   /* an empty packet would mean end of stream to FFmpeg */
             vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
                            vdec_on_picture, v);
+        v->lastAuMs = vdec_now_ms();
+        v->idleDrained = 0;
+        VDEC_UNLOCK();
         vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
         vdec_notify_new_pics(handle);
         return CELL_OK;
@@ -417,12 +535,16 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
         return (s32)CELL_VDEC_ERROR_ARG;
     const VdecSlot* v = &s_vdec[handle];
     if (v->ff) {
-        if (!v->qCount)
+        VDEC_LOCK();
+        if (!v->qCount) {
+            VDEC_UNLOCK();
             return (s32)CELL_VDEC_ERROR_EMPTY;
+        }
         const VdecPic* q = &v->queue[v->qHead];
         vdec_write_item(handle, &q->item);
         vdec_write_pic_type(handle, q);
         vm_write32(out, VDEC_ITEM_EA(handle));
+        VDEC_UNLOCK();
         return CELL_OK;
     }
     if (!s_vdec[handle].hasPic)
@@ -446,6 +568,14 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
     VdecPic* q = &v->queue[v->qHead];
     v->qHead = (v->qHead + 1) % VDEC_QUEUE;
     v->qCount--;
+    /* VDEC_PICLOG=1: the first pictures handed out, with where they went, then
+     * every 1000th and the last few before the AU count. */
+    { static int s_pl = -1; static unsigned s_n = 0;
+      if (s_pl < 0) s_pl = getenv("VDEC_PICLOG") ? 1 : 0;
+      s_n++;
+      if (s_pl && (s_n <= 16 || s_n % 1000 == 0 || v->auCount < s_n + 4))
+          printf("[cellVdec] GetPicture #%u (AUs %u) %ux%u type=%u matrix=%u alpha=%u -> 0x%08X\n",
+                 s_n, v->auCount, q->item.width, q->item.height, type, matrix, alpha, dst); }
     if (dst)                                           /* NULL: a skip */
         vdec_store_picture(dst, q->yuv, q->item.width, q->item.height,
                            type, matrix, alpha);
@@ -460,9 +590,13 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
-    if (v->ff)
-        return vdec_take_picture(v, dst, vm_read32(fmt_ea + 0),
-                                 vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 8));
+    if (v->ff) {
+        VDEC_LOCK();
+        s32 rc = vdec_take_picture(v, dst, vm_read32(fmt_ea + 0),
+                                   vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 8));
+        VDEC_UNLOCK();
+        return rc;
+    }
     if (!v->hasPic)
         return (s32)CELL_VDEC_ERROR_EMPTY;
     v->hasPic = 0;
@@ -509,8 +643,11 @@ s32 cellVdecGetPictureExt(CellVdecHandle handle, const void* format,
         return CELL_OK;
     if (!fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;
-    return vdec_take_picture(&s_vdec[handle], dst, vm_read32(fmt_ea + 0),
-                             vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 0xC));
+    VDEC_LOCK();
+    s32 rc = vdec_take_picture(&s_vdec[handle], dst, vm_read32(fmt_ea + 0),
+                               vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 0xC));
+    VDEC_UNLOCK();
+    return rc;
 }
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)

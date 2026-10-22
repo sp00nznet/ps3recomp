@@ -67,8 +67,16 @@ foreach(c avc mpeg2)
     add_test(NAME vdec_disabled_${c} COMMAND test_vdec_ffmpeg stub ${c} ${VDEC_MEDIA}/v.${es})
     set_tests_properties(vdec_disabled_${c} PROPERTIES
         ENVIRONMENT "PS3RECOMP_FFMPEG=0;${VDEC_LIB_ENV}")
-    set_tests_properties(vdec_decode_${c} vdec_rgba_${c} PROPERTIES
-        ENVIRONMENT "${VDEC_LIB_ENV}" SKIP_RETURN_CODE 77)
+    # No EndSeq: the pictures held for reordering come out once the title
+    # has taken the rest and no AU arrives (VDEC_IDLE_DRAIN_MS), and with
+    # the drain off they stay held.
+    add_test(NAME vdec_idle_${c} COMMAND test_vdec_ffmpeg idle ${c}
+        ${VDEC_MEDIA}/v.${es} ${VDEC_MEDIA}/ref_${es}.yuv 192 108 200)
+    add_test(NAME vdec_idle_off_${c} COMMAND test_vdec_ffmpeg idle ${c}
+        ${VDEC_MEDIA}/v.${es} ${VDEC_MEDIA}/ref_${es}.yuv 192 108 0)
+    set_tests_properties(vdec_decode_${c} vdec_rgba_${c} vdec_idle_${c} vdec_idle_off_${c}
+        PROPERTIES ENVIRONMENT "${VDEC_LIB_ENV}" SKIP_RETURN_CODE 77)
     set_tests_properties(vdec_decode_${c} vdec_rgba_${c} vdec_disabled_${c}
+        vdec_idle_${c} vdec_idle_off_${c}
         PROPERTIES FIXTURES_REQUIRED vdec_media)
 endforeach()

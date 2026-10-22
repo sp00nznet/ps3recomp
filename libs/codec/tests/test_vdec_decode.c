@@ -21,6 +21,13 @@
  *                          ARGB32 and RGBA32 output against FFmpeg's
  *                          (swscale) RGBA decode by PSNR; channel order
  *                          swapped must fail.
+ *   idle   CODEC ES REF W H MS
+ *                          every AU, then no EndSeq: with VDEC_IDLE_DRAIN_MS=MS
+ *                          the pictures the decoder holds back for reordering
+ *                          still come out, with their PICOUTs, once the title
+ *                          has taken the rest; not while pictures wait in the
+ *                          queue. MS 0 (drain off) is the control: they stay
+ *                          held until EndSeq.
  * CODEC: avc | mpeg2.
  */
 #include "../cellVdec.c"
@@ -412,6 +419,94 @@ static int mode_rgba(int argc, char** argv)
     return 0;
 }
 
+static void sleep_ms(unsigned ms)
+{
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000u);
+#endif
+}
+
+static int mode_idle(int argc, char** argv)
+{
+    CHECK(argc == 8);
+    u32 codec = parse_codec(argv[2]);
+    u32 W = (u32)atoi(argv[5]), H = (u32)atoi(argv[6]);
+    unsigned ms = (unsigned)atoi(argv[7]);
+    size_t len, rlen;
+    u8* es = read_file(argv[3], &len);
+    u8* ref = read_file(argv[4], &rlen);
+    split(es, len, codec == CELL_VDEC_CODEC_TYPE_AVC);
+    s_frame_size = (size_t)W * H * 3 / 2;
+    int nref = (int)(rlen / s_frame_size);
+    CHECK(nref > 0 && rlen == (size_t)nref * s_frame_size);
+    s_frames = (u8*)malloc((size_t)MAX_AU * 2 * s_frame_size);
+
+    /* Read by the drain thread, which the first decoder Open starts. */
+#ifdef _WIN32
+    _putenv_s("VDEC_IDLE_DRAIN_MS", argv[7]);
+#else
+    setenv("VDEC_IDLE_DRAIN_MS", argv[7], 1);
+#endif
+    u32 h = open_decoder(codec);
+#ifdef PS3RECOMP_FFMPEG_RUNTIME
+    if (!s_vdec[h].ff && !ps3_ffmpeg_get()) { printf("SKIP: libavcodec not loadable\n"); return 77; }
+#endif
+    CHECK(s_vdec[h].ff);
+
+    /* Every AU, taking each picture as it comes, except after the last one. */
+    s_npic = 0;
+    s_nmsg = 0;
+    CHECK(cellVdecStartSeq(h) == CELL_OK);
+    for (int i = 0; i < s_nau; i++) {
+        CHECK(submit(h, es, i) == CELL_OK);
+        if (i + 1 < s_nau) take_pictures(h, codec, 3);
+    }
+    const unsigned wait = ms ? ms * 2 + 200 : 1000;
+    VDEC_LOCK();
+    const u32 queued = s_vdec[h].qCount;
+    VDEC_UNLOCK();
+    CHECK(queued > 0);
+    sleep_ms(wait);
+    /* Pictures still waiting to be taken: nothing is drained yet. */
+    VDEC_LOCK();
+    CHECK(s_vdec[h].qCount == queued && !s_vdec[h].idleDrained);
+    VDEC_UNLOCK();
+    take_pictures(h, codec, 3);
+    const int held = nref - s_npic;
+    printf("idle %u ms: %d AUs in, %d pictures out, %d held by the decoder\n",
+           ms, s_nau, s_npic, held);
+    CHECK(held > 0);            /* the stream reorders, so the decoder owes some */
+
+    /* The queue is empty now; wait for the drain. */
+    for (unsigned t = 0; t < wait && s_npic < nref; t += 20) {
+        sleep_ms(20);
+        take_pictures(h, codec, 3);
+    }
+    if (ms == 0) {
+        /* Control: with the drain off they stay held, which is the hang. */
+        CHECK(s_npic == nref - held);
+        CHECK(cellVdecEndSeq(h) == CELL_OK);
+        take_pictures(h, codec, 3);
+        CHECK(s_npic == nref && count_mismatches(ref, nref) == 0);
+        printf("idle off: %d pictures held until EndSeq\n", held);
+    } else {
+        CHECK(s_npic == nref);
+        CHECK(count_mismatches(ref, nref) == 0);
+        CHECK(count_msgs(CELL_VDEC_MSG_TYPE_PICOUT) == nref);
+        CHECK(count_msgs(CELL_VDEC_MSG_TYPE_SEQDONE) == 0);
+        /* EndSeq after the drain: nothing more to give, still SEQDONE. */
+        CHECK(cellVdecEndSeq(h) == CELL_OK);
+        CHECK(s_msgs[s_nmsg - 1] == CELL_VDEC_MSG_TYPE_SEQDONE);
+        CHECK(count_msgs(CELL_VDEC_MSG_TYPE_PICOUT) == nref);
+        printf("idle drain: the %d held pictures came out without EndSeq, all equal to ffmpeg's\n", held);
+    }
+    CHECK(cellVdecClose(h) == CELL_OK);
+    printf("idle: OK\n");
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -422,6 +517,7 @@ int main(int argc, char** argv)
     if (strcmp(mode, "stub") == 0)   return mode_stub(argc, argv);
     if (strcmp(mode, "decode") == 0) return mode_decode(argc, argv);
     if (strcmp(mode, "rgba") == 0)   return mode_rgba(argc, argv);
+    if (strcmp(mode, "idle") == 0)   return mode_idle(argc, argv);
     printf("unknown mode %s\n", mode);
     return 2;
 }
