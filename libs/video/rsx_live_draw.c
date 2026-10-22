@@ -5224,7 +5224,9 @@ static int fetch_attr(u32 i, u32 base, u32 vertex_id, u32 base_index,
         p = dc.inl + at;
     } else {
         p = guest_ptr(
-            a.location, base + a.offset + source_element * stride, elem_size);
+            a.location,
+            rsx_dsp_resolve_vertex_offset(base, a.offset) + source_element * stride,
+            elem_size);
     }
     if (!p) return 0;
     for (u32 c = 0; c < a.size && c < 4; c++) {
@@ -5492,7 +5494,8 @@ static const float* dc_vertex_attr_canonical(
             ref->vertex_id, ref->base_index, fetch->desc.frequency,
             (dc.fetch_plan.divider_mask >> attr) & 1u);
         const u64 offset =
-            (u64)dc.fetch_plan.base_offset + fetch->desc.offset +
+            (u64)rsx_dsp_resolve_vertex_offset(dc.fetch_plan.base_offset,
+                                               fetch->desc.offset) +
             (u64)element * fetch->stride;
         if (offset <= UINT32_MAX) {
             const u8* source = guest_ptr(

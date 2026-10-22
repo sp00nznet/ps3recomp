@@ -242,8 +242,8 @@ void rsx_vertex_fetch_plan_prepare(
             if (element > last) last = element;
         }
 
-        const u64 prefix =
-            (u64)plan->base_offset + (u64)fetch->desc.offset;
+        const u64 prefix = rsx_dsp_resolve_vertex_offset(
+            plan->base_offset, fetch->desc.offset);
         const u64 start = prefix + (u64)first * fetch->stride;
         const u64 end =
             prefix + (u64)last * fetch->stride + fetch->elem_size;
@@ -293,7 +293,8 @@ int rsx_vertex_fetch_one(
             source = NULL;
         } else if (plan->guest_ptr) {
             const u32 offset =
-                plan->base_offset + fetch->desc.offset +
+                rsx_dsp_resolve_vertex_offset(plan->base_offset,
+                                              fetch->desc.offset) +
                 element * fetch->stride;
             source = plan->guest_ptr(
                 plan->guest_user, fetch->desc.location, offset,

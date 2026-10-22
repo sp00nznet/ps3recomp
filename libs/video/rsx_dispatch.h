@@ -224,6 +224,17 @@ static inline u32 rsx_dsp_resolve_vertex_index(u32 index, u32 base_index)
     return (index + base_index) & 0x000FFFFFu;
 }
 
+/* VERTEX_DATA_BASE_OFFSET is added to an array's offset and the sum is taken
+ * modulo 2^28 (the size of a location's address space) before it is
+ * translated through the array's location, for local and main memory alike.
+ * Resistance: Fall of Man relies on the wrap: its world lighting stream sits
+ * at base + offset = 0x1Fxxxxxx, which is local 0x0Fxxxxxx. The element
+ * offset (index * stride) is added after the mask. */
+static inline u32 rsx_dsp_resolve_vertex_offset(u32 base_offset, u32 array_offset)
+{
+    return (base_offset + array_offset) & 0x0FFFFFFFu;
+}
+
 /* Index array state (IDXBUF_OFFSET / IDXBUF_FORMAT) */
 typedef struct rsx_dsp_index_array {
     u32 offset;

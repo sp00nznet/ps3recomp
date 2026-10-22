@@ -8,6 +8,9 @@
  * references, some past the 20-bit element wrap: every attribute's stable
  * range (base, first, last) must be what the old walk gave.
  *
+ * Also: VERTEX_DATA_BASE_OFFSET + an array's offset wraps at 28 bits, for
+ * both the stable span and the per-element fetch.
+ *
  * Build (from the repo root):
  *   clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video \
  *     -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c \
@@ -80,7 +83,8 @@ static void ref_prepare(rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs,
             if (element < first) first = element;
             if (element > last) last = element;
         }
-        const u64 prefix = (u64)plan->base_offset + (u64)fetch->desc.offset;
+        /* base + array offset wraps at 28 bits (rsx_dispatch.h) */
+        const u64 prefix = (plan->base_offset + fetch->desc.offset) & 0x0FFFFFFFu;
         const u64 start = prefix + (u64)first * fetch->stride;
         const u64 end = prefix + (u64)last * fetch->stride + fetch->elem_size;
         if (start > UINT_MAX || end > 0x100000000ull || end <= start || end - start > UINT_MAX)
@@ -101,6 +105,7 @@ static void random_plan(rsx_vertex_fetch_plan* plan, int use_inline,
     memset(plan, 0, sizeof *plan);
     rsx_vertex_layout_plan_init(&plan->layout, rnd() & 0xFFFFu);
     plan->base_offset = (rnd() % 4 == 0) ? rnd() % 256u : 0;
+    if (rnd() % 8 == 0) plan->base_offset += (1u + rnd() % 15u) << 28;
     plan->divider_mask = rnd() & 0xFFFFu;
     plan->guest_ptr = guest_ptr;
     u32 inline_packed = 0;
@@ -128,8 +133,54 @@ static void random_plan(rsx_vertex_fetch_plan* plan, int use_inline,
     }
 }
 
+/* Resistance: Fall of Man's world lighting stream (UB256 x4, stride 4) sits
+ * at VERTEX_DATA_BASE_OFFSET + array offset = 0x1Fxxxxxx, past the end of
+ * local memory; wrapped at 28 bits it is local 0x0Fxxxxxx. Here the sum is
+ * 0x10000100, which must read local 0x100, through the stable span and
+ * through the per-element fetch. */
+static void test_offset_wraps_at_28_bits(void)
+{
+    memset(guest, 0, sizeof guest);
+    mapped_end[0] = mapped_end[1] = GUEST;
+    const u32 local = 0x0100;
+    for (u32 v = 0; v < 4; v++)
+        for (u32 c = 0; c < 4; c++) guest[0][local + v * 4 + c] = (u8)(10 * v + c + 1);
+
+    for (int stable = 0; stable < 2; stable++) {
+        rsx_vertex_fetch_plan plan;
+        memset(&plan, 0, sizeof plan);
+        rsx_vertex_layout_plan_init(&plan.layout, 1u << 4);
+        plan.base_offset = 0x0D9272C0u;
+        plan.guest_ptr = guest_ptr;
+        rsx_vertex_fetch_attr* f = &plan.attr[4];
+        f->desc.type = RSX_VTX_TYPE_UINT8;
+        f->desc.size = 4;
+        f->desc.stride = 4;
+        f->desc.location = 0;
+        f->desc.offset = 0x10000000u + local - plan.base_offset;
+        f->elem_size = rsx_vertex_attrib_size(f->desc.type, f->desc.size);
+        f->stride = 4;
+        rsx_vertex_ref refs[4];
+        for (u32 v = 0; v < 4; v++) { refs[v].vertex_id = v; refs[v].base_index = 0; }
+        if (stable) {
+            rsx_vertex_fetch_plan_prepare(&plan, refs, 4);
+            CHECK(plan.attr[4].stable_base == guest[0] + local,
+                  "stable span not at the wrapped offset");
+        }
+        for (u32 v = 0; v < 4; v++) {
+            float out[4] = {0, 0, 0, 0};
+            CHECK(rsx_vertex_fetch_one(&plan, &refs[v], (u8*)out), "fetch %u failed", v);
+            CHECK(out[0] == 10.0f * v + 1 && out[3] == 10.0f * v + 4,
+                  "%s fetch vertex %u read %g..%g", stable ? "stable" : "per-element",
+                  v, out[0], out[3]);
+        }
+    }
+}
+
 int main(void)
 {
+    test_offset_wraps_at_28_bits();
+
     enum { PLANS = 6000, MAXV = 200 };
     static rsx_vertex_ref refs[MAXV];
     static u8 inl[8192];
