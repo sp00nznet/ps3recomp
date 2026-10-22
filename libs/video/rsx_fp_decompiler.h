@@ -143,7 +143,8 @@ int rsx_fp_decompile_buffered_shadow_ex(
     char* out, u32 out_size, u32* out_constant_count);
 
 /* Extract the exact runtime inline-CONST payload. Returns the slot count on
- * success or -1 for an unterminated/truncated/oversized program. */
+ * success or -1 for an unterminated/truncated/oversized program. Only the
+ * first `count` slots are written; the rest of `values` is left as it was. */
 int rsx_fp_collect_constants(
     const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
 

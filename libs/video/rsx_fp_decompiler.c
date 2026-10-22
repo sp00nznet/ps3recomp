@@ -165,7 +165,7 @@ int rsx_fp_collect_constants(
 {
     if (!ucode || !out)
         return -1;
-    memset(out, 0, sizeof(*out));
+    out->count = 0;
 
     u32 off = 0;
     while (off + 16 <= max_bytes) {

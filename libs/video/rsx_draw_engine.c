@@ -44,6 +44,8 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
+#define ENG_PIPELINE_INDEX 16384u        /* open-addressed key index, 2x the table */
+#define ENG_VP_MEMO        8
 #define ENG_MAX_BATCHES    256
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
@@ -137,6 +139,16 @@ typedef struct {
 
 typedef struct { u32 first, count; } eng_batch;
 
+/* A vertex program's identity hash, remembered with the exact bytes it was
+ * computed from: the transform program changes only on upload, but every
+ * draw re-derives the pipeline key from it. */
+typedef struct {
+    const u8* uc;
+    u32 bytes;
+    u64 seed, hash;
+    u8 copy[RSX_DSP_VP_INSTR * 16u];
+} eng_vp_memo;
+
 typedef struct {
     u32 location, offset, pitch, width, height;
     int valid;
@@ -158,6 +170,9 @@ static struct {
     u32 n_textures;
     eng_pipeline pipelines[ENG_MAX_PIPELINES];
     u32 n_pipelines;
+    u16 pipeline_index[ENG_PIPELINE_INDEX];   /* pipelines[] slot + 1, 0 = empty */
+    eng_vp_memo vp_memo[ENG_VP_MEMO];
+    u32 vp_memo_next;
     eng_display_buffer display_buffers[8];
 
     u32 frames;
@@ -252,6 +267,31 @@ static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
     const u8* p = (const u8*)data;
     for (u32 i = 0; i < n; i++) { hash ^= p[i]; hash *= 1099511628211ull; }
     return hash;
+}
+
+/* eng_fnv1a(uc, bytes, seed) for a vertex program, reused while the bytes
+ * are unchanged. A byte compare is far cheaper than the byte-serial hash. */
+static u64 eng_vp_hash(const u8* uc, u32 bytes, u64 seed)
+{
+    if (bytes > sizeof g.vp_memo[0].copy) return eng_fnv1a(uc, bytes, seed);
+    for (u32 i = 0; i < ENG_VP_MEMO; i++) {
+        eng_vp_memo* m = &g.vp_memo[i];
+        if (m->uc == uc && m->bytes == bytes && m->seed == seed &&
+            !memcmp(m->copy, uc, bytes))
+            return m->hash;
+    }
+    eng_vp_memo* m = &g.vp_memo[g.vp_memo_next++ % ENG_VP_MEMO];
+    m->uc = uc;
+    m->bytes = bytes;
+    m->seed = seed;
+    memcpy(m->copy, uc, bytes);
+    m->hash = eng_fnv1a(uc, bytes, seed);
+    return m->hash;
+}
+
+static u32 eng_pipeline_slot(u64 key)
+{
+    return (u32)((key ^ (key >> 29)) * 0x9E3779B97F4A7C15ull >> 40) & (ENG_PIPELINE_INDEX - 1u);
 }
 
 /* ---- render state -------------------------------------------------------- */
@@ -1671,7 +1711,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (!(unnorm_mask & (1u << u)))
             unnorm_dim[u][0] = unnorm_dim[u][1] = 0;
 
-    memset(&g.fp_constants, 0, sizeof g.fp_constants);
+    g.fp_constants.count = 0;
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
         return 0;
 
@@ -1685,7 +1725,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
-        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+        key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
         if (!key) return 0;
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
@@ -1711,13 +1751,16 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
     key = rsx_draw_engine_hash_render_state(rs, key);
 
-    for (u32 i = 0; i < g.n_pipelines; i++)
-        if (g.pipelines[i].key == key) {
-            *out_fixed = g.pipelines[i].fixed;
-            *out_tex_used = g.pipelines[i].tex_used;
-            *out_fp_hash = g.pipelines[i].fp_hash;
-            return g.pipelines[i].handle;
+    u32 slot = eng_pipeline_slot(key);
+    for (; g.pipeline_index[slot]; slot = (slot + 1u) & (ENG_PIPELINE_INDEX - 1u)) {
+        const eng_pipeline* p = &g.pipelines[g.pipeline_index[slot] - 1u];
+        if (p->key == key) {
+            *out_fixed = p->fixed;
+            *out_tex_used = p->tex_used;
+            *out_fp_hash = p->fp_hash;
+            return p->handle;
         }
+    }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
     u32 handle = 0;
@@ -1795,6 +1838,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         (u16)(fixed ? 0xFFFFu : eng_sampled_units(s_ps_hlsl));
     *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
     *out_fp_hash = fp_hash;
+    g.pipeline_index[slot] = (u16)(g.n_pipelines + 1u);
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
