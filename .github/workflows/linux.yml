@@ -144,6 +144,14 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
           /tmp/test_np_identity
 
+      # The net-start dialog ends cancelled offline and connected with
+      # PS3_NET_ONLINE=1, its result word big-endian.
+      - name: Run the net-start dialog test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/system -o /tmp/test_netctl_netstart libs/network/tests/test_netctl_netstart.c
+          /tmp/test_netctl_netstart
+          PS3_NET_ONLINE=1 /tmp/test_netctl_netstart
+
       # cellVideoOutSetGamma's float argument comes from f1, and the value
       # reaches the presenter.
       - name: Run the video out gamma test

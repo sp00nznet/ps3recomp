@@ -182,7 +182,8 @@ s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid);
 s32 cellNetCtlDelHandler(s32 hid);
 
 /* Net-start ("connect to PSN") dialog. In an offline native recomp we never
- * show it — these report an immediate successful connection. */
+ * show it: it finishes at once, connected with PS3_NET_ONLINE=1 and cancelled
+ * (CELL_NET_CTL_ERROR_DIALOG_CANCELED) otherwise. */
 s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param);
 s32 cellNetCtlNetStartDialogAbortAsync(void);
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result);
