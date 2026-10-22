@@ -36,6 +36,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
 static int g_pass = 0, g_fail = 0, g_verbose = 0;
 
@@ -88,6 +92,129 @@ static int translate(const char* what, int stage)
     g_pass++;
     if (g_verbose) printf("---- %s MSL ----\n%s\n", what, g_msl);
     return 0;
+}
+
+/* ---- the translation cache ----------------------------------------------
+ * rsx_hlsl_to_msl keeps each translation in memory and, with
+ * PS3RECOMP_MSL_CACHE=<dir>, on disk: a new process (simulated by
+ * rsx_hlsl_to_msl_cache_reset) is served from the file with the same text, a
+ * damaged file is a miss and is rewritten, and a failed translation is not
+ * kept. */
+static void check_true(const char* what, int ok)
+{
+    printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
+    if (ok) g_pass++; else g_fail++;
+}
+
+static RsxMslCacheStats cache_stats(void)
+{
+    RsxMslCacheStats s;
+    rsx_hlsl_to_msl_cache_stats(&s);
+    return s;
+}
+
+#ifndef _WIN32
+/* The one .msl file in dir, or "" when there is not exactly one. */
+static void only_msl_file(const char* dir, char* out, size_t size)
+{
+    DIR* d = opendir(dir);
+    int n = 0;
+    out[0] = 0;
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        size_t len = strlen(e->d_name);
+        if (len > 4 && strcmp(e->d_name + len - 4, ".msl") == 0) {
+            snprintf(out, size, "%s/%s", dir, e->d_name);
+            n++;
+        }
+    }
+    closedir(d);
+    if (n != 1) out[0] = 0;
+}
+#endif
+
+static char g_msl2[65536];
+
+static void test_cache(void)
+{
+    static const char* kPS =
+        "float4 main(float4 pos : SV_Position, float4 col : COLOR0) : SV_Target0 {\n"
+        "    return col.zyxw * 0.5;\n"
+        "}\n";
+    RsxMslCacheStats s;
+    unsetenv("PS3RECOMP_MSL_CACHE");
+    rsx_hlsl_to_msl_cache_reset();
+
+    check_true("cache: first request translates",
+               rsx_hlsl_to_msl(kPS, RSX_SHADER_STAGE_FRAGMENT, g_msl, sizeof g_msl, g_log, sizeof g_log) == 0);
+    check_true("cache: the same request again",
+               rsx_hlsl_to_msl(kPS, RSX_SHADER_STAGE_FRAGMENT, g_msl2, sizeof g_msl2, g_log, sizeof g_log) == 0 &&
+               strcmp(g_msl, g_msl2) == 0);
+    s = cache_stats();
+    check_true("cache: ... from memory, translated once", s.translations == 1 && s.memory_hits == 1);
+    {
+        /* Valid as either stage: no inputs, one output. */
+        static const char* kBoth = "float4 main() : SV_Target0 { return float4(1, 0, 0, 1); }\n";
+        const int vs = rsx_hlsl_to_msl(kBoth, RSX_SHADER_STAGE_VERTEX, g_msl, sizeof g_msl, g_log, sizeof g_log);
+        const int fs = rsx_hlsl_to_msl(kBoth, RSX_SHADER_STAGE_FRAGMENT, g_msl2, sizeof g_msl2, g_log, sizeof g_log);
+        s = cache_stats();
+        check_true("cache: the same text for two stages is two entries",
+                   vs == 0 && fs == 0 && s.translations == 3 && s.memory_hits == 1 &&
+                   strcmp(g_msl, g_msl2) != 0);
+    }
+    {
+        char small[16];
+        check_true("cache: a hit larger than the buffer fails",
+                   rsx_hlsl_to_msl(kPS, RSX_SHADER_STAGE_FRAGMENT, small, sizeof small, NULL, 0) == -1);
+    }
+    const u32 before = cache_stats().translations;
+    check_true("cache: broken HLSL fails",
+               rsx_hlsl_to_msl("float4 main( {", RSX_SHADER_STAGE_FRAGMENT, g_msl2, sizeof g_msl2, g_log, sizeof g_log) != 0 &&
+               rsx_hlsl_to_msl("float4 main( {", RSX_SHADER_STAGE_FRAGMENT, g_msl2, sizeof g_msl2, g_log, sizeof g_log) != 0 &&
+               cache_stats().translations == before);
+
+#ifndef _WIN32
+    char dir[] = "/tmp/ps3recomp_msl_cache_XXXXXX";
+    if (!mkdtemp(dir)) { check_true("cache: mkdtemp", 0); return; }
+    setenv("PS3RECOMP_MSL_CACHE", dir, 1);
+    rsx_hlsl_to_msl_cache_reset();
+    check_true("cache: disk, first run translates",
+               rsx_hlsl_to_msl(kPS, RSX_SHADER_STAGE_FRAGMENT, g_msl, sizeof g_msl, g_log, sizeof g_log) == 0);
+    s = cache_stats();
+    check_true("cache: ... with the translator", s.translations == 1 && s.disk_hits == 0);
+    char path[1024];
+    only_msl_file(dir, path, sizeof path);
+    check_true("cache: ... and writes one file", path[0] != 0);
+
+    rsx_hlsl_to_msl_cache_reset();
+    check_true("cache: disk, next run",
+               rsx_hlsl_to_msl(kPS, RSX_SHADER_STAGE_FRAGMENT, g_msl2, sizeof g_msl2, g_log, sizeof g_log) == 0);
+    s = cache_stats();
+    check_true("cache: ... from the file, no translation", s.disk_hits == 1 && s.translations == 0);
+    check_true("cache: ... with the same MSL", strcmp(g_msl, g_msl2) == 0);
+
+    /* Damage the stored key: the file no longer matches the request. */
+    if (path[0]) {
+        FILE* f = fopen(path, "r+b");
+        if (f) { fseek(f, 16 * 4 + 10, SEEK_SET); fputc('#', f); fclose(f); }
+    }
+    rsx_hlsl_to_msl_cache_reset();
+    check_true("cache: damaged file",
+               rsx_hlsl_to_msl(kPS, RSX_SHADER_STAGE_FRAGMENT, g_msl2, sizeof g_msl2, g_log, sizeof g_log) == 0 &&
+               strcmp(g_msl, g_msl2) == 0);
+    s = cache_stats();
+    check_true("cache: ... is a miss, translated again", s.translations == 1 && s.disk_hits == 0);
+    rsx_hlsl_to_msl_cache_reset();
+    rsx_hlsl_to_msl(kPS, RSX_SHADER_STAGE_FRAGMENT, g_msl2, sizeof g_msl2, g_log, sizeof g_log);
+    s = cache_stats();
+    check_true("cache: ... and was rewritten", s.disk_hits == 1 && s.translations == 0);
+
+    if (path[0]) unlink(path);
+    rmdir(dir);
+    unsetenv("PS3RECOMP_MSL_CACHE");
+    rsx_hlsl_to_msl_cache_reset();
+#endif
 }
 
 int main(int argc, char** argv)
@@ -444,6 +571,8 @@ int main(int argc, char** argv)
             check_absent("precise math FP MSL", g_msl, "fast::");
         }
     }
+
+    test_cache();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

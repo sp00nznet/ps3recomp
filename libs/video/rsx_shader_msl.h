@@ -51,6 +51,21 @@ int rsx_hlsl_to_msl(const char* hlsl, int stage,
                     char* out, u32 out_size,
                     char* log, u32 log_size);
 
+/* The translation cache (rsx_shader_msl.cpp). A request is answered from
+ * memory, else from PS3RECOMP_MSL_CACHE's directory, else by glslang and
+ * spirv-cross. Deleting the directory is always safe. */
+typedef struct RsxMslCacheStats {
+    u32 memory_hits;
+    u32 disk_hits;
+    u32 translations;   /* glslang + spirv-cross runs that succeeded */
+} RsxMslCacheStats;
+
+void rsx_hlsl_to_msl_cache_stats(RsxMslCacheStats* out);
+
+/* Empties the memory cache, zeroes the counters and reads
+ * PS3RECOMP_MSL_CACHE again on the next request. Disk files stay. */
+void rsx_hlsl_to_msl_cache_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

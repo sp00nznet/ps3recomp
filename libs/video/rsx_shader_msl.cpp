@@ -36,7 +36,11 @@
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
 #include <spirv_cross_c.h>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -103,6 +107,14 @@ bool hlsl_to_spirv(const char* hlsl, EShLanguage lang, std::vector<unsigned int>
     return true;
 }
 
+/* PS3RECOMP_MSL_FAST=1: keep spirv-cross's fast:: math (see spirv_to_msl). */
+bool msl_keep_fast()
+{
+    static int keep_fast = -1;
+    if (keep_fast < 0) keep_fast = getenv("PS3RECOMP_MSL_FAST") ? 1 : 0;
+    return keep_fast != 0;
+}
+
 /* SPIR-V -> MSL into `out`. Returns false with the reason in `log`. */
 bool spirv_to_msl(const std::vector<unsigned int>& spirv, char* out, u32 out_size,
                   char* log, u32 log_size)
@@ -153,10 +165,8 @@ bool spirv_to_msl(const std::vector<unsigned int>& spirv, char* out, u32 out_siz
          * NaN from those. inFAMOUS 2's sky/bloom pass did, only on Metal.
          * The precise:: overloads follow IEEE fmax/fmin. PS3RECOMP_MSL_FAST=1
          * keeps the fast:: spelling. */
-        static int keep_fast = -1;
-        if (keep_fast < 0) keep_fast = getenv("PS3RECOMP_MSL_FAST") ? 1 : 0;
         std::string text(msl);
-        if (!keep_fast)
+        if (!msl_keep_fast())
             for (size_t at = 0; (at = text.find("fast::", at)) != std::string::npos; at += 9)
                 text.replace(at, 6, "precise::");
         if (text.size() + 1 > out_size) {
@@ -170,6 +180,137 @@ done:
     /* The MSL string belongs to the context; it was copied out above. */
     spvc_context_destroy(ctx);
     return ok;
+}
+
+/* ---- translation cache -------------------------------------------------
+ * The translation is most of what a guest pipeline's first use costs on
+ * Metal: in inFAMOUS 2 it was 83% of the 2.1 s that 218 first uses took
+ * over two minutes of play, with single frames of up to 366 ms, against ~16%
+ * for newLibraryWithSource and under 1% for the pipeline state (Metal keeps
+ * its own cache of those). So the MSL text is kept, in memory and, with
+ * PS3RECOMP_MSL_CACHE=<dir>, on disk across runs, as rsx_shader_spirv.cpp
+ * keeps SPIR-V. A file stands for one stage + HLSL text + PS3RECOMP_MSL_FAST
+ * setting, and its header names the glslang and spirv-cross versions and
+ * this file's build: a file written by any other combination is a miss. */
+const u32 kCacheFormat = 1;
+const u32 kCacheMagic = 0x4C534D52u;   /* "RMSL" */
+const char kTranslatorBuild[24] = __DATE__ " " __TIME__;
+
+struct Cache {
+    std::mutex lock;
+    std::unordered_map<std::string, std::string> map;
+    std::string dir;
+    bool dir_read = false;
+    RsxMslCacheStats stats = {};
+};
+
+Cache& cache()
+{
+    static Cache c;
+    return c;
+}
+
+const std::string& cache_dir(Cache& c)
+{
+    if (!c.dir_read) {
+        const char* e = getenv("PS3RECOMP_MSL_CACHE");
+        c.dir = (e && *e) ? e : "";
+        c.dir_read = true;
+    }
+    return c.dir;
+}
+
+/* The stage, the fast-math setting, then the HLSL text. */
+std::string cache_key(const char* hlsl, int stage)
+{
+    std::string key(1, (char)('0' + stage));
+    key += msl_keep_fast() ? 'f' : 'p';
+    key += hlsl;
+    return key;
+}
+
+std::string cache_path(const std::string& dir, const std::string& key)
+{
+    unsigned long long h = 0xcbf29ce484222325ull;       /* FNV-1a 64 */
+    for (unsigned char ch : key) { h ^= ch; h *= 0x100000001b3ull; }
+    char name[40];
+    snprintf(name, sizeof name, "/%016llx.msl", h);
+    return dir + name;
+}
+
+/* Header: magic, format, glslang major/minor/patch, spirv-cross C API
+ * major/minor/patch, translator build (six words), key bytes, MSL bytes;
+ * then the key and the MSL. */
+const int kHeaderWords = 16;
+
+void cache_header(u32 hdr[kHeaderWords], const std::string& key, size_t msl_bytes)
+{
+    const glslang::Version v = glslang::GetVersion();
+    unsigned sx_major = 0, sx_minor = 0, sx_patch = 0;
+    spvc_get_version(&sx_major, &sx_minor, &sx_patch);
+    hdr[0] = kCacheMagic; hdr[1] = kCacheFormat;
+    hdr[2] = (u32)v.major; hdr[3] = (u32)v.minor; hdr[4] = (u32)v.patch;
+    hdr[5] = sx_major; hdr[6] = sx_minor; hdr[7] = sx_patch;
+    memcpy(&hdr[8], kTranslatorBuild, sizeof kTranslatorBuild);
+    hdr[14] = (u32)key.size(); hdr[15] = (u32)msl_bytes;
+}
+
+bool cache_load(const std::string& path, const std::string& key, std::string& msl)
+{
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    u32 want[kHeaderWords], hdr[kHeaderWords];
+    cache_header(want, key, 0);
+    bool ok = fread(hdr, sizeof hdr, 1, f) == 1 &&
+              memcmp(hdr, want, (kHeaderWords - 1) * sizeof(u32)) == 0 &&
+              hdr[kHeaderWords - 1] != 0 && hdr[kHeaderWords - 1] <= (16u << 20);
+    if (ok) {
+        std::string stored(key.size(), '\0');
+        ok = fread(&stored[0], 1, stored.size(), f) == stored.size() && stored == key;
+    }
+    if (ok) {
+        msl.assign(hdr[kHeaderWords - 1], '\0');
+        ok = fread(&msl[0], 1, msl.size(), f) == msl.size();
+    }
+    fclose(f);
+    if (!ok) msl.clear();
+    return ok;
+}
+
+/* Written under a temporary name and renamed, so a reader never sees half a file. */
+void cache_store(const std::string& path, const std::string& key, const std::string& msl)
+{
+    char suffix[48];
+    snprintf(suffix, sizeof suffix, ".%zx.tmp", std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    const std::string tmp = path + suffix;
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    u32 hdr[kHeaderWords];
+    cache_header(hdr, key, msl.size());
+    bool ok = fwrite(hdr, sizeof hdr, 1, f) == 1 &&
+              fwrite(key.data(), 1, key.size(), f) == key.size() &&
+              fwrite(msl.data(), 1, msl.size(), f) == msl.size();
+    ok = (fclose(f) == 0) && ok;
+#ifdef _WIN32
+    if (ok) remove(path.c_str());      /* rename does not replace on Windows */
+#endif
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) remove(tmp.c_str());
+}
+
+/* HLSL -> MSL text, uncached. */
+bool translate(const char* hlsl, int stage, std::string& msl, char* log, u32 log_size)
+{
+    if (!glslang_ready()) {
+        put_log(log, log_size, "glslang::InitializeProcess failed", nullptr);
+        return false;
+    }
+    const EShLanguage lang = (stage == RSX_SHADER_STAGE_VERTEX) ? EShLangVertex : EShLangFragment;
+    std::vector<unsigned int> spirv;
+    if (!hlsl_to_spirv(hlsl, lang, spirv, log, log_size)) return false;
+    std::vector<char> out(512u * 1024u);
+    if (!spirv_to_msl(spirv, out.data(), (u32)out.size(), log, log_size)) return false;
+    msl = out.data();
+    return true;
 }
 
 } // namespace
@@ -186,20 +327,67 @@ extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
         return -1;
     }
     out[0] = '\0';
-    if (!glslang_ready()) {
-        put_log(log, log_size, "glslang::InitializeProcess failed", nullptr);
+    if (stage != RSX_SHADER_STAGE_VERTEX && stage != RSX_SHADER_STAGE_FRAGMENT) {
+        put_log(log, log_size, "unknown shader stage", nullptr);
         return -1;
     }
-    const EShLanguage lang = (stage == RSX_SHADER_STAGE_VERTEX) ? EShLangVertex : EShLangFragment;
-    std::vector<unsigned int> spirv;
-    if (!hlsl_to_spirv(hlsl, lang, spirv, log, log_size)) return -1;
-    if (!spirv_to_msl(spirv, out, out_size, log, log_size)) return -1;
+
+    /* One lock around the whole lookup and translation: glslang's process
+     * state is not documented as thread-safe either. */
+    Cache& c = cache();
+    std::lock_guard<std::mutex> guard(c.lock);
+    const std::string key = cache_key(hlsl, stage);
+    auto it = c.map.find(key);
+    if (it != c.map.end()) {
+        c.stats.memory_hits++;
+    } else {
+        std::string msl;
+        const std::string& dir = cache_dir(c);
+        const std::string path = dir.empty() ? std::string() : cache_path(dir, key);
+        if (!dir.empty() && cache_load(path, key, msl)) {
+            c.stats.disk_hits++;
+        } else {
+            if (!translate(hlsl, stage, msl, log, log_size)) return -1;
+            c.stats.translations++;
+            if (!dir.empty()) cache_store(path, key, msl);
+        }
+        it = c.map.emplace(key, std::move(msl)).first;
+    }
+    const std::string& msl = it->second;
+    if (msl.size() + 1 > out_size) {
+        put_log(log, log_size, "MSL output buffer too small", nullptr);
+        return -1;
+    }
+    memcpy(out, msl.c_str(), msl.size() + 1);
     return 0;
+}
+
+extern "C" void rsx_hlsl_to_msl_cache_stats(RsxMslCacheStats* out)
+{
+    Cache& c = cache();
+    std::lock_guard<std::mutex> guard(c.lock);
+    if (out) *out = c.stats;
+}
+
+extern "C" void rsx_hlsl_to_msl_cache_reset(void)
+{
+    Cache& c = cache();
+    std::lock_guard<std::mutex> guard(c.lock);
+    c.map.clear();
+    c.dir_read = false;
+    c.stats = {};
 }
 
 #else /* !PS3RECOMP_HAVE_MSL_TRANSLATION */
 
 extern "C" int rsx_hlsl_to_msl_available(void) { return 0; }
+
+extern "C" void rsx_hlsl_to_msl_cache_stats(RsxMslCacheStats* out)
+{
+    if (out) memset(out, 0, sizeof *out);
+}
+
+extern "C" void rsx_hlsl_to_msl_cache_reset(void) {}
 
 extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
                                char* out, u32 out_size,
