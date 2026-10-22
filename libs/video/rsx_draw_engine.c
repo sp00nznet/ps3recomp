@@ -1934,12 +1934,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         dc.fetch_ok = 0;
         return;
     }
-    for (u32 i = 0; i < dc.n_refs; i++) {
-        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
-        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
-            dc.fetch_ok = 0;
-            return;
-        }
+    if (!rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
+                               layout->stride ? dc.verts : NULL)) {
+        dc.fetch_ok = 0;
+        return;
     }
     dc.n_verts = dc.n_refs;
 }

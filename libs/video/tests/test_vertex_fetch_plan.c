@@ -6,7 +6,9 @@
  * vertex type, strides and offsets, frequency dividers in both modes, guest
  * memory that is partly unmapped, INLINE_ARRAY streams -- with random index
  * references, some past the 20-bit element wrap: every attribute's stable
- * range (base, first, last) must be what the old walk gave.
+ * range (base, first, last) must be what the old walk gave, and
+ * rsx_vertex_fetch_many must produce exactly the bytes and the result of
+ * rsx_vertex_fetch_one over the same references.
  *
  * Build (from the repo root):
  *   clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video \
@@ -133,7 +135,9 @@ int main(void)
     enum { PLANS = 6000, MAXV = 200 };
     static rsx_vertex_ref refs[MAXV];
     static u8 inl[8192];
-    int stable = 0, divided = 0;
+    int stable = 0, divided = 0, fetched = 0;
+    for (u32 i = 0; i < GUEST; i++) { guest[0][i] = (u8)rnd(); guest[1][i] = (u8)rnd(); }
+    for (u32 i = 0; i < sizeof inl; i++) inl[i] = (u8)rnd();
 
     for (int n = 0; n < PLANS; n++) {
         for (int l = 0; l < 2; l++)
@@ -152,6 +156,21 @@ int main(void)
         ref = plan;
         rsx_vertex_fetch_plan_prepare(&plan, refs, count);
         ref_prepare(&ref, refs, count);
+        /* The batched fetch against one vertex at a time. */
+        {
+            static u8 one[MAXV * 256], many[MAXV * 256];
+            const u32 stride = plan.layout.stride;
+            int ok_one = 1;
+            memset(one, 0xCD, sizeof one);
+            memset(many, 0xCD, sizeof many);
+            for (u32 i = 0; i < count && ok_one; i++)
+                ok_one = rsx_vertex_fetch_one(&plan, &refs[i], one + (size_t)i * stride);
+            const int ok_many = rsx_vertex_fetch_many(&plan, refs, count, many);
+            CHECK(ok_one == ok_many, "plan %d: fetch_many %d, fetch_one %d", n, ok_many, ok_one);
+            CHECK(!ok_one || !memcmp(one, many, (size_t)count * stride),
+                  "plan %d: fetch_many vertices differ from fetch_one", n);
+            if (ok_one) fetched++;
+        }
         for (u32 at = 0; at < RSX_DSP_NUM_VERTEX_ATTR; at++) {
             CHECK(plan.attr[at].stable_base == ref.attr[at].stable_base &&
                   plan.attr[at].stable_first == ref.attr[at].stable_first &&
@@ -167,9 +186,9 @@ int main(void)
         }
     }
 
-    printf("test_vertex_fetch_plan: %d plans, %d stable ranges (%d divided), %d failure(s)\n",
-           PLANS, stable, divided, fails);
-    if (stable < PLANS || divided < 100) {
+    printf("test_vertex_fetch_plan: %d plans, %d stable ranges (%d divided), %d fetched, %d failure(s)\n",
+           PLANS, stable, divided, fetched, fails);
+    if (stable < PLANS || divided < 100 || fetched < PLANS / 2) {
         printf("FAIL: too few cases exercised a path\n");
         return 1;
     }
