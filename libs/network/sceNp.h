@@ -29,6 +29,7 @@ extern "C" {
 #define SCE_NP_ERROR_ABORTED                    0x8002aa0b
 #define SCE_NP_ERROR_OFFLINE                    0x8002aa0c
 #define SCE_NP_ERROR_INTERNAL                   0x8002aaff
+#define SCE_NP_AUTH_EINVALID_ARGUMENT           0x8002a015
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -124,6 +125,9 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs);
 #define SCE_NP_MANAGER_STATUS_ONLINE            3
 
 typedef void (*SceNpManagerCallback)(s32 event, s32 result, void* arg);
+/* The manager callback's event for a ticket request's answer; result is the
+ * ticket's size, or a negative error. */
+#define SCE_NP_MANAGER_EVENT_GOT_TICKET         255
 
 s32 sceNpManagerGetStatus(s32* status);
 s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg);
@@ -132,6 +136,15 @@ s32 sceNpManagerGetNpId(SceNpId* npId);
 s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId);
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* onlineName);
 s32 sceNpManagerGetAccountAge(s32* age);
+
+/* Tickets, account region and network time. Every pointer is a guest
+ * address. OFFLINE without a psnr server; see sceNp.c. */
+s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
+                               u32 cookieSize, u32 entitlementId, u32 consumedCount);
+s32 sceNpManagerGetTicket(u32 buffer, u32 bufferSize);
+s32 sceNpManagerGetTicketParam(s32 paramId, u32 param);
+s32 sceNpManagerGetAccountRegion(u32 countryCode, u32 language);
+s32 sceNpManagerGetNetworkTime(u32 pTick);
 
 /* NPDRM availability checks. The guest passes its klicensee (16 bytes) and the
  * path of an EDAT/SELF; the klicensee is handed to the EDAT reader, which then
