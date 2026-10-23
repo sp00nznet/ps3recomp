@@ -893,8 +893,19 @@ static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park 
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
 /* How long a self-JUMP park may stand with `put` somewhere else before the
- * drain gives up on it being patched and follows `put` instead. */
+ * drain gives up on it being patched and follows `put` instead.
+ * GCM_PARK_GRACE_MS=<ms> sets it. A title that appends after the park, moves
+ * `put` there and patches the park last needs it longer: God of War HD,
+ * loading its menu, has taken more than 50 ms between the two stores, and
+ * following `put` dropped the commands in between, a fence with them, so
+ * the boot stopped. The RSX itself would just wait. */
 #define GCM_PARK_GRACE_MS 50ull
+static unsigned long long gcm_park_grace_ms(void)
+{
+    static long long ms = -1;
+    if (ms < 0) { const char* e = getenv("GCM_PARK_GRACE_MS"); ms = e ? atoll(e) : (long long)GCM_PARK_GRACE_MS; }
+    return (unsigned long long)ms;
+}
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -2003,7 +2014,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - park_since >= gcm_park_grace_ms()) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
