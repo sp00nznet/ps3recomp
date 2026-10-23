@@ -1,6 +1,7 @@
-/* The NEON integer/permute helpers must be bit-identical to their scalar
- * references (spu_*_ref) for random operands and every shift amount. Build on
- * arm64:  cc -O2 -I.. -I../.. -I../../.. test_spu_int_neon.c -o t && ./t */
+/* The NEON integer/permute helpers, and the SSE4.1 forms of the first 27,
+ * must be bit-identical to their scalar references (spu_*_ref) for random
+ * operands and every shift amount. Build on arm64, or on x86-64 with -msse4.1:
+ *   cc -O2 [-msse4.1] -I.. -I../.. -I../../.. test_spu_int_neon.c -o t && ./t */
 #include "../spu_helpers.h"
 #include <stdio.h>
 
@@ -24,8 +25,8 @@ static void check(const char* op, u128 got, u128 ref, u128 a, u128 b, int imm)
 
 int main(void)
 {
-#if !defined(__ARM_NEON)
-    puts("test_spu_int_neon: no NEON, nothing to compare");
+#if !defined(__ARM_NEON) && !defined(SPU_INT_SSE)
+    puts("test_spu_int_neon: no NEON or SSE4.1 forms, nothing to compare");
     return 0;
 #else
     const long N = 200000;
@@ -47,6 +48,7 @@ int main(void)
     }
     if (s_bad) { printf("test_spu_int_neon: %ld mismatches\n", s_bad); return 1; }
     printf("test_spu_int_neon: ok (%ld random cases x 27 ops)\n", N);
+#if defined(__ARM_NEON)
 
     /* The per-lane ops vectorised for tests/bench/spu. Shift and rotate counts come per lane,
      * so b is drawn three ways: random bits, a small count (0..80, past every lane width) in
@@ -78,6 +80,7 @@ int main(void)
     }
     if (s_bad) { printf("test_spu_int_neon: %ld mismatches (vectorised per-lane ops)\n", s_bad); return 1; }
     printf("test_spu_int_neon: ok (%ld cases x 60 vectorised per-lane ops)\n", 4 * N);
+#endif
     return 0;
 #endif
 }
