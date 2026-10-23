@@ -51,6 +51,9 @@ typedef struct {
     spu_lifted_entry_fn fn;
     int                 image_id;
     const char*         name;
+    /* Masked registrations only (var_len != 0): the image is `size` bytes and
+     * its fingerprint takes [var_off, var_off + var_len) as zero. */
+    uint32_t            size, var_off, var_len;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
@@ -101,6 +104,51 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
             if (image_id_out) *image_id_out = s_registry[i].image_id;
             return s_registry[i].fn;
         }
+    if (image_id_out) *image_id_out = 0;
+    return NULL;
+}
+
+void spu_workload_register_img_masked(uint64_t fingerprint, spu_lifted_entry_fn fn,
+                                      int image_id, const char* name,
+                                      uint32_t size, uint32_t var_off,
+                                      uint32_t var_len)
+{
+    if (!fn || !size || !var_len || var_off > size || var_len > size - var_off) {
+        fprintf(stderr, "[spu_workload] bad masked registration '%s' "
+                        "(size 0x%X, area 0x%X+0x%X)\n",
+                name ? name : "?", size, var_off, var_len);
+        return;
+    }
+    spu_workload_register_img(fingerprint, fn, image_id, name);
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            s_registry[i].size    = size;
+            s_registry[i].var_off = var_off;
+            s_registry[i].var_len = var_len;
+            return;
+        }
+}
+
+spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
+                                                 uint64_t* fp_out,
+                                                 int* image_id_out)
+{
+    const uint8_t* p = (const uint8_t*)data;
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        const spu_workload_entry* e = &s_registry[i];
+        if (!e->var_len || e->size != n) continue;
+        /* spu_workload_fingerprint() with the variable area read as zero. */
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t k = 0; k < n; k++) {
+            const uint8_t b = (k - e->var_off < e->var_len) ? 0 : p[k];
+            h ^= b;
+            h *= 1099511628211ULL;
+        }
+        if (h != e->fp) continue;
+        if (fp_out) *fp_out = h;
+        if (image_id_out) *image_id_out = e->image_id;
+        return e->fn;
+    }
     if (image_id_out) *image_id_out = 0;
     return NULL;
 }
