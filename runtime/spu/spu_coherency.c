@@ -12,6 +12,7 @@
 
 #include <stdlib.h>
 #include "spu_coherency.h"
+#include "spu_coh_bitmap.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -69,18 +70,17 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
  * line outside a hardcoded window would be silently non-coherent, which is the
  * failure this whole file exists to remove.
  * ===========================================================================*/
-#define SPU_COH_LINE_SHIFT  7                                  /* 128-byte lines */
 #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
 #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
 static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
 
-/* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
- * bitmap entirely for a title that runs no SPU code, and keeps every existing
- * test that stores through vm_write* paying one compare against a hot global.
- * Written once, under the lock; read unlocked, where a stale zero costs at most
- * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+/* g_spu_coh_bits (spu_coh_bitmap.h) stays NULL until the first GETLLAR
+ * anywhere. That keeps the PPU fast path off the bitmap entirely for a title
+ * that runs no SPU code, and keeps every existing test that stores through
+ * vm_write* paying one compare against a hot global. Written under the lock;
+ * read unlocked, where a stale NULL costs at most one missed event on the very
+ * first reservation of the run. */
 
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
@@ -95,9 +95,16 @@ unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
+    /* Read before writing. The kernel reserves the same few lines over and
+     * over, and a store of the same value still takes the cache line away
+     * from every other core: each PPU store then missed on the pointer and on
+     * the bitmap byte. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    const unsigned char bit = (unsigned char)(1u << (line & 7));
+    if (!(s_coh_bitmap[line >> 3] & bit))
+        s_coh_bitmap[line >> 3] |= bit;
+    if (!g_spu_coh_bits)
+        g_spu_coh_bits = s_coh_bitmap;
 
     if (!ctx) return;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
@@ -170,9 +177,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (!s_coh_armed) return 0;
-    uint32_t line = addr >> SPU_COH_LINE_SHIFT;
-    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    return spu_coh_line_reserved(addr);
 }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own

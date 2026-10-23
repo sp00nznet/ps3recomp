@@ -34,6 +34,7 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
+#include "../spu/spu_coh_bitmap.h"   /* spu_coh_line_reserved, for the stores */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
@@ -767,8 +768,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * to serialize through the SPU lock-line lock, or it can land inside a PUTLLC's
  * compare and be written straight back over; and it has to raise SPU_EVENT_LR,
  * which is how an SPURS idle service parked in `rdch SPU_RdEventStat` finds out
- * work was posted. spu_coh_is_reserved reads a global that stays zero until an
- * SPU reserves its first line, so an ordinary store pays one branch. */
+ * work was posted. The stores test the bitmap inline (spu_coh_line_reserved):
+ * a pointer that stays NULL until an SPU reserves its first line, so an
+ * ordinary store pays one branch. */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
@@ -1473,7 +1475,7 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(a))) {                             \
+        if (spu_coh_line_reserved((uint32_t)(a))) {                           \
             spu_lockline_lock();                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
