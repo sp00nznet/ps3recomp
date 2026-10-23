@@ -481,6 +481,17 @@ static int perf_on(void)
     if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
     return v;
 }
+/* Debug switches read on every draw, bind or frame: getenv takes the CRT
+ * environment lock and scans every variable, so read each one once. The
+ * cache starts at (char*)1, which getenv never returns. */
+static const char* env_str(const char* name, const char** cache)
+{
+    if (*cache == (const char*)1) *cache = getenv(name);
+    return *cache;
+}
+static const char *s_env_rtt_dump = (const char*)1, *s_env_rtt_pass = (const char*)1,
+                  *s_env_rtt_savert = (const char*)1, *s_env_mempeek = (const char*)1,
+                  *s_env_rsx_cap = (const char*)1, *s_env_texfmtdbg = (const char*)1;
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
  * texture), so the debug camera can follow it. The ducks are driven by the
  * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
@@ -2692,7 +2703,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
 
     void* mapped = NULL; D3D12_RANGE nr = {0,0};
     if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
-    { static int _tp=0; if (getenv("RTT_DUMP") && PS3_LOG_FIRST(_tp, 6)) {
+    { static int _tp=0; if (env_str("RTT_DUMP", &s_env_rtt_dump) && PS3_LOG_FIRST(_tp, 6)) {
         const u8* sp = vm_base + off;
         fprintf(stderr, "[TEXUP] off=0x%X fmt=0x%X row0:", off, fmt);
         for (int _b=0;_b<8;_b++) fprintf(stderr, " %02X", sp[_b]);
@@ -3936,7 +3947,7 @@ static void render_frame(void)
     /* Frames with no ops (init/boot presents) don't count against the cap --
      * PNG-decode-heavy titles burn hundreds of empty presents before the first
      * real draw. */
-    if (getenv("RTT_DUMP") && s_d3d.draw_count > 0) { static int _f=0; int _cap = atoi(getenv("RTT_DUMP")); if (_cap < 2) _cap = 14; if (PS3_LOG_FIRST(_f, _cap)) {
+    if (env_str("RTT_DUMP", &s_env_rtt_dump) && s_d3d.draw_count > 0) { static int _f=0; int _cap = atoi(s_env_rtt_dump); if (_cap < 2) _cap = 14; if (PS3_LOG_FIRST(_f, _cap)) {
         fprintf(stderr, "[RTT] frame %d: %u ops\n", _f, s_d3d.draw_count);
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
             D3D12DrawRecord* r = &s_d3d.draws[_d];
@@ -3950,7 +3961,7 @@ static void render_frame(void)
 
     /* Debug: RTT_PASS=N shows pass N's output directly on screen (drops later
      * ops, retargets pass N to the backbuffer). */
-    { const char* rp = getenv("RTT_PASS");
+    { const char* rp = env_str("RTT_PASS", &s_env_rtt_pass);
       if (rp) {
         int keep = atoi(rp), seen = 0; u32 cut = s_d3d.draw_count;
         int viewrt = getenv("RTT_VIEWRT") != NULL;
@@ -4716,7 +4727,7 @@ static void render_frame(void)
     if (perf_on()) s_perf_rf += perf_now() - _rf0;
     /* MEMPEEK=<hex addr>:<n>: n big-endian floats at a guest address each frame,
      * with a min/max so a buffer of constants is distinguishable from real data. */
-    { const char* mp = getenv("MEMPEEK");
+    { const char* mp = env_str("MEMPEEK", &s_env_mempeek);
       if (mp) { extern uint8_t* vm_base; static int _n = 0;
         u32 addr = 0; int cnt = 8; sscanf(mp, "%x:%d", &addr, &cnt);
         if (vm_base && addr && PS3_LOG_FIRST(_n, 6)) {
@@ -4821,7 +4832,7 @@ static void render_frame(void)
     static ID3D12Resource* s_rtsave_buf = NULL;
     static u32 s_rtsave_state = 0;   /* 1 = copy queued this frame */
     static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi;
-    { const char* sv = getenv("RTT_SAVERT");
+    { const char* sv = env_str("RTT_SAVERT", &s_env_rtt_savert);
       static int _done = 0;
       static u32 _skip = 0xFFFFFFFFu;
       if (_skip == 0xFFFFFFFFu) { const char* sk = getenv("RTT_SAVERT_SKIP");
@@ -5088,7 +5099,7 @@ skip_dump_consider: ;
      * manifest) at RSX_CAP=start[:count[:stride]] frame_counts. Runs before the
      * present transition would matter -- the backbuffer is in PRESENT here and
      * is restored to PRESENT after each readback. */
-    { const char* cap = getenv("RSX_CAP");
+    { const char* cap = env_str("RSX_CAP", &s_env_rsx_cap);
       if (cap) {
         static int s_cap_parsed = 0;
         static u32 s_cap_start = 0, s_cap_count = 1, s_cap_stride = 1, s_cap_done = 0;
@@ -5845,8 +5856,8 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
        * across all of them converges on the centre of the whole field -- which is
        * where there is nothing in particular. A single slice is a stable target
        * and can be magnified without drifting off it. */
-      static int pick = -1;
-      if (pick < 0) { const char* e = getenv("RSX_DBG_PICK"); pick = e ? atoi(e) : -2; }
+      static int pick = -1, pick_read = 0;
+      if (!pick_read) { const char* e = getenv("RSX_DBG_PICK"); pick = e ? atoi(e) : -2; pick_read = 1; }
       if (wantl && s_d3d.cur_texs[0].raw == wantl && count
           && (pick == -2 || (int)first == pick)) {
           double sx = 0, sy = 0, sz = 0;
@@ -6522,7 +6533,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
-        if (getenv("TEXFMTDBG")) { static u32 seen[64]; static int ns=0;
+        if (env_str("TEXFMTDBG", &s_env_texfmtdbg)) { static u32 seen[64]; static int ns=0;
             u32 k = (unit<<24) | (((tex->format>>8) & 0xFFu)<<16) | (width & 0xFFFFu);
             int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
             if (!f && ns < 64) { seen[ns++]=k;

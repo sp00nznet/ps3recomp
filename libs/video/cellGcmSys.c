@@ -250,7 +250,8 @@ extern u32 vm_read32(unsigned int);
 static u32 s_flip_handler_code    = 0;
 static u32 s_vblank_handler_code  = 0;
 static void ydkj_restore_handler_opd(u32 opd, u32 code) {
-    if (!getenv("YDKJ_HANDLERFIX") || !opd || !code) return;
+    static int fix = -1; if (fix < 0) fix = getenv("YDKJ_HANDLERFIX") ? 1 : 0;
+    if (!fix || !opd || !code) return;
     extern u8* vm_base; if (!vm_base) return;
     if (vm_read32(opd) == 0) {
         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
@@ -679,7 +680,8 @@ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
 void cellGcmResetFlipStatus(void)
 {
     { static int n = 0;
-      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 12))
+      static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
+      if (fd && PS3_LOG_FIRST(n, 12))
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
@@ -698,7 +700,8 @@ u32 cellGcmGetFlipStatus(void)
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     { static int n = 0;
-      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
+      static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
+      if (fd && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
     return s_flip_status;
@@ -2078,7 +2081,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
+                    { static int sn = 0, rd = -1; if (rd < 0) rd = getenv("GCM_RECDBG") ? 1 : 0;
+                      if (rd && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
@@ -2714,7 +2718,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           }
       } }
 
-    { static int _n=0; if (getenv("FLIP_DBG") && PS3_LOG_FIRST(_n, 20))
+    { static int _n=0, _fd=-1; if (_fd < 0) _fd = getenv("FLIP_DBG") ? 1 : 0;
+      if (_fd && PS3_LOG_FIRST(_n, 20))
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
