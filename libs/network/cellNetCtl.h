@@ -187,6 +187,9 @@ s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param
 s32 cellNetCtlNetStartDialogAbortAsync(void);
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result);
 
+/* 1 with PS3_NET_ONLINE (fake connected), 0 offline (the default). */
+int ps3_netctl_online(void);
+
 #ifdef __cplusplus
 }
 #endif

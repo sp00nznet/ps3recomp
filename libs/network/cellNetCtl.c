@@ -49,6 +49,9 @@ static int netctl_online(void)
     return v;
 }
 
+/* For the libraries that answer the same question (cellSysutilNpEula.c). */
+int ps3_netctl_online(void) { return netctl_online(); }
+
 typedef struct {
     int              in_use;
     cellNetCtlHandler handler;

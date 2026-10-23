@@ -222,6 +222,9 @@ s32 cellSysutilCheckCallback(void)
     /* Turn psnr replies and pushes into queued NP callbacks first, so this
      * same poll delivers them. A no-op when no psnr server is configured. */
     { extern void np_psnr_pump(void); np_psnr_pump(); }
+    /* A pending PSN terms-of-service answer (cellSysutilNpEula.c) joins the
+     * completions, so this same poll runs the title's callback. */
+    { extern void ps3_np_eula_tick(void); ps3_np_eula_tick(); }
     drain_guest_completions();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll
