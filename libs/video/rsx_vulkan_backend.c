@@ -90,7 +90,7 @@
     X(vkCreateShaderModule) X(vkDestroyShaderModule) \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) \
-    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
+    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkResetDescriptorPool) \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
     X(vkCreateSampler) X(vkDestroySampler) \
@@ -1134,6 +1134,7 @@ static struct {
     vk_buffer             ubo;              /* VPConst at 0, PSConstants at ps_off */
     VkDeviceSize          ps_off;
     VkDeviceSize          max_ubo_range;
+    VkDeviceSize          ubo_align;        /* minUniformBufferOffsetAlignment */
     vk_buffer             vertices;
     float*                cpu;
     size_t                cpu_cap, cpu_count;   /* in vertices */
@@ -1381,6 +1382,7 @@ static int vk_guest_init(void)
     s_g.max_ubo_range = p.limits.maxUniformBufferRange;
     VkDeviceSize align = p.limits.minUniformBufferOffsetAlignment;
     if (align == 0) align = 256;
+    s_g.ubo_align = align;
     s_g.ps_off = (VK_VPCONST_BYTES + align - 1u) / align * align;
     if (VK_VPCONST_BYTES > s_g.max_ubo_range) {
         VK_LOG("guest programs: maxUniformBufferRange %llu < VPConst\n",
@@ -2727,6 +2729,10 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
 #define VK_ENG_MAX_PIPE   8192
 #define VK_ENG_TOPOLOGIES 5
 #define VK_ENG_FB_CACHE   64
+#define VK_ENG_ARENA_CHUNK (4u << 20)   /* bytes per arena chunk; a bigger request gets its own */
+#define VK_ENG_ARENA_CHUNKS 64
+#define VK_ENG_POOL_SETS  64             /* descriptor sets per pool */
+#define VK_ENG_MAX_POOLS  64
 
 typedef struct vk_eng_pipe {
     int                 used;
@@ -2756,14 +2762,19 @@ static struct {
     int          have_vp, have_sc;
     u32          stencil_ref;
     float        depth_bounds[2];     /* min, max for the next draw */
-    vk_buffer    indices;
     u32          warned;
-    /* The split set layout (vk_eng_split_layout) and its one set, made the
-     * first time a pipeline samples a cube map; the 1x1 cube a cube unit
-     * with nothing bound samples. */
+    /* Per-draw storage. Each draw copies its vertices, indices and constants into
+     * a slice of the arena and takes a descriptor set of its own from a pool, so
+     * nothing a recorded draw reads is overwritten by the next one. Both are
+     * reset when no engine draw is in flight (vk_eng_storage_reset). */
+    struct { vk_buffer b[VK_ENG_ARENA_CHUNKS]; u32 count, cur; VkDeviceSize off; } arena;
+    struct { VkDescriptorPool p[VK_ENG_MAX_POOLS]; u32 count, cur; } pools;
+    u8*          vs_shadow;          /* bind_vs_constants copy, s_g.ps_off bytes */
+    u8*          ps_shadow;          /* bind_ps_constants copy, ubo.size - ps_off bytes */
+    /* The split set layout (vk_eng_split_layout), made the first time a
+     * pipeline samples a cube map; the 1x1 cube a cube unit with nothing
+     * bound samples. */
     VkDescriptorSetLayout split_layout;
-    VkDescriptorPool      split_pool;
-    VkDescriptorSet       split_set;
     VkPipelineLayout      split_pipe_layout;
     u32                   dummy_cube;
 } s_e2;
@@ -2905,23 +2916,11 @@ static VkPipelineLayout vk_eng_split_layout(void)
                                                    VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
     VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                             .bindingCount = 3 + RSX_MAX_TEXTURES, .pBindings = b };
-    VkDescriptorPoolSize ps[3] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES },
-        { VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES },
-    };
-    VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                       .maxSets = 1, .poolSizeCount = 3, .pPoolSizes = ps };
-    if (pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_e2.split_layout) != VK_SUCCESS ||
-        pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_e2.split_pool) != VK_SUCCESS)
+    if (pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_e2.split_layout) != VK_SUCCESS)
         return VK_NULL_HANDLE;
-    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                        .descriptorPool = s_e2.split_pool, .descriptorSetCount = 1,
-                                        .pSetLayouts = &s_e2.split_layout };
     VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                         .setLayoutCount = 1, .pSetLayouts = &s_e2.split_layout };
-    if (pvkAllocateDescriptorSets(s_vk.device, &dai, &s_e2.split_set) != VK_SUCCESS ||
-        pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_e2.split_pipe_layout) != VK_SUCCESS) {
+    if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_e2.split_pipe_layout) != VK_SUCCESS) {
         s_e2.split_pipe_layout = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
@@ -3111,33 +3110,115 @@ static void vk_eng2_shutdown(void* user)
         for (u32 n = 0; n <= RSX_BE_MAX_COLOR_TARGETS; n++)
             if (s_e2.rp[f][n]) pvkDestroyRenderPass(s_vk.device, s_e2.rp[f][n], NULL);
     vk_destroy_image(&s_e2.scratch_depth);
-    vk_destroy_buffer(&s_e2.indices);
+    for (u32 i = 0; i < s_e2.arena.count; i++) vk_destroy_buffer(&s_e2.arena.b[i]);
+    for (u32 i = 0; i < s_e2.pools.count; i++) pvkDestroyDescriptorPool(s_vk.device, s_e2.pools.p[i], NULL);
+    free(s_e2.vs_shadow);
+    free(s_e2.ps_shadow);
     if (s_e2.split_pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_e2.split_pipe_layout, NULL);
-    if (s_e2.split_pool)        pvkDestroyDescriptorPool(s_vk.device, s_e2.split_pool, NULL);
     if (s_e2.split_layout)      pvkDestroyDescriptorSetLayout(s_vk.device, s_e2.split_layout, NULL);
     memset(&s_e2, 0, sizeof s_e2);
     for (u32 i = 0; i < s_esamp_count; i++) pvkDestroySampler(s_vk.device, s_esamp[i].s, NULL);
     s_esamp_count = 0;
 }
 
-/* Constants go straight into the shared UBO: vertex at 0, pixel at ps_off.
- * Every operation is waited on, so overwriting per draw is safe. */
+/* A slice of the per-draw arena: host-visible and coherent, aligned, usable as a
+ * vertex, index or uniform buffer. NULL when out of memory. */
+static void* vk_eng_arena_alloc(VkDeviceSize bytes, VkDeviceSize align, VkBuffer* buf, VkDeviceSize* off)
+{
+    for (;;) {
+        if (s_e2.arena.cur < s_e2.arena.count) {
+            vk_buffer* c = &s_e2.arena.b[s_e2.arena.cur];
+            const VkDeviceSize o = (s_e2.arena.off + align - 1u) / align * align;
+            if (o + bytes <= c->size) {
+                s_e2.arena.off = o + bytes;
+                *buf = c->buf; *off = o;
+                return (u8*)c->ptr + o;
+            }
+            s_e2.arena.cur++; s_e2.arena.off = 0;
+            continue;
+        }
+        if (s_e2.arena.count == VK_ENG_ARENA_CHUNKS) {
+            if (!(s_e2.warned & 64u)) { VK_LOG("engine: per-draw arena full, draw skipped\n"); s_e2.warned |= 64u; }
+            return NULL;
+        }
+        vk_buffer* c = &s_e2.arena.b[s_e2.arena.count];
+        if (vk_create_host_buffer(c, bytes > VK_ENG_ARENA_CHUNK ? bytes : VK_ENG_ARENA_CHUNK,
+                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return NULL;
+        if (!c->coherent) { vk_destroy_buffer(c); VK_LOG("engine: arena memory is not host-coherent\n"); return NULL; }
+        s_e2.arena.count++;
+    }
+}
+
+/* A descriptor set of this draw's own, from the engine's pools. */
+static VkDescriptorSet vk_eng_alloc_set(VkDescriptorSetLayout layout)
+{
+    for (;;) {
+        if (s_e2.pools.cur < s_e2.pools.count) {
+            VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                .descriptorPool = s_e2.pools.p[s_e2.pools.cur],
+                                                .descriptorSetCount = 1, .pSetLayouts = &layout };
+            VkDescriptorSet set;
+            const VkResult r = pvkAllocateDescriptorSets(s_vk.device, &dai, &set);
+            if (r == VK_SUCCESS) return set;
+            if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) return VK_NULL_HANDLE;
+            s_e2.pools.cur++;
+            continue;
+        }
+        if (s_e2.pools.count == VK_ENG_MAX_POOLS) {
+            if (!(s_e2.warned & 128u)) { VK_LOG("engine: descriptor pools full, draw skipped\n"); s_e2.warned |= 128u; }
+            return VK_NULL_HANDLE;
+        }
+        const VkDescriptorPoolSize ps[3] = {
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * VK_ENG_POOL_SETS },
+            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES * VK_ENG_POOL_SETS },
+            { VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES * VK_ENG_POOL_SETS },
+        };
+        VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                           .maxSets = VK_ENG_POOL_SETS, .poolSizeCount = 3, .pPoolSizes = ps };
+        if (pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_e2.pools.p[s_e2.pools.count]) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        s_e2.pools.count++;
+    }
+}
+
+/* Called with no engine draw in flight: every slice and set handed out so far is free again. */
+static void vk_eng_storage_reset(void)
+{
+    s_e2.arena.cur = 0;
+    s_e2.arena.off = 0;
+    for (u32 i = 0; i < s_e2.pools.count && i <= s_e2.pools.cur; i++)
+        pvkResetDescriptorPool(s_vk.device, s_e2.pools.p[i], 0);
+    s_e2.pools.cur = 0;
+}
+
+/* The constants a draw sees are the ones bound when it is recorded: kept on the CPU
+ * here and copied into the draw's own arena slice. */
+static int vk_eng_shadows(void)
+{
+    if (!s_e2.vs_shadow) s_e2.vs_shadow = (u8*)calloc(1, (size_t)s_g.ps_off);
+    if (!s_e2.ps_shadow) s_e2.ps_shadow = (u8*)calloc(1, (size_t)(s_g.ubo.size - s_g.ps_off));
+    return s_e2.vs_shadow && s_e2.ps_shadow ? 0 : -1;
+}
+
+/* Constants are kept on the CPU until a draw copies them into its own slice of
+ * the arena (vk_eng_write_descriptors); vertex up to ps_off, pixel after it. */
 static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
+    if (!s_g.on || !data || vk_eng_shadows()) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
-    memcpy(s_g.ubo.ptr, data, bytes);
+    memcpy(s_e2.vs_shadow, data, bytes);
     s_e2.vs_bytes = bytes;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (!s_g.on || !data) { s_e2.ps_bytes = 0; return; }
+    if (!s_g.on || !data || vk_eng_shadows()) { s_e2.ps_bytes = 0; return; }
     const u32 cap = (u32)(s_g.ubo.size - s_g.ps_off);
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
-    memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
+    memcpy(s_e2.ps_shadow, data, bytes);
     s_e2.ps_bytes = bytes;
 }
 static void vk_eng_bind_textures(void* user, const u32* textures,
@@ -3227,16 +3308,6 @@ static VkImageView vk_eng_scratch_depth(u32 w, u32 h)
     return s_e2.scratch_depth.view;
 }
 
-static int vk_eng_ensure_indices(VkDeviceSize bytes)
-{
-    if (s_e2.indices.buf && s_e2.indices.size >= bytes) return 0;
-    VkDeviceSize size = s_e2.indices.size ? s_e2.indices.size : 64 * 1024;
-    while (size < bytes) size *= 2;
-    vk_destroy_buffer(&s_e2.indices);
-    if (vk_create_host_buffer(&s_e2.indices, size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) return -1;
-    return s_e2.indices.coherent ? 0 : -1;
-}
-
 /* rsx_be_sampler_desc is the registers decoded the D3D12 way; the wrap codes
  * stay the guest's 1..8, which vk_gcm_wrap already translates. */
 static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
@@ -3302,14 +3373,21 @@ static VkImageView vk_eng_dummy_cube_view(void)
 static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P)
 {
     const int split = P->cube_mask != 0;
-    const VkDescriptorSet set = split ? s_e2.split_set : s_g.set;
-    if (!set) return VK_NULL_HANDLE;
+    const VkDescriptorSetLayout layout = split ? s_e2.split_layout : s_g.set_layout;
+    if (!layout || vk_eng_shadows()) return VK_NULL_HANDLE;
     const VkImageView dummy_cube = split ? vk_eng_dummy_cube_view() : VK_NULL_HANDLE;
     if (split && !dummy_cube) return VK_NULL_HANDLE;
-    VkDescriptorBufferInfo bi[2] = {
-        { s_g.ubo.buf, 0, s_e2.vs_bytes ? s_e2.vs_bytes : 16u },
-        { s_g.ubo.buf, s_g.ps_off, s_e2.ps_bytes ? s_e2.ps_bytes : 16u },
-    };
+    const VkDeviceSize vs_n = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, ps_n = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
+    VkDescriptorBufferInfo bi[2];
+    u8* vs = (u8*)vk_eng_arena_alloc(vs_n, s_g.ubo_align, &bi[0].buffer, &bi[0].offset);
+    u8* ps = vs ? (u8*)vk_eng_arena_alloc(ps_n, s_g.ubo_align, &bi[1].buffer, &bi[1].offset) : NULL;
+    if (!ps) return VK_NULL_HANDLE;
+    memcpy(vs, s_e2.vs_shadow, (size_t)vs_n);
+    memcpy(ps, s_e2.ps_shadow, (size_t)ps_n);
+    bi[0].range = vs_n;
+    bi[1].range = ps_n;
+    const VkDescriptorSet set = vk_eng_alloc_set(layout);
+    if (!set) return VK_NULL_HANDLE;
     VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
         const int cube = (P->cube_mask >> u) & 1u;
@@ -3380,12 +3458,18 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
     if (!pipe || !rp || !fb) return;
 
+    /* Every engine draw is waited on, so none is in flight here. */
+    vk_eng_storage_reset();
     const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
-    if (vk_ensure_vertex_buffer(vbytes)) return;
-    memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
+    VkBuffer vbuf, ibuf = VK_NULL_HANDLE;
+    VkDeviceSize voff, ioff = 0;
+    void* vdst = vk_eng_arena_alloc(vbytes, 16u, &vbuf, &voff);
+    if (!vdst) return;
+    memcpy(vdst, vertices, (size_t)vbytes);
     if (indices && index_count) {
-        if (vk_eng_ensure_indices((VkDeviceSize)index_count * 4u)) return;
-        memcpy(s_e2.indices.ptr, indices, (size_t)index_count * 4u);
+        void* idst = vk_eng_arena_alloc((VkDeviceSize)index_count * 4u, 4u, &ibuf, &ioff);
+        if (!idst) return;
+        memcpy(idst, indices, (size_t)index_count * 4u);
     }
     const VkDescriptorSet set = vk_eng_write_descriptors(P);
     if (!set) return;
@@ -3421,10 +3505,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                              P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
                              0, 1, &set, 0, NULL);
-    VkDeviceSize off = 0;
-    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_vk.vertices.buf, &off);
+    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
     if (indices && index_count) {
-        pvkCmdBindIndexBuffer(s_vk.cmd, s_e2.indices.buf, 0, VK_INDEX_TYPE_UINT32);
+        pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
         pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
