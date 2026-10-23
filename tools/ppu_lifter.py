@@ -657,6 +657,31 @@ _CRSET_RE = re.compile(
     r"ctx->cr = \(ctx->cr & ~\(0xFu << (?P<shift>\d+)\)\) \| \(cr_val << (?P<shift2>\d+)\); \}$")
 _CRBR_RE = re.compile(
     r"^(?P<ind>\s*)if \((?P<neg>!)?\(+ctx->cr >> (?P<shift>\d+)\) & (?P<mask>0x[0-9A-Fa-f]+|\d+)\)+\) (?P<rest>.*)$")
+# A line PPULifter._patched_translate wrote; group 1 is its guard symbol.
+_INSN_PATCH_RE = re.compile(r"^if \(([A-Za-z_]\w*)\) \{ .* /\* insn patch 0x[0-9A-F]{8}: ")
+
+
+def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
+    """Read an --insn-patches file:
+
+        {"patches": [{"addr": "0x001E6F68", "orig": "0x419DFFDC",
+                      "new": "0x60000000", "guard": "g_port_unlock_fps",
+                      "note": "..."}, ...]}
+
+    -> {addr: (orig, new, guard)}."""
+    with open(path) as f:
+        spec = json.load(f)
+    out: dict[int, tuple[int, int, str]] = {}
+    for e in spec.get("patches", []):
+        addr = int(str(e["addr"]), 0)
+        guard = str(e["guard"])
+        if not re.fullmatch(r"[A-Za-z_]\w*", guard):
+            sys.exit(f"[ppu_lifter] {path}: guard {guard!r} is not a C identifier")
+        if addr & 3 or addr in out:
+            sys.exit(f"[ppu_lifter] {path}: bad or duplicate address 0x{addr:08X}")
+        out[addr] = (int(str(e["orig"]), 0) & 0xFFFFFFFF,
+                     int(str(e["new"]), 0) & 0xFFFFFFFF, guard)
+    return out
 
 
 def _crval_to_c(val: str, mask: int, decl_a: str, a_expr: str, b_expr: str) -> str:
@@ -875,6 +900,10 @@ class PPULifter:
         # Module primary TOC (r2). Set by main() only when the ELF yields exactly
         # one TOC candidate; enables the `ld r2, N(r1)` restore lowering below.
         self.toc_base: int = 0
+        # Runtime-switchable instruction patches (--insn-patches):
+        # {addr -> (original word, replacement word, guard symbol)}. See
+        # _patched_translate.
+        self.insn_patches: dict[int, tuple[int, int, str]] = {}
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -980,7 +1009,11 @@ class PPULifter:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
                 emitted_labels.add(insn.addr)
 
-            c_line = self._translate(insn, func)
+            patch = self.insn_patches.get(insn.addr)
+            if patch is not None:
+                c_line = self._patched_translate(insn, func, patch)
+            else:
+                c_line = self._translate(insn, func)
             if c_line:
                 func.body_lines.append(f"    {c_line}")
 
@@ -1324,6 +1357,39 @@ class PPULifter:
         alt = Instruction(insn.addr, raw, base, insn.operands, insn.comment)
         code2 = self._translate_op(alt, func)
         return code if code2.startswith("/* TODO") else code2
+
+    def _patched_translate(self, insn: Instruction, func: LiftedFunction,
+                           patch: tuple[int, int, str]) -> str:
+        """Both forms of a patched instruction, chosen at run time.
+
+        A static recompilation never executes the guest's code words, so a
+        patch that rewrites an instruction word in .text at run time does
+        nothing to the lifted title. This lifts the original
+        word and the replacement and emits
+
+            if (<guard>) { <replacement> } else { <original> }
+
+        so one build serves both, switched by an int the port defines and sets
+        before the guest starts. The original word must match what the spec
+        expects: a patch for one build of a title must never land on another.
+        The replacement may not branch -- it would need labels and call targets
+        this function was not lifted with; a nop, an immediate or a compare is
+        the shape these patches have."""
+        # Raised, not sys.exit: this runs in pool workers, where a SystemExit
+        # kills the worker and leaves the parent waiting for its result.
+        orig, new, guard = patch
+        if insn.raw != orig:
+            raise ValueError(f"insn patch at 0x{insn.addr:08X}: the input has "
+                             f"0x{(insn.raw or 0):08X}, the patch expects 0x{orig:08X} "
+                             f"(wrong binary for this patch set?)")
+        if (new >> 26) in (16, 17, 18, 19):
+            raise ValueError(f"insn patch at 0x{insn.addr:08X}: the replacement "
+                             f"0x{new:08X} is a branch/sc/CR op; not supported")
+        alt = disassemble_bytes(new.to_bytes(4, "big"), insn.addr, True)[0]
+        alt_c = self._translate(alt, func) or "/* nop */;"
+        orig_c = self._translate(insn, func) or ";"
+        return (f"if ({guard}) {{ {alt_c} }} else {{ {orig_c} }}"
+                f"  /* insn patch 0x{insn.addr:08X}: {orig:08X} -> {new:08X} */")
 
     def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
         code = self._oe_wrap(insn, self._translate_xo_base(insn, func))
@@ -3965,6 +4031,12 @@ class PPULifter:
         if label:
             lines.append(f"/* {label} */")
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
+        # The guard of each --insn-patches line in this body: the port defines it.
+        guards = sorted({m.group(1) for bl in func.body_lines
+                         for m in [_INSN_PATCH_RE.match(bl.strip())] if m})
+        for g in guards:
+            lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
+                      f"extern int {g};", "#endif"]
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
         for bline in _fuse_cr(func.body_lines):
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
@@ -4660,7 +4732,7 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0):
+                 toc_base=0, insn_patches=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4675,6 +4747,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_lo"] = code_lo
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
+    _WORKER_STATE["insn_patches"] = insn_patches or {}
 
 
 def _worker_lift(task):
@@ -4690,6 +4763,7 @@ def _worker_lift(task):
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
+    lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
     results = []
     for start, end in bounds:
         blob = b""
@@ -4724,7 +4798,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
-                             getattr(lifter, "toc_base", 0)))
+                             getattr(lifter, "toc_base", 0),
+                             lifter.insn_patches))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -4810,6 +4885,12 @@ def main() -> None:
                              "instead of its literal .lib.stub trampoline, and "
                              "split out as its own 0x20-byte function so direct "
                              "calls to it dispatch to the HLE handler.")
+    parser.add_argument("--insn-patches", metavar="FILE", default=None,
+                        help="JSON list of instruction patches to lift as "
+                             "run-time switches: each {addr, orig, new, guard} "
+                             "is emitted as `if (guard) {new} else {orig}`, guard "
+                             "being an int the port defines. The input must hold "
+                             "`orig` at `addr` or the lift stops.")
     args = parser.parse_args()
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
@@ -5266,6 +5347,9 @@ def main() -> None:
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
+    if args.insn_patches:
+        lifter.insn_patches = load_insn_patches(args.insn_patches)
+        print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
@@ -5312,6 +5396,16 @@ def main() -> None:
         print(f"  Mid-function pass {pass_num}: generated {n} tail-entry wrappers ({total_mid} total)")
     if total_mid:
         print(f"  Generated {total_mid} mid-function tail-entry wrappers total")
+
+    # Every patch must have landed in a lifted function: one at an address no
+    # function covers would otherwise vanish without a word.
+    if lifter.insn_patches:
+        landed = {int(m.group(1), 16) for f in lifter.functions for bl in f.body_lines
+                  for m in [re.search(r"/\* insn patch 0x([0-9A-F]{8}): ", bl)] if m}
+        missing = sorted(set(lifter.insn_patches) - landed)
+        if missing:
+            sys.exit("[ppu_lifter] insn patches at no lifted instruction: " +
+                     ", ".join(f"0x{a:08X}" for a in missing))
 
     os.makedirs(args.output, exist_ok=True)
 

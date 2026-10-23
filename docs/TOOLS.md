@@ -367,6 +367,35 @@ python tools/ppu_lifter.py game/EBOOT.ELF --functions out/EBOOT.functions.json \
 | `ppu_recomp_NNN.cpp` | Recompiled functions, batched across translation units |
 | `ppu_recomp.h` | Declarations, VM access helpers, and `ppu_recomp_register()` |
 
+### Run-time instruction patches (`--insn-patches`)
+
+A patch that changes an instruction word in `.text` (an unlocked frame
+limiter, a skipped check) does nothing to a lifted title: the guest's code
+words are never executed. `--insn-patches FILE` lifts both forms of each
+patched instruction and picks one at run time, so one build serves both:
+
+```json
+{"patches": [
+  {"addr": "0x00123454", "orig": "0x419D0010", "new": "0x60000000",
+   "guard": "g_port_skip_wait", "note": "bgt cr7 -> nop: do not wait for the next vblank"}
+]}
+```
+
+```c
+/* emitted in place of the instruction at 0x00123454 */
+if (g_port_skip_wait) { /* nop */; } else { if (...) goto loc_00123464; }  /* insn patch 0x00123454: 419D0010 -> 60000000 */
+```
+
+- `guard` is an `int` the port defines (and sets before the guest runs, e.g.
+  from its settings); each function that uses one declares it `extern "C"`.
+- The input must hold `orig` at `addr`, or the lift stops: a patch set made
+  for one build of a title never lands on another.
+- An address that no lifted function covers also stops the lift.
+- `new` may not be a branch, `sc` or CR operation (it would need labels and
+  call targets the function was not lifted with); a nop, an immediate or a
+  compare is the usual shape.
+- `note` is free text and ignored.
+
 ---
 
 ## spu_disasm.py
