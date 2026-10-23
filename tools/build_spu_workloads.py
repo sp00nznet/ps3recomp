@@ -127,6 +127,10 @@ def main():
                     help="do not run the lifter; assume --lifted already populated (still fixes includes + emits registry)")
     ap.add_argument("--allow-partial", action="store_true",
                     help="With --input, emit supported registrations despite incomplete coverage")
+    ap.add_argument("--merge-chunks", action="store_true",
+                    help="Pass --merge-chunks to spu_lifter.py: each run of chunks from one "
+                         "call target to the next becomes one C function, so branches "
+                         "inside it are gotos instead of trampoline round trips")
     args = ap.parse_args()
     if args.input:
         from spu_program_pipeline import build_programs
@@ -161,6 +165,8 @@ def main():
                    "--symbol-prefix", prefix, "-o", outdir]
             if img in extra_funcs:
                 cmd += ["--extra-funcs", extra_funcs[img]]
+            if args.merge_chunks:
+                cmd += ["--merge-chunks"]
                 print(f"[build_spu_workloads] {img}: extra entries {extra_funcs[img]}")
             print(f"[build_spu_workloads] LIFT {img}  (prefix {prefix})")
             if subprocess.run(cmd).returncode != 0:
