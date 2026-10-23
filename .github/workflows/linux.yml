@@ -338,6 +338,15 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
           /tmp/test_guest_ptr_trap
 
+      # Buffered stdout/stderr with a timed flush (runtime/platform/ps3_stdio.c):
+      # buffered by default, a line reaches the pipe within the flush interval,
+      # and nothing is lost at exit, on abort() or on a crash through the
+      # unhandled-exception filter; PS3_STDIO_UNBUFFERED=1 restores unbuffered.
+      - name: Run the stdio flush test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
+          /tmp/test_stdio_flush
+
       # PARAM.SFO is written as a binary PSF and read back (PSF and the old text file).
       - name: Run the savedata PARAM.SFO test
         run: |

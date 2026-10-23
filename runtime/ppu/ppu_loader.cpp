@@ -39,6 +39,7 @@
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "../platform/ps3_stdio.h"        /* ps3_stdio_init -- buffered stdout/stderr, timed flush */
 #ifndef _WIN32
 #include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
 #include <signal.h>
@@ -3797,11 +3798,16 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
-    /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
-     * (stderr); with a redirected block-buffered stdout, printf lines sat in
-     * the buffer for minutes and were LOST when the run was killed -- which
-     * made "the log line is absent" unusable as evidence. */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* HLE logs mix printf (stdout) with probe fprintf (stderr); with a
+     * redirected block-buffered stdout and nothing flushing it, printf lines
+     * sat in the buffer for minutes and were LOST when the run was killed --
+     * which made "the log line is absent" unusable as evidence. This used to
+     * set stdout unbuffered, which with mingw-w64 costs one write() per
+     * character. ps3_stdio_init() buffers stdout and stderr and flushes them
+     * every PS3_STDIO_FLUSH_MS (50 ms), at exit, on abort and on a crash, so a
+     * killed run loses at most one interval (runtime/platform/ps3_stdio.h).
+     * PS3_STDIO_UNBUFFERED=1 restores the old unbuffered stdout. */
+    ps3_stdio_init();
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
     uint32_t code = 0, toc = 0;
