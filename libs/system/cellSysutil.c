@@ -675,3 +675,86 @@ s32 cellSysutilIsMeetingApp(void)
 {
     return 0; /* Not a meeting app */
 }
+
+/* ---------------------------------------------------------------------------
+ * Host quit: the window's close button, Cmd+Q, a host menu's "Quit game".
+ *
+ * What the console's "Quit Game" does first: every registered sysutil
+ * callback gets CELL_SYSUTIL_REQUEST_EXITGAME, and the title tidies up and
+ * calls sys_process_exit, which ends the process here (exit()). A title that
+ * has not done so within PS3_QUIT_GRACE_MS (default 3000) is ended for it,
+ * as the console does: once no save is being written (cellSaveData.c
+ * ps3_savedata_busy, waited on for up to 10 s), with stdio flushed and the
+ * atexit handlers run, exit(0) -- a normal end for whatever launched the
+ * game. Runs on its own thread, so the caller (the main thread, the frame
+ * clock) returns at once; a second request is ignored.
+ * -----------------------------------------------------------------------*/
+#ifdef _WIN32
+static DWORD WINAPI host_quit_thread(LPVOID unused)
+#else
+#include <unistd.h>
+static void* host_quit_thread(void* unused)
+#endif
+{
+    (void)unused;
+    extern int ps3_savedata_busy(void);   /* cellSaveData.c */
+    int grace = 3000;
+    { const char* e = getenv("PS3_QUIT_GRACE_MS"); if (e && *e) grace = atoi(e); }
+    if (grace < 0) grace = 0;
+    int asked = 0;
+    for (int slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; ++slot) {
+        if (!s_callbacks[slot].registered || !s_callbacks[slot].guest_opd) continue;
+        const u64 args[8] = { CELL_SYSUTIL_REQUEST_EXITGAME, 0, s_callbacks[slot].userdata, 0, 0, 0, 0, 0 };
+        cellSysutilQueueGuestCallbackArgs(s_callbacks[slot].guest_opd, args);
+        asked++;
+    }
+    printf("[quit] REQUEST_EXITGAME to %d sysutil callback(s); waiting up to %d ms for the game\n",
+           asked, grace);
+    fflush(stdout);
+    const int step = 50;
+    for (int t = 0; t < grace; t += step) {
+#ifdef _WIN32
+        Sleep(step);
+#else
+        usleep(step * 1000);
+#endif
+    }
+    int waited = 0;
+    while (ps3_savedata_busy() && waited < 10000) {
+#ifdef _WIN32
+        Sleep(step);
+#else
+        usleep(step * 1000);
+#endif
+        waited += step;
+    }
+    printf("[quit] the game did not exit on its own; ending it (save in flight: %s, waited %d ms) -> exit 0\n",
+           ps3_savedata_busy() ? "yes, gave up" : "no", waited);
+    fflush(NULL);
+    exit(0);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static volatile int s_host_quit;
+
+int ps3_host_quitting(void) { return __atomic_load_n(&s_host_quit, __ATOMIC_ACQUIRE); }
+
+void ps3_host_quit(const char* why)
+{
+    if (__atomic_exchange_n(&s_host_quit, 1, __ATOMIC_ACQ_REL)) return;
+    printf("[quit] requested (%s)\n", why ? why : "host");
+    fflush(stdout);
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 0, host_quit_thread, NULL, 0, NULL);
+    if (h) { CloseHandle(h); return; }
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, host_quit_thread, NULL) == 0) { pthread_detach(th); return; }
+#endif
+    fflush(NULL);
+    exit(0);
+}

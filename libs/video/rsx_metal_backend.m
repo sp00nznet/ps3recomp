@@ -3983,6 +3983,18 @@ static int pump_messages_impl(void)
                                                 inMode:NSDefaultRunLoopMode
                                                dequeue:YES];
             if (!ev) break;
+            /* Cmd+Q quits. The host turns a plain run loop with no app menu,
+             * so AppKit has no Quit item to send it to and nothing happened.
+             * It ends the game the way the console's Quit Game does
+             * (cellSysutil.c ps3_host_quit: REQUEST_EXITGAME, then exit 0). */
+            if ([ev type] == NSEventTypeKeyDown && ([ev keyCode] & 127u) == 0x0C /* Q */ &&
+                ([ev modifierFlags] & NSEventModifierFlagCommand)) {
+                if (![ev isARepeat]) {
+                    extern void ps3_host_quit(const char* why);
+                    ps3_host_quit("Cmd+Q");
+                }
+                continue;
+            }
             [NSApp sendEvent:ev];
         }
     }

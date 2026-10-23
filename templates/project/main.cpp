@@ -74,6 +74,7 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 void     ps3_load_prx_modules(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
+void     ps3_host_quit(const char* why);      /* cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
 
 /* The status the guest handed to sys_process_exit. A title that exits that way
  * never returns through ppu_run, so this is only read on the path where the
@@ -228,6 +229,9 @@ static DWORD WINAPI frame_clock(LPVOID)
 
             if (rsx_backend_pump() != 0) {
                 rsx_ok = 0;              /* window closed */
+                /* ...so quit, as the console's Quit Game does, instead of
+                 * leaving the game running with no window. */
+                ps3_host_quit("window closed");
                 continue;
             }
             /* Present on a guest flip. A present on a fixed clock can catch the

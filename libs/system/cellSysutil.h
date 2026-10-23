@@ -120,6 +120,14 @@ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
  * games use slot 0. */
 void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 
+/* Quit the game from the host (the window closed, Cmd+Q, a host menu):
+ * sends REQUEST_EXITGAME to every registered callback, then ends the process
+ * with status 0 if the title has not within PS3_QUIT_GRACE_MS (default
+ * 3000), never while a save is being written. Returns at once; a second call
+ * does nothing. ps3_host_quitting(): 1 once asked. */
+void ps3_host_quit(const char* why);
+int  ps3_host_quitting(void);
+
 /* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
  * the title's own memory through vm_write*. Spelt u32 so a caller cannot
  * translate the argument first and hand over a host address. */
