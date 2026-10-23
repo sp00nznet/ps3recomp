@@ -110,6 +110,7 @@ typedef void (*test_spu_fn)(spu_context*);
 void spu_begin_image(int image_id);
 void spu_register_function(uint32_t addr, test_spu_fn fn);
 test_spu_fn spu_lookup(uint32_t addr, int image_id);
+test_spu_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 void spu_stop(spu_context* ctx);
 
 /* ---------------------------------------------------------------------------
@@ -398,6 +399,9 @@ static void test_resident_code_regions(void)
     spu_overlay_note_get(ctx, 0x500000, ctx->ls + a, 0x100);
     spu_overlay_note_get(ctx, 0x600000, ctx->ls + b, 0x100);
     spu_overlay_note_get(ctx, 0x500100, ctx->ls + a + 0x100, 0x100);
+    /* The interpreter's rejoin probe has to agree with the dispatcher. */
+    check(spu_lifted_lookup(ctx, a) == code_a, "interpreter rejoins the first streamed job's code");
+    check(spu_lifted_lookup(ctx, b) == code_b, "interpreter rejoins the second streamed job's code");
     ctx->pc = a; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 81, "first streamed job survives second job and continuation DMA");
     ctx->pc = b; spu_indirect_branch(ctx);
@@ -405,6 +409,7 @@ static void test_resident_code_regions(void)
     spu_overlay_note_get(ctx, 0x700000, ctx->ls + a, 0x100);
     ctx->pc = a; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] != 81, "overwriting a code buffer invalidates its old image");
+    check(spu_lifted_lookup(ctx, a) == code_stale, "an overwritten buffer falls back to the base image");
     ctx->pc = b; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 82, "overwriting one buffer preserves the other");
     g_spu_trampoline_fn = 0;

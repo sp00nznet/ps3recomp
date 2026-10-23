@@ -1511,9 +1511,20 @@ int spu_have_function(uint32_t addr)
 /* The pure interpreter's fast-path "is this LSA already lifted?" probe
  * (spu_interp.c, rejoin path). It IS the registry lookup, so overlay eviction and
  * self-modifying-code invalidation are honored automatically. Lived in
- * spu_fn_registry.c before the registry was consolidated into this TU. */
+ * spu_fn_registry.c before the registry was consolidated into this TU.
+ *
+ * Inside a resident code region the region's image owns the address, as in
+ * spu_indirect_branch. Looking only at ctx->image_id (the policy module's
+ * image, for a streamed job) never found the job's lifted functions, so an
+ * interpreter entered anywhere in a job -- an entry the lifter missed, a
+ * resume point -- ran the rest of the job interpreted, callees included. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    if (ctx)
+        for (unsigned slot = 0; slot < 4; ++slot)
+            if (ctx->resident_code[slot].image_id && lsa >= ctx->resident_code[slot].lsa &&
+                lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+                return (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 
