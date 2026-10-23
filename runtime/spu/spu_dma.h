@@ -163,6 +163,16 @@ static inline int mfc_is_fence(uint32_t cmd)
     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
 }
 
+/* SPU_POISON_DMA=1: the PUT path's poison detector (mfc_dma_transfer). Read
+ * once; a diagnostic, off by default. */
+static inline int spu_poison_dma_on(void)
+{
+    static int s = -1;
+    int v = __atomic_load_n(&s, __ATOMIC_RELAXED);
+    if (v < 0) { v = getenv("SPU_POISON_DMA") ? 1 : 0; __atomic_store_n(&s, v, __ATOMIC_RELAXED); }
+    return v;
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
@@ -728,7 +738,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
-         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash. */
+         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash.
+         * It reads every word of every PUT, several times what the copy
+         * itself costs, so it runs only under SPU_POISON_DMA=1. */
+        if (spu_poison_dma_on())
         { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
