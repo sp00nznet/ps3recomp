@@ -425,6 +425,18 @@ static void pad_init_backend(void)
 {
     if (!s_sdl_inited) {
         if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
+            /* The game is not always the focused app: on macOS its window
+             * can belong to another process (the launcher in
+             * tools/host_window), and then this process is never in the
+             * foreground. Controller input must not depend on focus. The
+             * hint stops SDL dropping joystick events while it has no
+             * focused window and lets Apple's GameController framework
+             * deliver them to a background process
+             * (GCController.shouldMonitorBackgroundEvents). The HIDAPI
+             * drivers (DualShock 4, DualSense) read IOKit directly and never
+             * cared. SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=0 in the
+             * environment still wins over this. */
+            SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
             SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
         }
         s_sdl_inited = 1;

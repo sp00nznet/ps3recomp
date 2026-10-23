@@ -56,6 +56,15 @@
 #include <pthread.h>
 #include "metal_frame_rate.h"
 #include <stdatomic.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <servers/bootstrap.h>
+#include <IOSurface/IOSurfaceRef.h>
+#include "rsx_host_surface.h"
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
@@ -86,6 +95,19 @@ static id                  s_window_close_observer;
 static int                 s_ready;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
+
+/* Host-surface mode (PS3RECOMP_HOST_SURFACES, see rsx_host_surface.h): no
+ * window and no NSApplication in this process; frames go into IOSurfaces a
+ * launcher process owns and shows in its own window, which outlives this
+ * process image across an exitspawn. s_headless stays 0 -- presents are
+ * paced by the in-flight semaphore exactly as windowed ones are -- and s_window
+ * stays nil, so everything that is about the window is skipped. */
+static int                 s_host;
+static rsx_host_control*   s_host_ctl;
+static mach_port_t         s_host_port;          /* the launcher's service */
+static id<MTLTexture>      s_host_tex[RSX_HOST_SLOTS];
+static u32                 s_host_w, s_host_h, s_host_gen;
+static dispatch_source_t   s_host_watch;          /* the launcher's exit */
 
 /* Each initialization owns its counters. A drawable callback retained by the
  * compositor can outlive shutdown without writing into a later session. */
@@ -130,6 +152,8 @@ static void fps_track_drawable(id<CAMetalDrawable> drawable)
 
 void rsx_metal_backend_note_guest_frame(void)
 {
+    rsx_host_control *ctl=s_host_ctl;
+    if (ctl) atomic_fetch_add(&ctl->guest_frames,1);   /* the launcher's FPS title */
     MetalFrameRateSession *session=fps_session();
     if (!session) return;
     pthread_mutex_lock(&session->lock);
@@ -557,6 +581,228 @@ static int create_offscreen(void)
     return s_offscreen ? 0 : -1;
 }
 
+/* ---- host surfaces --------------------------------------------------------
+ * PS3RECOMP_HOST_SURFACES=<bootstrap name>, set by the launcher
+ * (tools/host_window): attach to it, map its control page and wrap its
+ * IOSurfaces as render targets. A present then ends in one of those surfaces
+ * and a FRAME message to the launcher instead of in a drawable; the launcher
+ * blits it into its window. The GPU writes the surface directly, so there is
+ * no CPU copy and no readback. Protocol: rsx_host_surface.h.
+ * --------------------------------------------------------------------------*/
+#if !TARGET_OS_IPHONE
+/* IOSurface.framework is loaded with Metal already. Resolving its one entry
+ * point here keeps the link line -- the library's and every test's -- free of
+ * a framework only this mode needs. */
+static IOSurfaceRef host_lookup_surface(mach_port_t port)
+{
+    static IOSurfaceRef (*lookup)(mach_port_t);
+    if (!lookup) {
+        void* h = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",
+                         RTLD_LAZY | RTLD_LOCAL);
+        if (h) lookup = (IOSurfaceRef (*)(mach_port_t))dlsym(h, "IOSurfaceLookupFromMachPort");
+        if (!lookup) return NULL;
+    }
+    return lookup(port);
+}
+
+/* The window is gone: the pump reports it the way it reports a closed window. */
+static void host_note_gone(const char* why)
+{
+    if (atomic_exchange(&s_closed, 1)) return;
+    fprintf(stderr, "[RSX metal] host window gone (%s)\n", why);
+}
+
+/* The launcher closes its window by setting `closed` and sending SIGTERM. A
+ * launcher that died instead never sends it, and a process with no window and
+ * nothing left to show it would linger unseen, so the same signal is raised
+ * here once the launcher has been gone for a moment. */
+static void host_watch_launcher(pid_t pid)
+{
+    if (s_host_watch || pid <= 0) return;
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    void (^gone)(void) = ^{
+        host_note_gone("launcher exited");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), q, ^{
+            fprintf(stderr, "[RSX metal] no window left; terminating\n");
+            kill(getpid(), SIGTERM);
+        });
+    };
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid,
+                                                   DISPATCH_PROC_EXIT, q);
+    if (!src) return;
+    dispatch_source_set_event_handler(src, ^{
+        dispatch_source_cancel(src);
+        gone();
+    });
+    s_host_watch = src;
+    dispatch_resume(src);
+    if (kill(pid, 0) != 0 && errno == ESRCH) dispatch_async(q, gone);   /* already gone */
+}
+
+/* Ask the launcher for its surfaces at w x h (it keeps what it has when the
+ * size already matches). Called at init, by the image an exec brought up
+ * just the same, and by a vtable-path resize with nothing in flight. On
+ * failure the previous attachment, if any, stays. */
+static int host_attach(u32 w, u32 h)
+{
+    const char* name = getenv(RSX_HOST_SURFACE_ENV);
+    if (!name || !*name || !s_dev) return -1;
+    kern_return_t kr;
+    if (s_host_port == MACH_PORT_NULL) {
+        kr = bootstrap_look_up(bootstrap_port, name, &s_host_port);
+        if (kr != KERN_SUCCESS) {
+            fprintf(stderr, "[RSX metal] host window '%s' not found: %s\n", name,
+                    bootstrap_strerror(kr));
+            s_host_port = MACH_PORT_NULL;
+            return -1;
+        }
+    }
+    mach_port_t reply = MACH_PORT_NULL;
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply) != KERN_SUCCESS)
+        return -1;
+    rsx_host_attach_msg req;
+    memset(&req, 0, sizeof req);
+    req.header.msgh_bits        = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
+    req.header.msgh_size        = sizeof req;
+    req.header.msgh_remote_port = s_host_port;
+    req.header.msgh_local_port  = reply;
+    req.header.msgh_id          = RSX_HOST_MSG_ATTACH;
+    req.width = w; req.height = h; req.pid = getpid();
+    struct { rsx_host_surfaces_msg m; mach_msg_trailer_t trailer; } in;
+    memset(&in, 0, sizeof in);
+    kr = mach_msg(&req.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof req, 0,
+                  MACH_PORT_NULL, 5000, MACH_PORT_NULL);
+    if (kr == KERN_SUCCESS)
+        kr = mach_msg(&in.m.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof in, reply,
+                      10000, MACH_PORT_NULL);
+    mach_port_mod_refs(mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[RSX metal] host window '%s' did not answer: %s\n", name,
+                mach_error_string(kr));
+        return -1;
+    }
+    const rsx_host_surfaces_msg* m = &in.m;
+    vm_address_t addr = 0;
+    rsx_host_control* ctl = NULL;
+    id<MTLTexture> tex[RSX_HOST_SLOTS] = { nil };
+    int ok = m->header.msgh_id == RSX_HOST_MSG_SURFACES &&
+             (m->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+             m->body.msgh_descriptor_count == 1 + RSX_HOST_SLOTS &&
+             m->width && m->height && m->width <= RSX_HOST_MAX_DIM && m->height <= RSX_HOST_MAX_DIM;
+    if (ok)
+        ok = vm_map(mach_task_self(), &addr, RSX_HOST_CONTROL_BYTES, 0, VM_FLAGS_ANYWHERE,
+                    m->control.name, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                    VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) == KERN_SUCCESS;
+    if (ok) {
+        ctl = (rsx_host_control*)addr;
+        ok = ctl->magic == RSX_HOST_MAGIC && ctl->version == RSX_HOST_VERSION;
+    }
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:m->width
+                                                          height:m->height
+                                                       mipmapped:NO];
+    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = [s_dev hasUnifiedMemory] ? MTLStorageModeShared : MTLStorageModeManaged;
+    for (int i = 0; ok && i < RSX_HOST_SLOTS; i++) {
+        IOSurfaceRef sf = host_lookup_surface(m->surface[i].name);
+        if (sf) {
+            tex[i] = [s_dev newTextureWithDescriptor:td iosurface:sf plane:0];
+            CFRelease(sf);
+        }
+        ok = tex[i] != nil;
+    }
+    const u32 rw = m->width, rh = m->height, gen = m->generation;
+    mach_msg_destroy(&in.m.header);         /* the mapping and the textures hold their own references */
+    if (!ok) {
+        if (addr) vm_deallocate(mach_task_self(), addr, RSX_HOST_CONTROL_BYTES);
+        fprintf(stderr, "[RSX metal] host window '%s' sent an unusable reply\n", name);
+        return -1;
+    }
+    if (s_host_ctl) vm_deallocate(mach_task_self(), (vm_address_t)s_host_ctl, RSX_HOST_CONTROL_BYTES);
+    s_host_ctl = ctl;
+    for (int i = 0; i < RSX_HOST_SLOTS; i++) s_host_tex[i] = tex[i];
+    s_host_w = rw; s_host_h = rh; s_host_gen = gen;
+    atomic_store(&ctl->producer_pid, (int32_t)getpid());
+    host_watch_launcher(ctl->launcher_pid);
+    fprintf(stderr, "[RSX metal] host window '%s': %d surfaces %ux%u (generation %u)\n",
+            name, RSX_HOST_SLOTS, rw, rh, gen);
+    return 0;
+}
+
+/* A surface for this present, or -1 to skip it (the windowed path skips a
+ * frame the same way when the compositor has no drawable to give). */
+static int host_acquire(void)
+{
+    rsx_host_control* c = s_host_ctl;
+    if (!c) return -1;
+    if (atomic_load(&c->closed)) host_note_gone("window closed");
+    return rsx_host_begin_render(c);
+}
+
+/* From the command buffer's completion handler: publish the surface and
+ * wake the launcher. The wake never blocks; a full queue means the launcher
+ * has a wake pending already. */
+static void host_frame_done(int slot, u32 gen, int ok)
+{
+    rsx_host_control* c = s_host_ctl;
+    if (!c || slot < 0 || gen != s_host_gen) return;
+    rsx_host_end_render(c, slot, ok, mach_absolute_time());
+    if (!ok) return;
+    rsx_host_frame_msg msg;
+    memset(&msg, 0, sizeof msg);
+    msg.header.msgh_bits        = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    msg.header.msgh_size        = sizeof msg;
+    msg.header.msgh_remote_port = s_host_port;
+    msg.header.msgh_id          = RSX_HOST_MSG_FRAME;
+    const kern_return_t kr = mach_msg(&msg.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof msg,
+                                      0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    if (kr == MACH_SEND_INVALID_DEST) host_note_gone("launcher port dead");
+}
+
+/* Every in-flight frame finished: no completion handler can still touch the
+ * attachment. */
+static void host_drain(void)
+{
+    if (!s_inflight) return;
+    for (int i = 0; i < MTL_MAX_INFLIGHT; i++)
+        dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+    for (int i = 0; i < MTL_MAX_INFLIGHT; i++)
+        dispatch_semaphore_signal(s_inflight);
+}
+
+/* The vtable path renders straight into the surface, so the surface has to be
+ * the display's size: ask for new ones when the display buffer changes size. */
+static int host_match_size(u32 w, u32 h)
+{
+    if (w == s_host_w && h == s_host_h) return 0;
+    host_drain();
+    return host_attach(w, h);
+}
+
+static void host_detach(void)
+{
+    if (s_host_watch) { dispatch_source_cancel(s_host_watch); s_host_watch = nil; }
+    for (int i = 0; i < RSX_HOST_SLOTS; i++) s_host_tex[i] = nil;
+    if (s_host_ctl) {
+        vm_deallocate(mach_task_self(), (vm_address_t)s_host_ctl, RSX_HOST_CONTROL_BYTES);
+        s_host_ctl = NULL;
+    }
+    if (s_host_port != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), s_host_port);
+        s_host_port = MACH_PORT_NULL;
+    }
+    s_host_w = s_host_h = s_host_gen = 0;
+    s_host = 0;
+}
+#else
+static int  host_attach(u32 w, u32 h) { (void)w; (void)h; return -1; }
+static int  host_acquire(void) { return -1; }
+static void host_frame_done(int slot, u32 gen, int ok) { (void)slot; (void)gen; (void)ok; }
+static int  host_match_size(u32 w, u32 h) { (void)w; (void)h; return -1; }
+static void host_detach(void) {}
+#endif
+
 #if !TARGET_OS_IPHONE
 /* Visibility also changes for hide/order-out/minimize. Only an actual
  * close of this backend's window ends its presentation session. */
@@ -598,6 +844,16 @@ static int create_window_impl(const char* title)
     [s_window setTitle:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
     [s_window center];
 
+    /* A window handed over by the executable that spawned this one (see
+     * rsx_metal_backend_export_window_state): open where it was. */
+    double wx, wy, ww, wh;
+    int was_fullscreen = 0;
+    const char* handed = getenv("PS3RECOMP_WINDOW_STATE");
+    if (handed && sscanf(handed, "%lf,%lf,%lf,%lf,%d", &wx, &wy, &ww, &wh, &was_fullscreen) == 5 &&
+        ww >= 64 && wh >= 64)
+        [s_window setFrame:NSMakeRect(wx, wy, ww, wh) display:NO];
+    unsetenv("PS3RECOMP_WINDOW_STATE");
+
     s_layer = [CAMetalLayer layer];
     s_layer.device          = s_dev;
     s_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
@@ -610,8 +866,33 @@ static int create_window_impl(const char* title)
 
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+    if (was_fullscreen) [s_window toggleFullScreen:nil];
     fps_start();
     return 0;
+}
+
+/* A title that replaces its executable (sys_game_process_exitspawn: Resistance
+ * goes from the EBOOT's menus to game.self) loses its window with the old
+ * process image. Call this just before the exec: the frame and fullscreen
+ * state go into PS3RECOMP_WINDOW_STATE, and the new process's window opens
+ * in the same place instead of centred at the default size. */
+void rsx_metal_backend_export_window_state(void)
+{
+    /* Host-surface mode has nothing to hand over: the window is the
+     * launcher's, and the next image attaches to it again. */
+    if (s_headless || s_host || !s_window) return;
+    __block NSRect frame = NSZeroRect;
+    __block int fullscreen = 0;
+    void (^read_state)(void) = ^{
+        frame = [s_window frame];
+        fullscreen = ([s_window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+    };
+    if ([NSThread isMainThread]) read_state();
+    else dispatch_sync(dispatch_get_main_queue(), read_state);
+    char buf[128];
+    snprintf(buf, sizeof buf, "%.0f,%.0f,%.0f,%.0f,%d", frame.origin.x, frame.origin.y,
+             frame.size.width, frame.size.height, fullscreen);
+    setenv("PS3RECOMP_WINDOW_STATE", buf, 1);
 }
 
 static int create_window(const char* title)
@@ -3600,6 +3881,8 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
+        int host_slot = -1;
+        const u32 host_gen = s_host_gen;
         const int windowed_present = (present_dst && !s_headless);
         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
           if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
@@ -3608,6 +3891,13 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         if (present_dst) {
             if (s_headless) {
                 dst = s_offscreen;
+            } else if (s_host) {
+                host_slot = host_acquire();
+                if (host_slot < 0) {       /* every surface busy; skip */
+                    dispatch_semaphore_signal(s_inflight);
+                    return;
+                }
+                dst = s_host_tex[host_slot];
             } else {
                 drawable = [s_layer nextDrawable];
                 if (!drawable) {           /* compositor is busy; skip */
@@ -3625,6 +3915,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         if (!cb || (s_eng_stage_used && !stage)) {
             s_eng_encoding_failed = 1;
+            host_frame_done(host_slot, host_gen, 0);
             if (windowed_present) dispatch_semaphore_signal(s_inflight);
             return;
         }
@@ -3636,8 +3927,10 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
-            [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
-                (void)_unused;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                if (host_slot >= 0)
+                    host_frame_done(host_slot, host_gen,
+                                    [done status] == MTLCommandBufferStatusCompleted);
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];
@@ -3718,6 +4011,9 @@ static void eng_dump_frame(id<MTLTexture> src)
 static void eng_present(void* user, u32 surface)
 {
     (void)user;
+    /* The draw engine presents once per guest flip: count it for the
+     * PS3RECOMP_METAL_FPS "guest" figure (and the launcher's title). */
+    rsx_metal_backend_note_guest_frame();
     id<MTLTexture> src = eng_obj(surface);
     if (!src) { eng_encode_and_commit(nil); return; }
     eng_encode_and_commit(src);
@@ -3855,7 +4151,19 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         s_headless = 1;
         rc = create_offscreen();
 #else
-        rc = s_headless ? create_offscreen() : create_window(title);
+        /* Under a launcher (tools/host_window) the window is the launcher's.
+         * Without an answer from it the run is not lost: it opens a window of
+         * its own, as it would have without the launcher. */
+        const char* hs = getenv(RSX_HOST_SURFACE_ENV);
+        s_host = !s_headless && hs && *hs;
+        if (s_host) {
+            atomic_store(&s_closed, 0);
+            if (host_attach(s_width, s_height) != 0) {
+                fprintf(stderr, "[RSX metal] no host window; opening a window of our own\n");
+                host_detach();
+            }
+        }
+        rc = s_headless ? create_offscreen() : s_host ? 0 : create_window(title);
 #endif
         if (rc != 0) {
             fprintf(stderr, "[RSX metal] surface creation failed\n");
@@ -3913,7 +4221,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             rsx_set_backend(&s_backend_vtable);
         }
         fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s, %s path\n",
-                s_headless ? "headless" : "windowed",
+                s_headless ? "headless" : s_host ? "host-surface" : "windowed",
                 [[s_dev name] UTF8String], s_width, s_height,
                 s_guest_shaders ? "on" : (rsx_hlsl_to_msl_available() ? "off (env)" : "off (translator not built)"),
                 s_eng_active ? "register-file draw engine" : "vtable");
@@ -3939,6 +4247,7 @@ void rsx_metal_backend_shutdown(void)
                 dispatch_semaphore_signal(s_inflight);
             s_inflight = nil;
         }
+        if (s_host) host_detach();
 #if !TARGET_OS_IPHONE
         /* Only touch the main queue when there is AppKit state to tear down:
          * headless runs never pump it, and a dispatch_sync there would hang. */
@@ -4018,14 +4327,26 @@ void rsx_metal_backend_present(void)
         if (ft_t0) ps3_ft_span(PS3_FT_PRESENT, 0, 0, 0, ft_t0, ps3_ft_now());
         return;
     }
+    /* This path renders straight into the target, so a host surface has to
+     * be the display's size; a resize waits for the frames in flight first. */
+    if (s_host && host_match_size(s_width, s_height) != 0) return;
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
     if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
     @autoreleasepool {
         id<MTLTexture> target = nil;
         id<CAMetalDrawable> drawable = nil;
+        int host_slot = -1;
+        const u32 host_gen = s_host_gen;
 
         if (s_headless) {
             target = s_offscreen;
+        } else if (s_host) {
+            host_slot = host_acquire();
+            if (host_slot < 0) {        /* every surface busy; skip this frame */
+                dispatch_semaphore_signal(s_inflight);
+                return;
+            }
+            target = s_host_tex[host_slot];
         } else {
             drawable = [s_layer nextDrawable];
             if (!drawable) {            /* compositor is busy; skip this frame */
@@ -4104,8 +4425,10 @@ void rsx_metal_backend_present(void)
             [cb waitUntilCompleted];
         } else {
             dispatch_semaphore_t sem = s_inflight;
-            [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
-                (void)_unused;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                if (host_slot >= 0)
+                    host_frame_done(host_slot, host_gen,
+                                    [done status] == MTLCommandBufferStatusCompleted);
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];        /* no wait: the CPU goes on to the next frame */

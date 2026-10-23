@@ -287,3 +287,26 @@ endif()
 # Install
 # ---------------------------------------------------------------------------
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# The window launcher (macOS)
+# ---------------------------------------------------------------------------
+# A title that replaces its executable (sys_game_process_exitspawn, done by a
+# port as an exec) loses its window with the old process image. The launcher
+# holds the window for the whole session instead: it runs the port with
+# PS3RECOMP_HOST_SURFACES set, the Metal backend renders into IOSurfaces it
+# shares (libs/video/rsx_host_surface.h), and the image an exec brings up
+# attaches to the same window again. One Objective-C file and no runtime
+# library, so it builds in seconds:
+#
+#   ./MyGameRecomp_window [--title T] [--size WxH] -- ./MyGameRecomp <args>
+if(APPLE)
+    enable_language(OBJC)
+    add_executable(${PROJECT_NAME}_window "${PS3RECOMP_DIR}/tools/host_window/host_window.m")
+    target_include_directories(${PROJECT_NAME}_window PRIVATE "${PS3RECOMP_DIR}/libs/video")
+    target_compile_definitions(${PROJECT_NAME}_window PRIVATE HOST_WINDOW_TITLE="${PROJECT_NAME}")
+    target_compile_options(${PROJECT_NAME}_window PRIVATE -fobjc-arc -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(${PROJECT_NAME}_window PRIVATE
+        "-framework AppKit" "-framework Metal" "-framework QuartzCore" "-framework IOSurface")
+    install(TARGETS ${PROJECT_NAME}_window RUNTIME DESTINATION bin)
+endif()
