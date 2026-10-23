@@ -888,6 +888,10 @@ unsigned long long ps3_ms_now(void)
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
 static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
+/* The park the walker is waiting on (0 = none), the `put` it saw there, and
+ * since when it has stood with that put: the jump-park grace in the walker. */
+static u32 park_off, park_put;
+static unsigned long long park_since;
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
@@ -1911,6 +1915,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   nop = hdr = jmp = cal = ret = 0; t0 = now;
               } } }
         u32 type = w >> 29;
+        /* The walker is reading something other than the park it waited on:
+         * it has left it, by the patched word (a JUMP elsewhere, or commands
+         * written over the park) or by a resync. Forget the park here. Kept,
+         * its start time survived until the walker next stopped at the same
+         * address with the same put -- a title that reuses its command blocks
+         * does that -- and that park then inherited a grace that had already
+         * run out, so the jump-park resync fired at once and dropped the
+         * commands the title was about to link in. */
+        if (park_off && (s_fifo_getoff != park_off ||
+                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off))
+            park_off = 0;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
@@ -1998,8 +2013,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * takes between the two stores. */
                   if (put != s_fifo_getoff) {
                       extern unsigned long long ps3_ms_now(void);
-                      static u32 park_off, park_put;
-                      static unsigned long long park_since;
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
