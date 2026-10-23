@@ -2781,11 +2781,13 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
          * field 1). Read as Z24S8, a Z16 surface's 0xFFFF -- its far plane --
          * would clear it to 255/16777215, nearly the near plane, and every
          * LESS or LEQUAL draw into it would then fail. The nv40 reset
-         * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0. */
+         * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0, and the
+         * FIFO walker writes it again at every flip, as the RSX does. A 0 is
+         * the near plane: a title that sets 0 and never writes the register
+         * again gets the far plane back from the next flip, not from here. */
         const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
         const int z16 = sf.depth_format == 1u;
-        const float depth = !zs ? 1.0f
-                          : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
+        const float depth = z16 ? (float)(zs & 0xFFFFu) / 65535.0f
                                 : (float)(zs >> 8) / 16777215.0f;
         g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
                                   depth, z16 ? 0 : (u8)(zs & 0xFFu));

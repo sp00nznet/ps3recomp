@@ -36,6 +36,10 @@ extern "C" {
 #define RSX_DSP_NUM_VERTEX_ATTR 16
 #define RSX_DSP_NUM_TEXTURES    16               /* fragment texture units   */
 
+/* ZSTENCIL_CLEAR_VALUE (0x1D8C) after a reset: depth 1.0, stencil 0 in the
+ * Z24S8 layout. The RSX puts it back at every flip as well (cellGcmSys.c). */
+#define RSX_DSP_ZSTENCIL_CLEAR_RESET 0xFFFFFF00u
+
 /* rsx_dsp_texture.format values (gcm public format byte, incl. the LN/UN
  * modifier bits: 0x20 = linear/no-swizzle, 0x40 = unnormalized coords) */
 #define RSX_TEX_FMT_B8              0x81

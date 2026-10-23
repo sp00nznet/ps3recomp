@@ -164,6 +164,22 @@ static void gcm_set_current_display_buffer(u32 bufferId)
 }
 
 
+/* The RSX puts its 3D state back to the reset values at a flip, and a title
+ * may count on that: one sets ZSTENCIL_CLEAR_VALUE to 0 for a single clear
+ * and never writes it again, so its later depth clears are to the far plane
+ * only because every flip restored 0xFFFFFF00 (RPCS3's flip_command resets
+ * the whole register file, rsx_state::reset). Here it reaches every consumer
+ * of the method stream, at the flip's place in it.
+ * TODO: the rest of the reset image; this is the one register a title has
+ * been seen to depend on. */
+static void gcm_fifo_flip_resets_state(rsx_state* state)
+{
+    const u32 m = NV4097_SET_ZSTENCIL_CLEAR_VALUE, v = RSX_DSP_ZSTENCIL_CLEAR_RESET;
+    rsx_process_method(state, m, v);
+    if (rsx_live_draw_enabled())   rsx_live_draw_method(m, v);
+    if (rsx_draw_engine_enabled()) rsx_draw_engine_method(m, v);
+}
+
 /* Configuration */
 static CellGcmConfig s_config;
 /* Offset pages (1MB) known to be LOCAL-memory-derived (set by
@@ -1921,6 +1937,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            gcm_fifo_flip_resets_state(&s_state);
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
              * appearing on screen the first question is which side stopped:

@@ -1332,6 +1332,13 @@ static void test_depth_clear_value(void)
     m(M_CLEAR_BUFFERS, 0x01u);
     CHECK(stub.last_clear_depth == 1.0f,
           "a Z24S8 zeta cleared with 0xFFFFFF00 clears to 1.0 (%g)", stub.last_clear_depth);
+
+    /* 0 is the near plane. It used to read as 1.0, standing in for the
+     * reset a flip does (the FIFO walker's job now). */
+    m(M_ZSTENCIL_CLEAR, 0u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.last_clear_depth == 0.0f,
+          "a zeta cleared with 0 clears to 0.0 (%g)", stub.last_clear_depth);
     engine_down();
 }
 

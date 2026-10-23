@@ -20,6 +20,8 @@
  *   6. With every flip completed, a beat completes nothing: not after the
  *      status was reset, and not for a flip queued after that beat.
  *   7. A flip requested outside the stream completes on the next beat, once.
+ *   8. A flip in the stream puts ZSTENCIL_CLEAR_VALUE back to its reset value
+ *      for every consumer of the methods, after the methods ahead of it.
  *
  * gcc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_flip_stream.c
  *   -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread
@@ -47,9 +49,20 @@ void rsx_raise_user_cmd(uint32_t arg) { (void)arg; }
 void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
 void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
 void rsx_state_init(rsx_state* state) { (void)state; }
-int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
-int  rsx_draw_engine_enabled(void) { return 0; }
-void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
+/* ZSTENCIL_CLEAR_VALUE writes as each consumer of the methods saw them. */
+static u32 g_zs_state[4], g_zs_engine[4];
+static int g_n_zs_state, g_n_zs_engine, g_engine_on;
+int  rsx_process_method(rsx_state* state, u32 method, u32 data)
+{
+    (void)state;
+    if (method == 0x1D8Cu && g_n_zs_state < 4) g_zs_state[g_n_zs_state++] = data;
+    return 0;
+}
+int  rsx_draw_engine_enabled(void) { return g_engine_on; }
+void rsx_draw_engine_method(u32 method, u32 arg)
+{
+    if ((method & 0x1FFCu) == 0x1D8Cu && g_n_zs_engine < 4) g_zs_engine[g_n_zs_engine++] = arg;
+}
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -204,6 +217,23 @@ int main(void)
     cellGcm_request_tick();
     p = GCM_PENDING_TAKE();
     check(!(p & 2), "once");
+
+    /* 8: the title sets the clear value to 0 for one clear and flips. (The
+     * flips above wrote the reset too.) */
+    g_engine_on = 1;
+    g_n_zs_state = g_n_zs_engine = 0;
+    const u32 cur5 = vm_read32(ctx + 8);
+    vm_write32(cur5 + 0, 0x00041D8Cu);                 /* ZSTENCIL_CLEAR_VALUE */
+    vm_write32(cur5 + 4, 0);
+    vm_write32(cur5 + 8, GCM_FLIP_MARKER | 1u);
+    vm_write32(ctx + 8, cur5 + 12);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(cur5) + 12);
+    cellGcm_rsx_process_fifo();
+    check(g_n_zs_state == 2 && g_zs_state[0] == 0 && g_zs_state[1] == 0xFFFFFF00u,
+          "the method state sees 0, then the flip's 0xFFFFFF00");
+    check(g_n_zs_engine >= 1 && g_zs_engine[g_n_zs_engine - 1] == 0xFFFFFF00u,
+          "the draw engine gets the flip's 0xFFFFFF00 too");
+    g_engine_on = 0;
 
     printf("[gcm_flip_stream] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);

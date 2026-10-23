@@ -170,7 +170,7 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * 0xFFFFFF00 = depth 1.0, stencil 0 (RPCS3 rsx_methods.cpp reset image
      * as numbering oracle). Seeded so a raw register read is trustworthy for
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
-    rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+    rsx->regs[0x1D8C >> 2] = RSX_DSP_ZSTENCIL_CLEAR_RESET;
 
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
