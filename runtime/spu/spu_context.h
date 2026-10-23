@@ -783,6 +783,8 @@ extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
 void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
 void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    */
+/* Both of the above for one trampoline hop, with the common case inline. */
+void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
  * persistent LS-0xA00 workload module if one is set. */
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
@@ -872,8 +874,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
-            yz_lockstep_tick(ctx);                             \
-            spu_task_launch_check((ctx), (void*)_tf);          \
+            spu_drain_hop((ctx), _tf);                         \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \

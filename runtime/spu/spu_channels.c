@@ -1552,12 +1552,12 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
  * Matching the resolved function, not just its LS address, avoids affecting
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
-static unsigned s_stack_reset_count;
+unsigned g_spu_stack_reset_count;   /* spu_drain.c skips the check at 0 */
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
-    if (s_stack_reset_count < 16) {
-        s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
-        s_stack_reset[s_stack_reset_count++].image_id = image_id;
+    if (g_spu_stack_reset_count < 16) {
+        s_stack_reset[g_spu_stack_reset_count].entry = entry & SPU_LS_MASK;
+        s_stack_reset[g_spu_stack_reset_count++].image_id = image_id;
     }
 }
 
@@ -1565,8 +1565,8 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
  * a stack-switching routine without going through spu_indirect_branch. */
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 {
-    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
-    for (unsigned i = 0; i < s_stack_reset_count; ++i)
+    if (!g_spu_stack_reset_count || !ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
+    for (unsigned i = 0; i < g_spu_stack_reset_count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
