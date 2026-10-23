@@ -13,6 +13,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -71,12 +74,32 @@ uint64_t ppu_timebase_now(void)
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
-           (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
+    const uint64_t ns = host_monotonic_ns();
+    return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ +
+           (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
 #endif
 }
+
+#ifndef _WIN32
+uint64_t host_monotonic_ns(void)
+{
+#ifdef __APPLE__
+    static uint32_t numer, denom;
+    if (!denom) {                       /* benign race: same values either way */
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        numer = tb.numer; denom = tb.denom;
+    }
+    const uint64_t t = mach_absolute_time();
+    /* Split so t * numer cannot overflow (numer is 125 on Apple silicon). */
+    return (t / denom) * numer + (t % denom) * numer / denom;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+#endif
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -385,8 +408,7 @@ static uint64_t timer_now_us(void)
     return (uint64_t)(n.QuadPart / f.QuadPart) * 1000000ull +
            (uint64_t)(n.QuadPart % f.QuadPart) * 1000000ull / (uint64_t)f.QuadPart;
 #else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    return host_monotonic_ns() / 1000ull;
 #endif
 }
 

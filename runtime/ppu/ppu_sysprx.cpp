@@ -21,6 +21,10 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+#ifndef _WIN32
+/* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
+extern "C" uint64_t host_monotonic_ns(void);
+#endif
 #include "ps3emu/log_first.h"
 
 extern "C" uint8_t* vm_base;
@@ -71,8 +75,9 @@ static void sys_time_get_system_time(ppu_context* ctx)
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
 #else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    /* The same host clock as the timebase (sys_timer.h), so guest code that
+     * mixes mftb and this stays consistent. */
+    ctx->gpr[3] = host_monotonic_ns() / 1000ull;
 #endif
 }
 
