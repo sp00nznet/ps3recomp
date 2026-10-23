@@ -1,12 +1,15 @@
 /*
  * rsx_vertex_fetch_plan_prepare against the per-attribute walk it replaced.
  *
- * _prepare finds the span of ordinary per-vertex attributes (frequency 0/1)
+ * _prepare finds the span of ordinary per-vertex attributes (rsx_vertex_freq_plain)
  * once per draw instead of once per attribute. Random fetch plans -- every
  * vertex type, strides and offsets, frequency dividers in both modes, guest
  * memory that is partly unmapped, INLINE_ARRAY streams -- with random index
  * references, some past the 20-bit element wrap: every attribute's stable
  * range (base, first, last) must be what the old walk gave.
+ *
+ * Also: frequency 1 under a modulo operation bit reads element 0 for every
+ * vertex (vertex % 1), while frequency 1 under division stays per vertex.
  *
  * Build (from the repo root):
  *   clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video \
@@ -128,8 +131,57 @@ static void random_plan(rsx_vertex_fetch_plan* plan, int use_inline,
     }
 }
 
+static void put_be_f32(u8* p, float f)
+{
+    u32 u;
+    memcpy(&u, &f, 4);
+    p[0] = (u8)(u >> 24); p[1] = (u8)(u >> 16); p[2] = (u8)(u >> 8); p[3] = (u8)u;
+}
+
+/* Attribute 0 holds elements (10,11,12), (20,21,22), ...: frequency 1 with
+ * modulo gives every vertex element 0; with division, vertex i element i. */
+static void test_modulo_frequency_one(void)
+{
+    enum { VERTS = 4 };
+    mapped_end[0] = GUEST;
+    for (u32 e = 0; e < VERTS; e++)
+        for (u32 c = 0; c < 3; c++)
+            put_be_f32(&guest[0][256 + e * 12 + c * 4], (float)(10 * (e + 1) + c));
+    rsx_vertex_ref refs[VERTS];
+    for (u32 i = 0; i < VERTS; i++) { refs[i].vertex_id = i; refs[i].base_index = 0; }
+
+    for (u32 modulo = 0; modulo < 2; modulo++) {
+        rsx_vertex_fetch_plan plan;
+        memset(&plan, 0, sizeof plan);
+        rsx_vertex_layout_plan_init(&plan.layout, 1u);
+        plan.divider_mask = modulo;
+        plan.guest_ptr = guest_ptr;
+        rsx_vertex_fetch_attr* f = &plan.attr[0];
+        f->desc.type = RSX_VTX_TYPE_FLOAT;
+        f->desc.size = 3;
+        f->desc.stride = 12;
+        f->desc.frequency = 1;
+        f->desc.offset = 256;
+        f->elem_size = 12;
+        f->stride = 12;
+        rsx_vertex_fetch_plan_prepare(&plan, refs, VERTS);
+        CHECK(f->stable_base && f->stable_first == 0 &&
+              f->stable_last == (modulo ? 0u : VERTS - 1u),
+              "modulo %u: stable range %u..%u", modulo, f->stable_first, f->stable_last);
+        for (u32 i = 0; i < VERTS; i++) {
+            const float want = modulo ? 10.0f : (float)(10 * (i + 1));
+            float one[4];
+            CHECK(rsx_vertex_fetch_one(&plan, &refs[i], (u8*)one) &&
+                  one[0] == want && one[2] == want + 2.0f,
+                  "modulo %u vertex %u: fetch_one (%g,%g,%g), want x %g", modulo, i,
+                  one[0], one[1], one[2], want);
+        }
+    }
+}
+
 int main(void)
 {
+    test_modulo_frequency_one();
     enum { PLANS = 6000, MAXV = 200 };
     static rsx_vertex_ref refs[MAXV];
     static u8 inl[8192];

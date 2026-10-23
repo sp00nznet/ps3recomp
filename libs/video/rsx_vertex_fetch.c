@@ -2,6 +2,7 @@
  * ps3recomp - RSX guest vertex fetch (see rsx_vertex_fetch.h)
  */
 #include "rsx_vertex_fetch.h"
+#include "rsx_vertex_formats.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,8 +41,9 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
     const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
     if (!a->enabled || a->stride == 0 || !vm_base) return;
 
-    /* Vertex frequency divisor (instancing). freq 0/1 = per-vertex. For
-     * freq > 1 the element index is either vertex/freq (DIVIDE: per-instance
+    /* Vertex frequency divisor (instancing). An ordinary array
+     * (rsx_vertex_freq_plain: freq 0, or 1 with DIVIDE) is per-vertex.
+     * Otherwise the element index is either vertex/freq (DIVIDE: per-instance
      * data advances once per freq verts) or vertex%freq (MODULO: a mesh
      * repeats every freq verts). NV4097_SET_FREQUENCY_DIVIDER_OPERATION's
      * per-attribute bit selects MODULO. DeferredShading's cube rings need
@@ -50,7 +52,8 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
      * instanced cubes drew with garbage transforms (only the baseplate,
      * which isn't instanced, survived). */
     u32 ei = vi;
-    if (a->frequency > 1) {
+    if (!rsx_vertex_freq_plain(a->frequency,
+                               (st->frequency_divider_op >> idx) & 1u)) {
         static int nofreq = -1;                 /* VP_NOFREQ: instancing kill-switch */
         if (nofreq < 0) nofreq = getenv("VP_NOFREQ") ? 1 : 0;
         if (!nofreq)

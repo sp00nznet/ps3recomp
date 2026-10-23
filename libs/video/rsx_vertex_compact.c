@@ -180,7 +180,7 @@ void rsx_vertex_fetch_plan_prepare(
 {
     if (!plan)
         return;
-    /* Ordinary per-vertex attributes (frequency 0/1) all span the same
+    /* Ordinary per-vertex attributes (rsx_vertex_freq_plain) all span the same
      * elements: find them once for the draw instead of once per attribute.
      * The per-attribute walk was 2.2 ms of the RSX thread a frame in
      * inFAMOUS 2's New Marais. */
@@ -221,7 +221,8 @@ void rsx_vertex_fetch_plan_prepare(
 
         u32 first = UINT_MAX;
         u32 last = 0;
-        if (fetch->desc.frequency <= 1) {
+        if (rsx_vertex_freq_plain(fetch->desc.frequency,
+                                  (plan->divider_mask >> attr) & 1u)) {
             if (!plain_known) {
                 plain_known = 1;
                 for (u32 i = 0; i < count; i++) {
