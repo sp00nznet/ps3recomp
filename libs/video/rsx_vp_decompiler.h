@@ -71,6 +71,17 @@ int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
 
+/* User clip planes. RSX vertex programs write the six clip distances into
+ * o5.yzw and o6.yzw (o5.x is fog, o6.x the point size); which planes count,
+ * and which side of each is kept, is NV4097_SET_USER_CLIP_PLANE_CONTROL
+ * (0x1478) state, not program state. `ops` holds two bits per plane, plane N
+ * at bits 2N..2N+1: 0 disabled, 1 ENABLE_LT (keeps d <= 0), 2 ENABLE_GE
+ * (keeps d >= 0) -- RPCS3's factors -1/+1. Adds SV_ClipDistance outputs for
+ * them to HLSL from rsx_vp_decompile*; a disabled plane in the same vector
+ * gets 0.5 and never clips. Returns 0 (nothing to do when ops is 0), or -1
+ * when the text is not in the decompiler's form or does not fit in cap. */
+int rsx_vp_apply_user_clip(char* hlsl, size_t cap, u32 ops);
+
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);

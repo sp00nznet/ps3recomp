@@ -926,6 +926,34 @@ static void emit_shader_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
 }
 
+/* --clip / --clip-keep: the --shader triangle with a vertex program that
+ * also writes o5 = v3, the colour (0, 0, 1, 1), so user clip plane 1's
+ * distance (o5.z) is 1 everywhere. SET_USER_CLIP_PLANE_CONTROL (0x1478, one
+ * 4-bit op per plane) enables plane 1 as ENABLE_LT (keeps d <= 0: the whole
+ * triangle is clipped, the clear colour stays) or as ENABLE_GE (keeps d >= 0:
+ * the red comes through). A renderer that ignores the register draws red in
+ * both. The register goes back to 0 afterwards, as a title's reset would. */
+#define NV4097_SET_USER_CLIP_PLANE_CONTROL 0x00001478u
+static void emit_clip_draw(int keep)
+{
+    u8 vp[48];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 0);   /* MOV o1, v3      */
+    rsx_test_vp_mov_out(vp + 32, 3, RSX_TEST_VP_SWZ_IDENT, 5, 1);   /* MOV o5, v3, END */
+    emit_programs(vp, sizeof vp, FP_OFFSET);
+    emit(NV4097_SET_USER_CLIP_PLANE_CONTROL, (keep ? 2u : 1u) << 4);  /* plane 1 */
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(SVTX_OFFSET +  0));  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(SVTX_OFFSET + 16));  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3  */
+    emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
+    emit(NV4097_SET_USER_CLIP_PLANE_CONTROL, 0u);
+}
+
 /* Depth test on, LESS, writes on -- the state a title sets for opaque
  * geometry -- and the two triangles as separate BEGIN/END pairs, which is how
  * a title issues two draws rather than one split primitive stream. */
@@ -1031,6 +1059,7 @@ static void submit_frame(int with_draw)
     else if (with_draw == 5) emit_mip_draw();
     else if (with_draw == 4) emit_depth_draw();
     else if (with_draw == 3) emit_shader_draw();
+    else if (with_draw == 15 || with_draw == 16) emit_clip_draw(with_draw == 16);
     else if (with_draw == 2) emit_textured_draw();
     else if (with_draw == 1 || with_draw == 13) emit_triangle_draw();
 
@@ -1233,7 +1262,7 @@ static int run_audio_pad_check(void)
 static int mode_needs_translator(int mode)
 {
     return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
-           mode == 9 || mode == 10 || mode == 11;
+           mode == 9 || mode == 10 || mode == 11 || mode == 15 || mode == 16;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -1254,6 +1283,8 @@ static const char* mode_flag_name(int mode)
     case 9:  return "--mrt";
     case 10: return "--mrt-a";
     case 11: return "--cube";
+    case 15: return "--clip";
+    case 16: return "--clip-keep";
     default: return "(mode)";
     }
 }
@@ -1359,6 +1390,9 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--split-present") == 0) do_draw = 13;
         /* --feedback: see emit_feedback_draws. */
         else if (strcmp(argv[i], "--feedback") == 0) do_draw = 14;
+        /* --clip / --clip-keep: see emit_clip_draw. */
+        else if (strcmp(argv[i], "--clip") == 0) do_draw = 15;
+        else if (strcmp(argv[i], "--clip-keep") == 0) do_draw = 16;
     }
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
@@ -1404,7 +1438,7 @@ int main(int argc, char** argv)
     }
     if (do_draw == 1 || do_draw == 13) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
-    if (do_draw == 3) upload_shader_triangle();
+    if (do_draw == 3 || do_draw == 15 || do_draw == 16) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
     if (do_draw == 12) upload_depth_bounds_triangles();
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
@@ -1520,6 +1554,8 @@ int main(int argc, char** argv)
                  : (do_draw == 9) ? MRT_B_ARGB
                  : (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
+                 : (do_draw == 16) ? 0xFFFF0000u  /* plane 1 keeps d >= 0        */
+                 : (do_draw == 15) ? CLEAR_ARGB   /* plane 1 clipped it all      */
                  : (do_draw == 14) ? 0xFFFF0000u  /* the copy kept the triangle  */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
                  : (do_draw == 5) ? (s_mip_aniso ? MIP_L0_ARGB : MIP_L1_ARGB)

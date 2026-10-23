@@ -11,6 +11,7 @@
  *
  * Programs:
  *   VP  MOV o0, v0 ; MOV o1, v3 (END)      position through, colour through
+ *   VP  MOV o0, v0 ; MOV o5, v3 (END)      + user clip planes (o5.yzw, o6.yzw)
  *   FP  MOV r0, COL0 (END)                 colour out
  *   FP  MOV r0, COL0.zyxw (END)            colour out, red and blue swapped:
  *                                          what the host's --shader mode runs
@@ -127,6 +128,39 @@ int main(int argc, char** argv)
             check("VP MSL", g_msl, "[[user(locn0)]]");    /* COLOR0 */
             check("VP MSL", g_msl, "[[user(locn10)]]");   /* TEXCOORD7 */
         }
+    }
+
+    /* ---- user clip planes: MOV o0, v0 ; MOV o5, v3 ------------------------
+     * The distances live in o5.yzw / o6.yzw and the planes are register
+     * state (NV4097 0x1478), so they are added to the decompiled text:
+     * plane 0 ENABLE_GE keeps d >= 0, plane 1 ENABLE_LT keeps d <= 0, the
+     * rest of the vector never clips, and the varyings keep their slots. */
+    {
+        u8 vp[32];
+        rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0 */
+        rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 5, 1);   /* MOV o5, v3, END */
+        check_count("clip VP", rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 2);
+        const int none = rsx_vp_apply_user_clip(g_hlsl, sizeof g_hlsl, 0);
+        const int small = rsx_vp_apply_user_clip(g_hlsl, strlen(g_hlsl) + 8, 2u);
+        const int two = rsx_vp_apply_user_clip(g_hlsl, sizeof g_hlsl, 2u | (1u << 2));
+        if (none == 0 && small == -1 && two == 0) { printf("[PASS] clip VP patch results\n"); g_pass++; }
+        else { printf("[FAIL] clip VP patch results %d %d %d (want 0 -1 0)\n", none, small, two); g_fail++; }
+        check("clip VP HLSL", g_hlsl, "float4 clipd0:SV_ClipDistance0;");
+        check("clip VP HLSL", g_hlsl, "Out.clipd0 = float4(o[5].y, -(o[5].z), 0.5, 0.5);");
+        check_absent("clip VP HLSL", g_hlsl, "SV_ClipDistance1");
+        if (translate("clip VP", RSX_SHADER_STAGE_VERTEX) == 0) {
+            check("clip VP MSL", g_msl, "[[clip_distance]]");
+            check("clip VP MSL", g_msl, "[[user(locn0)]]");    /* COLOR0 */
+            check("clip VP MSL", g_msl, "[[user(locn10)]]");   /* TEXCOORD7 */
+        }
+        /* Plane 5 (o6.w) adds the second vector. */
+        check_count("clip VP 6", rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 2);
+        if (rsx_vp_apply_user_clip(g_hlsl, sizeof g_hlsl, 2u << 10) == 0) { printf("[PASS] clip VP 6 patch\n"); g_pass++; }
+        else { printf("[FAIL] clip VP 6 patch\n"); g_fail++; }
+        check("clip VP 6 HLSL", g_hlsl, "float2 clipd1:SV_ClipDistance1;");
+        check("clip VP 6 HLSL", g_hlsl, "Out.clipd1 = float2(0.5, o[6].w);");
+        if (translate("clip VP 6", RSX_SHADER_STAGE_VERTEX) == 0)
+            check("clip VP 6 MSL", g_msl, "[[clip_distance]]");
     }
 
     /* ---- fragment program: MOV r0, COL0 ---------------------------------- */

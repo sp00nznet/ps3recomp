@@ -3544,6 +3544,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     memset(&want, 0, sizeof want);
     pvkGetPhysicalDeviceFeatures(s_vk.phys, &have);
     want.textureCompressionBC = have.textureCompressionBC;
+    /* User clip planes (rsx_vp_apply_user_clip) write ClipDistance. */
+    want.shaderClipDistance = have.shaderClipDistance;
     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
     /* The depth bounds test: a deferred renderer bounds its light pass to
      * the geometry and its sky to the far plane with it. Optional in

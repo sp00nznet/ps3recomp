@@ -1599,6 +1599,31 @@ static int eng_debug_fp(u64 fp_hash, u32 pipeline)
     return 0;
 }
 
+/* User clip planes. NV4097_SET_USER_CLIP_PLANE_CONTROL (0x1478) holds one
+ * 4-bit op per plane (bits 0..23, planes 0..5): 0 disabled, 1 ENABLE_LT, 2
+ * ENABLE_GE. The vertex program writes the six distances into o[5].yzw and
+ * o[6].yzw (o[5].x is fog, o[6].x the point size). As RPCS3 does
+ * (fill_user_clip_data + the VP reg_table): GE keeps d >= 0 (factor +1), LT
+ * keeps d <= 0 (factor -1), a disabled plane never clips. A planar
+ * reflection clips its mirrored scene at the mirror plane this way; ignored,
+ * everything behind the plane was drawn into the reflection.
+ * Returns the op per plane, two bits each (0 = no plane enabled), the form
+ * rsx_vp_apply_user_clip takes. PS3RECOMP_ENG_USER_CLIP=0 ignores the
+ * register (the old behaviour). */
+static u32 eng_user_clip_key(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_USER_CLIP"); on = e ? atoi(e) : 1; }
+    if (!on) return 0;
+    const u32 ctl = rsx_dsp_reg(&g.rsx, 0x1478u);
+    u32 key = 0;
+    for (u32 p = 0; p < 6; p++) {
+        const u32 op = (ctl >> (p * 4u)) & 0xFu;
+        if (op == 1u || op == 2u) key |= op << (p * 2u);
+    }
+    return key;
+}
+
 /* A guest fragment program's name for the debug knobs: its structural hash
  * (inline constants excluded) seeded with the FNV offset basis, the value
  * RSX_FP_DEBUG matches in the decompiler. Unlike a backend pipeline handle it
@@ -1631,6 +1656,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 cube_mask = eng_cube_mask();
     const u32 vol_mask = eng_volume_mask();
     const u32 vtex_mask = eng_vtex_mask();
+    const u32 ucp = fixed ? 0 : eng_user_clip_key();
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
     u32 shadow_mask = 0;
     const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
@@ -1700,6 +1726,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             key = eng_fnv1a(shadow, sizeof shadow, key);
         }
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+        if (ucp) key = eng_fnv1a(&ucp, sizeof ucp, key);
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
     }
@@ -1730,6 +1757,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
+        if (vi > 0 && ucp && rsx_vp_apply_user_clip(s_vs_hlsl, sizeof s_vs_hlsl, ucp) < 0) {
+            vi = -1;
+            static u32 said;
+            if (PS3_LOG_FIRST(said, 8))
+                fprintf(stderr, "[rsx engine] user clip planes 0x%06X: vertex program text not in the"
+                                " decompiler's form, draw skipped\n", rsx_dsp_reg(&g.rsx, 0x1478u));
+        }
         fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask,
                 shadow_mask ? shadow : NULL, gamma_masks, expand_units ? expand_masks : NULL,
                 s_ps_hlsl, sizeof s_ps_hlsl, &nconst);

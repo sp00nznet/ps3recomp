@@ -159,6 +159,16 @@ jobs:
           # built-in run proves the check has teeth: it must fail.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader --frames=60
+          # User clip planes: the same triangle with plane 1 enabled through
+          # SET_USER_CLIP_PLANE_CONTROL. ENABLE_LT clips all of it (the clear
+          # colour stays), ENABLE_GE keeps it (red). With the register
+          # ignored --clip draws red, so that run must fail.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip-keep
+          if PS3RECOMP_ENG_USER_CLIP=0 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip; then
+            echo "--clip passed with user clip planes off; the check is not checking"
+            exit 1
+          fi
           # A guest texture sampled by a guest fragment program: layout,
           # decode, upload, the CONTROL1 crossbar as a swizzle, and the
           # sampler registers. The quad is green and the texture is not.
