@@ -74,6 +74,8 @@ jobs:
           /tmp/test_savedata_fixed
           clang -std=gnu17 -I include                 libs/system/tests/test_savedata_root.c                 -Wl,-dead_strip -o /tmp/test_savedata_root
           /tmp/test_savedata_root
+          clang -std=gnu17 -I include                 libs/system/tests/test_sysconf.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_sysconf
+          /tmp/test_sysconf
 
       - name: Run self-contained SPU helper tests
         run: |

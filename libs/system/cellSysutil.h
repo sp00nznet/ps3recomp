@@ -153,6 +153,16 @@ s32 cellDiscGameRegisterDiscChangeCallback(void (*callback)(void*), void* arg);
 s32 cellDiscGameUnregisterDiscChangeCallback(void);
 
 /* ---------------------------------------------------------------------------
+ * cellSysconf (exported by cellSysutil): the system accessory settings
+ * screen (Bluetooth headset and the like)
+ * -----------------------------------------------------------------------*/
+
+/* `func` is the guest callback's OPD, void func(s32 result, void* userdata);
+ * `userdata` a guest pointer handed back to it. */
+s32 cellSysconfOpen(u32 type, u32 func, u32 userdata, u32 extparam, u32 id);
+s32 cellSysconfAbort(void);
+
+/* ---------------------------------------------------------------------------
  * Misc utilities
  * -----------------------------------------------------------------------*/
 

@@ -239,7 +239,7 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
 
-/* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
+/* Indirect call dispatch (bctrl/bctr) â€” implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);

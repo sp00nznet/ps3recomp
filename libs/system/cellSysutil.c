@@ -662,6 +662,36 @@ s32 cellDiscGameUnregisterDiscChangeCallback(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * cellSysconf
+ *
+ * The accessory settings screen (audio devices, Bluetooth headsets) the system
+ * overlays on a title. There is no such screen here, so Open finishes at
+ * once: callback(CELL_OK, userdata) is queued as if the user had closed it,
+ * and it runs on the title's next cellSysutilCheckCallback like every other
+ * dialog completion, never from inside Open.
+ *
+ * Abort closes whatever settings screen is up; with none ever left open it is
+ * a successful no-op. Resistance: Fall of Man calls it whenever it tears its
+ * front end down -- starting the campaign, quitting, entering online play --
+ * and it reached the game as an unresolved import.
+ * -----------------------------------------------------------------------*/
+
+s32 cellSysconfOpen(u32 type, u32 func, u32 userdata, u32 extparam, u32 id)
+{
+    (void)extparam; (void)id;
+    printf("[cellSysutil] SysconfOpen(type=%u, func=0x%08X) -> closed\n", type, func);
+    if (func)
+        cellSysutilQueueGuestCallback(func, (u64)CELL_OK, (u64)userdata);
+    return CELL_OK;
+}
+
+s32 cellSysconfAbort(void)
+{
+    printf("[cellSysutil] SysconfAbort()\n");
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * Misc utilities
  * -----------------------------------------------------------------------*/
 
