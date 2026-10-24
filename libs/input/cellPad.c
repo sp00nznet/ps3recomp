@@ -645,6 +645,17 @@ skip_inject: ;
         len = CELL_PAD_LEN_CHANGE_PRESS_ON;
 
     data->len = len;
+    /* Finalize this call's packet freshness before any injected hold budget
+     * advances. len=0 drain reads still build the ordinary payload, but do
+     * not consume a PAD_FILE report. See the emission contract below. */
+    {
+        static int always = -1;
+        if (always < 0) always = getenv("PAD_ALWAYS_CHANGE") ? 1 : 0;
+        if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
+            if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
+            else                        s_data_fresh[port_no] = 0;
+        }
+    }
     /* button[0] is reserved and 0 on hardware; button[1] carries the pad mode
      * in its high nibble (0x7) and len/2 in its low one. GH3 drops any packet
      * whose button[0] is non-zero -- with len (8) there, every press was
@@ -725,14 +736,15 @@ skip_inject: ;
 
     /* PAD_FILE=<path> -- closed-loop input. Each poll, if the file holds a
      * button mask (same encoding as PAD_SCRIPT), press it for a fixed number
-     * of polls and empty the file. A driver outside the process can then look
-     * at the log or a frame dump, decide which screen the title is on, and
+     * of positive guest reports and empty the file on admission. A driver
+     * outside the process can look at the log or a frame dump, decide which
+     * screen the title is on, and
      * write the next button -- which a fixed time schedule cannot do, because
      * a menu system with several screens wanders when driven blind.
      *
      *   echo 0x0008 > pad.txt    # START
      *   echo 0x4000 > pad.txt    # CROSS
-     *   echo 0x0040 4 > pad.txt  # DOWN for 4 polls (menus auto-repeat a
+     *   echo 0x0040 4 > pad.txt  # DOWN for 4 reports (menus auto-repeat a
      *                            # long hold; the default is 40)
      */
     { static int s_pf = -1; static char pf_path[512];
@@ -756,7 +768,8 @@ skip_inject: ;
                   if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
-          if (held_n > 0) { held_n--;
+          if (held_n > 0) {
+              if (data->len > 0) held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
       } }
@@ -873,7 +886,8 @@ emit:
      * call made that loop infinite: the main thread pegged one core inside
      * libpad and the title never got past its first rendered screen.
      *
-     * So hand out one packet per host report and report len = 0 for any read
+     * Freshness was finalized before input injection above. Hand out one
+     * packet per host report and report len = 0 for any read
      * after that until the next one arrives (pad_poll_backend sets the flag when
      * it actually re-polls, every PAD_POLL_INTERVAL_MS). That is what the
      * hardware does: a pad streams reports at a fixed rate whether or not
@@ -886,14 +900,6 @@ emit:
      * attack firing once.
      *
      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
-    {
-        static int always = -1;
-        if (always < 0) always = getenv("PAD_ALWAYS_CHANGE") ? 1 : 0;
-        if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
-            if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
-            else                        s_data_fresh[port_no] = 0;
-        }
-    }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
