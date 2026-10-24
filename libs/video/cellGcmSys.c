@@ -2486,6 +2486,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
                 s_fifo_getoff = io_begin;                          /* get */
                 put = io_begin;
+                /* Count it as the walker taking the JUMP to begin. The title's
+                 * own callback can be recycling at the same moment: it writes
+                 * its JUMP and `put`, and only then marks itself waiting, so a
+                 * pass that read the mark clear can still land here. It then
+                 * waits for a backward JUMP that never comes, because `get` is
+                 * already at begin == put. God of War HD stopped for 2-4 s at
+                 * random points in gameplay this way. */
+                s_fifo_back_jumps++;
                 static int n = 0;
                 if (PS3_LOG_FIRST(n, 8))
                     fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
