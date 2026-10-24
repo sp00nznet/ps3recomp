@@ -481,6 +481,171 @@ static int perf_on(void)
     if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
     return v;
 }
+
+/* ---------------------------------------------------------------------------
+ * Compiled guest shaders on disk (D3D12_SHADER_CACHE=<file>)
+ *
+ * Guest vertex and fragment programs are decompiled to HLSL and compiled with
+ * D3DCompile on the drain thread when a draw first needs them, tens of
+ * milliseconds each, so a scene that brings in new programs stops the drain
+ * for as long as they take. With D3D12_SHADER_CACHE set, every compiled
+ * program is appended to that file under a hash of its source and target, and
+ * the next run reads the file at its first compile and skips D3DCompile for
+ * every program it has seen. A damaged record ends the read, and the file is
+ * then rewritten from what was read before it.
+ * -----------------------------------------------------------------------*/
+typedef struct { u64 key; u32 srclen; ID3DBlob* blob; } ShaderCacheEntry;
+static ShaderCacheEntry* s_shc;     /* open addressing, s_shc_cap slots (a power of two) */
+static u32    s_shc_cap, s_shc_n;
+static FILE*  s_shc_file;
+static int    s_shc_on = -1;
+static SRWLOCK s_shc_lock = SRWLOCK_INIT;
+static u32    s_shc_stat_compiled, s_shc_stat_hits, s_shc_stat_pso;   /* PERF=1 report */
+static double s_shc_stat_compile_s, s_shc_stat_pso_s;
+static const char s_shc_magic[8] = { 'P', 'S', '3', 'R', 'S', 'H', 'C', '1' };
+
+/* D3D12_SHADER_OPT=0|1|2|3|skip: the D3DCompile optimisation level for guest
+ * programs (default 1, D3DCompile's own default). */
+static UINT shc_flags(void)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char* e = getenv("D3D12_SHADER_OPT");
+        v = !e ? 1 : !strcmp(e, "skip") ? -1 : atoi(e);
+    }
+    switch (v) {
+    case -1: return D3DCOMPILE_SKIP_OPTIMIZATION;
+    case 0:  return D3DCOMPILE_OPTIMIZATION_LEVEL0;
+    case 2:  return D3DCOMPILE_OPTIMIZATION_LEVEL2;
+    case 3:  return D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    default: return D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    }
+}
+
+static u64 shc_key(const char* src, size_t len, const char* target, UINT flags)
+{
+    u64 h = 1469598103934665603ull;   /* FNV-1a 64 */
+    for (size_t i = 0; i < len; i++) { h ^= (u8)src[i]; h *= 1099511628211ull; }
+    for (const char* t = target; *t; t++) { h ^= (u8)*t; h *= 1099511628211ull; }
+    h ^= flags; h *= 1099511628211ull;
+    return h;
+}
+
+static ShaderCacheEntry* shc_slot(u64 key, u32 srclen)
+{
+    u32 i = (u32)(key ^ (key >> 32)) & (s_shc_cap - 1);
+    while (s_shc[i].blob && !(s_shc[i].key == key && s_shc[i].srclen == srclen))
+        i = (i + 1) & (s_shc_cap - 1);
+    return &s_shc[i];
+}
+
+/* Takes over the caller's reference to `blob`. Returns 0 if it was dropped. */
+static int shc_put(u64 key, u32 srclen, ID3DBlob* blob)
+{
+    if ((s_shc_n + 1) * 2 > s_shc_cap) {          /* keep the table under half full */
+        const u32 old_cap = s_shc_cap;
+        ShaderCacheEntry* old = s_shc;
+        ShaderCacheEntry* t = (ShaderCacheEntry*)calloc(old_cap ? old_cap * 2 : 1024, sizeof *t);
+        if (!t) { blob->lpVtbl->Release(blob); return 0; }
+        s_shc = t; s_shc_cap = old_cap ? old_cap * 2 : 1024;
+        for (u32 i = 0; i < old_cap; i++)
+            if (old[i].blob) *shc_slot(old[i].key, old[i].srclen) = old[i];
+        free(old);
+    }
+    ShaderCacheEntry* e = shc_slot(key, srclen);
+    if (e->blob) { blob->lpVtbl->Release(blob); return 0; }
+    e->key = key; e->srclen = srclen; e->blob = blob; s_shc_n++;
+    return 1;
+}
+
+static void shc_write(FILE* f, u64 key, u32 srclen, ID3DBlob* b)
+{
+    const u32 hdr[2] = { srclen, (u32)b->lpVtbl->GetBufferSize(b) };
+    fwrite(&key, 8, 1, f);
+    fwrite(hdr, 4, 2, f);
+    fwrite(b->lpVtbl->GetBufferPointer(b), 1, hdr[1], f);
+}
+
+static void shc_open(void)
+{
+    const char* path = getenv("D3D12_SHADER_CACHE");
+    s_shc_on = path && *path && strcmp(path, "0") != 0;
+    if (!s_shc_on) return;
+    u32 loaded = 0;
+    int clean = 0;
+    FILE* f = fopen(path, "rb");
+    if (f) {
+        char magic[8];
+        if (fread(magic, 1, 8, f) == 8 && !memcmp(magic, s_shc_magic, 8)) {
+            for (;;) {
+                u64 key; u32 hdr[2]; ID3DBlob* b = NULL;
+                if (fread(&key, 8, 1, f) != 1) { clean = feof(f) != 0; break; }
+                if (fread(hdr, 4, 2, f) != 2 || !hdr[1] || hdr[1] > (16u << 20)) break;
+                if (FAILED(D3DCreateBlob(hdr[1], &b)) || !b) break;
+                if (fread(b->lpVtbl->GetBufferPointer(b), 1, hdr[1], f) != hdr[1]) { b->lpVtbl->Release(b); break; }
+                loaded += (u32)shc_put(key, hdr[0], b);
+            }
+        }
+        fclose(f);
+    }
+    if (clean) {
+        s_shc_file = fopen(path, "ab");
+    } else {                     /* new, foreign or damaged: write it again from memory */
+        s_shc_file = fopen(path, "wb");
+        if (s_shc_file) {
+            fwrite(s_shc_magic, 1, 8, s_shc_file);
+            for (u32 i = 0; i < s_shc_cap; i++)
+                if (s_shc[i].blob) shc_write(s_shc_file, s_shc[i].key, s_shc[i].srclen, s_shc[i].blob);
+            fflush(s_shc_file);
+        }
+    }
+    printf("[d3d12] shader cache %s: %u programs%s%c", path, loaded,
+           s_shc_file ? "" : " (cannot write it)", 10);
+}
+
+/* D3DCompile for the guest programs (entry "main"), through the disk cache. */
+static HRESULT d3d_compile_cached(const char* src, size_t len, const char* name,
+                                  const char* target, ID3DBlob** out, ID3DBlob** err)
+{
+    const UINT flags = shc_flags();
+    u64 key = 0;
+    AcquireSRWLockExclusive(&s_shc_lock);
+    if (s_shc_on < 0) shc_open();
+    if (s_shc_on) {
+        key = shc_key(src, len, target, flags);
+        ShaderCacheEntry* e = s_shc_cap ? shc_slot(key, (u32)len) : NULL;
+        if (e && e->blob) {
+            e->blob->lpVtbl->AddRef(e->blob);
+            *out = e->blob;
+            if (err) *err = NULL;
+            s_shc_stat_hits++;
+            ReleaseSRWLockExclusive(&s_shc_lock);
+            return S_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_shc_lock);
+    const double t0 = perf_now();
+    HRESULT hr = D3DCompile(src, len, name, NULL, NULL, "main", target, flags, 0, out, err);
+    const double dt = perf_now() - t0;
+    if (dt >= 0.1) {
+        static int n = 0;
+        if (PS3_LOG_FIRST(n, 24))
+            printf("[d3d12] slow shader compile: %s (%s, %u bytes of HLSL) took %.0f ms%c",
+                   name, target, (unsigned)len, dt * 1000.0, 10);
+    }
+    AcquireSRWLockExclusive(&s_shc_lock);
+    s_shc_stat_compiled++;
+    s_shc_stat_compile_s += dt;
+    if (s_shc_on && SUCCEEDED(hr) && *out) {
+        (*out)->lpVtbl->AddRef(*out);
+        if (shc_put(key, (u32)len, *out) && s_shc_file) {
+            shc_write(s_shc_file, key, (u32)len, *out);
+            fflush(s_shc_file);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_shc_lock);
+    return hr;
+}
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
  * texture), so the debug camera can follow it. The ducks are driven by the
  * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
@@ -1816,8 +1981,7 @@ static int vp_get_vs(const rsx_state* st)
         }
     }
     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
-                            "main", "vs_5_0", 0, 0, &vb, &e);
+    HRESULT hr = d3d_compile_cached(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", &vb, &e);
     if (e) e->lpVtbl->Release(e);
     if (FAILED(hr) || !vb) {
         static int _e=0; if (PS3_LOG_FIRST(_e, 4)) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
@@ -2291,8 +2455,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
     }
     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
-                            "main", "ps_5_0", 0, 0, &pb, &e);
+    HRESULT hr = d3d_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", &pb, &e);
     if (FAILED(hr) || !pb) {
         static int _e2=0; if (PS3_LOG_FIRST(_e2, 16))
             printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
@@ -2380,8 +2543,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pd.SampleDesc.Count = 1;
 
     ID3D12PipelineState* pso = NULL;
-    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-        s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    { const double t0 = perf_now();
+      hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+          s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+      s_shc_stat_pso++; s_shc_stat_pso_s += perf_now() - t0; }
     pb->lpVtbl->Release(pb);
     if (FAILED(hr)) {
         static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
@@ -4788,6 +4953,14 @@ static void render_frame(void)
                     s_perf_pso, 100.0 * s_perf_pso / fr,
                     s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
                     fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr, 10);
+            if (s_shc_stat_compiled || s_shc_stat_hits || s_shc_stat_pso) {
+                fprintf(stderr, "[PERF] shaders: %u compiled (%.0f ms), %u from the disk cache,"
+                                " %u guest pipelines (%.0f ms)%c",
+                        s_shc_stat_compiled, s_shc_stat_compile_s * 1000.0, s_shc_stat_hits,
+                        s_shc_stat_pso, s_shc_stat_pso_s * 1000.0, 10);
+                s_shc_stat_compiled = s_shc_stat_hits = s_shc_stat_pso = 0;
+                s_shc_stat_compile_s = s_shc_stat_pso_s = 0.0;
+            }
             s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
             s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
             s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
