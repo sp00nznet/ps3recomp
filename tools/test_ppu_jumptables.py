@@ -370,6 +370,7 @@ def main() -> int:
     test_const_base_needs_constant()
     test_multi_toc_prefers_targets_near_the_dispatcher()
     test_bound_compare_beyond_window()
+    test_spilled_base_reused_as_target()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1
@@ -400,6 +401,31 @@ def test_const_base_needs_constant():
     mem = {base: w_blr(), TOC + 8: base}
     got = discover([w_lwz(8, 2, 8), w_add(8, 8, 7), w_mtctr(8), w_bctr()], mem)
     check("non-constant base is not a constant-base jump", got, None)
+
+
+def test_spilled_base_reused_as_target():
+    """The base is TOC-loaded, spilled to the stack, and reloaded at the
+    dispatch, which also reuses the base register for the case address:
+
+        lwz r10,16(r2) ; std r10,0x2D0(r1) ; ...
+        cmplwi r0,2 ; ld r11,0x2D0(r1) ; slwi r9,r0,2 ; lwzx r0,r9,r11
+        add r11,r0,r11 ; mtctr r11 ; bctr
+
+    Both defeated the base search: the nearest definition of r11 was the
+    `add` after the table load, and before it the stack reload. (A retail
+    title's 32-case dispatcher lifted to an unresolved indirect call.)
+    """
+    table = 0x11000
+    mem = {TOC + 16: table, table + 0: 0x100, table + 4: 0x200, table + 8: 0x300,
+           table + 12: 0xFFFFFFFF}
+    words = [w_lwz(10, 2, 16), w_std(10, 1, 0x2D0), w_li(5, 0), w_cmplwi(0, 0, 2),
+             w_ld(11, 1, 0x2D0), w_slwi(9, 0, 2), w_lwzx(0, 9, 11), w_add(11, 0, 11),
+             w_mtctr(11), w_bctr()]
+    check("spilled base, base register reused for the target", discover(words, mem),
+          [0x11100, 0x11200, 0x11300])
+    # A store to a different slot is not the spill: no base, no table.
+    words[1] = w_std(10, 1, 0x2D8)
+    check("reload of a slot nothing stored is not a base", discover(words, mem), None)
 
 
 if __name__ == "__main__":

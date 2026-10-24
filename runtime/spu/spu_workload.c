@@ -21,6 +21,9 @@
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
 
+static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
+                                     uint32_t owner_ea);   /* below */
+
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
  * real video-payload GET (>256B from a non-context EA) = it actually decoded,
  * as opposed to the 64-byte context handshake DMAs. The dispatcher's
@@ -211,6 +214,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
             "[spu_workload] dispatch MISS fp=0x%016llX size=%u "
             "(no lifted SPU binary registered for this image)\n",
             (unsigned long long)fp, image_size);
+        spu_workload_report_miss("sync", fp, image_size, args_ea);
         return 0;
     }
 
@@ -235,6 +239,35 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 
     free(ls);
     return 1;
+}
+
+/* A dispatch MISS drops the program: the task, workload or job never runs,
+ * and whatever waits on it (a taskset barrier, an atomic another task spins
+ * on) waits forever with nothing pointing back here. Say so once per
+ * program as an error naming what was dropped; SPU_MISS_FATAL=1 stops the
+ * process instead, for runs that must not continue past unsupported work. */
+static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
+                                     uint32_t owner_ea)
+{
+    static uint64_t seen[64];
+    static unsigned nseen;
+    static volatile LONG lock;
+    int first = 1;
+    while (InterlockedExchange(&lock, 1)) Sleep(0);
+    for (unsigned k = 0; k < nseen; k++) if (seen[k] == fp) { first = 0; break; }
+    if (first && nseen < 64) seen[nseen++] = fp;
+    InterlockedExchange(&lock, 0);
+    const char* fatal = getenv("SPU_MISS_FATAL");
+    const int abort_on_miss = fatal && *fatal == '1';
+    if (!first && !abort_on_miss) return;
+    fprintf(stderr,
+        "[spu_workload] ERROR: %s dispatch of an SPU program with no lifted image "
+        "(fp=0x%016llX size=%u owner=0x%08X) -- the program is DROPPED and will "
+        "never run; anything waiting on it stalls. Lift and register this image "
+        "(build_spu_workloads --input). Reported once per program; SPU_MISS_FATAL=1 aborts.\n",
+        path, (unsigned long long)fp, size, owner_ea);
+    fflush(stderr);
+    if (abort_on_miss) abort();
 }
 
 /* Async dispatch: run the SPU job on its OWN host thread so the PPU caller is
@@ -897,6 +930,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
           if (++miss_n <= 32 || miss_n % 100000 == 0)
             fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n",
                     (unsigned long long)fp, image_size, job_ea, miss_n); }
+        spu_workload_report_miss("SPURS job", fp, image_size, job_ea);
         /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
          * lifted and registered. SPURS job binaries are raw code+data blobs
          * the title loads from its own data files -- unlike sys_spu_image
@@ -1328,6 +1362,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
           } }
         fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
                 (unsigned long long)fp, image_size);
+        spu_workload_report_miss("async task", fp, image_size, args_ea);
         return 0;
     }
 

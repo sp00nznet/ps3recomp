@@ -4444,13 +4444,46 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # Widening is safe for the cases that already worked: the walk stops
             # at the NEAREST definition of `cand`, so when one exists inside the
             # window the result is unchanged.
-            for w in reversed(win_cand):
+            # Only definitions BEFORE the table load: `add r11, r0, r11` after
+            # `lwzx r0, r9, r11` reuses the base register for the case address,
+            # and is not the base's definition.
+            for w in reversed([x for x in win_cand if x.addr < lwzx.addr]):
                 a = [x.strip() for x in w.operands.split(',')]
                 if not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf')):
                     continue                    # not a GPR def: a store READS it; ppu_disasm names lfs/lfd's FPR target rN
                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
                     disp = mem_disp(a[1]); r_base = cand
                     base_is_ld = (w.mnemonic == 'ld')
+                elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r1)' in a[1]:
+                    # SPILLED base: the table address was TOC-loaded earlier,
+                    # stored to a stack slot, and reloaded at the dispatch
+                    # (`lwz r10,d(r2); std r10,s(r1)` ... `ld r11,s(r1);
+                    # lwzx; add; mtctr; bctr`). A loop around the dispatch in a
+                    # function with high register pressure does this; the reload
+                    # read as a non-TOC definition, the dispatcher was dropped
+                    # and its bctr lifted to an unresolved indirect call, so no
+                    # case of the switch ever ran. Follow the slot to the
+                    # nearest preceding store of it, and that register to its
+                    # TOC load.
+                    _slot, _at = mem_disp(a[1]), w.addr
+                    _src = None
+                    for w2 in reversed([x for x in win_cand if x.addr < _at]):
+                        b = [x.strip() for x in w2.operands.split(',')]
+                        if w2.mnemonic in ('std', 'stw') and len(b) == 2 and '(r1)' in b[1] \
+                                and mem_disp(b[1]) == _slot:
+                            _src = (b[0], w2.addr)
+                            break
+                        if b and b[0] == 'r1' and w2.mnemonic not in ('std', 'stw'):
+                            break               # the frame moved: another slot
+                    if _src is not None:
+                        for w2 in reversed([x for x in win_cand if x.addr < _src[1]]):
+                            b = [x.strip() for x in w2.operands.split(',')]
+                            if not b or b[0] != _src[0] or w2.mnemonic.startswith(('st', 'lf')):
+                                continue
+                            if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
+                                disp = mem_disp(b[1]); r_base = cand
+                                base_is_ld = (w2.mnemonic == 'ld')
+                            break               # nearest definition wins, TOC load or not
                 elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(' in a[1]:
                     # TWO-LEVEL base: `lwz r30, d1(r2); lwz r11, d2(r30)`. The
                     # table address is not in the TOC itself but in a global the
