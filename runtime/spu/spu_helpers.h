@@ -618,10 +618,23 @@ SPU__SF_V3(spu__fma_s,  spu__fma_any(x, y, z, 0, 0))
 SPU__SF_V3(spu__fms_s,  spu__fma_any(x, y, z, 0, 0x80000000u))
 SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
-/* The same fast path four lanes at a time, as two f64x2 halves: widen (exact), operate, clear
- * the 29 low significand bits, narrow (exact: the value now fits a single). Each lane is judged
- * on its own: the lanes that qualify keep the vector result, and only the others are redone one
- * by one (zero is not "plain", so a vector with a 0.0 lane -- w = 0, padding -- is common).
+/* Four lanes at a time, every lane exact, with no FPCR change. The host rounds to nearest (the
+ * thread's default FPCR: RN, no flush-to-zero -- writing FPCR per op serializes, ~17 ns on an
+ * M4); the SPU truncates. A result rounded to nearest is either the truncated one or one step
+ * above it in magnitude, so all that is needed is whether it was rounded away from zero:
+ *  - fa/fs in single precision: from Fast2Sum, one compare;
+ *  - fm in single precision: an fma gives |x||y| - |s|, whose sign bit says "rounded away"
+ *    (an exact zero is +0, a tiny negative error that underflows keeps its sign as -0);
+ *  - fma in double precision: the product of two 24-bit significands is exact, the add rounds
+ *    once at 53 bits (Fast2Sum compare again); one step toward zero at bit 53 before clearing
+ *    the 29 low bits gives the truncation also when the sum was rounded onto a 24-bit boundary.
+ * SPU zeros (biased exponent 0, any fraction) among the addends are made +0 before the op; a
+ * zero factor is applied to the result instead, so zero times an extended-range word is a zero
+ * product too. A result with biased exponent 0 is a zero (SPU results below 2^-126 flush; the
+ * double is narrowed with round-to-odd, which cannot round a value below 2^-126 up to it), and
+ * is +0. What remains for the per-lane path is a lane whose result is not below FLT_MAX in
+ * magnitude: an extended-range operand (Inf/NaN on the host) or a result at or above the single
+ * range -- extended range or saturated on the SPU.
  *
  * Inlining: the fast path is forced inline and the per-lane fix-up is kept out of line (noinline,
  * cold). Left to itself the compiler inlined the scalar fallback into spu__nv_fa/fma, found the
@@ -630,57 +643,24 @@ SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
  * 27.8 ns per op, latency). */
 #define SPU__NV_INLINE static inline __attribute__((always_inline))
 #define SPU__NV_SLOW   static inline __attribute__((noinline, cold))
-SPU__NV_INLINE uint32x4_t spu__nv_bexp(uint32x4_t x) { return vshrq_n_u32(vshlq_n_u32(x, 1), 24); }
-SPU__NV_INLINE uint32x4_t spu__nv_plain(uint32x4_t x) {         /* biased exponent 1..254 */
-    return vcltq_u32(vsubq_u32(spu__nv_bexp(x), vdupq_n_u32(1)), vdupq_n_u32(254));
+#define SPU__NV_SIGN   0x80000000u
+/* all-ones in the lanes the SPU reads as zero (biased exponent 0): |x| < 2^-126 as one host
+ * compare (facgt), which an extended-range word -- Inf or NaN here -- fails */
+SPU__NV_INLINE uint32x4_t spu__nv_z(uint32x4_t x) {
+    return vcaltq_f32(vreinterpretq_f32_u32(x), vdupq_n_f32(0x1p-126f));
 }
-/* Truncate f64x2 to singles. *ok gets all-ones in the lanes whose result is a normal single and,
- * when err is given (the exact rounding error of the operation that produced d), was not both
- * rounded and on a 24-bit boundary: only there can rounding have crossed the boundary and
- * changed the truncation. */
-SPU__NV_INLINE float32x2_t spu__nv_trunc(float64x2_t d, uint32x2_t* ok, const float64x2_t* err) {
-    const uint64x2_t u = vreinterpretq_u64_f64(d);
-    const int64x2_t e = vsubq_s64(vreinterpretq_s64_u64(vandq_u64(vshrq_n_u64(u, 52), vdupq_n_u64(0x7FF))), vdupq_n_s64(1023));
-    uint64x2_t good = vandq_u64(vcgeq_s64(e, vdupq_n_s64(-126)), vcleq_s64(e, vdupq_n_s64(127)));
-    if (err) good = vandq_u64(good, vorrq_u64(vtstq_u64(u, vdupq_n_u64(0x1FFFFFFFull)), vceqzq_f64(*err)));
-    *ok = vmovn_u64(good);
-    return vcvt_f32_f64(vreinterpretq_f64_u64(vandq_u64(u, vdupq_n_u64(~0x1FFFFFFFull))));
-}
-/* As spu__nv_trunc, but an exact zero result is accepted too; *zm marks those lanes so the caller
- * can clear the sign (the SPU never produces -0). Used once true zeros (+-0.0 words) are fast-path
- * operands: in double, 0 + y = y, x * 0 = +-0, 0 * y + z = z exactly -- the SPU's zero rules --
- * and a zero result of nonzero operands is an exact cancellation, which the SPU returns as +0.
- * The sign mask is computed beside the conversion, so it costs one AND on the result path. */
-SPU__NV_INLINE float32x2_t spu__nv_trunc0(float64x2_t d, uint32x2_t* ok, uint32x2_t* zm, const float64x2_t* err) {
-    const uint64x2_t u = vreinterpretq_u64_f64(d);
-    const uint64x2_t az = vceqzq_u64(vshlq_n_u64(u, 1));                  /* +-0 */
-    const int64x2_t e = vsubq_s64(vreinterpretq_s64_u64(vandq_u64(vshrq_n_u64(u, 52), vdupq_n_u64(0x7FF))), vdupq_n_s64(1023));
-    uint64x2_t good = vandq_u64(vcgeq_s64(e, vdupq_n_s64(-126)), vcleq_s64(e, vdupq_n_s64(127)));
-    if (err) good = vandq_u64(good, vorrq_u64(vtstq_u64(u, vdupq_n_u64(0x1FFFFFFFull)), vceqzq_f64(*err)));
-    *ok = vmovn_u64(vorrq_u64(good, az));
-    *zm = vmovn_u64(az);
-    return vcvt_f32_f64(vreinterpretq_f64_u64(vandq_u64(u, vdupq_n_u64(~0x1FFFFFFFull))));
-}
-/* A lane the fast path takes: an ordinary single (biased exponent 1..254) or a true zero
- * (+-0.0). Exponent-0 words with a nonzero fraction are zero on the SPU but not in double, so
- * they still go to the fix-up. */
-SPU__NV_INLINE uint32x4_t spu__nv_plain0(uint32x4_t x) {
-    return vorrq_u32(spu__nv_plain(x), vceqzq_u32(vshlq_n_u32(x, 1)));
-}
-/* r with the sign cleared in the lanes whose result is zero */
-SPU__NV_INLINE uint32x4_t spu__nv_pos0(uint32x4_t r, uint32x2_t zlo, uint32x2_t zhi) {
-    return vbicq_u32(r, vandq_u32(vcombine_u32(zlo, zhi), vdupq_n_u32(0x80000000u)));
-}
+/* r with every word of biased exponent 0 (zero, denormal) made +0 */
+SPU__NV_INLINE uint32x4_t spu__nv_flush(uint32x4_t r) { return vbicq_u32(r, spu__nv_z(r)); }
+/* the lanes a fast-path result stands for: magnitude below FLT_MAX (Inf and NaN fail) */
+SPU__NV_INLINE uint32x4_t spu__nv_inrange(float32x4_t r) { return vcaltq_f32(r, vdupq_n_f32(0x1.fffffep127f)); }
 SPU__NV_INLINE int spu__nv_all4(uint32x4_t m) { return vminvq_u32(m) == 0xFFFFFFFFu; }
-SPU__NV_INLINE float64x2_t spu__nv_lo(uint32x4_t x) { return vcvt_f64_f32(vget_low_f32(vreinterpretq_f32_u32(x))); }
-SPU__NV_INLINE float64x2_t spu__nv_hi(uint32x4_t x) { return vcvt_high_f64_f32(vreinterpretq_f32_u32(x)); }
+SPU__NV_INLINE float32x4_t spu__nv_f(uint32x4_t x) { return vreinterpretq_f32_u32(x); }
+SPU__NV_INLINE uint32x4_t spu__nv_u(float32x4_t x) { return vreinterpretq_u32_f32(x); }
 /* The lanes of r not marked in ok, recomputed one by one (scalar fast path, else exact). They take
  * and return NEON vectors, not u128: a u128 travels in general registers, and merging that return
  * with the fast path's vector result kept every fa/fm/fma result in x-registers, with fmov round
  * trips, on the fast path too (fa 5.3 -> 9.8 ns). */
 #define SPU__NV_LANES(v, m) uint32_t m[4]; vst1q_u32(m, v)
-SPU__NV_INLINE uint32x4_t spu__nv_vec(float32x2_t lo, float32x2_t hi) { return vreinterpretq_u32_f32(vcombine_f32(lo, hi)); }
-SPU__NV_INLINE uint32x4_t spu__nv_zero(uint32x4_t x) { return vceqzq_u32(spu__nv_bexp(x)); }   /* biased exponent 0: zero */
 /* SPU_FLOATFIX_STATS=1: count why lanes reach the fix-ups (T-0014) and print the tally every
  * 2^24 lanes. Only the cold fix-ups count, so it costs nothing on the fast path; the counters
  * are one weak global shared by every TU that includes this header. */
@@ -772,62 +752,116 @@ SPU__NV_SLOW uint32x4_t spu__fma_fix(uint32x4_t r, uint32x4_t ok, uint32x4_t a, 
     return vld1q_u32(o);
 }
 SPU__NV_INLINE u128 spu__nv_u128(uint32x4_t v) { u128 r; vst1q_u32(r._u32, v); return r; }
+/* s = RN(x + y), checked with Fast2Sum on the operands ordered by magnitude: t = s - big is exact
+ * (also through gradual underflow, and unlike TwoSum it cannot overflow while s is finite --
+ * TwoSum did, next to FLT_MAX: 1.5*2^104 - FLT_MAX), and s - (x + y) = t - small. s was rounded
+ * away from zero where that has s's sign: sign(s)*t > sign(s)*small, one compare (equal, and
+ * any two zeros, is not greater); those lanes take one step toward zero. */
 SPU__NV_INLINE u128 spu__nv_fa(u128 a, u128 b, uint32_t negb) {
     const uint32x4_t xa = vld1q_u32(a._u32), yb = vld1q_u32(b._u32);
-    const uint32x4_t x = xa, y = veorq_u32(yb, vdupq_n_u32(negb));
-    const uint32x4_t px = spu__nv_plain0(x), py = spu__nv_plain0(y);
-    /* the exponent-gap limit applies only between two nonzero terms */
-    const uint32x4_t pre = vandq_u32(vandq_u32(px, py),
-                                     vorrq_u32(vcleq_u32(vabdq_u32(spu__nv_bexp(x), spu__nv_bexp(y)), vdupq_n_u32(29)),
-                                               vorrq_u32(vceqzq_u32(vshlq_n_u32(x, 1)), vceqzq_u32(vshlq_n_u32(y, 1)))));
-    uint32x2_t oklo, okhi, zlo, zhi;
-    const float32x2_t lo = spu__nv_trunc0(vaddq_f64(spu__nv_lo(x), spu__nv_lo(y)), &oklo, &zlo, NULL);
-    const float32x2_t hi = spu__nv_trunc0(vaddq_f64(spu__nv_hi(x), spu__nv_hi(y)), &okhi, &zhi, NULL);
-    const uint32x4_t ok = vandq_u32(pre, vcombine_u32(oklo, okhi));
-    uint32x4_t r = spu__nv_pos0(spu__nv_vec(lo, hi), zlo, zhi);
+    const uint32x4_t yn = veorq_u32(yb, vdupq_n_u32(negb));
+    const float32x4_t x = spu__nv_f(vbicq_u32(xa, spu__nv_z(xa))), y = spu__nv_f(vbicq_u32(yn, spu__nv_z(yn)));
+    const uint32x4_t xbig = vcageq_f32(x, y);
+    const float32x4_t big = vbslq_f32(xbig, x, y), small = vbslq_f32(xbig, y, x);
+    const float32x4_t s = vaddq_f32(x, y), t = vsubq_f32(s, big);
+    const uint32x4_t su = spu__nv_u(s), sg = vandq_u32(su, vdupq_n_u32(SPU__NV_SIGN));
+    const uint32x4_t dec = vcgtq_f32(spu__nv_f(veorq_u32(spu__nv_u(t), sg)), spu__nv_f(veorq_u32(spu__nv_u(small), sg)));
+    const uint32x4_t ok = spu__nv_inrange(s);
+    uint32x4_t r = spu__nv_flush(vaddq_u32(su, dec));
     if (!spu__nv_all4(ok)) r = spu__fa_fix(r, ok, xa, yb, negb);
     return spu__nv_u128(r);
 }
-SPU__NV_INLINE u128 spu_fa(u128 a, u128 b) { return spu__nv_fa(a, b, 0); }
-SPU__NV_INLINE u128 spu_fs(u128 a, u128 b) { return spu__nv_fa(a, b, 0x80000000u); }
-SPU__NV_INLINE u128 spu_fm(u128 a, u128 b) {
+/* SPU_FLOAT_RZ: SPU code may run with FPCR at round toward zero with
+ * flush-to-zero (spu_float_mode_enter, runtime/spu/spu_channels.c). The host's own single-precision
+ * ops then truncate like the SPU and read and write a denormal as zero, so what is left of the
+ * exact forms above is the range check and the +0 rule: one native op per vector, about three
+ * times the throughput. The mode is read with mrs, which costs about a quarter of a nanosecond and,
+ * being a plain asm with no memory effects, is hoisted and shared by the compiler; it changes only
+ * in spu_run_with_halt, outside generated code. */
+#define SPU_FPCR_RZFZ 0x01C00000ull   /* FZ (bit 24), RMode = 0b11 round toward zero (bits 22-23) */
+SPU__NV_INLINE int spu__nv_rz(void) { uint64_t v; __asm__("mrs %0, fpcr" : "=r"(v)); return v == SPU_FPCR_RZFZ; }
+SPU__NV_INLINE u128 spu__rz_fa(u128 a, u128 b, uint32_t negb) {
+    const uint32x4_t x = vld1q_u32(a._u32), yb = vld1q_u32(b._u32), y = veorq_u32(yb, vdupq_n_u32(negb));
+    const float32x4_t s = vaddq_f32(spu__nv_f(x), spu__nv_f(y));
+    const uint32x4_t ok = spu__nv_inrange(s);
+    uint32x4_t r = spu__nv_flush(spu__nv_u(s));
+    if (!spu__nv_all4(ok)) r = spu__fa_fix(r, ok, x, yb, negb);
+    return spu__nv_u128(r);
+}
+SPU__NV_INLINE u128 spu__rz_fm(u128 a, u128 b) {
     const uint32x4_t x = vld1q_u32(a._u32), y = vld1q_u32(b._u32);
-    uint32x2_t oklo, okhi, zlo, zhi;
-    const float32x2_t lo = spu__nv_trunc0(vmulq_f64(spu__nv_lo(x), spu__nv_lo(y)), &oklo, &zlo, NULL);
-    const float32x2_t hi = spu__nv_trunc0(vmulq_f64(spu__nv_hi(x), spu__nv_hi(y)), &okhi, &zhi, NULL);
-    const uint32x4_t ok = vandq_u32(vandq_u32(spu__nv_plain0(x), spu__nv_plain0(y)), vcombine_u32(oklo, okhi));
-    uint32x4_t r = spu__nv_pos0(spu__nv_vec(lo, hi), zlo, zhi);
+    const uint32x4_t zp = vorrq_u32(spu__nv_z(x), spu__nv_z(y));         /* zero product */
+    const float32x4_t s = vmulq_f32(spu__nv_f(x), spu__nv_f(y));
+    const uint32x4_t ok = vorrq_u32(spu__nv_inrange(s), zp);
+    uint32x4_t r = vbicq_u32(spu__nv_flush(spu__nv_u(s)), zp);
     if (!spu__nv_all4(ok)) r = spu__fm_fix(r, ok, x, y);
     return spu__nv_u128(r);
 }
-/* p + z in double with its exact rounding error (Knuth's TwoSum: round to nearest, no overflow
- * -- the operands here are at most 2^257). *err == 0 means the sum was exact. */
-SPU__NV_INLINE float64x2_t spu__nv_twosum(float64x2_t p, float64x2_t z, float64x2_t* err) {
-    const float64x2_t s = vaddq_f64(p, z), bb = vsubq_f64(s, p);
-    *err = vaddq_f64(vsubq_f64(p, vsubq_f64(s, bb)), vsubq_f64(z, bb));
-    return s;
-}
-/* (+-a*b) + (+-c): the product is exact in double; one rounding in the add, and TwoSum says
- * whether it rounded. (The old test sent every result with 29 zero low bits to the exact path --
- * every exactly representable result, 1.5*1 + 0.5 -- so fma's common case was slow.) */
-SPU__NV_INLINE u128 spu__nv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+SPU__NV_INLINE u128 spu__rz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
     const uint32x4_t xa = vld1q_u32(a._u32), y = vld1q_u32(b._u32), zc = vld1q_u32(c._u32);
-    const uint32x4_t x = veorq_u32(xa, vdupq_n_u32(negp)), z = veorq_u32(zc, vdupq_n_u32(negc));
-    uint32x2_t oklo, okhi, zlo, zhi;
-    float64x2_t elo, ehi;
-    const float64x2_t slo = spu__nv_twosum(vmulq_f64(spu__nv_lo(x), spu__nv_lo(y)), spu__nv_lo(z), &elo);
-    const float64x2_t shi = spu__nv_twosum(vmulq_f64(spu__nv_hi(x), spu__nv_hi(y)), spu__nv_hi(z), &ehi);
-    const float32x2_t lo = spu__nv_trunc0(slo, &oklo, &zlo, &elo);
-    const float32x2_t hi = spu__nv_trunc0(shi, &okhi, &zhi, &ehi);
-    const uint32x4_t ok = vandq_u32(vandq_u32(vandq_u32(spu__nv_plain0(x), spu__nv_plain0(y)), spu__nv_plain0(z)),
-                                    vcombine_u32(oklo, okhi));
-    uint32x4_t r = spu__nv_pos0(spu__nv_vec(lo, hi), zlo, zhi);
+    const uint32x4_t zp = vorrq_u32(spu__nv_z(xa), spu__nv_z(y));        /* zero product */
+    const uint32x4_t zi = vbicq_u32(veorq_u32(zc, vdupq_n_u32(negc)), spu__nv_z(zc));   /* zero: +0 */
+    const uint32x4_t x = veorq_u32(xa, vdupq_n_u32(negp));
+    const float32x4_t s = vfmaq_f32(spu__nv_f(zi), spu__nv_f(x), spu__nv_f(y));
+    const uint32x4_t ok = vorrq_u32(spu__nv_inrange(s), zp);
+    uint32x4_t r = vbslq_u32(zp, zi, spu__nv_flush(spu__nv_u(s)));
     if (!spu__nv_all4(ok)) r = spu__fma_fix(r, ok, xa, y, zc, negp, negc);
     return spu__nv_u128(r);
 }
-SPU__NV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__nv_fma(a, b, c, 0, 0); }            /* a*b + c */
-SPU__NV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__nv_fma(a, b, c, 0, 0x80000000u); }  /* a*b - c */
-SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__nv_fma(a, b, c, 0x80000000u, 0); }  /* c - a*b */
+SPU__NV_INLINE u128 spu_fa(u128 a, u128 b) { return spu__nv_rz() ? spu__rz_fa(a, b, 0) : spu__nv_fa(a, b, 0); }
+SPU__NV_INLINE u128 spu_fs(u128 a, u128 b) { return spu__nv_rz() ? spu__rz_fa(a, b, 0x80000000u) : spu__nv_fa(a, b, 0x80000000u); }
+/* s = RN(x * y); |x||y| - |s| by fma is exact or, if it underflows, keeps its sign, and its sign
+ * bit set means s was rounded away from zero: one step toward zero (s + (em >> 31)). A zero
+ * factor is applied to the result, off the multiply's path: those lanes are +0 whatever the
+ * host made of the operands (a denormal pattern, or NaN from 0 * an extended-range word). */
+SPU__NV_INLINE u128 spu__nv_fm(u128 a, u128 b) {
+    const uint32x4_t xa = vld1q_u32(a._u32), yb = vld1q_u32(b._u32);
+    const uint32x4_t zp = vorrq_u32(spu__nv_z(xa), spu__nv_z(yb));       /* zero product */
+    const float32x4_t x = spu__nv_f(xa), y = spu__nv_f(yb);
+    const float32x4_t s = vmulq_f32(x, y);
+    const uint32x4_t su = spu__nv_u(s);
+    const float32x4_t em = vfmaq_f32(spu__nv_f(vorrq_u32(su, vdupq_n_u32(SPU__NV_SIGN))), vabsq_f32(x), vabsq_f32(y));
+    const uint32x4_t ok = vorrq_u32(spu__nv_inrange(s), zp);
+    uint32x4_t r = vbicq_u32(spu__nv_flush(vreinterpretq_u32_s32(vsraq_n_s32(vreinterpretq_s32_u32(su),
+                                                                             vreinterpretq_s32_f32(em), 31))), zp);
+    if (!spu__nv_all4(ok)) r = spu__fm_fix(r, ok, xa, yb);
+    return spu__nv_u128(r);
+}
+/* One f64x2 half of fma: p = x*y exact, s = RN(p + z), stepped one double ulp toward zero where
+ * it was rounded away from zero (the Fast2Sum compare of spu__nv_fa), then the 29 low bits
+ * cleared: the truncation of x*y + z, as a double that a single holds exactly when in range. */
+SPU__NV_INLINE float64x2_t spu__nv_fma2(float64x2_t x, float64x2_t y, float64x2_t z) {
+    const float64x2_t p = vmulq_f64(x, y);
+    const uint64x2_t pbig = vcageq_f64(p, z);
+    const float64x2_t big = vbslq_f64(pbig, p, z), small = vbslq_f64(pbig, z, p);
+    const float64x2_t s = vaddq_f64(p, z), t = vsubq_f64(s, big);
+    const uint64x2_t u = vreinterpretq_u64_f64(s), sg = vandq_u64(u, vdupq_n_u64(1ull << 63));
+    const uint64x2_t dec = vcgtq_f64(vreinterpretq_f64_u64(veorq_u64(vreinterpretq_u64_f64(t), sg)),
+                                     vreinterpretq_f64_u64(veorq_u64(vreinterpretq_u64_f64(small), sg)));
+    return vreinterpretq_f64_u64(vbicq_u64(vaddq_u64(u, dec), vdupq_n_u64(0x1FFFFFFFull)));
+}
+/* (+-a*b) + (+-c). A zero product (a or b an SPU zero) gives the addend as it is -- extended
+ * range too -- selected at the end, off the multiply's path; the host's value for those lanes
+ * (a denormal pattern's product, NaN from 0 * an extended-range word) is not used. */
+SPU__NV_INLINE u128 spu__nv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+    const uint32x4_t xa = vld1q_u32(a._u32), yb = vld1q_u32(b._u32), zc = vld1q_u32(c._u32);
+    const uint32x4_t zp = vorrq_u32(spu__nv_z(xa), spu__nv_z(yb));       /* zero product */
+    const uint32x4_t zi = vbicq_u32(veorq_u32(zc, vdupq_n_u32(negc)), spu__nv_z(zc));   /* zero: +0 */
+    const float32x4_t x = spu__nv_f(veorq_u32(xa, vdupq_n_u32(negp))), y = spu__nv_f(yb), z = spu__nv_f(zi);
+    const float64x2_t lo = spu__nv_fma2(vcvt_f64_f32(vget_low_f32(x)), vcvt_f64_f32(vget_low_f32(y)),
+                                        vcvt_f64_f32(vget_low_f32(z)));
+    const float64x2_t hi = spu__nv_fma2(vcvt_high_f64_f32(x), vcvt_high_f64_f32(y), vcvt_high_f64_f32(z));
+    const float32x4_t s = vcvtx_high_f32_f64(vcvtx_f32_f64(lo), hi);      /* round to odd: exact in range */
+    const uint32x4_t ok = vorrq_u32(spu__nv_inrange(s), zp);
+    uint32x4_t r = vbslq_u32(zp, zi, spu__nv_flush(spu__nv_u(s)));
+    if (!spu__nv_all4(ok)) r = spu__fma_fix(r, ok, xa, yb, zc, negp, negc);
+    return spu__nv_u128(r);
+}
+SPU__NV_INLINE u128 spu_fm(u128 a, u128 b) { return spu__nv_rz() ? spu__rz_fm(a, b) : spu__nv_fm(a, b); }
+#define SPU__NV_FMA(a, b, c, np, nc) (spu__nv_rz() ? spu__rz_fma(a, b, c, np, nc) : spu__nv_fma(a, b, c, np, nc))
+SPU__NV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return SPU__NV_FMA(a, b, c, 0, 0); }            /* a*b + c */
+SPU__NV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return SPU__NV_FMA(a, b, c, 0, 0x80000000u); }  /* a*b - c */
+SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__NV_FMA(a, b, c, 0x80000000u, 0); }  /* c - a*b */
 #elif defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS)
 /* The NEON fast path above, on x86 with AVX2: the four lanes widened to one f64x4 (exact),
  * the operation, the 29 low significand bits cleared, narrowed (exact). Same lane rules: an
@@ -1062,9 +1096,9 @@ static inline uint64_t spu__d_out(double d) {
     const uint64_t x = spu__dw_get(a, i), y = spu__dw_get(b, i); \
     spu__dw_put(&r, i, (spu__d_isnan(x) || spu__d_isnan(y)) ? 0x7FF8000000000000ull \
                        : spu__d_out(spu__d_in(x) op spu__d_in(y))); } return r; }
-SPU__D_V2(spu_dfa, +)
-SPU__D_V2(spu_dfs, -)
-SPU__D_V2(spu_dfm, *)
+SPU__D_V2(spu_dfa_h_, +)
+SPU__D_V2(spu_dfs_h_, -)
+SPU__D_V2(spu_dfm_h_, *)
 #undef SPU__D_V2
 /* dfma = a*b + c, dfms = a*b - c, dfnms = -(a*b - c), dfnma = -(a*b + c); c is rt. Fused. */
 static inline u128 spu__dfmx(u128 a, u128 b, u128 c, int negate, int subtract) { u128 r;
@@ -1080,10 +1114,10 @@ static inline u128 spu__dfmx(u128 a, u128 b, u128 c, int negate, int subtract) {
         spu__dw_put(&r, i, (negate && !spu__d_isnan(u)) ? u ^ 0x8000000000000000ull : u);
     }
     return r; }
-static inline u128 spu_dfma(u128 a, u128 b, u128 t)  { return spu__dfmx(a, b, t, 0, 0); }
-static inline u128 spu_dfms(u128 a, u128 b, u128 t)  { return spu__dfmx(a, b, t, 0, 1); }
-static inline u128 spu_dfnms(u128 a, u128 b, u128 t) { return spu__dfmx(a, b, t, 1, 1); }
-static inline u128 spu_dfnma(u128 a, u128 b, u128 t) { return spu__dfmx(a, b, t, 1, 0); }
+static inline u128 spu_dfma_h_(u128 a, u128 b, u128 t)  { return spu__dfmx(a, b, t, 0, 0); }
+static inline u128 spu_dfms_h_(u128 a, u128 b, u128 t)  { return spu__dfmx(a, b, t, 0, 1); }
+static inline u128 spu_dfnms_h_(u128 a, u128 b, u128 t) { return spu__dfmx(a, b, t, 1, 1); }
+static inline u128 spu_dfnma_h_(u128 a, u128 b, u128 t) { return spu__dfmx(a, b, t, 1, 0); }
 /* fesd: the single in word 2i (IEEE format, section 9.2.1) extended to doubleword i: exact,
  * Inf stays Inf, a NaN becomes the default QNaN, a denormal becomes +0.
  * frds: doubleword i rounded (to nearest) to an IEEE single in word 2i, word 2i+1 = 0; a NaN
@@ -1099,7 +1133,7 @@ static inline u128 spu_fesd(u128 a) { u128 r;
         spu__dw_put(&r, i, u);
     }
     return r; }
-static inline u128 spu_frds(u128 a) { u128 r;
+static inline u128 spu_frds_h_(u128 a) { u128 r;
     for (int i = 0; i < 2; i++) {
         const uint64_t u = spu__dw_get(a, i);
         if (spu__d_isnan(u)) { r._u32[2*i] = 0x7FC00000u; r._u32[2*i+1] = 0; continue; }
@@ -1123,8 +1157,8 @@ static inline void spu__dset(u128* r, int i, double d) {
 }
 /* double FMA family: c = rt (accumulator, 3-register). The SPU DFMA family is FUSED (single rounding). */
 /* double compares -> per-lane 64-bit mask (RPCS3 stubs these; sane impl here). */
-static inline u128 spu_dfceq(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-static inline u128 spu_dfcmeq(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+static inline u128 spu_dfceq_h_(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+static inline u128 spu_dfcmeq_h_(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 /* Singles occupy preferred words 0 and 2 when converting doubleword lanes. */
 /* mpyhhu: high-16 x high-16 of each word, unsigned, full 32-bit product. */
 static inline u128 spu_mpyhhu_ref(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
@@ -1141,8 +1175,39 @@ static inline u128 spu_avgb_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++
 static inline u128 spu_mpyhha_ref(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=t._s32[i]+(int32_t)a._s16[2*i+1]*(int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpyhhau_ref(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=t._u32[i]+(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
 /* double compare greater (RPCS3 stubs these; sane impl) -> per-lane mask. */
-static inline u128 spu_dfcgt(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-static inline u128 spu_dfcmgt(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+static inline u128 spu_dfcgt_h_(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+static inline u128 spu_dfcmgt_h_(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+
+/* Double precision is IEEE round to nearest with denormals, and the double -> single of frds
+ * rounds to nearest too. A thread running with SPU_FLOAT_RZ's FPCR (round toward zero,
+ * flush-to-zero) computes them with the default FPCR: the operands and the result pass through
+ * empty asm statements placed between the two FPCR writes, so the compiler cannot move a double
+ * op outside them. Double precision is rare in SPU code; the two writes (~20 ns) only happen on
+ * such a thread. */
+#if defined(__aarch64__)
+static inline uint64_t spu__fpcr_now(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
+static inline void spu__fpcr_put(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+#define SPU__DP_RN1(f) static inline u128 f(u128 a) { const uint64_t m = spu__fpcr_now(); \
+    if (__builtin_expect(m == 0, 1)) return f##_h_(a); \
+    spu__fpcr_put(0); __asm__ volatile("" : "+m"(a)); u128 r = f##_h_(a); \
+    __asm__ volatile("" : "+m"(r)); spu__fpcr_put(m); return r; }
+#define SPU__DP_RN2(f) static inline u128 f(u128 a, u128 b) { const uint64_t m = spu__fpcr_now(); \
+    if (__builtin_expect(m == 0, 1)) return f##_h_(a, b); \
+    spu__fpcr_put(0); __asm__ volatile("" : "+m"(a), "+m"(b)); u128 r = f##_h_(a, b); \
+    __asm__ volatile("" : "+m"(r)); spu__fpcr_put(m); return r; }
+#define SPU__DP_RN3(f) static inline u128 f(u128 a, u128 b, u128 c) { const uint64_t m = spu__fpcr_now(); \
+    if (__builtin_expect(m == 0, 1)) return f##_h_(a, b, c); \
+    spu__fpcr_put(0); __asm__ volatile("" : "+m"(a), "+m"(b), "+m"(c)); u128 r = f##_h_(a, b, c); \
+    __asm__ volatile("" : "+m"(r)); spu__fpcr_put(m); return r; }
+#else
+#define SPU__DP_RN1(f) static inline u128 f(u128 a) { return f##_h_(a); }
+#define SPU__DP_RN2(f) static inline u128 f(u128 a, u128 b) { return f##_h_(a, b); }
+#define SPU__DP_RN3(f) static inline u128 f(u128 a, u128 b, u128 c) { return f##_h_(a, b, c); }
+#endif
+SPU__DP_RN2(spu_dfa) SPU__DP_RN2(spu_dfs) SPU__DP_RN2(spu_dfm)
+SPU__DP_RN3(spu_dfma) SPU__DP_RN3(spu_dfms) SPU__DP_RN3(spu_dfnms) SPU__DP_RN3(spu_dfnma)
+SPU__DP_RN1(spu_frds)
+SPU__DP_RN2(spu_dfceq) SPU__DP_RN2(spu_dfcmeq) SPU__DP_RN2(spu_dfcgt) SPU__DP_RN2(spu_dfcmgt)
 /* dftsv rt,ra,I7: double test special value (Cell BE SPU ISA). Each
  * doubleword becomes all ones if it is in any class I7 selects:
  * 0x40 NaN, 0x20 +inf, 0x10 -inf, 0x08 +0, 0x04 -0, 0x02 +denorm, 0x01 -denorm.

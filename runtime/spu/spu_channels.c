@@ -198,10 +198,47 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
+/* SPU_FLOAT_RZ=1: SPU code runs with FPCR at round toward zero with flush-to-zero, so the
+ * single-precision helpers take their native form (spu_helpers.h, spu__nv_rz). The mode is set
+ * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
+ * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
+ * lifted floating point must keep round to nearest with denormals. Double precision restores
+ * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
+ * Returns the FPCR to restore, or ~0 when nothing was changed. */
+static uint64_t spu_float_mode_enter(void)
+{
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+    static int s_on = -1;
+    int on = __atomic_load_n(&s_on, __ATOMIC_RELAXED);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = e && e[0] == '1' && !e[1];
+        __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
+    }
+    if (!on) return ~0ull;
+    uint64_t v;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+    if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
+    __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
+    return v;
+#else
+    return ~0ull;
+#endif
+}
+static void spu_float_mode_leave(uint64_t outer)
+{
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+    if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
+#else
+    (void)outer;
+#endif
+}
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
+    const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
     int halted = 0;
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
@@ -274,6 +311,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
+    spu_float_mode_leave(fpcr_outer);
     return halted;
 }
 

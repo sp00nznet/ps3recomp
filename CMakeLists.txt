@@ -405,6 +405,17 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
 
+    if(NOT WIN32)
+        # The vector single-precision ops against the exact per-lane references.
+        add_executable(test_spu_float_exact
+            runtime/spu/tests/test_spu_float_exact.c)
+        target_include_directories(test_spu_float_exact PRIVATE include runtime/spu)
+        target_compile_options(test_spu_float_exact PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_float_exact PRIVATE m)
+        add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
+        set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
+    endif()
+
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME spinlock_word_width
