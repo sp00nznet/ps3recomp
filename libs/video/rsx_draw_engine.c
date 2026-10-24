@@ -88,6 +88,11 @@ extern u32 ppu_vm_size;
 #define M_DEPTH_WRITE         0x0A70
 #define M_DEPTH_TEST_ENABLE   0x0A74
 #define M_ZSTENCIL_CLEAR      0x1D8C
+#define M_POLY_OFFSET_POINT   0x0A60
+#define M_POLY_OFFSET_LINE    0x0A64
+#define M_POLY_OFFSET_FILL    0x0A68
+#define M_POLY_OFFSET_FACTOR  0x0A78
+#define M_POLY_OFFSET_BIAS    0x0A7C
 
 /* ---- module state -------------------------------------------------------- */
 
@@ -2420,6 +2425,18 @@ static void pd_close_pass(void)
     }
 }
 
+/* PS3RECOMP_ENG_POLY_OFFSET=0: draw without the guest's polygon offset (the
+ * behaviour before it was honoured). */
+static int eng_poly_offset_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_POLY_OFFSET");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on;
+}
+
 /* A draw (or, with rs NULL, a clear) into this target set: close the pass
  * when the set changed, and describe the first draw of a new one. */
 static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
@@ -2452,6 +2469,14 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
                 " dt %u dw %u at %u |", s_pd.pass, s_pd.draws, pipeline, rs->color_mask,
                 rs->blend_enable, rs->sf_rgb, rs->df_rgb, rs->depth_test, rs->depth_write,
                 rs->alpha_test_enable);
+        if (rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_FILL) & 1u) {
+            const u32 f = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_FACTOR);
+            const u32 b = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_BIAS);
+            float ff, fb;
+            memcpy(&ff, &f, sizeof ff);
+            memcpy(&fb, &b, sizeof fb);
+            fprintf(s_pd.draws_log, " po %g/%g", ff, fb);
+        }
         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
             if (!(tex_mask & (1u << u))) continue;
             rsx_dsp_texture t;
@@ -2719,6 +2744,26 @@ static void sink_end(void* user, const rsx_dispatch* r)
         memcpy(&fmin, &lo, sizeof fmin);
         memcpy(&fmax, &hi, sizeof fmax);
         g.be->set_depth_bounds(g.be->user, fmin, fmax);
+    }
+
+    /* Polygon offset: dynamic state, like the stencil reference. The
+     * enable that applies is the one for what the primitive rasterises as. */
+    if (g.be->set_depth_bias) {
+        float slope = 0.0f, units = 0.0f;
+        const u32 en = topology == RSX_TOPOLOGY_POINTS ? M_POLY_OFFSET_POINT
+                     : (topology == RSX_TOPOLOGY_LINES || topology == RSX_TOPOLOGY_LINE_STRIP)
+                       ? M_POLY_OFFSET_LINE : M_POLY_OFFSET_FILL;
+        if (eng_poly_offset_on() && (rsx_dsp_reg(&g.rsx, en) & 1u)) {
+            const u32 f = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_FACTOR);
+            const u32 b = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_BIAS);
+            memcpy(&slope, &f, sizeof slope);
+            memcpy(&units, &b, sizeof units);
+            if (slope != slope) slope = 0.0f;   /* NaN */
+            if (units != units) units = 0.0f;
+        }
+        g.be->set_depth_bias(g.be->user, slope, units,
+                             /* SURFACE_FORMAT depth: 1 Z16, 2 Z24S8 */
+                             sf.depth_format == 1u ? 16u : 24u);
     }
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;

@@ -2271,6 +2271,9 @@ typedef struct {
     float clear_depth;
     u8    clear_stencil;
     u32   resolve_dst;          /* snapshot/resolve destination texture */
+    /* Polygon offset in Metal's terms (setDepthBias:slopeScale:clamp:),
+     * dynamic encoder state like the stencil reference. */
+    float depth_bias, depth_slope;
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
@@ -3141,6 +3144,19 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 static void eng_set_stencil_ref(void* user, u32 ref)
 { (void)user; s_eng_pending.stencil_ref = ref; }
 
+/* Polygon offset. glPolygonOffset's units are steps of the guest depth
+ * buffer, 2^-16 for Z16 and 2^-24 for Z24S8. Metal's depthBias on the
+ * Depth32Float targets is in steps of 2^(e-23) for a primitive whose largest
+ * depth has exponent e: 2^-24 over [0.5, 1), where nearly all of a
+ * perspective scene's depth sits, so Z24 units carry over as they are and a
+ * Z16 unit is 256 of them. */
+static void eng_set_depth_bias(void* user, float slope, float units, u32 depth_bits)
+{
+    (void)user;
+    s_eng_pending.depth_slope = slope;
+    s_eng_pending.depth_bias  = depth_bits == 16u ? units * 256.0f : units;
+}
+
 static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                      u32 vertex_count, u32 stride, const u32* indices,
                      u32 index_count)
@@ -3210,6 +3226,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:p->winding];
     [enc setStencilReferenceValue:r->stencil_ref];
+    [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
     [enc setViewport:vp];
     if (r->sc[2] && r->sc[3])
@@ -3821,6 +3838,7 @@ static const rsx_draw_backend s_engine_backend = {
     .set_viewport         = eng_set_viewport,
     .set_scissor          = eng_set_scissor,
     .set_stencil_ref      = eng_set_stencil_ref,
+    .set_depth_bias       = eng_set_depth_bias,
     .draw                 = eng_draw,
     .clear_color          = eng_clear_color,
     .clear_depth_stencil  = eng_clear_depth_stencil,

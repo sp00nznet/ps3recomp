@@ -273,6 +273,15 @@ jobs:
           test -x build/test_shader_msl
           ./build/test_shader_msl
 
+      # The polygon offset reaches the GPU: a constant-depth triangle drawn
+      # with SET_POLY_OFFSET_FILL and a bias lands 256 Z24 (or one Z16) steps
+      # deeper, and PS3RECOMP_ENG_POLY_OFFSET=0 draws it without.
+      - name: Run the Metal polygon offset test
+        run: |
+          test -x build/test_metal_poly_offset
+          ./build/test_metal_poly_offset
+          PS3RECOMP_ENG_POLY_OFFSET=0 ./build/test_metal_poly_offset
+
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's

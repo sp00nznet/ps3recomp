@@ -485,6 +485,33 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+
+        # The polygon offset through the engine and the Metal backend on the
+        # GPU; the guest programs need the translation above.
+        if(APPLE)
+            add_executable(test_metal_poly_offset
+                libs/video/tests/test_metal_poly_offset.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_poly_offset.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_poly_offset PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_poly_offset PRIVATE
+                ps3recomp_msl_translation
+                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+            # Only what the engine and the backend reach; the rest of the
+            # runtime is not linked in.
+            target_link_options(test_metal_poly_offset PRIVATE "-Wl,-dead_strip")
+        endif()
     endif()
 
     # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang

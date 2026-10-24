@@ -1265,6 +1265,89 @@ static void test_custom_guest_mapping(void)
     engine_down();
 }
 
+/* ---- polygon offset ------------------------------------------------------ */
+
+#define M_POLY_OFFSET_POINT  0x0A60
+#define M_POLY_OFFSET_LINE   0x0A64
+#define M_POLY_OFFSET_FILL   0x0A68
+#define M_POLY_OFFSET_FACTOR 0x0A78
+#define M_POLY_OFFSET_BIAS   0x0A7C
+
+static u32 po_bits(float f) { u32 u; memcpy(&u, &f, 4); return u; }
+
+/* What the backend was told before the last draw. */
+static float po_slope = -99.0f, po_units = -99.0f;
+static u32 po_depth_bits, po_calls;
+static void stub_set_depth_bias(void* u, float slope, float units, u32 bits)
+{ (void)u; po_slope = slope; po_units = units; po_depth_bits = bits; po_calls++; }
+
+/* SET_POLY_OFFSET_FILL_ENABLE with SCALE_FACTOR and BIAS reaches the backend
+ * as set_depth_bias(slope, units, depth bits) before each draw, Z16 or Z24
+ * by the zeta format, and 0/0 while the offset is off. A title draws its
+ * shadow casters, decals and projected shadows with an offset so they do
+ * not fight the depth they sit on; the engine used to drop it. */
+static void test_polygon_offset(void)
+{
+    printf("-- polygon offset\n");
+    engine_up();
+    static rsx_draw_backend be;
+    be = g_stub_backend;
+    be.set_depth_bias = stub_set_depth_bias;
+    rsx_draw_engine_set_backend(&be);
+    po_calls = 0;
+
+    draw_triangle();
+    CHECK(stub.n_draw == 1, "the draw executed");
+    CHECK(po_calls == 1 && po_slope == 0.0f && po_units == 0.0f,
+          "no offset: the backend is told 0/0 (%u calls, slope %g units %g)",
+          po_calls, po_slope, po_units);
+
+    m(M_POLY_OFFSET_FACTOR, po_bits(-1.0f));
+    m(M_POLY_OFFSET_BIAS, po_bits(-256.0f));
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f,
+          "factor and bias alone change nothing while FILL is off");
+
+    m(M_POLY_OFFSET_FILL, 1u);
+    draw_triangle();
+    CHECK(po_slope == -1.0f && po_units == -256.0f && po_depth_bits == 24u,
+          "FILL on: -1/-256 against a Z24S8 zeta (slope %g units %g bits %u)",
+          po_slope, po_units, po_depth_bits);
+
+    m(M_SURFACE_FORMAT, 8u | (1u << 5));          /* A8R8G8B8, Z16 */
+    m(M_POLY_OFFSET_FACTOR, po_bits(0.25f));
+    m(M_POLY_OFFSET_BIAS, po_bits(200.0f));
+    draw_triangle();
+    CHECK(po_slope == 0.25f && po_units == 200.0f && po_depth_bits == 16u,
+          "a Z16 zeta says 16 bits (slope %g units %g bits %u)",
+          po_slope, po_units, po_depth_bits);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));          /* back to Z24S8 */
+
+    /* The enable for what the primitive rasterises as: LINE for lines. */
+    m(M_POLY_OFFSET_FILL, 0u);
+    m(M_POLY_OFFSET_LINE, 1u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f,
+          "LINE alone does not offset a triangle (slope %g units %g)", po_slope, po_units);
+    m(M_BEGIN_END, RSX_PRIMITIVE_LINES);
+    m(M_DRAW_ARRAYS, 0u | ((2u - 1u) << 24));
+    m(M_BEGIN_END, 0u);
+    CHECK(po_slope == 0.25f && po_units == 200.0f,
+          "LINE offsets a line list (slope %g units %g)", po_slope, po_units);
+    m(M_POLY_OFFSET_LINE, 0u);
+
+    /* A NaN factor is no offset, not a NaN bias. */
+    m(M_POLY_OFFSET_FILL, 1u);
+    m(M_POLY_OFFSET_FACTOR, 0x7FC00000u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 200.0f, "a NaN factor reads 0 (slope %g)", po_slope);
+
+    m(M_POLY_OFFSET_FILL, 0u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f, "FILL off again: 0/0");
+    engine_down();
+}
+
 /* NV4097_INLINE_ARRAY: the vertices arrive IN the pushbuffer.
  *
  * Nothing consumed method 0x1818 at all, so a title that builds geometry this
@@ -1616,6 +1699,7 @@ int main(void)
     test_scissor();
     test_readback();
     test_custom_guest_mapping();
+    test_polygon_offset();
     test_queued_flip_buffer();
     test_transfer_coherence();
     test_transfer_rows();

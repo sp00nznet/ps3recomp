@@ -201,6 +201,15 @@ typedef struct rsx_draw_backend {
      * (rsx_be_render_state.depth_bounds_test); a backend that leaves this
      * NULL draws as if the test were off. */
     void (*set_depth_bounds)(void* user, float min, float max);
+    /* Optional. The NV4097 polygon offset for the next draw, called before
+     * every draw like the stencil reference (SET_POLY_OFFSET_{POINT,LINE,
+     * FILL}_ENABLE 0x0A60/0x0A64/0x0A68, SCALE_FACTOR 0x0A78, BIAS 0x0A7C).
+     * glPolygonOffset's terms: `slope` multiplies the primitive's maximum
+     * depth slope and `units` the smallest resolvable difference of a depth
+     * buffer of `depth_bits` bits (16 for Z16, 24 for Z24S8), so a backend
+     * whose depth format is another converts the units. Both are 0 when the
+     * offset is off. Left NULL, every draw is drawn without it. */
+    void (*set_depth_bias)(void* user, float slope, float units, u32 depth_bits);
     /* One draw. `indices` is NULL for a non-indexed one. Everything the
      * hardware has and the host does not -- quads, quad strips, fans,
      * polygons -- has already been expanded into a triangle list by the time
