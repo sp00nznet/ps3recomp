@@ -23,6 +23,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include "sys_ppu_thread.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
+#include "ps3emu/ps3_tprof.h"            /* PS3_TPROF: in-process thread samples */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
@@ -123,6 +124,7 @@ static void* ppu_host_thread_proc(void* param)
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+    ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
@@ -165,6 +167,7 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
+    ps3_tprof_thread_exit();
     /* Mark as finished */
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
@@ -253,6 +256,7 @@ uint64_t ppu_thread_register_main(void)
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
+        ps3_tprof_thread('P', 1);
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else
