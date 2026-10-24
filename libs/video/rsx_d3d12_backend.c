@@ -161,7 +161,8 @@ typedef struct {
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
- * memory). SRV lives at heap index 1+slot. */
+ * memory). Each draw that samples it writes its own SRV into its window at
+ * DRAW_SRV_BASE. */
 typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
@@ -2414,8 +2415,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
 /* Upload the guest texture for a VP draw into a per-frame texture slot
  * (re-uploaded every frame: gcm/cube's plasma animates in guest memory).
- * Returns the slot index (SRV at heap 1+slot) or -1. Must run while the
- * command list is open, before the draw passes. */
+ * Returns the slot index or -1. Must run while the command list is open,
+ * before the draw passes. */
 /* NV4097 TEXTURE_CONTROL1 component remap -> D3D12 Shader4ComponentMapping.
  * The crossbar decode itself is RSX semantics and lives in
  * rsx_texture_layout.c; all that is left here is packing the four selectors
@@ -2496,7 +2497,6 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * re-deriving any of it. Only the DXGI mapping below is ours. */
     rsx_tex_layout tl;
     rsx_texture_layout(fmt, w, h, &tl);
-    u32 basef = fmt & 0x9F;              /* still needed for the SRV remap */
     int argb = (tl.fmt == RSX_TEXFMT_R8G8B8A8);
     int dxt  = tl.compressed;
     /* Compressed rows are counted in blocks, so keep bpp at 1 for the byte
@@ -3035,26 +3035,6 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
     }
-    /* SRV at heap slot 1+slot */
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
-    sv.Format = dxfmt;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    /* RSX B8 replicates the byte into all four channels (dbgfont's FP reads
-     * coverage from .w); DXGI R8 defaults to (r,0,0,1), so swizzle (R,R,R,R)
-     * = encoded 0x1000 (component 0 in all lanes + always-set bit). ARGB8
-     * keeps the identity mapping. */
-    sv.Shader4ComponentMapping = (basef == 0x81) ? 0x1000 : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sv.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE sh;
-    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
-    sh.ptr += (u64)(1 + slot) * s_d3d.srv_inc;
-    if (cube) {
-        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-        sv.TextureCube.MipLevels = 1;
-        sv.TextureCube.MostDetailedMip = 0;
-        sv.TextureCube.ResourceMinLODClamp = 0.0f;
-    }
-    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, t->res, &sv, sh);
 
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->cube = cube; t->used = 1;
@@ -4081,8 +4061,8 @@ static void render_frame(void)
     }
 
     /* Per-frame VP textures + guest-FP pipelines: for each VP draw, upload the
-     * texture it had bound at submit time into a slot (SRV heap 1+slot; plasma
-     * animates so contents re-upload every frame) and pre-build its FP PSO.
+     * texture it had bound at submit time into a slot (plasma animates, so
+     * contents re-upload every frame) and pre-build its FP PSO.
      * A texture whose offset matches an offscreen RT samples the RT directly
      * (tex_slot 1000+idx) -- no guest-memory upload. */
     double _pre0 = perf_on() ? perf_now() : 0.0;
