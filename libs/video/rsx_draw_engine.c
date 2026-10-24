@@ -125,6 +125,7 @@ typedef struct {
     u32 last_hash_frame;
     u64 last_use_serial;
     u32 depth;                  /* slices of a 3D texture, else 1 */
+    u32 levels;                 /* SET_TEXTURE_FORMAT mipmap count it was built with */
 } eng_texture;
 
 typedef struct {
@@ -1036,9 +1037,12 @@ static int eng_staging_reserve(u32 bytes)
 }
 
 /* Decode a guest texture out of guest memory and hand every face and level to
- * the backend. Returns the backend handle, or 0. */
+ * the backend. Returns the backend handle, or 0. `into`, when nonzero, is an
+ * existing 2D texture of exactly this key to rewrite instead of creating one
+ * (rsx_draw_backend.texture_upload_ordered). */
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                              u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
+                              u32 levels, u32 pitch, int cube, u32 remap, u32 depth,
+                              u32 into)
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
@@ -1046,7 +1050,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     /* A volume: every slice of every level decoded and uploaded on its own.
      * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
      * first slice and sampled in 2D it darkened whole boxes round every prop. */
-    if (depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
+    if (!into && depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
         !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
         const u8* src = eng_guest_ptr(NULL, location, offset, span);
@@ -1090,8 +1094,8 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     if (!src) return 0;
 
-    const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
-                                            w, h, nlv, faces, remap, fmt);
+    const u32 handle = into ? into
+        : g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt), w, h, nlv, faces, remap, fmt);
     if (!handle) return 0;
 
     for (u32 f = 0; f < faces; f++) {
@@ -1099,7 +1103,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         for (u32 m = 0; m < nlv; m++) {
             const rsx_tex_layout* tl = &lv[m].tl;
             if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows)) {
-                g.be->texture_release(g.be->user, handle);
+                if (!into) g.be->texture_release(g.be->user, handle);
                 return 0;
             }
             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
@@ -1153,13 +1157,20 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if (readable) e->sparse_hash = sparse;
             e->last_hash_frame = g.frames;
             if (readable && hash != e->content_hash) {
+                /* In place when the backend orders the upload after the draws
+                 * that sampled the old bytes; a volume keeps create-and-swap,
+                 * and so does a different mip count (the key does not hold it,
+                 * and the levels to upload would not all exist). */
+                const u32 into = (g.be->texture_upload_ordered && depth <= 1 &&
+                                  e->levels == levels) ? e->handle : 0u;
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
-                                                     levels, pitch, cube, remap, depth);
-                if (fresh) {
+                                                     levels, pitch, cube, remap, depth, into);
+                if (fresh && !into) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
-                    e->content_hash = hash;
+                    e->levels = levels;
                 }
+                if (fresh) e->content_hash = hash;
             }
         }
         e->last_use_serial = ++g.texture_use_serial;
@@ -1182,7 +1193,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     memset(&e, 0, sizeof(e));
     e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.pitch = pitch;
-    e.remap = remap; e.cubemap = (u32)(cube != 0); e.depth = depth;
+    e.remap = remap; e.cubemap = (u32)(cube != 0); e.depth = depth; e.levels = levels;
     e.last_hash_frame = g.frames;
     e.last_full_frame = g.frames - (index & (ENG_TEXHASH_FULL_EVERY - 1u));
     e.last_use_serial = ++g.texture_use_serial;
@@ -1190,7 +1201,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
       e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
-                                  cube, remap, depth);
+                                  cube, remap, depth, 0u);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) g.textures[index] = e;
     return e.handle;

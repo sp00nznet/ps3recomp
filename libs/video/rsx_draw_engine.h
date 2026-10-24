@@ -244,6 +244,12 @@ typedef struct rsx_draw_backend {
                               u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
     void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
                               u32 w, u32 h, const void* src, u32 row_bytes);
+    /* Nonzero when texture_upload is ordered after every draw already handed
+     * to the backend, so rewriting a texture those draws sample is safe. The
+     * engine then refreshes a changed 2D texture in place instead of creating
+     * a new one and releasing the old (an allocation, a free and a wait for
+     * the GPU each time). Zero keeps the create-and-swap. */
+    int texture_upload_ordered;
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
