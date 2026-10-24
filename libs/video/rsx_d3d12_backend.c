@@ -88,6 +88,8 @@ typedef struct {
                          * faces on most solid geometry; rendering everything
                          * double-sided lets a shell's interior faces show
                          * through and shade unlit (black). */
+    u64 zs_key;         /* packed guest depth/stencil state (rsx_zs_key), PSO key */
+    u32 stencil_ref;    /* guest stencil reference at draw time (dynamic state) */
     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
                          * (wave's sim passes write single lanes of the height
                          * maps; ignoring the mask stomped persistent state) */
@@ -106,6 +108,7 @@ typedef struct {
                          * one as 2D is what makes an environment-mapped chrome
                          * surface come out with black patches and banding. */
         int set;
+        u32 addr, filter, ctrl0, border;   /* TEXTURE_ADDRESS/FILTER/CONTROL0/BORDER_COLOR */
     } tex[4];
     int tex_rt[4];      /* pre-pass: OffRT index sampled by unit, -1 = none */
     int tex_slot;       /* legacy single-slot path (atlas); -1 = none */
@@ -218,6 +221,7 @@ typedef struct {
                              * declares those samplers as TextureCube, so a cube
                              * and a 2D variant of the same program are different
                              * pipelines and must not share a cache entry. */
+    u64 zs;                 /* depth/stencil state, rsx_zs_key (PSO key) */
     ID3D12PipelineState* pso;
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
@@ -318,7 +322,13 @@ typedef struct {
     int                   vp_fp_n;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1, mips; int cube; int set; } cur_texs[4];
+    struct { u32 off, raw, w, h, fmt, ctrl1, mips; int cube; int set;
+             u32 addr, filter, ctrl0, border; } cur_texs[4];
+    /* Guest sampler states, one shader-visible descriptor each (samp_key[i]
+     * describes descriptor i; 0 and 1 are the defaults for units with none). */
+    ID3D12DescriptorHeap* samp_heap;
+    u32                   samp_inc, samp_n;
+    u32                   samp_key[2048][4];
 
     /* Render-to-texture: offscreen RT pool + their RTV heap. */
     OffRT                 off_rt[MAX_OFF_RTS];
@@ -481,6 +491,8 @@ static int perf_on(void)
     if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
     return v;
 }
+
+static void vp_sampler_defaults(void);
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
  * texture), so the debug camera can follow it. The ducks are driven by the
  * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
@@ -1046,6 +1058,20 @@ static int init_d3d12(u32 width, u32 height)
          * root signature binds t0-t3) is valid on tier-1 hardware. */
         {
             D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+            {
+                D3D12_DESCRIPTOR_HEAP_DESC sh = {0};
+                sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+                sh.NumDescriptors = 2048;
+                sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(
+                        s_d3d.device, &sh, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.samp_heap)))
+                    printf("[D3D12] sampler heap creation failed%c", 10);
+                else {
+                    s_d3d.samp_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+                        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                    vp_sampler_defaults();
+                }
+            }
             hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             hd.NumDescriptors = SRV_HEAP_SIZE;
             hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
@@ -1129,7 +1155,7 @@ static int init_d3d12(u32 width, u32 height)
         srv_range.BaseShaderRegister = 0;
         srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-        D3D12_ROOT_PARAMETER rp[3] = {0};
+        D3D12_ROOT_PARAMETER rp[7] = {0};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b0 = vp_c bank */
         rp[0].Descriptor.ShaderRegister = 0;
         rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -1141,22 +1167,27 @@ static int init_d3d12(u32 width, u32 height)
         rp[2].Descriptor.ShaderRegister = 1;
         rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        D3D12_STATIC_SAMPLER_DESC samp[4] = {0};
+        /* s0-s3: one sampler table per unit, filled per draw from the guest's
+         * TEXTURE_ADDRESS/FILTER/CONTROL0 (vp_sampler). These were four static
+         * samplers -- s0 point/clamp for the dbgfont atlas, s1-s3 linear/wrap --
+         * so every unit-0 texture was point-sampled and clamped whatever the
+         * title asked for: God of War HD's soldiers wrap their texture atlas
+         * (v up to ~2) and drew transparent-black from its clamped bottom row.
+         * Units without guest state keep those two defaults. */
+        D3D12_DESCRIPTOR_RANGE samp_range[4] = {0};
         for (int _s = 0; _s < 4; _s++) {
-            samp[_s].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-            samp[_s].AddressU = samp[_s].AddressV = samp[_s].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-            samp[_s].ShaderRegister = (UINT)_s;
-            samp[_s].MaxLOD = D3D12_FLOAT32_MAX;
-            samp[_s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            samp_range[_s].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            samp_range[_s].NumDescriptors = 1;
+            samp_range[_s].BaseShaderRegister = (UINT)_s;
+            rp[3 + _s].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[3 + _s].DescriptorTable.NumDescriptorRanges = 1;
+            rp[3 + _s].DescriptorTable.pDescriptorRanges = &samp_range[_s];
+            rp[3 + _s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         }
-        /* s0 keeps point/clamp: the dbgfont atlas PS samples glyph cells and
-         * linear filtering bleeds neighbouring glyphs. */
-        samp[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samp[0].AddressU = samp[0].AddressV = samp[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
         D3D12_ROOT_SIGNATURE_DESC rd = {0};
-        rd.NumParameters = 3; rd.pParameters = rp;
-        rd.NumStaticSamplers = 4; rd.pStaticSamplers = samp;
+        rd.NumParameters = 7; rd.pParameters = rp;
+        rd.NumStaticSamplers = 0; rd.pStaticSamplers = NULL;
         rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ID3DBlob* sig = NULL; ID3DBlob* err = NULL;
@@ -1896,10 +1927,149 @@ static u8 gl_blend_op_d3d(u32 e)
  * plain 1/0 before any register arrives, so treat those defaults as BACK/CW. */
 static u32 rsx_cull_key(const rsx_state* st)
 {
-    if (!st || !st->cull_face_enable) return 0;
-    u32 k = 1u;
+    if (!st) return 0;
+    /* The front face counts with culling off too: two-sided stencil picks its
+     * front and back state by it (shadow volumes are drawn unculled). */
+    u32 k = st->front_face == 0x0901u ? 4u : 0u;                        /* CCW */
+    if (!st->cull_face_enable) return k;
+    k |= 1u;
     if (st->cull_face == 0x0404u || st->cull_face == 0x0408u) k |= 2u;  /* FRONT */
-    if (st->front_face == 0x0901u) k |= 4u;                             /* CCW */
+    return k;
+}
+
+/* NV4097 texture wrap mode -> D3D12. */
+static D3D12_TEXTURE_ADDRESS_MODE rsx_wrap(u32 w)
+{
+    switch (w & 0xFu) {
+    case 2: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    case 3: case 5: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;    /* CLAMP_TO_EDGE, CLAMP */
+    case 4: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    case 6: case 7: case 8: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    default: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;            /* 1 = WRAP */
+    }
+}
+
+/* Sampler from the guest's TEXTURE_ADDRESS (wrap S [3:0], T [11:8], R [19:16]),
+ * TEXTURE_FILTER (LOD bias [12:0] signed x/256, min [18:16], mag [26:24]) and
+ * TEXTURE_CONTROL0 (max anisotropy [6:4]) and BORDER_COLOR (ARGB). */
+static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
+{
+    const u32 addr = k[0], filter = k[1], ctrl0 = k[2], border = k[3];
+    const u32 minf = (filter >> 16) & 7u, magf = (filter >> 24) & 7u;
+    const int min_lin = minf == 2 || minf == 4 || minf == 6 || minf == 7;
+    const int mip_lin = minf == 5 || minf == 6 || minf == 7;
+    const int mag_lin = magf == 2 || magf == 4;
+    static const u8 aniso[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
+    memset(s, 0, sizeof *s);
+    if (aniso[(ctrl0 >> 4) & 7u] > 1 && min_lin && mag_lin) {
+        s->Filter = D3D12_FILTER_ANISOTROPIC;
+        s->MaxAnisotropy = aniso[(ctrl0 >> 4) & 7u];
+    } else {
+        s->Filter = (D3D12_FILTER)((min_lin << 4) | (mag_lin << 2) | mip_lin);
+        s->MaxAnisotropy = 1;
+    }
+    s->AddressU = rsx_wrap(addr);
+    s->AddressV = rsx_wrap(addr >> 8);
+    s->AddressW = rsx_wrap(addr >> 16);
+    int bias = (int)(filter & 0x1FFFu);
+    if (bias & 0x1000) bias -= 0x2000;
+    s->MipLODBias = (float)bias / 256.0f;
+    s->ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    s->BorderColor[0] = (float)((border >> 16) & 0xFFu) / 255.0f;
+    s->BorderColor[1] = (float)((border >> 8) & 0xFFu) / 255.0f;
+    s->BorderColor[2] = (float)(border & 0xFFu) / 255.0f;
+    s->BorderColor[3] = (float)(border >> 24) / 255.0f;
+    s->MinLOD = 0.0f;
+    s->MaxLOD = D3D12_FLOAT32_MAX;
+}
+
+static void vp_sampler_write(u32 i, const D3D12_SAMPLER_DESC* s)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.samp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &h);
+    h.ptr += (SIZE_T)i * s_d3d.samp_inc;
+    s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, s, h);
+}
+
+/* Descriptors 0 and 1: what the four static samplers were, for units the
+ * guest gave no state (s0 point/clamp for the dbgfont atlas, else linear/wrap). */
+static void vp_sampler_defaults(void)
+{
+    D3D12_SAMPLER_DESC s = {0};
+    s.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    s.MaxAnisotropy = 1; s.MaxLOD = D3D12_FLOAT32_MAX;
+    vp_sampler_write(0, &s);
+    s.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    s.AddressU = s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    vp_sampler_write(1, &s);
+    s_d3d.samp_n = 2;
+}
+
+/* The descriptor index for a draw's unit: one per distinct guest state, made
+ * on first use. A full heap falls back to the defaults. */
+static int vp_sampler(const D3D12DrawRecord* dr, int u)
+{
+    if (!dr->tex[u].set) return u == 0 ? 0 : 1;
+    const u32 k[4] = { dr->tex[u].addr & 0x000F0F0Fu, dr->tex[u].filter & 0x07071FFFu,
+                       dr->tex[u].ctrl0 & 0x70u, dr->tex[u].border };
+    for (u32 i = 2; i < s_d3d.samp_n; i++)
+        if (!memcmp(s_d3d.samp_key[i], k, sizeof k)) return (int)i;
+    if (s_d3d.samp_n >= 2048) return u == 0 ? 0 : 1;
+    const u32 i = s_d3d.samp_n++;
+    memcpy(s_d3d.samp_key[i], k, sizeof k);
+    D3D12_SAMPLER_DESC s;
+    rsx_sampler_desc(k, &s);
+    vp_sampler_write(i, &s);
+    return (int)i;
+}
+
+/* NV4097 stencil op (GL enum) -> D3D12_STENCIL_OP - 1. */
+static u32 rsx_stencil_op(u32 op)
+{
+    switch (op) {
+    case 0x0000: return 1;   /* ZERO      */
+    case 0x1E01: return 2;   /* REPLACE   */
+    case 0x1E02: return 3;   /* INCR (saturating) */
+    case 0x1E03: return 4;   /* DECR (saturating) */
+    case 0x150A: return 5;   /* INVERT    */
+    case 0x8507: return 6;   /* INCR_WRAP */
+    case 0x8508: return 7;   /* DECR_WRAP */
+    default:     return 0;   /* KEEP      */
+    }
+}
+
+/* Guest depth/stencil state, packed as a PSO key. Comparison functions are
+ * GL enums 0x200 NEVER .. 0x207 ALWAYS, so the low three bits are D3D12's
+ * D3D12_COMPARISON_FUNC - 1. Fields that cannot matter are left zero (no
+ * depth state with the test off, no stencil state with the test off), so the
+ * same pipeline is not built twice.
+ *   bit 0 depth test, 1 depth write, 2-4 depth func,
+ *   5 stencil test, 6-8 front func, 9-17 front fail/zfail/zpass,
+ *   18-20 back func, 21-29 back fail/zfail/zpass, 32-39 read mask, 40-47 write mask */
+static u64 rsx_zs_key(const rsx_state* st)
+{
+    if (!st) return 0;
+    u64 k = 0;
+    if (st->depth_test_enable) {
+        k |= 1u;
+        if (st->depth_mask) k |= 2u;
+        k |= (u64)(st->depth_func & 7u) << 2;
+    }
+    if (st->stencil_test_enable) {
+        const int two = st->two_sided_stencil;
+        k |= 1u << 5;
+        k |= (u64)(st->stencil_func & 7u) << 6;
+        k |= (u64)rsx_stencil_op(st->stencil_op_fail) << 9;
+        k |= (u64)rsx_stencil_op(st->stencil_op_zfail) << 12;
+        k |= (u64)rsx_stencil_op(st->stencil_op_zpass) << 15;
+        k |= (u64)((two ? st->back_stencil_func : st->stencil_func) & 7u) << 18;
+        k |= (u64)rsx_stencil_op(two ? st->back_stencil_op_fail : st->stencil_op_fail) << 21;
+        k |= (u64)rsx_stencil_op(two ? st->back_stencil_op_zfail : st->stencil_op_zfail) << 24;
+        k |= (u64)rsx_stencil_op(two ? st->back_stencil_op_zpass : st->stencil_op_zpass) << 27;
+        k |= (u64)(st->stencil_mask & 0xFFu) << 32;
+        k |= (u64)(st->stencil_write_mask & 0xFFu) << 40;
+    }
     return k;
 }
 
@@ -1975,7 +2145,7 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 cube_mask)
+                                          u32 cube_mask, u64 zs)
 {
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2031,7 +2201,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
-            s_d3d.vp_fp[i].cube_mask == cube_mask)
+            s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].zs == zs)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
@@ -2364,10 +2534,28 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     for (int _r = 0; _r < nrt; _r++)
         pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    pd.DepthStencilState.DepthEnable = TRUE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-    pd.DepthStencilState.StencilEnable = FALSE;
+    /* Guest depth/stencil state (rsx_zs_key). This was a fixed LESS_EQUAL
+     * depth test with writes and no stencil, whatever the title set: God of
+     * War HD's stencil shadow volumes then marked nothing and its shadow pass,
+     * a full-screen reverse-subtract quad meant only for the marked pixels,
+     * darkened the whole frame. */
+    {
+        D3D12_DEPTH_STENCIL_DESC* ds = &pd.DepthStencilState;
+        ds->DepthEnable    = (zs & 1u) ? TRUE : FALSE;
+        ds->DepthWriteMask = (zs & 2u) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+        ds->DepthFunc      = (D3D12_COMPARISON_FUNC)(((zs >> 2) & 7u) + 1u);
+        ds->StencilEnable  = (zs & (1u << 5)) ? TRUE : FALSE;
+        ds->StencilReadMask  = (UINT8)(zs >> 32);
+        ds->StencilWriteMask = (UINT8)(zs >> 40);
+        ds->FrontFace.StencilFunc        = (D3D12_COMPARISON_FUNC)(((zs >> 6) & 7u) + 1u);
+        ds->FrontFace.StencilFailOp      = (D3D12_STENCIL_OP)(((zs >> 9) & 7u) + 1u);
+        ds->FrontFace.StencilDepthFailOp = (D3D12_STENCIL_OP)(((zs >> 12) & 7u) + 1u);
+        ds->FrontFace.StencilPassOp      = (D3D12_STENCIL_OP)(((zs >> 15) & 7u) + 1u);
+        ds->BackFace.StencilFunc         = (D3D12_COMPARISON_FUNC)(((zs >> 18) & 7u) + 1u);
+        ds->BackFace.StencilFailOp       = (D3D12_STENCIL_OP)(((zs >> 21) & 7u) + 1u);
+        ds->BackFace.StencilDepthFailOp  = (D3D12_STENCIL_OP)(((zs >> 24) & 7u) + 1u);
+        ds->BackFace.StencilPassOp       = (D3D12_STENCIL_OP)(((zs >> 27) & 7u) + 1u);
+    }
     /* DEPTH_OFF=1: drop the depth test for guest-FP draws, so submission order
      * alone decides what is on top. Paired with DRAW_LAST_TEX this puts one
      * object in front of everything and answers "is it merely occluded?" --
@@ -2407,6 +2595,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cull    = cull;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp_n++;
     return pso;
@@ -4267,7 +4456,8 @@ static void render_frame(void)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr));
+                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr),
+                                       dr->zs_key);
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -4444,11 +4634,12 @@ static void render_frame(void)
             s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                 s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb));
-            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
-            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 1, heaps);
+            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
+            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, s_d3d.samp_heap ? 2 : 1, heaps);
             D3D12_GPU_DESCRIPTOR_HANDLE gh;
             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+            int samp_bound[4] = { -1, -1, -1, -1 };
             D3D12_VERTEX_BUFFER_VIEW vbv;
             vbv.BufferLocation = s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb)
                                + (u64)s_d3d.vp_parity * MAX_VERTICES * 256;
@@ -4605,9 +4796,10 @@ static void render_frame(void)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_exp32, dr->cmask, dr->cull,
-                                                dr_cube_mask(dr)) : NULL;
+                                                dr_cube_mask(dr), dr->zs_key) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
+                s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
                 /* Per-draw viewport: the guest rect when sane, else the
                  * full target. Scissor tracks the same rect. */
                 {
@@ -4642,6 +4834,18 @@ static void render_frame(void)
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
                 gh.ptr += (u64)(DRAW_SRV_BASE + d * 4) * s_d3d.srv_inc;
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+                if (s_d3d.samp_heap) {
+                    D3D12_GPU_DESCRIPTOR_HANDLE sb;
+                    s_d3d.samp_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &sb);
+                    for (int _u = 0; _u < 4; _u++) {
+                        const int si = vp_sampler(dr, _u);
+                        if (si == samp_bound[_u]) continue;
+                        samp_bound[_u] = si;
+                        D3D12_GPU_DESCRIPTOR_HANDLE sh = sb;
+                        sh.ptr += (u64)si * s_d3d.samp_inc;
+                        s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 3 + _u, sh);
+                    }
+                }
                 /* Per-draw constants: this draw's vp_cb + FP texscale slots. */
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                     s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb)
@@ -6084,7 +6288,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
-                dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+                dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
                 dr->cmask = 0xF;
@@ -6108,7 +6312,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                     dr->tex_rt[_u]  = -1;
                 }
@@ -6206,7 +6410,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
-            dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+            dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->cmask = 0xF;
@@ -6230,7 +6434,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
                 dr->tex_rt[_u]  = -1;
             }
@@ -6350,7 +6554,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
-        dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+        dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = 0xF;
         if (s_d3d.current_rsx_state) {
@@ -6373,7 +6577,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
+                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips; dr->tex[_u].addr = s_d3d.cur_texs[_u].addr; dr->tex[_u].filter = s_d3d.cur_texs[_u].filter; dr->tex[_u].ctrl0 = s_d3d.cur_texs[_u].ctrl0; dr->tex[_u].border = s_d3d.cur_texs[_u].border;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
             dr->tex_rt[_u]  = -1;
         }
@@ -6522,6 +6726,10 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
+        s_d3d.cur_texs[unit].addr   = tex->address;
+        s_d3d.cur_texs[unit].filter = tex->filter;
+        s_d3d.cur_texs[unit].ctrl0  = tex->control0;
+        s_d3d.cur_texs[unit].border = tex->border_color;
         if (getenv("TEXFMTDBG")) { static u32 seen[64]; static int ns=0;
             u32 k = (unit<<24) | (((tex->format>>8) & 0xFFu)<<16) | (width & 0xFFFFu);
             int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
