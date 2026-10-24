@@ -114,6 +114,8 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+    u32 ext_w, ext_h;      /* the largest clip it was bound with: past it,
+                            * nothing was drawn or cleared (eng_clear_rect) */
 } eng_zdepth;
 
 typedef struct {
@@ -843,6 +845,14 @@ static u32 eng_current_surface(void)
 /* One depth target per guest zeta address. Sharing a single resource across a
  * title's shadow, scene and post passes cross-contaminates later depth tests;
  * upstream's ef3271b records that as "the black player-character mass". */
+static void eng_zdepth_extend(eng_zdepth* z, u32 rt_w, u32 rt_h)
+{
+    if (!rt_w) rt_w = g.width;
+    if (!rt_h) rt_h = g.height;
+    if (rt_w > z->ext_w) z->ext_w = rt_w < z->w ? rt_w : z->w;
+    if (rt_h > z->ext_h) z->ext_h = rt_h < z->h ? rt_h : z->h;
+}
+
 static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 {
     /* The attachment must cover the whole canvas: an early pass declaring a
@@ -857,7 +867,10 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     for (u32 i = 0; i < g.n_zdepths; i++) {
         eng_zdepth* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
-            if (z->w >= want_w && z->h >= want_h) return i;
+            if (z->w >= want_w && z->h >= want_h) {
+                eng_zdepth_extend(z, rt_w, rt_h);
+                return i;
+            }
             slot = i;
             if (want_w < z->w) want_w = z->w;
             if (want_h < z->h) want_h = z->h;
@@ -884,6 +897,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->snapshot_valid = 0;
     z->depth_serial = 0;
     z->guest_dirty = 0;
+    z->ext_w = z->ext_h = 0;
+    eng_zdepth_extend(z, rt_w, rt_h);
     if (slot == g.n_zdepths) g.n_zdepths++;
     return slot;
 }
@@ -2527,6 +2542,69 @@ static void pd_present(u32 presented)
     }
 }
 
+/* The guest scissor intersected with a w x h target, as out[x, y, w, h] in
+ * the target's sample grid. The nv40 reset is a full 4096x4096 window and a
+ * never-written register reads 0 here, which the w == 0 test treats as no
+ * scissor, so only a real game scissor narrows anything
+ * (rsx_live_draw.c:6180-6197). */
+static void eng_scissor_rect(const rsx_dsp_surface* sf, u32 w, u32 h, u32 out[4])
+{
+    u32 sx = 0, sy = 0, sw = w, sh = h;
+    const u32 hr = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+    const u32 vr = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+    /* The scissor is in pixels: scale it to the sample grid. */
+    const u32 gx = (hr & 0xFFFFu) * sf->aa_sx, gw = (hr >> 16) * sf->aa_sx;
+    const u32 gy = (vr & 0xFFFFu) * sf->aa_sy, gh = (vr >> 16) * sf->aa_sy;
+    if (gw > 0 && gh > 0) {
+        u32 right = sx + sw, bottom = sy + sh;
+        if (gx > sx) sx = gx;
+        if (gy > sy) sy = gy;
+        if (gx + gw < right)  right = gx + gw;
+        if (gy + gh < bottom) bottom = gy + gh;
+        sw = right > sx ? right - sx : 0;
+        sh = bottom > sy ? bottom - sy : 0;
+    }
+    out[0] = sx; out[1] = sy; out[2] = sw; out[3] = sh;
+}
+
+/* What a CLEAR_SURFACE may write in a w x h target: the surface clip from
+ * the origin, then the scissor, as for a draw. Returns 0 when nothing is
+ * left, 1 for the whole target, 2 for part of it (out[] the rectangle).
+ *
+ * Resistance: Fall of Man's co-op split screen renders both views into one
+ * 2x1 antialiased 1280x720 scene target: the scissor on the left half (0,0
+ * 640x720), a colour and depth clear and player 1's view, then the scissor
+ * on the right half (640,0 640x720), a clear and player 2's view. Cleared
+ * whole, the second clear wiped player 1's view, and only the HUD, drawn
+ * later into the display buffer, was left on that side. */
+static int eng_clear_rect(const rsx_dsp_surface* sf, u32 w, u32 h, u32 out[4])
+{
+    const u32 cw = sf->clip_w && sf->clip_w < w ? sf->clip_w : w;
+    const u32 ch = sf->clip_h && sf->clip_h < h ? sf->clip_h : h;
+    eng_scissor_rect(sf, cw, ch, out);
+    if (!out[2] || !out[3]) return 0;
+    /* Only a scissor narrower than the clip makes a clear partial. A clip
+     * smaller than the target alone (a 1280x720 composite pass clearing the
+     * 2560x720 zeta of a 2x1 antialiased scene, every frame) stays a whole
+     * clear as before: as a partial one it cost every frame a pass of its
+     * own, and Resistance's campaign fell from ~30 fps to ~1. */
+    const int whole = out[0] == 0 && out[1] == 0 && out[2] >= cw && out[3] >= ch;
+    if (whole) { out[0] = out[1] = 0; out[2] = w; out[3] = h; return 1; }
+    /* PS3RECOMP_ENG_RECT_CLEAR=0: every clear whole, as before. */
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_RECT_CLEAR"); on = !(e && *e && atoi(e) == 0); }
+    if (!on) { out[0] = out[1] = 0; out[2] = w; out[3] = h; return 1; }
+    return 2;
+}
+
+static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
+{
+    static u32 logs = 0;
+    if (PS3_LOG_FIRST(logs, 8))
+        fprintf(stderr, "[rsx engine] %s clear limited to %u,%u %ux%u of a %ux%u target\n",
+                what, rc[0], rc[1], rc[2], rc[3], w, h);
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -2684,28 +2762,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
     g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
 
-    /* The guest scissor intersected with the surface. The nv40 reset is a
-     * full 4096x4096 window and a never-written register reads 0 here, which
-     * the w == 0 test treats as no scissor, so only a real game scissor
-     * narrows anything (rsx_live_draw.c:6180-6197). */
     {
-        u32 sx = 0, sy = 0;
-        u32 sw = g.surfaces[target].w, sh = g.surfaces[target].h;
-        const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
-        const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
-        /* The scissor is in pixels: scale it to the sample grid. */
-        const u32 gx = (h & 0xFFFFu) * sf.aa_sx, gw = (h >> 16) * sf.aa_sx;
-        const u32 gy = (v & 0xFFFFu) * sf.aa_sy, gh = (v >> 16) * sf.aa_sy;
-        if (gw > 0 && gh > 0) {
-            u32 right = sx + sw, bottom = sy + sh;
-            if (gx > sx) sx = gx;
-            if (gy > sy) sy = gy;
-            if (gx + gw < right)  right = gx + gw;
-            if (gy + gh < bottom) bottom = gy + gh;
-            sw = right > sx ? right - sx : 0;
-            sh = bottom > sy ? bottom - sy : 0;
-        }
-        g.be->set_scissor(g.be->user, sx, sy, sw, sh);
+        u32 sc[4];
+        eng_scissor_rect(&sf, g.surfaces[target].w, g.surfaces[target].h, sc);
+        g.be->set_scissor(g.be->user, sc[0], sc[1], sc[2], sc[3]);
     }
     /* Dynamic, and deliberately outside the pipeline key. */
     g.be->set_stencil_ref(g.be->user,
@@ -2751,6 +2811,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
                 NULL, 0, 0);
     }
 
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G |
                 RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
         const u32 c = rsx_dsp_clear_color(&g.rsx);
@@ -2762,17 +2824,39 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         };
         /* Every target the set names, not only A: a deferred pass clears its
          * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
-         * keep whatever the last frame left in them. */
-        for (u32 i = 0; i < n_targets; i++)
-            g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
-        eng_surfaces_wrote(targets, n_targets);
+         * keep whatever the last frame left in them. Each only where the
+         * clip and the scissor let the clear through (eng_clear_rect). */
+        int wrote = 0;
+        for (u32 i = 0; i < n_targets; i++) {
+            const eng_surface* s = &g.surfaces[targets[i]];
+            u32 rc[4];
+            const int part = eng_clear_rect(&sf, s->w, s->h, rc);
+            if (!part) continue;
+            if (part == 2 && g.be->clear_color_rect) {
+                eng_log_rect_clear("colour", rc, s->w, s->h);
+                g.be->clear_color_rect(g.be->user, s->handle, rgba,
+                                       rc[0], rc[1], rc[2], rc[3]);
+            } else
+                g.be->clear_color(g.be->user, s->handle, rgba);
+            wrote = 1;
+        }
+        if (wrote) eng_surfaces_wrote(targets, n_targets);
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
-        rsx_dsp_surface sf;
-        rsx_dsp_get_surface(&g.rsx, &sf);
         const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                          sf.clip_w, sf.clip_h);
         if (zslot == ENG_INVALID) return;
+        /* A depth target is at least the canvas (eng_zdepth_get), so a
+         * shadow map's clip is smaller than it all the same; a clear that
+         * covers everything the zeta was ever bound with is a whole clear,
+         * which the backend folds into the next pass. */
+        const eng_zdepth* z = &g.zdepths[zslot];
+        u32 rc[4];
+        const int part = eng_clear_rect(&sf, z->w, z->h, rc);
+        if (!part) return;
+        const int partial = part == 2 && g.be->clear_depth_stencil_rect &&
+                            !(rc[0] == 0 && rc[1] == 0 &&
+                              rc[2] >= z->ext_w && rc[3] >= z->ext_h);
         u32 flags = 0;
         if (mask & RSX_CLEAR_DEPTH)   flags |= RSX_BE_CLEAR_DEPTH;
         if (mask & RSX_CLEAR_STENCIL) flags |= RSX_BE_CLEAR_STENCIL;
@@ -2787,13 +2871,28 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         const float depth = !zs ? 1.0f
                           : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
                                 : (float)(zs >> 8) / 16777215.0f;
-        g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
-                                  depth, z16 ? 0 : (u8)(zs & 0xFFu));
+        const u32 handle = g.zdepths[zslot].handle;
+        if (partial) {
+            eng_log_rect_clear("depth", rc, z->w, z->h);
+            /* The rest of a target nothing initialised yet starts as the
+             * first bind would leave it (sink_end). */
+            if (!g.zdepths[zslot].cleared)
+                g.be->clear_depth_stencil(g.be->user, handle,
+                                          RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL,
+                                          1.0f, 0);
+            g.be->clear_depth_stencil_rect(g.be->user, handle, flags, depth,
+                                           z16 ? 0 : (u8)(zs & 0xFFu),
+                                           rc[0], rc[1], rc[2], rc[3]);
+        } else {
+            g.be->clear_depth_stencil(g.be->user, handle, flags,
+                                      depth, z16 ? 0 : (u8)(zs & 0xFFu));
+        }
         g.zdepths[zslot].cleared = 1;
         if (mask & RSX_CLEAR_DEPTH) {
             /* A clear invalidates the older published depth image; the next
-             * texture consumer resolves the newly written pass exactly once. */
-            g.zdepths[zslot].had_write = 0;
+             * texture consumer resolves the newly written pass exactly once.
+             * Past a partial clear the rest still holds what was drawn. */
+            if (!partial) g.zdepths[zslot].had_write = 0;
             g.zdepths[zslot].snapshot_valid = 0;
             eng_zdepth_wrote(zslot, &sf);
         }

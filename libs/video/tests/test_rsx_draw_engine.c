@@ -401,10 +401,10 @@ static const rsx_draw_backend g_stub_backend = {
 
 static void m(u32 method, u32 arg) { rsx_draw_engine_method(method, arg); }
 
-static void engine_up(void)
+static void engine_up_with(const rsx_draw_backend* be)
 {
     memset(&stub, 0, sizeof stub);
-    rsx_draw_engine_set_backend(&g_stub_backend);
+    rsx_draw_engine_set_backend(be);
     if (rsx_draw_engine_init(1280, 720) != 0) {
         printf("[FAIL] engine init\n");
         exit(1);
@@ -418,6 +418,8 @@ static void engine_up(void)
     m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
     m(M_VTXBUF_OFFSET, 0x80000000u | VTX_OFFSET);
 }
+
+static void engine_up(void) { engine_up_with(&g_stub_backend); }
 
 static void engine_down(void)
 {
@@ -1593,6 +1595,157 @@ static void test_immediate_packed_zero_and_inline(void)
     engine_down();
 }
 
+/* ---- clears limited to the clip and the scissor ---------------------------- */
+
+/* What the rectangle hooks were asked for. */
+static struct {
+    int n_color, n_depth;
+    u32 color_surface, depth;
+    u32 color_rect[4], depth_rect[4];
+    u32 depth_flags;
+} g_rect;
+
+static void stub_clear_color_rect(void* u, u32 s, const float rgba[4],
+                                  u32 x, u32 y, u32 w, u32 h)
+{
+    (void)u; (void)rgba;
+    g_rect.n_color++;
+    g_rect.color_surface = s;
+    g_rect.color_rect[0] = x; g_rect.color_rect[1] = y;
+    g_rect.color_rect[2] = w; g_rect.color_rect[3] = h;
+}
+
+static void stub_clear_ds_rect(void* u, u32 d, u32 f, float z, u8 st,
+                               u32 x, u32 y, u32 w, u32 h)
+{
+    (void)u; (void)z; (void)st;
+    g_rect.n_depth++;
+    g_rect.depth = d;
+    g_rect.depth_flags = f;
+    g_rect.depth_rect[0] = x; g_rect.depth_rect[1] = y;
+    g_rect.depth_rect[2] = w; g_rect.depth_rect[3] = h;
+}
+
+#define RECT_IS(r, x, y, w, h) ((r)[0] == (x) && (r)[1] == (y) && (r)[2] == (w) && (r)[3] == (h))
+
+/* RSX clears what the surface clip and the scissor let through, nothing
+ * else. Resistance's co-op split screen renders both players' views into one
+ * 2x1 antialiased 1280x720 scene target (2560x720 samples): scissor 0,0
+ * 640x720, clear, player 1's view; scissor 640,0 640x720, clear, player 2's.
+ * Cleared whole, the second clear wiped player 1's view and the left half of
+ * the screen was black under the HUD. */
+static void test_clear_rect(void)
+{
+    printf("-- clears limited to the clip and the scissor\n");
+    static rsx_draw_backend be;
+    be = g_stub_backend;
+    be.clear_color_rect = stub_clear_color_rect;
+    be.clear_depth_stencil_rect = stub_clear_ds_rect;
+
+    /* The scissor on the right half of a 256x256 surface: a split-screen
+     * view's clear leaves the other view alone. */
+    engine_up_with(&be);
+    memset(&g_rect, 0, sizeof g_rect);
+    m(M_SCISSOR_H, (128u << 16) | 128u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 0 &&
+          RECT_IS(g_rect.color_rect, 128u, 0u, 128u, 256u) &&
+          g_rect.color_surface == stub.last_created_color,
+          "a colour clear under a right-half scissor clears 128,0 128x256 only"
+          " (%d rect, %d whole; %u,%u %ux%u)", g_rect.n_color, stub.n_clear_color,
+          g_rect.color_rect[0], g_rect.color_rect[1], g_rect.color_rect[2],
+          g_rect.color_rect[3]);
+
+    /* A scissor covering the surface, or none, is a whole clear the backend
+     * can fold into the next pass. */
+    m(M_SCISSOR_H, 4096u << 16);
+    m(M_SCISSOR_V, 4096u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a scissor covering the surface clears it whole (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
+
+    /* A scissor entirely outside the surface clears nothing. */
+    m(M_SCISSOR_H, (64u << 16) | 300u);
+    m(M_SCISSOR_V, 64u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a scissor outside the surface clears nothing (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
+    engine_down();
+
+    /* The co-op frame: player 1's view under a left-half scissor, then
+     * player 2's clear under a right-half one, in the 2x1 antialiased scene. */
+    engine_up_with(&be);
+    memset(&g_rect, 0, sizeof g_rect);
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5) | (3u << 12));   /* A8R8G8B8, Z24S8, 2x1 */
+    m(M_SURFACE_CLIP_H, 1280u << 16);
+    m(M_SURFACE_CLIP_V, 720u << 16);
+    m(M_COLOR_A_OFFSET, 0x200000u);
+    m(M_SCISSOR_H, 640u << 16);
+    m(M_SCISSOR_V, 720u << 16);
+    m(M_CLEAR_BUFFERS, 0xF3u);
+    draw_triangle();
+    const u32 scene_color = stub.bound_surface, scene_depth = stub.bound_depth;
+    m(M_SCISSOR_H, (640u << 16) | 640u);
+    const int color_whole = stub.n_clear_color, depth_whole = stub.n_clear_ds;
+    m(M_CLEAR_BUFFERS, 0xF3u);
+    CHECK(stub.n_clear_color == color_whole && stub.n_clear_ds == depth_whole &&
+          g_rect.color_surface == scene_color && g_rect.depth == scene_depth &&
+          RECT_IS(g_rect.color_rect, 1280u, 0u, 1280u, 720u) &&
+          RECT_IS(g_rect.depth_rect, 1280u, 0u, 1280u, 720u),
+          "player 2's clear under scissor 640,0 640x720 leaves player 1's half:"
+          " colour %u,%u %ux%u, depth %u,%u %ux%u samples (%d/%d whole)",
+          g_rect.color_rect[0], g_rect.color_rect[1], g_rect.color_rect[2],
+          g_rect.color_rect[3], g_rect.depth_rect[0], g_rect.depth_rect[1],
+          g_rect.depth_rect[2], g_rect.depth_rect[3],
+          stub.n_clear_color - color_whole, stub.n_clear_ds - depth_whole);
+
+    /* The composite then binds the same zeta from a 1280x720 target that is
+     * not antialiased and clears it at that clip. Only the clip limits it,
+     * not the scissor, so it stays a whole clear: made partial, it cost every
+     * frame a pass of its own (the campaign fell from ~30 fps to ~1). */
+    m(M_SCISSOR_H, 1280u << 16);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));                /* the composite: 1x */
+    m(M_COLOR_A_OFFSET, 0x600000u);
+    const int whole_before = stub.n_clear_ds, zrects_before = g_rect.n_depth;
+    m(M_CLEAR_BUFFERS, 0x03u);                          /* depth and stencil */
+    CHECK(scene_depth != 0 && g_rect.n_depth == zrects_before &&
+          stub.n_clear_ds == whole_before + 1,
+          "the 1x 1280x720 composite's depth clear of the 2560x720 scene zeta"
+          " stays whole (%d rect, %d whole)", g_rect.n_depth - zrects_before,
+          stub.n_clear_ds - whole_before);
+
+    /* A zeta only ever bound at a small clip -- a shadow map in a target
+     * the canvas' size -- is still cleared whole: nothing past its clip was
+     * ever drawn, and a whole clear stays a load action. */
+    m(M_ZETA_OFFSET, ZETA_OFFSET + 0x400000u);
+    m(M_SURFACE_CLIP_H, 256u << 16);
+    m(M_SURFACE_CLIP_V, 256u << 16);
+    m(M_COLOR_A_OFFSET, 0x700000u);
+    m(M_SCISSOR_H, 256u << 16);
+    m(M_SCISSOR_V, 256u << 16);
+    const int rects_before = g_rect.n_depth, wholes_before = stub.n_clear_ds;
+    m(M_CLEAR_BUFFERS, 0x03u);
+    CHECK(g_rect.n_depth == rects_before && stub.n_clear_ds == wholes_before + 1,
+          "a zeta only bound at its 256x256 clip is cleared whole (%d rect, %d whole)",
+          g_rect.n_depth - rects_before, stub.n_clear_ds - wholes_before);
+    engine_down();
+
+    /* A backend without the rectangle hooks keeps the whole-target clear. */
+    engine_up();
+    m(M_SCISSOR_H, (128u << 16) | 128u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_clear_color == 1,
+          "without clear_color_rect a scissored clear falls back to a whole one (%d)",
+          stub.n_clear_color);
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1627,6 +1780,7 @@ int main(void)
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
+    test_clear_rect();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

@@ -244,6 +244,20 @@ typedef struct rsx_draw_backend {
                               u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
     void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
                               u32 w, u32 h, const void* src, u32 row_bytes);
+
+    /* Optional, both or neither: clear_color and clear_depth_stencil limited
+     * to the rectangle (x, y, w, h) of the target, in the engine's pixels
+     * (the sample grid of an antialiased surface), w and h never 0. RSX
+     * clears only what the scissor and the surface clip let through: a
+     * split-screen title renders the left view, then clears and renders the
+     * right one in the same target with the scissor on that half. The engine
+     * calls these only for a clear whose scissor leaves part of the clip
+     * alone; left NULL, such a clear covers the whole target, as before. */
+    void (*clear_color_rect)(void* user, u32 surface, const float rgba[4],
+                             u32 x, u32 y, u32 w, u32 h);
+    void (*clear_depth_stencil_rect)(void* user, u32 depth, u32 flags,
+                                     float depth_value, u8 stencil,
+                                     u32 x, u32 y, u32 w, u32 h);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

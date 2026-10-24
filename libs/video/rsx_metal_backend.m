@@ -2290,6 +2290,13 @@ static MTLPixelFormat             s_eng_blit_pso_fmt;
 static id<MTLRenderPipelineState> s_eng_depth_pso;
 static id<MTLSamplerState>        s_eng_point_sampler;
 static id<MTLSamplerState>        s_eng_linear_sampler;   /* FXAA's taps */
+/* Rectangle clears (eng_encode_clear_rect): a colour pipeline per target
+ * format, one depth/stencil pipeline per zeta format, and a depth/stencil
+ * state per RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL combination. */
+#define ENG_CLEAR_PSOS 8
+static struct { MTLPixelFormat fmt; id<MTLRenderPipelineState> pso; } s_eng_clear_pso[ENG_CLEAR_PSOS];
+static u32 s_eng_clear_pso_count;
+static id<MTLDepthStencilState>   s_eng_clear_ds[4];
 
 /* Post-processing in the present, read once; unset, the present is the plain
  * sample (and gamma) it always was.
@@ -2335,6 +2342,15 @@ static NSString* const kEngHelperMSL = @
 "    BOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
 "    o.uv = float2(p.x, 1.0 - p.y);\n"
 "    return o;\n"
+"}\n"
+/* A clear limited to a rectangle (eng_encode_clear_rect): a full-target
+ * triangle under a scissor writing the clear colour, or the clear depth. */
+"fragment float4 eng_clear_fs(BOut i [[stage_in]], constant float4& c [[buffer(0)]]) {\n"
+"    return c;\n"
+"}\n"
+"struct ClearZ { float z [[depth(any)]]; };\n"
+"fragment ClearZ eng_clear_depth_fs(BOut i [[stage_in]], constant float& z [[buffer(0)]]) {\n"
+"    ClearZ o; o.z = z; return o;\n"
 "}\n"
 "fragment float4 eng_blit_fs(BOut i [[stage_in]],\n"
 "                            texture2d<float> src [[texture(0)]],\n"
@@ -2614,6 +2630,9 @@ static void eng_shutdown(void* user)
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
+    for (u32 k = 0; k < s_eng_clear_pso_count; k++) s_eng_clear_pso[k].pso = nil;
+    s_eng_clear_pso_count = 0;
+    for (u32 k = 0; k < 4; k++) s_eng_clear_ds[k] = nil;
     s_eng_point_sampler = nil;
     s_eng_linear_sampler = nil;
     s_eng_fxaa_pso = nil;
@@ -3197,6 +3216,36 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     r->clear_stencil = stencil;
 }
 
+/* The same clears limited to a rectangle, carried in the record's scissor:
+ * sc[2] != 0 marks a record eng_encode_records must not fold into a pass's
+ * load action, which would clear the whole attachment. */
+static void eng_clear_rect_into(EngRecord* r, u32 x, u32 y, u32 w, u32 h)
+{
+    r->sc[0] = x; r->sc[1] = y;
+    r->sc[2] = w; r->sc[3] = h;
+}
+
+static void eng_clear_color_rect(void* user, u32 surface, const float rgba[4],
+                                 u32 x, u32 y, u32 w, u32 h)
+{
+    if (!w || !h) return;
+    const u32 before = s_eng_rec_count;
+    eng_clear_color(user, surface, rgba);
+    if (s_eng_rec_count != before)
+        eng_clear_rect_into(&s_eng_rec[s_eng_rec_count - 1], x, y, w, h);
+}
+
+static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
+                                         float depth_value, u8 stencil,
+                                         u32 x, u32 y, u32 w, u32 h)
+{
+    if (!w || !h) return;
+    const u32 before = s_eng_rec_count;
+    eng_clear_depth_stencil(user, depth, flags, depth_value, stencil);
+    if (s_eng_rec_count != before)
+        eng_clear_rect_into(&s_eng_rec[s_eng_rec_count - 1], x, y, w, h);
+}
+
 /* ---- replay -------------------------------------------------------------- */
 
 static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
@@ -3291,6 +3340,113 @@ static int eng_encode_clear(id<MTLCommandBuffer> cb, const EngRecord* r)
     return 1;
 }
 
+/* The pipeline a rectangle clear of a `fmt` attachment draws with: colour, or
+ * depth and stencil for the zeta format. nil when it cannot be built. */
+static id<MTLRenderPipelineState> eng_clear_pipeline(MTLPixelFormat fmt, int depth)
+{
+    for (u32 k = 0; k < s_eng_clear_pso_count; k++)
+        if (s_eng_clear_pso[k].fmt == fmt) return s_eng_clear_pso[k].pso;
+    if (!s_eng_helper_lib || s_eng_clear_pso_count >= ENG_CLEAR_PSOS) return nil;
+    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+    if (depth) {
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_clear_depth_fs"];
+        pd.depthAttachmentPixelFormat = fmt;
+        if (fmt == MTLPixelFormatDepth32Float_Stencil8)   /* MTL_DEPTH_FORMAT */
+            pd.stencilAttachmentPixelFormat = fmt;
+    } else {
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_clear_fs"];
+        pd.colorAttachments[0].pixelFormat = fmt;
+    }
+    NSError* err = nil;
+    id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!pso) {
+        fprintf(stderr, "[rsx engine/metal] rectangle clear pipeline failed: %s\n",
+                [[err localizedDescription] UTF8String]);
+        return nil;
+    }
+    s_eng_clear_pso[s_eng_clear_pso_count].fmt = fmt;
+    s_eng_clear_pso[s_eng_clear_pso_count].pso = pso;
+    s_eng_clear_pso_count++;
+    return pso;
+}
+
+/* A clear limited to the record's rectangle (sc): the attachment is loaded,
+ * and a full-target triangle under that scissor writes the clear colour, or
+ * the depth and stencil values with the test always passing. What lies
+ * outside the rectangle is kept -- the half of a split-screen target the
+ * other player's view was already drawn into. */
+static int eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
+{
+    const int depth = r->kind == ENG_REC_CLEAR_DS;
+    id<MTLTexture> t = eng_obj(depth ? r->depth : r->rt[0]);
+    if (!t) return 0;
+    const NSUInteger tw = [t width], th = [t height];
+    if (r->sc[0] >= tw || r->sc[1] >= th) return 1;      /* nothing inside */
+    MTLScissorRect sc = { r->sc[0], r->sc[1], r->sc[2], r->sc[3] };
+    if (sc.x + sc.width > tw)  sc.width  = tw - sc.x;
+    if (sc.y + sc.height > th) sc.height = th - sc.y;
+    id<MTLRenderPipelineState> pso = eng_clear_pipeline([t pixelFormat], depth);
+    if (!pso) return 0;
+
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLDepthStencilState> ds = nil;
+    const int has_stencil = [t pixelFormat] == MTLPixelFormatDepth32Float_Stencil8;
+    if (depth) {
+        rp.depthAttachment.texture     = t;
+        rp.depthAttachment.loadAction  = MTLLoadActionLoad;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        if (has_stencil) {
+            rp.stencilAttachment.texture     = t;
+            rp.stencilAttachment.loadAction  = MTLLoadActionLoad;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+        const u32 k = r->clear_flags & (RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL);
+        if (!s_eng_clear_ds[k]) {
+            MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+            dd.depthCompareFunction = MTLCompareFunctionAlways;
+            dd.depthWriteEnabled = (k & RSX_BE_CLEAR_DEPTH) != 0;
+            MTLStencilDescriptor* st = [MTLStencilDescriptor new];
+            st.stencilCompareFunction    = MTLCompareFunctionAlways;
+            st.stencilFailureOperation   = MTLStencilOperationKeep;
+            st.depthFailureOperation     = MTLStencilOperationReplace;
+            st.depthStencilPassOperation = MTLStencilOperationReplace;
+            st.readMask  = 0xFF;
+            st.writeMask = (k & RSX_BE_CLEAR_STENCIL) ? 0xFF : 0x00;
+            dd.frontFaceStencil = st;
+            dd.backFaceStencil  = st;
+            s_eng_clear_ds[k] = [s_dev newDepthStencilStateWithDescriptor:dd];
+        }
+        ds = s_eng_clear_ds[k];
+        if (!ds) return 0;
+    } else {
+        rp.colorAttachments[0].texture     = t;
+        rp.colorAttachments[0].loadAction  = MTLLoadActionLoad;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!enc) return 0;
+    [enc setRenderPipelineState:pso];
+    [enc setScissorRect:sc];
+    if (depth) {
+        const float z = r->clear_depth;
+        [enc setDepthStencilState:ds];
+        [enc setStencilReferenceValue:r->clear_stencil];
+        [enc setFragmentBytes:&z length:sizeof z atIndex:0];
+    } else {
+        [enc setFragmentBytes:r->clear_rgba length:sizeof r->clear_rgba atIndex:0];
+    }
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    return 1;
+}
+
+/* A clear record that covers only part of its target. */
+static int eng_record_is_rect_clear(const EngRecord* r)
+{
+    return (r->kind == ENG_REC_CLEAR_COLOR || r->kind == ENG_REC_CLEAR_DS) && r->sc[2];
+}
+
 /* One pass per contiguous run of draws against the same attachments, with any
  * clears immediately ahead of it folded into its load actions. A clear whose
  * targets the following draw does not share becomes a pass of its own, which
@@ -3340,6 +3496,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             continue;
         }
 
+        /* A clear of part of a target is a pass of its own: a load action
+         * clears the whole attachment. */
+        if (eng_record_is_rect_clear(&s_eng_rec[i])) {
+            if (!eng_encode_clear_rect(cb, &s_eng_rec[i])) s_eng_encoding_failed = 1;
+            else s_ft_passes++;
+            i++;
+            continue;
+        }
+
         /* The clears queued ahead of this pass. A colour clear names one
          * surface and an MRT set arrives as one clear per target, so they are
          * collected rather than compared: they become load actions on the
@@ -3354,7 +3519,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         u8 cstencil = 0;
         while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
                s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE &&
-               s_eng_rec[i].kind != ENG_REC_COLOR_SNAPSHOT) {
+               s_eng_rec[i].kind != ENG_REC_COLOR_SNAPSHOT &&
+               !eng_record_is_rect_clear(&s_eng_rec[i])) {
             const EngRecord* r = &s_eng_rec[i];
             if (r->kind == ENG_REC_CLEAR_COLOR) {
                 u32 k = 0;
@@ -3824,6 +3990,8 @@ static const rsx_draw_backend s_engine_backend = {
     .draw                 = eng_draw,
     .clear_color          = eng_clear_color,
     .clear_depth_stencil  = eng_clear_depth_stencil,
+    .clear_color_rect     = eng_clear_color_rect,
+    .clear_depth_stencil_rect = eng_clear_depth_stencil_rect,
     .present              = eng_present,
     .readback             = eng_readback,
 };
