@@ -314,6 +314,10 @@ jobs:
           # 32 dwords and the registers after it are not constants.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
           /tmp/test_rsx_transform_constants
+          # Vertex-program microcode and constant runs taken in one call leave the
+          # state exactly as the same words do one by one.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_vp_run libs/video/tests/test_rsx_vp_run.c libs/video/rsx_commands.c
+          /tmp/test_rsx_vp_run
           # Texture offsets are 31 bits; bit 31 is not an address bit.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
           /tmp/test_rsx_texture_offset

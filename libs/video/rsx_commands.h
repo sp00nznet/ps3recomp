@@ -393,6 +393,12 @@ void rsx_state_init(rsx_state* state);
  * Returns 0 on success, -1 if method is unrecognized. */
 int rsx_process_method(rsx_state* state, u32 method, u32 data);
 
+/* An incrementing run of data words read big-endian from `src`, for methods
+ * `method`, `method` + 4, ... Handles vertex-program microcode and constant
+ * runs in one call and returns 1; returns 0, doing nothing, for anything else
+ * (the caller then hands the words to rsx_process_method one by one). */
+int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count);
+
 /* Process a command buffer segment.
  * buf:  pointer to command buffer data (host memory)
  * size: size in bytes

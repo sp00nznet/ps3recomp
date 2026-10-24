@@ -40,6 +40,10 @@ void rsx_state_init(rsx_state* state) { (void)state; }
 /* Records where the control register's get stood when each probe method ran. */
 #define PROBE_METHOD 0x1EE0u
 static u32 seen_get[8], seen_n;
+/* No microcode or constant runs here: the walker hands every word to
+ * rsx_process_method instead. */
+int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{ (void)state; (void)method; (void)src; (void)count; return 0; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     (void)state;
