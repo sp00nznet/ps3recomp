@@ -123,7 +123,10 @@ int main(int argc, char** argv)
             check("VP MSL", g_msl, "[[attribute(0)]]");
             check("VP MSL", g_msl, "[[attribute(3)]]");
             check("VP MSL", g_msl, "[[buffer(0)]]");      /* VPConst */
-            check("VP MSL", g_msl, "[[position]]");
+            /* Invariant, so two programs computing the same position the
+             * same way agree to the bit (depth-EQUAL multipass); see
+             * rsx_shader_msl.cpp. PS3RECOMP_MSL_INVARIANT=0 drops it. */
+            check("VP MSL", g_msl, getenv("PS3RECOMP_MSL_INVARIANT") ? "[[position" : "[[position, invariant]]");
             check("VP MSL", g_msl, "[[user(locn0)]]");    /* COLOR0 */
             check("VP MSL", g_msl, "[[user(locn10)]]");   /* TEXCOORD7 */
         }

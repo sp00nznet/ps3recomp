@@ -761,6 +761,10 @@ static void dump_shader(const char* name, const char* text)
 static MTLCompileOptions* guest_compile_options(void)
 {
     MTLCompileOptions* o = [MTLCompileOptions new];
+    /* Honour the [[invariant]] the translator puts on a vertex program's
+     * position (rsx_shader_msl.cpp): depth-EQUAL multipass needs every
+     * program to compute it identically. */
+    if (@available(macOS 11.0, *)) o.preserveInvariance = YES;
     /* IEEE comparisons. The decompilers flush a NaN result to zero with
      * `x == x`, and the alpha test compares with isunordered; Metal's default
      * fast math is free to fold both away. */
