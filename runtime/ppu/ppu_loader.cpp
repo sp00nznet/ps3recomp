@@ -620,6 +620,8 @@ static void samp_report(void)
  * guest histogram says nothing about where it loops. */
 static DWORD s_samp_boot_tid;
 static int   s_samp_main = -1;
+static int   s_samp_drain = -1;
+extern "C" volatile unsigned long g_gcm_drain_tid;
 
 static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
 {
@@ -632,6 +634,41 @@ static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
         if (g) return g;
     }
     return 0;
+}
+
+/* PS3_SAMPLE_RVAS=<file>: every sample's address as an RVA of the executable,
+ * one hex word per line, appended at each report. 0 marks a sample outside the
+ * executable (a wait in ntdll, a DLL). The extent map above credits any host
+ * code that sits between two lifted functions to the first of them; naming
+ * these RVAs from the linker map (scripts/gow1hd.py symbolize does the
+ * parsing) attributes guest and runtime code exactly. */
+static FILE*     s_samp_rva_file;
+static uint32_t* s_samp_rvas;
+static uint32_t  s_samp_rva_n, s_samp_rva_cap;
+static void samp_rva_record(uintptr_t rip)
+{
+    if (!s_samp_rva_file) return;
+    static uintptr_t base, end;
+    if (!base) {
+        base = (uintptr_t)GetModuleHandleA(NULL);
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+        end = base + nt->OptionalHeader.SizeOfImage;
+    }
+    if (s_samp_rva_n == s_samp_rva_cap) {
+        uint32_t cap = s_samp_rva_cap ? s_samp_rva_cap * 2 : 65536;
+        uint32_t* n = (uint32_t*)realloc(s_samp_rvas, cap * sizeof *n);
+        if (!n) return;
+        s_samp_rvas = n; s_samp_rva_cap = cap;
+    }
+    s_samp_rvas[s_samp_rva_n++] = (rip >= base && rip < end) ? (uint32_t)(rip - base) : 0u;
+}
+static void samp_rva_flush(void)
+{
+    if (!s_samp_rva_file) return;
+    fprintf(s_samp_rva_file, "# %llu ms\n", (unsigned long long)GetTickCount64());  /* block end */
+    for (uint32_t i = 0; i < s_samp_rva_n; i++) fprintf(s_samp_rva_file, "%x\n", s_samp_rvas[i]);
+    fflush(s_samp_rva_file);
+    s_samp_rva_n = 0;
 }
 
 static DWORD WINAPI samp_thread(LPVOID p)
@@ -647,13 +684,58 @@ static DWORD WINAPI samp_thread(LPVOID p)
     unsigned ei = 0;
     unsigned long long next_report = t0 + early[0];
     samp_build_map();
+    if (const char* f = getenv("PS3_SAMPLE_RVAS")) s_samp_rva_file = fopen(f, "w");
+    /* PS3_SAMPLE_MAIN and PS3_SAMPLE_DRAIN sample one thread: open it once
+     * rather than walk a snapshot of every thread in the process each period,
+     * which held the rate to about 17 samples a second. The drain's thread is
+     * known once it has walked the FIFO, and reopened if that changes. */
+    HANDLE main_h = (s_samp_main > 0)
+        ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, s_samp_boot_tid) : NULL;
+    DWORD one_tid = s_samp_main > 0 ? s_samp_boot_tid : 0;
     for (;;) {
+        if (s_samp_drain > 0 && g_gcm_drain_tid && g_gcm_drain_tid != one_tid) {
+            if (main_h) CloseHandle(main_h);
+            one_tid = (DWORD)g_gcm_drain_tid;
+            main_h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, one_tid);
+        }
+        if (main_h) {
+            if (SuspendThread(main_h) != (DWORD)-1) {
+                CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(main_h, &c)) {
+                    s_samp_total++;
+                    samp_rva_record((uintptr_t)c.Rip);
+                    uint32_t g = samp_lookup((uintptr_t)c.Rip);
+                    if (!g && s_samp_main > 0) g = samp_stack_guest(main_h, &c);
+                    if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(one_tid);
+                             samp_tid2(one_tid, 1, 0); }
+                    else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                           if (!nt) samp_rva_hit((uintptr_t)c.Rip);
+                           samp_tid2(one_tid, 0, nt); }
+                }
+                ResumeThread(main_h);
+            }
+            Sleep(period);
+            if (GetTickCount64() >= next_report) {
+                fprintf(stderr, "[samp] --- report at t=%llums ---\n",
+                        (unsigned long long)(GetTickCount64() - t0));
+                samp_report();
+                samp_rva_flush();
+                if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
+                else next_report = GetTickCount64() + 10000;
+            }
+            continue;
+        }
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
             THREADENTRY32 te; te.dwSize = sizeof te;
             if (Thread32First(snap, &te)) do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
                 if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
+                /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
+                 * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
+                 * histogram is the drain's own cost, not the spin loops of
+                 * every SPU thread. */
+                if (s_samp_drain > 0 && te.th32ThreadID != g_gcm_drain_tid) continue;
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                       FALSE, te.th32ThreadID);
                 if (!h) continue;
@@ -661,6 +743,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
                     if (GetThreadContext(h, &c)) {
                         s_samp_total++;
+                        samp_rva_record((uintptr_t)c.Rip);
                         uint32_t g = samp_lookup((uintptr_t)c.Rip);
                         if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
@@ -680,6 +763,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
             fprintf(stderr, "[samp] --- report at t=%llums ---\n",
                     (unsigned long long)(GetTickCount64() - t0));
             samp_report();
+            samp_rva_flush();
             if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
             else next_report = GetTickCount64() + 10000;
         }
@@ -737,6 +821,7 @@ void ps3_sampler_start(void)
     unsigned ms = (unsigned)atoi(e); if (!ms) ms = 5;
     s_samp_boot_tid = GetCurrentThreadId();
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
+    s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */
