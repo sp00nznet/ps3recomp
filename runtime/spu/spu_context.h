@@ -482,6 +482,15 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #define SPU_LS_FAST 1
 #endif
 
+/* SPU_LS_PROBES=0 compiles the diagnostic probes below and the SPU_LS_WATCH
+ * check out of every LS access in the translation unit (a build option for
+ * the lifted SPU sources). Each one costs a load and a branch per access, and
+ * the watch globals are reloaded after every store, since a byte store may
+ * alias them. Default 1: the env-driven diagnostics stay available. */
+#ifndef SPU_LS_PROBES
+#define SPU_LS_PROBES 1
+#endif
+
 /* Debug probes of spu_ls_read128, out of line: inlined they kept every LS
  * load a real call (~10% of GH3's FMOD mixer task). g_spu_ls_probe is -1
  * until the first call reads SPU_LS_LOWREAD, then 0/1. */
@@ -499,6 +508,7 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
+#if SPU_LS_PROBES
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
@@ -536,16 +546,21 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
         }
     }
 }
+#endif
 
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+#if SPU_LS_PROBES
     if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
         spu_ls_read_probe(ctx, lsa);
+#endif
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
+#if SPU_LS_PROBES
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+#endif
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -563,6 +578,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
+#if SPU_LS_PROBES
 static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
 {
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
@@ -615,6 +631,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
                       p[0], p[1], p[2], p[3]);
       } }
 }
+#endif
 
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
@@ -626,8 +643,10 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * why it resolves to an empty buffer: the resolved address, the whole
      * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
      * command (commandNum==5) names the code buffer set. */
+#if SPU_LS_PROBES
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
         spu_ls_write_probe_pre(ctx, lsa, val);
+#endif
 #if SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
@@ -642,10 +661,12 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
+#if SPU_LS_PROBES
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     if (__builtin_expect(g_spu_smc_watch != 0, 0))
         spu_ls_write_probe_smc(ctx, lsa, p);
+#endif
 }
 
 /* ---------------------------------------------------------------------------

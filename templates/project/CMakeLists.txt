@@ -189,6 +189,9 @@ add_executable(${PROJECT_NAME}
 #   -O2                 -- the target-wide -O1 exists for the huge PPU TUs; the
 #                          SPU sources are small and decode-hot, so they get
 #                          full optimization. The last -O on the line wins.
+# Not set here: SPU_LS_PROBES=0 compiles the LS diagnostics (SPU_LS_WATCH,
+# SPU_SMC_WATCH, SPU_LS_LOWREAD) out of every LS load and store in these TUs.
+# Add it to COMPILE_DEFINITIONS once a title no longer needs them.
 if(SPU_SOURCES)
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"

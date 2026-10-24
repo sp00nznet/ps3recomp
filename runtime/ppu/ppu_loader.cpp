@@ -596,7 +596,12 @@ static void samp_report(void)
                 s_t2_id[k], (unsigned long long)s_t2_guest[k],
                 (unsigned long long)s_t2_ntdll[k], (unsigned long long)s_t2_other[k]);
     }
-    for (int rank = 0; rank < 25; rank++) {
+    /* PS3_SAMPLE_RANKS=<n>: RVA buckets printed per report (default 25).
+     * Lifted code spreads over thousands of 16-byte buckets, and the default
+     * leaves most of its samples out of the report. */
+    static int s_ranks = -1;
+    if (s_ranks < 0) { const char* e = getenv("PS3_SAMPLE_RANKS"); s_ranks = e ? atoi(e) : 25; }
+    for (int rank = 0; rank < s_ranks; rank++) {
         uint64_t best = 0; int bi = -1;
         for (int k = 0; k < SAMP_RVAS; k++)
             if (s_rva_ct[k] > best) { best = s_rva_ct[k]; bi = k; }
@@ -647,16 +652,37 @@ static DWORD WINAPI samp_thread(LPVOID p)
     unsigned ei = 0;
     unsigned long long next_report = t0 + early[0];
     samp_build_map();
+    /* The thread list is a system-wide snapshot, which took most of a round
+     * (one round per ~430 ms with ~45 threads, against a 2 ms period). Keep
+     * the handles and refresh the list every 2 s instead. */
+    enum { SAMP_MAXT = 256 };
+    static HANDLE s_th[SAMP_MAXT];
+    static DWORD s_th_id[SAMP_MAXT];
+    unsigned n_th = 0;
+    unsigned long long next_list = 0;
     for (;;) {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap != INVALID_HANDLE_VALUE) {
-            THREADENTRY32 te; te.dwSize = sizeof te;
-            if (Thread32First(snap, &te)) do {
-                if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-                if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
-                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
-                                      FALSE, te.th32ThreadID);
-                if (!h) continue;
+        if (GetTickCount64() >= next_list) {
+            for (unsigned i = 0; i < n_th; i++) CloseHandle(s_th[i]);
+            n_th = 0;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te; te.dwSize = sizeof te;
+                if (Thread32First(snap, &te)) do {
+                    if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+                    if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
+                    if (n_th >= SAMP_MAXT) break;
+                    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                          FALSE, te.th32ThreadID);
+                    if (h) { s_th[n_th] = h; s_th_id[n_th] = te.th32ThreadID; n_th++; }
+                } while (Thread32Next(snap, &te));
+                CloseHandle(snap);
+            }
+            next_list = GetTickCount64() + 2000;
+        }
+        {
+            for (unsigned ti = 0; ti < n_th; ti++) {
+                HANDLE h = s_th[ti];
+                THREADENTRY32 te; te.th32ThreadID = s_th_id[ti];
                 if (SuspendThread(h) != (DWORD)-1) {
                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
                     if (GetThreadContext(h, &c)) {
@@ -671,9 +697,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     }
                     ResumeThread(h);
                 }
-                CloseHandle(h);
-            } while (Thread32Next(snap, &te));
-            CloseHandle(snap);
+            }
         }
         Sleep(period);
         if (GetTickCount64() >= next_report) {
