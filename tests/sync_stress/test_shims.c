@@ -6,6 +6,7 @@
 #include "../../runtime/platform/win32_compat.h"   /* QueryPerformanceCounter on every host */
 
 #include <stdint.h>
+#include "../spu_ls_watch_fixture.h"
 
 extern uint8_t* vm_base;
 

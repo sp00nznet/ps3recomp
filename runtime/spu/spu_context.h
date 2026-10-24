@@ -39,10 +39,11 @@ extern "C" {
  * Fires from every SPU image's spu_ls_read128/write128. Cheap: one cached
  * compare on the hot path when disabled.
  * -----------------------------------------------------------------------*/
-/* The check sits on every spu_ls_read128/write128, so the disabled case must
- * be one load and a branch: it was a real call (the function-local statics
- * kept it out of line) and ~9% of GH3's FMOD mixer task. The list lives in
- * spu_channels.c; g_spu_ls_watch_n is -1 until the first check reads the env. */
+/* spu_ls_read128/write128 reach the check only through their per-direction
+ * diagnostics gate (g_spu_ls_rdiag/wdiag, which counts an armed watch), so the
+ * disabled case costs them nothing here; other callers pay one load and a
+ * branch. The list lives in spu_channels.c; g_spu_ls_watch_n is -1 until the
+ * first check reads the env. */
 extern int g_spu_ls_watch_n;
 void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr);
 unsigned* spu_ls_watch_list(int* out_n);   /* the armed lines (n may be 0) */
@@ -481,10 +482,23 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #define SPU_BSWAP32(x) __builtin_bswap32(x)
 #define SPU_LS_FAST 1
 #endif
+#if defined(__ARM_NEON)
+#include <arm_neon.h>     /* the quadword swap is one rev32 */
+#endif
 
-/* Debug probes of spu_ls_read128, out of line: inlined they kept every LS
- * load a real call (~10% of GH3's FMOD mixer task). g_spu_ls_probe is -1
- * until the first call reads SPU_LS_LOWREAD, then 0/1. */
+/* Debug probes of spu_ls_read128/write128, out of line: inlined they kept
+ * every LS load a real call (~10% of GH3's FMOD mixer task).
+ *
+ * The hot path tests ONE gate per direction, g_spu_ls_rdiag / g_spu_ls_wdiag:
+ * -1 until the first access goes out of line and settles it, then nonzero only
+ * while a read (write) diagnostic is armed -- SPU_LS_LOWREAD, SPU_LS_WATCH,
+ * SPU_SMC_WATCH, SPU_WWS_PROBE. Every test on that path is reloaded at every
+ * access: lifted code stores each result into ctx->gpr[], a u128 union, and
+ * clang gives union accesses char ("may alias anything") TBAA, so the gate
+ * words and ctx->image_id/policy_mode/ls cannot be kept in registers across
+ * them. Three gates (probe word, image_id==2 && policy_mode, watch count) were
+ * 4 loads and 3 branches per lqd in a retail title's hottest job; one is a
+ * load and a branch. */
 
 /* The diagnostic gates the inline helpers below read. Defined here rather than
  * in spu_channels.c, as one merged definition per program (selectany / weak),
@@ -499,6 +513,14 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
+SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
+SPU_GATE int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
+SPU_GATE int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
+static inline int spu_ls_wws_probe_on(void)
+{
+    if (g_spu_wws_probe < 0) g_spu_wws_probe = getenv("SPU_WWS_PROBE") ? 1 : 0;
+    return g_spu_wws_probe;
+}
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
@@ -525,8 +547,9 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     /* WWS buffer-resolution probe: GetLogicalBuffer reads bufferSetArray at
      * 0xDF0 + (jobNum<<6) + (logBufSet<<2), so the raw address encodes both.
      * Log them (capped) to see which set each command -- especially RunJob --
-     * resolves to. Uses the RAW lsa before 16-byte alignment masking. */
-    if (ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
+     * resolves to. Uses the RAW lsa before 16-byte alignment masking.
+     * SPU_WWS_PROBE=1 (it was always on, which put a test on every lqd). */
+    if (spu_ls_wws_probe_on() && ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
         extern int g_wws_read_probe;
         if (g_wws_read_probe < 48) {
             g_wws_read_probe++;
@@ -537,16 +560,27 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
+/* The read diagnostics, then g_spu_ls_rdiag recomputed: it drops to 0 once
+ * none is armed (the first call also settles g_spu_ls_watch_n). */
+static __attribute__((noinline, cold)) void spu_ls_read_diag(const spu_context* ctx, uint32_t lsa)
+{
+    spu_ls_read_probe(ctx, lsa);
+    const uint32_t a = lsa & SPU_LS_MASK & ~0xFu;
+    spu_ls_watch_hit2(a, 0, &ctx->ls[a], (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    g_spu_ls_rdiag = g_spu_ls_probe || spu_ls_wws_probe_on() || g_spu_ls_watch_n != 0;
+}
+
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
-        spu_ls_read_probe(ctx, lsa);
+    if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
+        spu_ls_read_diag(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-    spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-#if SPU_LS_FAST
+#if defined(__ARM_NEON)
+    vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
+#elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
     memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
@@ -616,19 +650,34 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
       } }
 }
 
+/* The write diagnostics, after the store, then g_spu_ls_wdiag recomputed. */
+static __attribute__((noinline, cold)) void spu_ls_write_diag(spu_context* ctx, uint32_t lsa, u128 val)
+{
+    const uint8_t* p = &ctx->ls[lsa];
+    /* WWS code-buffer probe (SPU_WWS_PROBE=1): LBP's ChangeLoadToRunJob
+     * dispatches to LS[0x1320] (= lsaJobCodeBuffer in LBP's layout) +
+     * entryOffset. When TecRunJob writes that code-buffer LS address, dump the
+     * RunJob decision inputs so we can see why it resolves to an empty buffer:
+     * the resolved address, the whole bufferSetArray (0xDF0), and the live
+     * loadCommands (0xC00) whose RunJob command (commandNum==5) names the code
+     * buffer set. None of those is the stored line, so it can run after the
+     * store. */
+    if (spu_ls_wws_probe_on() && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
+        spu_ls_write_probe_pre(ctx, lsa, val);
+    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    if (g_spu_smc_watch != 0)                      /* -1 until the probe reads it */
+        spu_ls_write_probe_smc(ctx, lsa, p);
+    g_spu_ls_wdiag = spu_ls_wws_probe_on() || g_spu_smc_watch || g_spu_ls_watch_n != 0;
+}
+
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
-    /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
-     * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
-     * that code-buffer LS address, dump the RunJob decision inputs so we can see
-     * why it resolves to an empty buffer: the resolved address, the whole
-     * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
-     * command (commandNum==5) names the code buffer set. */
-    if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
-        spu_ls_write_probe_pre(ctx, lsa, val);
-#if SPU_LS_FAST
+#if defined(__ARM_NEON)
+    vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
+#elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
     memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
@@ -642,10 +691,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
-        spu_ls_write_probe_smc(ctx, lsa, p);
+    if (__builtin_expect(g_spu_ls_wdiag != 0, 0))
+        spu_ls_write_diag(ctx, lsa, val);
 }
 
 /* ---------------------------------------------------------------------------
