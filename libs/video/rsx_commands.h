@@ -144,6 +144,8 @@ extern "C" {
 /* shader_control bit: fragment colour exports come from r0/r2/r3/r4 (32-bit)
  * instead of h0/h4/h6/h8 (half). */
 #define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x00000040
+/* shader_control bits: the program's r1.z replaces the fragment depth. */
+#define CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT    0x0000000E
 #define NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK    0x00001FF4
 #define NV4097_SET_TRANSFORM_PROGRAM_LOAD       0x00001E9C
 /* Which INSTRUCTION the vertex program starts executing at. Separate from
@@ -191,6 +193,15 @@ extern "C" {
 #define NV4097_SET_STENCIL_OP_FAIL              0x0000033C
 #define NV4097_SET_STENCIL_OP_ZFAIL             0x00000340
 #define NV4097_SET_STENCIL_OP_ZPASS             0x00000344
+#define NV4097_SET_STENCIL_MASK                 0x0000032C  /* stencil write mask */
+#define NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE 0x00000348
+#define NV4097_SET_BACK_STENCIL_MASK            0x0000034C
+#define NV4097_SET_BACK_STENCIL_FUNC            0x00000350
+#define NV4097_SET_BACK_STENCIL_FUNC_REF        0x00000354
+#define NV4097_SET_BACK_STENCIL_FUNC_MASK       0x00000358
+#define NV4097_SET_BACK_STENCIL_OP_FAIL         0x0000035C
+#define NV4097_SET_BACK_STENCIL_OP_ZFAIL        0x00000360
+#define NV4097_SET_BACK_STENCIL_OP_ZPASS        0x00000364
 #define NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE     0x00000380
 #define NV4097_SET_DEPTH_BOUNDS_MIN             0x00000384  /* float */
 #define NV4097_SET_DEPTH_BOUNDS_MAX             0x00000388  /* float */
@@ -281,6 +292,12 @@ typedef struct rsx_state {
     int stencil_test_enable;
     u32 stencil_func, stencil_ref, stencil_mask;
     u32 stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
+    u32 stencil_write_mask;
+    /* Back faces when two-sided stencil is on (shadow volumes increment on
+     * one side and decrement on the other); front state otherwise. */
+    int two_sided_stencil;
+    u32 back_stencil_func, back_stencil_ref, back_stencil_mask, back_stencil_write_mask;
+    u32 back_stencil_op_fail, back_stencil_op_zfail, back_stencil_op_zpass;
 
     /* Culling */
     int cull_face_enable;

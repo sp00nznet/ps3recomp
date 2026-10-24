@@ -74,6 +74,10 @@ void rsx_state_init(rsx_state* state)
     state->cull_face = 1; /* BACK */
     state->front_face = 0; /* CW */
 
+    /* Colour target A, as libgcm sets up. With 0 (NONE) a title that never
+     * writes the register would look like it draws depth only. */
+    state->color_target = 1;
+
     /* Default color mask: all channels writable (A|R|G|B) */
     state->color_mask = 0x01010101;
 
@@ -84,6 +88,13 @@ void rsx_state_init(rsx_state* state)
     state->stencil_op_fail = 0x1E00;  /* KEEP */
     state->stencil_op_zfail = 0x1E00; /* KEEP */
     state->stencil_op_zpass = 0x1E00; /* KEEP */
+    state->stencil_write_mask = 0xFF;
+    state->back_stencil_func = 0x0207;
+    state->back_stencil_mask = 0xFF;
+    state->back_stencil_write_mask = 0xFF;
+    state->back_stencil_op_fail = 0x1E00;
+    state->back_stencil_op_zfail = 0x1E00;
+    state->back_stencil_op_zpass = 0x1E00;
 
     /* Default alpha test */
     state->alpha_func = 0x0207; /* ALWAYS */
@@ -597,6 +608,27 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
     if (method == NV4097_SET_STENCIL_OP_ZPASS) {
         state->stencil_op_zpass = data;
+        state->stencil_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_STENCIL_MASK) {
+        state->stencil_write_mask = data;
+        state->stencil_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE) {
+        state->two_sided_stencil = data ? 1 : 0;
+        state->stencil_dirty = 1;
+        return 0;
+    }
+    if (method >= NV4097_SET_BACK_STENCIL_MASK && method <= NV4097_SET_BACK_STENCIL_OP_ZPASS) {
+        u32* const back[] = {
+            &state->back_stencil_write_mask, &state->back_stencil_func,
+            &state->back_stencil_ref, &state->back_stencil_mask,
+            &state->back_stencil_op_fail, &state->back_stencil_op_zfail,
+            &state->back_stencil_op_zpass,
+        };
+        *back[(method - NV4097_SET_BACK_STENCIL_MASK) / 4] = data;
         state->stencil_dirty = 1;
         return 0;
     }
