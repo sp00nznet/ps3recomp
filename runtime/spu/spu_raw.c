@@ -48,6 +48,7 @@ extern int g_spu_force_ch_block;              /* spu_channels.c */
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 /* For attributing an MMIO store to the guest code that made it. */
 #include "../ppu/ppu_context.h"
+#include "ps3emu/thread_name.h"
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern void ps3_hle_register_ctx(uint32_t nid, const char* name,
                                  void (*fn)(ppu_context*));
@@ -233,6 +234,7 @@ void spu_raw_note_image(uint32_t src_ea, uint32_t entry)
 static DWORD WINAPI raw_spu_thread(LPVOID arg)
 {
     raw_spu* s = (raw_spu*)arg;
+    ps3_thread_name("raw spu");
     spu_context* c = s->ctx;
 
     c->status = SPU_STATUS_RUNNING;

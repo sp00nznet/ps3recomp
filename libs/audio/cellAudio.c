@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -557,6 +558,7 @@ static void audio_notify_event_queues(void)
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
+    ps3_thread_name("audio mix");
     printf("[cellAudio] Mixing thread started\n");
 
     /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;

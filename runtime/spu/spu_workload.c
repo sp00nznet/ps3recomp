@@ -20,6 +20,7 @@
 #include <errno.h>
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
+#include "ps3emu/thread_name.h"
 
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
  * real video-payload GET (>256B from a non-context EA) = it actually decoded,
@@ -863,6 +864,7 @@ static void spu_async_run(spu_async_job* j)
 
 #ifdef _WIN32
 static DWORD WINAPI spu_async_thread(LPVOID p) {
+    ps3_thread_name("spu job");
     /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
      * instead of killing the process silently with 0x80000001. */

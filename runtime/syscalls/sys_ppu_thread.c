@@ -27,6 +27,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 #ifndef _WIN32
 #include <errno.h>
 #endif
@@ -108,6 +109,7 @@ static void* ppu_host_thread_proc(void* param)
 #endif
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
+    ps3_thread_name("ppu %s", info->name);
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -253,6 +255,7 @@ uint64_t ppu_thread_register_main(void)
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
+        ps3_thread_name("ppu main");      /* registered from the boot thread itself */
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else

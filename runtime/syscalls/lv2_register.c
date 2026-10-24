@@ -48,6 +48,7 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
@@ -715,6 +716,8 @@ static void* spu_exec_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+    { const spu_group_t* g = spu_find_group(t->group_id);
+      ps3_thread_name("spu %s:%u", g && g->name[0] ? g->name : "group", t->index); }
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
@@ -754,6 +757,8 @@ static void* spu_fallback_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+    { const spu_group_t* g = spu_find_group(t->group_id);
+      ps3_thread_name("spu-hle %s:%u", g && g->name[0] ? g->name : "group", t->index); }
     int32_t rc = 0;
     if (t->fb_handler) {
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);

@@ -40,6 +40,7 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #include <pthread.h>
 #include <time.h>
 #endif
+#include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
  * Internal workload tracking
@@ -1682,6 +1683,7 @@ static WklPm* spurs_resolve_pm(u32 wid)
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
+    ps3_thread_name("spurs pm");
     struct SpursInst* si = slot->instance;
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
@@ -1714,6 +1716,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
+    ps3_thread_name("spurs kernel");
     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
     AcquireSRWLockExclusive(&si->lock);
     while (!si->stopping) {
@@ -2733,6 +2736,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
+    ps3_thread_name("spurs jc %d", slot);
     /* TIMING PROBE (SPURS_JC_DELAY=ms): the real jm2 chain walker is async and
      * picks up jobs as the PPU appends them + fills their descriptors. Our walk
      * is one-shot; if it reads descriptors before the PPU populates the I/O
