@@ -15,6 +15,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
+#include "rsx_tiling.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
@@ -245,6 +246,96 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     if (!ea) return NULL;
     if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
     return vm_base + ea;
+}
+
+/* Guest memory as the engine reaches it, for the tiled range copies (rsx_tiling.h). */
+static u8* eng_tiled_ptr(void* user, u32 location, u32 offset, u32 len)
+{
+    return (u8*)eng_guest_ptr(user, location, offset, len);
+}
+
+static const rsx_tiled_mem s_eng_mem = { eng_tiled_ptr, NULL, NULL };
+
+/* Whether [offset, offset + len) touches a tile bound over main memory. */
+static int eng_tiled(u32 location, u32 offset, u32 len)
+{
+    rsx_tile t;
+    return rsx_tiling_find(location, offset, len, &t);
+}
+
+static u8* s_detiled;
+static u32 s_detiled_cap;
+
+/* Guest bytes as the RSX reads them: through the tiling where a tile bound
+ * over main memory covers them, as they lie elsewhere. The result lasts
+ * until the next call. */
+static const u8* eng_guest_linear(u32 location, u32 offset, u32 len)
+{
+    const u8* raw = eng_guest_ptr(NULL, location, offset, len);
+    if (!raw || !eng_tiled(location, offset, len)) return raw;
+    if (s_detiled_cap < len) {
+        u8* n = (u8*)realloc(s_detiled, len);
+        if (!n) return NULL;
+        s_detiled = n;
+        s_detiled_cap = len;
+    }
+    rsx_tiled_read(&s_eng_mem, location, offset, s_detiled, len);
+    return s_detiled;
+}
+
+/* Detiled copies the vertex, index and program fetches of one draw read
+ * (eng_fetch_ptr). The fetch plan keeps pointers into them for the whole
+ * draw, so a chunk never moves; all are reused from the next draw on. */
+#define ENG_ARENA_CHUNK (1u << 20)
+typedef struct eng_arena_chunk {
+    struct eng_arena_chunk* next;
+    u32 cap, used;
+    u8 data[];
+} eng_arena_chunk;
+static eng_arena_chunk* s_arena;
+
+static u8* eng_arena_alloc(u32 bytes)
+{
+    bytes = (bytes + 15u) & ~15u;
+    for (eng_arena_chunk* c = s_arena; c; c = c->next)
+        if (c->cap - c->used >= bytes) {
+            u8* p = c->data + c->used;
+            c->used += bytes;
+            return p;
+        }
+    const u32 cap = bytes > ENG_ARENA_CHUNK ? bytes : ENG_ARENA_CHUNK;
+    eng_arena_chunk* c = (eng_arena_chunk*)malloc(sizeof(*c) + cap);
+    if (!c) return NULL;
+    c->next = s_arena;
+    c->cap = cap;
+    c->used = bytes;
+    s_arena = c;
+    return c->data;
+}
+
+static void eng_arena_reset(void)
+{
+    for (eng_arena_chunk* c = s_arena; c; c = c->next) c->used = 0;
+}
+
+/* [offset, offset + len) read through the tiling into the arena; what
+ * guest memory does not back reads as zero. */
+static const u8* eng_fetch_detiled(u32 location, u32 offset, u32 len)
+{
+    if ((u64)offset + len > 0x100000000ull) len = (u32)(0x100000000ull - offset);
+    u8* p = len ? eng_arena_alloc(len) : NULL;
+    if (p) rsx_tiled_read(&s_eng_mem, location, offset, p, len);
+    return p;
+}
+
+/* eng_guest_ptr for the vertex, index and program fetches: a range that
+ * touches a tiled main-memory region comes back detiled, valid until the
+ * next draw. */
+static const u8* eng_fetch_ptr(void* user, u32 location, u32 offset, u32 min_bytes)
+{
+    const u8* raw = eng_guest_ptr(user, location, offset, min_bytes);
+    if (!raw || !eng_tiled(location, offset, min_bytes)) return raw;
+    return eng_fetch_detiled(location, offset, min_bytes);
 }
 
 static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
@@ -531,7 +622,7 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
     /* A8R8G8B8 with the LN bit: a surface is linear, never swizzled. */
     rsx_texture_layout(0x85u | 0x20u, w, h, &tl);
     if (!tl.face_bytes || !tl.dst_row_bytes) return NULL;
-    const u8* src = eng_guest_ptr(NULL, location, offset, tl.face_bytes);
+    const u8* src = eng_guest_linear(location, offset, tl.face_bytes);
     if (!src) return NULL;
     const u32 bytes = tl.dst_row_bytes * tl.rows;
     if (g.tex_staging_cap < bytes) {
@@ -797,7 +888,8 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
         } else if (!rgba) {
             eng_row_convert(src, src, n, 0, 1);   /* in place: one pixel per load/store */
         }
-        memcpy(dst, src + skip, bytes);
+        if (rsx_tiling_active()) rsx_tiled_write(&s_eng_mem, location, offset + r * pitch, src + skip, bytes);
+        else                     memcpy(dst, src + skip, bytes);
     }
 }
 
@@ -821,7 +913,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
     if (!rows) return;
     const int rgba = rsx_texture_argb_is_rgba();
     for (u32 r = 0; r < h; r++) {
-        const u8* src = eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
+        const u8* src = eng_guest_linear(location, offset + r * pitch, w * 4u);
         if (!src) return;
         eng_row_convert(rows + (size_t)r * w * 4u, src, w, rgba, 0);
     }
@@ -971,6 +1063,8 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, 
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                     int* readable)
 {
+    /* in tiled main memory, every byte the texture's texels are stored in */
+    if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
@@ -997,6 +1091,7 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
 static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
                                    int* readable)
 {
+    if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
@@ -1049,7 +1144,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
         !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
-        const u8* src = eng_guest_ptr(NULL, location, offset, span);
+        const u8* src = eng_guest_linear(location, offset, span);
         if (!src) return 0;
         const u32 handle = g.be->texture_create_3d(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                                    w, h, depth, nlv, remap, fmt);
@@ -1087,7 +1182,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 face_stride = cube
         ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
-    const u8* src = eng_guest_ptr(NULL, location, offset, span);
+    const u8* src = eng_guest_linear(location, offset, span);
     if (!src) return 0;
 
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
@@ -1278,9 +1373,21 @@ static int eng_zdepth_to_guest(u32 slot)
     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
                              w * (u32)sizeof(float)) != 0)
         return 0;
+    /* Rows of a zeta in tiled main memory are built here and stored through the tiling. */
+    const int tiled = eng_tiled(z->location, z->offset, z->pitch * h);
+    static u8* tile_row;
+    static u32 tile_row_cap;
+    if (tiled && tile_row_cap < w * bpp) {
+        u8* n = (u8*)realloc(tile_row, w * bpp);
+        if (!n) return 0;
+        tile_row = n;
+        tile_row_cap = w * bpp;
+    }
     for (u32 r = 0; r < h; r++) {
-        u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
-        if (!dst) return 0;
+        u8* const row = tiled ? tile_row
+                              : (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
+        if (!row) return 0;
+        u8* dst = row;
         const float* src = s_depth_rows + (size_t)r * w;
         for (u32 c = 0; c < w; c++) {
             float d = src[c];
@@ -1297,6 +1404,7 @@ static int eng_zdepth_to_guest(u32 slot)
             }
             dst += bpp;
         }
+        if (tiled) rsx_tiled_write(&s_eng_mem, z->location, z->offset + r * z->pitch, row, w * bpp);
     }
     z->guest_dirty = 0;
     eng_textures_touch(z->location, z->offset, z->pitch * h);
@@ -1443,8 +1551,11 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
         u32 fp_loc = 0;
         const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
         fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
+        /* in tiled main memory: as far as the size scan may look, detiled */
+        const int fp_tiled = fp_uc && eng_tiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
+        if (fp_tiled) fp_uc = eng_fetch_detiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
         fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
-        if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
+        if (fp_size && !fp_tiled) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
         if (!fp_uc) fp_size = 0;
     }
 
@@ -1894,10 +2005,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             const u8* run = NULL;
             if (count && start <= 0xFFFFFFFFull && bytes <= 0xFFFFFFFFull &&
                 start + bytes <= 0x100000000ull)
-                run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
+                run = eng_fetch_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
                 const u8* p = run ? run + (size_t)i * esz
-                    : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
+                    : eng_fetch_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
                 if (!p) { dc.fetch_ok = 0; break; }
                 const u32 index = ia.is_u32
                     ? (((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3])
@@ -1927,7 +2038,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     }
 
     dc.layout = *layout;
-    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_fetch_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
@@ -2531,6 +2642,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
+    eng_arena_reset();
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||

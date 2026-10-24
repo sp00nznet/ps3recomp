@@ -10,6 +10,7 @@
 
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
+#include "rsx_tiling.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -316,6 +317,20 @@ static _Atomic(u64) s_user_pending = 0;
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
 
+/* Every RSX client reads and writes tiled main memory through the tiling
+ * (rsx_tiling.h): publish what is bound. */
+static void gcm_tile_publish(u32 index)
+{
+    const CellGcmTileInfo* t = &s_tiles[index];
+    if (t->bound) rsx_tiling_set(index, t->tile & 1u, t->offset, t->size, t->pitch, t->bank);
+    else          rsx_tiling_set(index, 0, 0, 0, 0, 0);
+}
+
+static void gcm_tiles_publish(void)
+{
+    for (u32 i = 0; i < CELL_GCM_MAX_TILE_COUNT; i++) gcm_tile_publish(i);
+}
+
 /* Zcull configuration (8 zcull regions) */
 static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 
@@ -482,6 +497,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(&s_control, 0, sizeof(s_control));
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
     memset(s_tiles, 0, sizeof(s_tiles));
+    gcm_tiles_publish();
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
     s_report_dma = 0xFEED0000u;
@@ -1031,18 +1047,68 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
  * pixel: an SPU holding a reservation on a 128-byte line the row overwrites
  * loses it and gets its lost-reservation event. The two byte swaps a
  * vm_read32/vm_write32 pair does cancel, so the bytes move verbatim. */
-static void gcm_row_copy(u32 d, u32 s, u32 n)
+static void gcm_store(u32 d, const u8* src, u32 n)
 {
     extern u8* vm_base;
     const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
     int reserved = 0;
     for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
-    if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
+    if (!reserved) { memmove(vm_base + d, src, n); return; }
     spu_lockline_lock();
-    memmove(vm_base + d, vm_base + s, n);
+    memmove(vm_base + d, src, n);
     for (u32 a = l0; a <= l1; a += 128)
         if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
     spu_lockline_unlock();
+}
+
+static void gcm_row_copy(u32 d, u32 s, u32 n)
+{
+    extern u8* vm_base;
+    gcm_store(d, vm_base + s, n);
+}
+
+/* Guest memory as the 2D engines reach it, for the tiled range copies
+ * (rsx_tiling.h): a write keeps gcm_store's reservation bookkeeping. */
+static u8* gcm_tiled_ptr(void* user, u32 location, u32 offset, u32 len)
+{
+    extern u8* vm_base;
+    (void)user;
+    const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+    if (!ea || !len || (u64)ea + len > (ppu_vm_size ? ppu_vm_size : VM_TOTAL_SIZE)) return NULL;
+    return vm_base + ea;
+}
+
+static void gcm_tiled_store(void* user, u8* dst, const u8* src, u32 len)
+{
+    extern u8* vm_base;
+    (void)user;
+    gcm_store((u32)(dst - vm_base), src, len);
+}
+
+static const rsx_tiled_mem s_gcm_mem = { gcm_tiled_ptr, gcm_tiled_store, NULL };
+
+/* Whether `rows` rows of `pitch` bytes at `offset` touch a tile bound over
+ * main memory (always 0 for local memory, whose tiles are transparent). */
+static int gcm_rect_tiled(int local, u32 offset, u32 pitch, u32 rows)
+{
+    rsx_tile t;
+    if (local || !rsx_tiling_active()) return 0;
+    const u64 len = (u64)pitch * (rows ? rows : 1u);
+    return rsx_tiling_find(RSX_LOCATION_MAIN, offset, len > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)len, &t);
+}
+
+/* Scratch rows for the copies that go through the tiling; FIFO thread only. */
+static u8* gcm_rows(u32 bytes)
+{
+    static u8* rows;
+    static u32 cap;
+    if (cap < bytes) {
+        u8* n = (u8*)realloc(rows, bytes);
+        if (!n) return NULL;
+        rows = n;
+        cap = bytes;
+    }
+    return rows;
 }
 
 static void nv3089_blit(void)
@@ -1120,6 +1186,12 @@ static void nv3089_blit(void)
         u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
         u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
         nv3089_engine_read(in_pitch, out_w, out_h);
+        /* A source in tiled main memory is read a row at a time through the
+         * tiling, up to the last texel the row samples. */
+        const int stiled = gcm_rect_tiled(sl, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16);
+        const u32 sw = (u32)((nv3089_origin(u0b) + (u64)(out_w - 1u) * s_nv3089.ds_dx) >> 20) + 1u;
+        u8* trow = stiled ? gcm_rows(sw * 4u) : NULL;
+        if (stiled && !trow) return;
         /* Copy words verbatim through raw pointers rather than vm_read32/
          * vm_write32: this moves ~500k pixels per blit and several blits run per
          * frame, and the two byte swaps would cancel anyway. */
@@ -1129,6 +1201,11 @@ static void nv3089_blit(void)
           for (u32 y = 0; y < out_h; y++) {
               u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
               const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
+              if (stiled) {
+                  rsx_tiled_read(&s_gcm_mem, RSX_LOCATION_MAIN, s_nv3089.in_off + (u32)(sv >> 20) * in_pitch,
+                                 trow, sw * 4u);
+                  srow = trow;
+              }
               for (u32 x = 0; x < out_w; x++) {
                   u64 su = nv3089_origin(u0b) + (u64)x * s_nv3089.ds_dx;
                   memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
@@ -1199,6 +1276,36 @@ static void nv3089_blit(void)
      * per-pixel copy, which is what the PPU store watches see. */
     static int rowcopy = -1;
     if (rowcopy < 0) { const char* e = getenv("NV3089_ROWCOPY"); rowcopy = e ? atoi(e) : 1; }
+    /* A side in tiled main memory goes through the tiling (rsx_tiling.h).
+     * A retail title downsamples its scene and depth into a tiled main-memory
+     * region for an SPU depth-of-field job while aiming. */
+    const u32 in_w = s_nv3089.in_sz & 0xFFFF;
+    if (in_w && (gcm_rect_tiled(src_local, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16) ||
+                 gcm_rect_tiled(dst_local, s_gcm2d.dst_offset, dst_pitch, out_y + out_h))) {
+        /* Row at a time: the source row read as the RSX sees it, the
+         * destination row built linearly and written the same way. */
+        u8* srow = gcm_rows((in_w + out_w) * bpp);
+        if (!srow) return;
+        u8* drow = srow + in_w * bpp;
+        const u32 sloc = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        const u32 dloc = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        u32 xa = 0, xb = out_w;
+        if (out_x < cx0) xa = cx0 - out_x;
+        if ((u64)out_x + xb > cx1) xb = cx1 > out_x ? cx1 - out_x : 0;
+        for (u32 y = 0; y < out_h && xa < xb; y++) {
+            const u32 dy = out_y + y;
+            if (dy < cy0 || dy >= cy1) continue;
+            const u32 sy = (u32)((nv3089_origin(v0) + (u64)y * s_nv3089.dt_dy) >> 20);
+            rsx_tiled_read(&s_gcm_mem, sloc, s_nv3089.in_off + sy * in_pitch, srow, in_w * bpp);
+            for (u32 x = xa; x < xb; x++) {
+                u32 sx = (u32)((nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx) >> 20);
+                if (sx >= in_w) sx = in_w - 1u;
+                memcpy(drow + x * bpp, srow + sx * bpp, bpp);
+            }
+            rsx_tiled_write(&s_gcm_mem, dloc, s_gcm2d.dst_offset + dy * dst_pitch + (out_x + xa) * bpp,
+                            drow + xa * bpp, (xb - xa) * bpp);
+        }
+    } else
     if (rowcopy && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
         /* the source start in whole texels: IMAGE_IN_POINT is 12.4 */
         const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
@@ -1318,6 +1425,12 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                   printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+            const u32 at = s_gcm2d.dst_offset + py * dst_pitch + px * 4;
+            if (gcm_rect_tiled(local, at, 4, 1)) {
+                const u8 word[4] = { (u8)(data >> 24), (u8)(data >> 16), (u8)(data >> 8), (u8)data };
+                rsx_tiled_write(&s_gcm_mem, RSX_LOCATION_MAIN, at, word, 4);
+                return;
+            }
             vm_write32(base + py * dst_pitch + px * 4, data);
             return;
         }
@@ -3417,11 +3530,14 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     s_tiles[index].format = comp;
     s_tiles[index].base   = base;
     s_tiles[index].bank   = bank;
-    s_tiles[index].bound  = 0;
+    /* SetTile binds too (RPCS3 cellGcmSys.cpp: tile.bound = pitch > 0); a
+     * title that never calls BindTile still has its tiles in force. */
+    s_tiles[index].bound  = pitch > 0;
 
     /* Build tile register value (simplified) */
     s_tiles[index].tile  = (location << 0) | (pitch << 8);
     s_tiles[index].limit = offset + size - 1;
+    gcm_tile_publish(index);
 
     return CELL_OK;
 }
@@ -3462,6 +3578,7 @@ s32 cellGcmBindTile(u8 index)
 
     printf("[cellGcmSys] BindTile(index=%u)\n", index);
     s_tiles[index].bound = 1;
+    gcm_tile_publish(index);
     return CELL_OK;
 }
 
@@ -3484,6 +3601,7 @@ s32 cellGcmUnbindTile(u8 index)
 
     printf("[cellGcmSys] UnbindTile(index=%u)\n", index);
     s_tiles[index].bound = 0;
+    gcm_tile_publish(index);
     return CELL_OK;
 }
 
@@ -3689,6 +3807,7 @@ void cellGcmTerminate(void)
     memset(&s_control, 0, sizeof(s_control));
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
     memset(s_tiles, 0, sizeof(s_tiles));
+    gcm_tiles_publish();
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
     s_report_dma = 0xFEED0000u;
