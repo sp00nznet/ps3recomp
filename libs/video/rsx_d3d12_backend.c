@@ -17,6 +17,7 @@
 #ifdef _WIN32
 
 #include <time.h>
+#include <stdarg.h>
 #include "ps3emu/log_first.h"
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
@@ -481,6 +482,79 @@ static int perf_on(void)
     if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
     return v;
 }
+
+/* RENDERDOC_DLL=<path to renderdoc.dll>: load RenderDoc's capture layer before
+ * the device exists, and after each CELLMARK_DUMP capture the next frame that
+ * carries at least CELLMARK_DUMP_MINDRAWS draws, up to RENDERDOC_MAX captures
+ * (default 2), as RENDERDOC_DIR/gcm_*.rdc (default directory "rdoc"). The
+ * in-application API is a table of function pointers (renderdoc_app.h,
+ * RENDERDOC_API_1_6_0); only the slots used here are named. */
+typedef int (__cdecl* rdoc_get_api_fn)(int version, void** out);
+static void** s_rdoc;
+static int    s_rdoc_pending, s_rdoc_active, s_rdoc_done, s_rdoc_max;
+enum { RDOC_SET_CAPTURE_PATH = 11, RDOC_START_FRAME = 19, RDOC_END_FRAME = 21 };
+
+static void rdoc_load(void)
+{
+    const char* dll = getenv("RENDERDOC_DLL");
+    if (!dll || !*dll) return;
+    HMODULE m = LoadLibraryA(dll);
+    rdoc_get_api_fn get = m ? (rdoc_get_api_fn)(void*)GetProcAddress(m, "RENDERDOC_GetAPI") : NULL;
+    void* api = NULL;
+    if (!get || !get(10600, &api) || !api) {
+        printf("[rdoc] cannot load RenderDoc from %s%c", dll, 10);
+        return;
+    }
+    s_rdoc = (void**)api;
+    const char* dir = getenv("RENDERDOC_DIR");
+    char tmpl[512];
+    snprintf(tmpl, sizeof tmpl, "%s/gcm", dir && *dir ? dir : "rdoc");
+    ((void (__cdecl*)(const char*))s_rdoc[RDOC_SET_CAPTURE_PATH])(tmpl);
+    const char* mx = getenv("RENDERDOC_MAX");
+    s_rdoc_max = mx ? atoi(mx) : 2;
+    printf("[rdoc] RenderDoc loaded; up to %d captures as %s_*.rdc%c", s_rdoc_max, tmpl, 10);
+}
+
+static void rdoc_frame_begin(u32 draws)
+{
+    static int mind = -1;
+    if (mind < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS"); mind = e ? atoi(e) : 0; }
+    if (!s_rdoc || !s_rdoc_pending || draws < (u32)mind) return;
+    ((void (__cdecl*)(void*, void*))s_rdoc[RDOC_START_FRAME])(NULL, NULL);
+    s_rdoc_pending = 0;
+    s_rdoc_active = 1;
+}
+
+static void rdoc_frame_end(void)
+{
+    if (!s_rdoc_active) return;
+    const u32 ok = ((u32 (__cdecl*)(void*, void*))s_rdoc[RDOC_END_FRAME])(NULL, NULL);
+    s_rdoc_active = 0;
+    s_rdoc_done++;
+    printf("[rdoc] capture %d %s%c", s_rdoc_done, ok ? "written" : "FAILED", 10);
+}
+
+/* While RenderDoc is loaded, name a D3D12 object after the guest data it holds
+ * (texture offset and format, render-target offset, fragment program), so a
+ * capture reads in guest terms. */
+static void rdoc_name(ID3D12Object* o, const char* fmt, ...)
+{
+    if (!s_rdoc || !o) return;
+    char s[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s, sizeof s, fmt, ap);
+    va_end(ap);
+    WCHAR w[160];
+    MultiByteToWideChar(CP_ACP, 0, s, -1, w, 160);
+    o->lpVtbl->SetName(o, w);
+}
+
+static void rdoc_request(void)
+{
+    if (s_rdoc && !s_rdoc_pending && !s_rdoc_active && s_rdoc_done < s_rdoc_max) s_rdoc_pending = 1;
+}
+
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
  * texture), so the debug camera can follow it. The ducks are driven by the
  * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
@@ -571,6 +645,8 @@ static int init_d3d12(u32 width, u32 height)
                    "install 'Graphics Tools' optional feature\n", hr);
         }
     }
+
+    rdoc_load();   /* before the factory and device: RenderDoc hooks their creation */
 
     /* Create DXGI factory */
     IDXGIFactory4* factory = NULL;
@@ -2388,6 +2464,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         return NULL;
     }
     { static int _ok=0; if (PS3_LOG_FIRST(_ok, 32)) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
+    rdoc_name((ID3D12Object*)pso, "pso fp 0x%08X ucode %08X vs %d", fp_addr, uhash, vs_idx);
 
     /* insert (evict oldest when full) */
     if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
@@ -2689,6 +2766,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         }
         fresh = 1;
     }
+    rdoc_name((ID3D12Object*)t->res, "gtex 0x%08X fmt %02X %ux%u%s", off, fmt, w, h, cube ? " cube" : "");
 
     void* mapped = NULL; D3D12_RANGE nr = {0,0};
     if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
@@ -3380,6 +3458,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
     r->used = 1;
+    rdoc_name((ID3D12Object*)r->res, "rt 0x%08X %ux%u rsxfmt %02X", off, w, h, rsx_fmt);
 
     /* Populate the new RT from guest memory: titles CPU-initialise their
      * render-target buffers (wave fills the height fields with texels of
@@ -3810,6 +3889,7 @@ static void render_frame(void)
      * polygons). These workloads are a few draws/frame, so full serialisation
      * costs little. */
     wait_for_gpu();
+    rdoc_frame_begin(s_d3d.draw_count);
 
     /* Compile the real vertex program once its microcode is captured, and keep
      * the constant bank uploaded for the VS. */
@@ -4920,6 +5000,7 @@ skip_dump_consider: ;
         if (s_every < 0) { const char* e = getenv("CELLMARK_DUMP_EVERY");
                            s_every = e ? atoi(e) : 0; }
         if (s_every > 1) s_d3d.dump_skip_left = s_every - 1;
+        rdoc_request();
     }
     if (dumping) {
         /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
@@ -5112,6 +5193,7 @@ skip_dump_consider: ;
     /* Present */
     if (s_present_this_frame)
         s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
+    rdoc_frame_end();
 
     move_to_next_frame();
 
