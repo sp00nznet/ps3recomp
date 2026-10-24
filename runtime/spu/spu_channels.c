@@ -22,6 +22,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+/* setjmp/longjmp also save and restore the signal mask on POSIX: one
+ * sigprocmask system call per halt, stack reset or task resume. These frames
+ * never cross a signal handler, so the mask is the same at both ends. */
+#if defined(_WIN32)
+#define SPU_SETJMP(env) setjmp(env)
+#define SPU_LONGJMP(env, v) longjmp(env, v)
+#else
+#define SPU_SETJMP(env) _setjmp(env)
+#define SPU_LONGJMP(env, v) _longjmp(env, v)
+#endif
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
 #endif
@@ -117,7 +127,7 @@ static SPU_TLS int     s_spu_halt_armed = 0;
 void spu_restart_dispatch(spu_context* ctx)
 {
     g_spu_trampoline_fn = 0;
-    if (s_spu_halt_armed) longjmp(s_spu_halt_env, 2);
+    if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
@@ -155,7 +165,7 @@ void spu_halt(spu_context* ctx)
                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
         fflush(stderr);
       } }
-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
+    if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
 }
 
 /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
@@ -242,7 +252,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
-    switch (setjmp(s_spu_halt_env)) {
+    switch (SPU_SETJMP(s_spu_halt_env)) {
     case 1:
         halted = 1;
         g_spu_trampoline_fn = 0;
@@ -1550,27 +1560,47 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
 
 /* Register one-way runtime entries that replace the guest call stack.
  * Matching the resolved function, not just its LS address, avoids affecting
- * unrelated overlays using the same address. Registration precedes execution. */
+ * unrelated overlays using the same address. Entries have one registration
+ * writer and are immutable after publication. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
-static unsigned s_stack_reset_count;
+unsigned g_spu_stack_reset_count;
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
-    if (s_stack_reset_count < 16) {
-        s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
-        s_stack_reset[s_stack_reset_count++].image_id = image_id;
+    /* Registrations have one writer; publish a complete new slot before a
+     * reader observes its count, including registration during a live run. */
+    unsigned n = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
+    if (n < 16) {
+        s_stack_reset[n].entry = entry & SPU_LS_MASK;
+        s_stack_reset[n].image_id = image_id;
+        __atomic_store_n(&g_spu_stack_reset_count, n + 1, __ATOMIC_RELEASE);
     }
 }
 
+#if defined(_MSC_VER)
+static __declspec(noinline) void spu_check_stack_reset_scan(spu_context*, void (*)(spu_context*));
+#else
+static __attribute__((noinline, cold)) void spu_check_stack_reset_scan(spu_context*, void (*)(spu_context*));
+#endif
 /* Also called before direct trampoline transfers: generated calls can enter
  * a stack-switching routine without going through spu_indirect_branch. */
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 {
-    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
-    for (unsigned i = 0; i < s_stack_reset_count; ++i)
+    /* Runs on every drain transfer: test the registry before the
+     * thread-local halt state, which is a function call on Darwin, and keep
+     * the scan out of line so the common return needs no frame. */
+    if (!spu_stack_reset_needed(ctx)) return;
+    spu_check_stack_reset_scan(ctx, fn);
+}
+
+static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*))
+{
+    if (!s_spu_halt_armed) return;
+    const unsigned count = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
-            longjmp(s_spu_halt_env, 2);
+            SPU_LONGJMP(s_spu_halt_env, 2);
         }
 }
 
@@ -2268,7 +2298,7 @@ void spu_indirect_branch(spu_context* ctx)
              * Resume at depth zero so SPU_RET follows the restored guest link. */
             ctx->resident_task = ti;
             g_spu_trampoline_fn = 0;
-            longjmp(s_spu_halt_env, 2);
+            SPU_LONGJMP(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
         if (ti) ctx->resident_task = ti;

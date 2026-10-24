@@ -6,7 +6,18 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spu_lockstep.h"
 #include <setjmp.h>
+/* setjmp/longjmp also save and restore the signal mask on POSIX: one
+ * sigprocmask system call per halt, stack reset or task resume. These frames
+ * never cross a signal handler, so the mask is the same at both ends. */
+#if defined(_WIN32)
+#define SPU_SETJMP(env) setjmp(env)
+#define SPU_LONGJMP(env, v) longjmp(env, v)
+#else
+#define SPU_SETJMP(env) _setjmp(env)
+#define SPU_LONGJMP(env, v) _longjmp(env, v)
+#endif
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
@@ -49,20 +60,76 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
  * ended where it should not have (spurs_policy.c, [pm-end]). */
-static _Thread_local uint32_t t_recent[32];
-static _Thread_local uint32_t t_recent_n;
+/* One thread-local object: every Darwin TLV access is a call, and this runs
+ * on every drain transfer. */
+typedef struct spu_recent_history { uint32_t pc[32]; uint32_t n; } spu_recent_history;
+static _Thread_local spu_recent_history t_recent;
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
-    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
-    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
+    unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;
+    for (unsigned i = 0; i < k; i++) out[i] = t_recent.pc[(t_recent.n - k + i) & 31];
     return k;
 }
 
+#if defined(_MSC_VER)
+#define SPU_DRAIN_COLD __declspec(noinline)
+#define SPU_DRAIN_INLINE static __forceinline
+#else
+#define SPU_DRAIN_COLD __attribute__((noinline, cold))
+#define SPU_DRAIN_INLINE static inline __attribute__((always_inline))
+#endif
+static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
+
+/* Any of the step diagnostics below armed by the environment. */
+static int spu_task_launch_diagnostics(void)
+{
+    static int s_on = -1;
+    if (s_on < 0)
+        s_on = getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
+               getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
+    return s_on;
+}
+
+/* A drain may resolve the history TLS address once for its owning frame.
+ * Keep checkpoint order: stack reset can unwind before steps increment, and
+ * guest calls can change PM-flow, PC and steps before the next hop. */
+SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
+                                                  spu_recent_history* recent)
+{
+    recent->pc[recent->n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+    if (spu_stack_reset_needed(ctx))
+        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    if (!spu_task_launch_diagnostics() && !g_pm_flow_ctx &&
+        (!ctx->steps || (ctx->pc & SPU_LS_MASK))) {
+        ctx->steps++;
+        return;
+    }
+    spu_task_launch_slow(ctx);
+}
+
+/* Preserve the public checkpoint for generated and independent callers. */
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
-    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
-    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    spu_task_launch_check_inline(ctx, fn, &t_recent);
+}
+
+SPU_DRAIN_INLINE void spu_drain_hop_inline(spu_context* ctx,
+    void (*fn)(spu_context*), spu_recent_history* recent)
+{
+    /* Read the live gate each hop. -1 still takes the original initialization
+     * path; a callee can enable lockstep before the next checkpoint. */
+    if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
+    spu_task_launch_check_inline(ctx, (void*)fn, recent);
+}
+
+void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*))
+{
+    spu_drain_hop_inline(ctx, fn, &t_recent);
+}
+
+static void spu_task_launch_slow(spu_context* ctx)
+{
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
      * resident job manager, and with the job loaded at 0 that lands on its own
      * entry. Planting a return address in r0 catches the jobs that get there
@@ -259,7 +326,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                       if (s_it && PS3_LOG_FIRST(_n, 200))
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
-                    longjmp(f->env, 1);
+                    SPU_LONGJMP(f->env, 1);
                 }
                 if (!f && ctx->host_depth > 0) {
                     /* Taken by the top-level driver loop (depth 0), which
@@ -334,13 +401,14 @@ void (*spu_take_interrupt(spu_context* ctx,
 }
 
 /* See the declaration in spu_context.h. */
-void spu_depth_guard(spu_context* ctx)
+uint32_t g_spu_depth_guard_limit;
+SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
 {
-    static uint32_t s_max = 0;
-    if (!s_max) {
+    if (!g_spu_depth_guard_limit) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
-        s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+        g_spu_depth_guard_limit = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
     }
+    const uint32_t s_max = g_spu_depth_guard_limit;
 
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
@@ -348,6 +416,10 @@ void spu_depth_guard(spu_context* ctx)
     enum { RING = 24 };
     static uint32_t s_ring[RING];
     static uint32_t s_n;
+    /* Record only in the upper half of the budget: a runaway passes through it
+     * on its way to the limit, and ordinary transfers from every SPU thread no
+     * longer write this shared line. */
+    if (ctx->host_depth < s_max / 2) return;
     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     s_n++;
 
@@ -398,13 +470,16 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
-    spu_depth_guard(ctx);
+    spu_depth_guard_check(ctx);
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
      * running as trampolines of this loop -- until its iret fires or the
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
+    /* Nested contexts/drains share this thread's cursor. Only its address is
+     * stable across guest calls and IRQ longjmps, never the stored contents. */
+    spu_recent_history* const recent = &t_recent;
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
@@ -417,8 +492,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
-            yz_lockstep_tick(ctx);
-            spu_task_launch_check(ctx, (void*)fn);
+            spu_drain_hop_inline(ctx, fn, recent);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
@@ -430,7 +504,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         f.image_id = ctx->image_id;
                         ctx->irq_frame = &f;
                     }
-                    if (setjmp(f.env) == 0) {
+                    if (SPU_SETJMP(f.env) == 0) {
                         vf(ctx);
                     } else {
                         /* iret fired deeper: registers restored, pc = srr0 */
