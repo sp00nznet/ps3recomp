@@ -187,6 +187,8 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info);
 s32 cellPadSetPortSetting(u32 port_no, u32 port_setting);
 s32 cellPadInfoPressMode(u32 port_no);
 s32 cellPadSetPressMode(u32 port_no, u32 mode);
+s32 cellPadInfoSensorMode(u32 port_no);
+s32 cellPadSetSensorMode(u32 port_no, u32 mode);
 
 /* NID: 0x578E3C98 */
 s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info);

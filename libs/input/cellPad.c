@@ -1104,6 +1104,39 @@ s32 cellPadSetPressMode(u32 port_no, u32 mode)
     return CELL_OK;
 }
 
+/* cellPadInfoSensorMode (NID 0x78200559) / cellPadSetSensorMode (NID 0xBE5BE3BA)
+ *
+ * The same pair for the SIXAXIS sensors, which the virtual pad also advertises
+ * (CELL_PAD_CAPABILITY_SENSOR_MODE). Unresolved, Info answered 0 -- "no
+ * sensors" from a pad whose capability word says otherwise -- and Set never
+ * turned the sensor block of CellPadData on. With SENSOR_ON the packet grows to
+ * CELL_PAD_LEN_CHANGE_SENSOR_ON and carries the at-rest readings (see
+ * cellPadGetData), which is what a DS3 lying still reports. */
+s32 cellPadInfoSensorMode(u32 port_no)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    return 1;                                  /* supported */
+}
+
+s32 cellPadSetSensorMode(u32 port_no, u32 mode)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    const u32 was = s_port_setting[port_no] & CELL_PAD_SETTING_SENSOR_ON;
+    if (mode)
+        s_port_setting[port_no] |= CELL_PAD_SETTING_SENSOR_ON;
+    else
+        s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_SENSOR_ON;
+    if (was != (s_port_setting[port_no] & CELL_PAD_SETTING_SENSOR_ON))
+        printf("[cellPad] SetSensorMode(port %u) -> %s\n", port_no, mode ? "on" : "off");
+    return CELL_OK;
+}
+
 s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
 {
     if (!s_pad_initialized)

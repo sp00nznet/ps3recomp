@@ -132,6 +132,8 @@ jobs:
         run: |
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs)
           /tmp/test_pad_rumble
+          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_sensor_mode libs/input/tests/test_pad_sensor_mode.c $(sdl2-config --libs)
+          /tmp/test_pad_sensor_mode
 
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
