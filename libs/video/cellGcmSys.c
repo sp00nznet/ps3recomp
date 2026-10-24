@@ -556,6 +556,18 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     return CELL_OK;
 }
 
+/* GCM_FIFO_SEGMENT=<bytes>: hand the title its command ring a segment at a
+ * time, as libgcm does (RPCS3's _cellGcmInitBody uses 32 KB). The context's
+ * `end` is the end of the current segment, so the title's own reserve calls
+ * the buffer-full callback at every segment; the callback publishes `put`
+ * there and moves on (gcm_fifo_next_segment). The RSX then starts on a frame
+ * while the title is still writing it. With the whole ring as one segment,
+ * as before, `put` moves only when the title flushes: God of War HD flushes
+ * twice a frame, the second time at its flip, so its ~1.2 MB of commands
+ * reached the walker in one go and the title and the walker took turns.
+ * Unset (the default), nothing changes. */
+static u32 s_seg_size = 0, s_ring_begin = 0, s_ring_end = 0;
+
 /* Reusable _cellGcmInitBody core (NID 0x15BAE46B). See cellGcmSys.h for why the
  * guest vm is injected as callbacks. The CellGcmContextData layout here is the
  * one proven in the shipping Simpsons port (begin@0/end@4/current@8/callback@C);
@@ -578,10 +590,23 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     cellGcmInit(cmdSize, ioSize, ioAddress);
 
     u32 cmdbuf = ioAddress;                 /* FIFO lives at the IO region start */
+    {
+        const char* e = getenv("GCM_FIFO_SEGMENT");
+        const u32 seg = e ? (u32)strtoul(e, NULL, 0) : 0;
+        if (seg >= 0x1000 && (seg & 0xFFFu) == 0 && cmdSize >= 2 * seg) {
+            s_seg_size = seg;
+            s_ring_begin = cmdbuf;
+            s_ring_end = cmdbuf + cmdSize - cmdSize % seg;
+            printf("[cellGcmSys] command ring 0x%08X-0x%08X in %u KB segments%c",
+                   s_ring_begin, s_ring_end, seg / 1024, 10);
+        }
+    }
     u32 cdata  = galloc ? galloc(16, 16) : 0;
     if (cdata && gwrite32) {
         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
-        gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
+        /* end: the whole ring, or the first segment less the 4 bytes its
+         * closing JUMP needs. */
+        gwrite32(cdata + 0x4, s_seg_size ? cmdbuf + s_seg_size - 4 : cmdbuf + cmdSize);
         gwrite32(cdata + 0x8, cmdbuf);              /* current */
         /* Command-buffer-full callback: a guest OPD {func, toc} routed to
          * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
@@ -925,8 +950,9 @@ static u32 gcm_fifo_backlog(u32 put, u32 get)
 {
     if (put >= get) return put - get;
     if (!s_gcm_context_ea) return 0;
-    u32 b = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x0));
-    u32 e = gcm_ea2io(vm_read32(s_gcm_context_ea + 0x4));
+    /* In segments the context holds only the current one; the ring is fixed. */
+    u32 b = gcm_ea2io(s_seg_size ? s_ring_begin : vm_read32(s_gcm_context_ea + 0x0));
+    u32 e = gcm_ea2io(s_seg_size ? s_ring_end : vm_read32(s_gcm_context_ea + 0x4));
     if (b == 0xFFFFFFFFu || e == 0xFFFFFFFFu || e <= b) return 0;
     if (get < b || get > e || put < b || put > e) return 0;
     return (e - get) + (put - b);
@@ -2427,7 +2453,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea) {
+    /* Not on a segmented ring: its `begin` is the current segment, and the
+     * segment callback (gcm_fifo_next_segment) keeps the title inside it. */
+    if (s_gcm_ctx_out_ea && !(s_seg_size && vm_read32(s_gcm_ctx_out_ea) == s_gcm_context_ea)) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
@@ -2527,9 +2555,59 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
+/* The buffer-full callback on a segmented ring (GCM_FIFO_SEGMENT), what
+ * RPCS3's cellGcmCallback does: close the segment with a JUMP to the next one,
+ * publish `put` up to that JUMP so the walker can start, wait while the next
+ * segment still holds commands it has not read (only when the ring is a whole
+ * lap behind), and point the context at the next segment. */
+static void gcm_fifo_next_segment(u32 ctx)
+{
+    const u32 cur = vm_read32(ctx + 0x8), end = vm_read32(ctx + 0x4);
+    u32 next = end + 4;
+    if (next < s_ring_begin || next + s_seg_size > s_ring_end) next = s_ring_begin;
+    const u32 io_cur = gcm_ea2io(cur), io_next = gcm_ea2io(next);
+    if (io_cur == 0xFFFFFFFFu || io_next == 0xFFFFFFFFu || cur > end) return;
+    vm_write32(cur, 0x20000000u | io_next);              /* JUMP -> next segment */
+    /* The JUMP has to be in memory before `put` lets the walker reach it. */
+    atomic_thread_fence(memory_order_release);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur);      /* put: up to the JUMP */
+    if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);          /* start the walker now */
+    /* The walker is a whole lap behind only if it is still inside the next
+     * segment. Bounded on no progress, like the recycle wait below. */
+    int idle = 0;
+    u32 last_get = s_fifo_getoff;
+    while (s_fifo_getoff >= io_next && s_fifo_getoff < io_next + s_seg_size && idle < 2000) {
+        Sleep(1);
+        if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
+        else idle++;
+    }
+    if (idle >= 2000) {
+        static int warned = 0;
+        if (PS3_LOG_FIRST(warned, 4))
+            printf("[cellGcmSys] fifo segment: walker stalled in the next segment (get=0x%08X)%c",
+                   s_fifo_getoff, 10);
+    }
+    vm_write32(ctx + 0x0, next);
+    vm_write32(ctx + 0x8, next);
+    vm_write32(ctx + 0x4, next + s_seg_size - 4);
+}
+
+/* Room for `bytes` more at the context's write head. On the segmented ring a
+ * full segment is closed and the next one opened, as the title's own reserve
+ * would; elsewhere this only checks, with the recycle slack. */
+static int gcm_ctx_room(u32 ctx, u32 bytes)
+{
+    if (s_seg_size && ctx == s_gcm_context_ea) {
+        if (vm_read32(ctx + 0x8) + bytes > vm_read32(ctx + 0x4)) gcm_fifo_next_segment(ctx);
+        return vm_read32(ctx + 0x8) + bytes <= vm_read32(ctx + 0x4);
+    }
+    return vm_read32(ctx + 0x8) + bytes + GCM_RECYCLE_SLACK <= vm_read32(ctx + 0x4);
+}
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
+    if (s_seg_size && ctx_ea == s_gcm_context_ea) { gcm_fifo_next_segment(ctx_ea); return; }
     u32 begin   = vm_read32(ctx_ea + 0x0);
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
@@ -2772,10 +2850,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
 {
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
-    const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
     /* Never near the end: those bytes are the title's reserve before its
-     * ring wraps, and the recycle above keys on them. */
-    if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+     * ring wraps, and the recycle above keys on them. On a segmented ring a
+     * full segment is closed first instead. */
+    if (!gcm_ctx_room(ctx, 8)) return 0;
+    const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+    if (gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
     s_fifo_flips_queued++;
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
@@ -2796,7 +2876,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
     const u32 cb_opd = vm_read32(ctx + 0xC);
     const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
-    if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+    if (runtime_ring && !s_seg_size && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
@@ -3625,8 +3705,9 @@ s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
     const u32 c = (u32)(uintptr_t)ctx;
     if (c && labelIndex < CELL_GCM_MAX_LABEL_COUNT &&
         bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && s_display_buffer_set[bufferId]) {
-        const u32 end = vm_read32(c + 4), cur = vm_read32(c + 8);
-        if (cur + 16 + 8 + GCM_RECYCLE_SLACK <= end && gcm_ea2io(cur) != 0xFFFFFFFFu) {
+        const int room = gcm_ctx_room(c, 16 + 8);
+        const u32 cur = vm_read32(c + 8);
+        if (room && gcm_ea2io(cur) != 0xFFFFFFFFu) {
             vm_write32(cur + 0,  0x00040064u);   /* SEMAPHORE_OFFSET  */
             vm_write32(cur + 4,  labelIndex * GCM_LABEL_STRIDE);
             vm_write32(cur + 8,  0x00040068u);   /* SEMAPHORE_ACQUIRE */
