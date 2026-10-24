@@ -1944,7 +1944,44 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
 static int spu_smc_microstep(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+    /* Straight runs of quadword loads and stores (lqa/stqa/lqd/stqd) go through
+     * a tight loop: no decode chain, no per-access probe. The WWS handler's
+     * generated save and restore stubs are 76 of them and a `bi`, run on every
+     * stall-and-notify interrupt -- ~40k stubs a second on God of War:
+     * Ascension's serial EDGE chain, ~7% of its time at ~25 ns an instruction
+     * the generic way. Only while every LS diagnostic is off (they read 0 once
+     * the first access has read their switches); otherwise the generic path
+     * below runs them. */
+    const int ldst_fast = g_spu_ls_watch_n == 0 && g_spu_ls_probe == 0 &&
+                          g_spu_smc_watch == 0 && ctx->image_id != 2;
     for (int steps = 0; steps < 4096; steps++) {
+        if (ldst_fast) {
+            for (; steps < 4096; steps++, pc = (pc + 4) & SPU_LS_MASK) {
+                uint32_t wf;
+                memcpy(&wf, ctx->ls + pc, 4);
+                wf = SPU_BSWAP32(wf);
+                const uint32_t op9f = wf >> 23, op8f = wf >> 24;
+                uint32_t a;
+                if (op9f == 0x041 || op9f == 0x061)                   /* stqa / lqa: LSA = I16 << 2 */
+                    a = ((wf >> 7) & 0xFFFF) << 2;
+                else if (op8f == 0x24 || op8f == 0x34)                /* stqd / lqd */
+                    a = ctx->gpr[(wf >> 7) & 0x7F]._u32[0] + ((uint32_t)((int32_t)(wf << 8) >> 22) << 4);
+                else
+                    break;
+                uint8_t* p = ctx->ls + (a & SPU_LS_MASK & ~15u);
+                u128* r = &ctx->gpr[wf & 0x7F];
+                if (op9f == 0x041 || op8f == 0x24) {
+                    const uint32_t q[4] = { SPU_BSWAP32(r->_u32[0]), SPU_BSWAP32(r->_u32[1]),
+                                            SPU_BSWAP32(r->_u32[2]), SPU_BSWAP32(r->_u32[3]) };
+                    memcpy(p, q, 16);
+                } else {
+                    uint32_t q[4];
+                    memcpy(q, p, 16);
+                    for (int k = 0; k < 4; k++) r->_u32[k] = SPU_BSWAP32(q[k]);
+                }
+            }
+            if (steps >= 4096) break;
+        }
         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
         uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
