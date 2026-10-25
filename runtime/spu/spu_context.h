@@ -484,7 +484,8 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 
 /* Debug probes of spu_ls_read128, out of line: inlined they kept every LS
  * load a real call (~10% of GH3's FMOD mixer task). g_spu_ls_probe is -1
- * until the first call reads SPU_LS_LOWREAD, then 0/1. */
+ * until the first call reads SPU_LS_LOWREAD, then 0/1. The accessors reach
+ * them only through g_spu_ls_diag (below). */
 
 /* The diagnostic gates the inline helpers below read. Defined here rather than
  * in spu_channels.c, as one merged definition per program (selectany / weak),
@@ -499,6 +500,25 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
+/* Every LS diagnostic sits behind this one gate: -1 until the first quadword
+ * access reads the switches, then 0 or 1. The accessors are inlined into every
+ * load and store of lifted SPU code. Each switch read separately (with the LBP
+ * WWS probes' image and mode test), reloaded after every store since a store
+ * through the LS pointer may alias it, made God of War HD's hottest particle
+ * function 8,561 instructions; behind the one gate it is 5,939. */
+SPU_GATE int g_spu_ls_diag = -1;
+static inline __attribute__((noinline, cold)) int spu_ls_diag_env(void)
+{
+    return getenv("SPU_LS_WATCH") || getenv("SPU_LS_LOWREAD") ||
+           getenv("SPU_SMC_WATCH") || getenv("SPU_WWS_PROBE");
+}
+/* SPU_WWS_PROBE=1: the WWS buffer-resolution probes (LBP's job manager). */
+static inline int spu_wws_probe_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SPU_WWS_PROBE") ? 1 : 0;
+    return on;
+}
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
@@ -526,7 +546,7 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
      * 0xDF0 + (jobNum<<6) + (logBufSet<<2), so the raw address encodes both.
      * Log them (capped) to see which set each command -- especially RunJob --
      * resolves to. Uses the RAW lsa before 16-byte alignment masking. */
-    if (ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
+    if (spu_wws_probe_on() && ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
         extern int g_wws_read_probe;
         if (g_wws_read_probe < 48) {
             g_wws_read_probe++;
@@ -537,15 +557,24 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
+/* The read-side diagnostics, with the address before alignment. */
+static inline __attribute__((noinline, cold)) void spu_ls_diag_read(const spu_context* ctx, uint32_t lsa)
+{
+    if (g_spu_ls_diag < 0) g_spu_ls_diag = spu_ls_diag_env();
+    if (!g_spu_ls_diag) return;
+    spu_ls_read_probe(ctx, lsa);
+    lsa &= SPU_LS_MASK & ~0xFu;
+    spu_ls_watch_hit2(lsa, 0, &ctx->ls[lsa], (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+}
+
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
-        spu_ls_read_probe(ctx, lsa);
+    if (__builtin_expect(g_spu_ls_diag != 0, 0))
+        spu_ls_diag_read(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-    spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -616,18 +645,30 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
       } }
 }
 
+/* The write-side diagnostics, after the store. The WWS code-buffer probe:
+ * LBP's ChangeLoadToRunJob dispatches to LS[0x1320] (= lsaJobCodeBuffer in
+ * LBP's layout) + entryOffset. When TecRunJob writes that code-buffer LS
+ * address, dump the RunJob decision inputs so we can see why it resolves to an
+ * empty buffer: the resolved address, the whole bufferSetArray (0xDF0), and
+ * the live loadCommands (0xC00) whose RunJob command (commandNum==5) names the
+ * code buffer set. None of those lines is the one just stored. */
+static inline __attribute__((noinline, cold)) void spu_ls_diag_write(spu_context* ctx, uint32_t lsa, u128 val)
+{
+    if (g_spu_ls_diag < 0) g_spu_ls_diag = spu_ls_diag_env();
+    if (!g_spu_ls_diag) return;
+    const uint8_t* p = &ctx->ls[lsa];
+    if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode && spu_wws_probe_on())
+        spu_ls_write_probe_pre(ctx, lsa, val);
+    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    if (g_spu_smc_watch != 0)
+        spu_ls_write_probe_smc(ctx, lsa, p);
+}
+
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
-    /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
-     * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
-     * that code-buffer LS address, dump the RunJob decision inputs so we can see
-     * why it resolves to an empty buffer: the resolved address, the whole
-     * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
-     * command (commandNum==5) names the code buffer set. */
-    if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
-        spu_ls_write_probe_pre(ctx, lsa, val);
 #if SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
@@ -642,10 +683,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
-        spu_ls_write_probe_smc(ctx, lsa, p);
+    if (__builtin_expect(g_spu_ls_diag != 0, 0))
+        spu_ls_diag_write(ctx, lsa, val);
 }
 
 /* ---------------------------------------------------------------------------
