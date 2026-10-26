@@ -248,6 +248,12 @@ compatible with MIT (MIT, BSD, zlib, Apache-2.0, public domain). Specifically:
   line. Reading it to understand what a syscall or HLE module does is fine;
   carrying its code or structure across is not. A fix you saw there is best
   submitted as a description of the behaviour, and we'll write it fresh.
+- **Cite the source of a fact, not an emulator that also knows it.** Cite the
+  Sony SDK, the Cell/SPU ISA manual or the hardware documentation for
+  constants, structure layouts and check orderings; cite RPCS3 only for
+  behaviour you observed it produce. A comment naming an RPCS3 source file as
+  the authority for a constant reads like a transcription even when the value
+  came from the SDK, and telling those two apart costs a review round-trip.
 - **If something came from elsewhere, say so in the PR**, with a link, and
   keep any copyright header. A licence problem found at review costs a
   comment; one found after release means untangling history.
