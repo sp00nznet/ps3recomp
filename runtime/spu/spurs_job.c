@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_env_once.h"   /* getenv("...") once per call site */
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
