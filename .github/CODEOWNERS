@@ -1,0 +1,40 @@
+# Review ownership for the paths that execute.
+#
+# Everything listed here runs with a credential or ships to users. The release
+# workflow fires on a v* tag, configures CMake, compiles the tree and runs every
+# tools/test_*.py under `python`, then publishes the result -- so a change to any
+# of these paths executes on a runner and lands inside the release zip. Code in
+# runtime/, libs/ or include/ has to be compiled into something and deliberately
+# run before it does anything; these paths do not.
+#
+# IMPORTANT: this file does not block a merge. On its own it only *requests*
+# review from the owners below -- a PR touching these paths can still be merged
+# with that request outstanding. Turning it into a gate takes a branch
+# protection rule on `master` with "Require a pull request before merging" plus
+# "Require review from Code Owners", which only the repository owner can
+# configure. See the PR that added this file.
+#
+# Last matching pattern wins, so order matters: put narrower rules below wider
+# ones. A pattern ending in `/` matches the directory and everything under it;
+# a leading `/` anchors to the repository root.
+
+# Workflow definitions, their triggers and their permissions. A change here can
+# hand a token to anything else in the tree, so it is the widest lever in the
+# repository -- including this file.
+/.github/              @sp00nznet
+
+# The build system: CMakeLists.txt and the modules it includes both run at
+# configure time, before anyone has read the code they are about to compile.
+/CMakeLists.txt        @sp00nznet
+/cmake/                @sp00nznet
+
+# The Python pipeline. Every tools/test_*.py is executed by the release workflow
+# and by each push workflow, and the whole directory is copied into the bundle.
+/tools/                @sp00nznet
+
+# Dependency set for those scripts: one added line here is one added package
+# installed on a runner and in every contributor's environment.
+/requirements.txt      @sp00nznet
+
+# Vendored third-party source, compiled into the shipped runtime library.
+/third_party/          @sp00nznet
