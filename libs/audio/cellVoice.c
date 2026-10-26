@@ -163,12 +163,12 @@ s32 cellVoiceSetCallback(CellVoiceEventCallback callback, void* arg)
     return CELL_OK;
 }
 
-/* Port control (RPCS3 rpcs3/Emu/Cell/Modules/cellVoice.cpp semantics).
+/* Port control: Sony PS3 SDK libvoice Reference 4.0.0, pp. 33, 41, 53.
  *
- * A port that does not exist is CELL_VOICE_ERROR_TOPOLOGY there (its
- * access_port check), not PORT_NOT_FOUND as the older calls above return. No
- * voice data flows here, so there is nothing to flush on a reset and no signal
- * to measure: each call logs once so the missing audio path stays visible. */
+ * These stubs report TOPOLOGY for an unknown port; the older calls above
+ * retain PORT_NOT_FOUND. No voice data flows here, so there is nothing to
+ * flush on reset and no microphone signal to measure. Each call logs once
+ * so the missing audio path stays visible. */
 
 static int voice_port_valid(CellVoicePortId portId)
 {
@@ -192,9 +192,9 @@ s32 cellVoiceUpdatePort(CellVoicePortId portId, const CellVoicePortParam* param)
     if (!param) return (s32)CELL_VOICE_ERROR_ARGUMENT_INVALID;
     if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
     /* s_ports[].param holds the guest's bytes as CreatePort copied them.
-     * Like RPCS3, update threshold, bMute and volume (bytes 4..11) and, for
-     * voice ports (IN_VOICE 2 / OUT_VOICE 4), the bitrate (bytes 12..15);
-     * the port type and PCM format stay as created. */
+     * SDK libvoice Reference pp. 8 and 53: update threshold, bMute and
+     * volume (bytes 4..11) and, for voice ports (IN_VOICE 2 / OUT_VOICE 4),
+     * bitrate (bytes 12..15). Preserve portType, device and PCM fields. */
     uint8_t* dst = (uint8_t*)&s_ports[portId].param;
     const uint8_t* src = GUEST_PTR(param, const uint8_t*);
     u32 type = ((u32)dst[0] << 24) | ((u32)dst[1] << 16) | ((u32)dst[2] << 8) | dst[3];
@@ -211,6 +211,7 @@ s32 cellVoiceGetSignalState(CellVoicePortId portId, u32 attr, void* attrValue)
     (void)attrValue;
     if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
     if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
-    /* RPCS3 reports a detached microphone and does not write attrValue. */
+    /* SDK libvoice Reference p. 33 defines the missing-microphone error.
+     * This stub leaves attrValue untouched because no sample is available. */
     return (s32)CELL_VOICE_ERROR_DEVICE_NOT_PRESENT;
 }

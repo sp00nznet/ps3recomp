@@ -66,7 +66,7 @@ int main(void)
                               (CellVoicePortId*)(uintptr_t)PORTID) == CELL_OK, "CreatePort");
     u32 id = vm_read32(PORTID);
 
-    /* Unknown ports are a topology error, as in RPCS3's access_port check. */
+    /* Unknown ports exercise the stubs' topology validation. */
     CHECK((u32)cellVoiceResetPort(id + 1) == 0x80310807u, "ResetPort(unknown) -> TOPOLOGY");
     CHECK((u32)cellVoiceUpdatePort(id + 1, (const CellVoicePortParam*)(uintptr_t)UPDATE) == 0x80310807u,
           "UpdatePort(unknown) -> TOPOLOGY");
@@ -93,7 +93,7 @@ int main(void)
     CHECK(rate == 7300, "UpdatePort sets the voice bitrate (%u)", rate);
 
     /* No microphone: the signal state reports DEVICE_NOT_PRESENT and leaves
-     * the output alone (RPCS3 does the same). */
+     * the output alone in this stub. */
     vm_write32(SIGNAL, 0xA5A5A5A5u);
     CHECK((u32)cellVoiceGetSignalState(id, 11, (void*)(uintptr_t)SIGNAL) == 0x80310812u,
           "GetSignalState -> DEVICE_NOT_PRESENT");
