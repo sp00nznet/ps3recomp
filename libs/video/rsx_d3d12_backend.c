@@ -6624,6 +6624,37 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
     return o;
 }
 
+static u32 upload_quad_strip_vp(const rsx_state* state, u32 first, u32 count)
+{
+    extern uint8_t* vm_base;
+    if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+    if (!state->vertex_attribs[0].enabled) return 0;
+    if (count < 4) return 0;
+    u32 quads = (count - 2) / 2;
+    u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    if (quads * 6 > maxv) quads = maxv / 6;
+    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
+    u32 o = 0;
+    for (u32 q = 0; q < quads; q++) {
+        u32 b = first + q * 2;
+        VPSlot v0[16], v1[16], v2[16], v3[16];
+        read_vp_vertex(state, b + 0, v0);
+        read_vp_vertex(state, b + 1, v1);
+        read_vp_vertex(state, b + 2, v2);
+        read_vp_vertex(state, b + 3, v3);
+        memcpy(&out[(o + 0)*16], v0, sizeof(v0));
+        memcpy(&out[(o + 1)*16], v1, sizeof(v1));
+        memcpy(&out[(o + 2)*16], v3, sizeof(v3));
+        memcpy(&out[(o + 3)*16], v0, sizeof(v0));
+        memcpy(&out[(o + 4)*16], v3, sizeof(v3));
+        memcpy(&out[(o + 5)*16], v2, sizeof(v2));
+        o += 6;
+    }
+    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
+    return o;
+}
+
 /* Fetch index k from the guest index array (SET_INDEX_ARRAY_ADDRESS/_DMA:
  * dma [3:0] = location (0 local, 1 main), [7:4] = type (0 u32, 1 u16)).
  * Indices are big-endian in guest memory. */
@@ -7014,6 +7045,37 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     return o;
 }
 
+static u32 upload_quad_strip_vp_indexed(const rsx_state* state, u32 first, u32 count)
+{
+    extern uint8_t* vm_base;
+    if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+    if (!state->vertex_attribs[0].enabled) return 0;
+    if (count < 4) return 0;
+    u32 quads = (count - 2) / 2;
+    u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    if (quads * 6 > maxv) quads = maxv / 6;
+    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
+    u32 o = 0;
+    for (u32 q = 0; q < quads; q++) {
+        u32 b = first + q * 2;
+        VPSlot v0[16], v1[16], v2[16], v3[16];
+        read_vp_vertex(state, read_guest_index(state, b + 0), v0);
+        read_vp_vertex(state, read_guest_index(state, b + 1), v1);
+        read_vp_vertex(state, read_guest_index(state, b + 2), v2);
+        read_vp_vertex(state, read_guest_index(state, b + 3), v3);
+        memcpy(&out[(o + 0)*16], v0, sizeof(v0));
+        memcpy(&out[(o + 1)*16], v1, sizeof(v1));
+        memcpy(&out[(o + 2)*16], v3, sizeof(v3));
+        memcpy(&out[(o + 3)*16], v0, sizeof(v0));
+        memcpy(&out[(o + 4)*16], v3, sizeof(v3));
+        memcpy(&out[(o + 5)*16], v2, sizeof(v2));
+        o += 6;
+    }
+    s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
+    return o;
+}
+
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 {
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
@@ -7141,13 +7203,19 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * Geometry already in clip space with no VP -- flOw's injected scene -- must
      * go down the fixed-function passthrough below instead. */
     if ((primitive == RSX_PRIMITIVE_TRIANGLES || primitive == RSX_PRIMITIVE_TRIANGLE_STRIP
-         || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
+         || primitive == RSX_PRIMITIVE_TRIANGLE_FAN || primitive == RSX_PRIMITIVE_POLYGON
+         || primitive == RSX_PRIMITIVE_QUAD_STRIP) &&
         s_d3d.vp_vb_mapped && s_d3d.vp_root_sig &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
         u32 rec = s_d3d.vp_vb_offset;
-        u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
-            ? upload_tris_vp(s_d3d.current_rsx_state, first, count)
-            : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == RSX_PRIMITIVE_TRIANGLE_FAN);
+        u32 emitted = 0;
+        if (primitive == RSX_PRIMITIVE_TRIANGLES)
+            emitted = upload_tris_vp(s_d3d.current_rsx_state, first, count);
+        else if (primitive == RSX_PRIMITIVE_QUAD_STRIP)
+            emitted = upload_quad_strip_vp(s_d3d.current_rsx_state, first, count);
+        else
+            emitted = upload_strip_vp(s_d3d.current_rsx_state, first, count,
+                                      primitive == RSX_PRIMITIVE_TRIANGLE_FAN || primitive == RSX_PRIMITIVE_POLYGON);
         /* RSX splits one primitive stream across several DRAW_ARRAYS entries
          * inside a single BEGIN/END (each carries at most 256 vertices), and the
          * hardware concatenates them before assembling primitives. Recording a
@@ -7299,7 +7367,9 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     else if (primitive == RSX_PRIMITIVE_QUADS)        emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
     else if (primitive == RSX_PRIMITIVE_TRIANGLES)    emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
     else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
-    else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN)   emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN ||
+             primitive == RSX_PRIMITIVE_POLYGON)        emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1);
+    else if (primitive == RSX_PRIMITIVE_QUAD_STRIP)     emitted = upload_quad_strip_vp_indexed(s_d3d.current_rsx_state, first, count);
     else {
         static int _skip = 0;
         if (PS3_LOG_FIRST(_skip, 3))
