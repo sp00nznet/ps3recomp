@@ -740,6 +740,39 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
+
+        /* sys_mempool_create: creates a fixed-size memory pool (sysPrxForUser 0xCA9A60BF) */
+        if (nid == 0xCA9A60BFu) {
+            static uint32_t s_next_mempool_id = 1;
+            uint32_t pool_ptr = (uint32_t)ctx->gpr[3];
+            if (pool_ptr) {
+                vm_write32(pool_ptr, s_next_mempool_id++);
+            }
+            ctx->gpr[3] = 0; /* CELL_OK */
+            return;
+        }
+
+        /* cellSpursGetTasksetId: SPURS taskset ID query (cellSpurs 0xE7DD87E1) */
+        if (nid == 0xE7DD87E1u) {
+            uint32_t taskset_id_ptr = (uint32_t)ctx->gpr[4];
+            if (taskset_id_ptr) {
+                vm_write32(taskset_id_ptr, 0); /* taskset ID = 0 */
+            }
+            ctx->gpr[3] = 0; /* CELL_OK */
+            return;
+        }
+
+        /* cellSpurs 0x17001000: job chain attribute/priority setter */
+        if (nid == 0x17001000u) {
+            ctx->gpr[3] = 0; /* CELL_OK */
+            return;
+        }
+
+        /* cellUsbd: USB peripheral detection / driver registration stubs */
+        if (nid == 0x7FE92C54u || nid == 0xBD554BCBu) {
+            ctx->gpr[3] = 0; /* CELL_OK */
+            return;
+        }
         static int logged = 0;
         if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
@@ -810,6 +843,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
                     ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
     ctx->gpr[3] = r;   /* PPC return value */
+    { unsigned t = (unsigned)ctx->thread_id;
+      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
     /* PS3_HLE_PTRCHECK: the guest stores HLE return values as guest pointers, so
      * an HLE returning a value outside guest RAM (>= 0x10000000) that is not a
      * CELL_ERROR code (0x8001xxxx / 0x8002xxxx) is leaking a truncated HOST

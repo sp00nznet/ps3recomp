@@ -937,6 +937,8 @@ extern "C" void ppu_resv_register(ppu_context* c)
  * while calling out every pass. Reading a pinned lr as "no calls since
  * entry" narrowed a search to the wrong loop once already. lr names the
  * last DIRECT call site and nothing more. */
+extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
+
 extern "C" void ppu_report_guest_lrs(void)
 {
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
@@ -946,6 +948,7 @@ extern "C" void ppu_report_guest_lrs(void)
         fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
                 (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+        ppu_dump_guest_stack(c, "watchdog");
         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
          * targets. lr cannot see those (bctrl does not write it), so for a
          * thread looping on a vtable call the ring is the only record of where
@@ -3193,6 +3196,9 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
+/* GPIO device pin state (sys_gpio_set / sys_gpio_get). */
+static uint64_t s_gpio_dev[8] = { 0 };
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
@@ -3300,6 +3306,22 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         }
         if (outp) vm_write32(outp, va);
         ctx->gpr[3] = 0;
+        return;
+    }
+    case 630: {   /* sys_gpio_set(u64 device_id, u64 mask, u64 value) */
+        uint64_t dev  = ctx->gpr[3];
+        uint64_t mask = ctx->gpr[4];
+        uint64_t val  = ctx->gpr[5];
+        if (dev < 8) s_gpio_dev[dev] = (s_gpio_dev[dev] & ~mask) | (val & mask);
+        ctx->gpr[3] = 0;   /* CELL_OK */
+        return;
+    }
+    case 631: {   /* sys_gpio_get(u64 device_id, u64* value) */
+        uint64_t dev = ctx->gpr[3];
+        uint32_t outp = (uint32_t)ctx->gpr[4];
+        uint64_t val = (dev < 8) ? s_gpio_dev[dev] : 0;
+        if (outp) vm_write64(outp, val);
+        ctx->gpr[3] = 0;   /* CELL_OK */
         return;
     }
     case 988:     /* sys_tty_write — canonical LV2 number (psdevwiki); some CRTs

@@ -421,22 +421,25 @@ int64_t sys_fs_open(ppu_context* ctx)
      * libxml2 probes /etc/xml/catalog there, and that file is absent by design.
      * A share-lock/handle-pressure failure (the case this retry exists for)
      * reports EACCES/EBUSY, not ENOENT, so the recovery still works. */
-    if (!fp && errno != ENOENT &&
+    if (!fp && errno != ENOENT && errno != EINVAL &&
         !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
-        for (int _r = 0; !fp && _r < 3000; _r++) {
+        struct stat _st_retry;
+        if (stat(host_path, &_st_retry) == 0 && !S_ISDIR(_st_retry.st_mode)) {
+            for (int _r = 0; !fp && _r < 3000; _r++) {
 #ifdef _WIN32
-            Sleep(1);
+                Sleep(1);
 #else
-            /* The delay is the retry. 3000 iterations is meant to be about
-             * three seconds of waiting for a transient share lock or handle
-             * pressure to clear; without it the loop spends microseconds
-             * calling fopen 3000 times on a condition that has not changed,
-             * and the recovery this exists for never happens. */
-            { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
+                /* The delay is the retry. 3000 iterations is meant to be about
+                 * three seconds of waiting for a transient share lock or handle
+                 * pressure to clear; without it the loop spends microseconds
+                 * calling fopen 3000 times on a condition that has not changed,
+                 * and the recovery this exists for never happens. */
+                { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
 #endif
-            fp = fopen(host_path, mode);
+                fp = fopen(host_path, mode);
+            }
+            if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
         }
-        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
     }
 
     /* If CREAT flag set and file doesn't exist, try creating it */
