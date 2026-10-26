@@ -3821,6 +3821,11 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * and concurrently-emitted fences vanished (the boot-loading stall). */
     { extern uint64_t ppu_thread_register_main(void);
       ctx.thread_id = ppu_thread_register_main(); }
+    /* register_main() leaves stack_addr/stack_size zeroed; sys_ppu_thread_
+     * get_stack_information(49) would report a {0,0} stack for the main
+     * thread. Backfill the real region now that the harness chose it. */
+    { extern void ppu_thread_set_main_stack(uint32_t, uint32_t);
+      ppu_thread_set_main_stack(stack_top - VM_PPU_STACK_SIZE, VM_PPU_STACK_SIZE); }
     /* For samplers on other threads (a port's periodic stack dump): the main
      * thread's context lives on this frame, not in the thread table. */
     g_ppu_main_ctx = &ctx;
