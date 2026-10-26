@@ -45,6 +45,9 @@ typedef struct sys_rwlock_info {
      * because this header is reachable from C++ through extern "C", the same
      * reason win32_compat.h gives for its own choice. */
     uint64_t         writer_tid;
+    /* Read locks held, for the same EPERM-on-unlock-without-a-lock check as the
+     * Win32 branch (pthread_rwlock_unlock on a lock nobody holds is undefined). */
+    int32_t          readers;
 #endif
 
 } sys_rwlock_info;

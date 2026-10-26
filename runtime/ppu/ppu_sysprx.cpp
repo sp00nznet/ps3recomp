@@ -126,9 +126,12 @@ static void sys_lwmutex_create(ppu_context* ctx)
       if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
         fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
     uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
+    /* sys_lwmutex_t.attribute is protocol | recursive (the two words of
+     * sys_lwmutex_attribute_t OR-ed together); the recursive word was dropped. */
+    uint32_t recursive = attr ? vm_read32(attr + 4) : 0;
     vm_write32(lwm + 0x00, 0);          /* owner */
     vm_write32(lwm + 0x04, 0);          /* waiter */
-    vm_write32(lwm + LWM_ATTR, protocol);
+    vm_write32(lwm + LWM_ATTR, protocol | recursive);
     vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
     vm_write32(lwm + 0x14, 0);
@@ -338,7 +341,9 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
             ctx->gpr[3] = 0;
             return;
         }
-        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+        /* Held elsewhere -> CELL_EBUSY (0x8001000A). This answered 0x8001000B,
+         * which is CELL_ETIMEDOUT, so a caller testing for EBUSY never saw it. */
+        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; } // EBUSY
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
     vm_write32(lwm + LWM_OWNER, self);
