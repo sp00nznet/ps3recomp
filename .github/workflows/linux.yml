@@ -225,6 +225,12 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -lm
           /tmp/test_pad_hotplug
 
+      # cellPad keyboard fallback on port 0 (SDL source, fake keyboard and focus).
+      - name: Run the pad keyboard test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(sdl2-config --cflags) -o /tmp/test_pad_keyboard libs/input/tests/test_pad_keyboard.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_keyboard
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler

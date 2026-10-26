@@ -168,6 +168,7 @@ if(APPLE)
         "-framework QuartzCore"
         "-framework Foundation"
         "-framework AppKit"
+        "-framework ApplicationServices"
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"

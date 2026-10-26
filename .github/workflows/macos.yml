@@ -200,6 +200,13 @@ jobs:
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
           /tmp/test_pad_hotplug
 
+      # cellPad keyboard fallback on port 0 (read through SDL here too, with a
+      # fake keyboard and focus; the real macOS source is CGEventSourceKeyState).
+      - name: Run the pad keyboard test
+        run: |
+          clang -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_keyboard libs/input/tests/test_pad_keyboard.c $(sdl2-config --libs)
+          /tmp/test_pad_keyboard
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge
