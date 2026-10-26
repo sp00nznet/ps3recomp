@@ -405,6 +405,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
           /tmp/test_stdio_flush
 
+      # PS3_DEV_FLASH may name several roots; the first one that holds the file wins
+      # (runtime/platform/ps3_dev_flash.c, shared by cellFs and the raw sys_fs).
+      - name: Run the dev_flash path test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_dev_flash_path runtime/platform/tests/test_dev_flash_path.c runtime/platform/ps3_dev_flash.c
+          /tmp/test_dev_flash_path
+
       # PARAM.SFO is written as a binary PSF and read back (PSF and the old text file).
       - name: Run the savedata PARAM.SFO test
         run: |

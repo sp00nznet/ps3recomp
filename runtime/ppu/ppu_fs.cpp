@@ -28,6 +28,7 @@
 #include <atomic>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
+#include "../platform/ps3_dev_flash.h"   /* ps3_dev_flash_path: PS3_DEV_FLASH may name several roots */
 
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
  * `extern "C"` inside a function body is ill-formed in C++. */
@@ -168,7 +169,7 @@ static void host_path(char* out, size_t cap, const char* guest)
     if (strncmp(guest, "/dev_flash/", 11) == 0) {
         const char* fw = getenv("PS3_DEV_FLASH");
         if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
-        snprintf(out, cap, "%s/%s", fw, guest + 11);
+        ps3_dev_flash_path(out, cap, fw, guest + 11);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
