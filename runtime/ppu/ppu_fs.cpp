@@ -87,7 +87,12 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_OK              0
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
-#define CELL_FS_EIO          (-2147418111)
+/* 0x8001002B. This was -2147418111 = 0x80010001, which is CELL_EAGAIN ("try
+ * again"), not EIO: a title that retries on EAGAIN spun on a hard I/O failure. */
+#define CELL_FS_EIO          (-2147418069)
+#define CELL_FS_EBADF        (-2147418070)   /* 0x8001002A: not an open fd */
+#define CELL_FS_EMFILE       (-2147418068)   /* 0x8001002C: fd table full */
+#define CELL_FS_EINVAL       (-2147418110)   /* 0x80010002 */
 #define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
@@ -317,7 +322,7 @@ static void cellFsOpen(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
     int fd = fd_alloc_file(f);
-    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
@@ -415,7 +420,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         free(dec);
         rewind(tf);
         int fd = fd_alloc_file(tf);
-        if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+        if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
         fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
                 gpath, fd, dec_sz,
@@ -425,7 +430,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         return;
     }
     int fd = fd_alloc_file(f);
-    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
             magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
@@ -480,7 +485,7 @@ static void cellFsRead(ppu_context* ctx)
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(f);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
@@ -552,7 +557,7 @@ static void cellFsWrite(ppu_context* ctx)
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     fs_set_dir(fd, f, 2);
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
@@ -614,7 +619,7 @@ static void cellFsFGetBlockSize(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (!fd_file(fd)) {
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
         return;
     }
     fs_report_block_size(ctx, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
@@ -634,11 +639,21 @@ static void cellFsLseek(ppu_context* ctx)
     uint32_t wh   = (uint32_t)ctx->gpr[5];
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
+    /* An unknown whence, or a seek that would land before the start of the
+     * file, is CELL_EINVAL and leaves the offset where it was. fseek failing
+     * is not harmless on the MSVC CRT: it drops the stream's buffer and the
+     * stream then reports the OS position, which is past the buffered data,
+     * so the old position is put back explicitly. */
+    if (wh > CELL_FS_SEEK_END) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EINVAL; return; }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    FS_SEEK64(f, off, worigin);
+    const int64_t before = FS_TELL64(f);
+    if (FS_SEEK64(f, off, worigin) != 0) {
+        if (before >= 0) FS_SEEK64(f, before, SEEK_SET);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EINVAL; return;
+    }
     int64_t p = FS_TELL64(f);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
@@ -652,14 +667,15 @@ static void cellFsLseek(ppu_context* ctx)
  * DLFileDeviceStream, stat@obj+0xD8) then have the trailing blksize clobber the
  * field right after the stat (the fd at obj+0x10c), which later fails lseek.
  * Layout: mode@0 uid@4 gid@8 atime@0x0C mtime@0x14 ctime@0x1C size@0x24 blksize@0x2C. */
-static void write_stat(uint32_t sb, uint32_t mode, uint64_t size)
+static void write_stat(uint32_t sb, uint32_t mode, uint64_t size,
+                       int64_t atime = 0, int64_t mtime = 0, int64_t ctime = 0)
 {
     vm_write32(sb + 0x00, mode);
     vm_write32(sb + 0x04, 0);            /* uid */
     vm_write32(sb + 0x08, 0);            /* gid */
-    vm_write64(sb + 0x0C, 0);            /* atime */
-    vm_write64(sb + 0x14, 0);            /* mtime */
-    vm_write64(sb + 0x1C, 0);            /* ctime */
+    vm_write64(sb + 0x0C, (uint64_t)atime);   /* seconds since the epoch */
+    vm_write64(sb + 0x14, (uint64_t)mtime);
+    vm_write64(sb + 0x1C, (uint64_t)ctime);
     vm_write64(sb + 0x24, size);         /* size */
     vm_write64(sb + 0x2C, 0x200);        /* blksize */
 }
@@ -678,7 +694,11 @@ static void cellFsStat(ppu_context* ctx)
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
-    if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
+    /* The file's own times; they used to be written as 0 (1970), and a title
+     * that lists a directory and shows or compares file dates saw all of them
+     * equal. */
+    if (sb) write_stat(sb, mode, (uint64_t)st.st_size,
+                       (int64_t)st.st_atime, (int64_t)st.st_mtime, (int64_t)st.st_ctime);
     if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
     ctx->gpr[3] = CELL_OK;
 }
@@ -688,7 +708,7 @@ static void cellFsFstat(ppu_context* ctx)
     int fd      = (int)(uint32_t)ctx->gpr[3];
     uint32_t sb = (uint32_t)ctx->gpr[4];
     FILE* f = fd_file(fd);
-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
     int64_t cur = FS_TELL64(f);
@@ -707,7 +727,18 @@ static void cellFsFstat(ppu_context* ctx)
           if (c > 0 && sz > c) {
               fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
               sz = c; } } }
-    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
+    if (sb) {
+        /* Times only from the host: the size above also counts unflushed writes. */
+        fs_stat64_t fst;   /* 64-bit: a 32-bit fstat fails on a file past 2 GiB */
+#ifdef _WIN32
+        const int have_t = _fstat64(_fileno(f), &fst) == 0;
+#else
+        const int have_t = fstat(fileno(f), &fst) == 0;
+#endif
+        write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz,
+                   have_t ? (int64_t)fst.st_atime : 0, have_t ? (int64_t)fst.st_mtime : 0,
+                   have_t ? (int64_t)fst.st_ctime : 0);
+    }
     if (getenv("PS3_FSLOG")) { static int _n=0; if(PS3_LOG_FIRST(_n, 12)) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
     ctx->gpr[3] = CELL_OK;
 }
@@ -722,7 +753,7 @@ static void cellFsOpendir(ppu_context* ctx)
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
     int fd = fd_alloc_dir(d);
-    if (fd < 0) { closedir(d); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0) { closedir(d); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     strncpy(g_dir_path[fd], hpath, sizeof g_dir_path[fd] - 1);
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     ctx->gpr[3] = CELL_OK;
@@ -735,12 +766,16 @@ static void cellFsReaddir(ppu_context* ctx)
     uint32_t dirent = (uint32_t)ctx->gpr[4];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[5];
     DIR* d = fd_dir(fd);
-    if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
     struct dirent* e = readdir(d);
     if (!e) { if (nread_ptr) vm_write64(nread_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
     char full[1300]; struct stat st;
     snprintf(full, sizeof full, "%s/%s", g_dir_path[fd], e->d_name);
-    uint8_t type = (stat(full, &st) == 0 && (st.st_mode & S_IFDIR))
+    /* "." and ".." are always directories: a title that walks a tree skips the
+     * dot entries by type and name, and one typed as a file would be handed
+     * to its file handler. Not left to stat("<dir>//.") resolving. */
+    const int dot = e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]));
+    uint8_t type = (dot || (stat(full, &st) == 0 && (st.st_mode & S_IFDIR)))
                    ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
     size_t nl = strlen(e->d_name); if (nl > 255) nl = 255;
     vm_base[dirent + 0] = type;

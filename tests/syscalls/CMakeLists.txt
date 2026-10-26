@@ -48,3 +48,31 @@ set_tests_properties(lock_line PROPERTIES
     LABELS "runtime;syscalls"
     TIMEOUT 30
 )
+
+# The raw filesystem syscalls (open flags, seek, mkdir/unlink/rmdir codes,
+# readdir, fd-table limits and concurrency) against real files in a temporary
+# directory. Links sys_fs.c alone.
+add_executable(test_sys_fs
+    test_sys_fs.c
+    "${PS3RECOMP_ROOT}/runtime/syscalls/sys_fs.c"
+)
+target_include_directories(test_sys_fs PRIVATE
+    "${PS3RECOMP_ROOT}/runtime/syscalls"
+    "${PS3RECOMP_ROOT}/runtime"
+    "${PS3RECOMP_ROOT}/include"
+    "${PS3RECOMP_ROOT}/libs/filesystem"
+)
+if(MSVC)
+    target_compile_definitions(test_sys_fs PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_sys_fs PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_sys_fs PRIVATE Threads::Threads)
+endif()
+add_test(NAME sys_fs COMMAND test_sys_fs)
+set_tests_properties(sys_fs PROPERTIES
+    LABELS "runtime;syscalls"
+    TIMEOUT 60
+)

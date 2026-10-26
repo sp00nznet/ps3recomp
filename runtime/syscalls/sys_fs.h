@@ -65,15 +65,20 @@ extern "C" {
 #define CELL_FS_S_IRGRP   0000040
 #define CELL_FS_S_IROTH   0000004
 
-/* Open flags */
-#define CELL_FS_O_RDONLY   0x000000
-#define CELL_FS_O_WRONLY   0x000001
-#define CELL_FS_O_RDWR     0x000002
-#define CELL_FS_O_ACCMODE  0x000003
-#define CELL_FS_O_CREAT    0x000100
-#define CELL_FS_O_TRUNC    0x000200
-#define CELL_FS_O_EXCL     0x000400
-#define CELL_FS_O_APPEND   0x002000
+/* Open flags. The SDK values are OCTAL (libs/filesystem/cellFs.h has the same
+ * set): O_CREAT 0100, O_EXCL 0200, O_TRUNC 01000, O_APPEND 02000. They used to
+ * be spelt 0x100/0x400/0x2000 here, which are different bits: a guest libc's
+ * open(O_WRONLY|O_CREAT) of a new file (0x41) never saw O_CREAT and failed
+ * ENOENT, and fopen("a") (O_APPEND = 0x400) was read as O_EXCL and overwrote
+ * from offset 0. */
+#define CELL_FS_O_RDONLY   0000000
+#define CELL_FS_O_WRONLY   0000001
+#define CELL_FS_O_RDWR     0000002
+#define CELL_FS_O_ACCMODE  0000003
+#define CELL_FS_O_CREAT    0000100
+#define CELL_FS_O_EXCL     0000200
+#define CELL_FS_O_TRUNC    0001000
+#define CELL_FS_O_APPEND   0002000
 
 /* Seek modes */
 #define CELL_FS_SEEK_SET   0
