@@ -290,6 +290,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSpurs", "cellSpursQueueTryPopBody"),
     # SPURS LFQueue
     ("cellSpurs", "_cellSpursLFQueueInitialize"),
+    ("cellSpurs", "_cellSpursLFQueuePushBody"),
     ("cellSpurs", "cellSpursLFQueuePush"),
     ("cellSpurs", "cellSpursLFQueuePop"),
     ("cellSpurs", "cellSpursLFQueueAttachLv2EventQueue"),

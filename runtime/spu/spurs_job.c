@@ -267,13 +267,12 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * job's own instruction words and it indexed per-SPU tables with an opcode
      * and halted. The lifted code never reads those bytes as data, so overlay
      * the kernel's view: SPU 0, our DMA tag, tracing off. */
-    if (jm_iface) {
-        memset(ls + 0x170, 0, 0x10);
-        memset(ls + 0x1C0, 0, 0x10);
-        ls32(ls, 0x1C8, g_spurs_job_spu_num);
-        ls32(ls, 0x1CC, JOB_DMA_TAG);
-        memset(ls + 0x210, 0, 0x10);
-    }
+    /* Overlay the SPURS kernel context for all jobs (spuNum at 0x1C8, DMA tag at 0x1CC). */
+    memset(ls + 0x170, 0, 0x10);
+    memset(ls + 0x1C0, 0, 0x10);
+    ls32(ls, 0x1C8, g_spurs_job_spu_num);
+    ls32(ls, 0x1CC, JOB_DMA_TAG);
+    memset(ls + 0x210, 0, 0x10);
     ls32(ls, ctx_ls + JC_SIZE_JOB_DESC,
          ((dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28) | jm_iface);
     ls16(ls, ctx_ls + JC_NUM_IO_BUFFER,    (uint16_t)n_dma);

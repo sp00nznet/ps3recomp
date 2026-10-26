@@ -2130,10 +2130,15 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                     fflush(stderr);
                 }
             }
-            if (s_force && waits >= 1000) {
-                fprintf(stderr, "[cellSpurs] EventFlagWait: SPURS_EF_FORCE -- faking pattern "
-                                "0x%04X (NOT real; A/B only)\n", pattern);
-                vm_write16(ea + EF_EVENTS, (u16)(current | pattern));
+            if (s_force && waits >= 2) {
+                static int s_flog = 0;
+                if (++s_flog <= 5 || (s_flog % 300 == 1)) {
+                    fprintf(stderr, "[cellSpurs] EventFlagWait: SPURS_EF_FORCE -- faking pattern "
+                                    "0x%04X on 0x%08X (waits=%u)\n", pattern, ea, waits);
+                }
+                current = (u16)(current | pattern);
+                vm_write16(ea + EF_EVENTS, current);
+                break;
             }
         }
     }
@@ -2257,7 +2262,9 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
 s32 _cellSpursSendSignal(void* taskset, u32 taskId)
 {
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
-    printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    static int _s_sig_n = 0;
+    if (PS3_LOG_FIRST(_s_sig_n, 8))
+        printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
     /* Real delivery now that SPU tasks execute (comment was stale). */
     if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
     return CELL_OK;
@@ -2299,6 +2306,7 @@ static struct {
     u16 max_grab;
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
+    volatile long rerun;     /* 1 if RunJobChain called while running */
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -2495,7 +2503,16 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
      * DMA traffic at all. spu_workload_dispatch_job reproduces jm2's staging.
      * Synchronous by design: a job runs to completion, and the chain's own
      * NEXT/CALL/RET commands are what order them. */
-    spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc);
+    int ok = spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc);
+    if (!ok) {
+        /* Safety fallback for unlifted/missed jobs: if the job descriptor specifies
+         * a completion counter/signal EA at +0x30, clear it so PPU threads polling
+         * on the job's completion do not deadlock. */
+        u64 comp_ea = vm_read64(job_ea + 0x30);
+        if (comp_ea >= 0x10000 && comp_ea < 0xD0000000ull) {
+            vm_write32((u32)comp_ea, 0);
+        }
+    }
 }
 
 /* Walk one chain's command stream. Bounded: a malformed or self-looping stream
@@ -2736,6 +2753,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
      * a malformed chain is spinning through commands WITHOUT running a job, so
      * count that instead and reset it whenever real work happens. */
     int idle = 0;
+    int has_guard = 0;
     for (;; idle++) {
         if (idle > 4096) break;
         u64 cmd = vm_read64(pc);
@@ -2743,6 +2761,12 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         u32 ext = (u32)(cmd & 127);
 
         if (cmd != 0 && op == 0) {                    /* JOB */
+            if (!has_guard) {
+                /* Consume one-shot batch job command in place (replace with
+                 * SYNC=2) so a concurrent RunJobChain rerun does not execute
+                 * the same batch job twice before the PPU resets the list. */
+                vm_write64(pc, 2);
+            }
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
             int idx = jobs++;
             jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
@@ -2760,7 +2784,9 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                static int _end_log = 0;
+                if (PS3_LOG_FIRST(_end_log, 16))
+                    printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
                 return;
             }
@@ -2774,6 +2800,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
             }
         }
         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
+            has_guard = 1;
             u32 g_ea = (u32)(cmd & ~127ull);
             if (!jg_wait(g_ea)) return;                  /* still closed */
             pc += 8; continue;
@@ -2782,9 +2809,11 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
          * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
         pc += 8;
     }
-    printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
-           "job(s) -- malformed?\n",
-           jc_ea, jobs);
+    { static int _mal_log = 0;
+      if (PS3_LOG_FIRST(_mal_log, 16))
+          printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
+                 "job(s) -- malformed?\n",
+                 jc_ea, jobs); }
 }
 
 static DWORD WINAPI jc_thread(LPVOID p)
@@ -2798,9 +2827,16 @@ static DWORD WINAPI jc_thread(LPVOID p)
      * Confirms timing-vs-never before committing to the async rewrite. */
     { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
-    jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-               s_jobchains[slot].size_desc);
-    s_jobchains[slot].running = 0;
+    for (;;) {
+        _InterlockedExchange(&s_jobchains[slot].rerun, 0);
+        jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
+                   s_jobchains[slot].size_desc);
+        if (!s_jobchains[slot].rerun) {
+            _InterlockedExchange(&s_jobchains[slot].running, 0);
+            if (!s_jobchains[slot].rerun || _InterlockedCompareExchange(&s_jobchains[slot].running, 1, 0) != 0)
+                break;
+        }
+    }
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
     jc_signal_done(s_jobchains[slot].jc_ea, -1);
@@ -2834,7 +2870,8 @@ static s32 jc_start(u64 jc_ea, const char* who)
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
-        /* Coalesce: a chain already being walked must not start twice. */
+        /* Request rerun in case the walker is currently finishing a previous pass */
+        _InterlockedExchange(&s_jobchains[i].rerun, 1);
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
@@ -2909,6 +2946,21 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] JobChainGetError(jc=0x%08X)\n", (u32)jc_ea);
     if (cause_out_ea) vm_write32((u32)cause_out_ea, 0);
+    return CELL_OK;
+}
+
+s32 cellSpursGetJobChainId(u64 jc_ea, u64 id_out_ea)
+{
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] cellSpursGetJobChainId(jc=0x%08X)\n", (u32)jc_ea);
+    if (!jc_ea || !id_out_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (s_jobchains[i].jc_ea == (u32)jc_ea) {
+            vm_write32((u32)id_out_ea, (u32)i);
+            return CELL_OK;
+        }
+    }
+    vm_write32((u32)id_out_ea, 0);
     return CELL_OK;
 }
 
@@ -3477,5 +3529,107 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
 {
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+    return CELL_OK;
+}
+
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, const void* buffer, u32 isBlocking)
+{
+    if (!queue_ea || !buffer)
+    {
+        return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    }
+
+    uint32_t q = (uint32_t)queue_ea;
+    uint32_t sz = vm_read32(q + 0x10);
+    uint32_t dep = vm_read32(q + 0x14);
+    uint32_t buf = (uint32_t)vm_read64(q + 0x18);
+    uint32_t tsp = (uint32_t)vm_read64(q + 0x70); // eaSignal: taskset
+    if (!sz || !dep || !buf)
+    {
+        return CELL_SPURS_TASK_ERROR_INVAL;
+    }
+
+    int32_t mod = (int32_t)vm_read32(q + 0x0C);
+    if (mod <= 0)
+    {
+        mod = (int32_t)dep;
+    }
+
+    int32_t pop = (int32_t)(vm_read32(q + 0x04) & 0xFFFF); // W1, consumer pop index
+    int32_t tail = (int32_t)vm_read16(q + 0x08);           // W2, producer push index
+    int32_t nsync = (pop < 0) ? ~pop : pop;
+    int32_t cur = (tail < 0) ? ~tail : tail;
+
+    uint32_t occ = (uint32_t)((cur >= nsync) ? (cur - nsync) : (cur + 2 * mod - nsync));
+    if (occ >= dep)
+    {
+        if (!isBlocking)
+        {
+            return CELL_SPURS_TASK_ERROR_BUSY;
+        }
+        int spins = 0;
+        while (occ >= dep)
+        {
+            if (++spins > 200)
+            {
+#ifdef _WIN32
+                Sleep(1);
+#else
+                usleep(1000);
+#endif
+                spins = 0;
+            }
+            pop = (int32_t)(vm_read32(q + 0x04) & 0xFFFF);
+            nsync = (pop < 0) ? ~pop : pop;
+            tail = (int32_t)vm_read16(q + 0x08);
+            cur = (tail < 0) ? ~tail : tail;
+            occ = (uint32_t)((cur >= nsync) ? (cur - nsync) : (cur + 2 * mod - nsync));
+        }
+    }
+
+    uint32_t slot = (uint32_t)(cur % mod);
+    uint32_t data_ea = (uint32_t)(uintptr_t)buffer;
+    const void* src = (data_ea < 0x20000000u) ? (const void*)(vm_base + data_ea) : buffer;
+    memcpy(vm_base + buf + (size_t)slot * sz, src, sz);
+    const uint32_t* pld = (const uint32_t*)(vm_base + buf + (size_t)slot * sz);
+    { static int _n_pld = 0;
+      if (PS3_LOG_FIRST(_n_pld, 16))
+          printf("[cellSpurs] LFQueuePush payload: w0=0x%08X w1=0x%08X w2=0x%08X w3=0x%08X\n",
+                 pld[0], pld[1], pld[2], pld[3]); }
+
+    int32_t nxt = (cur + 1) % (2 * mod);
+    // W1 (q+0x04) belongs to the consumer SPU; DO NOT overwrite it!
+    // W2 (q+0x08) belongs to the producer PPU; write new push index:
+    vm_write16(q + 0x08, (uint16_t)nxt);
+    vm_write16(q + 0x0A, (uint16_t)nxt);
+
+    // Notify any registered waiters
+    uint8_t* qp = vm_base + q;
+    uint32_t waiters = qp[0x20];
+    int woke = -1;
+    extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
+    if (waiters > 0 && waiters <= 3 && tsp)
+    {
+        woke = qp[0x21];
+        qp[0x21] = qp[0x22];
+        qp[0x22] = qp[0x23];
+        qp[0x23] = 0;
+        qp[0x20] = (uint8_t)(waiters - 1);
+        spu_taskset_signal_task(tsp, (uint32_t)woke);
+    }
+    if (tsp)
+    {
+        // SPURS_EF_WAKE_PARKED: wake any worker tasks waiting on this taskset
+        spu_taskset_signal_task(tsp, 0);
+        spu_taskset_signal_task(tsp, 1);
+    }
+
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 20))
+    {
+        printf("[cellSpurs] _cellSpursLFQueuePushBody#%d q=0x%08X slot=%u (cur=%u->%u) "
+               "buf=0x%08X size=%u depth=%u waiters=%u woke=%d taskset=0x%08X\n",
+               _n, q, slot, cur, nxt, buf + slot * sz, sz, dep, waiters, woke, tsp);
+    }
     return CELL_OK;
 }
