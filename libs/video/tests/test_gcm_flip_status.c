@@ -7,6 +7,8 @@
  * guest thread next pumps, and the title may have requested another flip by
  * then. That newer request must stay WAITING until a tick of its own
  * completes it, and so must one that outlives cellGcmSetWaitFlip's bound.
+ * A beat completes only a flip the RSX has executed (b00e0e2a): each flip
+ * here is executed before the tick that is to complete it.
  */
 #include "../cellGcmSys.c"
 #include <assert.h>
@@ -21,6 +23,8 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 ps3_guest_caller_fn g_ps3_guest_caller;
+/* What the drain does when it reaches a flip queued in the command stream. */
+static void flip_executed(void) { s_fifo_flips_reached++; }
 static unsigned flips;
 static void callback(uint32_t opd, uint64_t a, uint64_t b, uint64_t c,
                      uint64_t d, uint64_t e, uint64_t f, uint64_t h, uint64_t i)
@@ -33,9 +37,13 @@ int main(void)
     g_ps3_guest_caller = callback;
     s_flip_handler_opd = 0x400;
 
-    /* The plain case: request, tick, deliver. */
+    /* The plain case: request, execute, tick, deliver. */
     cellGcmResetFlipStatus();
     assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == 0 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+    flip_executed();
     cellGcmTickFlip();
     ppu_gcm_pump();
     assert(flips == 1 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
@@ -47,10 +55,12 @@ int main(void)
     /* A newer request between the tick and the delivery: the late completion
      * runs the handler for the old flip but leaves the new one WAITING. */
     cellGcmResetFlipStatus();
+    flip_executed();
     cellGcmTickFlip();
     cellGcmResetFlipStatus();
     ppu_gcm_pump();
     assert(flips == 2 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+    flip_executed();
     cellGcmTickFlip();
     ppu_gcm_pump();
     assert(flips == 3 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
@@ -60,6 +70,7 @@ int main(void)
     cellGcmResetFlipStatus();
     cellGcmSetWaitFlip();
     assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+    flip_executed();
     cellGcmTickFlip();
     ppu_gcm_pump();
     assert(flips == 4 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
