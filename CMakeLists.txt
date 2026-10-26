@@ -521,6 +521,7 @@ if(UNIX)
         if(APPLE)
             add_executable(test_metal_poly_offset
                 libs/video/tests/test_metal_poly_offset.m
+                libs/video/rsx_tiling.c
                 libs/video/rsx_shader_msl.cpp
                 libs/video/rsx_dispatch.c
                 libs/video/rsx_vertex_compact.c

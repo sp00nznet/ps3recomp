@@ -3,6 +3,7 @@
  *   -o /tmp/test_gcm_user_command && /tmp/test_gcm_user_command
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>

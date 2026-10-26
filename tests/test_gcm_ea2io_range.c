@@ -5,6 +5,7 @@
  * and overlapping ranges, and that every active slot is below the mark.
  * Includes the real implementation, as test_gcm_map_flags.c does. */
 #include "../libs/video/cellGcmSys.c"
+#include "../libs/video/rsx_tiling.c"
 #include <assert.h>
 
 uint8_t* vm_base;

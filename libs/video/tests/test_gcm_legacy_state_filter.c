@@ -11,6 +11,7 @@
  *   (gcc: -Wl,--gc-sections -pthread -lm)
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

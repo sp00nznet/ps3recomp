@@ -17,6 +17,7 @@
  *   (clang on macOS: -Wl,-dead_strip)
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 uint8_t* vm_base;

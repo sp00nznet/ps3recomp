@@ -9,6 +9,7 @@
  * completes it, and so must one that outlives cellGcmSetWaitFlip's bound.
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <assert.h>
 uint8_t* vm_base;
 uint32_t ppu_vm_size;

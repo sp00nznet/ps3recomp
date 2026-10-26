@@ -11,6 +11,7 @@
  *      /tmp/test_gcm_walker_prof off <file>  (RSX_WALKER_PROF unset)
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
