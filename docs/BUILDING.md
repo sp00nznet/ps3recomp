@@ -159,6 +159,13 @@ compiled into the runtime. If you redistribute FFmpeg DLLs with a port, use an
 LGPL-only build: distro and MSYS2 packages are usually built with GPL parts
 enabled (`--enable-gpl`), which changes what you may ship.
 
+cellAtrac decodes ATRAC3plus with a vendored FFmpeg decoder
+(`third_party/at3_standalone`, LGPL-2.1-or-later, kept as a separable
+component), which is compiled into the runtime. For a binary that has to stay
+free of LGPL code, configure with `-DPS3RECOMP_ATRAC_LGPL=OFF`: a stub
+(`third_party/at3_stub`) replaces it, every ATRAC track fails to open, and the
+title sees an ATRAC error. The default is ON.
+
 ### Running the Tests
 
 ```bash
