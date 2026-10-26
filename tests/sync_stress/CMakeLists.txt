@@ -138,3 +138,27 @@ if(WIN32)
         set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
     endforeach()
 endif()
+
+# sys_event_queue_destroy modes (EINVAL / EBUSY / FORCE -> ECANCELED), ports
+# disconnected from a destroyed queue, and the absolute deadline of a timed
+# receive. Links sys_event.c alone.
+add_executable(test_event_queue_destroy
+    test_event_queue_destroy.c test_shims.c
+    "${RUNTIME_SYNC_DIR}/sys_event.c")
+if(NOT WIN32)
+    target_sources(test_event_queue_destroy PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_event_queue_destroy PRIVATE Threads::Threads)
+endif()
+target_include_directories(test_event_queue_destroy PRIVATE
+    "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+    "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
+if(MSVC)
+    target_compile_definitions(test_event_queue_destroy PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_event_queue_destroy PRIVATE /experimental:c11atomics)
+else()
+    target_compile_options(test_event_queue_destroy PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
+set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 60)

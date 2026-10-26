@@ -85,6 +85,21 @@ static uint64_t bswap64(uint64_t v)
 #endif
 }
 
+#ifdef _WIN32
+/* Milliseconds left to a lv2_usec_deadline() deadline, rounded UP (a timed
+ * receive must not return before the guest's timeout); 0 once it has passed. */
+static DWORD evt_ms_until(int64_t deadline)
+{
+    LARGE_INTEGER f, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart >= deadline) return 0;
+    const uint64_t left = (uint64_t)(deadline - now.QuadPart), q = (uint64_t)f.QuadPart;
+    const uint64_t ms = (left / q) * 1000ull + ((left % q) * 1000ull + q - 1) / q;
+    return ms >= (uint64_t)INFINITE ? (DWORD)(INFINITE - 1) : (DWORD)ms;
+}
+#endif
+
 /* =========================================================================
  * EVENT QUEUES
  * ========================================================================= */
@@ -217,9 +232,13 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 int64_t sys_event_queue_destroy(ppu_context* ctx)
 {
     uint32_t queue_id = LV2_ARG_U32(ctx, 0);
+    /* r4 = mode: 0, or SYS_EVENT_QUEUE_DESTROY_FORCE. It was ignored. */
+    int32_t  mode     = LV2_ARG_S32(ctx, 1);
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
+    if (mode != 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE)
+        return (int64_t)(int32_t)CELL_EINVAL;
 
     evt_table_lock();
 
@@ -229,14 +248,52 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
         return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
+    /* Receivers blocked in the queue. This used to delete the lock and
+     * condition variable under them: a receiver parked with no timeout never
+     * woke again. lv2: a plain destroy with waiters is EBUSY; FORCE wakes every
+     * waiter with CELL_ECANCELED. The lock and condition variable are
+     * deliberately NOT destroyed: a receiver that passed its unlocked `active`
+     * test just before this can still enter them safely and will see !active,
+     * and create re-initialises them when the slot is reused. */
 #ifdef _WIN32
-    DeleteCriticalSection(&q->lock);
+    EnterCriticalSection(&q->lock);
+    if (q->waiters > 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE) {
+        LeaveCriticalSection(&q->lock);
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+    q->active = 0;
+    WakeAllConditionVariable(&q->not_empty);
+    while (q->waiters > 0) {            /* let them return ECANCELED first */
+        LeaveCriticalSection(&q->lock);
+        SwitchToThread();
+        EnterCriticalSection(&q->lock);
+    }
+    LeaveCriticalSection(&q->lock);
 #else
-    pthread_cond_destroy(&q->not_empty);
-    pthread_mutex_destroy(&q->lock);
+    pthread_mutex_lock(&q->lock);
+    if (q->waiters > 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE) {
+        pthread_mutex_unlock(&q->lock);
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+    q->active = 0;
+    pthread_cond_broadcast(&q->not_empty);
+    while (q->waiters > 0) {
+        pthread_mutex_unlock(&q->lock);
+        sched_yield();
+        pthread_mutex_lock(&q->lock);
+    }
+    pthread_mutex_unlock(&q->lock);
 #endif
 
-    q->active = 0;
+    /* Ports still wired to this queue are now unconnected: a send answers
+     * ENOTCONN, and the stale index can no longer deliver into whatever queue
+     * next reuses this slot. */
+    for (int i = 0; i < SYS_EVENT_PORT_MAX; i++)
+        if (g_sys_event_ports[i].active && g_sys_event_ports[i].connected_queue == (int32_t)queue_id)
+            g_sys_event_ports[i].connected_queue = 0;
+
     evt_table_unlock();
     return CELL_OK;
 }
@@ -477,6 +534,13 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
+    if (!q->active) {                   /* destroyed since the unlocked test */
+        LeaveCriticalSection(&q->lock);
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    /* Counted while inside (every return below gives it back): destroy needs it
+     * for its EBUSY / FORCE decision and to know when we are out. */
+    q->waiters++;
 
     /* EVT_RECV_KICK=<qid>:<ms>: an infinite wait on that queue that sees
      * nothing for <ms> gets the last event pushed to the queue re-delivered.
@@ -490,6 +554,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         while (q->count == 0 && q->active && !q->cancelled) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, s_kms) && q->count == 0) {
                 sys_event_t evt = s_last_evt[queue_id - 1];
+                q->waiters--;
                 LeaveCriticalSection(&q->lock);
                 { static int n = 0; if (n++ < 16)
                     fprintf(stderr, "[evt] EVT_RECV_KICK: q=%u idle %lu ms -> re-delivered last event\n",
@@ -510,6 +575,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
         }
         if (q->count == 0 && q->cancelled) {
+            q->waiters--;
             LeaveCriticalSection(&q->lock);
             return (int64_t)(int32_t)CELL_ECANCELED;
         }
@@ -522,26 +588,45 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
          * return ETIMEDOUT immediately if empty -- same result the game already
          * handles, just without the bogus 15ms stall. */
         if (q->count == 0 || !q->active) {
+            q->waiters--;
             LeaveCriticalSection(&q->lock);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
     } else {
-        DWORD ms = (DWORD)(timeout_us / 1000);
+        /* Wait to an absolute deadline. A fixed `timeout_us / 1000` per wait
+         * truncated (1500 us became 1 ms) and restarted the FULL timeout after
+         * every wake that found the queue empty (another receiver took the
+         * event), so a contended timed receive could overrun without bound.
+         * The slice is rounded up, so it never returns before the guest's
+         * timeout, and an event that lands right at the deadline is still
+         * taken (the loop re-tests the count before giving up). Past 2^40 us
+         * (12.7 days) the QPC arithmetic would wrap; that is forever anyway. */
+        const int64_t deadline = lv2_usec_deadline(timeout_us < (1ull << 40) ? timeout_us : (1ull << 40));
         while (q->count == 0 && q->active && !q->cancelled) {
-            if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
-                if (GetLastError() == ERROR_TIMEOUT) {
-                    LeaveCriticalSection(&q->lock);
-                    return (int64_t)(int32_t)CELL_ETIMEDOUT;
-                }
+            const DWORD ms = evt_ms_until(deadline);
+            if (ms == 0) {
+                q->waiters--;
+                LeaveCriticalSection(&q->lock);
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
+            SleepConditionVariableCS(&q->not_empty, &q->lock, ms);
         }
     }
 
-    if (q->count == 0 && q->cancelled) {
+    if (!q->active) {
+        /* Destroyed with SYS_EVENT_QUEUE_DESTROY_FORCE while we waited: lv2
+         * hands every waiter CELL_ECANCELED. */
+        q->waiters--;
         LeaveCriticalSection(&q->lock);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
-    if (!q->active || q->count == 0) {
+    if (q->count == 0 && q->cancelled) {
+        q->waiters--;
+        LeaveCriticalSection(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
+    if (q->count == 0) {
+        q->waiters--;
         LeaveCriticalSection(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
@@ -550,9 +635,15 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     q->head = (q->head + 1) % q->capacity;
     q->count--;
 
+    q->waiters--;
     LeaveCriticalSection(&q->lock);
 #else
     pthread_mutex_lock(&q->lock);
+    if (!q->active) {                   /* destroyed since the unlocked test */
+        pthread_mutex_unlock(&q->lock);
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    q->waiters++;                       /* see the _WIN32 branch */
 
     if (timeout_us == 0) {
         while (q->count == 0 && q->active && !q->cancelled) {
@@ -569,18 +660,26 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
         while (q->count == 0 && q->active && !q->cancelled) {
             int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
-            if (rc == ETIMEDOUT) {
+            if (rc == ETIMEDOUT && q->count == 0) {
+                q->waiters--;
                 pthread_mutex_unlock(&q->lock);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
     }
 
-    if (q->count == 0 && q->cancelled) {
+    if (!q->active) {                   /* FORCE-destroyed while waiting */
+        q->waiters--;
         pthread_mutex_unlock(&q->lock);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
-    if (!q->active || q->count == 0) {
+    if (q->count == 0 && q->cancelled) {
+        q->waiters--;
+        pthread_mutex_unlock(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
+    if (q->count == 0) {
+        q->waiters--;
         pthread_mutex_unlock(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
@@ -589,6 +688,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     q->head = (q->head + 1) % q->capacity;
     q->count--;
 
+    q->waiters--;
     pthread_mutex_unlock(&q->lock);
 #endif
 
