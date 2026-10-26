@@ -92,6 +92,9 @@ static atomic_int          s_closed;
 #if !TARGET_OS_IPHONE
 static id                  s_window_close_observer;
 #endif
+/* The window's content size in device pixels, kept current by the message pump (main thread) and read
+ * by the present path, which sizes the drawable to it. 0 until the first pump. */
+static volatile u32        s_win_px_w, s_win_px_h;
 static int                 s_ready;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
@@ -831,7 +834,14 @@ static int create_window_impl(const char* title)
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
+    /* PS3RECOMP_METAL_WINDOW=<w>x<h>: initial content size in points (default: the game's size). */
     NSRect frame = NSMakeRect(0, 0, (CGFloat)s_width, (CGFloat)s_height);
+    {
+        unsigned ww = 0, wh = 0;
+        const char* ws = getenv("PS3RECOMP_METAL_WINDOW");
+        if (ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 160 && wh >= 90 && ww <= 16384 && wh <= 16384)
+            frame.size = NSMakeSize((CGFloat)ww, (CGFloat)wh);
+    }
     s_window = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -864,10 +874,17 @@ static int create_window_impl(const char* title)
     [view setWantsLayer:YES];
     [view setLayer:s_layer];
 
+    [s_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     if (was_fullscreen) [s_window toggleFullScreen:nil];
     fps_start();
+    /* PS3RECOMP_FULLSCREEN=1, the same for every backend: start in fullscreen (a window handed over from another
+     * executable keeps the state it had); the picture is letterboxed as in a resized window. */
+    {
+        const char* fs = getenv("PS3RECOMP_FULLSCREEN");
+        if (!was_fullscreen && fs && fs[0] && fs[0] != '0') [s_window toggleFullScreen:nil];
+    }
     return 0;
 }
 
@@ -4219,13 +4236,23 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     }
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture     = dst;
-    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+    rp.colorAttachments[0].loadAction  = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor  = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return;
+    /* In the window the picture keeps its aspect ratio: fitted into the drawable and centred, black around it. The
+     * headless and host-surface targets are the size the title asked for and are filled as before. */
+    const double dw = (double)[dst width], dh = (double)[dst height];
+    const double sw = (double)[src width], sh = (double)[src height];
+    const int fill = s_headless || s_host;
+    const double fit = fmin(dw / sw, dh / sh);
+    const double vw = fill ? dw : floor(sw * fit + 0.5), vh = fill ? dh : floor(sh * fit + 0.5);
+    [e setViewport:(MTLViewport){floor((dw - vw) * 0.5), floor((dh - vh) * 0.5), vw, vh, 0.0, 1.0}];
     [e setRenderPipelineState:s_eng_blit_pso];
     [e setFragmentTexture:src atIndex:0];
-    [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
+    const int scaled = !fill && (vw != sw || vh != sh);   /* a resized window filters; 1:1 and the fixed targets stay point-sampled */
+    [e setFragmentSamplerState:(scaled ? s_default_sampler : s_eng_point_sampler) atIndex:0];
     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
      * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
      * sharpening taps are one source texel apart. */
@@ -4272,6 +4299,14 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 }
                 dst = s_host_tex[host_slot];
             } else {
+                /* The drawable is the window's size in device pixels, so the compositor does not
+                 * stretch it; eng_blit_to_display fits the game picture into it. */
+                const u32 ww = s_win_px_w, wh = s_win_px_h;
+                const CGSize cur = s_layer.drawableSize;
+                if (ww && wh && ((u32)cur.width != ww || (u32)cur.height != wh)) {
+                    s_layer.drawableSize = CGSizeMake((CGFloat)ww, (CGFloat)wh);
+                    fprintf(stderr, "[RSX metal] drawable %ux%u (window)\n", ww, wh);
+                }
                 drawable = [s_layer nextDrawable];
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);
@@ -4683,6 +4718,12 @@ static int pump_messages_impl(void)
                 continue;
             }
             [NSApp sendEvent:ev];
+        }
+        if (s_window) {
+            NSView* v = [s_window contentView];
+            const NSSize px = [v convertSizeToBacking:[v bounds].size];
+            s_win_px_w = (u32)px.width;
+            s_win_px_h = (u32)px.height;
         }
     }
 #endif

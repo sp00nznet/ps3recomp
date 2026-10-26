@@ -1749,8 +1749,11 @@ static void vk_window_open(const char* title)
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;
     }
-    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
-    if (vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    /* Resizable and maximizable; F11 or Alt+Enter switches to borderless fullscreen and back. The frame keeps its
+     * aspect ratio inside whatever size the window has (vk_window_fit). */
+    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    /* PS3RECOMP_FULLSCREEN=1 (--fullscreen), the same for every backend; PS3RECOMP_VK_FULLSCREEN is the older name. */
+    if (vk_env_on("PS3RECOMP_FULLSCREEN") || vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                    (int)s_vk.width, (int)s_vk.height, flags);
@@ -1761,6 +1764,8 @@ static void vk_window_open(const char* title)
         vk_window_drop(why);
         return;
     }
+    SDL_SetWindowMinimumSize(s_vk.window, 320, 180);
+    if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) SDL_ShowCursor(SDL_DISABLE);
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
         !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
@@ -1776,6 +1781,7 @@ static void vk_window_open(const char* title)
            SDL_GetCurrentVideoDriver(), n);
 }
 
+/* 0 on success, 1 when the window has no drawable area right now (the old swapchain is kept), -1 on failure. */
 static int vk_create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -1820,7 +1826,7 @@ static int vk_create_swapchain(void)
         if (ext.width  > caps.maxImageExtent.width)  ext.width  = caps.maxImageExtent.width;
         if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
     }
-    if (!ext.width || !ext.height) { VK_LOG("window has no drawable area\n"); return -1; }
+    if (!ext.width || !ext.height) return 1;   /* minimized: no drawable area, try again once it is shown */
 
     u32 count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
@@ -1872,16 +1878,56 @@ static int vk_create_swapchain(void)
     return 0;
 }
 
+/* The window changed size (or fullscreen state) since the swapchain was made: it is recreated before the next acquire.
+ * Also set while the window is minimized, when there is no drawable area to make one for. */
+static int s_vk_resized;
+
+/* Minimized, or no drawable area: nothing can be presented, and a swapchain cannot be created for it. */
+static int vk_window_hidden(void)
+{
+    int w = 0, h = 0;
+    if (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) return 1;
+    SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &h);
+    return w <= 0 || h <= 0;
+}
+
 static void vk_swapchain_lost(void)
 {
+    if (vk_window_hidden()) { s_vk_resized = 1; return; }   /* recreated once it is shown again */
     vk_device_idle();
-    if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
+    const int r = vk_create_swapchain();
+    s_vk_resized = r > 0;     /* the surface is 0x0 before SDL reports the window minimized */
+    if (r < 0) vk_window_drop("the swapchain could not be recreated");
+}
+
+/* Where the frame goes in the swapchain image: the largest rectangle of the frame's aspect ratio, centred. The rest
+ * of the image is black (letterbox or pillarbox). */
+typedef struct { u32 x, y, w, h; } vk_rect;
+
+static vk_rect vk_window_fit(void)
+{
+    const u32 dw = s_vk.sc_extent.width, dh = s_vk.sc_extent.height;
+    vk_rect r = { 0, 0, dw, dh };
+    if (!s_vk.width || !s_vk.height) return r;
+    if ((u64)dw * s_vk.height > (u64)dh * s_vk.width) {
+        r.w = (u32)(((u64)dh * s_vk.width + s_vk.height / 2) / s_vk.height);
+        r.x = (dw - r.w) / 2;
+    } else {
+        r.h = (u32)(((u64)dw * s_vk.height + s_vk.width / 2) / s_vk.width);
+        r.y = (dh - r.h) / 2;
+    }
+    return r;
 }
 
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
+    if (vk_window_hidden()) return;
+    if (s_vk_resized) {
+        vk_swapchain_lost();
+        if (!s_vk.windowed || s_vk_resized) return;
+    }
 
     u32 idx = 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
@@ -1908,12 +1954,19 @@ static void vk_present_window(void)
     };
     pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                           0, 0, NULL, 0, NULL, 1, &b);
+    const vk_rect fit = vk_window_fit();
+    if (fit.w != s_vk.sc_extent.width || fit.h != s_vk.sc_extent.height) {
+        /* The bars. The clear and the blit write disjoint pixels, so they need no barrier between them. */
+        static const VkClearColorValue black = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+        pvkCmdClearColorImage(cb, s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
+                              &b.subresourceRange);
+    }
     VkImageBlit blit = {
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstOffsets = { { 0, 0, 0 },
-                        { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
+        .dstOffsets = { { (int32_t)fit.x, (int32_t)fit.y, 0 },
+                        { (int32_t)(fit.x + fit.w), (int32_t)(fit.y + fit.h), 1 } },
     };
     pvkCmdBlitImage(cb, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -4033,6 +4086,19 @@ int rsx_vulkan_backend_pump_messages(void)
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
+                 (e.key.keysym.sym == SDLK_F11 ||
+                  (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
+            /* Borderless fullscreen on the window's display, and back. */
+            const int full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+            if (SDL_SetWindowFullscreen(s_vk.window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
+                SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
+            s_vk_resized = 1;
+        } else if (e.type == SDL_WINDOWEVENT &&
+                   (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
+                    e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
+            s_vk_resized = 1;
+        }
     }
     return quit ? -1 : 0;
 }
