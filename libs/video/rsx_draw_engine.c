@@ -1165,6 +1165,27 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, 
                    src + (size_t)rsx_swizzle_offset_3d(x, y, z, lw, lh, ld) * bpp, bpp);
 }
 
+/* Slice z of a block-compressed 3D level in NVIDIA's VTC layout
+ * (https://registry.khronos.org/OpenGL/extensions/NV/NV_texture_compression_vtc.txt),
+ * into dst in plain S3TC order. Slices go in groups of four, and each 4x4x4
+ * block is four consecutive 4x4 blocks, one per layer; the d % 4 slices left
+ * over form a last group of 4x4x1, 4x4x2 or 4x4x3 blocks. So block i of slice
+ * z is at (4 * floor(z / 4) * blocks + i * n + z % 4) * block_bytes, n the
+ * layer count of z's group. For full groups that is the spec's blockIndex; for
+ * the last group the spec's formula stores the slices one after another, which
+ * contradicts its prose for d % 4 >= 2, and the prose is followed. `blocks` is
+ * the blocks in one slice. Only a volume whose width and height are powers of
+ * two is stored this way; any other is slice after slice. */
+static void eng_unvtc_3d_slice(u8* dst, const u8* src, u32 blocks, u32 d, u32 z, u32 block_bytes)
+{
+    const u32 group = z & ~3u;
+    const u32 n = group + 4 <= d ? 4 : d - group;
+    const u8* base = src + (size_t)group * blocks * block_bytes;
+    for (u32 i = 0; i < blocks; i++)
+        memcpy(dst + (size_t)i * block_bytes,
+               base + ((size_t)i * n + (z & 3)) * block_bytes, block_bytes);
+}
+
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
@@ -1248,9 +1269,12 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (!nlv || !lv[0].tl.face_bytes) return 0;
     /* A volume: every slice of every level decoded and uploaded on its own.
      * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
-     * first slice and sampled in 2D it darkened whole boxes round every prop. */
+     * first slice and sampled in 2D it darkened whole boxes round every prop.
+     * A DXT volume too: a retail title's explosion smoke is a 256x256x16 DXT5
+     * animation, and its first 64 KB read as one 2D image (four slices'
+     * blocks interleaved) drew dark squares where the smoke was. */
     if (!into && depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
-        !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
+        (lv[0].tl.compressed || lv[0].tl.bytes_per_texel)) {
         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
         const u8* src = eng_guest_ptr(NULL, location, offset, span);
         if (!src) return 0;
@@ -1261,13 +1285,19 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         u32 d = depth;
         for (u32 m = 0; m < nlv; m++) {
             const rsx_tex_layout* tl = &lv[m].tl;
+            const int vtc = tl->compressed && !(lv[m].w & (lv[m].w - 1u)) &&
+                            !(lv[m].h & (lv[m].h - 1u));
             const u32 lin_bytes = tl->swizzled ? tl->row_bytes * tl->rows : 0u;
             if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows + lin_bytes)) {
                 g.be->texture_release(g.be->user, handle);
                 return 0;
             }
             for (u32 z = 0; z < d; z++) {
-                if (tl->swizzled) {
+                if (vtc) {
+                    /* Block rows go up as they are (rsx_texture_decode only copies them). */
+                    eng_unvtc_3d_slice(g.tex_staging, level_src, tl->face_bytes / tl->block_bytes, d, z,
+                                       tl->block_bytes);
+                } else if (tl->swizzled) {
                     u8* lin = g.tex_staging + tl->dst_row_bytes * tl->rows;
                     eng_deswizzle_3d_slice(lin, level_src, lv[m].w, lv[m].h, d, z, tl->bytes_per_texel);
                     rsx_tex_layout ltl = *tl; ltl.swizzled = 0;

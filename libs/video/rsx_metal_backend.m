@@ -3113,12 +3113,17 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
     (void)user;
     id<MTLTexture> t = eng_obj(handle);
     if (!t || !src || !row_bytes) return;
+    /* A block-compressed slice is rows of 4x4 blocks. */
+    const MTLPixelFormat pf = [t pixelFormat];
+    const int bc = pf == MTLPixelFormatBC1_RGBA || pf == MTLPixelFormatBC2_RGBA ||
+                   pf == MTLPixelFormatBC3_RGBA;
+    const u32 rows = bc ? (h + 3u) / 4u : h;
     [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1)
          mipmapLevel:mip
                slice:0
            withBytes:src
          bytesPerRow:row_bytes
-       bytesPerImage:(NSUInteger)row_bytes * h];
+       bytesPerImage:(NSUInteger)row_bytes * rows];
 }
 
 static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,

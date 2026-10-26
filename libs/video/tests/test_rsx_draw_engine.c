@@ -796,6 +796,134 @@ static void test_texture_sparse_rehash(void)
 
 /* ---- 4. the pipeline key ------------------------------------------------- */
 
+/* A block-compressed volume (dimension 3, DXT) goes up slice by slice as a
+ * 3D texture. A retail title's explosion smoke is a 256x256x16 DXT5 volume;
+ * uploaded as the 2D image its first 64 KB make, it drew dark squares. */
+#define VOL_MIPS 3
+#define VOL_SLICES 8
+static struct {
+    int n_create, n_upload;
+    u32 depth, row_bytes[VOL_MIPS];
+    u8 slice[VOL_MIPS][VOL_SLICES][128];   /* the first bytes of each slice's upload */
+} g_vol;
+
+static u32 stub_texture_create_3d(void* u, rsx_be_format f, u32 w, u32 h, u32 depth,
+                                  u32 mips, u32 remap, u32 rsx_fmt)
+{
+    g_vol.n_create++;
+    g_vol.depth = depth;
+    return stub_texture_create(u, f, w, h, mips, 1, remap, rsx_fmt);
+}
+
+static void stub_texture_upload_3d(void* u, u32 t, u32 z, u32 mip, u32 w, u32 h,
+                                   const void* src, u32 row_bytes)
+{
+    (void)u; (void)t; (void)w;
+    g_vol.n_upload++;
+    if (mip >= VOL_MIPS || z >= VOL_SLICES || !src) return;
+    g_vol.row_bytes[mip] = row_bytes;
+    const u32 bytes = row_bytes * ((h + 3u) / 4u);   /* one slice of block rows */
+    memcpy(g_vol.slice[mip][z], src, bytes < 128u ? bytes : 128u);
+}
+
+/* Block i of slice z of level m, as the volume's guest bytes mark it. */
+static int volume_block_is(u32 m, u32 z, u32 i, u32 block_bytes)
+{
+    const u8* b = g_vol.slice[m][z] + i * block_bytes;
+    return b[0] == (u8)(0xA0u + m * 0x10u + z) && b[1] == (u8)i;
+}
+
+/* Lay level m (w x h blocks, d slices) out at `at` in VTC order (power-of-two
+ * sides) or slice after slice, each block marked with its level, slice and
+ * index. Returns the level's size. */
+static u32 volume_level(u32 at, u32 m, u32 blocks, u32 d, u32 block_bytes, int vtc)
+{
+    const u32 full = d & ~3u;
+    for (u32 z = 0; z < d; z++)
+        for (u32 i = 0; i < blocks; i++) {
+            u32 n = z * blocks + i;
+            if (vtc) {
+                const u32 group = z < full ? z & ~3u : full, stride = z < full ? 4u : d - full;
+                n = group * blocks + i * stride + (z - group);
+            }
+            vm_base[at + n * block_bytes]      = (u8)(0xA0u + m * 0x10u + z);
+            vm_base[at + n * block_bytes + 1u] = (u8)i;
+        }
+    return blocks * d * block_bytes;
+}
+
+static void bind_volume(u32 fmt, u32 w, u32 h, u32 depth, u32 mips)
+{
+    m(M_TEX_UNIT + 0x00, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x04, 2u | (3u << 4) | (fmt << 8) | (mips << 16));   /* main, 3D */
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    m(M_TEX_UNIT + 0x10, 0xAAE4u);
+    m(M_TEX_UNIT + 0x18, (w << 16) | h);
+    m(0x1840 /* control3 */, depth << 20);
+}
+
+static void test_compressed_volume(void)
+{
+    printf("-- compressed volume\n");
+    rsx_draw_backend be = g_stub_backend;
+    be.texture_create_3d = stub_texture_create_3d;
+    be.texture_upload_3d = stub_texture_upload_3d;
+
+    /* 8x8x6 DXT5: four blocks a slice. Power-of-two sides, so VTC order:
+     * slices 0-3 interleaved block by block, then 4-5 the same way. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    volume_level(TEX_OFFSET, 0, 4, 6, 16, 1);
+    bind_volume(0x88, 8, 8, 6, 1);
+    draw_triangle();
+    int ok = g_vol.n_create == 1 && g_vol.depth == 6 && g_vol.n_upload == 6 && g_vol.row_bytes[0] == 32;
+    for (u32 z = 0; z < 6 && ok; z++)
+        for (u32 i = 0; i < 4; i++) ok &= volume_block_is(0, z, i, 16);
+    CHECK(ok, "a power-of-two DXT5 volume goes up as 6 slices out of VTC order "
+              "(%d created, depth %u, %d uploads, row %u)",
+          g_vol.n_create, g_vol.depth, g_vol.n_upload, g_vol.row_bytes[0]);
+    engine_down();
+
+    /* 12x4x2: not a power of two, so slice after slice as they lie. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    volume_level(TEX_OFFSET, 0, 3, 2, 16, 0);
+    bind_volume(0x88, 12, 4, 2, 1);
+    draw_triangle();
+    ok = g_vol.n_create == 1 && g_vol.n_upload == 2 && g_vol.row_bytes[0] == 48;
+    for (u32 z = 0; z < 2 && ok; z++)
+        for (u32 i = 0; i < 3; i++) ok &= volume_block_is(0, z, i, 16);
+    CHECK(ok, "a non-power-of-two DXT5 volume goes up slice after slice "
+              "(%d created, %d uploads, row %u)",
+          g_vol.n_create, g_vol.n_upload, g_vol.row_bytes[0]);
+    engine_down();
+
+    /* 16x16x8 DXT1 with three levels: 16 blocks x 8 slices (two groups of
+     * four), 4 blocks x 4 slices (one group), 1 block x 2 slices (a group of
+     * two), each level in VTC order after the one before. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    u32 at = TEX_OFFSET;
+    at += volume_level(at, 0, 16, 8, 8, 1);
+    at += volume_level(at, 1, 4, 4, 8, 1);
+    volume_level(at, 2, 1, 2, 8, 1);
+    bind_volume(0x86, 16, 16, 8, 3);
+    draw_triangle();
+    static const u32 blocks[VOL_MIPS] = {16, 4, 1}, slices[VOL_MIPS] = {8, 4, 2}, rows[VOL_MIPS] = {32, 16, 8};
+    ok = g_vol.n_create == 1 && g_vol.n_upload == 8 + 4 + 2;
+    for (u32 lv = 0; lv < VOL_MIPS && ok; lv++) {
+        ok &= g_vol.row_bytes[lv] == rows[lv];
+        for (u32 z = 0; z < slices[lv]; z++)
+            for (u32 i = 0; i < blocks[lv]; i++) ok &= volume_block_is(lv, z, i, 8);
+    }
+    CHECK(ok, "a DXT1 volume's every level goes up out of its own VTC order "
+              "(%d created, %d uploads)", g_vol.n_create, g_vol.n_upload);
+    engine_down();
+}
+
 static void test_pipeline_key(void)
 {
     printf("-- pipeline key\n");
@@ -2456,6 +2584,7 @@ int main(void)
     test_texture_cache();
     test_texture_lookup_memo();
     test_texture_sparse_rehash();
+    test_compressed_volume();
     test_pipeline_key();
     test_restart_expansion();
     test_indexed_runs();
