@@ -22,8 +22,8 @@ extern "C" {
 #define CELL_VOICE_ERROR_PORT_NOT_FOUND      0x80310804
 #define CELL_VOICE_ERROR_OUT_OF_MEMORY       0x80310805
 #define CELL_VOICE_ERROR_SERVICE_DETACHED    0x80310806
-/* Codes as RPCS3's cellVoice.h names them; used by the port-control calls
- * below, which follow RPCS3's semantics. */
+/* Sony PS3 SDK 4.00: cell/voiceTypes.h; libvoice Reference 4.0.0,
+ * p. 60 (Define Summary). These are the SDK's port-control error codes. */
 #define CELL_VOICE_ERROR_ARGUMENT_INVALID    0x80310805
 #define CELL_VOICE_ERROR_TOPOLOGY            0x80310807
 #define CELL_VOICE_ERROR_DEVICE_NOT_PRESENT  0x80310812
@@ -84,7 +84,8 @@ s32 cellVoiceGetPortInfo(CellVoicePortId portId, CellVoicePortParam* param);
 s32 cellVoiceWriteToIPort(CellVoicePortId portId, const void* data, u32* size);
 s32 cellVoiceReadFromOPort(CellVoicePortId portId, void* data, u32* size);
 
-/* Port control. These take the real (big-endian) CellVoicePortParam:
+/* Port control. SDK libvoice Reference 4.0.0, pp. 8, 33, 41, 53.
+ * These take the guest (big-endian) CellVoicePortParam:
  * portType u32 @0, threshold u16 @4, bMute u16 @6, volume f32 @8,
  * union @12 (voice.bitrate u32 for IN_VOICE/OUT_VOICE ports). */
 s32 cellVoiceResetPort(CellVoicePortId portId);
