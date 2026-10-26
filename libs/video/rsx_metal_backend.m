@@ -826,10 +826,41 @@ static void window_close_observer_start(NSWindow* window)
         }];
 }
 
+/* The menu's Quit item does what Cmd+Q does: it posts that key press, and the message pump (pump_messages_impl) turns it
+ * into ps3_host_quit. The one place that calls it is the pump, so a program that links the backend without the HLE
+ * modules (the Metal tests) needs no stub for it as long as it never pumps. */
+@interface RsxQuitTarget : NSObject
+- (void)quit:(id)sender;
+@end
+@implementation RsxQuitTarget
+- (void)quit:(id)sender
+{
+    (void)sender;
+    NSEvent* q = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+                             modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:0 context:nil
+                                characters:@"q" charactersIgnoringModifiers:@"q" isARepeat:NO keyCode:0x0C];
+    [NSApp postEvent:q atStart:YES];
+}
+@end
+static RsxQuitTarget* s_quit_target;
+
 static int create_window_impl(const char* title)
 {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    {   /* A plain run loop has no menu bar, so the app menu was empty: a "Quit <title>" item is all it gets. */
+        s_quit_target = [RsxQuitTarget new];
+        NSMenu* bar = [NSMenu new];
+        NSMenuItem* appItem = [NSMenuItem new];
+        [bar addItem:appItem];
+        NSMenu* appMenu = [NSMenu new];
+        NSString* quitTitle = [@"Quit " stringByAppendingString:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
+        NSMenuItem* quit = [[NSMenuItem alloc] initWithTitle:quitTitle action:@selector(quit:) keyEquivalent:@"q"];
+        [quit setTarget:s_quit_target];
+        [appMenu addItem:quit];
+        [appItem setSubmenu:appMenu];
+        [NSApp setMainMenu:bar];
+    }
 
     NSRect frame = NSMakeRect(0, 0, (CGFloat)s_width, (CGFloat)s_height);
     s_window = [[NSWindow alloc]
@@ -4670,16 +4701,22 @@ static int pump_messages_impl(void)
                                                 inMode:NSDefaultRunLoopMode
                                                dequeue:YES];
             if (!ev) break;
-            /* Cmd+Q quits. The host turns a plain run loop with no app menu,
-             * so AppKit has no Quit item to send it to and nothing happened.
-             * It ends the game the way the console's Quit Game does
-             * (cellSysutil.c ps3_host_quit: REQUEST_EXITGAME, then exit 0). */
+            /* Cmd+Q quits. A plain run loop has no app menu, so AppKit had no
+             * Quit item to send it to and nothing happened; it is taken here, before
+             * the menu's key equivalent could be, and ends the game the way the
+             * console's Quit Game does (cellSysutil.c ps3_host_quit: REQUEST_EXITGAME,
+             * then exit 0). The menu's Quit item (create_window_impl) does the same. */
             if ([ev type] == NSEventTypeKeyDown && ([ev keyCode] & 127u) == 0x0C /* Q */ &&
                 ([ev modifierFlags] & NSEventModifierFlagCommand)) {
                 if (![ev isARepeat]) {
                     extern void ps3_host_quit(const char* why);
                     ps3_host_quit("Cmd+Q");
                 }
+                continue;
+            }
+            /* The pad reads the keyboard by polling (cellPad), so the other key events have no consumer here: the
+             * window would answer each with the system alert sound. */
+            if ([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) {
                 continue;
             }
             [NSApp sendEvent:ev];
