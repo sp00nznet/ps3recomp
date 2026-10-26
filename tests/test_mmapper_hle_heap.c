@@ -18,6 +18,9 @@ static void vm_write32(uint32_t a,uint32_t v) {
     uint8_t* p=vm_base+a;p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;
 }
 extern int64_t sys_mmapper_allocate_memory(ppu_context*);
+/* The old _sys_heap_delete_heap forwarded to this, which only knows the ids of
+ * the s_heaps table and so answers ESRCH for a _sys_heap_create_heap id. */
+s32 sys_heap_destroy_heap(sys_heap_t heap) { (void)heap; return (s32)CELL_ESRCH; }
 static void slot_lock(void) {}
 static void slot_unlock(void) {}
 /* Exact production heap definitions/functions, copied without modification by
@@ -90,5 +93,28 @@ int main(void) {
     reset();vm_write32(0x10000,0xAABBCCDDu);
     CHECK(reserve(0x80000000,0x10000000)!=(int64_t)CELL_OK);CHECK(out()==0xAABBCCDDu);
     CHECK(reserve(0x100000,0x100000)==CELL_OK);CHECK(out()==0x40000000u);
+    /* Heap bounds. A request larger than the window can never fit, and one
+     * whose size + alignment + header wraps 32 bits used to come back as a tiny
+     * block. */
+    reset();
+    CHECK(yz_heap_alloc(YZ_HEAP_END-YZ_HEAP_BASE+1u,16)==0);
+    CHECK(yz_heap_alloc(0xFFFFFFF0u,16)==0);
+    CHECK(yz_heap_alloc(0x100,0xFFFFFFF0u)==0);
+    CHECK(s_heap_bump==0);
+    /* A request that does not fit in what is left must fail WITHOUT moving the
+     * bump pointer past the end of the window; the next small request still
+     * succeeds, inside the window. (The pointer used to be advanced first, so
+     * after one failure every later request failed or wrapped.) */
+    reset();CHECK(vm_commit(YZ_HEAP_END-0x1000,0x1000)==CELL_OK);
+    s_heap_bump=YZ_HEAP_END-0x1000;
+    CHECK(yz_heap_alloc(0x10000,16)==0);
+    CHECK(s_heap_bump==YZ_HEAP_END-0x1000);
+    uint32_t tail=yz_heap_alloc(16,16);
+    CHECK(tail>=YZ_HEAP_BASE && tail+16<=YZ_HEAP_END);
+    CHECK(s_heap_bump<=YZ_HEAP_END);
+    /* Deleting a heap made by _sys_heap_create_heap is CELL_OK. */
+    u32 heap=_sys_heap_create_heap(0,0,0,0);
+    CHECK(heap!=0);
+    CHECK(_sys_heap_delete_heap(heap)==CELL_OK);
     vm_shutdown();printf("PASS %u mapper/HLE heap checks\n",checks);return 0;
 }

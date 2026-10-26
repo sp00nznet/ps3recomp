@@ -378,6 +378,7 @@ static void rsx_present_frame(void)
 }
 static int rsx_pump_messages(void)
 { return s_rsx_live ? rsx_null_backend_pump_messages() : rsx_backend_pump(); }
+extern "C" void ps3_host_quit(const char* why);   /* libs/system/cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
 
 /* Frames handed to the backend at a guest FLIP boundary -- one per frame the
  * guest actually finished, which is the number a port means by "is anything
@@ -538,7 +539,13 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
               static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
-            if (rsx_pump_messages() != 0) { rsx_ok = 0; }
+            if (rsx_pump_messages() != 0) {
+                rsx_ok = 0;
+                /* The window was closed (or ESC pressed): quit as the console's Quit Game does -- every
+                 * registered sysutil callback gets CELL_SYSUTIL_REQUEST_EXITGAME, so the title can finish a
+                 * save and exit -- instead of leaving the guest running with no window. Once only. */
+                ps3_host_quit("window closed");
+            }
             if (getenv("YDKJ_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
