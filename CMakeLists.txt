@@ -277,6 +277,21 @@ if(UNIX)
                 endif()
             endforeach()
         endif()
+        # The translator's identity in the MSL translation cache: a hash of its
+        # sources, so a rebuild that changes nothing keeps the cached files and
+        # an edit to the translator retires them. (Its build time did the
+        # latter too, and threw the whole cache away on every rebuild.)
+        set(_msl_sources libs/video/rsx_shader_msl.cpp libs/video/rsx_shader_msl.h)
+        set(_msl_text "")
+        foreach(f IN LISTS _msl_sources)
+            file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${f}" _h)
+            string(APPEND _msl_text "${_h}")
+        endforeach()
+        string(SHA256 _msl_id "${_msl_text}")
+        string(SUBSTRING "${_msl_id}" 0 23 _msl_id)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_msl_sources})
+        target_compile_definitions(ps3recomp_msl_translation INTERFACE
+            "PS3RECOMP_MSL_TRANSLATOR_ID=\"${_msl_id}\"")
         target_link_libraries(ps3recomp_runtime PRIVATE ps3recomp_msl_translation)
         set(PS3RECOMP_MSL_TRANSLATION ON)
         message(STATUS "  Shaders:      guest programs translated to MSL (glslang ${glslang_VERSION}, ${SPVC_LIBS})")
