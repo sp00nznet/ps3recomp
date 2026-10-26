@@ -39,6 +39,7 @@ s32 sceNpEulaCheckEulaStatus(u32 communicationId, u32 arg2, u64 arg3,
 s32 sceNpEulaAbort(void);                                             /* NID 0x5EC05AD8 */
 s32 sceNpEulaShowCurrentEula(u32 communicationId, u64 arg2,
                              u32 cbFunc, u32 cbFuncArg);              /* NID 0x6599500D */
+s32 cellSysutilNpEulaCheck(void* cb, void* arg);                      /* Legacy compatibility stub */
 
 /* Called by cellSysutilCheckCallback: moves a pending answer to the guest
  * callback queue, which that same poll drains (RPCS3's sysutil_register_cb). */

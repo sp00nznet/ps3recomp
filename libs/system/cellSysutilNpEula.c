@@ -122,3 +122,10 @@ void ps3_np_eula_tick(void)
     if (kind == EULA_CHECK)
         printf("[cellSysutilNpEula] callback status=%u delivered\n", status);
 }
+
+s32 cellSysutilNpEulaCheck(void* cb, void* arg)
+{
+    (void)cb; (void)arg;
+    printf("[cellSysutilNpEula] cellSysutilNpEulaCheck (compat stub) -> accepted\n");
+    return 1;
+}
