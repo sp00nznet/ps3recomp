@@ -48,3 +48,24 @@ set_tests_properties(lock_line PROPERTIES
     LABELS "runtime;syscalls"
     TIMEOUT 30
 )
+
+# sys_ppu_thread_join / detach through the real sys_ppu_thread.c with host
+# threads: the slot a join frees stays free (Windows), self-join, second joiner.
+add_executable(test_ppu_thread_join test_ppu_thread_join.c)
+target_include_directories(test_ppu_thread_join PRIVATE
+    "${PS3RECOMP_ROOT}/runtime/syscalls"
+    "${PS3RECOMP_ROOT}/runtime"
+    "${PS3RECOMP_ROOT}/include"
+)
+if(MSVC)
+    target_compile_definitions(test_ppu_thread_join PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_ppu_thread_join PRIVATE -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_ppu_thread_join PRIVATE Threads::Threads)
+endif()
+add_test(NAME ppu_thread_join COMMAND test_ppu_thread_join)
+set_tests_properties(ppu_thread_join PROPERTIES
+    LABELS "runtime;syscalls"
+    TIMEOUT 120
+)
