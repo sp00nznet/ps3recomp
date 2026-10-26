@@ -145,6 +145,9 @@ static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
+#ifdef _WIN32
+static unsigned g_audio_holes[CELL_AUDIO_PORT_MAX];   /* AUDIO_RATE: empty blocks right after a block with sound */
+#endif
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -492,6 +495,17 @@ static void audio_mix_one_block(void)
                         p, (unsigned long long)port->read_index, block_idx, map);
             } } }
 
+#ifdef _WIN32   /* reported by the Windows mix thread's AUDIO_RATE */
+        /* AUDIO_RATE: a block with nothing in it right after one with sound is a hole, the guest's audio engine late
+         * with it (what the mix then plays is a click or a gap, whatever the device does). */
+        { static int hole_on = -1; static u32 prev_nz[CELL_AUDIO_PORT_MAX];
+          if (hole_on < 0) hole_on = getenv("AUDIO_RATE") ? 1 : 0;
+          if (hole_on) { int nz = 0;
+            for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 2) if (src[s2] != 0.0f) { nz = 1; break; }
+            if (!nz && prev_nz[p]) g_audio_holes[p]++;
+            prev_nz[p] = nz; } }
+#endif
+
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             float left, right;
             if (nch >= 2) {
@@ -559,6 +573,26 @@ static void audio_notify_event_queues(void)
     }
 }
 
+/* The loudest sample of the block just mixed (AUDIO_PEAK). */
+static float audio_mix_peak(void)
+{
+    float pk = 0.0f;
+    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+        const float a = s_mix_buffer[i] < 0 ? -s_mix_buffer[i] : s_mix_buffer[i];
+        if (a > pk) pk = a;
+    }
+    return pk;
+}
+
+/* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
+ * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
+static void audio_dump_mix(void)
+{
+    static FILE* wf = (FILE*)-1;
+    if (wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); wf = e ? fopen(e, "wb") : NULL; }
+    if (wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wf);
+}
+
 #ifdef _WIN32
 static unsigned long long g_audio_underruns;
 static unsigned __stdcall audio_mix_thread_func(void* arg)
@@ -613,16 +647,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
          * "is any port producing sound" is answerable (LBP Bink movie audio). */
         { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
-          if (_ap) { static unsigned _n = 0; float pk = 0.0f;
-            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-                float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
+          if (_ap) { static unsigned _n = 0; const float pk = audio_mix_peak();
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
-        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
-         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
-        { static FILE* _wf = (FILE*)-1;
-          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+        audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
@@ -631,14 +659,15 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
             if (now - t0 >= 5000) {
-                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u%c",
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u, holes %u+%u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
                         g_audio_underruns - u0,
                 #if AUDIO_BACKEND_WASAPI
-                        (unsigned)s_wasapi_buf_frames, 10);
+                        (unsigned)s_wasapi_buf_frames, g_audio_holes[0], g_audio_holes[1], 10);
 #else
-                        0u, 10);
+                        0u, g_audio_holes[0], g_audio_holes[1], 10);
 #endif
+                g_audio_holes[0] = g_audio_holes[1] = 0;
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
 
         /* Notify event queues */
@@ -654,10 +683,18 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    unsigned long blocks = 0; float peak = 0.0f;
     while (s_mix_thread_running) {
         audio_mix_one_block();
+        audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
+        /* AUDIO_PEAK=1: the loudest sample of every second of mixed output (187.5 blocks of 256). */
+        { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;
+          if (pk_on) {
+              const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
+              if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
+          } }
 
         u32 queued = audio_backend_queued_samples();
         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
