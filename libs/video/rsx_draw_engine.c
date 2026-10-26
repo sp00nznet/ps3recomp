@@ -996,7 +996,6 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 
     eng_zdepth* z = &g.zdepths[slot];
     /* The old size's snapshot goes with it: it can never be valid again. */
-    if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     if (z->conv) g.be->texture_release(g.be->user, z->conv);
     if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
