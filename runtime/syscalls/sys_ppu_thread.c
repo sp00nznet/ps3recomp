@@ -264,6 +264,24 @@ uint64_t ppu_thread_register_main(void)
     return 1;
 }
 
+/* Fill in the main thread's stack fields after the boot harness has chosen
+ * where the stack lives. register_main() memset()s the whole struct, so
+ * without this sys_ppu_thread_get_stack_information(49) finds tid 1 in the
+ * table with stack_addr/stack_size == 0 and reports a {0,0} stack -- a guest
+ * that dumps its own stack (RPCS3's dump_stack test) then calls
+ * cellFsWrite(fd, NULL, 0) and produces an empty file while the real kernel
+ * reports the actual region. RPCS3's main stack: base 0xD0010000, 1 MB. */
+void ppu_thread_set_main_stack(uint32_t stack_base, uint32_t stack_size)
+{
+    table_lock();
+    ppu_thread_info* t = &g_ppu_threads[0];
+    if (t->state != PPU_THREAD_STATE_FREE) {
+        t->stack_addr = stack_base;
+        t->stack_size = stack_size;
+    }
+    table_unlock();
+}
+
 /* ---------------------------------------------------------------------------
  * sys_ppu_thread_create
  *
