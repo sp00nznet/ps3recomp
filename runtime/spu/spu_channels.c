@@ -988,6 +988,20 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
+    /* The MFC parameter channels only latch a value in the context (see
+     * mfc_channel_write); the command write is what reaches the engine. Store
+     * them here and skip mfc_for for five or six of the eight or nine writes
+     * of every DMA. */
+    switch (channel) {
+    case MFC_LSA:       ctx->mfc_lsa = v;         return;
+    case MFC_EAH:       ctx->mfc_eah = v;         return;
+    case MFC_EAL:       ctx->mfc_eal = v;         return;
+    case MFC_Size:      ctx->mfc_size = v;        return;
+    case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+    default: break;
+    }
+
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
