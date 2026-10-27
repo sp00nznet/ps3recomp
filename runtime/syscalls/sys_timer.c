@@ -264,7 +264,32 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * and busy-spins at full speed (so the wait is effectively a no-op).
          * Busy-wait to a precise QPC deadline, yielding inside the spin
          * (SwitchToThread) so a sibling host thread the guest may be waiting on
-         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
+         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail.
+         *
+         * PS3_USLEEP_WAIT_US=<n> (default 0, off): a sub-millisecond sleep of
+         * at least n us waits on a high-resolution waitable timer instead. The
+         * spin keeps a logical processor busy for the whole sleep, and a
+         * thread that polls with ~800 us sleeps (GoW:A's EdgeWatchdog) holds
+         * one all the time; such a poller only needs to wake roughly on time. */
+        static int s_wait_us = -1;
+        if (s_wait_us < 0) { const char* e = getenv("PS3_USLEEP_WAIT_US"); s_wait_us = e ? atoi(e) : 0; }
+        if (s_wait_us > 0 && usec >= (uint64_t)s_wait_us) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+            static __declspec(thread) HANDLE t_timer;
+            if (!t_timer)
+                t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                 TIMER_ALL_ACCESS);
+            if (t_timer) {
+                LARGE_INTEGER due;
+                due.QuadPart = -((LONGLONG)usec * 10);
+                if (SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE)) {
+                    WaitForSingleObject(t_timer, INFINITE);
+                    return CELL_OK;
+                }
+            }
+        }
         ensure_qpc_init();
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
