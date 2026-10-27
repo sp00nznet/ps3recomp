@@ -336,7 +336,7 @@ static unsigned __stdcall t1_watchdog(void* p)
         Sleep(100);
         if (sh->done_producing && sh->produced <= sh->consumed) return 0; /* test finished cleanly */
         if (sh->produced > sh->consumed) {
-            ULONGLONG stalled_for = now_ms() - (ULONGLONG)sh->last_progress_ms;
+            ULONGLONG stalled_for = (DWORD)(now_ms() - (ULONGLONG)(DWORD)sh->last_progress_ms);   /* mod 2^32: the stamps are 32-bit */
             if (stalled_for > T1_STALL_MS) {
                 fprintf(stderr, "[FAIL] test1_no_lost_wakeup: STUCK: no consumption progress for "
                         ">%dms with produced=%ld consumed=%ld (possible lost wakeup)\n",
@@ -406,7 +406,7 @@ static unsigned __stdcall t1b_watchdog(void* p)
         Sleep(50);
         if (sh->woke) return 0;
         if (sh->parked_at_ms != 0) {
-            ULONGLONG since_park = now_ms() - (ULONGLONG)sh->parked_at_ms;
+            ULONGLONG since_park = (DWORD)(now_ms() - (ULONGLONG)(DWORD)sh->parked_at_ms);   /* mod 2^32: the stamps are 32-bit */
             if (since_park > (ULONGLONG)(T1B_PARK_DELAY_MS + T1B_STALL_MS)) {
                 fprintf(stderr, "[FAIL] test1b_rendezvous_park: consumer parked >%dms ago and "
                         "never woke (signal delivered to an already-sleeping waiter was lost)\n",
