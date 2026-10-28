@@ -18,6 +18,7 @@
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+#include "../../include/ps3emu/guest_host_thread.h" /* the GCM interrupt thread's host stack */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
@@ -928,10 +929,9 @@ static int gcm_handler_thread_on(void)
     if (v < 0) { const char* e = getenv("GCM_HANDLER_THREAD"); v = (e && *e && *e != '0') ? 1 : 0; }
     return v;
 }
-#ifndef _WIN32
-#include <pthread.h>
-#endif
-static DWORD WINAPI gcm_intr_main(LPVOID unused)
+/* The handlers run guest code, so the thread gets the host stack a guest PPU
+ * thread does (guest_host_thread.h): their call chains are as deep. */
+static void gcm_intr_main(void* unused)
 {
     (void)unused;
     s_gcm_intr_tid = (unsigned long)GetCurrentThreadId();
@@ -940,12 +940,7 @@ static DWORD WINAPI gcm_intr_main(LPVOID unused)
 #else
     for (;;) { ppu_gcm_pump(); usleep(250); }
 #endif
-    return 0;
 }
-
-#ifndef _WIN32
-static void* gcm_intr_posix(void* a) { gcm_intr_main(a); return NULL; }
-#endif
 
 void ppu_gcm_pump(void)
 {
@@ -959,11 +954,7 @@ void ppu_gcm_pump(void)
     if (gcm_handler_thread_on() && (unsigned long)GetCurrentThreadId() != s_gcm_intr_tid) {
         static volatile long started = 0;
         if (!started && InterlockedCompareExchange(&started, 1, 0) == 0)
-#ifdef _WIN32
-            CreateThread(NULL, 1u << 20, gcm_intr_main, NULL, 0, NULL);
-#else
-        { pthread_t t; if (pthread_create(&t, NULL, gcm_intr_posix, NULL) == 0) pthread_detach(t); }
-#endif
+            ps3_guest_host_thread_start(gcm_intr_main, NULL);
         return;   /* only the interrupt thread delivers */
     }
     if (!GCM_PUMP_TRY_ENTER()) return;
