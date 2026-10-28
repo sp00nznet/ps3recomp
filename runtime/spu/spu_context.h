@@ -564,6 +564,9 @@ SPU_GATE int g_wws_read_probe = 0;
 SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
 SPU_GATE int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
 SPU_GATE int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
+/* SPURS_PM_TRACE_WID: the policy-module context whose run is being traced
+ * (spurs_policy.c sets it for the run; its DMAs and atomics are printed). */
+SPU_GATE void* volatile g_spurs_pm_trace_ctx = 0;
 static inline int spu_ls_wws_probe_on(void)
 {
     if (g_spu_wws_probe < 0) g_spu_wws_probe = getenv("SPU_WWS_PROBE") ? 1 : 0;

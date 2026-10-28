@@ -624,8 +624,13 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     spu_coh_notify_write(taskset_ea);
     spu_lockline_unlock();
     for (int i = 0; i < n_start; i++) {
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
+        /* Per-task lines: the first few, then only with PS3_VERBOSE. A title
+         * that starts ten tasks a frame (God of War: Ascension's particle work)
+         * otherwise writes them all through the one stderr lock. */
+        { static int _n = 0;
+          if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+            fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                            "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task); }
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
         spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
     }
@@ -839,9 +844,11 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
-                            "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                    { static int _n = 0;
+                      if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+                        fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                                "taskset=0x%08X task=%u\n", j->image_id,
+                                j->taskset_ea, j->taskid); }
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -979,8 +986,10 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
-                    "(job ran to completion, did not loop)\n", j->image_id, rc);
+            { static int _n = 0;
+              if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+                fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                        "(job ran to completion, did not loop)\n", j->image_id, rc); }
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
         }
@@ -1166,7 +1175,13 @@ void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_
             int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
             while (hw <= i && !__atomic_compare_exchange_n(&s_parked_hw, &hw, i + 1, 1,
                                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-            s_parked_obj[i] = wait_obj; s_parked[i] = key;
+            /* Claim the slot: two tasks parking at once found the same free
+             * one, and the second store left the first task unlisted -- "not
+             * parked" for as long as it waited. */
+            uint64_t expect = 0;
+            if (!__atomic_compare_exchange_n(&s_parked[i], &expect, key, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+            s_parked_obj[i] = wait_obj;
             __atomic_fetch_add(&s_parked_count, 1, __ATOMIC_RELAXED);
             return;
         }
@@ -1177,7 +1192,8 @@ void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
         if (s_parked[i] == key) {
-            s_parked[i] = 0;
+            s_parked_obj[i] = 0;   /* "unknown" until the next owner sets its own */
+            __atomic_store_n(&s_parked[i], 0, __ATOMIC_RELEASE);
             __atomic_fetch_sub(&s_parked_count, 1, __ATOMIC_RELAXED);
             return;
         }
@@ -1310,9 +1326,36 @@ static void spu_taskset_wake_written(void* opaque)
 }
 
 /* Deliver a signal to a task (callable from any PPU/host thread). */
+/* SPU_SIG_TRACE=<ea>[,<ea>...] (hex, up to 8): 128-byte lines to follow --
+ * a taskset (its signalled bitset is at +0x40), a barrier, a control block.
+ * Every atomic commit to them, every WAIT_SIGNAL of a task of a listed
+ * taskset and every runtime-delivered signal is printed with a time stamp. */
+static int spu_sig_trace_hit(uint32_t ea)
+{
+    static uint32_t lines[8];
+    static int n = -1;
+    if (n < 0) {
+        int k = 0;
+        const char* e = getenv("SPU_SIG_TRACE");
+        while (e && *e && k < 8) {
+            lines[k++] = (uint32_t)strtoul(e, NULL, 16) & ~127u;
+            while (*e && *e != ',') e++;
+            if (*e == ',') e++;
+        }
+        n = k;
+    }
+    for (int i = 0; i < n; i++) if (lines[i] == (ea & ~127u)) return 1;
+    return 0;
+}
+
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return;
+    if (spu_sig_trace_hit(taskset_ea)) {   /* SPU_SIG_TRACE */
+        extern unsigned long long ps3_ms_now(void);
+        fprintf(stderr, "[sig] %llu SIGNAL task=%08X/%u from the runtime (caller %p)\n",
+                ps3_ms_now(), taskset_ea, taskId, __builtin_return_address(0));
+    }
     /* Update before taking s_sig_lock: watched-line notifications run under
      * lock-line and take s_sig_lock, so lock-line must never nest inside it. */
     spu_signalled_update(taskset_ea, taskId, 1);
@@ -1355,8 +1398,37 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * line holding a parked taskset's signalled bitset is committed; a commit
  * that did not signal them only costs a spurious wake, which the wait loop
  * re-checks. */
+/* Every taskset created through cellSpursCreateTaskset/Taskset2. An SPU task
+ * creates a task the way the SPU task library does: it sets the task's
+ * enabled and pending bits with a PUTLLC on the taskset's first line. Nothing
+ * here started such a task unless a task of that same taskset exited later,
+ * and the task that creates one usually belongs to another taskset. God of War:
+ * Ascension's particle work runs in two phases: the last of five tasks in one
+ * taskset creates the next five in a sibling, and the main thread waits for
+ * them. */
+#define SPU_TASKSETS_MAX 32
+static volatile uint32_t s_tasksets[SPU_TASKSETS_MAX];
+static volatile int s_n_tasksets;
+
+void spu_taskset_register(uint32_t ea)
+{
+    const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) if (s_tasksets[i] == ea) return;
+    if (n < SPU_TASKSETS_MAX) {
+        s_tasksets[n] = ea;
+        __atomic_store_n(&s_n_tasksets, n + 1, __ATOMIC_RELEASE);
+    }
+}
+
 void spu_taskset_line_committed(uint32_t line)
 {
+    /* A commit to a taskset's first line (its bitsets) may have created a
+     * task: start whatever is enabled, ready or pending, and not running. */
+    {
+        const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < n; i++)
+            if (s_tasksets[i] == line) { spu_taskset_start_pending(line); break; }
+    }
     /* Nothing parked -- the whole run, for a title that never parks a taskset
      * task -- costs one load instead of a 64-slot scan; otherwise only the
      * slots below the high-water mark can hold a parked task. Slot order, and
@@ -1548,9 +1620,11 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
-        (unsigned long long)fp, args_ea, image_id);
+    { static int _n = 0;
+      if (ps3_log_verbose() || PS3_LOG_FIRST(_n, 32))
+        fprintf(stderr,
+            "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
+            (unsigned long long)fp, args_ea, image_id); }
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
         static int _d=0; if (PS3_LOG_FIRST(_d, 1)) {
             /* Dump a larger window of the task context buffer + scan for any word

@@ -647,8 +647,66 @@ static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
  * parsing) attributes guest and runtime code exactly. */
 static FILE*     s_samp_rva_file;
 static uint32_t* s_samp_rvas;
+static uint8_t*  s_samp_rva_cls;              /* PS3_SAMPLE_THREAD: the name each matched */
+static int8_t*   s_samp_rva_wid;              /* and the workload a SPURS worker was running */
+static uint32_t* s_samp_rva_caller;           /* outside the executable: its caller in it */
 static uint32_t  s_samp_rva_n, s_samp_rva_cap;
-static void samp_rva_record(uintptr_t rip)
+
+/* PS3_SAMPLE_THREAD=<name>[,<name>...]: sample only the threads whose name
+ * (ps3_thread_name: "spurs pm", "spu job", "ppu main", ...) starts with one of
+ * these, each of them every period, and write each RVA with the index of the
+ * name it matched and, for a SPURS policy-module worker, the workload it was
+ * running ("<rva> <index> <wid> <caller>", -1 for none; the first line lists the
+ * names). A sample outside the executable -- a wait in ntdll or kernelbase --
+ * also gets the first return address into the executable's code found on the
+ * thread's stack (0 if none in its first 4 KB), so a wait is named by what
+ * waited.
+ * The whole-process walk samples one thread at a time through a snapshot and
+ * cannot split the SPU workers from the main thread; this can. */
+#define SAMP_NAMES 8
+static char s_samp_names[SAMP_NAMES][32];
+static int  s_samp_nnames;
+
+extern "C" int spurs_pm_current_wid(unsigned long tid);   /* libs/spurs/cellSpurs.c */
+
+/* Whether the code before v ends with a call (E8 rel32, or FF /2 with any of
+ * its address forms): a stack word that points into .text but is not a return
+ * address -- a function pointer kept in a frame, say -- fails it. */
+static int samp_after_call(uintptr_t v)
+{
+    const uint8_t* p = (const uint8_t*)v;
+    if (p[-5] == 0xE8) return 1;
+    for (int n = 2; n <= 7; n++)
+        if (p[-n] == 0xFF && (p[-n + 1] & 0x38) == 0x10) return 1;
+    return 0;
+}
+
+/* The first return address into the executable's .text in the 4 KB above a
+ * suspended thread's RSP, as an RVA, or 0. The system frames between a wait
+ * and its caller are small, so the first word that is in .text and follows a
+ * call is the caller nearly always. */
+static uint32_t samp_exe_caller(const CONTEXT* c)
+{
+    static uintptr_t base, lo, hi;
+    if (!base) {
+        const uintptr_t b = (uintptr_t)GetModuleHandleA(NULL);
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(b + ((const IMAGE_DOS_HEADER*)b)->e_lfanew);
+        const IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++)
+            if (!memcmp(sh[i].Name, ".text", 6)) { lo = b + sh[i].VirtualAddress; hi = lo + sh[i].Misc.VirtualSize; }
+        base = b;
+    }
+    if (!lo) return 0;
+    const uintptr_t* sp = (const uintptr_t*)c->Rsp;
+    for (int i = 0; i < 512; i++) {
+        uintptr_t v;
+        __try { v = sp[i]; } __except (1) { return 0; }
+        if (v >= lo + 8 && v < hi && samp_after_call(v)) return (uint32_t)(v - base);
+    }
+    return 0;
+}
+
+static void samp_rva_record(uintptr_t rip, int cls = 0, int wid = -1, uint32_t caller = 0)
 {
     if (!s_samp_rva_file) return;
     static uintptr_t base, end;
@@ -661,17 +719,83 @@ static void samp_rva_record(uintptr_t rip)
         uint32_t cap = s_samp_rva_cap ? s_samp_rva_cap * 2 : 65536;
         uint32_t* n = (uint32_t*)realloc(s_samp_rvas, cap * sizeof *n);
         if (!n) return;
-        s_samp_rvas = n; s_samp_rva_cap = cap;
+        s_samp_rvas = n;
+        uint8_t* k = (uint8_t*)realloc(s_samp_rva_cls, cap);
+        if (!k) return;
+        s_samp_rva_cls = k;
+        int8_t* w = (int8_t*)realloc(s_samp_rva_wid, cap);
+        if (!w) return;
+        s_samp_rva_wid = w;
+        uint32_t* cl = (uint32_t*)realloc(s_samp_rva_caller, cap * sizeof *cl);
+        if (!cl) return;
+        s_samp_rva_caller = cl; s_samp_rva_cap = cap;
     }
+    s_samp_rva_caller[s_samp_rva_n] = caller;
+    s_samp_rva_cls[s_samp_rva_n] = (uint8_t)cls;
+    s_samp_rva_wid[s_samp_rva_n] = (int8_t)(wid >= -1 && wid < 128 ? wid : -1);
     s_samp_rvas[s_samp_rva_n++] = (rip >= base && rip < end) ? (uint32_t)(rip - base) : 0u;
 }
 static void samp_rva_flush(void)
 {
     if (!s_samp_rva_file) return;
     fprintf(s_samp_rva_file, "# %llu ms\n", (unsigned long long)GetTickCount64());  /* block end */
-    for (uint32_t i = 0; i < s_samp_rva_n; i++) fprintf(s_samp_rva_file, "%x\n", s_samp_rvas[i]);
+    for (uint32_t i = 0; i < s_samp_rva_n; i++) {
+        if (s_samp_nnames) fprintf(s_samp_rva_file, "%x %u %d %x\n", s_samp_rvas[i],
+                                   s_samp_rva_cls[i], s_samp_rva_wid[i], s_samp_rva_caller[i]);
+        else               fprintf(s_samp_rva_file, "%x\n", s_samp_rvas[i]);
+    }
     fflush(s_samp_rva_file);
     s_samp_rva_n = 0;
+}
+
+/* One sample of a named thread, taken after the thread was resumed: nothing
+ * here may run while it is suspended, since the record can realloc and the
+ * module query takes the loader lock, and the thread may hold either. */
+static void samp_take(DWORD tid, uintptr_t rip, int cls, int wid, uint32_t caller)
+{
+    s_samp_total++;
+    samp_rva_record(rip, cls, wid, caller);
+    uint32_t g = samp_lookup(rip);
+    if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(tid); samp_tid2(tid, 1, 0); }
+    else { int nt = samp_mod_hit(rip); if (!nt) samp_rva_hit(rip); samp_tid2(tid, 0, nt); }
+}
+
+struct SampThread { DWORD tid; HANDLE h; int cls; };
+
+/* The threads PS3_SAMPLE_THREAD names, found again every second (workers come
+ * and go); their handles stay open in between. */
+static int samp_list_named(SampThread* th, int cap, DWORD self)
+{
+    typedef HRESULT (WINAPI *get_desc_fn)(HANDLE, PWSTR*);
+    static const get_desc_fn get_desc = (get_desc_fn)(void*)GetProcAddress(
+        GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    if (!get_desc) return 0;
+    const DWORD pid = GetCurrentProcessId();
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te; te.dwSize = sizeof te;
+    for (BOOL ok = Thread32First(snap, &te); ok && n < cap; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                              THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        char name[48] = "";
+        PWSTR w = NULL;
+        if (SUCCEEDED(get_desc(h, &w)) && w) {
+            int i = 0;
+            for (; w[i] && i < 47; i++) name[i] = (char)(w[i] < 128 ? w[i] : '?');
+            name[i] = 0;
+        }
+        if (w) LocalFree(w);
+        int cls = -1;
+        for (int k = 0; k < s_samp_nnames && cls < 0; k++)
+            if (strncmp(name, s_samp_names[k], strlen(s_samp_names[k])) == 0) cls = k;
+        if (cls < 0) { CloseHandle(h); continue; }
+        th[n].tid = te.th32ThreadID; th[n].h = h; th[n].cls = cls; n++;
+    }
+    CloseHandle(snap);
+    return n;
 }
 
 static DWORD WINAPI samp_thread(LPVOID p)
@@ -688,6 +812,48 @@ static DWORD WINAPI samp_thread(LPVOID p)
     unsigned long long next_report = t0 + early[0];
     samp_build_map();
     if (const char* f = getenv("PS3_SAMPLE_RVAS")) s_samp_rva_file = fopen(f, "w");
+    if (s_samp_nnames) {
+        if (s_samp_rva_file) {
+            fprintf(s_samp_rva_file, "#! threads");
+            for (int k = 0; k < s_samp_nnames; k++)
+                fprintf(s_samp_rva_file, "%c%s", k ? '|' : ' ', s_samp_names[k]);
+            fprintf(s_samp_rva_file, "\n");
+        }
+        static SampThread th[64];
+        int nth = 0;
+        unsigned long long relist = 0;
+        for (;;) {
+            if (GetTickCount64() >= relist) {
+                for (int i = 0; i < nth; i++) CloseHandle(th[i].h);
+                nth = samp_list_named(th, 64, self);
+                relist = GetTickCount64() + 1000;
+            }
+            for (int i = 0; i < nth; i++) {
+                if (SuspendThread(th[i].h) == (DWORD)-1) continue;
+                CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+                const BOOL got = GetThreadContext(th[i].h, &c);
+                const int wid = spurs_pm_current_wid(th[i].tid);   /* plain loads */
+                static uintptr_t exe_lo, exe_hi;
+                if (!exe_lo) {
+                    exe_lo = (uintptr_t)GetModuleHandleA(NULL);
+                    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(exe_lo + ((const IMAGE_DOS_HEADER*)exe_lo)->e_lfanew);
+                    exe_hi = exe_lo + nt->OptionalHeader.SizeOfImage;
+                }
+                const uint32_t caller = (got && (c.Rip < exe_lo || c.Rip >= exe_hi)) ? samp_exe_caller(&c) : 0;
+                ResumeThread(th[i].h);
+                if (got) samp_take(th[i].tid, (uintptr_t)c.Rip, th[i].cls, wid, caller);
+            }
+            Sleep(period);
+            if (GetTickCount64() >= next_report) {
+                fprintf(stderr, "[samp] --- report at t=%llums (%d threads) ---\n",
+                        (unsigned long long)(GetTickCount64() - t0), nth);
+                samp_report();
+                samp_rva_flush();
+                if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
+                else next_report = GetTickCount64() + 10000;
+            }
+        }
+    }
     /* PS3_SAMPLE_MAIN and PS3_SAMPLE_DRAIN sample one thread: open it once
      * rather than walk a snapshot of every thread in the process each period,
      * which held the rate to about 17 samples a second. The drain's thread is
@@ -825,6 +991,14 @@ void ps3_sampler_start(void)
     s_samp_boot_tid = GetCurrentThreadId();
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
     s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
+    for (const char* t = getenv("PS3_SAMPLE_THREAD"); t && *t && s_samp_nnames < SAMP_NAMES; ) {
+        const char* c = strchr(t, ',');
+        size_t len = c ? (size_t)(c - t) : strlen(t);
+        if (len >= sizeof s_samp_names[0]) len = sizeof s_samp_names[0] - 1;
+        if (len) { memcpy(s_samp_names[s_samp_nnames], t, len);
+                   s_samp_names[s_samp_nnames++][len] = 0; }
+        t = c ? c + 1 : t + strlen(t);
+    }
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */

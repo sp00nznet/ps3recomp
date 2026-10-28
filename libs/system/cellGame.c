@@ -328,6 +328,15 @@ const char* cellGame_get_hdd_title_id(void)
     return s_game_type == CELL_GAME_GAMETYPE_HDD && s_title_id[0] ? s_title_id : NULL;
 }
 
+/* Whether the title was started as a game patch (CATEGORY GP over a disc
+ * game). The port boots the title itself, never a patch. */
+s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved)
+{
+    (void)size; (void)reserved;
+    printf("[cellGame] PatchCheck() -> not a patch\n");
+    return CELL_GAME_ERROR_NOTPATCH;
+}
+
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)
 {

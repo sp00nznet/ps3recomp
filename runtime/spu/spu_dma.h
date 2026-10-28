@@ -1550,6 +1550,18 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* Policy-module observation trace: every SPURS PM run's first transfers,
      * always on (policy runs are rare and their DMA pattern is the primary
      * bring-up signal: joblist fetch, job-module loads, output stores). */
+    if (spu->policy_mode && (void*)spu == g_spurs_pm_trace_ctx) {
+        /* SPURS_PM_TRACE_WID: what the traced run moves, with the first words
+         * of the source (guest memory for a GET, local store for a PUT). */
+        const int get = mfc_is_get(cmd);
+        const uint8_t* src = get ? vm_base + (uint32_t)ea : spu->ls + (lsa & SPU_LS_MASK);
+        const uint32_t n = size < 32 ? size : 32;
+        fprintf(stderr, "[pm-wid]   %s cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X tag=%u pc=0x%05X:",
+                get ? "GET" : "PUT", cmd, lsa, (uint32_t)ea, size, tag, (uint32_t)spu->pc & SPU_LS_MASK);
+        for (uint32_t o = 0; o + 4 <= n; o += 4)
+            fprintf(stderr, " %02X%02X%02X%02X", src[o], src[o + 1], src[o + 2], src[o + 3]);
+        fprintf(stderr, "\n");
+    }
     if (spu->policy_mode) {
         static int _pn = 0;
         /* Cap the boot-time flood, but reopen the trace once the PPU is at the

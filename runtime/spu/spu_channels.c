@@ -577,6 +577,28 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
+/* SPU_SIG_TRACE=<ea>[,<ea>...] (hex, up to 8): 128-byte lines to follow --
+ * a taskset (its signalled bitset is at +0x40), a barrier, a control block.
+ * Every atomic commit to them, every WAIT_SIGNAL of a task of a listed
+ * taskset and every runtime-delivered signal is printed with a time stamp. */
+static int spu_sig_trace_hit(uint32_t ea)
+{
+    static uint32_t lines[8];
+    static int n = -1;
+    if (n < 0) {
+        int k = 0;
+        const char* e = getenv("SPU_SIG_TRACE");
+        while (e && *e && k < 8) {
+            lines[k++] = (uint32_t)strtoul(e, NULL, 16) & ~127u;
+            while (*e && *e != ',') e++;
+            if (*e == ',') e++;
+        }
+        n = k;
+    }
+    for (int i = 0; i < n; i++) if (lines[i] == (ea & ~127u)) return 1;
+    return 0;
+}
+
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
@@ -592,6 +614,32 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
+    if (cmd != MFC_GETLLAR_CMD && spu_sig_trace_hit(ea)) {   /* SPU_SIG_TRACE */
+        extern unsigned long long ps3_ms_now(void);
+        const uint32_t tts = ((uint32_t)ctx->ls[0x27BC] << 24) | ((uint32_t)ctx->ls[0x27BD] << 16) |
+                             ((uint32_t)ctx->ls[0x27BE] << 8)  |  (uint32_t)ctx->ls[0x27BF];
+        const uint32_t tid = ctx->ls[0x27D7];
+        fprintf(stderr, "[sig] %llu %s ea=0x%08X img=%d pc=0x%05X lr=0x%05X task=%08X/%u:",
+                ps3_ms_now(), cmd == MFC_PUTLLC_CMD ? "PUTLLC" : "PUTLLUC", ea, ctx->image_id,
+                (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                ctx->policy_mode ? 0u : tts, ctx->policy_mode ? 0u : tid);
+        for (uint32_t o = 0; o < MFC_ATOMIC_LINE; o += 4) {
+            const uint32_t a = ((uint32_t)mem[o] << 24) | ((uint32_t)mem[o + 1] << 16) | ((uint32_t)mem[o + 2] << 8) | mem[o + 3];
+            const uint32_t b = ((uint32_t)ls[o] << 24) | ((uint32_t)ls[o + 1] << 16) | ((uint32_t)ls[o + 2] << 8) | ls[o + 3];
+            if (a != b) fprintf(stderr, " +%02X:%08X>%08X", o, a, b);
+        }
+        fprintf(stderr, "\n");
+    }
+    if ((void*)ctx == g_spurs_pm_trace_ctx) {   /* SPURS_PM_TRACE_WID */
+        const uint8_t* d = cmd == MFC_GETLLAR_CMD ? mem : ls;
+        fprintf(stderr, "[pm-wid]   %s ea=0x%08X lsa=0x%05X pc=0x%05X:",
+                cmd == MFC_GETLLAR_CMD ? "GETLLAR" : cmd == MFC_PUTLLC_CMD ? "PUTLLC" : "PUTLLUC",
+                ea, lsa, (uint32_t)ctx->pc & SPU_LS_MASK);
+        for (uint32_t o = 0; o < 0x50; o += 4)
+            fprintf(stderr, "%s%02X%02X%02X%02X", (o && !(o & 15)) ? " | " : " ",
+                    d[o], d[o + 1], d[o + 2], d[o + 3]);
+        fprintf(stderr, "\n");
+    }
 
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;
@@ -1165,7 +1213,11 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
 {
     const uint64_t t1 = ps3_ft_now();
     if (t1 - t0 < ps3_ft_min_ns()) return;
-    if (t_ft_busy0 && t0 > t_ft_busy0) {
+    /* Not for a policy module's context: its worker records each run as a
+     * busy span (cellSpurs.c), and t_ft_busy0 outlives the run, so the span
+     * from here would cover the time the worker sat idle between runs too --
+     * the trace showed more EDGE runs open than there are workers. */
+    if (t_ft_busy0 && t0 > t_ft_busy0 && !ctx->policy_mode) {
         const uint8_t* w = ctx->ls + 0x1DC;
         ps3_ft_span(PS3_FT_SPU_BUSY, ctx->spu_id, (uint32_t)ctx->image_id,
                     ((uint32_t)w[0] << 24) | ((uint32_t)w[1] << 16) | ((uint32_t)w[2] << 8) | w[3],
@@ -2357,14 +2409,26 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
             extern void spu_taskset_parked_add(uint32_t, uint32_t, uint32_t);
             extern void spu_taskset_parked_del(uint32_t, uint32_t);
             extern int spu_taskset_consume_wake(uint32_t);
+            const int sig_trace = spu_sig_trace_hit(ts);   /* SPU_SIG_TRACE */
+            extern unsigned long long ps3_ms_now(void);
             if (spu_taskset_consume_wake(ts)) {   /* a Set beat us to the park */
+                if (sig_trace)
+                    fprintf(stderr, "[sig] %llu WAIT task=%08X/%u lr=0x%05X: wake already owed, no wait\n",
+                            ps3_ms_now(), ts, tid, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
                 spu_ef_deliver_owed(ctx, wobj);
                 ctx->gpr[3]._u32[0] = 0;
                 return;
             }
+            const unsigned long long sig_t0 = sig_trace ? ps3_ms_now() : 0;
+            if (sig_trace)
+                fprintf(stderr, "[sig] %llu WAIT task=%08X/%u lr=0x%05X signalled=%02X\n",
+                        sig_t0, ts, tid, ctx->gpr[0]._u32[0] & SPU_LS_MASK, vm_base[ts + 0x40]);
             yz_lockstep_block_begin(ctx);
             spu_taskset_parked_add(ts, tid, wobj);
             spu_taskset_wait_signal(ts, tid);
+            if (sig_trace)
+                fprintf(stderr, "[sig] %llu WOKE task=%08X/%u after %llums signalled=%02X\n",
+                        ps3_ms_now(), ts, tid, ps3_ms_now() - sig_t0, vm_base[ts + 0x40]);
             spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);
             spu_ef_deliver_owed(ctx, wobj);
@@ -2654,6 +2718,12 @@ void spu_indirect_branch(spu_context* ctx)
                   fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                           n, ctx->gpr[3]._u32[0]); }
             ctx->gpr[3] = spu_make_preferred_u32(0);
+            /* The kernel's selection copies the instance's first line into the
+             * context's tempArea (LS 0x100) on every call, not only at module
+             * entry, and jobs that ran since may have overwritten it. */
+            { const uint32_t sp = ((uint32_t)ctx->ls[0x1C4] << 24) | ((uint32_t)ctx->ls[0x1C5] << 16) |
+                                  ((uint32_t)ctx->ls[0x1C6] << 8) | ctx->ls[0x1C7];
+              if (sp) memcpy(ctx->ls + 0x100, vm_base + sp, 0x80); }
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
