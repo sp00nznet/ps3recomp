@@ -987,7 +987,12 @@ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
  * done", which is exactly true here. */
 static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 
-static void cellFsAioRead(ppu_context* ctx)
+/* One id space for reads and writes: the completion callback and
+ * cellFsAioCancel tell requests apart by id alone, and with a counter each a
+ * read and a write in flight together could both be id 1. */
+static std::atomic<int32_t> s_aio_next_id{1};
+
+static void fs_aio_submit(ppu_context* ctx, bool write)
 {
     uint32_t aio    = (uint32_t)ctx->gpr[3];
     uint32_t id_ptr = (uint32_t)ctx->gpr[4];
@@ -998,81 +1003,49 @@ static void cellFsAioRead(ppu_context* ctx)
     uint32_t buf    = guest_be32(aio + 0x10);
     uint64_t size   = guest_be64(aio + 0x18);
 
-    static std::atomic<int32_t> s_next_id{1};
-    int32_t id = s_next_id++;
+    int32_t id = s_aio_next_id++;
     if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
 
     size_t n = 0;
     int32_t err = CELL_FS_ENOENT;
     if (FILE* f = fd_file(fd)) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
-        fs_prefault(buf, size);
-        /* AIO reads are absolute: they must not move the fd's own position,
-         * and the guest issues them from several threads at once (FIOS media
-         * threads, audio streamers) on the same fd as its plain reads. A bare
-         * seek + read on the shared FILE* did both: another thread's seek
-         * could land between the two, and the next cellFsRead continued from
-         * wherever the AIO stopped. Hold the stream lock across seek, read
-         * and the seek back (stdio's own calls take the same lock). */
+        if (!write) fs_prefault(buf, size);
+        /* AIO transfers are absolute: they must not move the fd's own
+         * position, and the guest issues them from several threads at once
+         * (FIOS media threads, audio streamers) on the same fd as its plain
+         * reads. A bare seek + read on the shared FILE* did both: another
+         * thread's seek could land between the two, and the next cellFsRead
+         * continued from wherever the AIO stopped. Hold the stream lock across
+         * seek, transfer and the seek back (stdio's own calls take the same
+         * lock). */
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
         if (HOST_FSEEK64(f, offset) == 0)
-            n = fread(vm_base + buf, 1, (size_t)size, f);
+            n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
+                      : fread(vm_base + buf, 1, (size_t)size, f);
+        if (write) fflush(f);
         if (pos >= 0) HOST_FSEEK64(f, pos);
         HOST_UNLOCKFILE(f);
-        err = CELL_OK;
+        err = (!write || n == size) ? CELL_OK : CELL_FS_EIO;
     }
     if (ps3_env_once("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
+        fprintf(stderr, "[fs] aio %s id=%d fd=%d off=%llu size=%llu -> %zu\n", write ? "write" : "read",
                 id, fd, (unsigned long long)offset, (unsigned long long)size, n);
 
     ctx->gpr[3] = CELL_OK;
     if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
+
+static void cellFsAioRead(ppu_context* ctx) { fs_aio_submit(ctx, false); }
 
 /* MLB The Show 16 copies files into its /dev_hdd1 cache in 64 KB chunks, each
  * written with cellFsAioWrite, and polls a status word its completion callback
  * sets. With the NID unresolved the submit "succeeded", nothing was written, the
  * callback never ran, and the boot parked on the first screen. Same contract and
  * the same synchronous-completion shortcut as cellFsAioRead above. */
-static void cellFsAioWrite(ppu_context* ctx)
-{
-    uint32_t aio    = (uint32_t)ctx->gpr[3];
-    uint32_t id_ptr = (uint32_t)ctx->gpr[4];
-    uint32_t cb_opd = (uint32_t)ctx->gpr[5];
-
-    int      fd     = (int)guest_be32(aio + 0x00);
-    uint64_t offset = guest_be64(aio + 0x08);
-    uint32_t buf    = guest_be32(aio + 0x10);
-    uint64_t size   = guest_be64(aio + 0x18);
-
-    static std::atomic<int32_t> s_next_id{1};
-    int32_t id = s_next_id++;
-    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
-
-    size_t n = 0;
-    int32_t err = CELL_FS_ENOENT;
-    if (FILE* f = fd_file(fd)) {
-        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
-        /* Absolute, like the read: leave the fd's own position where it was. */
-        HOST_LOCKFILE(f);
-        const int64_t pos = (int64_t)HOST_FTELL64(f);
-        if (HOST_FSEEK64(f, offset) == 0)
-            n = fwrite(vm_base + buf, 1, (size_t)size, f);
-        fflush(f);
-        if (pos >= 0) HOST_FSEEK64(f, pos);
-        HOST_UNLOCKFILE(f);
-        err = (n == size) ? CELL_OK : CELL_FS_EIO;
-    }
-    if (ps3_env_once("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio write id=%d fd=%d off=%llu size=%llu -> %zu\n",
-                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
-
-    ctx->gpr[3] = CELL_OK;
-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
-}
+static void cellFsAioWrite(ppu_context* ctx) { fs_aio_submit(ctx, true); }
 
 extern "C" void ppu_fs_register(void)
 {
