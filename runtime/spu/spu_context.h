@@ -295,14 +295,26 @@ typedef struct spu_context {
      * overlay is now resident; dispatch retries a missed lookup against it. */
     int resident_ovl;
     /* Independently streamed code buffers can coexist with the policy overlay.
-     * Each mapping records which translated image owns that local-store span. */
+     * Each mapping records which translated image owns that local-store span.
+     * A job holds its module, the code fragments it streams after it and a
+     * bigger block at once, hence the count. */
+#define SPU_RESIDENT_CODE_SLOTS 16
     struct {
         uint32_t lsa, size, source_ea;
         int image_id;
         /* 0: unchecked legacy region; otherwise SPU_OVERLAY_* state of a
          * region registered with its code bytes (spu_overlay_residency.h). */
         int verify_state, source_index;
-    } resident_code[4];
+        /* Position-independent code (spu_overlay_register_pic_region): it may
+         * land anywhere, and its functions are registered at lsa - pic_delta. */
+        int pic;
+        uint32_t pic_delta;
+    } resident_code[SPU_RESIDENT_CODE_SLOTS];
+    /* What position-independent lifted code adds to every local-store code
+     * address it computes (lqr/stqr, links, returns): its placement minus the
+     * address it was lifted at. Set by dispatch into it; each function reads
+     * it once, on entry. */
+    uint32_t pic_base;
 
     /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
      * context's current lifetime: 0 after spu_context_init (or a zeroed

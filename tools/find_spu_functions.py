@@ -175,15 +175,22 @@ def collect_branch_targets(insns):
     """
     targets = set()
     for ins in insns:
-        if ins.mnemonic not in _BRANCH_MNEMONICS:
-            continue
-        ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
-        for t in ops:
-            if t.startswith("0x"):
-                try:
-                    targets.add(int(t, 16))
-                except ValueError:
-                    pass
+        targets |= insn_branch_targets(ins)
+    return targets
+
+
+def insn_branch_targets(ins):
+    """The resolved target of one direct branch, as a set (empty otherwise)."""
+    targets = set()
+    if ins.mnemonic not in _BRANCH_MNEMONICS:
+        return targets
+    ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
+    for t in ops:
+        if t.startswith("0x"):
+            try:
+                targets.add(int(t, 16))
+            except ValueError:
+                pass
     return targets
 
 
@@ -580,8 +587,11 @@ def is_return(ins):
     return ops == ["$r0"]
 
 
-def find_end(start, insns_by_addr, sorted_starts, code_end):
-    """Walk forward from `start` until a terminator or the next function."""
+def find_end(start, insns_by_addr, sorted_starts, code_end, stop_at_data=False):
+    """Walk forward from `start` until a terminator or the next function.
+
+    With stop_at_data, a word that decodes to no instruction also ends it:
+    code does not run into data, so that is where the function stops."""
     # Index of next function start
     i = 0
     while i < len(sorted_starts) and sorted_starts[i] <= start:
@@ -593,6 +603,8 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
         ins = insns_by_addr.get(pc)
         if ins is None:
             break
+        if stop_at_data and ins.mnemonic == ".word":
+            return pc
         if is_return(ins):
             return pc + 4
         if ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH and not is_resuming_stop(ins):
@@ -605,7 +617,39 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
     return min(next_start, code_end)
 
 
-def detect_functions(buf, base_override=None, verbose=True, raw=False):
+def looks_like_code(start, insns_by_addr, code_end):
+    """Whether the straight line from `start` reaches a return or an
+    unconditional branch before it reaches a word that is not an instruction
+    or a branch past the end of the image. Read-only data that decodes as
+    instructions (strings, constants) rarely does."""
+    pc = start
+    while pc < code_end:
+        ins = insns_by_addr.get(pc)
+        if ins is None or ins.mnemonic == ".word":
+            return False
+        if any(t >= code_end for t in insn_branch_targets(ins)):
+            return False
+        if is_return(ins) or (ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH
+                              and not is_resuming_stop(ins)):
+            return True
+        pc += 4
+    return False
+
+
+def detect_functions(buf, base_override=None, verbose=True, raw=False, reachable=False):
+    """Function ranges of an SPU image.
+
+    By default every direct branch anywhere in the executable segment seeds a
+    function. An image without section headers has its read-only data in that
+    segment too (Edge's SPU programs keep their strings after the code), and a
+    data word that happens to decode as a branch then seeds a "function" made of
+    data. reachable=True seeds only from the entry, the symbols and the
+    indirect-target scans, then adds the direct branch targets of the functions
+    found that way until nothing new appears, and ends a function at the first
+    word that is not an instruction. A target from the indirect-target scans is
+    kept only if it looks like code (looks_like_code): those scans take any
+    immediate that is an address in the segment, and a pointer to a string is
+    one."""
     if raw:
         # A raw local-store image: a SPURS job binary, which the title loads
         # from its own data files as a flat code+data blob rather than as an
@@ -644,9 +688,10 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
             seed_starts.add(s["addr"])
             if s["size"] > 0:
                 sized_funcs.append((s["addr"], s["addr"] + s["size"]))
-    for t in collect_branch_targets(insns):
-        if code_start <= t < code_end:
-            seed_starts.add(t)
+    if not reachable:
+        for t in collect_branch_targets(insns):
+            if code_start <= t < code_end:
+                seed_starts.add(t)
     # Link-register resume addresses (`il`/`ila $r0, <code>` + a plain branch to
     # a stub that returns via `bi $r0`). Require the target to be 4-byte aligned
     # AND to decode as an instruction, so a scratch use of $r0 that happens to
@@ -659,7 +704,8 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
               | collect_ila_continuation_targets(insns, code_start, code_end)
               | collect_duff_targets(insns, code_start, code_end)
               | fptr_targets):
-        if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
+        if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr and \
+           (not reachable or looks_like_code(t, insns_by_addr, code_end)):
             seed_starts.add(t)
     if fptr_targets and verbose:
         print(f"  {len(fptr_targets)} data function-pointer-table target(s): "
@@ -670,8 +716,25 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     if not seed_starts:
         seed_starts.add(code_start)
 
-    sorted_starts = sorted(seed_starts)
     sized_by_start = {s: e for (s, e) in sized_funcs}
+    if reachable:
+        while True:
+            ordered = sorted(seed_starts)
+            new = set()
+            for start in ordered:
+                end = sized_by_start.get(start) or find_end(
+                    start, insns_by_addr, ordered, code_end, stop_at_data=True)
+                for pc in range(start, end, 4):
+                    ins = insns_by_addr.get(pc)
+                    if ins is not None:
+                        new |= {t for t in insn_branch_targets(ins)
+                                if code_start <= t < code_end and (t & 3) == 0}
+            new -= seed_starts
+            if not new:
+                break
+            seed_starts |= new
+
+    sorted_starts = sorted(seed_starts)
 
     # ---- end discovery ----
     funcs = []
@@ -679,7 +742,8 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
         if start in sized_by_start:
             end = sized_by_start[start]
         else:
-            end = find_end(start, insns_by_addr, sorted_starts, code_end)
+            end = find_end(start, insns_by_addr, sorted_starts, code_end,
+                           stop_at_data=reachable)
         if end > start:
             funcs.append((start, end))
 

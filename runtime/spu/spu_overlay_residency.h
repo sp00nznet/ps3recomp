@@ -29,6 +29,15 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code,
     unsigned count);
 
+/* The same for position-independent code, a piece a job streams to wherever
+ * it has room: lifted once at lift_lsa, it is resident wherever a GET from
+ * content_ea lands it. The segments are compared at that placement, and
+ * dispatch into it runs the function registered at the same offset from
+ * lift_lsa with ctx->pic_base set to the difference. */
+int spu_overlay_register_pic_region(uint32_t content_ea, uint32_t lift_lsa,
+    uint32_t span, int image_id, const spu_overlay_code_segment* code,
+    unsigned count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -471,6 +471,59 @@ static void test_verified_resident_code_regions(void)
     free(ctx);
 }
 
+/* Position-independent code: lifted once, resident wherever a GET from its
+ * EA lands it, run with ctx->pic_base set to that placement's distance from
+ * where it was lifted -- also when the dispatch cache answers. */
+static void code_pic(spu_context* ctx)
+{
+    ctx->gpr[3]._u32[0] = 86;
+    ctx->gpr[4]._u32[0] = ctx->pic_base;
+}
+static void test_pic_resident_code_regions(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate position-independent code context"); return; }
+    spu_context_init(ctx, 0);
+    const uint32_t lift = 0x30000, entry = 0x18, ea = 0x880000;
+    const uint32_t p1 = 0x11090, p2 = 0x11490, p3 = 0x11C00;
+    uint8_t code[0x80];
+    for (unsigned i = 0; i < sizeof code; ++i) code[i] = (uint8_t)(0x90 + i);
+    spu_begin_image(86); spu_register_function(lift + entry, code_pic);
+    spu_begin_image(87); spu_register_function(p1 + entry, code_stale);
+    spu_begin_image(0);
+    const spu_overlay_code_segment seg = {lift, sizeof code, code};
+    check(spu_overlay_register_pic_region(ea, lift, sizeof code, 86, &seg, 1),
+          "position-independent region registers");
+    ctx->image_id = 87;
+
+    memcpy(ctx->ls + p1, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + p1, sizeof code);
+    memcpy(ctx->ls + p2, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + p2, sizeof code);
+    check(spu_lifted_lookup(ctx, p1 + entry) == code_pic, "the piece dispatches where it landed");
+    check(ctx->pic_base == p1 - lift, "dispatch sets the placement's base");
+    check(spu_lifted_lookup(ctx, p2 + entry) == code_pic, "the same piece dispatches at a second placement");
+    check(ctx->pic_base == p2 - lift, "the second placement has its own base");
+    ctx->pic_base = 0;
+    check(spu_lifted_lookup(ctx, p1 + entry) == code_pic && ctx->pic_base == p1 - lift,
+          "a cached dispatch sets the base too");
+    ctx->pc = p2 + entry; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 86 && ctx->gpr[4]._u32[0] == p2 - lift,
+          "the lifted piece runs with its placement's base");
+    check(spu_lifted_lookup(ctx, p1 + 4) == NULL, "an offset with no lifted function stays interpreted");
+
+    memcpy(ctx->ls + p3, code, sizeof code);
+    ctx->ls[p3 + 0x40] ^= 0xFF;
+    spu_overlay_note_get(ctx, ea, ctx->ls + p3, sizeof code);
+    check(spu_lifted_lookup(ctx, p3 + entry) == NULL, "a placement whose bytes differ stays interpreted");
+
+    spu_overlay_note_get(ctx, 0x990000, ctx->ls + p1, 0x40);
+    check(spu_lifted_lookup(ctx, p1 + entry) == code_stale, "a foreign GET over a placement ends it");
+    check(spu_lifted_lookup(ctx, p2 + entry) == code_pic, "and leaves the other placement resident");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
 /* Dispatch memoizes registry lookups per host thread, misses included. An
  * image whose functions register after its address was first dispatched
  * (and missed) must still be found: registration invalidates the memo. */
@@ -1059,6 +1112,7 @@ int main(void)
     test_smc_xori();
     test_resident_code_regions();
     test_verified_resident_code_regions();
+    test_pic_resident_code_regions();
     test_registry_lookup_memo();
     test_resident_interpreter_rejoin();
     test_dispatch_cache();

@@ -77,6 +77,13 @@ CODE_END = {
 EXTRA_FUNCS = [a.strip() for a in
                os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",") if a.strip()]
 
+# Extra function entries for one module only (--extra-funcs NAME=ADDR,...),
+# keyed by module name. Several modules of one title can span the same LS
+# addresses, and an address that is code in one is data in another: offered to
+# every module, a return point inside one job became a "function" made of
+# another job's constant tables.
+MODULE_EXTRA_FUNCS = {}
+
 
 def manual_link_targets(raw, base=BASE):
     """Return targets built into the link register by hand:
@@ -211,6 +218,7 @@ def module_code_end(raw, name, base=BASE):
     hi = min(base + len(raw), CODE_END.get(name, base + len(raw)))
     seeds = {base + struct.unpack_from(">I", raw, 0x10)[0], base + 0x30}
     seeds |= {int(a, 0) for a in EXTRA_FUNCS}
+    seeds |= {int(a, 0) for a in MODULE_EXTRA_FUNCS.get(name, [])}
     derived = manual_link_sites(raw, base) + switch_table_sites(raw, base)
     while True:
         seen = reachable(raw, seeds, hi, base)
@@ -223,10 +231,11 @@ def module_code_end(raw, name, base=BASE):
     return max(seen) + 4
 
 
-def module_seeds(raw, base=BASE):
+def module_seeds(raw, base=BASE, name=None):
     """Extra function entries offered to the lifter for one module."""
     # Only offer addresses that fall inside THIS module's image.
-    inside = [a for a in EXTRA_FUNCS if base <= int(a, 0) < base + len(raw)]
+    inside = [a for a in EXTRA_FUNCS + MODULE_EXTRA_FUNCS.get(name, [])
+              if base <= int(a, 0) < base + len(raw)]
     # The module's first function starts right after the 0x30-byte header
     # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
     # reached by a branch and found anyway, but in two modules it is a bare
@@ -268,7 +277,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
         cmd += ["--code-end", hex(end)]
     if merge_chunks:
         cmd += ["--merge-chunks"]
-    inside = module_seeds(raw, base)
+    inside = module_seeds(raw, base, name)
     if code_end:
         inside = [a for a in inside if int(a, 0) < code_end]
     if inside:
@@ -314,18 +323,30 @@ def find_engine_modules(elf):
     at +0x10 and image size at +0x14. Like extract_jobmods.py, the module is
     the initialised image, imageSize - 32 (the rest is bss), so a module gets
     the same name, and CODE_END fixup, from either source.
+
+    A second header form has 0 at +0x28. Its code also starts at +0x30, and
+    the policy module loads it at the same base: God of War: Ascension keeps
+    25 of its 31 modules this way, and each is copied from its header's EA to
+    LS 0x4000 (SPU_DMA_RANGE). Its +0x14 is not the initialised size (a
+    10,128-byte module there gives 0x2B1A0), so it is bounded by the next
+    header in the segment as well; the lift stops at code_end either way.
     Returns [(ea, raw)] sorted by EA."""
     out = []
     for vaddr, blob in elf_load_segments(elf):
+        heads = []
         at = blob.find(b"\xc0\xde\xc0\xde")
         while at != -1:
             h = at - 0x20
-            if h >= 0 and h % 16 == 0 and struct.unpack_from(">I", blob, h + 0x28)[0] == BASE:
-                entry_off, image = struct.unpack_from(">II", blob, h + 0x10)
-                size = image - 32
-                if 0x30 <= entry_off < size and image <= 0x40000 - BASE and h + size <= len(blob):
-                    out.append((vaddr + h, bytes(blob[h:h + size])))
+            if h >= 0 and h % 16 == 0 and struct.unpack_from(">I", blob, h + 0x28)[0] in (BASE, 0):
+                heads.append(h)
             at = blob.find(b"\xc0\xde\xc0\xde", at + 4)
+        for k, h in enumerate(heads):
+            entry_off, image = struct.unpack_from(">II", blob, h + 0x10)
+            size = image - 32
+            if struct.unpack_from(">I", blob, h + 0x28)[0] == 0 and k + 1 < len(heads):
+                size = min(size, heads[k + 1] - h)
+            if 0x30 <= entry_off < size and image <= 0x40000 - BASE and h + size <= len(blob):
+                out.append((vaddr + h, bytes(blob[h:h + size])))
     return sorted(out)
 
 
@@ -345,6 +366,14 @@ def main():
     ap.add_argument("--symbol-prefix", default="port", metavar="NAME",
                     help="C symbol prefix for the registration functions, so two "
                          "ports linked in one tree cannot collide (default: port).")
+    ap.add_argument("--extra-funcs", action="append", default=[], metavar="NAME=ADDR[,ADDR...]",
+                    help="Extra function entries (LS addresses) for the module named NAME "
+                         "only. Repeatable. For indirect-branch targets and return points "
+                         "the function finder doesn't reach.")
+    ap.add_argument("--skip-ea", action="append", default=[], metavar="EA[,EA...]",
+                    help="--engine-elf: leave the module whose header is at EA (hex) "
+                         "unlifted, so it runs in the interpreter. Repeatable. For a "
+                         "module whose lift misbehaves, until that is fixed.")
     ap.add_argument("--merge-chunks", action="store_true",
                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks "
                          "between call targets becomes one C function with gotos "
@@ -353,8 +382,16 @@ def main():
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
+    for spec in args.extra_funcs:
+        name, _, addrs = spec.partition("=")
+        if not name or not addrs:
+            sys.exit(f"--extra-funcs: expected NAME=ADDR[,ADDR...], got {spec!r}")
+        MODULE_EXTRA_FUNCS.setdefault(name.strip(), []).extend(
+            hex(int(a, 0)) for a in addrs.split(",") if a.strip())
     if EXTRA_FUNCS:
         print(f"  extra function entries: {', '.join(EXTRA_FUNCS)}")
+    for name, addrs in sorted(MODULE_EXTRA_FUNCS.items()):
+        print(f"  extra function entries for {name}: {', '.join(addrs)}")
     if args.engine_elf:
         return lift_engine_elf(args, register_c)
     JOBMODS = args.jobmods
@@ -389,6 +426,11 @@ def lift_engine_elf(args, register_c):
     found = find_engine_modules(open(args.engine_elf, "rb").read())
     if not found:
         sys.exit(f"no job modules found in {args.engine_elf}")
+    skip = {int(x, 16) for spec in args.skip_ea for x in spec.split(",") if x}
+    for ea, _ in found:
+        if ea in skip:
+            print(f"  SKIP module at 0x{ea:08X} (--skip-ea): interpreted", file=sys.stderr)
+    found = [(ea, raw) for ea, raw in found if ea not in skip]
     by_name = {}
     for ea, raw in found:
         entry_off = struct.unpack_from(">I", raw, 0x10)[0]
@@ -489,6 +531,7 @@ def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
     L.append(" * title's code bytes, like the lifted C it registers. */")
     L.append("#include <stdint.h>")
     L.append("#include <stdio.h>")
+    L.append("#include <stdlib.h>")
     L.append('#include "spu_overlay_residency.h"')
     L.append("")
     L.append("extern void spu_begin_image(int image_id);")
@@ -503,11 +546,36 @@ def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
             L.append("    " + ",".join(f"0x{x:02X}" for x in b[k:k + 16]) + ",")
         L.append("};")
     L.append("")
+    # SPU_JOBMOD_SKIP / SPU_JOBMOD_ONLY: leave modules out at run time, to find
+    # which lift misbehaves without lifting and building again.
+    L.append("/* SPU_JOBMOD_SKIP=<ea>[,<ea>...] leaves those modules interpreted;")
+    L.append(" * SPU_JOBMOD_ONLY=<ea>[,<ea>...] registers those alone (hex source EAs).")
+    L.append(" * Bisecting a misbehaving lift needs neither a lift nor a build. */")
+    L.append("static int jobmod_listed(const char* var, uint32_t ea)")
+    L.append("{")
+    L.append("    const char* e = getenv(var);")
+    L.append("    while (e && *e) {")
+    L.append("        char* end;")
+    L.append("        if ((uint32_t)strtoul(e, &end, 16) == ea) return 1;")
+    L.append("        e = *end ? end + 1 : end;")
+    L.append("    }")
+    L.append("    return 0;")
+    L.append("}")
+    L.append("")
+    L.append("static int jobmod_skipped(uint32_t ea)")
+    L.append("{")
+    L.append('    if (getenv("SPU_JOBMOD_ONLY") && !jobmod_listed("SPU_JOBMOD_ONLY", ea)) return 1;')
+    L.append('    if (!jobmod_listed("SPU_JOBMOD_SKIP", ea)) return 0;')
+    L.append('    fprintf(stderr, "[jobmods] 0x%08X left interpreted (SPU_JOBMOD_SKIP)\\n", ea);')
+    L.append("    return 1;")
+    L.append("}")
+    L.append("")
     L.append(f"void {sym_prefix}_jobmods_register_all(void)")
     L.append("{")
     for i, m in enumerate(manifest):
         img = JOBMOD_IMAGE_BASE + i
         span = m["code_end"] - BASE
+        L.append(f"    if (!jobmod_skipped(0x{m['ea']:08X}u))")
         L.append(f"    {{ static const spu_overlay_code_segment seg = "
                  f"{{0x{BASE + 0x30:X}u, sizeof code_{img}, code_{img}}};")
         L.append(f"      spu_begin_image({img}); {m['prefix']}spu_recomp_register();   "

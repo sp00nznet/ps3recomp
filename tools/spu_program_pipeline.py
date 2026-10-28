@@ -181,27 +181,36 @@ def build_programs(args, registry_writer):
             (outdir / 'image.elf').write_bytes(blob)
             try:
                 ranges = code_ranges(info)
-                functions, (offset, base, size) = detect_functions(blob, verbose=False)
-                bounds = sorted({(max(s, a), min(e, b)) for s, e in functions for a, b in ranges
-                                 if max(s, a) < min(e, b)})
-                for address in extra.get(name, []):
-                    if not any(a <= address < b and address % 4 == 0 for a, b in ranges):
-                        raise ValueError('extra function address is outside executable ranges')
-                program['executable_ranges'] = ranges
-                (outdir / 'code.bin').write_bytes(blob[offset:offset + size])
-                (outdir / 'functions.json').write_text(json.dumps([dict(start=s, end=e) for s, e in bounds]))
-                command = [sys.executable, args.lifter, str(outdir / 'code.bin'), '--base', str(base),
-                           '--functions', str(outdir / 'functions.json'), '--symbol-prefix', prefix,
-                           '--report', str(outdir / 'lift.json'), '--output', str(outdir)]
-                if extra.get(name):
-                    command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
-                if getattr(args, 'merge_chunks', False):
-                    command += ['--merge-chunks']
-                result = subprocess.run(command, capture_output=True, text=True)
-                (outdir / 'lift.log').write_text(result.stdout + result.stderr)
-                if result.returncode:
-                    raise ValueError('lifter failed; see ' + name + '/lift.log')
-                diagnostics = json.loads((outdir / 'lift.json').read_text())
+                # A word of read-only data inside the executable segment that
+                # decodes as a branch seeds a "function" of data, which lifts to
+                # unsupported words. Detect again from what is reachable.
+                for reachable in (False, True):
+                    functions, (offset, base, size) = detect_functions(blob, verbose=False,
+                                                                       reachable=reachable)
+                    bounds = sorted({(max(s, a), min(e, b)) for s, e in functions for a, b in ranges
+                                     if max(s, a) < min(e, b)})
+                    for address in extra.get(name, []):
+                        if not any(a <= address < b and address % 4 == 0 for a, b in ranges):
+                            raise ValueError('extra function address is outside executable ranges')
+                    program['executable_ranges'] = ranges
+                    (outdir / 'code.bin').write_bytes(blob[offset:offset + size])
+                    (outdir / 'functions.json').write_text(json.dumps([dict(start=s, end=e) for s, e in bounds]))
+                    command = [sys.executable, args.lifter, str(outdir / 'code.bin'), '--base', str(base),
+                               '--functions', str(outdir / 'functions.json'), '--symbol-prefix', prefix,
+                               '--report', str(outdir / 'lift.json'), '--output', str(outdir)]
+                    if extra.get(name):
+                        command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
+                    if getattr(args, 'merge_chunks', False):
+                        command += ['--merge-chunks']
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    (outdir / 'lift.log').write_text(result.stdout + result.stderr)
+                    if result.returncode:
+                        raise ValueError('lifter failed; see ' + name + '/lift.log')
+                    diagnostics = json.loads((outdir / 'lift.json').read_text())
+                    if not diagnostics['unsupported']:
+                        break
+                if reachable:
+                    program['function_detection'] = 'reachable'
                 program['diagnostics'] = diagnostics
                 if diagnostics['unsupported']:
                     raise ValueError('unsupported instructions emitted by lifter')

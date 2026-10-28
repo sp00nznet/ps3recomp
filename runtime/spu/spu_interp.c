@@ -10,6 +10,7 @@
 #include "spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
  * into each generated spu_recomp.h — declared here to stay header-independent. */
@@ -450,12 +451,126 @@ static void interp_stats_step(const spu_context* ctx)
     s_is_tot = 0; s_is_t0 = now;
 }
 
+/* SPU_INTERP_ENTRIES=<lo>-<hi> (hex LS): every distinct pc in [lo,hi) the
+ * interpreter is entered at, once, with the image that owns it. The stats
+ * above keep the eight busiest; a lift that misbehaves because one indirect
+ * target or return point is missing needs all of them, even the rare ones. */
+static void interp_entry_note(const spu_context* ctx, uint32_t pc)
+{
+    static uint32_t lo = 1, hi;
+    if (lo == 1) {
+        const char* e = getenv("SPU_INTERP_ENTRIES");
+        char* d;
+        lo = 0;
+        if (e) { lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') hi = (uint32_t)strtoul(d + 1, 0, 16); }
+    }
+    if (!hi || pc < lo || pc >= hi) return;
+    enum { SEEN = 1024 };
+    static uint32_t seen[SEEN]; static volatile long n;
+    for (long i = 0; i < n && i < SEEN; i++) if (seen[i] == pc) return;
+    const long k = __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
+    if (k >= SEEN) return;
+    seen[k] = pc;
+    int owner = ctx->image_id;
+    for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
+        if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
+            pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
+            owner = ctx->resident_code[s].image_id;
+    const uint8_t* q = ctx->ls + pc;
+    fprintf(stderr, "[interp-entry] pc=0x%05X owner=%d lr=0x%05X code=%02X%02X%02X%02X %02X%02X%02X%02X res:",
+            pc, owner, ctx->gpr[0]._u32[0] & 0x3FFFC, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+    for (unsigned s2 = 0; s2 < SPU_RESIDENT_CODE_SLOTS; ++s2)
+        if (ctx->resident_code[s2].image_id)
+            fprintf(stderr, " %d@%05X-%05X/%d", ctx->resident_code[s2].image_id, ctx->resident_code[s2].lsa,
+                    ctx->resident_code[s2].lsa + ctx->resident_code[s2].size, ctx->resident_code[s2].verify_state);
+    fprintf(stderr, "\n");
+}
+
+/* SPU_INTERP_BYSIG=<s>: interpreted steps by the code where each interpreter
+ * run starts, every s seconds -- the 16 bytes at the entry, so a piece of code
+ * that runs at a different local-store address each time (a job's streamed
+ * fragments) adds up in one row, and the bytes find it in the executable.
+ * Steps are exclusive: a nested run's steps count for the nested entry only. */
+static _Thread_local uint64_t t_bysig_total, t_bysig_child;
+static int bysig_secs(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPU_INTERP_BYSIG"); v = e ? atoi(e) : 0; if (v < 0) v = 0; }
+    return v;
+}
+enum { BYSIG_N = 2048 };
+static struct { volatile long used; uint32_t sig[4]; volatile long long steps, calls; } s_bysig[BYSIG_N];
+static void bysig_add(const uint32_t sig[4], uint64_t steps)
+{
+    uint32_t h = (sig[0] * 0x9E3779B1u) ^ (sig[1] * 0x85EBCA77u) ^ sig[2] ^ (sig[3] >> 7);
+    for (unsigned k = 0; k < 64; k++) {
+        unsigned i = (h + k) & (BYSIG_N - 1);
+        if (!s_bysig[i].used) {
+            long z = 0;
+            if (__atomic_compare_exchange_n(&s_bysig[i].used, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                memcpy(s_bysig[i].sig, sig, 16);
+                __atomic_store_n(&s_bysig[i].used, 2, __ATOMIC_RELEASE);
+            }
+        }
+        while (__atomic_load_n(&s_bysig[i].used, __ATOMIC_ACQUIRE) == 1) {}
+        if (memcmp(s_bysig[i].sig, sig, 16)) continue;
+        __atomic_fetch_add(&s_bysig[i].steps, (long long)steps, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&s_bysig[i].calls, 1, __ATOMIC_RELAXED);
+        break;
+    }
+    static volatile long long s_t0; static volatile long s_printing;
+    const long long now = (long long)time(NULL);
+    long long t0 = __atomic_load_n(&s_t0, __ATOMIC_RELAXED);
+    if (!t0) { __atomic_compare_exchange_n(&s_t0, &t0, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); return; }
+    if (now - t0 < bysig_secs()) return;
+    long z = 0;
+    if (!__atomic_compare_exchange_n(&s_printing, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    const double secs = (double)(now - t0);
+    long long tot = 0;
+    for (unsigned i = 0; i < BYSIG_N; i++) tot += s_bysig[i].steps;
+    fprintf(stderr, "[interp-bysig] %.1fM steps/s over %.0fs\n", tot / 1e6 / secs, secs);
+    for (int r = 0; r < 40; r++) {
+        int best = -1;
+        for (unsigned i = 0; i < BYSIG_N; i++)
+            if (s_bysig[i].used == 2 && s_bysig[i].steps > 0 && (best < 0 || s_bysig[i].steps > s_bysig[best].steps))
+                best = (int)i;
+        if (best < 0) break;
+        fprintf(stderr, "[interp-bysig] %8.3fM/s %7lld calls  %08X%08X%08X%08X\n",
+                s_bysig[best].steps / 1e6 / secs, s_bysig[best].calls,
+                s_bysig[best].sig[0], s_bysig[best].sig[1], s_bysig[best].sig[2], s_bysig[best].sig[3]);
+        s_bysig[best].steps = -s_bysig[best].steps;   /* printed: hidden until the reset below */
+    }
+    for (unsigned i = 0; i < BYSIG_N; i++) { s_bysig[i].steps = 0; s_bysig[i].calls = 0; }
+    __atomic_store_n(&s_t0, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_printing, 0, __ATOMIC_RELEASE);
+}
+
+static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    if (!bysig_secs()) return spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    const uint32_t pc = start_lsa & 0x3FFFC;
+    uint32_t sig[4] = {0, 0, 0, 0};
+    for (int k = 0; k < 4; k++) {
+        const uint32_t a = (pc + 4u * (uint32_t)k) & 0x3FFFC;
+        sig[k] = ((uint32_t)ctx->ls[a] << 24) | ((uint32_t)ctx->ls[a + 1] << 16) |
+                 ((uint32_t)ctx->ls[a + 2] << 8) | ctx->ls[a + 3];
+    }
+    const uint64_t s0 = t_bysig_total, saved = t_bysig_child;
+    t_bysig_child = 0;
+    const uint32_t r = spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    const uint64_t incl = t_bysig_total - s0;
+    bysig_add(sig, incl - t_bysig_child);
+    t_bysig_child = saved + incl;
+    return r;
+}
+
+static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    interp_entry_note(ctx, start_lsa & 0x3FFFC);
     if (interp_stats_on()) {
         /* Credit an entry inside a resident code region to the image that
          * owns it, so the list names the lift that's missing the entry. */
         uint32_t pc = start_lsa & 0x3FFFC; int owner = ctx->image_id;
-        for (unsigned s = 0; s < 4; ++s)
+        for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
             if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
                 pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
                 owner = ctx->resident_code[s].image_id;
@@ -515,6 +630,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
+        t_bysig_total++;
         if (interp_stats_on()) interp_stats_step(ctx);
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */

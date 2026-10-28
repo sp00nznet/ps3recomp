@@ -230,6 +230,25 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           if (PS3_LOG_FIRST(_n, 64))
               fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+          /* SPU_DMA_RANGE_UNIQ=1: also each distinct (ea, size, lsa), once --
+           * the set of pieces a job streams and where each one lands. */
+          { static int on = -1;
+            if (on < 0) on = getenv("SPU_DMA_RANGE_UNIQ") ? 1 : 0;
+            if (on) {
+                enum { N = 4096 };
+                static uint32_t k_ea[N], k_sz[N], k_ls[N]; static volatile long n;
+                int seen = 0;
+                for (long i = 0; i < n && i < N; i++)
+                    if (k_ea[i] == (uint32_t)ea && k_sz[i] == size && k_ls[i] == lsa) { seen = 1; break; }
+                if (!seen) {
+                    const long k = __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
+                    if (k < N) {
+                        k_ea[k] = (uint32_t)ea; k_sz[k] = size; k_ls[k] = lsa;
+                        fprintf(stderr, "[dma-uniq] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                                (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+                    }
+                }
+            } }
           /* ...and every 5 s, the bytes PUT into / GOT from the range. */
           { static volatile long long s_put, s_get; static unsigned long long s_t0;
             extern unsigned long long ps3_ms_now(void);
@@ -238,6 +257,25 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             if (!s_t0) s_t0 = now;
             if (now - s_t0 >= 5000) {
                 fprintf(stderr, "[dma-range] %.0f B/s put, %.0f B/s get\n",
+                        s_put * 1000.0 / (now - s_t0), s_get * 1000.0 / (now - s_t0));
+                s_put = s_get = 0; s_t0 = now; } } } }
+    /* SPU_DMA_RANGE2=<lo>-<hi>: a second range, the same report as [dma-range2]
+     * (a producer's source and destination watched in one run). */
+    { static uint32_t s_lo = 1, s_hi;
+      if (s_lo == 1) { const char* e = getenv("SPU_DMA_RANGE2"); s_lo = 0;
+          if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, 0, 16); } }
+      if (s_hi && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
+          static int _n = 0;
+          if (PS3_LOG_FIRST(_n, 64))
+              fprintf(stderr, "[dma-range2] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+          { static volatile long long s_put, s_get; static unsigned long long s_t0;
+            extern unsigned long long ps3_ms_now(void);
+            if ((cmd & 0xF0) == 0x20) s_put += size; else if ((cmd & 0xF0) == 0x40) s_get += size;
+            unsigned long long now = ps3_ms_now();
+            if (!s_t0) s_t0 = now;
+            if (now - s_t0 >= 5000) {
+                fprintf(stderr, "[dma-range2] %.0f B/s put, %.0f B/s get\n",
                         s_put * 1000.0 / (now - s_t0), s_get * 1000.0 / (now - s_t0));
                 s_put = s_get = 0; s_t0 = now; } } } }
     /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
