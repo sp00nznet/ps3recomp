@@ -16,6 +16,10 @@
 #include "ppu_fs.cpp"
 #include <thread>
 #include <vector>
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/mman.h>
+#endif
 
 /* ---- link stubs: nothing on the paths this test drives calls them ---- */
 extern "C" {
@@ -71,6 +75,56 @@ static bool holds(uint32_t buf, uint64_t off, uint32_t len)
     for (uint32_t i = 0; i < len; i += 4) if (rd32(buf + i) != (uint32_t)(off + i)) return false;
     return true;
 }
+
+#ifndef _WIN32
+/* Stand-in for the VEH that commits reserved guest pages on first touch: the
+ * guest region is PROT_NONE, a user-mode fault commits the page, but a kernel
+ * access (write(2) from a stdio flush) just fails with EFAULT. */
+static uint8_t* g_res; static size_t g_res_len;
+static void commit_page(int, siginfo_t* si, void*)
+{
+    uintptr_t a = (uintptr_t)si->si_addr & ~(uintptr_t)0xFFF;
+    if (a < (uintptr_t)g_res || a >= (uintptr_t)g_res + g_res_len) _exit(3);
+    mprotect((void*)a, 0x1000, PROT_READ | PROT_WRITE);
+}
+
+/* cellFsAioWrite must pre-fault its source like cellFsWrite and cellFsAioRead. */
+static void test_aio_write_prefault(const char* dir)
+{
+    const uint32_t SZ = 0x10000;
+    g_res_len = 1 << 20;
+    g_res = (uint8_t*)mmap(nullptr, g_res_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = commit_page; sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGSEGV, &sa, nullptr);
+    uint8_t* saved = vm_base; uint32_t saved_sz = ppu_vm_size;
+    vm_base = g_res; ppu_vm_size = (uint32_t)g_res_len;
+
+    /* path + out pointers live in pages the test commits itself */
+    mprotect(g_res, 0x1000, PROT_READ | PROT_WRITE);
+    strcpy((char*)g_res + 0x100, "/dev_hdd1/ps3recomp_fs_aiow.bin");
+    char host[1100]; snprintf(host, sizeof host, "%s/ps3recomp_fs_aiow.bin", dir);
+    ppu_context c; memset(&c, 0, sizeof c);
+    c.gpr[3] = 0x100; c.gpr[4] = 2 /* RDWR */ | 0x40 /* CREAT */ | 0x200 /* TRUNC */; c.gpr[5] = 0x200;
+    cellFsOpen(&c);
+    const uint32_t fd = rd32(0x200);
+    CHECK((uint32_t)c.gpr[3] == 0, "cellFsOpen for the write test (fd %u)", fd);
+    if ((uint32_t)c.gpr[3] == 0) {
+        /* source buffer is 16 untouched pages */
+        wr32(0x300, fd); wr64(0x308, 0); wr32(0x310, 0x20000); wr64(0x318, SZ);
+        memset(&c, 0, sizeof c); c.gpr[3] = 0x300;
+        cellFsAioWrite(&c);
+        memset(&c, 0, sizeof c); c.gpr[3] = fd; cellFsClose(&c);
+        struct stat st; bool ok = stat(host, &st) == 0 && (uint64_t)st.st_size == SZ;
+        CHECK(ok, "cellFsAioWrite from untouched guest pages writes all %u bytes (file is %lld)",
+              SZ, (long long)(stat(host, &st) == 0 ? st.st_size : -1));
+    }
+    remove(host);
+    signal(SIGSEGV, SIG_DFL);
+    vm_base = saved; ppu_vm_size = saved_sz;
+    munmap(g_res, g_res_len);
+}
+#endif
 
 int main(int argc, char** argv)
 {
@@ -165,7 +219,9 @@ int main(int argc, char** argv)
     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd;
     cellFsClose(&ctx);
     remove(host);
-
+#ifndef _WIN32
+    test_aio_write_prefault(dir);
+#endif
     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

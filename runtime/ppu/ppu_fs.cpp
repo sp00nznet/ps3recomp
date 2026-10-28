@@ -1010,7 +1010,7 @@ static void fs_aio_submit(ppu_context* ctx, bool write)
     int32_t err = CELL_FS_ENOENT;
     if (FILE* f = fd_file(fd)) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
-        if (!write) fs_prefault(buf, size);
+        fs_prefault(buf, size);   /* a read fills it, a write makes the kernel read it: both trap on reserved pages */
         /* AIO transfers are absolute: they must not move the fd's own
          * position, and the guest issues them from several threads at once
          * (FIOS media threads, audio streamers) on the same fd as its plain
