@@ -454,12 +454,17 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     if (interp_stats_on()) {
         /* Credit an entry inside a resident code region to the image that
          * owns it, so the list names the lift that's missing the entry. */
-        uint32_t pc = start_lsa & 0x3FFFC; int owner = ctx->image_id;
+        uint32_t pc = start_lsa & 0x3FFFC, key = pc; int owner = ctx->image_id;
         for (unsigned s = 0; s < 4; ++s)
             if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
-                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
+                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size) {
                 owner = ctx->resident_code[s].image_id;
-        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, pc);
+                /* Relocatable code: the CANONICAL pc (placement-independent), which
+                 * is the entry its --reloc lift needs. */
+                key = ctx->resident_code[s].canon
+                    ? pc - ctx->resident_code[s].lsa + ctx->resident_code[s].canon : pc;
+            }
+        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, key);
     }
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;

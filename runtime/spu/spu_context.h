@@ -302,7 +302,15 @@ typedef struct spu_context {
         /* 0: unchecked legacy region; otherwise SPU_OVERLAY_* state of a
          * region registered with its code bytes (spu_overlay_residency.h). */
         int verify_state, source_index;
+        /* Nonzero for position-independent code lifted once at this canonical LS base
+         * (spu_overlay_register_region_reloc): its functions are registered at
+         * canon + offset, wherever the title placed this copy. 0 = ordinary placed lift. */
+        uint32_t canon;
     } resident_code[4];
+    /* Placement minus canonical base of the relocatable code running now (spu_lifter.py
+     * --reloc): lifted relocatable code adds it to every address it derives from its own
+     * pc. Set by the dispatcher on entry into such code; only that code reads it. */
+    int32_t reloc_delta;
 
     /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
      * context's current lifetime: 0 after spu_context_init (or a zeroed

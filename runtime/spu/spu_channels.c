@@ -1715,7 +1715,7 @@ int spu_have_function(uint32_t addr)
  * through would execute stale code registered under another image. Task and
  * unbounded overlay misses retain their existing primary-image fallback. */
 static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
-static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
+static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa, int* reloc)
 {
     /* Every probe below goes through #436's per-thread memo rather than
      * spu_lookup() directly: the resolver makes up to three of them per
@@ -1730,7 +1730,18 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
              * unverified: other images' functions there would be stale. */
             if (ctx->resident_code[slot].verify_state &&
                 !spu_overlay_resident_verified((spu_context*)ctx, slot)) return NULL;
-            return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
+            const uint32_t canon = ctx->resident_code[slot].canon;
+            if (!canon)
+                return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
+            /* Relocatable code (spu_overlay_register_region_reloc): its lift sits at
+             * canon + offset. The caller runs the function next, so set its delta now. */
+            spu_fn f = spu_lookup_memoized(lsa - ctx->resident_code[slot].lsa + canon,
+                                           ctx->resident_code[slot].image_id);
+            if (f) {
+                ((spu_context*)ctx)->reloc_delta = (int32_t)(ctx->resident_code[slot].lsa - canon);
+                if (reloc) *reloc = 1;
+            }
+            return (spu_lifted_fn)f;
         }
     spu_fn fn = NULL;
     if (ctx->resident_task) fn = spu_lookup_memoized(lsa, ctx->resident_task);
@@ -1762,6 +1773,10 @@ typedef struct {
     spu_lifted_fn fn;
     uint32_t id, lsa, rgen, residency;
     int image, ovl, task;
+    /* A relocatable resolution also sets ctx->reloc_delta, which a hit must
+     * repeat: residency fixes the placement, so the delta is part of the answer. */
+    int reloc;
+    int32_t reloc_delta;
 } spu_dcache_ent;
 #define SPU_DCACHE_ENTRIES 512u
 static SPU_TLS spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
@@ -1792,7 +1807,7 @@ static void spu_dcache_shadow_stats(void)
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
     const int mode = spu_dcache_mode();
-    if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
+    if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa, NULL);
     spu_context* c = (spu_context*)ctx;
     uint32_t id = c->dcache_id;
     if (!id) {
@@ -1806,9 +1821,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     if (e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
         e->residency == c->dcache_residency && e->image == c->image_id &&
         e->ovl == c->resident_ovl && e->task == c->resident_task) {
+        if (e->reloc) c->reloc_delta = e->reloc_delta;
         if (mode == 2) {
             __atomic_fetch_add(&s_dcache_hits, 1, __ATOMIC_RELAXED);
-            const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
+            const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa, NULL);
             if (full != e->fn) {
                 if (__atomic_fetch_add(&s_dcache_shadow_bad, 1, __ATOMIC_RELAXED) < 16)
                     fprintf(stderr, "[spu-dcache] shadow mismatch img=%d ovl=%d task=%d lsa=0x%05X "
@@ -1825,13 +1841,15 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         __atomic_fetch_add(&s_dcache_misses, 1, __ATOMIC_RELAXED);
         spu_dcache_shadow_stats();
     }
-    const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
+    int reloc = 0;
+    const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa, &reloc);
     if (fn) {
         /* The resolver may have verified a pending slot; the entry records the
          * residency it resolved against, read after it. */
         e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
         e->residency = c->dcache_residency; e->image = c->image_id;
         e->ovl = c->resident_ovl; e->task = c->resident_task;
+        e->reloc = reloc; e->reloc_delta = c->reloc_delta;
     }
     return fn;
 }
@@ -1842,7 +1860,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
 typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
-                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code; } spu_ovl_src;
+                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
+                 uint32_t canon; } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature). */
 #define SPU_OVL_SRC_MAX 128
@@ -1894,6 +1913,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
+        s_ovl_src[s_ovl_src_count].canon = 0;
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
@@ -1905,6 +1925,22 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
     if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
     spu_overlay_register_source(content_ea, image_id);
     s_ovl_src[s_ovl_src_count - 1].span = span;
+}
+
+/* And for position-independent code the title copies to a different LS address at each
+ * load (GoW:A's BatchJobList jobs place four EBOOT blobs at a new 16-byte-aligned address
+ * every time): lifted ONCE at a canonical base with spu_lifter.py --reloc. A GET of the
+ * content at any address makes that copy resident; dispatch then looks the function up at
+ * canon + offset and sets ctx->reloc_delta, which the lifted code adds to every address
+ * it derives from its own pc. */
+void spu_overlay_register_region_reloc(uint32_t content_ea, uint32_t span, uint32_t canon, int image_id)
+{
+    if (!canon || canon >= SPU_LS_SIZE || span > SPU_LS_SIZE - canon) return;
+    { static int s_off = -1; if (s_off < 0) { const char* e = getenv("SPU_RELOC_OFF"); s_off = e && e[0] == '1'; }
+      if (s_off) return; }   /* SPU_RELOC_OFF=1: leave that code to the interpreter (A/B) */
+    const int n = s_ovl_src_count;
+    spu_overlay_register_region(content_ea, span, image_id);
+    if (s_ovl_src_count == n + 1) s_ovl_src[n].canon = canon;
 }
 
 /* Residency proves which load happened, not what the bytes are: the source EA
@@ -2159,7 +2195,10 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 /* Verified code was lifted for one load address. */
                 if (o->code && lsa != o->load_lsa) continue;
                 for (unsigned slot = 0; slot < 4; ++slot) {
-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                    /* A relocatable image takes over its own previous placement's slot: each load
+                     * lands somewhere new, and stale copies would fill the slots. */
+                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa &&
+                        !(o->canon && ctx->resident_code[slot].image_id == o->image_id))
                         continue;
                     ctx->resident_code[slot].lsa = lsa;
                     ctx->resident_code[slot].size = o->span;
@@ -2167,6 +2206,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].image_id = o->image_id;
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
                     ctx->resident_code[slot].source_index = i;
+                    ctx->resident_code[slot].canon = o->canon;
                     spu_dcache_residency_changed(ctx);
                     return;
                 }
