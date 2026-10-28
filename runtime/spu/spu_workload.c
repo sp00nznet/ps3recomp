@@ -583,6 +583,10 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     uint8_t* ts = vm_base + taskset_ea;
     uint8_t* run = ts_running(taskset_ea);
     if (done_task < 128) spu_taskset2_set_exit(taskset_ea, done_task, 1, 0);
+    if (done_task < 128) {
+        extern void spu_taskset_round_drop(uint32_t, uint32_t);
+        spu_taskset_round_drop(taskset_ea, done_task);
+    }
     /* The ready/pending/enabled bitsets share the taskset's first line with the
      * SPU task library (GETLLAR/PUTLLC) and with cellSpursCreateTask, which
      * update them under the lock-line lock. Update them under the same lock,
@@ -1158,9 +1162,54 @@ static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait objec
 static volatile int s_parked_count;
 static volatile int s_parked_hw;
 
+/* Tasks that have waited for a signal at least once: they work in rounds, a
+ * signal starts one and the next WAIT_SIGNAL ends it. A task that never waits
+ * (a decoder streaming on its own) is not one, so it holds nothing up.
+ * Same racy-hint rules as s_parked; an entry leaves when its task exits. */
+#define SPU_ROUND_MAX 64
+static volatile uint64_t s_round[SPU_ROUND_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
+
+static void spu_round_note(uint64_t key)
+{
+    int free_slot = -1;
+    for (int i = 0; i < SPU_ROUND_MAX; i++) {
+        if (s_round[i] == key) return;
+        if (s_round[i] == 0 && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) s_round[free_slot] = key;
+}
+
+void spu_taskset_round_drop(uint32_t taskset_ea, uint32_t taskId)
+{
+    const uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_ROUND_MAX; i++)
+        if (s_round[i] == key) s_round[i] = 0;
+}
+
+/* How many round tasks are busy: out of WAIT_SIGNAL, or parked with their
+ * signal bit set (woken, not yet running: the bit is cleared after the wait
+ * returns). The first busy one is returned in *taskset_ea / *taskId.
+ * GCM_REPORT_SPU_HOLD_MS holds the RSX's next report while this is non-zero. */
+int spu_taskset_round_busy(uint32_t* taskset_ea, uint32_t* taskId)
+{
+    int busy = 0;
+    for (int i = 0; i < SPU_ROUND_MAX; i++) {
+        const uint64_t key = s_round[i];
+        if (!key) continue;
+        int parked = 0;
+        const int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
+        for (int j = 0; j < hw && !parked; j++) parked = s_parked[j] == key;
+        const uint32_t ts = (uint32_t)(key >> 32), tid = (uint32_t)key - 1u;
+        if (parked && !spurs_bitset_test(ts + CSTS_SIGNALLED, tid)) continue;
+        if (!busy++ && taskset_ea) { *taskset_ea = ts; *taskId = tid; }
+    }
+    return busy;
+}
+
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    spu_round_note(key);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
         if (s_parked[i] == 0) {
             int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);

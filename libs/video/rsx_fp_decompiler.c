@@ -905,6 +905,11 @@ static int rsx_fp_decompile_internal(
         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+        /* Screen-space derivatives. God of War: Ascension's font is a distance
+         * field whose edge width is max(|ddx|, |ddy|) of the sampled value; as
+         * an unhandled op the destination kept 0 and every glyph bloated. */
+        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
          * builtins): the packed word is a scalar that replicates. */
@@ -1320,8 +1325,13 @@ static int rsx_fp_decompile_internal(
     if (shadow) for (u32 u = 0; u < 16; u++)
         if ((sampled_units & (1u << u)) && shadow[u].enabled)
             fp_shadow_helper(&p, u, tex_sep_mask, &shadow[u]);
-    if (gamma_units) fp_gamma_helper(&p);
-    if (expand_units || bx2_units) fp_expand_helper(&p);
+    /* Also wherever the body calls one: the unit scanners above skip an inline
+     * constant only after a non-branch instruction, the body walk after any,
+     * so a program with branches can desynchronise them. God of War:
+     * Ascension's level had programs that called _rsx_expand_input with no
+     * definition and failed to compile. */
+    if (gamma_units || strstr(o.p, "_rsx_gamma_input(")) fp_gamma_helper(&p);
+    if (expand_units || bx2_units || strstr(o.p, "_rsx_expand_input(")) fp_expand_helper(&p);
     /* NV40 pack/unpack. A packed word travels on in a float's bits, so the
      * packs bitcast and the unpacks bitcast back; the sRGB forms follow
      * RPCS3's _builtin_pkg/_builtin_upg (linear_to_srgb, srgb_to_linear).

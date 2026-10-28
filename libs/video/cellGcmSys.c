@@ -409,6 +409,25 @@ static int s_gcm_syscall_mode = 0;
  * Internal helpers
  * -----------------------------------------------------------------------*/
 
+/* The guest's copy of the tables is the real thing once cellGcmGetOffsetTable
+ * has handed it out: titles keep the pointers and convert addresses inline
+ * (ioAddress[ea >> 20], 0xFFFF and up meaning unmapped) instead of calling
+ * cellGcmAddressToOffset. Publishing only inside cellGcmGetOffsetTable left
+ * every later map and unmap out of it. God of War: Ascension maps more main
+ * memory after taking the table, converts a command buffer pointer in it to
+ * `put`, gets -1, and the FIFO walker then runs off the end of its commands
+ * into shader microcode. From the first hand-out on, each changed entry is
+ * written through. */
+static int s_offset_tables_published;
+static void gcm_mirror_offset_entry(u32 ea_page, u32 io_page)
+{
+    if (!s_offset_tables_published) return;
+    if (ea_page < GCM_OFFSET_TABLE_PAGES)
+        vm_write16(GCM_OFFSET_TABLE_IO_ADDR + ea_page * 2, s_io_address_table[ea_page]);
+    if (io_page < GCM_OFFSET_TABLE_PAGES)
+        vm_write16(GCM_OFFSET_TABLE_EA_ADDR + io_page * 2, s_ea_address_table[io_page]);
+}
+
 /* Populate the offset table entries for an IO mapping */
 static void populate_offset_table(u32 ea, u32 io, u32 size)
 {
@@ -429,6 +448,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
+        gcm_mirror_offset_entry(ea_page + i, io_page + i);
     }
 }
 
@@ -442,6 +462,7 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = 0xFFFF;
         s_ea_address_table[io_page + i] = 0xFFFF;
+        gcm_mirror_offset_entry(ea_page + i, io_page + i);
     }
 }
 
@@ -946,6 +967,7 @@ unsigned long long ps3_ms_now(void)
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
 static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
+static int s_report_hold_pass = 0;    /* this drain stopped on a held GET_REPORT */
 /* The park the walker is waiting on (0 = none), the `put` it saw there, and
  * since when it has stood with that put: the jump-park grace in the walker. */
 static u32 park_off, park_put;
@@ -2043,6 +2065,46 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
 }
 
 
+/* GCM_REPORT_SPU_HOLD_MS=<ms> (off by default): a GET_REPORT waits, up to <ms>,
+ * while SPU tasks that work in signal-driven rounds are in one
+ * (spu_taskset_round_busy). The real RSX spends a frame's time drawing between
+ * two reports; this walker spends none, so a title that turns reports into
+ * task signals can signal the next round while the last one runs, and a
+ * signal sent to a task that is still busy is taken by whatever wait it
+ * reaches next. God of War: Ascension's RsxSync posts post-process batch N+1
+ * on the next report, and the batch's signal ended batch N's barrier waits:
+ * the tasks then waited for a batch that had already been signalled, and the
+ * RSX waited for their label. Like an ACQUIRE, a held report stops the drain
+ * pass without consuming the method, and the next pass looks again.
+ * After arnaldolima1/gow-ascension-pc (ps3kit patch 0029). */
+static int gcm_report_hold(void)
+{
+    static int ms = -1;
+    if (ms < 0) { const char* e = getenv("GCM_REPORT_SPU_HOLD_MS"); ms = e ? atoi(e) : 0; }
+    if (ms <= 0) return 0;
+    extern int spu_taskset_round_busy(uint32_t*, uint32_t*);
+    extern unsigned long long ps3_ms_now(void);
+    static u32 h_off; static unsigned long long h_t0; static unsigned h_n, h_gaveup;
+    uint32_t ts = 0, tid = 0;
+    const int busy = spu_taskset_round_busy(&ts, &tid);
+    const unsigned long long now = ps3_ms_now();
+    if (busy && (!h_t0 || h_off != s_fifo_getoff)) { h_off = s_fifo_getoff; h_t0 = now; h_n++; }
+    if (busy && now - h_t0 < (unsigned long long)ms) return 1;
+    if (h_t0 && h_off == s_fifo_getoff) {
+        const int gave_up = busy != 0;
+        h_gaveup += (unsigned)gave_up;
+        static int ln = 0;
+        if (gave_up || PS3_LOG_FIRST(ln, 16))
+            fprintf(stderr, "[report-hold] #%u get=0x%08X held %llu ms%s (%u given up so far)\n",
+                    h_n, s_fifo_getoff, now - h_t0,
+                    gave_up ? ", gave up with a task still busy" : "", h_gaveup);
+        if (gave_up)
+            fprintf(stderr, "[report-hold]   busy: %d, first taskset 0x%08X task %u\n", busy, ts, tid);
+    }
+    h_t0 = 0;
+    return 0;
+}
+
 /* The diagnostic switches below are tested on every drain pass, and GCM_RECDBG
  * on every semaphore method. getenv walks the whole environment and showed in
  * RSX-thread profiles, so each is read once and cached, like the other knobs. */
@@ -2443,6 +2505,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * the method, so the next pass re-reads it -- which is what the hardware does
              * while it waits. Semaphore offsets index the same label window
              * cellGcmGetLabelAddress hands out. */
+            if (subch == 0 && method == 0x1800u && gcm_report_hold()) {
+                s_report_hold_pass = 1;
+                break;
+            }
             if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
                 int sem_blocked = 0;
                 for (u32 i = 0; i < count; i++) {
@@ -2758,8 +2824,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * for good that way in about one New Marais run in five ("stuck-get" at a
      * self-jump with no "jump-park" before it). */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_sema_blocked_pass || s_park_pass) {
-          stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
+      if (s_sema_blocked_pass || s_park_pass || s_report_hold_pass) {
+          stuck = 0; last = s_fifo_getoff;
+          s_sema_blocked_pass = 0; s_park_pass = 0; s_report_hold_pass = 0; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
@@ -3303,6 +3370,7 @@ static void gcm_publish_offset_tables(void)
         vm_write16(GCM_OFFSET_TABLE_IO_ADDR + i * 2, s_io_address_table[i]);
         vm_write16(GCM_OFFSET_TABLE_EA_ADDR + i * 2, s_ea_address_table[i]);
     }
+    s_offset_tables_published = 1;   /* from here on, gcm_mirror_offset_entry */
 }
 
 s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
@@ -3347,7 +3415,12 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (address >= s_config.localAddress &&
         address < s_config.localAddress + s_config.localSize) {
         u32 loff = address - s_config.localAddress;
-        if ((loff >> 20) < sizeof(s_local_offset_page)) s_local_offset_page[loff >> 20] = 1;
+        /* Written only when it changes: this runs for every local address a
+         * title converts (God of War HD: tens of thousands a second), and a
+         * store of the same byte still takes the line from the drain thread,
+         * which reads it in cellGcmResolveLocated. */
+        if ((loff >> 20) < sizeof(s_local_offset_page) && !s_local_offset_page[loff >> 20])
+            s_local_offset_page[loff >> 20] = 1;
         vm_write32(off_ea, loff);
         return CELL_OK;
     }

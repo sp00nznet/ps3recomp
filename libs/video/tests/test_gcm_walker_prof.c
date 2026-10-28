@@ -16,6 +16,9 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+/* GCM_REPORT_SPU_HOLD_MS asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;

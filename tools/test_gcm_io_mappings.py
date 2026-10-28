@@ -13,7 +13,10 @@ against a small stub for guest memory, and checks:
    before the first refusal (Killzone 3 maps up to 38);
 2. a refused cellGcmMapMainMemory does not consume IO address space (no IO
    page changes);
-3. a sys_rsx iomap after an unmap does not overwrite a live mapping.
+3. a sys_rsx iomap after an unmap does not overwrite a live mapping;
+4. once the tables have been handed to the title, a map and an unmap reach
+   the guest's copy (titles index it themselves; God of War: Ascension's
+   `put` came out -1 from a stale one).
 
 Run: python tools/test_gcm_io_mappings.py
 """
@@ -44,7 +47,8 @@ def function(signature):
 
 slots = re.search(r'^#define CELL_GCM_MAX_IO_MAPPINGS\s+(\d+)', hdr, re.M).group(1)
 io_pages = re.search(r'^#define GCM_IO_PAGES\s+(\w+)', src, re.M).group(1)
-parts = [function(r'static void populate_offset_table\(u32 ea, u32 io, u32 size\)'),
+parts = [function(r'static void gcm_mirror_offset_entry\(u32 ea_page, u32 io_page\)'),
+         function(r'static void populate_offset_table\(u32 ea, u32 io, u32 size\)'),
          function(r'static void clear_offset_table\(u32 ea, u32 io, u32 size\)'),
          function(r'static IoMapping\* find_mapping_by_io\(u32 io\)'),
          function(r'static IoMapping\* find_free_mapping\(void\)'),
@@ -79,6 +83,17 @@ static u32 rd32(u32 a) { return (u32)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2
 static int s_gcm_initialized = 0;
 static u16 s_ea_address_table[65536];   /* IO page -> EA page, 0xFFFF = free */
 static u16 s_io_address_table[65536];   /* EA page -> IO page */
+/* The guest's copy of the two tables, as cellGcmGetOffsetTable hands it out. */
+#define GCM_OFFSET_TABLE_PAGES   4096u
+#define GCM_OFFSET_TABLE_IO_ADDR 0x10000u
+#define GCM_OFFSET_TABLE_EA_ADDR 0x20000u
+static u16 guest_io[4096], guest_ea[4096];
+static int s_offset_tables_published = 0;
+static void vm_write16(u32 a, u16 v)
+{
+    if (a >= GCM_OFFSET_TABLE_EA_ADDR) guest_ea[(a - GCM_OFFSET_TABLE_EA_ADDR) / 2] = v;
+    else if (a >= GCM_OFFSET_TABLE_IO_ADDR) guest_io[(a - GCM_OFFSET_TABLE_IO_ADDR) / 2] = v;
+}
 static int io_pages_used(void)
 {
     int n = 0;
@@ -118,6 +133,21 @@ int main(void)
     printf("%%s live mapping kept after unmap + iomap: %%s\n",
            b_kept && c_found ? "ok  " : "FAIL", b_kept ? (c_found ? "yes" : "new one lost") : "overwritten");
     ok &= b_kept && c_found;
+
+    /* 4: the guest's copy follows a map and an unmap once handed out. */
+    memset(guest_io, 0xFF, sizeof guest_io);
+    memset(guest_ea, 0xFF, sizeof guest_ea);
+    s_offset_tables_published = 1;
+    cellGcmMapMainMemory(0x75200000u, 0x200000u, out);
+    u32 io_m = rd32(0x100);
+    int mapped = guest_io[0x752] == (u16)(io_m >> 20) && guest_io[0x753] == (u16)((io_m >> 20) + 1)
+                 && guest_ea[io_m >> 20] == 0x752;
+    cellGcmUnmapIoAddress(io_m);
+    int unmapped = guest_io[0x752] == 0xFFFF && guest_ea[io_m >> 20] == 0xFFFF;
+    printf("%%s guest offset tables follow map and unmap: %%s\n",
+           mapped && unmapped ? "ok  " : "FAIL", mapped ? (unmapped ? "yes" : "unmap missed") : "map missed");
+    ok &= mapped && unmapped;
+    s_offset_tables_published = 0;
 
     /* 1 + 2: map 1 MB chunks until the first refusal. */
     static u32 offs[4096];

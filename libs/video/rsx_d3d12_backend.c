@@ -2847,6 +2847,30 @@ static u32 tex_csum(const u8* base, u32 nbytes)
     return h;
 }
 
+/* The DXGI format a guest texture is uploaded as -- the DECODED image's, which
+ * is not always the guest's: the packed 16-bit colour formats arrive unpacked
+ * to RGBA8, and DEPTH24_D8 as a float. rsx_texture_layout.h says which class
+ * each format byte lands in. The SRV over the upload must name the same one. */
+static DXGI_FORMAT vp_tex_dxgi(u32 fmt)
+{
+    rsx_tex_layout tl;
+    rsx_texture_layout(fmt, 4, 4, &tl);
+    switch (tl.fmt) {
+    case RSX_TEXFMT_R8G8B8A8:      return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case RSX_TEXFMT_R8G8:          return DXGI_FORMAT_R8G8_UNORM;
+    case RSX_TEXFMT_BC1:           return DXGI_FORMAT_BC1_UNORM;
+    case RSX_TEXFMT_BC2:           return DXGI_FORMAT_BC2_UNORM;
+    case RSX_TEXFMT_BC3:           return DXGI_FORMAT_BC3_UNORM;
+    case RSX_TEXFMT_R16:           return DXGI_FORMAT_R16_UNORM;
+    case RSX_TEXFMT_R16G16:        return DXGI_FORMAT_R16G16_UNORM;
+    case RSX_TEXFMT_R16G16F:       return DXGI_FORMAT_R16G16_FLOAT;
+    case RSX_TEXFMT_R16G16B16A16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case RSX_TEXFMT_R32F:          return DXGI_FORMAT_R32_FLOAT;
+    case RSX_TEXFMT_R32G32B32A32F: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    default:                       return DXGI_FORMAT_R8_UNORM;
+    }
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
@@ -2880,18 +2904,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     /* The DECODED image's format, which is not always the guest's: the packed
      * 16-bit colour formats arrive here unpacked to RGBA8, and DEPTH24_D8 as a
      * float. rsx_texture_layout.h says which class each format byte lands in. */
-    DXGI_FORMAT dxfmt = (tl.fmt == RSX_TEXFMT_R8G8B8A8) ? DXGI_FORMAT_R8G8B8A8_UNORM
-                      : (tl.fmt == RSX_TEXFMT_R8G8)     ? DXGI_FORMAT_R8G8_UNORM
-                      : (tl.fmt == RSX_TEXFMT_BC1)      ? DXGI_FORMAT_BC1_UNORM
-                      : (tl.fmt == RSX_TEXFMT_BC2)      ? DXGI_FORMAT_BC2_UNORM
-                      : (tl.fmt == RSX_TEXFMT_BC3)      ? DXGI_FORMAT_BC3_UNORM
-                      : (tl.fmt == RSX_TEXFMT_R16)      ? DXGI_FORMAT_R16_UNORM
-                      : (tl.fmt == RSX_TEXFMT_R16G16)   ? DXGI_FORMAT_R16G16_UNORM
-                      : (tl.fmt == RSX_TEXFMT_R16G16F)  ? DXGI_FORMAT_R16G16_FLOAT
-                      : (tl.fmt == RSX_TEXFMT_R16G16B16A16F) ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                      : (tl.fmt == RSX_TEXFMT_R32F)     ? DXGI_FORMAT_R32_FLOAT
-                      : (tl.fmt == RSX_TEXFMT_R32G32B32A32F) ? DXGI_FORMAT_R32G32B32A32_FLOAT
-                      : DXGI_FORMAT_R8_UNORM;
+    DXGI_FORMAT dxfmt = vp_tex_dxgi(fmt);
     /* DXT data is stored as linear 4x4 block rows (compressed formats are
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
     u32 blkrow  = dxt ? tl.row_bytes : 0;
@@ -4869,9 +4882,12 @@ static void render_frame(void)
                     continue;
                 }
                 u32 _bf = dr->tex[_u].fmt & 0x9F;
+                /* The formats d3d12_bind_texture records. A half-float one
+                 * that is not a render target found above is guest data too. */
                 if (dr->tex[_u].off &&
                     (_bf == 0x81 || _bf == 0x85 || _bf == 0x8B ||
-                     (_bf >= 0x86 && _bf <= 0x88))) {
+                     (_bf >= 0x86 && _bf <= 0x88) || _bf == 0x9A ||
+                     _bf == 0x94 || _bf == 0x95 || _bf == 0x9C || _bf == 0x9F)) {
                     double _tt = perf_on() ? perf_now() : 0.0;
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
@@ -4884,13 +4900,9 @@ static void render_frame(void)
                     if (s_duck_off && dr->tex[_u].off == s_duck_off)
                         s_duck_raw = dr->tex[_u].raw;
                     if (ts >= 0) {
-                        DXGI_FORMAT sf =
-                            (_bf == 0x85) ? DXGI_FORMAT_R8G8B8A8_UNORM :
-                            (_bf == 0x8B) ? DXGI_FORMAT_R8G8_UNORM :
-                            (_bf == 0x86) ? DXGI_FORMAT_BC1_UNORM :
-                            (_bf == 0x87) ? DXGI_FORMAT_BC2_UNORM :
-                            (_bf == 0x88) ? DXGI_FORMAT_BC3_UNORM :
-                                            DXGI_FORMAT_R8_UNORM;
+                        /* The upload's own format: an X16 font atlas bound
+                         * as R8 over an R16 resource sampled nothing. */
+                        DXGI_FORMAT sf = vp_tex_dxgi(dr->tex[_u].fmt);
                         srv_write_ex(wslot, s_d3d.vp_tex[ts].res, sf,
                                   (_bf == 0x81) ? 0x1000
                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
@@ -7408,6 +7420,21 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     u32 height = tex->image_rect & 0xFFFF;
     u32 format = (tex->format >> 8) & 0xFF;
     u32 offset = tex->offset;
+    /* TEXFMT_ALL=1: every distinct texture a draw binds, whatever its format.
+     * TEXFMTDBG logs only the formats this backend binds; a format it drops
+     * (the draw then samples nothing) never shows up there. */
+    { static int ta = -1;
+      if (ta < 0) ta = getenv("TEXFMT_ALL") ? 1 : 0;
+      if (ta) {
+          static u32 seen[256]; static int ns = 0; int known = 0;
+          const u32 key = offset ^ (format << 24) ^ unit;
+          for (int k = 0; k < ns; k++) if (seen[k] == key) known = 1;
+          if (!known && ns < 256) { seen[ns++] = key;
+              fprintf(stderr, "[TEXFMT_ALL] unit=%u fmt=0x%02X %ux%u pitch=%u off=0x%08X "
+                              "remap=0x%08X ctrl0=0x%08X filter=0x%08X%c",
+                      unit, format, (tex->image_rect >> 16) & 0xFFFF, tex->image_rect & 0xFFFF,
+                      tex->control3 & 0xFFFFF, offset, tex->control1, tex->control0, tex->filter, 10); }
+      } }
     /* CUBEDBG=1: NV4097_SET_TEXTURE_FORMAT bit 2 is the cubemap flag, and the
      * line above throws it away with the rest of the low byte. Nothing in this
      * backend handles cube textures, so a cubemap bound for an environment
@@ -7473,7 +7500,12 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         (base_fmt == 0x81 /* B8 */ || base_fmt == 0x85 /* A8R8G8B8 */ ||
          base_fmt == 0x8B /* G8B8: LBP's font atlas */ ||
          (base_fmt >= 0x86 && base_fmt <= 0x88) /* DXT1/23/45 */ ||
-         base_fmt == 0x9A /* W16Z16Y16X16 half-float: RTT intermediates */)) {
+         base_fmt == 0x9A /* W16Z16Y16X16 half-float: RTT intermediates */ ||
+         /* One- and two-channel 16/32-bit formats rsx_texture_layout already
+          * decodes: X16 (God of War: Ascension's 256x256 font atlas -- without
+          * it every glyph drew as a solid quad), Y16_X16, X32_FLOAT and
+          * Y16_X16_FLOAT (its post-process intermediates). */
+         base_fmt == 0x94 || base_fmt == 0x95 || base_fmt == 0x9C || base_fmt == 0x9F)) {
         /* TEX_RESOLVE_AUTO=1: resolve through the page tables (local-page map
          * then IO table) instead of trusting the format's location bits. A
          * texture the guest built in main memory but tagged local resolves to
