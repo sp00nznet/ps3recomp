@@ -16,7 +16,7 @@ void spu_func_00000000(spu_context* ctx) {
         spu_wrch(ctx, MFC_Size, ctx->gpr[6]);
         spu_wrch(ctx, MFC_TagID, ctx->gpr[7]);
         spu_wrch(ctx, MFC_Cmd, ctx->gpr[8]);
-        ctx->gpr[5] = spu_il(448);
+        ctx->gpr[5] = spu_ila(0x101C0);
         ctx->gpr[8] = spu_il(32);
         spu_wrch(ctx, MFC_LSA, ctx->gpr[3]);
         spu_wrch(ctx, MFC_EAH, ctx->gpr[4]);

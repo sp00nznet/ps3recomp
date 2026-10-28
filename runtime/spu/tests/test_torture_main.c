@@ -2,9 +2,8 @@
  * each targets a bug class the LBP Bink bring-up hit in the wild (preferred-
  * halfword branches, ila-continuations, computed-branch stack growth).
  *
- * Run with clang (GCC=clang ./run_tests.sh): K6's 100k-iteration bi-loop needs
- * guaranteed-flat dispatch (musttail); under gcc the fallback relies on
- * sibling-call optimization and may fail for harness reasons, not lifter bugs.
+ * Transfers go through g_spu_trampoline_fn and the drain loop in main, so the
+ * 100k-iteration bi-loop in K6 runs flat under gcc and clang alike.
  */
 #include "spu_recomp.h"
 #include "spu_helpers.h"
@@ -41,12 +40,10 @@ void spu_indirect_branch(spu_context* ctx) {
     uint32_t pc = ctx->pc & SPU_LS_MASK;
     for (int i = 0; i < g_nreg; i++) {
         if (g_reg[i].addr == pc) {
-#if defined(__clang__)
-            __attribute__((musttail)) return g_reg[i].fn(ctx);
-#else
-            g_reg[i].fn(ctx);
+            /* Queue the target for main's drain loop; calling it from here
+             * would nest one host frame per bi in K6's 100k-iteration loop. */
+            g_spu_trampoline_fn = g_reg[i].fn;
             return;
-#endif
         }
     }
     fprintf(stderr, "FAIL: unresolved indirect branch to 0x%05X "
@@ -67,6 +64,11 @@ int main(void) {
     spu_recomp_register();
 
     spu_func_00000000(ctx);
+    while (g_spu_trampoline_fn) {            /* lifted transfers return here */
+        fnp next = g_spu_trampoline_fn;
+        g_spu_trampoline_fn = 0;
+        next(ctx);
+    }
 
     int bad = 0;
     if (!g_stopped) { printf("FAIL: guest never reached stop\n"); bad = 1; }

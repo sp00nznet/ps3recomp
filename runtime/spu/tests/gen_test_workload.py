@@ -28,7 +28,7 @@ def ri10(op8, i10, ra, rt): return w(((op8 & 0xFF) << 24) | ((i10 & 0x3FF) << 14
 def rr(op11, rb, ra, rt): return w(((op11 & 0x7FF) << 21) | ((rb & 0x7F) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F))
 def ch(op11, channel, rt): return w(((op11 & 0x7FF) << 21) | ((channel & 0x1F) << 7) | (rt & 0x7F))
 
-IL, LQD, STQD, WRCH, STOP = 0x81, 0x34, 0x24, 0x10D, 0x000
+IL, ILHU, LQD, STQD, WRCH, STOP = 0x81, 0x82, 0x34, 0x24, 0x10D, 0x000
 MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID, MFC_Cmd = 16, 17, 18, 19, 20, 21
 MFC_PUT = 0x20
 MARKER = 0xCAFEF00D
@@ -38,10 +38,10 @@ b  = ri16(IL, 0, 0)                # il   r0, 0            (base reg = 0)
 b += ri10(LQD, 0x08, 0, 11)       # lqd  r11, 0x80(r0)    r11 = LS[0x80] = marker
 b += ri10(STQD, 0x10, 0, 3)       # stqd r3,  0x100(r0)   LS[0x100] = r3 (task arg)
 b += ri10(STQD, 0x11, 0, 11)      # stqd r11, 0x110(r0)   LS[0x110] = marker
-# --- DMA PUT: LS 0x100..0x11F (32 bytes) -> main memory EA 0 ---
+# --- DMA PUT: LS 0x100..0x11F (32 bytes) -> main memory EA 0x10000 ---
 b += ri16(IL, 0x100,    3)        # il   r3, 0x100        (LSA)  [overwrites arg, already stored]
 b += ri16(IL, 0,        4)        # il   r4, 0            (EAH)
-b += ri16(IL, 0,        5)        # il   r5, 0            (EAL = main-mem offset 0)
+b += ri16(ILHU, 1,      5)        # ilhu r5, 1            (EAL = 0x10000; PUTs below 64 KB are rejected as null-page writes)
 b += ri16(IL, 32,       6)        # il   r6, 32           (Size)
 b += ri16(IL, 0,        7)        # il   r7, 0            (TagID)
 b += ri16(IL, MFC_PUT,  8)        # il   r8, 0x20         (PUT)

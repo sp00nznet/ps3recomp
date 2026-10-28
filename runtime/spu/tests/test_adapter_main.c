@@ -48,7 +48,7 @@ int main(void) {
 
     /* The PPU side places a task descriptor / input at some EA and hands its
      * address to the task (the SPURS arg). Here: input 0xABCD1234 at EA 0x800. */
-    const uint32_t ARG_EA = 0x800;
+    const uint32_t ARG_EA = 0x10800;
     const uint32_t kInput = 0xABCD1234u;
     wbe32(&g_mem[ARG_EA], kInput);
 
