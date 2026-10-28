@@ -365,12 +365,50 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     }
 }
 
+/* SPU_COH_STATS=1: what a notify's walk finds, every 2^20 notifies -- the
+ * contexts walked, how many hold a reservation on any line, how many on the
+ * written one, and the lines written most. Under the lock-line lock, as the
+ * walk is. To size a cheaper walk; off, it costs one test. */
+static int s_coh_stats = -1;
+static SPU_NOINLINE_COLD void spu_coh_stats(uint32_t line)
+{
+    static unsigned long long n, walked, holding, matched;
+    enum { TOP = 64 };
+    static uint32_t top_line[TOP]; static unsigned long long top_n[TOP];
+    n++;
+    for (spu_coh_entry* e = s_coh_ctxs; e; e = e->next) {
+        if (!e->ctx) continue;
+        walked++;
+        if (__atomic_load_n(&e->ctx->resv_valid, __ATOMIC_RELAXED)) holding++;
+        if (spu_coh_holds(e->ctx, line)) matched++;
+    }
+    int k = (int)((line >> 7) % TOP);
+    if (top_line[k] != line && top_n[k]) { if (--top_n[k] == 0) top_line[k] = line; }
+    else { top_line[k] = line; top_n[k]++; }
+    if ((n & ((1ull << 20) - 1)) == 0) {
+        fprintf(stderr, "[spu-coh] %llu notifies: %.1f contexts walked, %.2f holding a reservation, "
+                "%.3f on the written line; hot lines:", n, (double)walked / (double)n,
+                (double)holding / (double)n, (double)matched / (double)n);
+        for (int r = 0; r < 6; r++) {
+            int b = -1; for (int i = 0; i < TOP; i++) if (top_n[i] && (b < 0 || top_n[i] > top_n[b])) b = i;
+            if (b < 0) break;
+            fprintf(stderr, " 0x%08X", top_line[b]); top_n[b] = 0;
+        }
+        fprintf(stderr, "\n");
+        n = walked = holding = matched = 0;
+    }
+}
+
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
+    if (__builtin_expect(s_coh_stats != 0, 0)) {
+        if (s_coh_stats < 0) s_coh_stats = getenv("SPU_COH_STATS") ? 1 : 0;
+        if (s_coh_stats) spu_coh_stats(line);
+    }
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c) continue;

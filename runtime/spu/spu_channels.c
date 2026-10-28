@@ -242,8 +242,9 @@ void spu_stop(spu_context* ctx)
  * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
  * lifted floating point must keep round to nearest with denormals. Double precision restores
- * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
- * Returns the FPCR to restore, or ~0 when nothing was changed. */
+ * the default around itself inside a run. arm64, and x86-64 with MXCSR (the AVX2 forms; the
+ * scalar ones the interpreter uses are exact in either mode); elsewhere the exact forms always
+ * run. Returns the FPCR (MXCSR) to restore, or ~0 when nothing was changed. */
 static uint64_t spu_float_mode_enter(void)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
@@ -260,6 +261,23 @@ static uint64_t spu_float_mode_enter(void)
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
     return v;
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
+    /* x86: MXCSR at round toward zero with FTZ and DAZ (SPU_MXCSR_RZFZ). Lifted code picks its
+     * forms by g_spu_float_rz rather than by reading MXCSR, so the flag is set before any run
+     * switches the mode, and from then on every run does. */
+    static int s_on = -1;
+    int on = __atomic_load_n(&s_on, __ATOMIC_ACQUIRE);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = e && e[0] == '1' && !e[1];
+        if (on) __atomic_store_n(&g_spu_float_rz, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_on, on, __ATOMIC_RELEASE);
+    }
+    if (!on) return ~0ull;
+    const unsigned v = _mm_getcsr();
+    if ((v & SPU_MXCSR_RZFZ) == SPU_MXCSR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
+    _mm_setcsr(v | SPU_MXCSR_RZFZ);
+    return v;
 #else
     return ~0ull;
 #endif
@@ -268,6 +286,8 @@ static void spu_float_mode_leave(uint64_t outer)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
+    if (outer != ~0ull) _mm_setcsr((unsigned)outer);
 #else
     (void)outer;
 #endif
@@ -576,6 +596,73 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
+/* ===========================================================================
+ * Idle lock-line polls
+ *
+ * A guest that waits for work by re-reading one lock line (GETLLAR, look,
+ * GETLLAR again) costs nothing on a real SPU, which shares its core with no
+ * one. Here every SPU is a host thread, and God of War HD's two particle job
+ * SPUs spend about half their time in exactly that loop: a million GETLLARs a
+ * second each, nearly all of them reading back the line unchanged, holding two
+ * host cores at 100% with nothing to do.
+ *
+ * A GETLLAR is idle when the reservation from this context's previous GETLLAR
+ * of the same line is still valid (PUTLLC and PUTLLUC always drop it, and so
+ * does any store reported to the line) and the line still matches the
+ * snapshot. Once idle GETLLARs have run back to back for the spin window, the
+ * thread parks on its channel CV until a store to the line wakes it -- every
+ * writer reports one: PPU stores through the reserved-line bitmap, SPU
+ * PUTLLC/PUTLLUC and DMA puts -- or until SPU_LLAR_WAIT_MS passes. It then
+ * returns and the GETLLAR goes ahead, so the guest runs one more iteration of
+ * its loop and sees whatever woke it, a mailbox write included.
+ *
+ * Delaying a GETLLAR only moves the read later, which is always legal, so a
+ * missed wake costs at most the timeout. In that game's combat no timed-out
+ * wait found the line changed (the timeouts are the queue staying empty), and
+ * the process went from 3.5 busy host cores to 2.3 with the frame time
+ * unchanged. SPU_LLAR_BACKOFF=0 turns this off; any other value is the spin
+ * window in microseconds (default 50).
+ * ===========================================================================*/
+static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0);
+
+#define SPU_LLAR_GAP_NS   50000ull   /* a longer gap between polls is work */
+#define SPU_LLAR_WAIT_MS  1
+
+static void spu_llar_backoff(spu_context* ctx, uint32_t ea)
+{
+    static int64_t spin_ns = -1;
+    if (spin_ns < 0) {
+        const char* e = getenv("SPU_LLAR_BACKOFF");
+        spin_ns = e ? (int64_t)atoi(e) * 1000 : 50000;
+    }
+    static SPU_THREAD_LOCAL const spu_context* t_ctx;
+    static SPU_THREAD_LOCAL uint32_t t_ea;
+    static SPU_THREAD_LOCAL uint64_t t_first, t_last;
+    const uint8_t* line = vm_base + ea;
+    if (!spin_ns || !ctx->resv_valid || ctx->resv_ea != ea ||
+        memcmp(line, ctx->resv_line, MFC_ATOMIC_LINE) != 0) {
+        t_ctx = NULL;
+        return;
+    }
+    const uint64_t now = ps3_ft_now();
+    if (t_ctx != ctx || t_ea != ea || now - t_last > SPU_LLAR_GAP_NS) {
+        t_ctx = ctx; t_ea = ea; t_first = now;
+    }
+    t_last = now;
+    if (now - t_first < (uint64_t)spin_ns) return;
+
+    const uint64_t ft_t0 = PS3_FT_ON() ? now : 0;
+    yz_lockstep_block_begin(ctx);
+    AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    if (ctx->resv_valid && memcmp(line, ctx->resv_line, MFC_ATOMIC_LINE) == 0)
+        SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                  (SRWLOCK*)&ctx->ch_wait_lock, SPU_LLAR_WAIT_MS, 0);
+    ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    yz_lockstep_block_end(ctx);
+    if (ft_t0) spu_ft_wait_span(ctx, MFC_RdAtomicStat, ft_t0);
+    t_last = ps3_ft_now();
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -707,6 +794,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
       } }
     switch (cmd) {
     case MFC_GETLLAR_CMD:
+        /* Back off first: a GETLLAR that only re-reads an unchanged line
+         * parks here, outside the lock-line lock, until the line is written. */
+        spu_llar_backoff(ctx, ea);
         /* Lockstep tick: a guest GETLLAR..PUTLLC poll loop is intra-function
          * (all gotos), so it never crosses the SPU_DRAIN tick site -- without a
          * tick here a polling SPU would hold the run token forever while the
@@ -842,7 +932,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
-            memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            spu_put_bytes(mem, ls, MFC_ATOMIC_LINE);   /* commit local store, head last */
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to
@@ -939,7 +1029,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_lockline_lock();
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
-        memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        spu_put_bytes(mem, ls, MFC_ATOMIC_LINE);       /* unconditional store, head last */
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
          * bookkeeping below rather than after it. A peer left holding a

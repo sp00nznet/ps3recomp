@@ -167,6 +167,42 @@ static inline int mfc_is_fence(uint32_t cmd)
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
+/* Copy a transfer to guest memory so that a reader walking FORWARD through
+ * it never sees a new word ahead of stale ones: everything past the first
+ * 128 bytes first, then those 128 bytes from the highest address down, with
+ * 8-byte volatile stores the compiler keeps in order (x86 keeps stores in
+ * program order for every other core; the fence covers weaker hosts).
+ *
+ * The RSX FIFO is such a reader. God of War HD's SPU jobs build a command
+ * block where the title left a self-JUMP park in its ring: one PUT for the
+ * body, then one PUT of 32-128 bytes starting AT the park, carrying the patch
+ * that releases it (a JUMP to the next word) and the block's first commands.
+ * A plain memcpy may store the patch before the rest of those bytes. The
+ * walker, re-reading the park, then followed the patch into stale words:
+ * float data taken for a CALL, an unmapped JUMP, a resync, and once a hung
+ * title. On hardware the MFC writes a 128-byte line whole, and the RSX
+ * cannot see half of one.
+ *
+ * Transfers under 16 bytes (1, 2, 4, 8) stay single stores, so a patched
+ * word is never torn. */
+static inline void spu_put_bytes(uint8_t* dst, const uint8_t* src, uint32_t size)
+{
+    if (size < 16u) { memcpy(dst, src, size); return; }
+    const uint32_t head = size < 128u ? size : 128u;    /* sizes >= 16 are multiples of 16 */
+    if (size > head) memcpy(dst + head, src + head, size - head);
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+#else
+    MemoryBarrier();
+#endif
+    for (uint32_t n = head; n; ) {
+        n -= 8u;
+        uint64_t v;
+        memcpy(&v, src + n, 8);
+        *(volatile uint64_t*)(dst + n) = v;
+    }
+}
+
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
@@ -716,14 +752,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 spu_lockline_unlock();
             } else if (span_reserved) {
                 spu_lockline_lock();
-                memcpy(ea_ptr, ls_ptr, size);
+                spu_put_bytes(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock();
             } else {
-                memcpy(ea_ptr, ls_ptr, size);
+                spu_put_bytes(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
                         spu_lockline_lock();

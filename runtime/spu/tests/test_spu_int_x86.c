@@ -64,6 +64,8 @@ int main(void) {
         TI(spu_ai); TI(spu_sfi); TI(spu_andi); TI(spu_ori); TI(spu_xori);
         TI(spu_ceqi); TI(spu_cgti); TI(spu_clgti);
         TI(spu_shlqbyi); TI(spu_rotqbyi); TI(spu_rotqmbyi);
+        TI(spu_shlqbii); TI(spu_rotqbii); TI(spu_rotqmbii);
+        T2(spu_shlqbi); T2(spu_rotqbi); T2(spu_rotqmbi);
         T2(spu_shlqby); T2(spu_rotqby); T2(spu_shlqbybi); T2(spu_rotqbybi); T2(spu_rotqmby); T2(spu_rotqmbybi);
         TI(spu_cwd);
         T2(spu_absdb); T2(spu_avgb); T2(spu_ceqb); T2(spu_cgtb); T2(spu_clgtb);

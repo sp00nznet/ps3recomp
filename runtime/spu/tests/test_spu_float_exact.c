@@ -11,6 +11,8 @@
  *     boundary, wide exponent gaps, zeros of every kind, extended-range words, raw words.
  * Build (arm64, or x86 with -mavx2 -mfma):
  *   cc -O2 -I runtime/spu -I include runtime/spu/tests/test_spu_float_exact.c -lm -o t && ./t [scale]
+ * On x86 also with -mavx2 alone (the fma's double form) and with -msse4.1 alone (the scalar forms
+ * the interpreter uses); each runs the passes again in SPU_FLOAT_RZ's MXCSR mode.
  * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
 #include "spu_helpers.h"
 #include "../../../tests/spu_ls_watch_fixture.h"
@@ -111,7 +113,7 @@ static void gen_lane(int kind, uint32_t* x, uint32_t* y, uint32_t* z)
     }
 }
 
-static int all_passes(long scale, const char* mode)
+static __attribute__((noinline)) int all_passes(long scale, const char* mode)
 {
     s_bad = 0; s_lanes = 0;
     printf("test_spu_float_exact: FPCR %s\n", mode);
@@ -170,8 +172,21 @@ static int all_passes(long scale, const char* mode)
 }
 
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#define TEST_RZ 1
 static uint64_t fpcr_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
 static void fpcr_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+#define FPCR_DEFAULT 0
+#define FPCR_RZ SPU_FPCR_RZFZ
+#elif defined(__x86_64__) || defined(_M_X64)
+/* MXCSR, as spu_run_with_halt sets it with SPU_FLOAT_RZ=1, and the flag the AVX2 forms read */
+#define TEST_RZ 1
+static unsigned s_csr0;
+static uint64_t fpcr_get(void) { return _mm_getcsr() & ~0x3Fu; }   /* without the sticky flags */
+static void fpcr_set(uint64_t v) { _mm_setcsr((unsigned)v); g_spu_float_rz = ((unsigned)v & SPU_MXCSR_RZFZ) != 0; }
+#define FPCR_DEFAULT s_csr0
+#define FPCR_RZ (s_csr0 | SPU_MXCSR_RZFZ)
+#endif
+#if TEST_RZ
 /* SPU_FLOAT_RZ: double precision and frds must give the default-FPCR answer on a thread whose
  * FPCR is round toward zero with flush-to-zero; FPCR must be back afterwards. */
 static long dp_under_rz(long n)
@@ -189,14 +204,14 @@ static long dp_under_rz(long n)
         want[3] = spu_dfma(a, b, c); want[4] = spu_dfms(a, b, c); want[5] = spu_dfnms(a, b, c);
         want[6] = spu_dfnma(a, b, c); want[7] = spu_frds(a); want[8] = spu_dfceq(a, b);
         want[9] = spu_dfcmeq(a, b); want[10] = spu_dfcgt(a, b); want[11] = spu_dfcmgt(a, b);
-        fpcr_set(SPU_FPCR_RZFZ);
+        fpcr_set(FPCR_RZ);
         got[0] = spu_dfa(a, b); got[1] = spu_dfs(a, b); got[2] = spu_dfm(a, b);
         got[3] = spu_dfma(a, b, c); got[4] = spu_dfms(a, b, c); got[5] = spu_dfnms(a, b, c);
         got[6] = spu_dfnma(a, b, c); got[7] = spu_frds(a); got[8] = spu_dfceq(a, b);
         got[9] = spu_dfcmeq(a, b); got[10] = spu_dfcgt(a, b); got[11] = spu_dfcmgt(a, b);
         const uint64_t after = fpcr_get();
-        fpcr_set(0);
-        if (after != SPU_FPCR_RZFZ) bad++;
+        fpcr_set(FPCR_DEFAULT);
+        if (after != FPCR_RZ) bad++;
         for (int k = 0; k < 12; k++) bad += memcmp(&want[k], &got[k], 16) != 0;
     }
     return bad;
@@ -207,12 +222,15 @@ int main(int argc, char** argv)
 {
     const long scale = argc > 1 ? atol(argv[1]) : 1;
     int rc = all_passes(scale, "default (round to nearest)");
-#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#if TEST_RZ
     /* SPU_FLOAT_RZ: the same passes on a thread running round toward zero with flush-to-zero,
      * where spu_fa.. take their native form. */
-    fpcr_set(SPU_FPCR_RZFZ);
+#if defined(__x86_64__) || defined(_M_X64)
+    s_csr0 = _mm_getcsr() & ~0x3Fu;
+#endif
+    fpcr_set(FPCR_RZ);
     rc |= all_passes(scale, "round toward zero, flush-to-zero (SPU_FLOAT_RZ)");
-    fpcr_set(0);
+    fpcr_set(FPCR_DEFAULT);
     const long dbad = dp_under_rz(4L * 1000 * 1000);
     printf("test_spu_float_exact: double precision under SPU_FLOAT_RZ: %ld mismatches\n", dbad);
     rc |= dbad != 0;
