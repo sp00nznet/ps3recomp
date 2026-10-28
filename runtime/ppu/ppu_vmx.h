@@ -300,20 +300,25 @@ VMX_FUN(vmx_vrfiz, truncf(f), 0, 2)
 VMX_FUN(vmx_vrfip, ceilf(f), 1, 2)
 VMX_FUN(vmx_vrfim, floorf(f), 1, 2)
 
-/* int <-> float with a 2^uimm scale */
+/* int <-> float with a 2^uimm scale. uimm is 5 bits, so 2^-uimm and 2^uimm are
+ * normal floats and the scaling is exact: the same results as ldexpf, without
+ * a libm call per lane (which also kept these helpers out of line). */
+VMX_INL float vmx_pow2(int e) { return vmx_f((uint32_t)(127 + e) << 23); }
 VMX_INL void vmx_vcfux(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(ldexpf((float)vmx_w(b, i), -(int)uimm))); VMX_OUT; }
+    const float s = vmx_pow2(-(int)(uimm & 31u));
+    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u((float)vmx_w(b, i) * s)); VMX_OUT; }
 VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(ldexpf((float)(int32_t)vmx_w(b, i), -(int)uimm))); VMX_OUT; }
+    const float s = vmx_pow2(-(int)(uimm & 31u));
+    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u((float)(int32_t)vmx_w(b, i) * s)); VMX_OUT; }
 VMX_INL void vmx_vctsxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * ldexpf(1.0f, (int)uimm); int32_t v;
+    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * vmx_pow2((int)(uimm & 31u)); int32_t v;
         if (f != f) v = 0;
         else if (f < -2147483648.0f) { v = INT32_MIN; *vscr |= VMX_SAT; }
         else if (f >= 2147483648.0f) { v = INT32_MAX; *vscr |= VMX_SAT; }
         else v = (int32_t)f;
         vmx_sw(r, i, (uint32_t)v); } VMX_OUT; }
 VMX_INL void vmx_vctuxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * ldexpf(1.0f, (int)uimm); uint32_t v;
+    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * vmx_pow2((int)(uimm & 31u)); uint32_t v;
         if (f != f) v = 0;
         else if (f < 0.0f) { v = 0; *vscr |= VMX_SAT; }
         else if (f >= 4294967296.0f) { v = 0xFFFFFFFFu; *vscr |= VMX_SAT; }
