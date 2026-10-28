@@ -1166,7 +1166,13 @@ void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_
             int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
             while (hw <= i && !__atomic_compare_exchange_n(&s_parked_hw, &hw, i + 1, 1,
                                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-            s_parked_obj[i] = wait_obj; s_parked[i] = key;
+            /* Claim the slot: two tasks parking at once found the same free
+             * one, and the second store left the first task unlisted -- "not
+             * parked" for as long as it waited. */
+            uint64_t expect = 0;
+            if (!__atomic_compare_exchange_n(&s_parked[i], &expect, key, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+            s_parked_obj[i] = wait_obj;
             __atomic_fetch_add(&s_parked_count, 1, __ATOMIC_RELAXED);
             return;
         }
@@ -1177,7 +1183,8 @@ void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
         if (s_parked[i] == key) {
-            s_parked[i] = 0;
+            s_parked_obj[i] = 0;   /* "unknown" until the next owner sets its own */
+            __atomic_store_n(&s_parked[i], 0, __ATOMIC_RELEASE);
             __atomic_fetch_sub(&s_parked_count, 1, __ATOMIC_RELAXED);
             return;
         }
@@ -1355,8 +1362,37 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * line holding a parked taskset's signalled bitset is committed; a commit
  * that did not signal them only costs a spurious wake, which the wait loop
  * re-checks. */
+/* Every taskset created through cellSpursCreateTaskset/Taskset2. An SPU task
+ * creates a task the way the SPU task library does: it sets the task's
+ * enabled and pending bits with a PUTLLC on the taskset's first line. Nothing
+ * here started such a task unless a task of that same taskset exited later,
+ * and the task that creates one usually belongs to another taskset. God of War:
+ * Ascension's particle work runs in two phases: the last of five tasks in one
+ * taskset creates the next five in a sibling, and the main thread waits for
+ * them. */
+#define SPU_TASKSETS_MAX 32
+static volatile uint32_t s_tasksets[SPU_TASKSETS_MAX];
+static volatile int s_n_tasksets;
+
+void spu_taskset_register(uint32_t ea)
+{
+    const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) if (s_tasksets[i] == ea) return;
+    if (n < SPU_TASKSETS_MAX) {
+        s_tasksets[n] = ea;
+        __atomic_store_n(&s_n_tasksets, n + 1, __ATOMIC_RELEASE);
+    }
+}
+
 void spu_taskset_line_committed(uint32_t line)
 {
+    /* A commit to a taskset's first line (its bitsets) may have created a
+     * task: start whatever is enabled, ready or pending, and not running. */
+    {
+        const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < n; i++)
+            if (s_tasksets[i] == line) { spu_taskset_start_pending(line); break; }
+    }
     /* Nothing parked -- the whole run, for a title that never parks a taskset
      * task -- costs one load instead of a 64-slot scan; otherwise only the
      * slots below the high-water mark can hold a parked task. Slot order, and

@@ -1054,6 +1054,20 @@ int64_t sys_event_port_send(ppu_context* ctx)
  * EVENT FLAGS
  * ========================================================================= */
 
+int64_t sys_event_flag_create(ppu_context* ctx);
+
+/* An event flag the runtime makes for a guest object (no attribute block),
+ * its id stored big-endian at the guest address id_out. */
+int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init_pattern)
+{
+    ppu_context c;
+    memset(&c, 0, sizeof c);
+    c.gpr[3] = id_out;
+    c.gpr[4] = 0;
+    c.gpr[5] = init_pattern;
+    return sys_event_flag_create(&c);
+}
+
 int64_t sys_event_flag_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);

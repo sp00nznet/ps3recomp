@@ -2654,6 +2654,12 @@ void spu_indirect_branch(spu_context* ctx)
                   fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                           n, ctx->gpr[3]._u32[0]); }
             ctx->gpr[3] = spu_make_preferred_u32(0);
+            /* The kernel's selection copies the instance's first line into the
+             * context's tempArea (LS 0x100) on every call, not only at module
+             * entry, and jobs that ran since may have overwritten it. */
+            { const uint32_t sp = ((uint32_t)ctx->ls[0x1C4] << 24) | ((uint32_t)ctx->ls[0x1C5] << 16) |
+                                  ((uint32_t)ctx->ls[0x1C6] << 8) | ctx->ls[0x1C7];
+              if (sp) memcpy(ctx->ls + 0x100, vm_base + sp, 0x80); }
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
