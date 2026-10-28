@@ -114,6 +114,39 @@ static void sys_process_is_stack(ppu_context* ctx)
  * concurrently -- fences vanished mid-ring. A zero id now means an
  * unregistered context (bug); stamp a sentinel that matches no real thread. */
 #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
+/* The owner and recursion words, read and written in place under the test
+ * lifted code makes for its own loads and stores (ppu_recomp.h, vm_mm_*):
+ * inside the inline range, no diagnostic armed and, for a store, no SPU
+ * reservation on the line. Anything else goes out of line as before. When
+ * God of War HD's allocator is busy the fast paths below run 640,000 times
+ * in one frame, and the out-of-line accessors' probes were the larger part
+ * of each. */
+extern "C" int vm_inline_ok;
+extern "C" int vm_inline_st_ok;
+extern "C" uint32_t g_barrier_sync_watch;
+extern "C" uint32_t g_null_sweep_hi;
+extern "C" const unsigned char* g_spu_coh_bits;
+static inline int lwm_word_inline(uint32_t ea)
+{
+    const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
+    return !(ea & 3u) && ea >= 0x10000u && ea <= hi - 4u;
+}
+static inline uint32_t lwm_rd(uint32_t ea)
+{
+    if (vm_inline_ok && lwm_word_inline(ea) && ea != ppu_hle_inject_base + 0x2008u)
+        return __builtin_bswap32(__atomic_load_n((const uint32_t*)(vm_base + ea), __ATOMIC_RELAXED));
+    return vm_read32(ea);
+}
+static inline void lwm_wr(uint32_t ea, uint32_t v)
+{
+    const unsigned char* bits = g_spu_coh_bits;
+    if (vm_inline_st_ok && lwm_word_inline(ea) && !(g_barrier_sync_watch | g_null_sweep_hi) &&
+        !(bits && ((bits[ea >> 10] >> ((ea >> 7) & 7u)) & 1u))) {
+        __atomic_store_n((uint32_t*)(vm_base + ea), __builtin_bswap32(v), __ATOMIC_RELAXED);
+        return;
+    }
+    vm_write32(ea, v);
+}
 
 struct LwmSlot;
 static struct LwmSlot* lwm_slot(uint32_t addr);   /* fwd (defined below) */
@@ -310,11 +343,11 @@ static int sys_lwmutex_lock_fast(ppu_context* ctx)
     struct LwmSlot* sl = lwm_slot(lwm);
     if (!sl || lwm_trace()) return 0;
     const uint32_t self = LWM_SELF(ctx);
-    if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0)
-        vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+    if (lwm_rd(lwm + LWM_OWNER) == self && lwm_rd(lwm + LWM_RECUR) > 0)
+        lwm_wr(lwm + LWM_RECUR, lwm_rd(lwm + LWM_RECUR) + 1);
     else if (lwm_try(sl)) {
-        vm_write32(lwm + LWM_OWNER, self);
-        vm_write32(lwm + LWM_RECUR, 1);
+        lwm_wr(lwm + LWM_OWNER, self);
+        lwm_wr(lwm + LWM_RECUR, 1);
     } else
         return 0;
     ctx->gpr[3] = 0;
@@ -348,14 +381,14 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
 static void sys_lwmutex_unlock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
-    uint32_t rc = vm_read32(lwm + LWM_RECUR);
+    uint32_t rc = lwm_rd(lwm + LWM_RECUR);
     if (rc > 1) {                       /* recursive hold: count down, keep the lock */
-        vm_write32(lwm + LWM_RECUR, rc - 1);
+        lwm_wr(lwm + LWM_RECUR, rc - 1);
         ctx->gpr[3] = 0;
         return;
     }
-    vm_write32(lwm + LWM_RECUR, 0);
-    vm_write32(lwm + LWM_OWNER, 0);
+    lwm_wr(lwm + LWM_RECUR, 0);
+    lwm_wr(lwm + LWM_OWNER, 0);
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
         if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
             if (held > 100000) {

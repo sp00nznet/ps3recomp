@@ -244,8 +244,34 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
-    /* Use high-resolution sleep via waitable timer for better precision */
-    if (usec >= 1000) {
+    /* SYS_USLEEP_SPIN_MAX_US (default 200): waits that long or longer sleep on
+     * this thread's high-resolution waitable timer; shorter ones spin below.
+     * Spinning every wait under 1 ms held a core per polling thread: God of
+     * War: Ascension's EdgeWatchdog polls with 800 us sleeps (12k a 10 s)
+     * and sat at 97-99% of a core on a 6-core host where the SPU workers
+     * needed it. */
+    static long s_spin_max = -1;
+    if (s_spin_max < 0) {
+        const char* e = getenv("SYS_USLEEP_SPIN_MAX_US");
+        s_spin_max = e ? atol(e) : 200;
+    }
+    static _Thread_local HANDLE s_hrt;
+    static _Thread_local int s_hrt_tried;
+    if (!s_hrt_tried) {
+        s_hrt_tried = 1;
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+        /* Windows 10 1803 and later; NULL before, and the paths below stand. */
+        s_hrt = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+    }
+    if (s_hrt && usec > 0 && (long)usec >= s_spin_max) {
+        LARGE_INTEGER due;
+        due.QuadPart = -((LONGLONG)usec * 10);   /* 100 ns units, relative */
+        if (SetWaitableTimer(s_hrt, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(s_hrt, INFINITE);
+    } else if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         if (timer) {
             LARGE_INTEGER due;
@@ -359,14 +385,17 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     uint64_t sec, nsec;
 
 #ifdef _WIN32
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-
-    /* Convert QPC to seconds + nanoseconds */
-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
+    /* The wall clock, in seconds since 1970 as on the console and as the
+     * CLOCK_REALTIME branch below returns. This used QueryPerformanceCounter,
+     * i.e. the time since the PC started: God of War HD stamps its saves with
+     * this call and its load screen showed every one as Jan 1, 1970. FILETIME
+     * counts 100 ns units since 1601. */
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    const uint64_t t100 = (((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime)
+                        - 116444736000000000ULL;
+    sec  = t100 / 10000000ULL;
+    nsec = (t100 % 10000000ULL) * 100ULL;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

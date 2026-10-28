@@ -55,15 +55,26 @@ static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 
 /* $PS3_GAMEDATA_ROOT replaces the cwd-relative "./gamedata", so a port can keep
  * the player's saves in one fixed place (e.g. ~/Library/Application Support/...)
- * no matter which directory the game was launched from. */
+ * no matter which directory the game was launched from.
+ *
+ * Without it, $PS3_HDD0_ROOT -- the host directory sys_fs maps /dev_hdd0 to --
+ * holds the saves as well, where the guest's own /dev_hdd0/home paths point. A
+ * port that set only that one kept its saves under whatever directory the game
+ * was started from, apart from the rest of /dev_hdd0: God of War HD's first
+ * save landed in the build directory when the executable was started there. */
 static void adopt_gamedata_root(void)
 {
     static int s_done = 0;
     if (s_done) return;
     s_done = 1;
     const char* env = getenv("PS3_GAMEDATA_ROOT");
-    if (env && *env)
+    if (env && *env) {
         snprintf(s_save_root, sizeof(s_save_root), "%s/dev_hdd0/home/00000001/savedata", env);
+        return;
+    }
+    const char* hdd0 = getenv("PS3_HDD0_ROOT");
+    if (hdd0 && *hdd0)
+        snprintf(s_save_root, sizeof(s_save_root), "%s/home/00000001/savedata", hdd0);
 }
 
 /* Ensure directory (and parents) exist */
@@ -660,6 +671,143 @@ static u32 enumerate_save_files(const char* save_path,
     return count;
 }
 
+/* $PS3_SAVEDATA_BACKUPS=<n>: before a save writes into a save directory that
+ * already holds one, copy its files to <save root>_backup/<dir>/<YYYYMMDD-
+ * HHMMSS> and keep the newest n copies. A slot saved over by mistake, or a
+ * save the title wrote wrong, can then be put back by hand. Off when unset. */
+static int save_backups_max(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char* e = getenv("PS3_SAVEDATA_BACKUPS");
+        n = e ? atoi(e) : 0;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
+static int copy_host_file(const char* src, const char* dst)
+{
+    FILE* in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE* out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+    char buf[65536];
+    size_t n;
+    int failed = 0;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+        if (fwrite(buf, 1, n, out) != n) { failed = 1; break; }
+    if (ferror(in)) failed = 1;
+    fclose(in);
+    if (fclose(out) != 0) failed = 1;
+    return failed ? -1 : 0;
+}
+
+/* Names of the subdirectories of `dir`, sorted, up to `max`. */
+static int list_subdirs(const char* dir, char (*names)[64], int max)
+{
+    int n = 0;
+#ifdef _WIN32
+    char search[1100];
+    snprintf(search, sizeof search, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+        if (n < max) { strncpy(names[n], fd.cFileName, 63); names[n][63] = 0; n++; }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir);
+    if (!d) return 0;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char p[1200];
+        snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+        HOST_STAT_T st;
+        if (HOST_STAT(p, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (n < max) { strncpy(names[n], de->d_name, 63); names[n][63] = 0; n++; }
+    }
+    closedir(d);
+#endif
+    qsort(names, (size_t)n, 64, (int (*)(const void*, const void*))strcmp);
+    return n;
+}
+
+/* The listing leaves out PARAM.SFO and PARAM.PFD (a title never sees them);
+ * a copy of the save needs them, and a directory holding them cannot be
+ * removed. */
+static const char* const k_save_system_files[] = { "PARAM.SFO", "PARAM.PFD" };
+
+/* Remove a backup directory: the files in it, then the directory. */
+static void remove_backup_dir(const char* dir)
+{
+    CellSaveDataFileStat files[64];
+    const u32 n = enumerate_save_files(dir, files, 64);
+    char p[1200];
+    for (u32 i = 0; i < n; i++) {
+        snprintf(p, sizeof p, "%s/%s", dir, files[i].fileName);
+        remove(p);
+    }
+    for (int i = 0; i < 2; i++) {
+        snprintf(p, sizeof p, "%s/%s", dir, k_save_system_files[i]);
+        remove(p);
+    }
+#ifdef _WIN32
+    RemoveDirectoryA(dir);
+#else
+    rmdir(dir);
+#endif
+}
+
+static void save_backup(const char* save_path, const char* dirName)
+{
+    const int keep = save_backups_max();
+    if (keep <= 0) return;
+    CellSaveDataFileStat files[64];
+    const u32 n = enumerate_save_files(save_path, files, 64);
+    if (!n) return;
+
+    char root[1100];
+    snprintf(root, sizeof root, "%s_backup/%s", s_save_root, dirName);
+    const time_t now = time(NULL);
+    struct tm lt;
+#ifdef _WIN32
+    localtime_s(&lt, &now);
+#else
+    localtime_r(&now, &lt);
+#endif
+    char stamp[32], dst[1200];
+    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &lt);
+    snprintf(dst, sizeof dst, "%s/%s", root, stamp);
+    for (int k = 2; dir_exists(dst) && k < 100; k++)     /* two saves in one second */
+        snprintf(dst, sizeof dst, "%s/%s-%02d", root, stamp, k);
+    ensure_dirs(dst);
+    int copied = 0;
+    char from[1200], to[1300];
+    for (u32 i = 0; i < n; i++) {
+        snprintf(from, sizeof from, "%s/%s", save_path, files[i].fileName);
+        snprintf(to, sizeof to, "%s/%s", dst, files[i].fileName);
+        if (copy_host_file(from, to) == 0) copied++;
+    }
+    for (int i = 0; i < 2; i++) {
+        snprintf(from, sizeof from, "%s/%s", save_path, k_save_system_files[i]);
+        snprintf(to, sizeof to, "%s/%s", dst, k_save_system_files[i]);
+        if (copy_host_file(from, to) == 0) copied++;
+    }
+    printf("[cellSaveData] backup of '%s': %d file(s) to %s\n", dirName, copied, dst);
+
+    static char names[128][64];
+    const int have = list_subdirs(root, names, 128);
+    for (int i = 0; i + keep < have; i++) {
+        char old[1200];
+        snprintf(old, sizeof old, "%s/%s", root, names[i]);
+        remove_backup_dir(old);
+    }
+}
+
 /* Execute file callback: read/write/delete files in the save directory */
 static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 {
@@ -961,6 +1109,9 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
             return CELL_SAVEDATA_ERROR_NODATA;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
+
+    /* The title goes ahead with the save: keep a copy of what it replaces. */
+    if (is_save && !is_new) save_backup(save_path, dirName);
 
     /* Write PARAM.SFO if stat set provided params and we're saving */
     if (is_save && statSet.setParam) {
