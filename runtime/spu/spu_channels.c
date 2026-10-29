@@ -845,7 +845,24 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
-        spu_lockline_lock();
+        /* Direction-3 (spurs_test SpinLock): in a lock-line contention storm
+         * most PUTLLCs are losers whose reservation a peer's commit already
+         * killed -- and hardware fails those WITHOUT touching the line lock.
+         * Check the reservation state atomically first and skip the global
+         * lock-line lock entirely when the PUTLLC cannot succeed (measured
+         * storm ceiling was ~90k locked ops/s: ~8 threads each taking the
+         * lock on every handoff; this removes ~7 of those 8 acquisitions).
+         * A live reservation still takes the lock for the compare-and-commit,
+         * and the memcmp inside re-verifies, so a reservation killed between
+         * this check and the lock simply fails there as before. The fail
+         * branch below is reached with pre_ok==0 exactly as it used to be
+         * with a dead reservation. */
+        { const int pre_ok =
+              __atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE) &&
+              (__atomic_load_n(&ctx->resv_ea, __ATOMIC_RELAXED) & ~(uint32_t)(MFC_ATOMIC_LINE - 1)) == ea;
+        if (pre_ok) spu_lockline_lock();
+        /* pre_ok==0 means the reservation test below already fails (plain
+         * loads), so the branch selection is identical to always-locking. */
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
@@ -935,11 +952,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
-        spu_lockline_unlock();
+        if (pre_ok) spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         }
+        }   /* pre_ok scope */
         return 1;
 
     case MFC_PUTLLUC_CMD:
