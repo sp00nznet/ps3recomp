@@ -1228,22 +1228,33 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
 }
 
 /* A guest-memory row copy with the same reservation bookkeeping a coherent
- * PPU store does (ppu_loader.cpp VM_WRITE_COH), once per row instead of per
+ * PPU store does (ppu_loader.cpp VM_WRITE_COH), once per line instead of per
  * pixel: an SPU holding a reservation on a 128-byte line the row overwrites
- * loses it and gets its lost-reservation event. The two byte swaps a
- * vm_read32/vm_write32 pair does cancel, so the bytes move verbatim. */
+ * loses it and gets its lost-reservation event. Reserved lines copy under
+ * that line's own lock; a line marked after its unlocked copy is notified but
+ * not copied again. The two byte swaps a vm_read32/vm_write32 pair does
+ * cancel, so the bytes move verbatim. */
 static void gcm_store(u32 d, const u8* src, u32 n)
 {
     extern u8* vm_base;
     const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
     int reserved = 0;
-    for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
+    for (u32 a = l0; ; a += 128) { reserved = spu_coh_is_reserved(a); if (reserved || a == l1) break; }
     if (!reserved) { memmove(vm_base + d, src, n); return; }
-    spu_lockline_lock();
-    memmove(vm_base + d, src, n);
-    for (u32 a = l0; a <= l1; a += 128)
-        if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
-    spu_lockline_unlock();
+    for (u32 a = l0; ; a += 128) {
+        const u32 lo = a > d ? a - d : 0u;
+        const u32 hi = a + 128u - d < n ? a + 128u - d : n;
+        if (spu_coh_is_reserved(a)) {
+            spu_linelock_lock(a);
+            memmove(vm_base + d + lo, src + lo, hi - lo);
+            spu_linelock_release(a);
+            spu_coh_notify_write(a);
+        } else {
+            memmove(vm_base + d + lo, src + lo, hi - lo);
+            if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);   /* reserved after its copy */
+        }
+        if (a == l1) break;
+    }
 }
 
 static void gcm_row_copy(u32 d, u32 s, u32 n)
