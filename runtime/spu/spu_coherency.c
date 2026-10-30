@@ -3,12 +3,14 @@
  *
  * See spu_coherency.h for what this is for. The state here is deliberately
  * plain: a bit per 128-byte line, a small table of the SPU contexts that have
- * ever reserved one, and the lock-line spinlock. Everything that WRITES it runs
- * with the lock-line lock held (the SPU's GETLLAR, the PPU's coherent store),
- * so the read-modify-write on a shared bitmap byte is serialized. Only
- * spu_coh_is_reserved reads without the lock, which is the entire point: it is
- * on every PPU store. The one other unlocked path is a GETLLAR that re-reserves
- * a marked line (spu_coh_reserve_fast); its ordering argument is there.
+ * ever reserved one, a 512-entry per-line lock+version table, and the table
+ * lock. Everything that touches the holder/watch lists or the bitmap's first
+ * mark runs under the table lock (spu_lockline_lock); line DATA, by contrast,
+ * is written under the owning line's per-line lock, so writers of different
+ * lines never serialize. Only spu_coh_is_reserved reads without any lock,
+ * which is the entire point: it is on every PPU store. The other unlocked
+ * path is a GETLLAR that re-reserves a marked line (spu_coh_reserve_fast);
+ * its ordering argument is there.
  */
 
 #include <stdlib.h>
@@ -104,6 +106,125 @@ void spu_lockline_lock(void)
 }
 void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort(); }
 #endif
+
+/* ===========================================================================
+ * Per-line lock + version words
+ *
+ * One word per 128-byte line, words spaced a cache line apart so two hot
+ * lines do not ping-pong each other; indexing aliases every 64 KiB (512
+ * words, 32 KiB of BSS) like RPCS3's g_reservations -- see spu_coherency.h.
+ * Bit 6 is the exclusive transaction lock; bits 7+ are a version counter
+ * (+128 per committed write), advisory only.
+ * ===========================================================================*/
+#define SPU_LL_WORDS     512u
+#define SPU_LL_STRIDE    8u                 /* u64s per word: 64-byte spacing */
+#define SPU_LL_LOCK_BIT  0x40u
+#define SPU_LL_VER_STEP  0x80u
+
+#if defined(_MSC_VER)
+#  include <intrin.h>
+#  include <windows.h>   /* SwitchToThread */
+__declspec(align(64)) static uint64_t s_ll_words[SPU_LL_WORDS * SPU_LL_STRIDE];
+#else
+#  include <stdatomic.h>
+__attribute__((aligned(64))) static uint64_t s_ll_words[SPU_LL_WORDS * SPU_LL_STRIDE];
+#endif
+
+static inline uint32_t spu_ll_index(uint32_t ea)
+{
+    return (ea >> SPU_COH_LINE_SHIFT) & (SPU_LL_WORDS - 1u);
+}
+
+void spu_linelock_lock(uint32_t ea)
+{
+#if defined(_MSC_VER)
+    volatile long long* w = (volatile long long*)&s_ll_words[spu_ll_index(ea) * SPU_LL_STRIDE];
+    unsigned spins = 0;
+    for (;;) {
+        const long long cur = *w;
+        if (!(cur & SPU_LL_LOCK_BIT) &&
+            _InterlockedCompareExchange64(w, cur | SPU_LL_LOCK_BIT, cur) == cur)
+            return;
+        do {
+            _mm_pause();
+            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
+        } while (*w & SPU_LL_LOCK_BIT);
+    }
+#else
+    _Atomic uint64_t* w = (_Atomic uint64_t*)&s_ll_words[spu_ll_index(ea) * SPU_LL_STRIDE];
+    unsigned spins = 0;
+    for (;;) {
+        uint64_t cur = atomic_load_explicit(w, memory_order_relaxed);
+        if (!(cur & SPU_LL_LOCK_BIT) &&
+            atomic_compare_exchange_weak_explicit(w, &cur, cur | SPU_LL_LOCK_BIT,
+                                                  memory_order_acquire, memory_order_relaxed))
+            return;
+        do {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+            __builtin_ia32_pause();
+#endif
+            if (++spins >= 4096) { spins = 0; }
+            cur = atomic_load_explicit(w, memory_order_relaxed);
+        } while (cur & SPU_LL_LOCK_BIT);
+    }
+#endif
+}
+
+void spu_linelock_unlock(uint32_t ea)
+{
+#if defined(_MSC_VER)
+    volatile long long* w = (volatile long long*)&s_ll_words[spu_ll_index(ea) * SPU_LL_STRIDE];
+    _InterlockedAnd64(w, ~(long long)SPU_LL_LOCK_BIT);
+#else
+    _Atomic uint64_t* w = (_Atomic uint64_t*)&s_ll_words[spu_ll_index(ea) * SPU_LL_STRIDE];
+    atomic_fetch_and_explicit(w, ~(_Atomic uint64_t)SPU_LL_LOCK_BIT, memory_order_release);
+#endif
+}
+
+void spu_linelock_bump(uint32_t ea)
+{
+    /* Caller holds the line lock: the word is exclusively ours. */
+    s_ll_words[spu_ll_index(ea) * SPU_LL_STRIDE] += SPU_LL_VER_STEP;
+}
+
+void spu_linelock_release(uint32_t ea)
+{
+    /* bump+unlock in one atomic step: adding 0x40 to a word with the lock bit
+     * set clears the bit and carries into the version field (+0x80). Caller
+     * must hold the lock. A full barrier is wanted here anyway: the data
+     * write ordered before the release must be visible before any waiter
+     * that observes the lock free starts its own transaction. */
+#if defined(_MSC_VER)
+    volatile long long* w = (volatile long long*)&s_ll_words[spu_ll_index(ea) * SPU_LL_STRIDE];
+    _InterlockedExchangeAdd64(w, SPU_LL_LOCK_BIT);
+#else
+    _Atomic uint64_t* w = (_Atomic uint64_t*)&s_ll_words[spu_ll_index(ea) * SPU_LL_STRIDE];
+    atomic_fetch_add_explicit(w, SPU_LL_LOCK_BIT, memory_order_release);
+#endif
+}
+
+void spu_linelock_range(uint32_t ea_lo, uint32_t ea_hi)
+{
+    /* Ascending address order -- see spu_coherency.h for the deadlock argument. */
+    const uint32_t last = ea_hi & ~127u;
+    uint32_t a = ea_lo & ~127u;
+    for (;;) {
+        spu_linelock_lock(a);
+        if (a == last) break;
+        a += 128u;
+    }
+}
+
+void spu_linelock_range_unlock(uint32_t ea_lo, uint32_t ea_hi)
+{
+    const uint32_t last = ea_hi & ~127u;
+    uint32_t a = ea_lo & ~127u;
+    for (;;) {
+        spu_linelock_unlock(a);
+        if (a == last) break;
+        a += 128u;
+    }
+}
 
 /* ===========================================================================
  * The reserved-line bitmap
@@ -319,11 +440,14 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  *    critical section could overlap this read walks past it.
  * Anything else takes the lock and spu_coh_reserve as before.
  *
- * Writers still hold the lock-line lock, so they stay serialized with each
- * other and with PUTLLC's compare-and-commit; only the reader stopped
- * waiting. resv_valid and resv_ea are accessed atomically on both sides of
- * the race; everything else about a reservation is still only touched by the
- * owning thread or under the lock.
+ * Writers commit line data under the LINE's own lock (spu_linelock_lock), so
+ * writers of different lines stay parallel and only same-line writers -- and
+ * PUTLLC's compare-and-commit -- serialize with each other. The reservation
+ * kill runs after the data write, behind spu_coh_writer_fence, in
+ * spu_coh_notify_write; only the reader stopped waiting. resv_valid and
+ * resv_ea are accessed atomically on both sides of the race; everything else
+ * about a reservation is still only touched by the owning thread or under the
+ * table lock.
  * ===========================================================================*/
 static inline void spu_coh_writer_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
@@ -352,6 +476,13 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
+    /* The kill walk touches the watch and holder lists: the table lock, taken
+     * here (self-contained), NOT by the caller. Callers commit their line
+     * write under the line's own lock, release it, then notify -- so a writer
+     * of another line is never serialized with this walk beyond its own
+     * commit. The data compare is the authority; this walk is advisory and
+     * may lag the write. */
+    spu_lockline_lock();
     spu_coh_wake_watches(line);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
@@ -363,6 +494,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
             spu_ch_wake(c);
         }
     }
+    spu_lockline_unlock();
 }
 
 void spu_coh_notify_write(uint32_t ea)
@@ -370,6 +502,7 @@ void spu_coh_notify_write(uint32_t ea)
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
+    spu_lockline_lock();
     spu_coh_wake_watches(line);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
@@ -393,6 +526,7 @@ void spu_coh_notify_write(uint32_t ea)
             spu_ch_wake(c);
         }
     }
+    spu_lockline_unlock();
 }
 
 #ifdef __cplusplus
