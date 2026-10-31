@@ -978,6 +978,49 @@ static void cellFsAioRead(ppu_context* ctx)
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
 
+/* MLB The Show 16 copies files into its /dev_hdd1 cache in 64 KB chunks, each
+ * written with cellFsAioWrite, and polls a status word its completion callback
+ * sets. With the NID unresolved the submit "succeeded", nothing was written, the
+ * callback never ran, and the boot parked on the first screen. Same contract and
+ * the same synchronous-completion shortcut as cellFsAioRead above. */
+static void cellFsAioWrite(ppu_context* ctx)
+{
+    uint32_t aio    = (uint32_t)ctx->gpr[3];
+    uint32_t id_ptr = (uint32_t)ctx->gpr[4];
+    uint32_t cb_opd = (uint32_t)ctx->gpr[5];
+
+    int      fd     = (int)guest_be32(aio + 0x00);
+    uint64_t offset = guest_be64(aio + 0x08);
+    uint32_t buf    = guest_be32(aio + 0x10);
+    uint64_t size   = guest_be64(aio + 0x18);
+
+    static std::atomic<int32_t> s_next_id{1};
+    int32_t id = s_next_id++;
+    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
+
+    size_t n = 0;
+    int32_t err = CELL_FS_ENOENT;
+    if (FILE* f = fd_file(fd)) {
+        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+        /* Absolute, like the read: leave the fd's own position where it was. */
+        HOST_LOCKFILE(f);
+        const int64_t pos = (int64_t)HOST_FTELL64(f);
+        if (HOST_FSEEK64(f, offset) == 0)
+            n = fwrite(vm_base + buf, 1, (size_t)size, f);
+        fflush(f);
+        if (pos >= 0) HOST_FSEEK64(f, pos);
+        HOST_UNLOCKFILE(f);
+        err = (n == size) ? CELL_OK : CELL_FS_EIO;
+    }
+    if (getenv("PS3_FSLOG"))
+        fprintf(stderr, "[fs] aio write id=%d fd=%d off=%llu size=%llu -> %zu\n",
+                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
+
+    ctx->gpr[3] = CELL_OK;
+    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
+                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+}
+
 extern "C" void ppu_fs_register(void)
 {
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
@@ -1012,5 +1055,6 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(0xDB869F20u, "cellFsAioInit",   cellFsAioInit);
     ps3_hle_register_ctx(0x9F951810u, "cellFsAioFinish", cellFsAioFinish);
     ps3_hle_register_ctx(0xC1C507E7u, "cellFsAioRead",   cellFsAioRead);
+    ps3_hle_register_ctx(0x4CEF342Eu, "cellFsAioWrite",  cellFsAioWrite);
     ps3_hle_register_ctx(0x7F13FC8Cu, "cellFsAioCancel", cellFsAioCancel);
 }
