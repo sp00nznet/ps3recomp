@@ -101,6 +101,8 @@ uint64_t ppu_thread_register_main(void);
  * With PS3_PRIO_START=1, sys_ppu_thread_create waits for it on a thread it has just made at a higher priority than
  * the creator's, as lv2's scheduler would run that thread first. */
 void ppu_thread_note_block(uint64_t tid);
+/* Set the executable's validated PROC_PARAM priority before main dispatch. */
+uint64_t ppu_thread_register_main_priority(int32_t priority);
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

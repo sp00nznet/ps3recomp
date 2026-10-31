@@ -325,6 +325,7 @@ uint64_t ppu_thread_register_main(void)
         t->ctx.thread_id = 1;
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
+        t->priority = 1001;                 /* default PS3 process priority */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
         ps3_tprof_thread('P', 1);
@@ -338,6 +339,18 @@ uint64_t ppu_thread_register_main(void)
     }
     table_unlock();
     return 1;
+}
+
+/* The ELF entry path may follow a host bootstrap which already claimed slot
+ * zero. Apply its process priority in either case, before guest dispatch. The
+ * legacy no-argument registration API remains available for other harnesses. */
+uint64_t ppu_thread_register_main_priority(int32_t priority)
+{
+    uint64_t id = ppu_thread_register_main();
+    table_lock();
+    g_ppu_threads[0].priority = (priority >= 0 && priority <= 3071) ? priority : 1001;
+    table_unlock();
+    return id;
 }
 
 /* ---------------------------------------------------------------------------
