@@ -698,6 +698,14 @@ s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads)
     return CELL_OK;
 }
 
+/* The instance keeps maxContention in one byte and no workload can occupy more
+ * than CELL_SPURS_MAX_SPU SPUs, so larger values clamp: a bare (u8) cast turned
+ * 256 into 0. */
+static u32 spurs_clamp_contention(u32 c)
+{
+    return c > CELL_SPURS_MAX_SPU ? CELL_SPURS_MAX_SPU : c;
+}
+
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
                               u32 maxContention)
 {
@@ -710,6 +718,7 @@ s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
         spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
     }
 
+    maxContention = spurs_clamp_contention(maxContention);
     s_workloads[wid].maxContention = maxContention;
     vm_write8(si->ea + SPURS_WKL_MAXCONT + wid, (u8)maxContention);
     spurs_api_unlock(si);
@@ -1387,6 +1396,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
 {
     if (!spurs || !wid)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    maxContention = spurs_clamp_contention(maxContention);
     /* spurs/wid/priority are guest EAs; pm stays a guest EA (it's the SPU
      * program address consumed later by the workload dispatch). */
     uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
@@ -3125,10 +3135,25 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
  * Misc SPURS surface the title links (logged CELL_OK stubs).
  * =====================================================================*/
 
-s32 cellSpursRequestIdleSpu(u64 spurs_ea)
+/* cellSpursRequestIdleSpu(spurs, wid, count): the workload may also run on up to
+ * `count` SPUs beyond its ready count. Stored in the instance byte the
+ * kernel reads (SPURS_WKL_IDLE2). */
+s32 cellSpursRequestIdleSpu(u64 spurs_ea, u64 wid64, u64 count64)
 {
+    const u32 wid = (u32)wid64, count = (u32)count64;
+    if (!spurs_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+    if (rc) return rc;
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;   /* same as SetMaxContention */
+    }
+    vm_write8(si->ea + SPURS_WKL_IDLE2 + wid, (u8)count);
     static int _n = 0;
-    if (PS3_LOG_FIRST(_n, 4)) printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X)\n", (u32)spurs_ea);
+    if (PS3_LOG_FIRST(_n, 8))
+        printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X wid=%u count=%u)\n", (u32)spurs_ea, wid, count);
+    spurs_api_unlock(si);
     return CELL_OK;
 }
 
