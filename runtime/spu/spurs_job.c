@@ -44,6 +44,7 @@
 #include <string.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: one span per job */
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
@@ -179,6 +180,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                 job_ea, size_bin);
         return -1;
     }
+    /* The whole job: DMA in, the run, DMA out. Its run and waits nest inside. */
+    PS3_TRACE_SCOPE(PS3_TR_SPU_JOB, job_ea, (uint32_t)image_id);
 
     uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
     if (!ls) return -1;
