@@ -838,8 +838,42 @@ void* ppu_gcm_wait_pump(void (**pump)(void))
 }
 #endif
 
+/* GCM_HANDLER_THREAD=1: deliver the guest's vblank/flip/user handlers only on a
+ * dedicated host thread, as the PS3 does on its GCM interrupt thread. Pumped at
+ * an HLE boundary, a handler runs nested in whatever guest thread made the call
+ * and inherits its thread id, so a handler taking a lock that thread already
+ * holds re-enters it instead of waiting. MLB The Show 16's lock wrappers record
+ * the owner id and unlock only for the recorded owner: its flip handler,
+ * delivered inside its DisplayFlip thread, cleared that record, DisplayFlip's
+ * own unlock was skipped and the lock leaked, freezing the game. */
+void ppu_gcm_pump(void);
+static unsigned long s_gcm_intr_tid = 0;
+static int gcm_handler_thread_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_HANDLER_THREAD"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+static DWORD WINAPI gcm_intr_main(LPVOID unused)
+{
+    (void)unused;
+    s_gcm_intr_tid = (unsigned long)GetCurrentThreadId();
+#ifdef _WIN32
+    for (;;) { ppu_gcm_pump(); Sleep(1); }
+#else
+    for (;;) { ppu_gcm_pump(); usleep(250); }
+#endif
+    return 0;
+}
+
 void ppu_gcm_pump(void)
 {
+    if (gcm_handler_thread_on() && (unsigned long)GetCurrentThreadId() != s_gcm_intr_tid) {
+        static volatile long started = 0;
+        if (!started && InterlockedCompareExchange(&started, 1, 0) == 0)
+            CreateThread(NULL, 1u << 20, gcm_intr_main, NULL, 0, NULL);
+        return;   /* only the interrupt thread delivers */
+    }
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
