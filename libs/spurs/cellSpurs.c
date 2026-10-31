@@ -934,7 +934,7 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
     const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
     u32 size = attr_h->tasksetSize;
     if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
-    return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
+    return spurs_create_taskset(spurs, taskset, attr_h->args, NULL, 0, size);
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
@@ -1286,17 +1286,20 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
                                attr_h->lsPattern_ea, attr_h->argument_ea);
 }
 
-/* The SDK's versioned taskset-attribute initializer. We forward taskset creation
- * through CreateTaskset (which ignores the attribute), so just zero the struct. */
+/* The SDK's versioned taskset-attribute initializer. Only argTaskset and the
+ * size are carried to creation: the taskset argument reaches every task in r4,
+ * and a task that reads its setup through it (MLB The Show 16's Bink task DMAs
+ * its event flag address from there) otherwise gets 0. */
 s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
                                          u32 revision, u32 sdkVersion, u64 argTaskset,
                                          u64 priority, u32 maxContention)
 {
-    (void)sdkVersion; (void)argTaskset; (void)priority; (void)maxContention;
+    (void)sdkVersion; (void)priority; (void)maxContention;
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
     attr->revision = revision ? revision : 1;
+    attr->args = argTaskset;
     attr->tasksetSize = CSTS_STRUCT_END;
     printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u)\n", revision);
     return CELL_OK;
