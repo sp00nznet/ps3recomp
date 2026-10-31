@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/nid.h"         /* ps3_compute_nid: context-handler registration */
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -1595,6 +1596,31 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
     printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u)\n",
            (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention);
     return CELL_OK;
+}
+
+/* The ninth argument, maxContention, is on the guest stack, so the generic 8-GPR
+ * adapter can't see it and the version above stores 1. That ran every WWS job
+ * list on one SPU at a time: MLB The Show 16 sizes its mesh vertex rings for
+ * several SPUs sharing a list, and with one they overflowed every frame and the
+ * jobs waited on the GPU for ring space it could not free. */
+#include "../../runtime/ppu/ppu_context.h"
+static void hle_workload_attribute_initialize(ppu_context* ctx)
+{
+    s32 rc = _cellSpursWorkloadAttributeInitialize(ctx->gpr[3], (u32)ctx->gpr[4], (u32)ctx->gpr[5],
+                                                   ctx->gpr[6], (u32)ctx->gpr[7], ctx->gpr[8],
+                                                   ctx->gpr[9], (u32)ctx->gpr[10]);
+    if (rc == CELL_OK) {
+        u32 maxc = (u32)vm_read64((u32)ctx->gpr[1] + 112u);   /* first stack argument slot */
+        vm_write32((u32)ctx->gpr[3] + WKATTR_MAX_CONT, maxc);
+    }
+    ctx->gpr[3] = (u64)(s64)rc;
+}
+
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+void cellSpurs_register_ctx_handlers(void)
+{
+    ps3_hle_register_ctx(ps3_compute_nid("_cellSpursWorkloadAttributeInitialize"),
+                         "_cellSpursWorkloadAttributeInitialize", hle_workload_attribute_initialize);
 }
 
 s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameInstance_ea)
