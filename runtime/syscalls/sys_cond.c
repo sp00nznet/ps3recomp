@@ -7,6 +7,7 @@
  */
 #include "sys_cond.h"
 #include "sys_ppu_thread.h"   /* ppu_thread_note_block */
+#include "../../include/ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -148,6 +149,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
         cond_unlock(c); return (int32_t)CELL_EPERM;
     }
+    /* Every wait blocks until a signal; the mutex reacquire is part of it. */
+    PS3_TRACE_SCOPE(PS3_TR_PPU_COND, LV2_ARG_U32(ctx, 0), ps3_trace_clamp32(timeout));
     struct sys_cond_waiter waiter = {NULL, 0};
     struct sys_cond_waiter** tail = &c->waiters;
     while (*tail) tail = &(*tail)->next;

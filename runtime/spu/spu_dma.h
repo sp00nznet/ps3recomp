@@ -17,6 +17,7 @@
 
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
+#include "../../include/ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: tag-status waits */
 #include "spu_coherency.h"
 #include <stdint.h>
 #include <string.h>
@@ -1730,8 +1731,19 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
     case MFC_WrTagMask:
         spu->mfc_tag_mask = value;
         break;
-    case MFC_WrTagUpdate:
+    case MFC_WrTagUpdate: {
+        /* PS3RECOMP_TRACE: a wait for tags that are not complete yet -- one
+         * an SPU would block in. Already-complete waits, the usual case with
+         * this synchronous MFC, are not recorded. */
+        uint64_t tr_t0 = ps3_trace_begin();
+        if (tr_t0) {
+            const uint32_t done = mfc->tag_completed & spu->mfc_tag_mask;
+            if (value == MFC_TAG_UPDATE_IMMEDIATE || !spu->mfc_tag_mask ||
+                (value == MFC_TAG_UPDATE_ALL ? done == spu->mfc_tag_mask : done != 0))
+                tr_t0 = 0;
+        }
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
+        ps3_trace_end(tr_t0, PS3_TR_SPU_TAG_WAIT, spu->mfc_tag_mask, spu->mfc_tag_status);
         /* WWS Run-promotion gate probe: after kCommandsExecuted the job manager
          * only calls ChangeLoadToRunJob if `ceq(RdTagStat, tagMask)` holds, i.e.
          * RdTagStat must equal the mask EXACTLY (mask 2 = tag 1 =
@@ -1745,6 +1757,7 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
                       spu->mfc_tag_status,
                       (spu->mfc_tag_status == spu->mfc_tag_mask) ? "  (== mask: PROMOTE)" : "  (!= mask: idle)"); } }
         break;
+    }
     case MFC_WrListStallAck:
         /* Acknowledge a stalled list element's tag group: resume the parked
          * list from the element after the stall point (may stall again). */

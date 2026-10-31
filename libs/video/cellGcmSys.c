@@ -18,6 +18,7 @@
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
+#include "../../include/ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE timeline */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -692,8 +693,10 @@ void cellGcmSetWaitFlip(void)
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
+    const uint64_t tr_t0 = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING ? ps3_trace_begin() : 0;
     for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
         Sleep(1);
+    ps3_trace_end(tr_t0, PS3_TR_PPU_GCM_WAIT_FLIP, 0, 0);
     /* A flip still WAITING after the bound is left to the tick. Forcing DONE
      * here skipped its completion: the tick only completes WAITING flips, so
      * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
@@ -734,7 +737,13 @@ u32 cellGcmGetFlipStatus(void)
       if (fd && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
-    return s_flip_status;
+    /* PS3RECOMP_TRACE: a title that spins here is waiting for the flip. */
+    const u32 st = s_flip_status;
+    if (ps3_trace_on()) {
+        if (st == CELL_GCM_FLIP_STATUS_WAITING) ps3_trace_poll(PS3_TR_PPU_GCM_FLIP_POLL, 0);
+        else ps3_trace_poll_end(PS3_TR_PPU_GCM_FLIP_POLL);
+    }
+    return st;
 }
 
 /* Host-side ticks. The game's host driver (e.g. flow main.cpp) calls
@@ -904,6 +913,7 @@ void cellGcmTickFlip(void)
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
     if (waiting) GCM_PENDING_SET(2);
+    if (waiting) ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, s_flip_tick_seq, 0);
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -1824,6 +1834,7 @@ void cellGcm_ref_on_poll(void)
 }
 
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
+static uint64_t s_tr_sema_t0;          /* PS3RECOMP_TRACE: the same */
 
 /* RSX_WALKER_PROF=<file>: an in-process sampling profile of the FIFO walker
  * thread, for hosts where an external sampler cannot attach. Once
@@ -1946,13 +1957,42 @@ static void wprof_note_walker(void) {}
 /* Host thread that last walked the FIFO, for PS3_SAMPLE_DRAIN. */
 volatile unsigned long g_gcm_drain_tid;
 
+/* PS3RECOMP_TRACE: a pass that ends caught up with `put`, or on a self-JUMP
+ * park, starts a wait for the guest's next `put`; the first later pass that
+ * moves `get` ends it where that pass began. Passes run on whichever thread
+ * calls the walker, so the wait is an async span, not a nested one. */
+static uint64_t s_tr_put_t0;
+static u32 s_tr_put_get;
+static int s_tr_parked;       /* set by the walker: this pass stopped on a park */
+
+static void gcm_tr_pass(uint64_t t0, u32 get0)
+{
+    const uint64_t t1 = ps3_trace_now();
+    const u32 get = s_fifo_getoff, put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    ps3_trace_span(PS3_TR_RSX_DRAIN, t0, t1, get0, get);
+    if (s_tr_put_t0 && get != get0) {
+        ps3_trace_span(PS3_TR_RSX_PUT_WAIT, s_tr_put_t0, t0, s_tr_put_get, put);
+        s_tr_put_t0 = 0;
+    }
+    if (!s_tr_put_t0 && (get == put || s_tr_parked)) { s_tr_put_t0 = t1; s_tr_put_get = get; }
+    s_tr_parked = 0;
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
     wprof_note_walker();
     g_gcm_drain_tid = GetCurrentThreadId();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
-    gcm_rsx_process_fifo_unlocked();
+    const uint64_t tr_t0 = ps3_trace_begin();
+    if (tr_t0) {
+        ps3_trace_thread_name_default("rsx walker");
+        const u32 tr_get0 = s_fifo_getoff;
+        gcm_rsx_process_fifo_unlocked();
+        gcm_tr_pass(tr_t0, tr_get0);
+    } else {
+        gcm_rsx_process_fifo_unlocked();
+    }
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
     if (ft_t0) {
         const uint64_t t1 = ps3_ft_now();
@@ -2302,6 +2342,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           flips, 10); }
             if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                                ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
+            ps3_trace_instant(PS3_TR_GCM_FLIP, w & 7u, 0);
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
@@ -2384,6 +2425,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   }
                   why = "parked";
                   s_park_pass = 1;
+                  s_tr_parked = 1;
                   break;
               }
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
@@ -2459,6 +2501,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
                         s_ft_sema_t0 = 0;
                     }
+                    /* PS3RECOMP_TRACE: the same, as an async span. */
+                    if (m == 0x68u && s_tr_sema_t0 && vm_read32(la) == v) {
+                        ps3_trace_span(PS3_TR_RSX_SEMA_WAIT, s_tr_sema_t0, ps3_trace_now(), s_sema_offset, v);
+                        s_tr_sema_t0 = 0;
+                    }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) {
                         /* The RSX has fetched past a RELEASE before its
@@ -2498,12 +2545,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now; }
                 if (!blk_ms || now - b_t0 < blk_ms) {
                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                    if (!s_tr_sema_t0 && ps3_trace_on()) s_tr_sema_t0 = ps3_trace_now();
                     sem_blocked = 1; break;
                 }
                 { static int tn; if (PS3_LOG_FIRST(tn, 12))
                     fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
                             s_sema_offset, v, blk_ms, vm_read32(la)); }
                 b_t0 = 0;
+                if (s_tr_sema_t0) {   /* PS3RECOMP_TRACE: the bounded wait ended without the value */
+                    ps3_trace_span(PS3_TR_RSX_SEMA_WAIT, s_tr_sema_t0, ps3_trace_now(), s_sema_offset, v);
+                    s_tr_sema_t0 = 0;
+                }
             }
         }
                 }
@@ -3116,6 +3168,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     s_last_flip_time = get_timestamp_ns();
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
+    ps3_trace_instant(PS3_TR_GCM_FLIP_REQ, bufferId, (uint32_t)in_fifo);
 
     /* Invoke via OPD resolution, not a raw call into guest code.
      *

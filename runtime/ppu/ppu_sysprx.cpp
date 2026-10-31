@@ -26,6 +26,7 @@
 extern "C" uint64_t host_monotonic_ns(void);
 #endif
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: lwmutex / lwcond waits */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -284,6 +285,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
             ppu_thread_note_block(ctx->thread_id);
+            PS3_TRACE_SCOPE(PS3_TR_PPU_LWMUTEX, lwm, ps3_trace_clamp32(timeout_us));
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
             if (!lwm_acquire(sl0, timeout_us)) {   /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
@@ -434,6 +436,13 @@ static void sys_lwcond_wait(ppu_context* ctx)
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
     ctx->gpr[3] = 0;
+}
+/* PS3RECOMP_TRACE: the wait as a span. A wrapper, so the body above stays the
+ * self-contained function tools/test_lwcond_layout.py builds. */
+static void sys_lwcond_wait_traced(ppu_context* ctx)
+{
+    PS3_TRACE_SCOPE(PS3_TR_PPU_LWCOND, (uint32_t)ctx->gpr[3], 0);
+    sys_lwcond_wait(ctx);
 }
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
@@ -979,7 +988,7 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal"),     "sys_lwcond_signal",     sys_lwcond_signal);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_all"), "sys_lwcond_signal_all", sys_lwcond_signal_all);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_to"),  "sys_lwcond_signal_to",  sys_lwcond_signal_to);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_wait"),       "sys_lwcond_wait",       sys_lwcond_wait);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_wait"),       "sys_lwcond_wait",       sys_lwcond_wait_traced);
 
     /* Thread id + memory manager (high-frequency boot imports). The flat VM
      * means map/unmap/free are no-ops: the memory already exists everywhere. */

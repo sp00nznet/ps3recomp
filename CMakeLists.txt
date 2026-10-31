@@ -402,6 +402,21 @@ if(PS3RECOMP_BUILD_TESTS)
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
     endif()
+    # PS3RECOMP_TRACE (include/ps3emu/ps3_trace.h): synthetic threads through
+    # the API; the Python driver loads the JSON and checks that spans nest.
+    add_executable(test_frame_trace tests/test_frame_trace.c)
+    target_include_directories(test_frame_trace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(TARGET Threads::Threads)
+        target_link_libraries(test_frame_trace PRIVATE Threads::Threads)
+    endif()
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME frame_trace
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_frame_trace.py"
+                $<TARGET_FILE:test_frame_trace>)
+        set_tests_properties(frame_trace PROPERTIES TIMEOUT 120)
+    endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

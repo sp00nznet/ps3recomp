@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: lwmutex / lwcond waits */
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -554,11 +555,19 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
         fprintf(stderr, "[LWMTX] tid %lu BLOCKING on lwmutex slot %u (guest 0x%08X)\n",
                 GetCurrentThreadId(), slot, YZ_GUEST_ADDR(lwmutex));
+        const uint64_t tr_t0 = ps3_trace_begin();
         EnterCriticalSection(&s_lwmutex[slot].cs);
+        ps3_trace_end(tr_t0, PS3_TR_PPU_LWMUTEX, YZ_GUEST_ADDR(lwmutex), ps3_trace_clamp32(timeout));
         fprintf(stderr, "[LWMTX] tid %lu acquired slot %u\n", GetCurrentThreadId(), slot);
     }
 #else
-    pthread_mutex_lock(&s_lwmutex[slot].mtx);
+    if (!ps3_trace_on()) {
+        pthread_mutex_lock(&s_lwmutex[slot].mtx);
+    } else if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0) {   /* a span only if it blocks */
+        const uint64_t tr_t0 = ps3_trace_now();
+        pthread_mutex_lock(&s_lwmutex[slot].mtx);
+        ps3_trace_end(tr_t0, PS3_TR_PPU_LWMUTEX, YZ_GUEST_ADDR(lwmutex), ps3_trace_clamp32(timeout));
+    }
 #endif
 
     lwmutex->lock_var = 1;
@@ -742,6 +751,7 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
     u32 mslot = s_lwcond[cslot].lwmutex_id;
     if (mslot >= MAX_LWMUTEX || !s_lwmutex[mslot].in_use)
         return CELL_ESRCH;
+    PS3_TRACE_SCOPE(PS3_TR_PPU_LWCOND, YZ_GUEST_ADDR(lwcond), 0);
 
 #ifdef _WIN32
     DWORD ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);

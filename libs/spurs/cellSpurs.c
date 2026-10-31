@@ -16,6 +16,8 @@
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: SPURS SPU busy spans */
+#include "ps3emu/ps3_trace.h"    /* PS3RECOMP_TRACE: policy module quanta */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -1729,8 +1731,13 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
+        const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        const uint64_t tr_t0 = ps3_trace_begin();
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
+        ps3_trace_end(tr_t0, PS3_TR_SPU_POLICY, (uint32_t)slot->image_id, slot->wid);
+        if (ft_t0)   /* PS3_FTRACE: SPURS SPUs never block on a channel, so their busy time is the module run */
+            ps3_ft_span(PS3_FT_SPU_BUSY, slot->spu_num, (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
         AcquireSRWLockExclusive(&si->lock);

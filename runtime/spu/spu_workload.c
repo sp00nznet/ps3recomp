@@ -21,6 +21,7 @@
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
 #include "ps3emu/thread_name.h"
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: one span per dispatched workload */
 
 static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
                                      uint32_t owner_ea);   /* below */
@@ -339,7 +340,9 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
         "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n",
         (unsigned long long)fp, entry, args_ea, image_id);
 
-    spu_run_lifted_job_img(fn, ls, args_ea, image_id);
+    { const uint64_t tr_t0 = ps3_trace_begin();
+      spu_run_lifted_job_img(fn, ls, args_ea, image_id);
+      ps3_trace_end(tr_t0, PS3_TR_SPU_WORKLOAD, (uint32_t)image_id, args_ea); }
 
     free(ls);
     return 1;
@@ -642,6 +645,7 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
 
 static void spu_async_run(spu_async_job* j)
 {
+    PS3_TRACE_SCOPE(PS3_TR_SPU_WORKLOAD, (uint32_t)j->image_id, j->args_ea);
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */

@@ -18,6 +18,7 @@
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: runs, channel waits, lock-line retries */
 #include "spu_overlay_residency.h"
 #include <stdint.h>
 #include <stdatomic.h>
@@ -131,6 +132,12 @@ void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc
 
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
+
+/* PS3RECOMP_TRACE: this thread's PUTLLC retry loop, from its first failure to
+ * the next success (spu_tr_putllc). Reset by each run so a loop a halt cut
+ * short never ends inside a later run. */
+static SPU_TLS uint64_t s_tr_retry_t0;
+static SPU_TLS uint32_t s_tr_retry_n, s_tr_retry_ea;
 
 /* Call right after a setjmp returned 0. On 64-bit Windows longjmp unwinds every
  * host frame between it and its setjmp (RtlUnwindEx, a function-table lookup
@@ -330,6 +337,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
+    const uint64_t tr_t0 = ps3_trace_begin();   /* PS3RECOMP_TRACE; not modified after setjmp */
+    if (tr_t0) s_tr_retry_n = 0;
     switch (SPU_SETJMP(s_spu_halt_env)) {
     case 1:
         halted = 1;
@@ -364,6 +373,10 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         SPU_DRAIN(ctx);
     }
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
+    if (tr_t0) {
+        s_tr_retry_n = 0;
+        ps3_trace_end(tr_t0, PS3_TR_SPU_RUN, (uint32_t)ctx->image_id, ctx->spu_id);
+    }
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
     spu_float_mode_leave(fpcr_outer);
@@ -575,6 +588,21 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * itself; we have no manager, so we pass this and treat arriving here as job
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
+
+/* PS3RECOMP_TRACE: a failed PUTLLC opens a retry span, the next successful one
+ * on this thread closes it with the number of failures. */
+static void spu_tr_putllc(uint32_t ea, int ok)
+{
+    if (!ok) {
+        if (!s_tr_retry_n++) { s_tr_retry_t0 = ps3_trace_now(); s_tr_retry_ea = ea; }
+        return;
+    }
+    if (s_tr_retry_n) {
+        ps3_trace_span(PS3_TR_SPU_LOCKLINE_RETRY, s_tr_retry_t0, ps3_trace_now(),
+                       s_tr_retry_ea, s_tr_retry_n);
+        s_tr_retry_n = 0;
+    }
+}
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
@@ -928,6 +956,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
+        if (ps3_trace_on()) spu_tr_putllc(ea, ctx->atomic_stat == 0);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
@@ -1019,11 +1048,14 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * polling the MMIO window, whereas SPURS-thread mailboxes are drained
          * by paths that do not wake a stalled writer. A raw SPU's local store
          * is the guest window, not its own buffer. */
-        if (ctx->ls != ctx->ls_store)
+        if (ctx->ls != ctx->ls_store) {
+            const uint64_t tr_t0 = ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH ? ps3_trace_begin() : 0;
             while (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && ctx->status != SPU_STATUS_STOPPED) {
                 spu_honour_stop_request(ctx);
                 Sleep(0);
             }
+            ps3_trace_end(tr_t0, PS3_TR_SPU_OUT_MBOX_WAIT, v, ctx->pc & SPU_LS_MASK);
+        }
         spu_channel_write(&ctx->ch_out_mbox, v);
         /* SPU_DBG_MBOX=1: depth after the write. The image-1 SPUs publish their
          * LS work buffer here (LS 0x11D4) and then poll it, and the guest sets
@@ -1180,6 +1212,17 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 {
     if (!yz_ch_block() || spu_ch_ready(ctx, channel)) return;
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    /* PS3RECOMP_TRACE: what the wait is for, taken before it changes. */
+    const uint64_t tr_t0 = ps3_trace_begin();
+    int tr_ev = PS3_TR_SPU_EVENT_WAIT;
+    uint32_t tr_a = 0, tr_pc = 0;
+    if (tr_t0) {
+        tr_a = ctx->event_mask;
+        tr_pc = ctx->pc & SPU_LS_MASK;
+        if (channel == SPU_RdInMbox) { tr_ev = PS3_TR_SPU_MBOX_WAIT; tr_a = channel; }
+        else if (channel == SPU_RdSigNotify1 || channel == SPU_RdSigNotify2) { tr_ev = PS3_TR_SPU_SIGNAL_WAIT; tr_a = channel; }
+        else if ((ctx->event_mask & 0x400u) && ctx->resv_valid) { tr_ev = PS3_TR_SPU_RESV_WAIT; tr_a = ctx->resv_ea; }
+    }
 
     { static unsigned long bn = 0; unsigned long n = ++bn;
       if (n <= 50 || (n % 512) == 0)
@@ -1214,6 +1257,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     }
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
     if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);
+    ps3_trace_end(tr_t0, tr_ev, tr_a, tr_pc);
     ctx->status = SPU_STATUS_RUNNING;
 }
 

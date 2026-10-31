@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
 #include "ps3emu/log_first.h"
+#include "../../include/ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: blocking waits */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -391,6 +392,9 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+    /* A peek, not the decision: a wait that finds no token is a span. */
+    PS3_TRACE_SCOPE_IF(__atomic_load_n(&s->value, __ATOMIC_RELAXED) <= 0, PS3_TR_PPU_SEMAPHORE,
+                       sem_id, ps3_trace_clamp32(timeout_us));
 
 #ifdef _WIN32
     /* value is the only count. The kernel semaphore is only a wake channel;

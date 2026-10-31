@@ -37,6 +37,7 @@
 #include "ppu_recomp.h"
 #include "../spu/spu_coh_bitmap.h"   /* spu_coh_line_reserved, for the stores */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
+#include "ps3emu/ps3_trace.h"    /* PS3RECOMP_TRACE timeline */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -1756,7 +1757,11 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
      * publishes at up to 1/ms and the loading progresses ~35x faster. */
     if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
         if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
-        if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+        if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); }
+        /* PS3RECOMP_TRACE: a guest spinning on the ref register is in
+         * cellGcmFinish (or a FIFO-space wait); a run of reads is the wait. */
+        if (ps3_trace_on()) { uint32_t r; memcpy(&r, vm_base + (uint32_t)a, 4);
+                              ps3_trace_poll(PS3_TR_PPU_GCM_FINISH, __builtin_bswap32(r)); } }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
 #ifdef _WIN32

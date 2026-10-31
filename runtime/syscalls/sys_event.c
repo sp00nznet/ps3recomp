@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>               /* getenv */
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: blocking waits */
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
@@ -474,6 +475,9 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
         spu_dispatch_frame_by_queue(queue_id, 0);
     }
+    /* A peek, not the decision: a receive that finds the queue empty is a span. */
+    PS3_TRACE_SCOPE_IF(__atomic_load_n(&q->count, __ATOMIC_RELAXED) == 0, PS3_TR_PPU_EVENT_QUEUE,
+                       queue_id, ps3_trace_clamp32(timeout_us));
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
@@ -1249,6 +1253,8 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         pthread_mutex_lock(&f->lock); f->pattern |= bitpat; pthread_mutex_unlock(&f->lock);
 #endif
       } }
+    PS3_TRACE_SCOPE_IF(!flag_check(__atomic_load_n(&f->pattern, __ATOMIC_RELAXED), bitpat, mode),
+                       PS3_TR_PPU_EVENT_FLAG, flag_id, ps3_trace_clamp32(timeout_us));
 
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
