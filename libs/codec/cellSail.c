@@ -566,21 +566,23 @@ s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
 }
 
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
-                                     CellSailMemAllocatorFuncs* pFuncs)
+                                     CellSailMemAllocatorFuncs* pFuncs, void* pArg)
 {
-    /* Both parameters are GUEST addresses, and both structs live in GUEST
-     * memory with 32-bit big-endian pointers. Dereferencing them as host
-     * structs was wrong twice over: the address was never translated, and the
-     * host struct has 64-bit fields, so even the offsets did not line up. The
-     * values stored here are guest OPD addresses that SAIL calls back into. */
-    u32 alloc_ea = (u32)(uintptr_t)allocator;
-    u32 funcs_ea = (u32)(uintptr_t)pFuncs;
-    printf("[cellSail] MemAllocatorInitialize(allocator=0x%08X funcs=0x%08X)\n",
-           alloc_ea, funcs_ea);
-    if (!alloc_ea) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    if (funcs_ea) {
-        vm_write32(alloc_ea + 0, vm_read32(funcs_ea + 0));   /* pAlloc */
-        vm_write32(alloc_ea + 4, vm_read32(funcs_ea + 4));   /* pFree  */
-    }
+    /* These arguments are guest EAs, not host records. Copy the two callback
+     * OPDs by value and preserve the third argument in the twelve-byte record.
+     * Read both callbacks first so overlapping input/output remains safe. */
+    const u64 alloc_ea = (u64)(uintptr_t)allocator;
+    const u64 funcs_ea = (u64)(uintptr_t)pFuncs;
+    extern u32 ppu_vm_size;
+    const u64 limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    if (!vm_base || !alloc_ea || !funcs_ea || (alloc_ea & 3) || (funcs_ea & 3) ||
+        alloc_ea > limit || funcs_ea > limit ||
+        12 > limit - alloc_ea || 8 > limit - funcs_ea)
+        return (s32)0x80610701u;
+    const u32 alloc_opd = vm_read32((u32)funcs_ea);
+    const u32 free_opd = vm_read32((u32)funcs_ea + 4);
+    vm_write32((u32)alloc_ea, alloc_opd);
+    vm_write32((u32)alloc_ea + 4, free_opd);
+    vm_write32((u32)alloc_ea + 8, (u32)(uintptr_t)pArg);
     return CELL_OK;
 }
