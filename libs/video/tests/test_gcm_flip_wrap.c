@@ -103,6 +103,14 @@ int main(void)
     u32 rt = cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     s_display_buffer_set[1] = 1;
 
+    /* CellGcmContextData: end reserves the last word for the wrap JUMP */
+    const u32 rt_begin = vm_read32(rt);
+    const u32 rt_end = vm_read32(rt + 4);
+    if (rt_end != rt_begin + CMD_SIZE - 4) {
+        printf("FAIL: rt_end (0x%08X) != rt_begin + CMD_SIZE - 4 (0x%08X)\n", rt_end, rt_begin + CMD_SIZE - 4);
+        fails++;
+    }
+
     /* The title's draw context: 0x30000 bytes inside the IO window, with its
      * own callback descriptor. */
     const u32 tctx = host_alloc(0x18, 16), tbuf = IO_ADDR + 0x200000u;

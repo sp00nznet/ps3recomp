@@ -612,7 +612,11 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     u32 cdata  = galloc ? galloc(16, 16) : 0;
     if (cdata && gwrite32) {
         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
-        gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
+        /* The last word is the wrap JUMP's slot, as in the SDK: a title that
+         * writes its JUMP-to-begin AT `end` (MLB 16) otherwise puts it in the
+         * memory after the ring, and when that is overwritten the walker runs
+         * on into data. */
+        gwrite32(cdata + 0x4, cmdbuf + cmdSize - 4); /* end     */
         gwrite32(cdata + 0x8, cmdbuf);              /* current */
         /* Command-buffer-full callback: a guest OPD {func, toc} routed to
          * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
@@ -2841,12 +2845,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * and near-end recycling is enabled from then on. */
         static int s_title_overran = 0;
         if (s_fifo_recycle_waiting) head_consumed = 0;   /* its callback is recycling */
-        else if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
+        else if (begin && end > begin && cur > end) { head_consumed = 1; s_title_overran = 1; }   /* `end` is the last word: cur == end is full, not overrun */
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
-                u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
+                u32 jmp_at = (cur <= end) ? cur : end;   /* `end` is the JUMP's own slot */
                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
