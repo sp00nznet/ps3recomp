@@ -63,6 +63,7 @@ int64_t sys_memory_get_page_attribute(ppu_context* ctx);
 int64_t sys_memory_container_create(ppu_context* ctx);
 int64_t sys_memory_container_destroy(ppu_context* ctx);
 int64_t sys_memory_container_get_size(ppu_context* ctx);
+int64_t sys_memory_allocate_from_container(ppu_context* ctx);
 int64_t sys_mmapper_allocate_address(ppu_context* ctx);
 int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out);
 int64_t sys_mmapper_free_address(ppu_context* ctx);
