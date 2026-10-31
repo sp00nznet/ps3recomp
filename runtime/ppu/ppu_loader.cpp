@@ -3944,10 +3944,22 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
  * callbacks whose OPD is captured at registration time and may later be
  * clobbered in guest memory (e.g. the GCM flip/vblank handler OPDs). Same
  * scratch-stack + trampoline-drain behaviour as ppu_guest_call. */
-extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+/* Restore host context even when a synchronous callback throws. */
+struct ppu_active_context_scope {
+    ppu_context* previous;
+    explicit ppu_active_context_scope(ppu_context* current) : previous(g_active_ctx) {
+        g_active_ctx = current;
+    }
+    ~ppu_active_context_scope() { g_active_ctx = previous; }
+};
+
+extern "C" int ppu_guest_call_ct_checked(uint32_t code, uint32_t toc,
                                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                                      uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+                                      uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
+                                      uint64_t* result)
 {
+    if (!result) return 0;
+    *result = 0;
     if (!code) return 0;
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
@@ -3970,11 +3982,30 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
 #else
     ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
 #endif
-    g_active_ctx = &ctx;
+    ppu_active_context_scope active_scope(&ctx);
+    /* A callback owns only the continuations it enqueues. Preserve any caller
+     * continuation, and discard an abandoned tail if this callback unwinds. */
+    struct callback_trampoline_scope {
+        void (*previous)(void*);
+        callback_trampoline_scope() : previous(g_trampoline_fn) { g_trampoline_fn = nullptr; }
+        ~callback_trampoline_scope() { g_trampoline_fn = previous; }
+    } trampoline_scope;
+
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
-    g_active_ctx = saved_active;
-    return ctx.gpr[3];
+    *result = ctx.gpr[3];
+    return 1;
+}
+
+/* Legacy callers keep their result-only contract. Ownership-sensitive users
+ * use the checked entry point: zero-valued callback success is unambiguous. */
+extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+                                      uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                      uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{
+    uint64_t result = 0;
+    ppu_guest_call_ct_checked(code,toc,a0,a1,a2,a3,a4,a5,a6,a7,&result);
+    return result;
 }
 
 extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
