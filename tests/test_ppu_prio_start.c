@@ -129,6 +129,12 @@ int main(void)
         finish_case();
     }
 
+    /* Priority zero is the highest valid priority, not an unset sentinel. */
+    set_main_priority(0);
+    create(400, BODY_WRITE_THEN_BLOCK);
+    EXPECT(__atomic_load_n(&g_published, __ATOMIC_RELAXED) == 0);
+    finish_case();
+
     /* 5. The creator's own priority counts once main has set one: at 300, a 400 thread no longer preempts it. */
     set_main_priority(300);
     create(400, BODY_WRITE_THEN_BLOCK);

@@ -141,12 +141,13 @@ void ppu_thread_note_block(uint64_t tid)
         __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
 }
 
-/* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
- * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
+/* Priority the creator runs at. Must be called under the table lock. Main
+ * registration now initializes a real priority; zero is the highest valid
+ * priority and must not be treated as an unset/default sentinel. */
 static int32_t creator_priority(uint64_t tid)
 {
     const ppu_thread_info* c = find_thread(tid);
-    if (!c || (c == &g_ppu_threads[0] && c->priority == 0)) return PPU_DEFAULT_PRIORITY;
+    if (!c) return PPU_DEFAULT_PRIORITY;
     return c->priority;
 }
 
