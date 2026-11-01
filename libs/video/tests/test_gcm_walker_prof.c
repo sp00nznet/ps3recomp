@@ -125,7 +125,11 @@ int main(int argc, char** argv)
         check(f == NULL, "without RSX_WALKER_PROF no profile is written");
         if (f) fclose(f);
     } else {
-        walker_loop(6.0);
+        /* The sampler requests 1000 one-millisecond sleeps. nanosleep is a
+         * minimum delay: timer coalescing on a shared macOS runner can make
+         * those ticks substantially longer. Keep a bounded completion check
+         * without requiring the host to schedule each tick within 6 ms. */
+        walker_loop(30.0);
         check(atomic_load(&s_wprof_state) == 2, "the sampler finishes after RSX_WALKER_PROF_SECONDS");
         FILE* f = fopen(path, "r");
         check(f != NULL, "the profile file is written");
