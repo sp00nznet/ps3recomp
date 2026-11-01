@@ -432,8 +432,16 @@ static int spu_mfc_cache_enabled(void)
     static atomic_int cached;
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (!value) {
+        /* Default ON since 2026-10-31: SPU_MFC_PROF showed ~32 mfc_for calls
+         * per 32B PUT (every LSA/EAH/EAL/Size/Tag/channel access looks the
+         * engine up), each paying the SRW claim lock under 8-thread
+         * contention -- the single dominant cost of the whole spurs suite
+         * (PUT item 37x off PS3). The generation-invalidation contract on
+         * release/forget_range already makes a stale hit impossible; this
+         * only flips who pays for it by default. SPU_MFC_LOOKUP_CACHE=0
+         * restores the always-locked path. */
         const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
-        value = flag && !strcmp(flag, "1") ? 2 : 1;
+        value = (flag && flag[0] == '0') ? 1 : 2;
         atomic_store_explicit(&cached, value, memory_order_relaxed);
     }
     return value == 2;
