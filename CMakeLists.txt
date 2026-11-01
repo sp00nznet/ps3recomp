@@ -431,6 +431,15 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
 
+    # Current colors are explicit shader inputs even when they equal the
+    # hardware default; exercise both compact fetch entry points without a GPU.
+    add_executable(test_vertex_current_color
+        libs/video/tests/test_vertex_current_color.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_dispatch.c)
+    target_include_directories(test_vertex_current_color PRIVATE include libs/video)
+    add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

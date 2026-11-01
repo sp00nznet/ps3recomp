@@ -109,6 +109,22 @@ void rsx_vertex_layout_plan_init(
     plan->stride = (u32)plan->count * 16u;
 }
 
+void rsx_vertex_fetch_default(const rsx_dispatch* rsx, u32 attr, float out[4])
+{
+    rsx_dsp_vertex_default(rsx, attr, out);
+    if (attr != 3)
+        return;
+    const u32 base = (0x1C00u + attr * 0x10u) >> 2;
+    const u32 written = rsx->seen[base] | rsx->seen[base + 1] |
+        rsx->seen[base + 2] | rsx->seen[base + 3];
+    /* Preserve the legacy white color fallback only for an unwritten
+     * attribute. An explicit (0,0,0,1) is shader input, even when it equals
+     * the hardware default; a shader may swizzle x into output alpha. */
+    if (!written && out[0] == 0.0f && out[1] == 0.0f &&
+        out[2] == 0.0f && out[3] == 1.0f)
+        out[0] = out[1] = out[2] = 1.0f;
+}
+
 void rsx_vertex_fetch_plan_init(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
     const rsx_vertex_layout_plan* layout,
@@ -129,16 +145,7 @@ void rsx_vertex_fetch_plan_init(
             rsx_vertex_attrib_size(fetch->desc.type, fetch->desc.size);
         fetch->stride =
             fetch->desc.stride ? fetch->desc.stride : fetch->elem_size;
-        rsx_dsp_vertex_default(rsx, attr, fetch->default_value);
-        if (attr == 3 &&
-            fetch->default_value[0] == 0.0f &&
-            fetch->default_value[1] == 0.0f &&
-            fetch->default_value[2] == 0.0f &&
-            fetch->default_value[3] == 1.0f) {
-            fetch->default_value[0] = 1.0f;
-            fetch->default_value[1] = 1.0f;
-            fetch->default_value[2] = 1.0f;
-        }
+        rsx_vertex_fetch_default(rsx, attr, fetch->default_value);
     }
 }
 
