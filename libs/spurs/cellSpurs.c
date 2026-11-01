@@ -1710,6 +1710,22 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
+/* SPURS_IDLE_MAX=<n> (default 4, 0..8): cap of the idle back-off, as log2 of
+ * the pass cadence. A module run that finds no work doubles its workload's probe
+ * interval up to every 2^n-th kernel pass. Work that arrives without a kick is
+ * found only by those probes, and a chain of such workloads, each backed off,
+ * pays up to 2^n passes per link. 0 probes every enabled workload every pass. */
+static u32 spurs_idle_max(void)
+{
+    static int s_max = -1;
+    if (s_max < 0) {
+        const char* e = getenv("SPURS_IDLE_MAX");
+        int v = e && *e ? atoi(e) : 4;
+        s_max = v < 0 ? 0 : v > 8 ? 8 : v;
+    }
+    return (u32)s_max;
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -1740,7 +1756,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         vm_base[slot->ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
-        else if (si->idle[wid] < 4) si->idle[wid]++;
+        else if (si->idle[wid] < spurs_idle_max()) si->idle[wid]++;
         slot->busy = 0;
         WakeAllConditionVariable(&si->wake);
     }
