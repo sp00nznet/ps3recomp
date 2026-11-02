@@ -104,6 +104,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include "rsx_vertex_formats.h"
+#include "rsx_d3d12_device.h"
 #include <sys/stat.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -8339,7 +8340,11 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     ld_enable_dred();
     IDXGIFactory4* factory = NULL;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory))) return -1;
-    if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&g.dev))) {
+    /* The high-performance adapter first, then the default one, then WARP
+     * (rsx_d3d12_device.h); D3D12CreateDevice(NULL) alone is the integrated
+     * GPU on a dual-GPU laptop. */
+    if (rsx_d3d12_create_device(factory, &g.dev, "live renderer",
+                                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) < 0) {
         factory->lpVtbl->Release(factory); return -1;
     }
 #if defined(YZ_PERF_PROFILE)
