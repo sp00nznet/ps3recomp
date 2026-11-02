@@ -210,6 +210,7 @@ typedef struct {
     /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
     struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
     u32 swin_wgen;            /* bumped by every write into the surface; a window older than it is recopied */
+    u64 last_write_serial;    /* production ordering across same-address views */
 #if !defined(YZ_PERF_CLEAN)
     u32 resource_serial;
     u32 last_write_generation;
@@ -302,6 +303,7 @@ typedef struct {
 
     surface_t                  surfaces[MAX_SURFACES];
     u32                        n_surfaces;
+    u64                        surface_write_serial;
     display_buffer_t           display_buffers[8];
 
     ID3D12DescriptorHeap*      dsv_heap;
@@ -487,6 +489,7 @@ static void ld_surface_note_write(u32 target, u32 kind)
     if (target >= MAX_SURFACES)
         return;
     surface_t* surface = &g.surfaces[target];
+    surface->last_write_serial = ++g.surface_write_serial;
     const u32 generation = ++g_ld_surface_generation;
     surface->swin_wgen++;
     surface->last_write_generation = generation;
@@ -517,7 +520,10 @@ static void ld_surface_note_write(u32 target, u32 kind)
 }
 #else
 #define ld_surface_note_write(target, kind) \
-    do { if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; } while (0)
+    do { if ((target) < MAX_SURFACES) { \
+        g.surfaces[(target)].last_write_serial = ++g.surface_write_serial; \
+        g.surfaces[(target)].swin_wgen++; \
+    } } while (0)
 #endif
 
 #define LD_LAYOUT_CACHE_CAP 256u
@@ -2947,6 +2953,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->resource_serial = ++g_ld_surface_resource_serial;
 #endif
     ld_surface_note_write(slot, LD_SURFACE_WRITE_CREATE);
+    s->last_write_serial = 0;  /* allocation is not a write of usable content */
     /* RTVs for surfaces live above the swap-chain backbuffer RTVs */
     g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex,
         NULL, rtv_handle(LD_SWAP_BUFFERS + slot));
@@ -3082,6 +3089,54 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
             fprintf(stderr, "[swin] copies=%llu frame=%u\n", (unsigned long long)g_ld_swin_copies, g_ld_frames);
     }
     return (int)(SRV_SURF_WIN_BASE + si * LD_SWIN_PER + k);
+}
+
+static u32 ld_surface_texel_bytes(DXGI_FORMAT format)
+{
+    if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) return 16u;
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) return 8u;
+    return 4u;
+}
+
+/* Exact physical-layout reads of the current target need its ordered
+ * snapshot, even if a stale resource of another size shares its address.
+ * Keep existing remap/reinterpretation/subrectangle routes, and let a newer
+ * covering write through the same guest rows remain the sampled source. */
+static int surface_feedback_matches(const surface_t* s, const rsx_dsp_texture* t,
+                                    const rsx_dsp_surface* sf)
+{
+    const u32 base = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    u32 color = 0;
+    if (s->fmt == DXGI_FORMAT_R8G8B8A8_UNORM && base == RSX_TEX_FMT_A8R8G8B8)
+        color = 8;
+    else if (s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT && base == RSX_TEX_FMT_W16Z16Y16X16_FLOAT)
+        color = 11;
+    else if (s->fmt == DXGI_FORMAT_R32G32B32A32_FLOAT && base == RSX_TEX_FMT_W32Z32Y32X32_FLOAT)
+        color = 12;
+    if (!color || (t->remap & 0xffffu) != 0xaae4u ||
+        sf->color_format != color || sf->raster_type != 1 ||
+        s->location != t->location || s->offset != t->offset ||
+        !(t->format & TEX_FMT_LINEAR) || t->dimension != 2 ||
+        t->cubemap || t->mipmaps > 1 || t->depth > 1 ||
+        t->width != s->w || t->height != s->h)
+        return 0;
+    const u64 row = (u64)s->w * ld_surface_texel_bytes(s->fmt);
+    const u64 sp = s->pitch ? s->pitch : row;
+    const u64 tp = t->pitch ? t->pitch : row;
+    if (!row || sp < row || tp != sp) return 0;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const surface_t* other = &g.surfaces[i];
+        if (other == s || !other->tex || other->location != s->location ||
+            other->offset != s->offset || other->fmt != s->fmt ||
+            other->w < t->width || other->h < t->height ||
+            other->last_write_serial <= s->last_write_serial)
+            continue;
+        const u64 other_row = (u64)other->w * ld_surface_texel_bytes(other->fmt);
+        const u64 other_pitch = other->pitch ? other->pitch : other_row;
+        if (other_pitch == sp && other_pitch >= other_row)
+            return 0;
+    }
+    return 1;
 }
 
 /* A draw that samples its own render target. RSX reads and writes the same
@@ -7470,7 +7525,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                     zeta_pref = 1;
                     break;
                 }
-        if (!zeta_pref) { u32 best_gen = 0;
+        const int current_feedback = !zeta_pref &&
+            surface_feedback_matches(&g.surfaces[target], &t, &sf);
+        if (!zeta_pref && !current_feedback) { u32 best_gen = 0;
           for (u32 i = 0; i < g.n_surfaces; i++) {
               const surface_t* sf_i = &g.surfaces[i];
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
