@@ -40,13 +40,25 @@ static volatile long g_lockline = 0;
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
  * -- FMOD's mixer task among them, 25-40 ms at a time. */
+/* After ~1 ms of spinning (six rounds of 4096 pauses) the waiter sleeps instead.
+ * SwitchToThread only hands the core to a thread queued on this same processor,
+ * and Sleep(0) only to one of equal or higher priority -- neither reaches a
+ * lower-priority holder that is waiting for a core. With every core busy, waiters
+ * above the holder's priority could keep it off the CPU for tens of milliseconds.
+ * A normal wait is far under a microsecond and never gets here.
+ * SPU_LOCKLINE_SLEEP=0 keeps the plain spin. */
 void spu_lockline_lock(void)
 {
-    unsigned spins = 0;
+    static int s_sleep = -1;
+    unsigned spins = 0, rounds = 0;
     while (_InterlockedExchange(&g_lockline, 1)) {
+        if (s_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_sleep = !(e && e[0] == '0'); }
         do {
             _mm_pause();
-            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
+            if (++spins >= 4096) {
+                spins = 0;
+                if (rounds++ < 6 || !s_sleep) SwitchToThread(); else Sleep(1);
+            }
         } while (g_lockline);
     }
 }
