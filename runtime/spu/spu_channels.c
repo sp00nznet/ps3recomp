@@ -1053,15 +1053,17 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                              ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:
-        /* Under the lock-line lock, because every producer of the LR bit sets
-         * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
-         * PUTLLUC or plain PUT. A bare read-modify-write here can read
-         * event_status, have a concurrent |= SPU_EVENT_LR land in between, and
-         * write the stale value back. The edge is then gone, and an SPU that
-         * has just acknowledged the events it read goes back to sleep believing
-         * it still holds a reservation it has already lost, which is the parked
-         * SPURS kernel this whole mechanism exists to wake. */
-        spu_lockline_lock();
+        /* No lock-line lock. It was taken here so that a concurrent
+         * |= SPU_EVENT_LR from another thread (the PPU coherent store, a peer
+         * SPU's PUTLLC, PUTLLUC or plain PUT) could not land inside a plain
+         * read-modify-write and be written back away. SPU_EVENT_CLEAR and
+         * SPU_EVENT_SET are atomic now (spu_context.h), so the clear alone
+         * cannot lose that edge. The re-raise below reads list_stall_stat,
+         * which only this context's own thread writes (lists run inline), so
+         * it needs no lock either. A title whose job manager takes a
+         * stall-and-notify interrupt per DMA list acknowledges tens of
+         * thousands of events a second, and every one serialized on the
+         * lock every SPU and the PPU store path share. */
         SPU_EVENT_CLEAR(ctx, v);
         /* A stall-and-notify nobody has read yet stays pending. We run a
          * resumed list inline, inside the MFC_WrListStallAck that resumes it,
@@ -1071,7 +1073,6 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * (list_stall_stat set, Sn clear). */
         if ((v & 0x2u) && ctx->list_stall_stat)
             SPU_EVENT_SET(ctx, 0x2u);
-        spu_lockline_unlock();
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
