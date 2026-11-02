@@ -17,7 +17,12 @@
 
 #include <stdint.h>
 
-#if defined(_MSC_VER)
+/* selectany (a COMDAT "any": one definition kept, every object sees the same
+ * variable) under MSVC and MinGW. MinGW's weak definition is a PE weak external
+ * whose default is a per-object `.weak.<name>.<object>` symbol; linking C++
+ * objects that reach it through the .refptr indirection ended with the symbol
+ * undefined. */
+#if defined(_MSC_VER) || defined(__MINGW32__)
 #  define SPU_COH_SHARED __declspec(selectany)
 #else
 #  define SPU_COH_SHARED __attribute__((weak))

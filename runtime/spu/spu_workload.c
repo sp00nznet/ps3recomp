@@ -25,6 +25,8 @@
 static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
                                      uint32_t owner_ea);   /* below */
 
+#include "../platform/mingw_timespec_get.h"   /* timespec_get on msvcrt MinGW (after windows.h) */
+
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
  * real video-payload GET (>256B from a non-context EA) = it actually decoded,
  * as opposed to the 64-byte context handshake DMAs. The dispatcher's
