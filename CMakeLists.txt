@@ -401,6 +401,8 @@ if(PS3RECOMP_BUILD_TESTS)
     # each report DMA context. Links the runtime like the POSIX host below.
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
+        # The same walker's JUMP decode: the old and the new form.
+        add_subdirectory(tests/gcm_fifo_jump)
     endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
