@@ -567,8 +567,23 @@ extern uint8_t* vm_base;
  * lock, same critical sections, now shared with the PPU store paths. */
 
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
- * the delta across one policy run to find the run that performed a claim. */
+ * the delta across one policy run to find the run that performed a claim.
+ *
+ * Direction 11: this counter used to be a single volatile incremented by
+ * EVERY PUTLLC on EVERY SPU host thread. In a lock-line contention storm
+ * (MFC War: ~150M PUTLLCs across 6+ threads on ONE line) each increment is a
+ * read-for-ownership round trip on one shared cache line -- measured inside
+ * the llc entry overhead at roughly the cost of the whole verify step. The
+ * only consumer tolerates a fuzzy run-scoped delta, so each thread counts in
+ * TLS and folds into the global every 1024 ops (max skew 1023*threads). */
 volatile unsigned g_spu_putllc_count = 0;
+static SPU_THREAD_LOCAL unsigned t_putllc_count_batch;
+#define SPU_PUTLLC_COUNT_STEP() do { \
+    if (++t_putllc_count_batch >= 1024u) { \
+        t_putllc_count_batch = 0; \
+        _InterlockedExchangeAdd((volatile long*)&g_spu_putllc_count, 1024ul); \
+    } \
+} while (0)
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
@@ -857,7 +872,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
-        g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
+        SPU_PUTLLC_COUNT_STEP(); /* TLS-batched: see g_spu_putllc_count above */
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
@@ -876,11 +891,29 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { const int pre_ok =
               __atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE) &&
               (__atomic_load_n(&ctx->resv_ea, __ATOMIC_RELAXED) & ~(uint32_t)(MFC_ATOMIC_LINE - 1)) == ea;
-        if (pre_ok) spu_linelock_lock(ea);
+        /* Direction 11 (memcmp screen): a PUTLLC that is going to fail
+         * because the LINE CHANGED need not touch the line lock at all --
+         * hardware fails those without locking, and the d11 probe measured
+         * the locked verify at ~300ns/op inside a storm. The screen is a
+         * plain memcmp of guest memory against our snapshot: a "different"
+         * verdict is final (writers commit the line only under this same
+         * lock, and content-wise the line can only move AWAY from our
+         * snapshot). A screen "equal" verdict is NOT authoritative -- a
+         * commit can land between the screen and the lock -- so the locked
+         * compare below still re-verifies everything exactly as before;
+         * the screen costs one extra 128-byte read per commit only. A
+         * torn read during a writer's memcpy can only produce a false
+         * FAIL (benign: the guest retries, which is the storm's normal
+         * path); a false SUCCESS is impossible because success still
+         * re-verifies under the lock. */
+        const int screen_fail = pre_ok &&
+            memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0;
+        if (pre_ok && !screen_fail) spu_linelock_lock(ea);
         int putllc_committed = 0;
         /* pre_ok==0 means the reservation test below already fails (plain
          * loads), so the branch selection is identical to always-locking. */
-        if (ctx->resv_valid && ctx->resv_ea == ea &&
+        if (!screen_fail &&
+            ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
@@ -933,7 +966,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                   }
               } }
         }
-        if (pre_ok) {
+        if (pre_ok && !screen_fail) {
             if (putllc_committed) spu_linelock_release(ea);
             else spu_linelock_unlock(ea);
         }
