@@ -286,12 +286,12 @@ VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
  * runtime changes MXCSR). */
 VMX_INL float vmx_fmaf(float x, float z, float y) {
 #if defined(__FMA__)
-    return __builtin_fmaf(x, z, y);
+    return fmaf(x, z, y);   /* one instruction with -mfma */
 #else
     const double s = (double)x * (double)z + (double)y;
     uint64_t u; memcpy(&u, &s, sizeof u);
     const uint32_t e = (uint32_t)(u >> 52) & 0x7FFu;
-    if (__builtin_expect((u & 0x1FFFFFFFull) != 0x10000000ull && e - (1023u - 126u) < 254u, 1))
+    if ((u & 0x1FFFFFFFull) != 0x10000000ull && e - (1023u - 126u) < 254u)
         return (float)s;
     return fmaf(x, z, y);
 #endif
