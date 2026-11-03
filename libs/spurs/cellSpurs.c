@@ -266,17 +266,20 @@ extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
  * silently undone: an SPU wait registered there is lost, nothing ever signals
  * the task, and its PPU partner blocks for good (GH3: FMOD's mixer deadlocked
  * at boot in 1 run of ~4). Raw accesses inside: vm_write16 would take the
- * same (non-recursive) lock. The end notifies reserving SPUs, under the lock
- * as spu_coh_notify_write expects. */
+ * same (non-recursive) lock. The end notifies reserving SPUs via
+ * spu_coh_notify_write_locked, which expects the caller to hold the lock. */
 extern void spu_lockline_lock(void);
 extern void spu_lockline_unlock(void);
 extern int  spu_coh_is_reserved(uint32_t);
-extern void spu_coh_notify_write(uint32_t);
+extern void spu_coh_notify_write_locked(uint32_t);
 static inline u16 ef_r16(uint32_t a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
 static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static inline void ef_line_end(uint32_t ea)
 {
-    if (spu_coh_is_reserved(ea & ~127u)) spu_coh_notify_write(ea & ~127u);
+    /* The _locked variant: this thread already holds the table lock, and it
+     * is non-recursive -- the self-contained spu_coh_notify_write would
+     * self-deadlock here (spurs_scheduler hang on Linux/macOS CI). */
+    if (spu_coh_is_reserved(ea & ~127u)) spu_coh_notify_write_locked(ea & ~127u);
     spu_lockline_unlock();
 }
 

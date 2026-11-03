@@ -107,6 +107,12 @@ int spu_coh_is_reserved(uint32_t addr);
  * write by the caller's own program order, and the 128-byte data compare is
  * the real authority anyway, so the event may safely lag the write). */
 void spu_coh_notify_write(uint32_t ea);
+/* Same walk, but the CALLER already holds the table lock (the legacy contract
+ * cellSpurs.c's ef_line_end was written against: its flag RMW holds the lock
+ * for the whole update, and the table lock is non-recursive). Callers that
+ * take the lock themselves must use this variant; spu_coh_notify_write must
+ * never be called with the lock held. */
+void spu_coh_notify_write_locked(uint32_t ea);
 /* Remove a context from the reserving set. MUST be called before a
  * transient (stack-allocated) spu_context goes out of scope. */
 void spu_coh_unregister(spu_context* ctx);

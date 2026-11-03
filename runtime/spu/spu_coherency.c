@@ -486,6 +486,41 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
     return 1;
 }
 
+void spu_coh_notify_write_locked(uint32_t ea)
+{
+    uint32_t line = ea & ~127u;
+    ppu_resv_break_line(ea);
+    spu_coh_writer_fence();
+    /* The caller holds the table lock (spu_lockline_lock). This is the legacy
+     * contract ef_line_end in cellSpurs.c was written against: its RMW spans
+     * hold the lock for the whole flag update, so the kill walk has to run
+     * inside it -- releasing and re-taking a non-recursive lock on the same
+     * thread is a self-deadlock. */
+    spu_coh_wake_watches(line);
+    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
+        spu_context* c = entry->ctx;
+        if (!c) continue;
+        if (spu_coh_holds(c, line)) {
+            SPU_EVENT_SET(c, SPU_EVENT_LR);
+            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
+            /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
+             * always fails for "no reservation" is useless without knowing who
+             * took it away -- a peer SPU, or the PPU committing to the line. */
+            { static int s_w = -1;
+              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+              if (s_w) { static unsigned long long n;
+                  if ((++n % 200000) == 1)
+                      fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
+                              n, line, c->image_id, (void*)c); } }
+            g_spu_lr_raise++;
+            /* The event_status store has to be visible before the wake. The
+             * waiter re-polls its predicate on a timeout as well, so a
+             * straggling store costs latency and not the wakeup itself. */
+            spu_ch_wake(c);
+        }
+    }
+}
+
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
@@ -518,29 +553,7 @@ void spu_coh_notify_write(uint32_t ea)
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_lockline_lock();
-    spu_coh_wake_watches(line);
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
-        if (!c) continue;
-        if (spu_coh_holds(c, line)) {
-            SPU_EVENT_SET(c, SPU_EVENT_LR);
-            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
-            /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
-             * always fails for "no reservation" is useless without knowing who
-             * took it away -- a peer SPU, or the PPU committing to the line. */
-            { static int s_w = -1;
-              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
-              if (s_w) { static unsigned long long n;
-                  if ((++n % 200000) == 1)
-                      fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
-                              n, line, c->image_id, (void*)c); } }
-            g_spu_lr_raise++;
-            /* The event_status store has to be visible before the wake. The
-             * waiter re-polls its predicate on a timeout as well, so a
-             * straggling store costs latency and not the wakeup itself. */
-            spu_ch_wake(c);
-        }
-    }
+    spu_coh_notify_write_locked(ea);
     spu_lockline_unlock();
 }
 
