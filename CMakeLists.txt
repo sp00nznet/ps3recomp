@@ -417,6 +417,16 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
         set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
 
+        # fi and cflts (NEON on ARM64) against their scalar references, in the
+        # default FPCR and under round-toward-zero plus flush-to-zero.
+        add_executable(test_spu_fi_cflts_neon
+            runtime/spu/tests/test_spu_fi_cflts_neon.c)
+        target_include_directories(test_spu_fi_cflts_neon PRIVATE include runtime/spu)
+        target_compile_options(test_spu_fi_cflts_neon PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_fi_cflts_neon PRIVATE m)
+        add_test(NAME spu_fi_cflts_neon COMMAND test_spu_fi_cflts_neon)
+        set_tests_properties(spu_fi_cflts_neon PROPERTIES TIMEOUT 300)
+
         add_executable(test_spu_lockline_wait
             runtime/spu/tests/test_spu_lockline_wait.c)
         target_include_directories(test_spu_lockline_wait PRIVATE include)
