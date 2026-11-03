@@ -581,7 +581,10 @@ static SPU_THREAD_LOCAL unsigned t_putllc_count_batch;
 #define SPU_PUTLLC_COUNT_STEP() do { \
     if (++t_putllc_count_batch >= 1024u) { \
         t_putllc_count_batch = 0; \
-        _InterlockedExchangeAdd((volatile long*)&g_spu_putllc_count, 1024ul); \
+        /* width matters: on LP64 'long' atomics are 8 bytes against a
+         * 4-byte counter -- use the exact-width op (the counter is a
+         * fuzzy run-scoped statistic, relaxed is plenty). */ \
+        __atomic_fetch_add(&g_spu_putllc_count, 1024u, __ATOMIC_RELAXED); \
     } \
 } while (0)
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the

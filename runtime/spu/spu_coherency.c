@@ -127,6 +127,11 @@ void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort();
 __declspec(align(64)) static uint64_t s_ll_words[SPU_LL_WORDS * SPU_LL_STRIDE];
 #else
 #  include <stdatomic.h>
+#  if defined(_WIN32)
+#    include <windows.h> /* Sleep */
+#  else
+#    include <sched.h>   /* sched_yield */
+#  endif
 __attribute__((aligned(64))) static uint64_t s_ll_words[SPU_LL_WORDS * SPU_LL_STRIDE];
 #endif
 
@@ -163,7 +168,17 @@ void spu_linelock_lock(uint32_t ea)
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
             __builtin_ia32_pause();
 #endif
-            if (++spins >= 4096) { spins = 0; }
+            /* Without a yield this is a livelock on an oversubscribed host:
+             * the spinning waiters starve the preempted lock owner. The MSVC
+             * branch always yielded; the POSIX path must too. */
+            if (++spins >= 4096) {
+                spins = 0;
+#if defined(_WIN32)
+                Sleep(0);
+#else
+                sched_yield();
+#endif
+            }
             cur = atomic_load_explicit(w, memory_order_relaxed);
         } while (cur & SPU_LL_LOCK_BIT);
     }
