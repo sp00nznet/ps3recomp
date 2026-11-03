@@ -97,6 +97,8 @@ s32 sceNpBasicGetFriendPresence(const SceNpOnlineId* onlineId,
 
 /* Own presence */
 s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence);
+/* Explicit unsupported publication; does not claim delivery to PSN/PSNR. */
+s32 sceNpBasicSetPresenceDetails(const void* presence, u32 options);
 
 /* Messaging */
 s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
