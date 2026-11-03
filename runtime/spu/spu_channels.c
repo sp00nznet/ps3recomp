@@ -1018,16 +1018,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
-        /* Unconditional, so it invalidates EVERY reservation on the line --
-         * this SPU's included, which is why our own reservation is dropped
-         * BEFORE the notify rather than after it: a peer left holding a
-         * reservation here would commit a PUTLLC against a snapshot this
-         * store has already overwritten, and a self-LR is not how hardware
-         * reports a reservation a PUTLLUC consumed. The kill itself runs
-         * after the line lock is released (notify is self-contained). */
-        ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_linelock_release(ea);
+        /* Unconditional, so it invalidates EVERY reservation on the line --
+         * this SPU's included, and the issuer is told (self-LR): it never
+         * made the compare that would have said so. Runs after the line
+         * lock release because the kill walk takes the table lock itself;
+         * a peer PUTLLC that sneaks in between is still caught by the
+         * locked data re-verify, so the walk lagging the store is safe. */
         spu_coh_notify_write(ea);
+        ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
