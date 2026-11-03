@@ -29,6 +29,7 @@ void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
 void spu_lockline_lock(void) { }
 void spu_lockline_unlock(void) { }
 void spu_linelock_lock(uint32_t a) { (void)a; }
+void spu_linelock_release(uint32_t a) { (void)a; }
 void spu_linelock_unlock(uint32_t a) { (void)a; }
 void spu_linelock_bump(uint32_t a) { (void)a; }
 void spu_mfc_release(spu_context* c) { (void)c; }

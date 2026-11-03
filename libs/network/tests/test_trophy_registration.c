@@ -19,6 +19,8 @@ void spu_lockline_unlock(void) {}
 void cellMsgDialog_tick(void) {}
 void np_psnr_pump(void) {}
 void ps3_np_eula_tick(void) {}
+void spu_linelock_lock(uint32_t a) { (void)a; }
+void spu_linelock_release(uint32_t a) { (void)a; }
 static unsigned calls;
 static void callback(u32 opd, u64 context, u64 status, u64 completed, u64 total,
                      u64 arg, u64 a, u64 b, u64 c)

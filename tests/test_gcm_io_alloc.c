@@ -18,6 +18,8 @@ int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }
 void spu_lockline_unlock(void) { abort(); }
+void spu_linelock_lock(uint32_t addr) { (void)addr; }
+void spu_linelock_release(uint32_t addr) { (void)addr; }
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size);   /* set by cellGcmInit */
 
 #define MB 0x100000u

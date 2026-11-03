@@ -13,6 +13,8 @@ int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }
 void spu_lockline_unlock(void) { abort(); }
+void spu_linelock_lock(uint32_t addr) { (void)addr; }
+void spu_linelock_release(uint32_t addr) { (void)addr; }
 
 static void reset_maps(void) {
     memset(s_io_mappings,0,sizeof(s_io_mappings));s_io_mapping_count=0;
