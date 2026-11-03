@@ -31,6 +31,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* c) { (void)ea; (void)c
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_linelock_lock(uint32_t ea) { (void)ea; }
+void spu_linelock_release(uint32_t ea) { (void)ea; }
 void spu_linelock_unlock(uint32_t ea) { (void)ea; }
 void spu_linelock_bump(uint32_t ea) { (void)ea; }
 void spu_lockguard_check(spu_context* c, uint32_t ea, const uint8_t* p, uint32_t n, const char* what)

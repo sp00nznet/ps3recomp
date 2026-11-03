@@ -20,6 +20,7 @@ static uint32_t dispatched_size, dispatched_context;
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_linelock_lock(uint32_t ea) { (void)ea; }
+void spu_linelock_release(uint32_t ea) { (void)ea; }
 void spu_linelock_unlock(uint32_t ea) { (void)ea; }
 void spu_linelock_bump(uint32_t ea) { (void)ea; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }

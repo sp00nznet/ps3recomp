@@ -28,6 +28,8 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+void spu_linelock_lock(uint32_t a) { (void)a; }
+void spu_linelock_release(uint32_t a) { (void)a; }
 
 static int fails = 0;
 #define CHECK(c, ...) do { int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
