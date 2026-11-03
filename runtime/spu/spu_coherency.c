@@ -189,7 +189,7 @@ void spu_linelock_unlock(uint32_t ea)
     _InterlockedAnd64(w, ~(long long)SPU_LL_LOCK_BIT);
 #else
     _Atomic uint64_t* w = (_Atomic uint64_t*)&s_ll_words[spu_ll_index(ea) * SPU_LL_STRIDE];
-    atomic_fetch_and_explicit(w, ~(_Atomic uint64_t)SPU_LL_LOCK_BIT, memory_order_release);
+    atomic_fetch_and_explicit(w, ~(uint64_t)SPU_LL_LOCK_BIT, memory_order_release);
 #endif
 }
 
