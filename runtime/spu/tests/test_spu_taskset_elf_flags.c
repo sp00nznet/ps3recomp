@@ -23,6 +23,8 @@ void spu_linelock_lock(uint32_t ea) { (void)ea; }
 void spu_linelock_release(uint32_t ea) { (void)ea; }
 void spu_linelock_unlock(uint32_t ea) { (void)ea; }
 void spu_linelock_bump(uint32_t ea) { (void)ea; }
+void spu_linelock_range(uint32_t lo, uint32_t hi) { (void)lo; (void)hi; }
+void spu_linelock_range_unlock(uint32_t lo, uint32_t hi) { (void)lo; (void)hi; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t context)
 {
