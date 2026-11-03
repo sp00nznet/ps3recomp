@@ -431,6 +431,19 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
 
+    # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
+    # Without -mfma it takes the double-rounding path; with it, the builtin.
+    add_executable(test_vmx_fmaf tests/test_vmx_fmaf.c)
+    target_compile_options(test_vmx_fmaf PRIVATE -UNDEBUG)
+    if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        target_compile_options(test_vmx_fmaf PRIVATE -mno-fma)
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(test_vmx_fmaf PRIVATE m)
+    endif()
+    add_test(NAME vmx_fmaf COMMAND test_vmx_fmaf)
+    set_tests_properties(vmx_fmaf PROPERTIES TIMEOUT 120)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
