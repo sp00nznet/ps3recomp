@@ -416,6 +416,20 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_spu_float_exact PRIVATE m)
         add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
         set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
+        # The vector forms against the scalar per-lane forms, directly.
+        add_executable(test_spu_float_vector_scalar
+            runtime/spu/tests/test_spu_float_vector_scalar.c)
+        target_include_directories(test_spu_float_vector_scalar PRIVATE include runtime/spu)
+        target_compile_options(test_spu_float_vector_scalar PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_float_vector_scalar PRIVATE m)
+        add_test(NAME spu_float_vector_scalar COMMAND test_spu_float_vector_scalar 4)
+        set_tests_properties(spu_float_vector_scalar PROPERTIES TIMEOUT 300)
+        # On x86 both take the ISA the runtime and lifted code are built for, so the SSE4.1
+        # vector form is the one under test; no contraction, as in the runtime.
+        if(PS3RECOMP_HAS_MSSE41)
+            target_compile_options(test_spu_float_exact PRIVATE -msse4.1 -ffp-contract=off)
+            target_compile_options(test_spu_float_vector_scalar PRIVATE -msse4.1 -ffp-contract=off)
+        endif()
 
         add_executable(test_spu_lockline_wait
             runtime/spu/tests/test_spu_lockline_wait.c)
