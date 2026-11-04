@@ -610,11 +610,14 @@ static void test_ack_keeps_a_concurrent_raise(void)
     CHECK(g_ack_done == 0);
     CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
 
-    /* The raise a peer's commit would make after dropping its line lock
-     * (notify takes the table lock itself; it must run with ours released). */
-    spu_lockline_unlock();
-    spu_coh_notify_write(LINE_A);
+    /* The raise a peer's commit would make, under the lock that peer holds:
+     * with the table lock still held the acknowledging thread stays parked on
+     * it, so raise-then-clear is deterministic. A self-contained
+     * spu_coh_notify_write would both race the acknowledge for the lock and
+     * self-deadlock on it (it is non-recursive), hence the _locked variant. */
+    spu_coh_notify_write_locked(LINE_A);
     CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
+    spu_lockline_unlock();
 
     pthread_join(t, NULL);
 
