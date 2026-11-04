@@ -417,6 +417,16 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
         set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
 
+        # The interpreter's op/immediate decode at the opcode-width and
+        # immediate-form boundaries, against ISA-layout encodings.
+        add_executable(test_spu_decode
+            runtime/spu/tests/test_spu_decode.c)
+        target_include_directories(test_spu_decode PRIVATE include runtime/spu)
+        target_compile_options(test_spu_decode PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_decode PRIVATE m)
+        add_test(NAME spu_decode COMMAND test_spu_decode)
+        set_tests_properties(spu_decode PROPERTIES TIMEOUT 30)
+
         add_executable(test_spu_lockline_wait
             runtime/spu/tests/test_spu_lockline_wait.c)
         target_include_directories(test_spu_lockline_wait PRIVATE include)
