@@ -55,6 +55,8 @@ int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_lockline_lock(void)   { }
 void spu_lockline_unlock(void) { }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; }
+void spu_linelock_lock(uint32_t addr) { (void)addr; }
+void spu_linelock_release(uint32_t addr) { (void)addr; }
 
 static uint32_t g_bump = 4096;   /* keep guest address 0 invalid */
 static uint32_t guest_alloc(uint32_t size, uint32_t align)

@@ -383,8 +383,8 @@ static void* race_writer(void* arg)
         if (k & 1) {
             spu_lockline_lock();
             memset(g_guest_mem + LINE_A, v, 128);
-            spu_coh_notify_write(LINE_A);
             spu_lockline_unlock();
+            spu_coh_notify_write(LINE_A);
         } else {
             memset(g_b.ls + LSA_B, v, 128);
             spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
@@ -610,11 +610,15 @@ static void test_ack_keeps_a_concurrent_raise(void)
     CHECK(g_ack_done == 0);
     CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
 
-    /* The raise a peer's commit would make, under the lock that peer holds. */
-    spu_coh_notify_write(LINE_A);
+    /* The raise a peer's commit would make, under the lock that peer holds:
+     * with the table lock still held the acknowledging thread stays parked on
+     * it, so raise-then-clear is deterministic. A self-contained
+     * spu_coh_notify_write would both race the acknowledge for the lock and
+     * self-deadlock on it (it is non-recursive), hence the _locked variant. */
+    spu_coh_notify_write_locked(LINE_A);
     CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
-
     spu_lockline_unlock();
+
     pthread_join(t, NULL);
 
     TEST("the acknowledge clears what it asked for and keeps the raise");
@@ -663,8 +667,8 @@ static void test_producer_keeps_peer_event(unsigned bit)
     /* #418 had the producer wait for this lock; since #492 every event_status
      * write is an atomic OR/AND, so it need not, and may already be done. What
      * must hold either way is checked below: neither bit is lost. */
-    spu_coh_notify_write(LINE_A);
     spu_lockline_unlock();
+    spu_coh_notify_write(LINE_A);
     pthread_join(t, NULL);
     TEST("MFC notification retains the concurrent reservation event");
     CHECK_EQ_U32(g_a.event_status, bit | SPU_EVENT_LR);

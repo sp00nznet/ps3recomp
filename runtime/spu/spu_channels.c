@@ -432,8 +432,16 @@ static int spu_mfc_cache_enabled(void)
     static atomic_int cached;
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (!value) {
+        /* Default ON since 2026-10-31: SPU_MFC_PROF showed ~32 mfc_for calls
+         * per 32B PUT (every LSA/EAH/EAL/Size/Tag/channel access looks the
+         * engine up), each paying the SRW claim lock under 8-thread
+         * contention -- the single dominant cost of the whole spurs suite
+         * (PUT item 37x off PS3). The generation-invalidation contract on
+         * release/forget_range already makes a stale hit impossible; this
+         * only flips who pays for it by default. SPU_MFC_LOOKUP_CACHE=0
+         * restores the always-locked path. */
         const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
-        value = flag && !strcmp(flag, "1") ? 2 : 1;
+        value = (flag && flag[0] == '0') ? 1 : 2;
         atomic_store_explicit(&cached, value, memory_order_relaxed);
     }
     return value == 2;
@@ -559,8 +567,26 @@ extern uint8_t* vm_base;
  * lock, same critical sections, now shared with the PPU store paths. */
 
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
- * the delta across one policy run to find the run that performed a claim. */
+ * the delta across one policy run to find the run that performed a claim.
+ *
+ * Direction 11: this counter used to be a single volatile incremented by
+ * EVERY PUTLLC on EVERY SPU host thread. In a lock-line contention storm
+ * (MFC War: ~150M PUTLLCs across 6+ threads on ONE line) each increment is a
+ * read-for-ownership round trip on one shared cache line -- measured inside
+ * the llc entry overhead at roughly the cost of the whole verify step. The
+ * only consumer tolerates a fuzzy run-scoped delta, so each thread counts in
+ * TLS and folds into the global every 1024 ops (max skew 1023*threads). */
 volatile unsigned g_spu_putllc_count = 0;
+static SPU_THREAD_LOCAL unsigned t_putllc_count_batch;
+#define SPU_PUTLLC_COUNT_STEP() do { \
+    if (++t_putllc_count_batch >= 1024u) { \
+        t_putllc_count_batch = 0; \
+        /* width matters: on LP64 'long' atomics are 8 bytes against a
+         * 4-byte counter -- use the exact-width op (the counter is a
+         * fuzzy run-scoped statistic, relaxed is plenty). */ \
+        __atomic_fetch_add(&g_spu_putllc_count, 1024u, __ATOMIC_RELAXED); \
+    } \
+} while (0)
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
@@ -715,15 +741,28 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         yz_lockstep_tick(ctx);
         /* A registered holder re-reading an already marked line -- every
          * policy-module poll -- publishes its reservation and copies without
-         * the lock; any write the copy misses ends that reservation (see
-         * spu_coh_reserve_fast). Anything else takes the lock as before. */
+         * any lock; any write the copy misses ends that reservation (see
+         * spu_coh_reserve_fast). Anything else marks + registers under the
+         * table lock, then publishes BEFORE the copy (same order as the fast
+         * path, and the one the fence argument in spu_coherency.c documents):
+         * a writer that commits between the publish and the copy kills this
+         * reservation in its notify walk, so nothing is resurrected -- and a
+         * write landing mid-copy leaves this snapshot stale, which the PUTLLC
+         * compare then fails, the safe direction. The copy itself needs no
+         * lock: the 128-byte compare is the authority. */
         const int llar_fast = spu_coh_reserve_fast(ctx, ea);
         if (!llar_fast) {
+            /* Tell the PPU store paths this line is live, so a store into it
+             * takes the line lock and raises SPU_EVENT_LR here instead of
+             * landing unannounced. Nothing else about this transaction
+             * changes. */
             spu_lockline_lock();
-            /* Tell the PPU store paths this line is live, so a store into it goes
-             * through the lock and raises SPU_EVENT_LR here instead of landing
-             * unannounced. Nothing else about this transaction changes. */
             spu_coh_reserve(ctx, ea);
+            spu_lockline_unlock();
+            __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
+            ctx->resv_ea = ea;
+            __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
         }
 
         /* ONE read of guest memory, then the snapshot from that copy.
@@ -758,7 +797,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
-        if (!llar_fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; }   /* the fast path published it already */
         ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
@@ -774,7 +812,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
-        if (!llar_fast) spu_lockline_unlock();
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -833,28 +870,56 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
-        g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
+        SPU_PUTLLC_COUNT_STEP(); /* TLS-batched: see g_spu_putllc_count above */
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
-        spu_lockline_lock();
-        if (ctx->resv_valid && ctx->resv_ea == ea &&
+        /* Direction-3 (spurs_test SpinLock): in a lock-line contention storm
+         * most PUTLLCs are losers whose reservation a peer's commit already
+         * killed -- and hardware fails those WITHOUT touching the line lock.
+         * Check the reservation state atomically first and skip the line lock
+         * entirely when the PUTLLC cannot succeed (measured storm ceiling was
+         * ~90k locked ops/s: ~8 threads each taking a lock on every handoff;
+         * this removes ~7 of those 8 acquisitions). A live reservation still
+         * takes the line's OWN lock for the compare-and-commit, and the
+         * memcmp inside re-verifies, so a reservation killed between this
+         * check and the lock simply fails there as before. The fail branch
+         * below is reached with pre_ok==0 exactly as it used to be with a
+         * dead reservation. */
+        { const int pre_ok =
+              __atomic_load_n(&ctx->resv_valid, __ATOMIC_ACQUIRE) &&
+              (__atomic_load_n(&ctx->resv_ea, __ATOMIC_RELAXED) & ~(uint32_t)(MFC_ATOMIC_LINE - 1)) == ea;
+        /* Direction 11 (memcmp screen): a PUTLLC that is going to fail
+         * because the LINE CHANGED need not touch the line lock at all --
+         * hardware fails those without locking, and the d11 probe measured
+         * the locked verify at ~300ns/op inside a storm. The screen is a
+         * plain memcmp of guest memory against our snapshot: a "different"
+         * verdict is final (writers commit the line only under this same
+         * lock, and content-wise the line can only move AWAY from our
+         * snapshot). A screen "equal" verdict is NOT authoritative -- a
+         * commit can land between the screen and the lock -- so the locked
+         * compare below still re-verifies everything exactly as before;
+         * the screen costs one extra 128-byte read per commit only. A
+         * torn read during a writer's memcpy can only produce a false
+         * FAIL (benign: the guest retries, which is the storm's normal
+         * path); a false SUCCESS is impossible because success still
+         * re-verifies under the lock. */
+        const int screen_fail = pre_ok &&
+            memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0;
+        if (pre_ok && !screen_fail) spu_linelock_lock(ea);
+        int putllc_committed = 0;
+        /* pre_ok==0 means the reservation test below already fails (plain
+         * loads), so the branch selection is identical to always-locking. */
+        if (!screen_fail &&
+            ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
-            /* A committing PUTLLC is a line write like any other, so every
-             * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
-             * Silent, this is the same lost update the PPU half was added to
-             * close, with an SPU on the writing side: a peer is never told to
-             * re-read, so it goes on polling a line it believes it still owns,
-             * and a peer parked on RdEventStat sleeps through the commit it
-             * was waiting for.
-             *
-             * Our own reservation is dropped FIRST so the notify does not
+            putllc_committed = 1;
+            /* Our own reservation is dropped FIRST so the notify does not
              * raise a self-LR: hardware CONSUMES the reservation on a
-             * successful PUTLLC, it does not report it lost. Already under the
-             * lock-line lock, which is what spu_coh_notify_write expects. */
+             * successful PUTLLC, it does not report it lost. */
             ctx->resv_valid = 0;
             { static int s_w = -1;
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
@@ -874,8 +939,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                                         " line=%08X %08X %08X %08X %08X %08X %08X %08X\n",
                                 n, ctx->image_id, (void*)ctx, ea,
                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
-            spu_coh_notify_write(ea);
-            ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
             /* SPU_PUTLLC_WHY=1: which of the three conditions failed.
@@ -900,6 +963,24 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       fflush(stderr);
                   }
               } }
+        }
+        if (pre_ok && !screen_fail) {
+            if (putllc_committed) spu_linelock_release(ea);
+            else spu_linelock_unlock(ea);
+        }
+        if (putllc_committed) {
+            /* A committing PUTLLC is a line write like any other, so every
+             * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
+             * Silent, this is the same lost update the PPU half was added to
+             * close, with an SPU on the writing side: a peer is never told to
+             * re-read, so it goes on polling a line it believes it still owns,
+             * and a peer parked on RdEventStat sleeps through the commit it
+             * was waiting for. The kill runs after the line lock is released:
+             * notify is self-contained (it takes the table lock) and the
+             * 128-byte compare is the authority, so the event may safely lag
+             * the commit. */
+            spu_coh_notify_write(ea);
+            ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         }
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
@@ -927,27 +1008,28 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
-        spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         }
+        }   /* pre_ok scope */
         return 1;
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
-        spu_lockline_lock();
+        spu_linelock_lock(ea);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        spu_linelock_release(ea);
         /* Unconditional, so it invalidates EVERY reservation on the line --
-         * this SPU's included, which is why the notify runs before the
-         * bookkeeping below rather than after it. A peer left holding a
-         * reservation here would commit a PUTLLC against a snapshot this store
-         * has already overwritten. */
+         * this SPU's included, and the issuer is told (self-LR): it never
+         * made the compare that would have said so. Runs after the line
+         * lock release because the kill walk takes the table lock itself;
+         * a peer PUTLLC that sneaks in between is still caught by the
+         * locked data re-verify, so the walk lagging the store is safe. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
-        spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;

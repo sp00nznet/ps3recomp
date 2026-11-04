@@ -559,25 +559,28 @@ void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint3
 {
     extern uint8_t* vm_base;
     if (task >= 128 || !spu_taskset_is_v2(taskset_ea)) return;
-    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_linelock_lock(uint32_t); extern void spu_linelock_unlock(uint32_t);
+    extern void spu_linelock_release(uint32_t);
     extern void spu_coh_notify_write(uint32_t);
-    const uint32_t ea = taskset_ea + 0x1980 + 16u * task;
+    const uint32_t ea = taskset_ea + 0x1980 + 16u * task;   /* never crosses a line: 16 | 128 */
     uint8_t* e = vm_base + ea;
-    spu_lockline_lock();   /* a joining SPU may hold a reservation on this line */
+    spu_linelock_lock(ea);   /* a joining SPU may hold a reservation on this line */
     memset(e, 0, 16);
     if (exited) {
         e[8] = (uint8_t)(code >> 24); e[9] = (uint8_t)(code >> 16); e[10] = (uint8_t)(code >> 8); e[11] = (uint8_t)code;
         e[15] = 2;   /* exited, not yet joined; byte 14 must stay 0 or the join reports ESRCH */
     }
+    spu_linelock_release(ea);
     spu_coh_notify_write(ea);
-    spu_lockline_unlock();
 }
 
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_linelock_range(uint32_t, uint32_t);
+    extern void spu_linelock_range_unlock(uint32_t, uint32_t);
+    extern void spu_linelock_bump(uint32_t);
     extern void spu_coh_notify_write(uint32_t);
     ts_lock(); s_ts_held = 1;
     uint8_t* ts = vm_base + taskset_ea;
@@ -585,20 +588,25 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     if (done_task < 128) spu_taskset2_set_exit(taskset_ea, done_task, 1, 0);
     /* The ready/pending/enabled bitsets share the taskset's first line with the
      * SPU task library (GETLLAR/PUTLLC) and with cellSpursCreateTask, which
-     * update them under the lock-line lock. Update them under the same lock,
-     * then drop the reservations on the line, so neither side undoes the
-     * other's change. Tasks to start are collected here and dispatched after
-     * the lock is released (the dispatch writes guest memory itself). */
+     * update them under the line's own lock; the TaskInfo reads at +0x80..
+     * must not tear against an SPU commit either. Hold every line from the
+     * bitsets through the TaskInfo array (ascending order, per
+     * spu_coherency.h), then drop the reservations on the written lines, so
+     * neither side undoes the other's change. Tasks to start are collected
+     * here and dispatched after the locks are released (the dispatch writes
+     * guest memory itself). */
     uint32_t start_t[128], start_elf[128], start_ctx[128];
     size_t start_sz[128];
     int n_start = 0;
-    spu_lockline_lock();
+    const uint32_t ts_lo = taskset_ea + 0x10;                 /* first bitset byte */
+    const uint32_t ts_hi = taskset_ea + 0x80u + 0x30u * 128u - 1u;  /* TaskInfo end */
+    spu_linelock_range(ts_lo, ts_hi);
     if (done_task < 128) {
         uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
         ts[0x10 + done_task / 8] &= (uint8_t)~m;
         ts[0x20 + done_task / 8] &= (uint8_t)~m;
         ts[0x30 + done_task / 8] &= (uint8_t)~m;
-        if (run) run[done_task / 8] &= (uint8_t)~m;
+        if (run) run[done_task / 8] &= (uint8_t)~m;   /* host-side mirror, no line */
     }
     for (uint32_t t = 0; t < 128 && run; t++) {
         uint8_t m = (uint8_t)(0x80u >> (t & 7));
@@ -621,8 +629,19 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         start_t[n_start] = t; start_elf[n_start] = elf; start_ctx[n_start] = ctx;
         start_sz[n_start] = sz; n_start++;
     }
-    spu_coh_notify_write(taskset_ea);
-    spu_lockline_unlock();
+    /* The bitset bytes at +0x10..+0x3F can cross into a second line when
+     * taskset_ea is not 128-aligned: bump and notify every line they touch.
+     * (The old global-lock code notified only taskset_ea's own line, a latent
+     * gap for unaligned tasksets.) */
+    for (uint32_t a = ts_lo & ~127u; ; a += 128u) {
+        spu_linelock_bump(a);
+        if (a + 128u >= taskset_ea + 0x40) break;
+    }
+    spu_linelock_range_unlock(ts_lo, ts_hi);
+    for (uint32_t a = ts_lo & ~127u; ; a += 128u) {
+        spu_coh_notify_write(a);
+        if (a + 128u >= taskset_ea + 0x40) break;
+    }
     for (int i = 0; i < n_start; i++) {
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
@@ -1275,21 +1294,22 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
  * and drop every reservation on the line. */
 static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
 {
-    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_linelock_lock(uint32_t); extern void spu_linelock_unlock(uint32_t);
+    extern void spu_linelock_release(uint32_t);
     extern void spu_coh_notify_write(uint32_t);
     extern uint8_t* vm_base;
-    /* Raw guest bytes, not vm_read32/vm_write32: vm_write32 takes the lock-line
-     * lock itself when an SPU has the line reserved, and the lock does not
+    /* Raw guest bytes, not vm_read32/vm_write32: vm_write32 takes the line's
+     * own lock when an SPU has the line reserved, and that lock does not
      * nest. */
     const uint32_t word = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
     const uint32_t mask = (1u << 31) >> (taskId % 32u);
     uint8_t* p = vm_base + word;
-    spu_lockline_lock();
+    spu_linelock_lock(word);
     uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
     v = set ? (v | mask) : (v & ~mask);
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+    spu_linelock_release(word);
     spu_coh_notify_write(word);
-    spu_lockline_unlock();
 }
 
 /* Wake WAIT_SIGNAL sleepers when the signalled line is written, including by

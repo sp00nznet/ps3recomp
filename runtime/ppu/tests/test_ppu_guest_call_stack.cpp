@@ -27,6 +27,8 @@ int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) {}
 void spu_lockline_lock(void) { std::abort(); }
 void spu_lockline_unlock(void) { std::abort(); }
+void spu_linelock_lock(uint32_t) { std::abort(); }
+void spu_linelock_release(uint32_t) { std::abort(); }
 int spu_raw_reg_load(uint32_t, uint32_t*) { std::abort(); }
 void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
 void cellGcm_ref_on_poll(void) { std::abort(); }

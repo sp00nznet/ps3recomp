@@ -861,6 +861,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
+extern "C" void spu_linelock_lock(uint32_t addr);
+extern "C" void spu_linelock_unlock(uint32_t addr);
+extern "C" void spu_linelock_release(uint32_t addr);
 extern "C" void spu_coh_notify_write(uint32_t addr);
 
 /* ---------------------------------------------------------------------------
@@ -1045,10 +1048,10 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     volatile LONG* L = resv_slot(ea);
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }   /* reservation lost */
-    /* On a line an SPU has reserved, take the lock-line lock around the CAS and
-     * notify: the same serialization the coherent stores use, so a PPU commit
-     * cannot land inside an SPU PUTLLC's compare/commit window (nor the
-     * reverse), and the reserving SPU gets its lost-reservation event. */
+    /* On a line an SPU has reserved, take the line's own lock around the CAS
+     * and notify: the same serialization the coherent stores use, so a PPU
+     * commit cannot land inside an SPU PUTLLC's compare/commit window (nor
+     * the reverse), and the reserving SPU gets its lost-reservation event. */
     int coh = spu_coh_is_reserved((uint32_t)ea);
     /* SPU_PUTLLC_WHY=1: count PPU commits that land on a line an SPU has
      * reserved. If an SPU's PUTLLC never succeeds for "no reservation", the
@@ -1060,18 +1063,19 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
-    if (coh) spu_lockline_lock();
-    /* Re-check under the lock-line lock: an SPU commit to this line between
-     * the check above and here has broken the reservation (SPU commits call
-     * ppu_resv_break_line with this lock held). */
+    if (coh) spu_linelock_lock((uint32_t)ea);
+    /* Re-check under the line lock: an SPU commit to this line between the
+     * check above and here has broken the reservation (SPU commits bump the
+     * line and call ppu_resv_break_line after their copy). */
     if (coh && self && self->reserve_addr != (uint32_t)ea) {
-        spu_lockline_unlock(); resv_unlock(L); return 0;
+        spu_linelock_unlock((uint32_t)ea); resv_unlock(L); return 0;
     }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
+        if (ok) spu_linelock_release((uint32_t)ea);
+        else spu_linelock_unlock((uint32_t)ea);
         if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
     }
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
@@ -1137,14 +1141,15 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
-    if (coh) spu_lockline_lock();
+    if (coh) spu_linelock_lock((uint32_t)ea);
     if (coh && self && self->reserve_addr != (uint32_t)ea) {   /* as in ppu_stwcx32 */
-        spu_lockline_unlock(); resv_unlock(L); return 0;
+        spu_linelock_unlock((uint32_t)ea); resv_unlock(L); return 0;
     }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
+        if (ok) spu_linelock_release((uint32_t)ea);
+        else spu_linelock_unlock((uint32_t)ea);
         if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
     }
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
     resv_unlock(L);
@@ -1568,14 +1573,15 @@ extern "C" int* ps3_ppu_dispatch_depth_slot(void) { return &g_dispatch_depth; }
 extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 
 /* Every guest store commits through this: on a line no SPU has reserved (all of
- * them, until SPU code runs) it is the plain memcpy it replaced. */
+ * them, until SPU code runs) it is the plain memcpy it replaced. The notify
+ * runs after the line lock is released: it is self-contained. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
         if (spu_coh_line_reserved((uint32_t)(a))) {                           \
-            spu_lockline_lock();                                              \
+            spu_linelock_lock((uint32_t)(a));                                 \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+            spu_linelock_release((uint32_t)(a));                               \
             spu_coh_notify_write((uint32_t)(a));                              \
-            spu_lockline_unlock();                                            \
         } else {                                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
         }                                                                     \

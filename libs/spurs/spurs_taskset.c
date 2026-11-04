@@ -34,20 +34,22 @@ void spurs_taskset_init(uint32_t taskset_ea, uint32_t spurs_ea, uint64_t args,
  *
  * These bitsets share the taskset's first 128-byte line with the SPU task library, which updates them with
  * GETLLAR/PUTLLC, and with the host's task exit (spu_taskset_task_exited). spurs_bitset_set/_clear read the word
- * with vm_read32 outside the lock-line lock and write it back with vm_write32, so a change committed between the
- * two was undone. Do the read-modify-write on the raw guest bytes under the lock-line lock (vm_write32 takes that
- * lock itself when the line is reserved, and it does not nest), then drop every reservation on the line. */
+ * with vm_read32 outside the line's own lock and write it back with vm_write32, so a change committed between the
+ * two was undone. Do the read-modify-write on the raw guest bytes under that line's lock (vm_write32 takes the
+ * same lock itself when the line is reserved, and it does not nest), then bump the version and drop every
+ * reservation on the line (notify takes the table lock itself, so it runs after the line lock is dropped). */
 void spurs_taskset_bitset_update(uint32_t bitset_ea, uint32_t taskId, int set)
 {
-    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_linelock_lock(uint32_t); extern void spu_linelock_unlock(uint32_t);
+    extern void spu_linelock_release(uint32_t); extern int spu_coh_is_reserved(uint32_t);
     extern void spu_coh_notify_write(uint32_t);
     extern uint8_t* vm_base;
     uint8_t* p = vm_base + bitset_ea + taskId / 8;
     const uint8_t m = (uint8_t)(0x80u >> (taskId % 8));
-    spu_lockline_lock();
+    spu_linelock_lock(bitset_ea + taskId / 8);
     if (set) *p |= m; else *p &= (uint8_t)~m;
-    spu_coh_notify_write(bitset_ea);
-    spu_lockline_unlock();
+    spu_linelock_release(bitset_ea + taskId / 8);
+    if (spu_coh_is_reserved(bitset_ea)) spu_coh_notify_write(bitset_ea);
 }
 
 /* Take the lowest free task id of a taskset: find the first clear bit of the enabled bitset and set it, as one
@@ -55,18 +57,24 @@ void spurs_taskset_bitset_update(uint32_t bitset_ea, uint32_t taskId, int set)
  * never get the same id. Returns `max_tasks` when every id is taken. */
 uint32_t spurs_taskset_take_slot(uint32_t taskset_ea, uint32_t max_tasks)
 {
-    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_linelock_lock(uint32_t); extern void spu_linelock_unlock(uint32_t);
+    extern void spu_linelock_release(uint32_t); extern int spu_coh_is_reserved(uint32_t);
     extern void spu_coh_notify_write(uint32_t);
     extern uint8_t* vm_base;
     uint8_t* en = vm_base + taskset_ea + CSTS_ENABLED;
     uint32_t slot = max_tasks;
-    spu_lockline_lock();
+    spu_linelock_lock(taskset_ea + CSTS_ENABLED);
     for (uint32_t t = 0; t < max_tasks; t++) {
         const uint8_t m = (uint8_t)(0x80u >> (t % 8));
         if (!(en[t / 8] & m)) { en[t / 8] |= m; slot = t; break; }
     }
-    if (slot < max_tasks) spu_coh_notify_write(taskset_ea + CSTS_ENABLED);
-    spu_lockline_unlock();
+    if (slot < max_tasks) {
+        spu_linelock_release(taskset_ea + CSTS_ENABLED);
+        if (spu_coh_is_reserved(taskset_ea + CSTS_ENABLED))
+            spu_coh_notify_write(taskset_ea + CSTS_ENABLED);
+    } else {
+        spu_linelock_unlock(taskset_ea + CSTS_ENABLED);
+    }
     return slot;
 }
 

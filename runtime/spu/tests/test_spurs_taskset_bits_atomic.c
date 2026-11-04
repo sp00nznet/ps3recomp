@@ -129,13 +129,21 @@ static void* do_take_slot(void* arg)  { (void)arg; g_slot = spurs_taskset_take_s
 /* The host operation runs on its own thread while the main thread holds the
  * lock-line lock; task 0's exit (its enabled bit cleared) is applied under the
  * lock, then the lock is released and the host operation completes. */
+/* d4 gave the bitset line its own lock: every real mutator (take_slot,
+ * bitset_update, spu_taskset_task_exited) now serializes on that line lock,
+ * not the global table lock. Model the exit's clear the same way -- under the
+ * line lock -- so the host op is still held behind it. */
+extern void spu_linelock_lock(uint32_t ea);
+extern void spu_linelock_unlock(uint32_t ea);
 static void interleave(void* (*host_op)(void*))
 {
     pthread_t t;
     spu_lockline_lock();
+    spu_linelock_lock(EN_WORD);
     pthread_create(&t, NULL, host_op, NULL);
-    sleep_ms(100);                            /* the host op reaches the lock */
+    sleep_ms(100);                            /* the host op blocks on the line lock */
     wr_be32(EN_WORD, rd_be32(EN_WORD) & ~BIT(0));     /* task 0 exits */
+    spu_linelock_unlock(EN_WORD);
     spu_lockline_unlock();
     pthread_join(t, NULL);
 }
