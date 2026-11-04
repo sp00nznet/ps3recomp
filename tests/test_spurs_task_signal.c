@@ -101,7 +101,11 @@ int main(void)
     vm_write32(0x1040,0); remains_blocked(&w);
     vm_write32(0x2040,0x80000000); remains_blocked(&w);
     guest_or(0x1040,0x40000000); remains_blocked(&w);
-    spu_lockline_lock(); spu_coh_notify_write(0x1040); spu_lockline_unlock();
+    /* Notify while already holding the table lock: on master the notify API
+     * required the caller-held lock, so this line used to take it itself;
+     * d4 made spu_coh_notify_write self-contained, so a held-lock caller must
+     * use the locked variant (same contract cellSpurs.c ef_line_end follows). */
+    spu_lockline_lock(); spu_coh_notify_write_locked(0x1040); spu_lockline_unlock();
     remains_blocked(&w);
     spu_taskset_signal_task(0x1000,0); promptly(t,&w);
     assert(vm_read32(0x1040)==0x40000000);
