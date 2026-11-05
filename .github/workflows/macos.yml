@@ -368,6 +368,15 @@ jobs:
           ./build/test_metal_poly_offset
           PS3RECOMP_ENG_POLY_OFFSET=0 ./build/test_metal_poly_offset
 
+      # The depth-bounds test, which Metal lacks, emulated in the fragment
+      # program: a bounded draw lands only where the STORED depth is inside
+      # the bounds; PS3RECOMP_ENG_DEPTH_BOUNDS=0 ignores the test.
+      - name: Run the Metal depth bounds test
+        run: |
+          test -x build/test_metal_depth_bounds
+          ./build/test_metal_depth_bounds
+          PS3RECOMP_ENG_DEPTH_BOUNDS=0 ./build/test_metal_depth_bounds
+
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's

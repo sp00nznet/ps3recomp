@@ -175,6 +175,18 @@ u64 rsx_fp_literal_source_hash(
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func);
 
+/* The depth-bounds test (NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE 0x0380, MIN
+ * 0x0384, MAX 0x0388) for a host API without one: the program first reads
+ * the depth STORED at its pixel from a float copy of the depth buffer bound
+ * on texture unit `unit` (one the program does not sample, declared
+ * Texture2D), and discards the fragment when it lies outside
+ * [fp_dbounds.x, fp_dbounds.y]. Adds `float4 fp_dbounds;` to PSConstants
+ * after fp_alpha, so the caller passes one more float4 there. For the
+ * buffered decompilers' HLSL, applied after the other wrappers. Returns 1,
+ * or -1 without mutation for an unexpected form, a cube or volume unit, a
+ * second application or insufficient capacity. */
+int rsx_fp_apply_depth_bounds(char* hlsl, u32 capacity, u32 unit);
+
 /* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
  * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
  * -1 when one allocation can never fit. */
