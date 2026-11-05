@@ -77,6 +77,15 @@ jobs:
           clang -std=gnu17 -I include                 libs/system/tests/test_sysconf.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_sysconf
           /tmp/test_sysconf
 
+      # ps3_env_once: one getenv per name, compiled as C and as C++ (ppu_fs.cpp
+      # includes it too).
+      - name: Run the ps3_env_once test
+        run: |
+          clang -std=gnu17 -Wall -Werror -I include -o /tmp/test_env_once tests/test_env_once.c
+          /tmp/test_env_once
+          clang++ -x c++ -std=c++17 -Wall -Werror -I include -o /tmp/test_env_once_cpp tests/test_env_once.c
+          /tmp/test_env_once_cpp
+
       - name: Run self-contained SPU helper tests
         run: |
           clang -std=gnu17 -I include -I runtime/spu \

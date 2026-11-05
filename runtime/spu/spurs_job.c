@@ -43,7 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
-#include "ps3emu/ps3_env_once.h"   /* getenv("...") once per call site */
+#include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
@@ -299,7 +299,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * its DMA and atomic EAs from these words, so when a job spins on a
      * lock-line address that is not backed, this is what to read first. */
     { static int _d = 0;
-      if (getenv("SPURS_JOB_DESCDUMP") && PS3_LOG_FIRST(_d, 4)) {
+      if (ps3_env_once("SPURS_JOB_DESCDUMP") && PS3_LOG_FIRST(_d, 4)) {
           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
@@ -310,7 +310,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
            * data (past JH_SIZE) and dump what they point at. The job reads its
            * parameters from there, so a wild DMA/atomic address usually
            * originates in one of these blocks. */
-          if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
+          if (atoi(ps3_env_once("SPURS_JOB_DESCDUMP")) >= 2) {
               for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
                   uint32_t v = g32(job_ea + o);
                   if (v < 0x10000u || v >= 0xD0000000u) continue;
@@ -329,7 +329,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
      * the user data + that command block so the bail path is attributable. */
     uint32_t dump_cmd = 0;
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (ps3_env_once("SPURS_JOB_DUMP")) {
         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
@@ -406,7 +406,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     /* TEMP SPURS_JOB_LSWORD=<img>:<lsa>: after a job of that image, print the
      * LS word at lsa and every other LS offset holding the same value. */
     { static int img = -2; static uint32_t lsa; static int n = 0;
-      if (img == -2) { const char* e = getenv("SPURS_JOB_LSWORD"); img = -1;
+      if (img == -2) { const char* e = ps3_env_once("SPURS_JOB_LSWORD"); img = -1;
           if (e) { img = atoi(e); const char* c = strchr(e, ':'); lsa = c ? (uint32_t)strtoul(c + 1, 0, 16) : 0; } }
       if (img == image_id && n++ < 3) {
           const uint8_t* q = ctx.ls + (lsa & 0x3FFFC);
@@ -428,13 +428,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
     { uint32_t _cb = g32(job_ea + 0x4C);
       g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
+    { static int s_t = -1; if (s_t < 0) s_t = ps3_env_once("SPURS_JOB_MBOX") ? 1 : 0;
       static int n = 0;
       if (s_t && PS3_LOG_FIRST(n, 16) && g_spurs_job_mbox_valid)
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
-    if (getenv("SPURS_JOB_DUMP")) {
+    if (ps3_env_once("SPURS_JOB_DUMP")) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
                 job_ea, ctx.status, ctx.stop_code, ctx.pc);
         /* Post-run view of the same command block: the game polls result/status

@@ -98,6 +98,17 @@ jobs:
             python "$t"
           done
 
+      # ps3_env_once: one getenv per name, compiled as C and as C++ (ppu_fs.cpp
+      # includes it too).
+      - name: Run the ps3_env_once test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Werror -I include \
+            -o /tmp/test_env_once tests/test_env_once.c
+          /tmp/test_env_once
+          ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }} -x c++ -std=c++17 -Wall -Werror -I include \
+            -o /tmp/test_env_once_cpp tests/test_env_once.c
+          /tmp/test_env_once_cpp
+
       - name: Run self-contained SPU helper tests
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \

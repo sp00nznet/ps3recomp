@@ -94,6 +94,23 @@ jobs:
       # did. That gap let a broken xswd case sit red on both POSIX runners
       # while Windows reported green, which is exactly the wrong way round for
       # the platform most contributors build on.
+      # ps3_env_once with plain MSVC (cl) as well as clang-cl: the helper must
+      # cache on the compiler the Windows CRT's environment lock matters for.
+      - name: Run the ps3_env_once test (cl and clang-cl)
+        run: |
+          cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_cl.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cl /nologo /W3 /WX /TP /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl_cpp.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_cl_cpp.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_clang.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_clang.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Run self-contained SPU helper tests
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c
