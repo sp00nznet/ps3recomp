@@ -172,6 +172,12 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = RSX_DSP_ZSTENCIL_CLEAR_RESET;
 
+    /* NV40 reset ZMIN_MAX_CONTROL (0x1D78) is 1: clip at the near and far
+     * planes, no depth clamp (RPCS3 rsx_methods.cpp; the GCM default of
+     * cellGcmSetZMinMaxControl(TRUE, FALSE, FALSE)). Seeded so a raw 0 means
+     * a title that turned clipping off. */
+    rsx->regs[0x1D78 >> 2] = 0x00000001u;
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);

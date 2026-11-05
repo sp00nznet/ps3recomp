@@ -214,6 +214,7 @@ typedef struct vk_state {
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              depth_bounds_ok; /* depthBounds enabled                */
+    int              depth_clamp_ok;  /* depthClamp enabled                 */
     int              indep_blend_ok;  /* independentBlend: per-target MRT state */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
@@ -3119,6 +3120,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
      * screen the same one D3D's viewport produces. */
     VkPipelineRasterizationStateCreateInfo ras = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .depthClampEnable = (rs->depth_clamp && s_vk.depth_clamp_ok) ? VK_TRUE : VK_FALSE,
         .polygonMode = VK_POLYGON_MODE_FILL,
         .cullMode = !rs->cull_enable ? VK_CULL_MODE_NONE
                   : (rs->cull_face == 0x0404u || rs->cull_face == 0x0408u) ? VK_CULL_MODE_FRONT_BIT
@@ -3871,6 +3873,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * Vulkan; without it the test stays off, as before. */
     want.depthBounds = have.depthBounds;
     s_vk.depth_bounds_ok = have.depthBounds ? 1 : 0;
+    /* SET_ZMIN_MAX_CONTROL's depth clamp (rs->depth_clamp). Optional too;
+     * without it such draws are clipped, as before. */
+    want.depthClamp = have.depthClamp;
+    s_vk.depth_clamp_ok = have.depthClamp ? 1 : 0;
     /* Per-target colour mask and blend enable (an MRT set's targets B..D
      * have their own); without it every target takes target A's. */
     want.independentBlend = have.independentBlend;
