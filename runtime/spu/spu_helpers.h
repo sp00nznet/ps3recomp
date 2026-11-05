@@ -16,6 +16,7 @@
 #include "spu_context.h"
 #include <string.h>
 #include <math.h>
+#include "../ppu/ps3_fma.h"   /* correctly rounded fma without hardware FMA */
 
 #ifdef __cplusplus
 extern "C" {
@@ -770,7 +771,7 @@ static inline uint32_t spu__fm_fast(uint32_t x, uint32_t y) {
 static inline uint32_t spu__fma_fast(uint32_t x, uint32_t y, uint32_t z, uint32_t negp, uint32_t negc) {
     if (!spu__sf_plain(x) || !spu__sf_plain(y) || !spu__sf_plain(z)) return 0;
     const double p = (double)spu__sf_f(x ^ negp) * (double)spu__sf_f(y);      /* exact */
-    return spu__sf_from_d(fma(1.0, p, (double)spu__sf_f(z ^ negc)), 1);
+    return spu__sf_from_d(ps3_fma(1.0, p, (double)spu__sf_f(z ^ negc)), 1);
 }
 static inline uint32_t spu__fa_any(uint32_t x, uint32_t y) { const uint32_t f = spu__fa_fast(x, y); return f ? f : spu__fa_lane(x, y); }
 static inline uint32_t spu__fm_any(uint32_t x, uint32_t y) { const uint32_t f = spu__fm_fast(x, y); return f ? f : spu__fm_lane(x, y); }
@@ -1276,7 +1277,7 @@ static inline u128 spu__dfmx(u128 a, u128 b, u128 c, int negate, int subtract) {
         const uint64_t x = spu__dw_get(a, i), y = spu__dw_get(b, i), z = spu__dw_get(c, i);
         if (spu__d_isnan(x) || spu__d_isnan(y) || spu__d_isnan(z)) { spu__dw_put(&r, i, 0x7FF8000000000000ull); continue; }
         const double zz = subtract ? -spu__d_in(z) : spu__d_in(z);
-        const double v = fma(spu__d_in(x), spu__d_in(y), zz);
+        const double v = ps3_fma(spu__d_in(x), spu__d_in(y), zz);
         /* Negate the RESULT by its sign bit: written as -fma(..) the compiler may fold it into a
          * negated fused multiply-add, (-x*y) - z, which differs from -(x*y + z) in the sign of an
          * exact zero. */

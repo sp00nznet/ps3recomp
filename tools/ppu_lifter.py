@@ -355,6 +355,7 @@ SOURCE_PREAMBLE = """\
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include "ps3_fma.h"   /* correctly rounded fma without hardware FMA (runtime/ppu/ps3_fma.h) */
 
 /* Float->int conversion per Book I 4.6.7: SATURATE out-of-range (positive
  * overflow => max, negative => min, NaN => min) and honor the rounding mode
@@ -383,7 +384,9 @@ static inline uint64_t ppu_f2i64(double v, int rn)
  * operation with no NaN inputs produces the DEFAULT QNaN
  * 0x7FF8000000000000 (positive). x86's default "real indefinite" is
  * NEGATIVE (0xFFF8...), so plain C expressions diverge on every inf-inf,
- * 0*inf and 0/0. The fmadd family also needs a REAL fused fma(): the
+ * 0*inf and 0/0. The fmadd family also needs a REAL fused fma() (ps3_fma: the
+ * instruction with -mfma, else an exact integer version; a C-runtime fma() can be
+ * inexact, as mingw-w64's is): the
  * unfused a*b+c double-rounds away cancellation residuals (newlib atan2's
  * argument reduction depends on the fused residual; wave's colour wheel
  * painted garbage without it). */
@@ -428,10 +431,10 @@ static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
     if (c != c) return ppu_fp_quiet(c);
-    double r = fma(a, c, neg_b ? -b : b);
+    double r = ps3_fma(a, c, neg_b ? -b : b);
     if (r != r) return ppu_fp_default_qnan();
 #else
-    double r = fma(a, c, neg_b ? -b : b);
+    double r = ps3_fma(a, c, neg_b ? -b : b);
 #endif
     return neg_res ? -r : r;
 }
