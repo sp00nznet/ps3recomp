@@ -184,6 +184,13 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
           /tmp/test_np_nat
 
+      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+      - name: Run the Avc2 Load test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_avc2_load libs/network/tests/test_avc2_load.c
+          /tmp/test_avc2_load
+
       # cellPadSetActDirect: the small motor is on/off at full strength, and
       # a rumble lasts until the title changes it (renewed from the pad poll).
       - name: Run the pad rumble test

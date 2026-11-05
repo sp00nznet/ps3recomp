@@ -203,6 +203,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
           /tmp/test_np_nat
 
+      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+      - name: Run the Avc2 Load test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_avc2_load libs/network/tests/test_avc2_load.c
+          /tmp/test_avc2_load
+
       # sceNpCommerce2CreateCtx takes the SDK's five arguments and stores the context id through the fifth.
       - name: Run the Commerce2 CreateCtx test
         run: |

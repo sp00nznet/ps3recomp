@@ -54,6 +54,33 @@ s32 cellSysutilAvc2LoadAsync(u16 ctxId, u32 container, u32 callback, u32 userdat
     return CELL_OK;
 }
 
+/* The synchronous load, same arguments. J-Stars Victory VS+ calls this one, not LoadAsync: with it unexported the
+ * title's callback was never stored, so JoinChatRequest's JOIN_SUCCEEDED had no one to go to and the room screen
+ * timed out. Load reports LOAD_SUCCEEDED through the callback as LoadAsync does; the title proceeds on it. */
+s32 cellSysutilAvc2Load(u16 ctxId, u32 container, u32 callback, u32 userdata, u32 initParam)
+{
+    (void)ctxId; (void)container; (void)initParam;
+    s_cb = callback;
+    s_userdata = userdata;
+    printf("[cellSysutilAvc2] Load: voice chat up, silent\n");
+    avc2_event(AVC2_EVENT_LOAD_SUCCEEDED);
+    return CELL_OK;
+}
+
+s32 cellSysutilAvc2Unload(void)
+{
+    avc2_event(AVC2_EVENT_UNLOAD_SUCCEEDED);
+    return CELL_OK;
+}
+
+/* Settings of a chat that carries no audio: accepted. (CellSysutilAvc2AttributeId, CellSysutilAvc2Attribute*) */
+s32 cellSysutilAvc2SetAttribute(u32 attr) { (void)attr; return CELL_OK; }
+s32 cellSysutilAvc2SetSpeakerVolumeLevel(u32 level) { (void)level; return CELL_OK; }
+s32 cellSysutilAvc2SetSpeakerMuting(u8 muting) { (void)muting; return CELL_OK; }
+s32 cellSysutilAvc2SetVoiceMuting(u8 muting) { (void)muting; return CELL_OK; }
+s32 cellSysutilAvc2StartVoiceDetection(void) { return CELL_OK; }
+s32 cellSysutilAvc2StopVoiceDetection(void) { return CELL_OK; }
+
 s32 cellSysutilAvc2UnloadAsync(void)
 {
     avc2_event(AVC2_EVENT_UNLOAD_SUCCEEDED);
