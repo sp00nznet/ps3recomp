@@ -174,6 +174,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
           /tmp/test_np_matching2
 
+      # sceNpSignaling for Matching2 room members: context ids from 1,
+      # ActivateConnection, the events a title's handlers get, the peer address.
+      - name: Run the sceNpSignaling room connection test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_signaling_rooms libs/network/tests/test_np_signaling_rooms.c
+          /tmp/test_np_signaling_rooms
+
       # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
       # and PSN's online ID rules.
       - name: Run the player-name test

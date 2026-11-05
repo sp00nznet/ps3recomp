@@ -36,6 +36,7 @@
 #include "sceNpMatching2.h"
 #include "sceNp.h"
 #include "np_psnr.h"
+#include "sceNpSignaling.h"   /* np_signaling_room_peer */
 #include "../system/cellSysutil.h"
 #include "../../runtime/ppu/ppu_memory.h"
 
@@ -501,6 +502,8 @@ static u32 rb_room_internal(rb_t* r, const m2_room* room)
 static void signal_member(m2_ctx* c, u16 member, u16 event)
 {
     printf("[sceNpMatching2] -> signaling 0x%04X member %u\n", event, member);
+    const m2_member* m = room_member(&c->room, member);
+    if (m) np_signaling_room_peer(m->online_id, m->ip, m->port, event == SIG_EV_Established);
     /* (ctxId, roomId, memberId, event, errorCode, arg) */
     queue_cb(c->sig_cb, ctx_id(c), c->room.id, member, event, 0, c->sig_arg, 0, 0);
 }
