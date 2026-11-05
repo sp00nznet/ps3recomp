@@ -40,6 +40,10 @@ void rsx_state_init(rsx_state* state) { (void)state; }
 /* Records where the control register's get stood when each probe method ran. */
 #define PROBE_METHOD 0x1EE0u
 static u32 seen_get[8], seen_n;
+/* No microcode or constant runs here: the walker hands every word to
+ * rsx_process_method instead. */
+int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{ (void)state; (void)method; (void)src; (void)count; return 0; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     (void)state;
@@ -47,6 +51,7 @@ int  rsx_process_method(rsx_state* state, u32 method, u32 data)
     return 0;
 }
 int  rsx_draw_engine_enabled(void) { return 0; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }

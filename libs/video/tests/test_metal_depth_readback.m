@@ -53,6 +53,14 @@ int main(void)
         float baseline[12]={0}; [eng_obj(snap) getBytes:baseline bytesPerRow:16 fromRegion:MTLRegionMake2D(0,0,4,3) mipmapLevel:0];
         int baseline_ok=1; for (u32 y=0;y<3;y++) for(u32 x=0;x<4;x++) baseline_ok &= fabsf(baseline[y*4+x]-expected(x,y))<1e-6;
         CHECK(baseline_ok,"existing depth snapshot preserves nonuniform source"); eng_obj_release(NULL,snap);
+        /* A smaller snapshot is the top-left region 1:1, not the whole target
+         * scaled down: a texture smaller than its canvas-sized zeta. */
+        u32 crop=eng_depth_snapshot(NULL,depth,2,2); eng_submit_and_wait(NULL,0);
+        CHECK(crop && [eng_obj(crop) width]==2 && [eng_obj(crop) height]==2,"cropped snapshot size");
+        float cropped[4]={0}; if (crop) [eng_obj(crop) getBytes:cropped bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+        CHECK(fabsf(cropped[0]-expected(0,0))<1e-6 && fabsf(cropped[1]-expected(1,0))<1e-6 &&
+              fabsf(cropped[2]-expected(0,1))<1e-6 && fabsf(cropped[3]-expected(1,1))<1e-6,"cropped snapshot keeps top-left texels");
+        if (crop) eng_obj_release(NULL,crop);
         CHECK(s_engine_backend.depth_readback!=NULL,"backend advertises depth readback");
         float out[18]; for(int i=0;i<18;i++)out[i]=-7;
         CHECK(read_depth(depth,0,0,4,3,out,24)==0,"full depth readback with padded rows");

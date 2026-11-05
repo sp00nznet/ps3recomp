@@ -6,6 +6,7 @@
 #include "../../runtime/platform/win32_compat.h"   /* QueryPerformanceCounter on every host */
 
 #include <stdint.h>
+#include "../spu_ls_watch_fixture.h"
 
 extern uint8_t* vm_base;
 
@@ -26,6 +27,7 @@ int lv2_deadline_passed(int64_t deadline)
 }
 
 void ydkj_release_pending_threads(void) {}
+void ppu_thread_note_block(uint64_t tid) { (void)tid; }   /* sys_ppu_thread.c: PS3_PRIO_START */
 
 uint32_t vm_read32(uint64_t addr)
 {

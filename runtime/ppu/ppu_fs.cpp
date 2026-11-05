@@ -13,6 +13,7 @@
  * Context-aware HLE: guest pointers (path, buffers, out params) are read/written
  * through vm_base in big-endian.
  */
+#define PPU_NO_INLINE_STORES   /* declares its own out-of-line vm_write32/64 below */
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
@@ -23,6 +24,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <mutex>
 #include <atomic>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
@@ -209,17 +211,55 @@ static FILE* g_files[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
+/* Last transfer direction on each fd's stream: 0 none, 1 read, 2 write.
+ *
+ * C allows a read after a write on one stream only once it has been flushed or
+ * repositioned, and a write after a read only once it has been repositioned;
+ * otherwise the result is undefined. cellFs has no such rule, so a title may
+ * write and then read on one fd with nothing in between. FIOS does exactly
+ * that with its HDD cache: it writes a 512-byte header into a new cache.idx
+ * and reads on. On the MSVC CRT that read returned 3584 bytes of stale buffer
+ * and the header never reached the file (size still 0), so the index never
+ * validated and FIOS rebuilt it for good -- ICO stayed on a black screen.
+ * fs_set_dir() repositions in place (SEEK_CUR 0) when the direction changes. */
+static uint8_t g_fd_dir[FS_MAX];
+static void fs_set_dir(int fd, FILE* f, uint8_t dir)
+{
+    if (g_fd_dir[fd] && g_fd_dir[fd] != dir) FS_SEEK64(f, 0, SEEK_CUR);
+    g_fd_dir[fd] = dir;
+}
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
+/* Guest threads open, read and close concurrently (FIOS media threads, audio
+ * streamers). Allocation and release take this lock, so two opens can no longer
+ * claim the same slot, and every handler reads its slot once (fd_file/fd_dir)
+ * rather than re-reading a pointer another thread's close may have cleared. */
+static std::mutex g_fd_lock;
 static int fd_alloc_file(FILE* f)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
+    std::lock_guard<std::mutex> hold(g_fd_lock);
+    for (int i = 3; i < FS_MAX; i++)
+        if (!g_files[i] && !g_dirs[i]) {
+            g_fd_dir[i] = 0;
+            __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
+            return i;
+        }
     return -1;
 }
 static int fd_alloc_dir(DIR* d)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_dirs[i] = d; return i; }
+    std::lock_guard<std::mutex> hold(g_fd_lock);
+    for (int i = 3; i < FS_MAX; i++)
+        if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
     return -1;
+}
+static FILE* fd_file(int fd)
+{
+    return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_files[fd], __ATOMIC_ACQUIRE) : nullptr;
+}
+static DIR* fd_dir(int fd)
+{
+    return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
 }
 
 /* ---- handlers ---- */
@@ -398,10 +438,17 @@ static void cellFsClose(ppu_context* ctx)
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
-        if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
-        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
+    FILE* f = nullptr;
+    if (fd >= 0 && fd < FS_MAX) {
+        std::lock_guard<std::mutex> hold(g_fd_lock);
+        f = g_files[fd];
+        if (f) {
+            if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
+            __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
+            g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
+        }
     }
+    if (f) fclose(f);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -433,12 +480,14 @@ static void cellFsRead(ppu_context* ctx)
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FILE* f = fd_file(fd);
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     uint64_t raw_nbytes = ctx->gpr[5];
-    long fpos_before = ftell(g_files[fd]);
+    long fpos_before = ftell(f);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
-    size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    fs_set_dir(fd, f, 1);
+    size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -462,7 +511,7 @@ static void cellFsRead(ppu_context* ctx)
       if (wfd >= 0 && fd == wfd)
           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
                   fd, (unsigned long long)nbytes, n, fpos_before); }
-    if (getenv("PS3_FSLOG")) { static int _fd=0; if(PS3_LOG_FIRST(_fd, 20)) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
+    if (getenv("PS3_FSLOG")) { static int _fd=0; if(PS3_LOG_FIRST(_fd, 20)) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(f),ferror(f)); }
 #ifdef _WIN32
     if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
 #endif
@@ -503,9 +552,11 @@ static void cellFsWrite(ppu_context* ctx)
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FILE* f = fd_file(fd);
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
-    size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+    fs_set_dir(fd, f, 2);
+    size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -563,7 +614,7 @@ static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t bl
 static void cellFsFGetBlockSize(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+    if (!fd_file(fd)) {
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
         return;
     }
@@ -583,12 +634,13 @@ static void cellFsLseek(ppu_context* ctx)
     int64_t off   = (int64_t)ctx->gpr[4];
     uint32_t wh   = (uint32_t)ctx->gpr[5];
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FILE* f = fd_file(fd);
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    FS_SEEK64(g_files[fd], off, worigin);
-    int64_t p = FS_TELL64(g_files[fd]);
+    FS_SEEK64(f, off, worigin);
+    int64_t p = FS_TELL64(f);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -636,13 +688,14 @@ static void cellFsFstat(ppu_context* ctx)
 {
     int fd      = (int)(uint32_t)ctx->gpr[3];
     uint32_t sb = (uint32_t)ctx->gpr[4];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FILE* f = fd_file(fd);
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    int64_t cur = FS_TELL64(g_files[fd]);
-    FS_SEEK64(g_files[fd], 0, SEEK_END);
-    int64_t sz = FS_TELL64(g_files[fd]);
-    FS_SEEK64(g_files[fd], cur, SEEK_SET);
+    int64_t cur = FS_TELL64(f);
+    FS_SEEK64(f, 0, SEEK_END);
+    int64_t sz = FS_TELL64(f);
+    FS_SEEK64(f, cur, SEEK_SET);
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -682,8 +735,9 @@ static void cellFsReaddir(ppu_context* ctx)
     int fd          = (int)(uint32_t)ctx->gpr[3];
     uint32_t dirent = (uint32_t)ctx->gpr[4];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[5];
-    if (fd < 0 || fd >= FS_MAX || !g_dirs[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
-    struct dirent* e = readdir(g_dirs[fd]);
+    DIR* d = fd_dir(fd);
+    if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    struct dirent* e = readdir(d);
     if (!e) { if (nread_ptr) vm_write64(nread_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
     char full[1300]; struct stat st;
     snprintf(full, sizeof full, "%s/%s", g_dir_path[fd], e->d_name);
@@ -714,7 +768,8 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
         ctx->gpr[3] = 0x8001000Du; // CELL_EFAULT
         return;
     }
-    if (fd < 3 || fd >= FS_MAX || !g_dirs[fd]) {
+    DIR* d = fd < 3 ? nullptr : fd_dir(fd);
+    if (!d) {
         ctx->gpr[3] = 0x8001002Au; // CELL_EBADF
         return;
     }
@@ -722,7 +777,7 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
     for (; count < bytes / 312; ++count) {
         errno = 0;
-        struct dirent* entry = readdir(g_dirs[fd]);
+        struct dirent* entry = readdir(d);
         if (!entry) {
             if (errno) ctx->gpr[3] = 0x8001002Bu; // CELL_EIO
             break;
@@ -754,7 +809,13 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
 static void cellFsClosedir(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    if (fd >= 0 && fd < FS_MAX && g_dirs[fd]) { closedir(g_dirs[fd]); g_dirs[fd] = nullptr; }
+    DIR* d = nullptr;
+    if (fd >= 0 && fd < FS_MAX) {
+        std::lock_guard<std::mutex> hold(g_fd_lock);
+        d = g_dirs[fd];
+        __atomic_store_n(&g_dirs[fd], (DIR*)nullptr, __ATOMIC_RELEASE);
+    }
+    if (d) closedir(d);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -798,7 +859,7 @@ static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 static void cellFsFsync(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) fflush(g_files[fd]);
+    if (FILE* f = fd_file(fd)) fflush(f);
     ctx->gpr[3] = CELL_OK;
 }
 /* File-area preallocation (LBP cache warm-up spams this): host filesystems
@@ -891,7 +952,7 @@ static void cellFsAioRead(ppu_context* ctx)
 
     size_t n = 0;
     int32_t err = CELL_FS_ENOENT;
-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+    if (FILE* f = fd_file(fd)) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
         fs_prefault(buf, size);
         /* AIO reads are absolute: they must not move the fd's own position,
@@ -901,7 +962,6 @@ static void cellFsAioRead(ppu_context* ctx)
          * could land between the two, and the next cellFsRead continued from
          * wherever the AIO stopped. Hold the stream lock across seek, read
          * and the seek back (stdio's own calls take the same lock). */
-        FILE* f = g_files[fd];
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
         if (HOST_FSEEK64(f, offset) == 0)

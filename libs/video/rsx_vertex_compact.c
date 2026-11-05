@@ -180,7 +180,7 @@ void rsx_vertex_fetch_plan_prepare(
 {
     if (!plan)
         return;
-    /* Ordinary per-vertex attributes (frequency 0/1) all span the same
+    /* Ordinary per-vertex attributes (rsx_vertex_freq_plain) all span the same
      * elements: find them once for the draw instead of once per attribute.
      * The per-attribute walk was 2.2 ms of the RSX thread a frame in
      * inFAMOUS 2's New Marais. */
@@ -221,7 +221,8 @@ void rsx_vertex_fetch_plan_prepare(
 
         u32 first = UINT_MAX;
         u32 last = 0;
-        if (fetch->desc.frequency <= 1) {
+        if (rsx_vertex_freq_plain(fetch->desc.frequency,
+                                  (plan->divider_mask >> attr) & 1u)) {
             if (!plain_known) {
                 plain_known = 1;
                 for (u32 i = 0; i < count; i++) {
@@ -242,8 +243,8 @@ void rsx_vertex_fetch_plan_prepare(
             if (element > last) last = element;
         }
 
-        const u64 prefix =
-            (u64)plan->base_offset + (u64)fetch->desc.offset;
+        const u64 prefix = rsx_dsp_resolve_vertex_offset(
+            plan->base_offset, fetch->desc.offset);
         const u64 start = prefix + (u64)first * fetch->stride;
         const u64 end =
             prefix + (u64)last * fetch->stride + fetch->elem_size;
@@ -262,53 +263,138 @@ void rsx_vertex_fetch_plan_prepare(
     }
 }
 
+/* One attribute of one vertex, exactly as rsx_vertex_fetch_one does it. */
+static int rsx_vertex_fetch_attr_value(
+    const rsx_vertex_fetch_plan* plan, u32 attr,
+    const rsx_vertex_ref* ref, float* value)
+{
+    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+    if (!fetch->desc.type || !fetch->desc.size) {
+        memcpy(value, fetch->default_value, 16);
+        return 1;
+    }
+
+    const u32 element = rsx_vertex_element_index(
+        ref->vertex_id, ref->base_index, fetch->desc.frequency,
+        (plan->divider_mask >> attr) & 1u);
+    const u8* source = NULL;
+    if (fetch->stable_base &&
+        element >= fetch->stable_first && element <= fetch->stable_last) {
+        source = fetch->stable_base +
+            (u64)(element - fetch->stable_first) * fetch->stride;
+    } else if (plan->inline_data) {
+        /* An inline draw has no vertex array to fall back to: the array
+         * offsets still hold whatever the last ordinary draw bound, and
+         * reading them would feed this draw another mesh's vertices.
+         * An attribute the stream does not supply gets its default,
+         * which is what the hardware feeds. */
+        source = NULL;
+    } else if (plan->guest_ptr) {
+        const u32 offset =
+            rsx_dsp_resolve_vertex_offset(plan->base_offset,
+                                          fetch->desc.offset) +
+            element * fetch->stride;
+        source = plan->guest_ptr(
+            plan->guest_user, fetch->desc.location, offset,
+            fetch->elem_size);
+    }
+
+    if (source && rsx_vertex_decode_element(
+            fetch->desc.type, fetch->desc.size, source, value))
+        return 1;
+    if (attr == 0)
+        return 0;
+    memcpy(value, fetch->default_value, 16);
+    return 1;
+}
+
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out)
 {
     if (!plan || !ref || (!out && plan->layout.stride))
         return 0;
+    for (u32 slot = 0; slot < plan->layout.count; slot++)
+        if (!rsx_vertex_fetch_attr_value(plan, plan->layout.attrs[slot], ref,
+                                   (float*)(out + slot * 16u)))
+            return 0;
+    return 1;
+}
+
+/* The stable-range loop for one attribute and one vertex type: `decode`
+ * reads `src` into `v` (pre-set to 0,0,0,1) for components c < n. Elements
+ * outside the stable range take the one-vertex path. */
+#define RSX_FETCH_LOOP(decode)                                                  \
+    for (u32 i = 0; i < count; i++) {                                           \
+        float* v = (float*)(out + (size_t)i * stride + slot * 16u);             \
+        const u32 element = plain                                               \
+            ? ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu)          \
+            : rsx_vertex_element_index(refs[i].vertex_id, refs[i].base_index,   \
+                                       fetch->desc.frequency, modulo);          \
+        if (element - first > span) {                                          \
+            if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v)) return 0;      \
+            continue;                                                           \
+        }                                                                       \
+        const u8* src = base + (u64)(element - first) * fstride;                \
+        v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;                                 \
+        for (u32 c = 0; c < n; c++) { decode; }                                 \
+    }
+
+int rsx_vertex_fetch_many(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out)
+{
+    if (!plan || (!refs && count) || (!out && plan->layout.stride && count))
+        return 0;
+    const u32 stride = plan->layout.stride;
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
-        float* value = (float*)(out + slot * 16u);
-        if (!fetch->desc.type || !fetch->desc.size) {
-            memcpy(value, fetch->default_value, 16);
+        const u8* base = fetch->stable_base;
+        const u32 type = fetch->desc.type;
+        if (!type || !fetch->desc.size || !base ||
+            type < RSX_VTX_TYPE_SNORM16 || type > RSX_VTX_TYPE_UINT8) {
+            for (u32 i = 0; i < count; i++)
+                if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
+                        (float*)(out + (size_t)i * stride + slot * 16u)))
+                    return 0;
             continue;
         }
-
-        const u32 element = rsx_vertex_element_index(
-            ref->vertex_id, ref->base_index, fetch->desc.frequency,
-            (plan->divider_mask >> attr) & 1u);
-        const u8* source = NULL;
-        if (fetch->stable_base &&
-            element >= fetch->stable_first && element <= fetch->stable_last) {
-            source = fetch->stable_base +
-                (u64)(element - fetch->stable_first) * fetch->stride;
-        } else if (plan->inline_data) {
-            /* An inline draw has no vertex array to fall back to: the array
-             * offsets still hold whatever the last ordinary draw bound, and
-             * reading them would feed this draw another mesh's vertices.
-             * An attribute the stream does not supply gets its default,
-             * which is what the hardware feeds. */
-            source = NULL;
-        } else if (plan->guest_ptr) {
-            const u32 offset =
-                plan->base_offset + fetch->desc.offset +
-                element * fetch->stride;
-            source = plan->guest_ptr(
-                plan->guest_user, fetch->desc.location, offset,
-                fetch->elem_size);
+        const u32 first = fetch->stable_first;
+        const u32 span = fetch->stable_last - first;
+        const u32 fstride = fetch->stride;
+        const u32 modulo = (plan->divider_mask >> attr) & 1u;
+        const int plain = rsx_vertex_freq_plain(fetch->desc.frequency, modulo);
+        const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
+        switch (type) {
+        case RSX_VTX_TYPE_FLOAT:
+            RSX_FETCH_LOOP(v[c] = rsx_compact_be_f32(src + c * 4))
+            break;
+        case RSX_VTX_TYPE_HALF:
+            RSX_FETCH_LOOP(v[c] = rsx_compact_be_f16(src + c * 2))
+            break;
+        case RSX_VTX_TYPE_UNORM8:
+            RSX_FETCH_LOOP(v[c] = src[c] / 255.0f)
+            break;
+        case RSX_VTX_TYPE_UINT8:
+            RSX_FETCH_LOOP(v[c] = (float)src[c])
+            break;
+        case RSX_VTX_TYPE_SNORM16:
+            RSX_FETCH_LOOP(v[c] = (s16)((src[c * 2] << 8) | src[c * 2 + 1]) / 32767.0f)
+            break;
+        case RSX_VTX_TYPE_SINT16:
+            RSX_FETCH_LOOP(v[c] = (float)(s16)((src[c * 2] << 8) | src[c * 2 + 1]))
+            break;
+        default:   /* RSX_VTX_TYPE_CMP32: one packed word, whatever the size */
+            for (u32 i = 0; i < count; i++)
+                if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
+                        (float*)(out + (size_t)i * stride + slot * 16u)))
+                    return 0;
+            break;
         }
-
-        if (source && rsx_vertex_decode_element(
-                fetch->desc.type, fetch->desc.size, source, value))
-            continue;
-        if (attr == 0)
-            return 0;
-        memcpy(value, fetch->default_value, 16);
     }
     return 1;
 }
+#undef RSX_FETCH_LOOP
 
 static u64 rsx_vertex_remap_hash(u64 value)
 {

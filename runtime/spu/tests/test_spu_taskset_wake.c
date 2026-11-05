@@ -254,6 +254,45 @@ static void test_other_taskset_stays_parked(void)
     pthread_join(th, NULL);
 }
 
+/* The commit hook only visits slots that can hold a parked task: none while
+ * nothing is parked, and none past the highest slot ever used. A waiter that
+ * parked behind other entries, some since removed, must still be reached. */
+static void test_waiter_behind_other_entries_wakes(void)
+{
+    TEST("a waiter parked behind other entries and holes wakes");
+    clear_guest();
+    /* Slots 0-4: other tasks of taskset B, parked without threads. */
+    for (uint32_t t = 10; t < 15; t++) spu_taskset_parked_add(TASKSET_B, t, 0);
+    waiter w; pthread_t th;
+    park(&w, &th, TASKSET_A, WAITER);   /* slot 5 */
+    /* Leave slot 0 and the waiter: two entries, three holes between them. */
+    for (uint32_t t = 11; t < 15; t++) spu_taskset_parked_del(TASKSET_B, t);
+    const uint64_t t0 = now_ms();
+    spu_signal(TASKSET_A, WAITER, MFC_PUTLLC_CMD);
+    const uint64_t took = wait_return(&w, t0, WAKE_MS);
+    CHECK(took != ~(uint64_t)0);
+    if (took == ~(uint64_t)0) wait_return(&w, t0, 2000);
+    pthread_join(th, NULL);
+    spu_taskset_parked_del(TASKSET_B, 10);
+}
+
+static void test_unmatched_remove_keeps_bookkeeping(void)
+{
+    TEST("removing a task that is not parked does not hide a later waiter");
+    clear_guest();
+    /* Nothing is parked, so this finds no entry and must change nothing:
+     * counting it as a removal would leave the waiter below uncounted. */
+    spu_taskset_parked_del(TASKSET_A, WAITER);
+    waiter w; pthread_t th;
+    park(&w, &th, TASKSET_A, WAITER);
+    const uint64_t t0 = now_ms();
+    spu_signal(TASKSET_A, WAITER, MFC_PUTLLUC_CMD);
+    const uint64_t took = wait_return(&w, t0, WAKE_MS);
+    CHECK(took != ~(uint64_t)0);
+    if (took == ~(uint64_t)0) wait_return(&w, t0, 2000);
+    pthread_join(th, NULL);
+}
+
 int main(void)
 {
     printf("SPURS task wake on an SPU-side signal\n");
@@ -262,6 +301,8 @@ int main(void)
     test_putlluc_signal_wakes();
     test_other_task_stays_parked();
     test_other_taskset_stays_parked();
+    test_waiter_behind_other_entries_wakes();
+    test_unmatched_remove_keeps_bookkeeping();
     printf("SPURS task wake on an SPU-side signal: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

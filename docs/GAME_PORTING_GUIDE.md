@@ -32,7 +32,7 @@ Porting a PS3 game with ps3recomp is a **per-game project**. Unlike emulation (w
 
 - A legally obtained copy of the PS3 game
 - Decryption keys or a fSELF version of the game binary
-- Python 3.9+ for the recompiler tools
+- Python 3.10+ for the recompiler tools
 - CMake 3.20+ and a C17/C++20 compiler
 - RPCS3 as a reference (for testing and behavior verification)
 - Patience and debugging skills
@@ -301,7 +301,7 @@ cp -r ps3recomp/templates/project/ my_game/
 
 ### Configure
 
-Edit `my_game/config.toml`:
+Edit `my_game/config.toml` (reference only: nothing reads it yet, so the paths also go on the tool command lines):
 
 ```toml
 [input]
@@ -562,6 +562,56 @@ void hle_spu_audio_mixer(spu_context* ctx)
         dst[i] += src[i];
 }
 ```
+
+### Lifting SPU programs
+
+When the HLE route does not fit (custom compute, or code you would rather run
+than rewrite), lift the SPU programs and let the runtime execute them.
+
+**Lifting.** `tools/extract_spu_images.py <ppu_elf> --output DIR` writes every
+embedded SPU ELF it finds. `tools/spu_lifter.py` lifts one image to C
+(`spu_recomp.c` / `spu_recomp.h`); `tools/build_spu_workloads.py` lifts a whole
+directory (`--images DIR --lifted OUTDIR --out spu_workloads.c --constructor`)
+or discovers the images itself (`--input FILE`, repeatable), giving each image
+its own symbol prefix so they link together. The project template does this at
+configure time when `PORT_SPU_INPUTS` lists the files to scan
+(`templates/project/CMakeLists.txt`, `cmake/PS3RecompSPU.cmake`); set
+`PORT_ENABLE_SPU=OFF` to leave SPU lifting out. Details of the lifter:
+[SPU_LIFTER.md](SPU_LIFTER.md).
+
+**Workload registration.** The generated `spu_workloads.c` calls
+`spu_workload_register` (or `spu_workload_register_img`, which also binds the
+image's indirect-branch table id) from `runtime/spu/spu_workload.c`, keyed by a
+fingerprint of the image's bytes. cellSpurs looks the image the game passes in
+up by that fingerprint, so a table generated from a different release of the
+game never matches.
+
+**Job modules.** SPURS job modules that are streamed into local store are not
+separate ELFs, so `extract_spu_images.py` does not find them. Depending on the
+title they sit in the PPU binary's data, in the title's data files
+(`tools/extract_jobmods.py` handles modules in zlib streams inside SDATA
+archives), or exist only at run time: `SPU_DUMP_MISS=<dir>` writes every SPU
+image the runtime does not recognise to a file, one per fingerprint
+(`runtime/spu/spu_workload.c`). Lift the raw `.bin` files with
+`tools/lift_jobmods.py --jobmods DIR --out OUTDIR`, which also writes
+`jobmods_register.c`. Job modules are keyed differently from ELF images: each
+registers its lifted functions under its own image id and the module's first 16
+bytes, which are matched when the module is streamed into the job code buffer.
+`--merge-chunks` (added in PR #386) passes through to the lifter and emits each
+run of chunks between call targets as one C function, for speed; every chunk
+stays registered for indirect entry.
+
+**Lifted sources are generated output.** Lift again after updating ps3recomp or
+changing the lifter: sources from an older lifter still compile and link, but
+can disagree with the current runtime.
+
+**Code that is not lifted.** SPU code with no lifted entry runs in the SPU
+interpreter (`runtime/spu/spu_interp.c`), and a branch from interpreted code
+to a lifted entry resumes the lifted code; see
+[SPU_INTERPRETER_LIFTED_HANDOFF.md](SPU_INTERPRETER_LIFTED_HANDOFF.md). To see
+what still runs interpreted, set `SPU_INTERP_STATS=<seconds>`: the interpreter
+then prints, once per that many seconds, its step rate and the six busiest
+1 KB local-store pages by image id.
 
 ---
 

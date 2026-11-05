@@ -104,7 +104,7 @@
 #define CELL_ERROR_BASE_FS              0x80010700
 #define CELL_ERROR_BASE_AUDIO           0x80310700
 #define CELL_ERROR_BASE_VIDEO           0x8002B100
-#define CELL_ERROR_BASE_GCM             0x80210700
+#define CELL_ERROR_BASE_GCM             0x80210000
 #define CELL_ERROR_BASE_NET             0x80130100
 #define CELL_ERROR_BASE_PAD             0x80121100
 #define CELL_ERROR_BASE_KB              0x80121200
@@ -117,6 +117,7 @@
 #define CELL_ERROR_BASE_JPG             0x80611300
 #define CELL_ERROR_BASE_FONT            0x80540000
 #define CELL_ERROR_BASE_SPURS           0x80410700
+#define CELL_ERROR_BASE_SPURS_TASK      0x80410900
 #define CELL_ERROR_BASE_FIBER           0x80410800
 #define CELL_ERROR_BASE_SYNC            0x80410100
 #define CELL_ERROR_BASE_USBD            0x80110100

@@ -62,6 +62,35 @@ int main(void)
     g_ppu_thread_entry_trampoline = guest_entry;
     ppu_thread_register_main();
 
+    /* 0. A thread that has exited is gone: get_priority on its id returns ESRCH, and its id is not handed to the next
+     *    thread at once (the title's poll needs that). An id nobody created (and the main thread) keeps the default answer. */
+    {
+        int32_t* out = (int32_t*)(vm_base + 0x200);
+        ppu_context ctx; memset(&ctx, 0, sizeof(ctx));
+        ctx.gpr[3] = 40; ctx.gpr[4] = 0x200;                   /* an id nothing created */
+        EXPECT_EQ(sys_ppu_thread_get_priority(&ctx), 0);
+        EXPECT_EQ(__builtin_bswap32((uint32_t)*out), 1000);
+        uint64_t a = 0, b = 0;
+        EXPECT_EQ(create(0, &a), 0);
+        settle();
+        for (int i = 0; i < 1000 && used_slots(); i++) { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
+        ctx.gpr[3] = a;
+        EXPECT_EQ(sys_ppu_thread_get_priority(&ctx), (int64_t)(int32_t)CELL_ESRCH);
+        EXPECT_EQ(create(0, &b), 0);
+        EXPECT_EQ(b != a, 1);                                  /* first-fit gave the exited thread's id back */
+        settle();
+        for (int i = 0; i < 1000 && used_slots(); i++) { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
+        uint64_t j = 0;
+        EXPECT_EQ(create(1, &j), 0);
+        settle();
+        ctx.gpr[3] = j;
+        EXPECT_EQ(sys_ppu_thread_get_priority(&ctx), 0);       /* joinable and not joined yet: still there */
+        ctx.gpr[4] = 0x300;
+        EXPECT_EQ(sys_ppu_thread_join(&ctx), 0);
+        ctx.gpr[4] = 0x200;
+        EXPECT_EQ(sys_ppu_thread_get_priority(&ctx), (int64_t)(int32_t)CELL_ESRCH);
+    }
+
     /* 1. More than PPU_THREAD_MAX non-joinable threads, one after the other: every create succeeds and the slots
      *    come back (create flags 0, nobody joins). */
     int ok = 0;

@@ -65,6 +65,14 @@ typedef enum {
 typedef struct rsx_be_sampler_desc {
     u8  min_linear, mag_linear, mip_linear, mip_present;
     u8  wrap_s, wrap_t, wrap_r;
+    /* What the BORDER wrap returns outside 0..1, reduced to the colours
+     * every backend can express: SET_TEXTURE_BORDER_COLOR read the way the
+     * unit's format reads it (a depth format takes its depth from the low 24
+     * bits). 0 transparent black (also the old behaviour), 1 opaque black,
+     * 2 opaque white, 3 any other colour, which the backend clamps to the
+     * edge texel instead -- nearer than black for the colours seen (a video
+     * title's chroma planes border at 0x80, neutral). */
+    u8  border;
     float min_lod, max_lod;
 } rsx_be_sampler_desc;
 
@@ -201,6 +209,15 @@ typedef struct rsx_draw_backend {
      * (rsx_be_render_state.depth_bounds_test); a backend that leaves this
      * NULL draws as if the test were off. */
     void (*set_depth_bounds)(void* user, float min, float max);
+    /* Optional. The NV4097 polygon offset for the next draw, called before
+     * every draw like the stencil reference (SET_POLY_OFFSET_{POINT,LINE,
+     * FILL}_ENABLE 0x0A60/0x0A64/0x0A68, SCALE_FACTOR 0x0A78, BIAS 0x0A7C).
+     * glPolygonOffset's terms: `slope` multiplies the primitive's maximum
+     * depth slope and `units` the smallest resolvable difference of a depth
+     * buffer of `depth_bits` bits (16 for Z16, 24 for Z24S8), so a backend
+     * whose depth format is another converts the units. Both are 0 when the
+     * offset is off. Left NULL, every draw is drawn without it. */
+    void (*set_depth_bias)(void* user, float slope, float units, u32 depth_bits);
     /* One draw. `indices` is NULL for a non-indexed one. Everything the
      * hardware has and the host does not -- quads, quad strips, fans,
      * polygons -- has already been expanded into a triangle list by the time
@@ -244,6 +261,41 @@ typedef struct rsx_draw_backend {
                               u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
     void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
                               u32 w, u32 h, const void* src, u32 row_bytes);
+    /* Nonzero when texture_upload is ordered after every draw already handed
+     * to the backend, so rewriting a texture those draws sample is safe. The
+     * engine then refreshes a changed 2D texture in place instead of creating
+     * a new one and releasing the old (an allocation, a free and a wait for
+     * the GPU each time). Zero keeps the create-and-swap. */
+    int texture_upload_ordered;
+    /* Optional. A depth target's top-left w x h read as a texture of base
+     * format `rsx_fmt` reads the bytes the zeta holds: a fresh texture (a
+     * colour target for surface_view) whose texel is what depth_readback,
+     * stored as eng_zdepth_to_guest stores it and decoded, gives.
+     *  - A8R8G8B8 (0x85) of a Z24S8 zeta: R8G8B8A8, R = depth bits 15..8,
+     *    G = bits 7..0, B = 0 (the stencil byte), A = bits 23..16, with
+     *    round(depth * 0xFFFFFF) taken exactly;
+     *  - DEPTH16 (0x92) of a Z16 zeta: R16 unorm of round(depth * 0xFFFF).
+     * Any other format: 0. Made in command order, like
+     * depth_snapshot, so no wait, and from the depth the draws so far left,
+     * which may be the target the current pass still attaches; the engine
+     * owns the handle. 0 when the backend cannot; NULL keeps the store
+     * through guest memory. */
+    u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt);
+
+    /* Optional, both or neither: clear_color and clear_depth_stencil limited
+     * to the rectangle (x, y, w, h) of the target, in the engine's pixels
+     * (the sample grid of an antialiased surface), w and h never 0. RSX
+     * clears only what the scissor and the surface clip let through: a
+     * split-screen title renders the left view, then clears and renders the
+     * right one in the same target with the scissor on that half. The engine
+     * calls these only for a clear whose scissor leaves part of the clip
+     * alone; left NULL, such a clear covers the whole target, as before. */
+    void (*clear_color_rect)(void* user, u32 surface, const float rgba[4],
+                             u32 x, u32 y, u32 w, u32 h);
+    void (*clear_depth_stencil_rect)(void* user, u32 depth, u32 flags,
+                                     float depth_value, u8 stencil,
+                                     u32 x, u32 y, u32 w, u32 h);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

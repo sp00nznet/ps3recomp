@@ -52,8 +52,9 @@ stage starts, and the title drops the peer as "not responding". Set
 | sceNpScore | Title and transaction contexts. Record score, and ranking by range and by NP ID, sync and async, all on psnr leaderboards. |
 | sceNpLookup | Profiles are answered locally from the online ID. There is no avatar. |
 | cellSysutilAvc2 | Voice chat loads, joins and streams, but carries no audio. |
-| sceNp manager | Reports ONLINE when psnr is set, and fires the manager callback once. |
+| sceNp manager | Reports ONLINE when psnr is set, and fires the manager callback once. Tickets, the account region and the network time answer OFFLINE without psnr; with it a ticket request gets a failed GOT_TICKET at once (psnr issues none), and the region (`us`) and the time are local. |
 | sys_net | P2P sockets map to plain UDP/TCP on `PS3_NET_P2P_PORT`. There is no vport multiplexing. |
+| cellSysutilNpEula | The terms-of-service check answers through its callback on the next sysutil poll: ERROR offline (the terms cannot be fetched), ALREADY_ACCEPTED with `PS3_NET_ONLINE=1` or psnr (as RPCS3). "Show the terms" closes at once. |
 
 ## How it was verified
 

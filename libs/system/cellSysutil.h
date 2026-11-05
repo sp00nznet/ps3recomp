@@ -27,7 +27,17 @@ extern "C" {
 #define CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE             0x0116
 #define CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME           0x0117
 #define CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL  0x0121
+#define CELL_SYSUTIL_SYSTEMPARAM_ID_LICENSE_AREA         0x0122
 #define CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT  0x0123
+
+/* CELL_SYSUTIL_SYSTEMPARAM_ID_LICENSE_AREA values */
+#define CELL_SYSUTIL_LICENSE_AREA_J      0   /* SCEJ */
+#define CELL_SYSUTIL_LICENSE_AREA_A      1   /* SCEA (North America) */
+#define CELL_SYSUTIL_LICENSE_AREA_E      2   /* SCEE (Europe, Oceania, Russia) */
+#define CELL_SYSUTIL_LICENSE_AREA_H      3   /* SCEH */
+#define CELL_SYSUTIL_LICENSE_AREA_K      4   /* SCEK */
+#define CELL_SYSUTIL_LICENSE_AREA_C      5   /* SCH */
+#define CELL_SYSUTIL_LICENSE_AREA_OTHER  100
 #define CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT    0x0141
 #define CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ        0x0151
 #define CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE           0x0152
@@ -120,6 +130,14 @@ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
  * games use slot 0. */
 void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 
+/* Quit the game from the host (the window closed, Cmd+Q, a host menu):
+ * sends REQUEST_EXITGAME to every registered callback, then ends the process
+ * with status 0 if the title has not within PS3_QUIT_GRACE_MS (default
+ * 3000), never while a save is being written. Returns at once; a second call
+ * does nothing. ps3_host_quitting(): 1 once asked. */
+void ps3_host_quit(const char* why);
+int  ps3_host_quitting(void);
+
 /* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
  * the title's own memory through vm_write*. Spelt u32 so a caller cannot
  * translate the argument first and hand over a host address. */
@@ -151,6 +169,16 @@ s32 cellSysCacheClear(void);
 s32 cellDiscGameGetBootDiscInfo(void* getParam);
 s32 cellDiscGameRegisterDiscChangeCallback(void (*callback)(void*), void* arg);
 s32 cellDiscGameUnregisterDiscChangeCallback(void);
+
+/* ---------------------------------------------------------------------------
+ * cellSysconf (exported by cellSysutil): the system accessory settings
+ * screen (Bluetooth headset and the like)
+ * -----------------------------------------------------------------------*/
+
+/* `func` is the guest callback's OPD, void func(s32 result, void* userdata);
+ * `userdata` a guest pointer handed back to it. */
+s32 cellSysconfOpen(u32 type, u32 func, u32 userdata, u32 extparam, u32 id);
+s32 cellSysconfAbort(void);
 
 /* ---------------------------------------------------------------------------
  * Misc utilities

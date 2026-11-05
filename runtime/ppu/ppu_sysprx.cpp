@@ -21,10 +21,15 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+#ifndef _WIN32
+/* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
+extern "C" uint64_t host_monotonic_ns(void);
+#endif
 #include "ps3emu/log_first.h"
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+extern "C" void ps3_hle_register_fast(uint32_t nid, int (*fn)(ppu_context*));
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" uint64_t vm_read64(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
@@ -71,8 +76,9 @@ static void sys_time_get_system_time(ppu_context* ctx)
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
 #else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    /* The same host clock as the timebase (sys_timer.h), so guest code that
+     * mixes mftb and this stays consistent. */
+    ctx->gpr[3] = host_monotonic_ns() / 1000ull;
 #endif
 }
 
@@ -109,7 +115,9 @@ static void sys_process_is_stack(ppu_context* ctx)
  * unregistered context (bug); stamp a sentinel that matches no real thread. */
 #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
 
-static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
+struct LwmSlot;
+static struct LwmSlot* lwm_slot(uint32_t addr);   /* fwd (defined below) */
+static void lwm_release(struct LwmSlot* sl);
 static void sys_lwmutex_create(ppu_context* ctx)
 {
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
@@ -125,9 +133,9 @@ static void sys_lwmutex_create(ppu_context* ctx)
     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
     vm_write32(lwm + 0x14, 0);
     /* A recreate at a reused address must not inherit a locked slot (e.g. the
-     * previous holder exited while holding). Force the semaphore signaled;
-     * over-release of an already-free sem fails harmlessly at max count 1. */
-    { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
+     * previous holder exited while holding): release it. Releasing a free
+     * lock does nothing. */
+    { struct LwmSlot* sl = lwm_slot(lwm); if (sl) lwm_release(sl); }
     ctx->gpr[3] = 0;
 }
 /* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
@@ -149,7 +157,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * we stamp (only the holder ever writes owner=self, so the re-lock check is
  * race-free). Keyed by guest address in an open-addressed table. */
 #define LWM_HASH 65536u
-static struct LwmSlot { volatile long addr; HANDLE sem;
+static struct LwmSlot { volatile long addr; HANDLE sem; volatile long state;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
     volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
@@ -179,23 +187,24 @@ static struct LwmSlot* lwm_find(uint32_t addr){
         if(cur==0) return nullptr; }
     return nullptr;
 }
-static HANDLE lwm_sem(uint32_t addr)
+static struct LwmSlot* lwm_slot(uint32_t addr)
 {
     if (!addr) return nullptr;
     uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
     for (uint32_t i = 0; i < LWM_HASH; i++) {
         uint32_t idx = (h + i) & (LWM_HASH - 1);
         long cur = g_lwm[idx].addr;
-        if ((uint32_t)cur == addr) return g_lwm[idx].sem;
+        if ((uint32_t)cur == addr) return &g_lwm[idx];
         if (cur == 0) {
             while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
-            HANDLE r = nullptr;
+            struct LwmSlot* r = nullptr;
             if (g_lwm[idx].addr == 0) {
-                g_lwm[idx].sem = CreateSemaphoreA(NULL, 1, 1, NULL); /* free */
+                g_lwm[idx].sem = CreateSemaphoreA(NULL, 0, 1, NULL);   /* wake channel, empty */
+                g_lwm[idx].state = 0;                                   /* free */
                 g_lwm[idx].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
-                r = g_lwm[idx].sem;
+                r = &g_lwm[idx];
             } else if ((uint32_t)g_lwm[idx].addr == addr) {
-                r = g_lwm[idx].sem;
+                r = &g_lwm[idx];
             }
             _InterlockedExchange(&g_lwm_tab_lock, 0);
             if (r) return r;
@@ -204,10 +213,45 @@ static HANDLE lwm_sem(uint32_t addr)
     }
     return nullptr;   /* table full (raise LWM_HASH) */
 }
+/* The lock itself is the slot's state word: 0 free, 1 held, 2 held with a
+ * thread waiting (or that was). Taking a free lock and releasing one nobody
+ * waits for are one atomic operation each; the semaphore only wakes a waiter,
+ * which then tries again. Every lock and unlock used to go through the
+ * semaphore, two kernel calls a pair: God of War HD makes some 320,000 pairs
+ * in one frame when a fight's next wave spawns, and that frame took 360 ms.
+ * A waiter that gives up leaves the word at 2, so the next release posts a
+ * wake nobody takes; the next waiter consumes it and waits again. */
+static int lwm_try(struct LwmSlot* sl)
+{
+    return InterlockedCompareExchange(&sl->state, 1, 0) == 0;
+}
+/* 1 = taken, 0 = timed out. timeout_us 0 waits forever. */
+static int lwm_acquire(struct LwmSlot* sl, uint64_t timeout_us)
+{
+    if (lwm_try(sl)) return 1;
+    const long long deadline = timeout_us ? lwm_now_us() + (long long)timeout_us : 0;
+    while (InterlockedExchange(&sl->state, 2) != 0) {
+        DWORD ms = INFINITE;
+        if (timeout_us) {
+            const long long left = deadline - lwm_now_us();
+            if (left <= 0) return 0;
+            const unsigned long long m = ((unsigned long long)left + 999) / 1000;
+            ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m;
+        }
+        WaitForSingleObject(sl->sem, ms);
+    }
+    return 1;
+}
+static void lwm_release(struct LwmSlot* sl)
+{
+    if (InterlockedExchange(&sl->state, 0) == 2) ReleaseSemaphore(sl->sem, 1, NULL);
+}
 /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
  * logging during that window only (park hunts: gate on state, not counts). */
 volatile int g_nd_inpump = 0;
+/* syscalls/sys_ppu_thread.c: this thread is about to wait (PS3_PRIO_START). */
+extern "C" void ppu_thread_note_block(uint64_t tid);
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
@@ -218,8 +262,8 @@ static void sys_lwmutex_lock(ppu_context* ctx)
      * contended lock yields to other threads instead of hard-blocking). We had
      * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
     uint64_t timeout_us = ctx->gpr[4];
-    HANDLE s = lwm_sem(lwm);
-    if (s) {
+    struct LwmSlot* sl0 = lwm_slot(lwm);
+    if (sl0) {
         /* Recursive re-lock by the current holder: bump the count, no wait.
          * Only the holder ever stamps owner=self, so this check is race-free. */
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
@@ -227,7 +271,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             ctx->gpr[3] = 0;
             return;
         }
-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) {
+        if (!lwm_try(sl0)) {
             /* Contended: log who we're stuck behind (owner stamped at acquire),
              * then block. Bounded diagnostics for park hunts; uncapped while the
              * probe window is open (g_nd_inpump). */
@@ -239,11 +283,9 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 long h = sl ? sl->holder : 0; long long held = (sl && h) ? (lwm_now_us() - sl->acq_us) : 0;
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
+            ppu_thread_note_block(ctx->thread_id);
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
-            DWORD ms = INFINITE;
-            if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
-            DWORD wr = WaitForSingleObject(s, ms);
-            if (wr == WAIT_TIMEOUT) {           /* honor the timeout: ETIMEDOUT, no acquire */
+            if (!lwm_acquire(sl0, timeout_us)) {   /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
                     (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
                 ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
@@ -259,18 +301,44 @@ static void sys_lwmutex_lock(ppu_context* ctx)
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;   // CELL_OK
 }
+/* Fast forms for ps3_hle_call (see ps3_hle_register_fast): a lock that is
+ * free or already ours, and any unlock. A lock that has to wait, and every
+ * call while PS3_LWMUTEX_TRACE is on, take the full handler. */
+static int sys_lwmutex_lock_fast(ppu_context* ctx)
+{
+    const uint32_t lwm = (uint32_t)ctx->gpr[3];
+    struct LwmSlot* sl = lwm_slot(lwm);
+    if (!sl || lwm_trace()) return 0;
+    const uint32_t self = LWM_SELF(ctx);
+    if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0)
+        vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+    else if (lwm_try(sl)) {
+        vm_write32(lwm + LWM_OWNER, self);
+        vm_write32(lwm + LWM_RECUR, 1);
+    } else
+        return 0;
+    ctx->gpr[3] = 0;
+    return 1;
+}
+static void sys_lwmutex_unlock(ppu_context* ctx);
+static int sys_lwmutex_unlock_fast(ppu_context* ctx)
+{
+    if (lwm_trace()) return 0;
+    sys_lwmutex_unlock(ctx);
+    return 1;
+}
 static void sys_lwmutex_trylock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t self = LWM_SELF(ctx);
-    HANDLE s = lwm_sem(lwm);
-    if (s) {
+    struct LwmSlot* sl0 = lwm_slot(lwm);
+    if (sl0) {
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
             vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
             ctx->gpr[3] = 0;
             return;
         }
-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
     vm_write32(lwm + LWM_OWNER, self);
@@ -315,11 +383,10 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
                 fprintf(stderr, "%s\n", b); fflush(stderr);
             }
             sl->holder = 0; } }
-    HANDLE s = lwm_sem(lwm);
-    /* Semaphore release works from ANY thread (unlike a CS) -- guest code
-     * hands lwmutex ownership across threads. Over-release (unlock of a free
-     * mutex) fails harmlessly at the max count of 1. */
-    if (s) ReleaseSemaphore(s, 1, NULL);
+    /* Any thread may release (unlike a CS) -- guest code hands lwmutex
+     * ownership across threads. Unlocking a free mutex does nothing. */
+    struct LwmSlot* sl0 = lwm_slot(lwm);
+    if (sl0) lwm_release(sl0);
     ctx->gpr[3] = 0;
 }
 
@@ -353,15 +420,16 @@ static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = vm_read32(lwcond + 0x00);
-    HANDLE s = lwm_sem(lwmutex);
-    if (s) {
+    struct LwmSlot* sl = lwm_slot(lwmutex);
+    if (sl) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
-        ReleaseSemaphore(s, 1, NULL);
+        ppu_thread_note_block(ctx->thread_id);
+        lwm_release(sl);
         Sleep(1);
-        WaitForSingleObject(s, INFINITE);
+        lwm_acquire(sl, 0);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
@@ -897,6 +965,8 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_lock"),    "sys_lwmutex_lock",    sys_lwmutex_lock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_unlock"),  "sys_lwmutex_unlock",  sys_lwmutex_unlock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_trylock"), "sys_lwmutex_trylock", sys_lwmutex_trylock);
+    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_lock"),   sys_lwmutex_lock_fast);
+    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_unlock"), sys_lwmutex_unlock_fast);
 
     /* Spinlocks. One guest word each, no kernel object; see the block above. */
     ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_initialize"), "sys_spinlock_initialize", sys_spinlock_initialize);

@@ -27,13 +27,13 @@ jobs:
         build_type: [Debug, Release]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Puts cl, the Windows SDK and the MSVC headers on PATH. clang-cl needs
       # the MSVC headers even though it is doing the compiling, and the
       # conformance suite shells out to cl to build its generated driver.
       - name: Set up MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
 
@@ -62,7 +62,7 @@ jobs:
           ls -la build/ps3recomp_runtime.lib
           test -s build/ps3recomp_runtime.lib
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 

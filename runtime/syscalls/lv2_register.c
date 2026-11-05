@@ -48,6 +48,7 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
@@ -715,6 +716,8 @@ static void* spu_exec_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+    { const spu_group_t* g = spu_find_group(t->group_id);
+      ps3_thread_name("spu %s:%u", g && g->name[0] ? g->name : "group", t->index); }
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
@@ -754,6 +757,8 @@ static void* spu_fallback_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+    { const spu_group_t* g = spu_find_group(t->group_id);
+      ps3_thread_name("spu-hle %s:%u", g && g->name[0] ? g->name : "group", t->index); }
     int32_t rc = 0;
     if (t->fb_handler) {
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
@@ -2479,6 +2484,12 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 
     /* Process control */
     lv2_syscall_register(tbl, SYS_PROCESS_GETPID, sys_process_getpid_handler);
+    lv2_syscall_register(tbl, SYS_PROCESS_EXIT3,  sys_process_exit_handler);
+    /* SYS_PROCESS_EXIT (22 on real lv2 / RPCS3) was never registered: a guest
+     * issuing it fell through to the catch-all stub, which told the guest its
+     * exit succeeded -- and the guest carried on executing. Registered as the
+     * same handler as SYS_PROCESS_EXIT3 (3, the number bare-metal/newlib
+     * images issue; both spell the same call). */
     lv2_syscall_register(tbl, SYS_PROCESS_EXIT,   sys_process_exit_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_GET_SDK_VERSION, sys_process_get_sdk_version_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS,

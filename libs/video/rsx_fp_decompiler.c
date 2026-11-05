@@ -165,7 +165,7 @@ int rsx_fp_collect_constants(
 {
     if (!ucode || !out)
         return -1;
-    memset(out, 0, sizeof(*out));
+    out->count = 0;
 
     u32 off = 0;
     while (off + 16 <= max_bytes) {
@@ -340,7 +340,7 @@ static const char* input_expr(u32 input_src)
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0: return "_rsx_wpos(input.position)"; /* WPOS (window origin applied below) */
     /* RSX clamps fragment color-input reads before swizzle/abs/negate.
      * Texture coordinates and the vertex output registers remain unbounded. */
     case 0x1: return "saturate(input.col0)"; /* COL0 */
@@ -483,9 +483,11 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
 {
     char tex[32], text[4096];
     snprintf(tex, sizeof tex, cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", unit);
-    const char* cmp[] = { "0.0", "reference < depth", "reference == depth",
-        "reference <= depth", "reference > depth", "reference != depth",
-        "reference >= depth", "1.0" };
+    /* The RSX compares the stored depth with the reference (depth FUNC reference), the reverse of
+     * the ARB_shadow order (reference FUNC depth). See docs/SHADOW_COMPARISON.md. */
+    const char* cmp[] = { "0.0", "depth < reference", "depth == reference",
+        "depth <= reference", "depth > reference", "depth != reference",
+        "depth >= reference", "1.0" };
     snprintf(text, sizeof text,
         "float _rsx_shadow_cmp%u(float reference, float depth) { return (float)(%s); }\n"
         "float4 _rsx_shadow%u(float3 coordinate) {\n"
@@ -1274,6 +1276,18 @@ static int rsx_fp_decompile_internal(
             "#else\n"
             "#define _rsx_inv_w(p) (1.0 / (p).w)\n"
             "#endif\n");
+    /* WPOS in the RSX window convention. The host position has its origin at the
+     * top left; with SET_SHADER_WINDOW origin BOTTOM the RSX counts y up from the
+     * bottom edge. A full-screen pass that builds its UV from it, e.g.
+     * uv = wpos * (1/W, -1/H) + (0, 1), mirrored its source when it read the host y.
+     * The draw engine passes the window height in fp_alpha.y when the origin is
+     * BOTTOM (0 otherwise) and a pixel-center bias in fp_alpha.z (-0.5 for INTEGER
+     * centers, 0 for HALF). A backend that leaves both 0 gets the host position. */
+    if (strstr(o.p, "_rsx_wpos("))
+        out_puts(&p, buffered
+            ? "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
+              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)\n"
+            : "#define _rsx_wpos(p) (p)\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
@@ -1655,10 +1669,12 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
  * works this way, and leaves every non-UNNORM program byte-identical.
  *
  * Cube units are skipped: their coordinate is a float3 direction, and
- * RSX_TEX_FMT_UNNORM has no meaning for one.
+ * RSX_TEX_FMT_UNNORM has no meaning for one. A volume unit (Texture3D) is
+ * sampled with three coordinates, all in texels, so it is divided by its depth
+ * too (RPCS3's texture cache scales a 3D texture's r by 1/depth the same way).
  */
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
-                              const u32 dim[][2], u32 cube_mask)
+                              const u32 dim[][3], u32 cube_mask, u32 volume_mask)
 {
     if (!hlsl || !unnorm_mask) return 0;
     int patched = 0;
@@ -1666,8 +1682,9 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
     for (u32 u = 0; u < 16; u++) {
         if (!((unnorm_mask >> u) & 1u)) continue;
         if ((cube_mask >> u) & 1u) continue;
-        const u32 w = dim[u][0], h = dim[u][1];
-        if (!w || !h) continue;
+        const u32 w = dim[u][0], h = dim[u][1], d = dim[u][2];
+        const int volume = (volume_mask >> u) & 1u;
+        if (!w || !h || (volume && !d)) continue;
 
         /* Both spellings the emitter produces for a 2D unit. */
         char needles[2][40];
@@ -1693,8 +1710,12 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                 if (*p != ')') break;
 
                 char scale[80];
-                snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
-                         1.0 / (double)w, 1.0 / (double)h);
+                if (volume)
+                    snprintf(scale, sizeof scale, " * float3(%.9g, %.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h, 1.0 / (double)d);
+                else
+                    snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
+                             1.0 / (double)w, 1.0 / (double)h);
                 const u32 slen = (u32)strlen(scale);
                 const u32 used = (u32)strlen(hlsl);
                 if (used + slen + 1 > hlsl_size) return -1;
@@ -1714,6 +1735,52 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
             memcpy(q, "rsx_tex", 7);
     }
     return patched;
+}
+
+/*
+ * WPOS on an antialiased surface (see the header).
+ *
+ * A backend that keeps a DIAGONAL_CENTERED_2 or SQUARE_*_4 target at its sample
+ * resolution maps the viewport over the sample grid, so a pixel program runs
+ * once per sample and SV_POSITION.x of a 960-pixel 2x1 target runs to 1920. A
+ * program that addresses a screen-sized texture by WPOS then reads it at twice
+ * the position: Resistance 3's material pass fetches its light and SSAO
+ * buffers that way and drew its lighting shifted on the left half of the frame
+ * and clamped to one edge column, full-width streaks, on the right half.
+ *
+ * Every sample of a pixel gets that pixel's centre, floor(pos / grid) + 0.5,
+ * the half-pixel centre SV_POSITION already gives on a 1x1 grid. The line goes
+ * first in main, before any read; z and w (the _rsx_inv_w source) are kept.
+ * WPOS reaches the body only as the emitter's "_rsx_wpos(input.position)"
+ * source (#589's window convention wraps it; _rsx_inv_w also reads
+ * input.position, so match the wrapper), so a program without it stays
+ * byte-identical. The grid applies first, then _rsx_wpos flips y in pixels.
+ */
+int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy)
+{
+    static const char wpos_read[] = "_rsx_wpos(input.position)";
+    static const char* const entries[] = { "main(PSInput input) : SV_TARGET {\n",
+                                           "main(PSInput input) {\n" };
+    if (!hlsl || !capacity || !sx || !sy) return -1;
+    if (sx == 1 && sy == 1) return 0;
+    size_t len = 0;
+    while (len < capacity && hlsl[len]) ++len;
+    if (len == capacity) return -1;
+    if (!strstr(hlsl, wpos_read)) return 0;
+    if (strstr(hlsl, "input.position.xy = floor(")) return -1;
+    char* body = NULL;
+    for (size_t i = 0; i < sizeof entries / sizeof entries[0] && !body; ++i) {
+        char* at = strstr(hlsl, entries[i]);
+        if (at) body = at + strlen(entries[i]);
+    }
+    if (!body) return -1;
+    char line[128];
+    const int n = snprintf(line, sizeof line,
+        "    input.position.xy = floor(input.position.xy / float2(%u, %u)) + 0.5;\n", sx, sy);
+    if (n < 0 || (size_t)n >= sizeof line || len + (size_t)n + 1 > capacity) return -1;
+    memmove(body + n, body, len - (size_t)(body - hlsl) + 1);
+    memcpy(body, line, (size_t)n);
+    return 1;
 }
 
 /* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and

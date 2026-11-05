@@ -57,6 +57,12 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
  * to the ucode pointer handed in. Defaults to 0. */
 void rsx_vp_set_branch_base(u32 start_slot);
 
+/* SET_TRANSFORM_BRANCH_BITS for the next program decompiled. BRB and CLB
+ * branch on one of these bits; the decompiler bakes the outcome in, so a
+ * program that rsx_vp_uses_branch_bits() must be keyed on them too. */
+void rsx_vp_set_branch_bits(u32 bits);
+int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes);
+
 /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).
  * Unmasked units retain the defined-zero fallback. */
@@ -70,6 +76,17 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
 int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
+
+/* User clip planes. RSX vertex programs write the six clip distances into
+ * o5.yzw and o6.yzw (o5.x is fog, o6.x the point size); which planes count,
+ * and which side of each is kept, is NV4097_SET_USER_CLIP_PLANE_CONTROL
+ * (0x1478) state, not program state. `ops` holds two bits per plane, plane N
+ * at bits 2N..2N+1: 0 disabled, 1 ENABLE_LT (keeps d <= 0), 2 ENABLE_GE
+ * (keeps d >= 0) -- RPCS3's factors -1/+1. Adds SV_ClipDistance outputs for
+ * them to HLSL from rsx_vp_decompile*; a disabled plane in the same vector
+ * gets 0.5 and never clips. Returns 0 (nothing to do when ops is 0), or -1
+ * when the text is not in the decompiler's form or does not fit in cap. */
+int rsx_vp_apply_user_clip(char* hlsl, size_t cap, u32 ops);
 
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);

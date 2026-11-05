@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "ps3recomp"
+type: software
+authors:
+  - alias: sp00nznet
+repository-code: "https://github.com/sp00nznet/ps3recomp"
+url: "https://github.com/sp00nznet/ps3recomp"
+license: MIT
+version: "0.18.0"
+date-released: "2026-10-26"
+abstract: >-
+  Static recompilation runtime libraries for PlayStation 3 titles: turns PS3
+  binaries into native executables, with no emulator required.
+keywords:
+  - static recompilation
+  - PS3
+  - PlayStation 3
+  - game preservation

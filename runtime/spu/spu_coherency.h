@@ -51,6 +51,12 @@ void spu_lockline_unlock(void);
  * mark costs one locked PPU store to a line the kernel owns anyway. */
 void spu_coh_reserve(spu_context* ctx, uint32_t ea);
 
+/* GETLLAR fast path: publish ctx's reservation of ea WITHOUT the lock-line
+ * lock, when ctx is already a registered holder and ea's line already marked.
+ * Returns 0 when the caller must take the lock and call spu_coh_reserve
+ * instead. On 1 the caller copies the line, also without the lock. */
+int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea);
+
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
@@ -69,6 +75,20 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
 /* As above, but leaves `self`'s own reservation alone: an SPU's own MFC
  * write does not cost it its reservation on hardware. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self);
+
+/* Scoped host waiters for real writes to a guest 128-byte line. Add, remove,
+ * and callbacks all run under the lock-line lock. A watch remains caller-owned
+ * until remove returns; callbacks must not re-enter coherence or alter watches.
+ * They may wake a host waiter, but must not manufacture guest state. */
+typedef struct spu_coh_watch {
+    uint32_t line;
+    void (*wake)(void* opaque);
+    void* opaque;
+    struct spu_coh_watch* next;
+} spu_coh_watch;
+void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
+                       void (*wake)(void*), void* opaque);
+void spu_coh_watch_remove(spu_coh_watch* watch);
 
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */

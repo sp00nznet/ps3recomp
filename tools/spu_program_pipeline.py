@@ -93,9 +93,18 @@ def build_programs(args, registry_writer):
         tool_names = ['spu_program_pipeline.py', 'build_spu_workloads.py', 'spu_elf.py',
                       'find_spu_functions.py', 'spu_disasm.py']
         tool_paths = [Path(__file__).with_name(n) for n in tool_names] + [Path(args.lifter).resolve()]
+        handled = json.loads(Path(args.handled).read_text()) if getattr(args, 'handled', None) else {}
+        pinned_ids = json.loads(Path(args.image_ids).read_text()) if getattr(args, 'image_ids', None) else None
+        if not all(isinstance(v, str) and v for v in handled.values()):
+            raise ValueError('--handled maps sha256 to a non-empty reason')
+        if pinned_ids is not None:
+            values = list(pinned_ids.values())
+            if not all(type(v) is int and 0 < v < 0x80000000 for v in values) or len(set(values)) != len(values):
+                raise ValueError('--image-ids maps sha256 to distinct positive image ids')
         report['provenance'] = dict(tools={str(p): sha256(p.read_bytes()) for p in tool_paths},
                                     python=sys.version, options=dict(register_fn=args.register_fn, constructor=args.constructor,
-                                                 extra_funcs=args.extra_funcs, allow_partial=args.allow_partial))
+                                                 extra_funcs=args.extra_funcs, allow_partial=args.allow_partial,
+                                                 handled=handled, image_ids=pinned_ids))
         unique = {}
         blobs = {}
         layouts = {}
@@ -120,6 +129,8 @@ def build_programs(args, registry_writer):
                     continue
                 name = 'spu_' + digest
                 image_id = 0x10000000 | int(digest[:7], 16)  # positive signed-int range, away from legacy IDs
+                if pinned_ids is not None and digest in pinned_ids:
+                    image_id = pinned_ids[digest]
                 p = dict(name=name, sha256=digest, size=len(blob), entry=info['entry'], image_id=image_id,
                          fingerprint=f'{fnv1a64(blob):016X}', status='discovered', occurrences=[occurrence])
                 unique[digest], blobs[digest], layouts[digest] = p, blob, info
@@ -141,6 +152,16 @@ def build_programs(args, registry_writer):
             if len(group) > 1:
                 for program in group:
                     program.update(status='unsupported', reason='ambiguous runtime fingerprint or image-id collision')
+        for digest, program in unique.items():
+            if digest in handled and program['status'] == 'discovered':
+                program.update(status='handled', reason=handled[digest])
+                program.pop('image_id', None)
+            elif pinned_ids is not None and program['status'] == 'discovered' and digest not in pinned_ids:
+                program.update(status='unsupported', reason='no pinned image id (--image-ids)')
+        stale = (set(handled) | set(pinned_ids or {})) - set(unique)
+        if stale:
+            report['errors'].append('--handled/--image-ids name programs that were not discovered: ' +
+                                    ', '.join(sorted(stale)))
         extra = {}
         for spec in args.extra_funcs:
             name, sep, value = spec.partition('=')
@@ -151,7 +172,7 @@ def build_programs(args, registry_writer):
         from find_spu_functions import detect_functions
         from build_spu_workloads import debase_includes
         for digest, program in sorted(unique.items()):
-            if program['status'] == 'unsupported':
+            if program['status'] in ('unsupported', 'handled'):
                 continue
             name, prefix = program['name'], program['name'] + '_'
             outdir = stage / name
@@ -174,6 +195,8 @@ def build_programs(args, registry_writer):
                            '--report', str(outdir / 'lift.json'), '--output', str(outdir)]
                 if extra.get(name):
                     command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
+                if getattr(args, 'merge_chunks', False):
+                    command += ['--merge-chunks']
                 result = subprocess.run(command, capture_output=True, text=True)
                 (outdir / 'lift.log').write_text(result.stdout + result.stderr)
                 if result.returncode:
@@ -211,7 +234,8 @@ def build_programs(args, registry_writer):
         if sum(len(p.get('diagnostics', {}).get('functions', [])) for p in report['programs']
                if p['status'] == 'registered') > 262144:
             report['errors'].append('generated functions exceed default runtime registry capacity (262144)')
-        report['complete'] = not report['errors'] and all(p['status'] == 'registered' for p in report['programs'])
+        report['complete'] = not report['errors'] and all(p['status'] in ('registered', 'handled')
+                                                          for p in report['programs'])
         usable = not report['errors'] and (report['complete'] or args.allow_partial)
         if usable:
             registry_args = type('RegistryArgs', (), dict(out=str(stage / registry.name), title='discovered SPU programs',

@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "sys_ppu_thread.h"         /* ppu_thread_note_block */
 #include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -299,6 +300,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     if (ps3_log_verbose())
         fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
                 queue_id, (unsigned long long)timeout_us,
@@ -1160,6 +1162,7 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
  * -----------------------------------------------------------------------*/
 int64_t sys_event_flag_wait(ppu_context* ctx)
 {
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);

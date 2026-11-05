@@ -1,5 +1,108 @@
 # Changelog
 
+### v0.15.0 — *"Seventy-Six"* (October 2026)
+
+*76 pull requests from six contributors, merged in #325. They come from five
+ports in progress: Killzone 2 and 3, inFAMOUS and inFAMOUS 2, and Twisted
+Metal, plus tekulvw's correctness sweep of the runtime and Metal. Every
+change ships with a test or a measurement.*
+
+**SPU and SPURS**
+- **Hardware-exact SPU float** (*[@NoahBPeterson](https://github.com/NoahBPeterson)*, #287).
+  Single precision now follows the ISA: extended range, truncation, denormal
+  flush and saturation. `frest` uses the hardware table. Results are checked
+  against an exact-arithmetic referee, and NEON paths run 1.6-4x faster with
+  bit-identical output. This replaces the previous GPL-derived float code.
+- **SPURS policy scheduling** (*[@tekulvw](https://github.com/tekulvw)*, #291).
+  Each instance gets a coordinator and `nSpus` persistent workers, with
+  admission capped by each workload's contention, so a waiting consumer no
+  longer starves its producer. Every live SPU context also keeps private DMA
+  and reservation state (#290).
+- Interpreter fallback resumes lifted code (#266), and machine status reports
+  the interrupt-enable bit (#289). MFC `SDCRZ` is implemented (#295), FNMS
+  keeps its addend for zero times an extended operand (#318), and parked-list
+  diagnostics are bounded (#298). SPURS task exit-code containers (#283),
+  taskset storage size (#284) and TaskInfo requeue masking (#306)
+  (*@tekulvw*).
+- `build_spu_workloads.py --input` discovers, validates and registers SPU ELFs
+  from supplied files, and the project template runs it (*@tekulvw*, #288).
+- `SPU_RdDec` no longer wraps 231 s after its base stamp
+  (*[@erikomis](https://github.com/erikomis)*, #313).
+- From *[@undecuple](https://github.com/undecuple)*: the SMC micro-interpreter
+  addresses `lqa`/`stqa` at I16 << 2 (#268). The MFC engine table grows past
+  eight contexts (#272, later replaced by #290's unbounded registry). The
+  policy module's u64 argument is passed in the preferred doubleword (#309),
+  and `_cellSpursAttributeInitialize` gets its SDK argument order (#310).
+
+**PPU lifter and loader**
+- **Exact VMX** (*@NoahBPeterson*, #286). About 45 VMX ops that lifted as
+  no-ops are now implemented, along with VSCR saturation and CR6 compares.
+  BO/BI branches are decoded (`bdnzt` and `bdzf` were always taken), CTR is
+  64-bit, and get-PC idioms are recognised.
+- From *@undecuple*:
+  - big-endian lane order for ten VMX integer ops (#269);
+  - `lwax` jump tables (#285);
+  - `sc` at the end of a function falls through (#297);
+  - a carry-form definition is no longer mistaken for a callee-save restore
+    (#320);
+  - `--chunks N` cuts lifted source by guest address and rewrites only the
+    files that changed (#254).
+- Loader, from *@undecuple*: TLS blocks sized by the TLS image (#253), a
+  per-coroutine indirect-call depth guard (#270), and thread-locals that stay
+  thread-local under MinGW (#271).
+- Jump tables behind a tail-call epilogue are found (*@erikomis*, #311).
+- Boot, from *@tekulvw*: PPU entry argv/envp live in stack-owned storage
+  (#263), and HLE registrations regenerate when library sources change (#262).
+
+**RSX, draw engine, Metal and Vulkan**
+- **Depth:** from *@undecuple*, fragment depth export (#279), depth buffers
+  sampled as textures return real depth (#280), and Z16 clear values are
+  decoded (#282). From *@tekulvw*, 2D depth-compare textures (#302), depth24
+  endpoints preserved (#299), depth export in the shader cache keys (#301),
+  and Metal depth attachments read back to guest memory (#300). From
+  *[@Kurtisone](https://github.com/Kurtisone)*, the depth bounds test (#319).
+- **Colour:** from *@tekulvw*, sRGB framebuffer output (#304), per-channel
+  texture input gamma (#305), fragment colour inputs clamped before source
+  modifiers (#303), and register-fed DATA3F/DATA4F immediate vertices (#292).
+- **Fragment decompiler:** predicated writes are a select, not a lerp
+  (*@undecuple*, #278). The NV40 pack/unpack opcodes are implemented
+  (*@erikomis*, #314).
+- Antialiased surfaces render at sample resolution (#281), and the sampler
+  cache key covers every field it decodes (#321) (*@undecuple*).
+- **Metal:**
+  - from *@tekulvw*: owned colour targets snapshotted in GPU order (#307),
+    clears replayed over complete surfaces (#293), real window-close
+    reporting (#308), and opt-in `PS3RECOMP_METAL_FPS` frame timing (#294);
+  - from *@erikomis*: a command buffer that fails is reported (#316).
+
+**cellGcm**
+- From *@undecuple*: IO mapping table 16 -> 512 with no leak on refusal
+  (#255), `GET_REPORT` honours its DMA context (#256), FIFO user commands
+  reach `cellGcmSetUserHandler` (#273), and the in-FIFO flip wraps only the
+  runtime's own ring (#275).
+- Strict-order IO mapping (*@tekulvw*, #248). A parked FIFO gets time to be
+  patched before the walker follows `put` (*@erikomis*, #312).
+
+**System libraries**
+- **cellFs:** directory entries (*@tekulvw*, #247), configured disc roots
+  (*@tekulvw*, #249), `GetFreeSize`/`Chmod`/`Utime`/`SdataOpenByFd` (#257),
+  and 64-bit sizes on Windows (#258).
+- **cellSaveData:** PARAM.SFO is written and read as a real binary PSF, and
+  old text saves still load (#322). UserAutoSave keeps its ninth argument
+  (#276).
+- **Network:**
+  - from *@undecuple*: cellHttp's URI path (#260) and response getters (#261);
+    sceNpBasic usable after `sceNpInit` (#259); sceNpCommerce2 `CreateCtx`
+    (#323); the EDAT klicensee from `sceNpDrmIsAvailable` (#274);
+  - from *@tekulvw*: no SIGPIPE on host sends (#250) and `inet_pton` (#265).
+- **Other:**
+  - from *@undecuple*: `sys_lwcond_t` layout (#277) and
+    `cellFontInitializeWithRevision` (#324);
+  - from *@erikomis*: `cellGemGetMemorySize` and the event-queue notify forms
+    (#315);
+  - from *@tekulvw*: the timezone syscall (#264), extended sysmodule tracking
+    (#267), message-dialog abort (#251) and Sail boot parameters (#252).
+
 ### v0.14.0 — *"Outside In"* (October 2026)
 
 *This release is mostly community work: 28 pull requests from five

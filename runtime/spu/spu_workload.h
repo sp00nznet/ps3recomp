@@ -58,6 +58,28 @@ spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 /* As spu_workload_find, but also returns the image's indirect-branch table id. */
 spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_out);
 
+/* Register an image whose loaded bytes include an area the loading code fills
+ * in on every load: a parameter block of pointers and per-level values that
+ * the PPU writes into the program before it DMAs it into a raw SPU. Its bytes
+ * differ from load to load, so a plain fingerprint of the loaded run never
+ * repeats. `fingerprint` is FNV-1a-64 over the `size` bytes with
+ * [var_off, var_off + var_len) taken as zero -- for an image cut out of an ELF
+ * whose parameter block is zero there, simply the fingerprint of those bytes.
+ * spu_workload_find_img_masked() matches it against a run of exactly `size`
+ * bytes, whatever the area holds. */
+void spu_workload_register_img_masked(uint64_t fingerprint, spu_lifted_entry_fn fn,
+                                      int image_id, const char* name,
+                                      uint32_t size, uint32_t var_off,
+                                      uint32_t var_len);
+
+/* Look `data` (n bytes) up among the masked registrations of that size: the
+ * entry whose fingerprint matches `data` with its variable area zeroed. Writes
+ * that fingerprint to *fp_out and the image id to *image_id_out on a match;
+ * NULL when none matches. */
+spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
+                                                 uint64_t* fp_out,
+                                                 int* image_id_out);
+
 /* Run a SPURS policy module (raw PM binary loaded at LS 0xA00) under the HLE'd
  * kernel handoff: kernel context at LS 0x100, entry ABI of
  * cellSpursModuleEntry(context, ea) with the workload's u64 data in r4.

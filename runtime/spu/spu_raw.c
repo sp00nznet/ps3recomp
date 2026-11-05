@@ -48,6 +48,7 @@ extern int g_spu_force_ch_block;              /* spu_channels.c */
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 /* For attributing an MMIO store to the guest code that made it. */
 #include "../ppu/ppu_context.h"
+#include "ps3emu/thread_name.h"
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern void ps3_hle_register_ctx(uint32_t nid, const char* name,
                                  void (*fn)(ppu_context*));
@@ -229,16 +230,48 @@ void spu_raw_note_image(uint32_t src_ea, uint32_t entry)
 /* ---------------------------------------------------------------------------
  * The SPU host thread
  * -----------------------------------------------------------------------*/
+/* The thread body is the same on both hosts; only the thread API differs.
+ * Raw SPUs used to start on Windows only (the whole thread was under _WIN32),
+ * so on macOS and Linux a raw SPU loaded, was told to run, and never did:
+ * Resistance's game.self stalls behind the two it starts after its intro. */
 #ifdef _WIN32
-static DWORD WINAPI raw_spu_thread(LPVOID arg)
+#define RAW_XCHG(p, v)    InterlockedExchange((p), (v))
+#define RAW_CAS(p, v, c)  InterlockedCompareExchange((p), (v), (c))
+#else
+#include <pthread.h>
+#define RAW_XCHG(p, v)    __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+static inline long raw_cas(volatile long* p, long v, long c)
 {
-    raw_spu* s = (raw_spu*)arg;
+    long e = c;
+    __atomic_compare_exchange_n(p, &e, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return e;
+}
+#define RAW_CAS(p, v, c)  raw_cas((p), (v), (c))
+#endif
+
+static void raw_spu_run(raw_spu* s)
+{
+    ps3_thread_name("raw spu");
     spu_context* c = s->ctx;
 
     c->status = SPU_STATUS_RUNNING;
     publish(s);
 
     int halted = spu_run_with_halt(s->entry, c);
+
+    /* Stopped from outside (SPU_RunCntl = 0, see raw_spu_stop): no stop
+     * code, no stop-and-signal interrupt -- just a stopped SPU. */
+    if (c->stop_request) {
+        c->status = SPU_STATUS_STOPPED;
+        publish(s);
+        fprintf(stderr, "[spu-raw] spu%u stopped by RunCntl at pc=0x%05X\n",
+                (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK));
+        fflush(stderr);
+        spu_coh_unregister(c);
+        spu_mfc_release(c);
+        RAW_XCHG(&s->started, 0);
+        return;
+    }
 
     /* A raw SPU that returns has executed `stop`. Report it the way hardware
      * does -- run bit clear, stop bit set, stop code in the high half -- so the
@@ -253,7 +286,7 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
     s->int_stat |= 0x2u;
     if (s->int_stat & s->int_mask) ps3_intr_raise(s->intrtag);
     publish(s);
-    InterlockedExchange(&s->started, 0);
+    RAW_XCHG(&s->started, 0);
 
     fprintf(stderr, "[spu-raw] spu%u stopped: halted=%d pc=0x%05X lr=0x%05X "
                     "steps=%llu stop_code=0x%X outmbox(n=%u v=0x%08X) "
@@ -265,35 +298,115 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
             (unsigned)c->ch_out_intr_mbox.count, c->ch_out_intr_mbox.value,
             (unsigned)c->ch_in_mbox.count);
     fflush(stderr);
-    return 0;
 }
+
+/* SPU_RunCntl = 0 on a running SPU. Hardware stops the core and the run bit
+ * clears, so the store returns once the SPU is stopped. Here the host thread
+ * must actually leave: the PPU's next steps are to stream a new program into
+ * local store and write RunCntl = 1, and a thread still parked in a channel
+ * wait would otherwise sleep through that, ignore the start ("already up")
+ * and later resume its OLD register state over the freshly loaded image.
+ * Resistance: Fall of Man does exactly this to raw SPU 1 on every checkpoint
+ * reload. */
+static void raw_spu_stop(raw_spu* s)
+{
+    spu_context* c = s->ctx;
+    if (!c) return;
+    if (!s->started) { c->status = SPU_STATUS_STOPPED; return; }
+    c->stop_request = 1;
+    spu_ch_wake(c);
+    for (int i = 0; i < 20000 && s->started; i++) {   /* up to ~4 s */
+        spu_ch_wake(c);
+#ifdef _WIN32
+        Sleep(1);
+#else
+        { struct timespec ts = {0, 200 * 1000}; nanosleep(&ts, 0); }
+#endif
+    }
+    if (s->started)
+        fprintf(stderr, "[spu-raw] spu%u did not stop on RunCntl = 0 (pc=0x%05X): "
+                        "it is not reaching a channel operation\n",
+                (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK));
+    else
+        c->status = SPU_STATUS_STOPPED;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI raw_spu_thread(LPVOID arg) { raw_spu_run((raw_spu*)arg); return 0; }
+#else
+static void* raw_spu_thread(void* arg) { raw_spu_run((raw_spu*)arg); return NULL; }
 #endif
 
 static void raw_spu_start(raw_spu* s)
 {
     uint32_t n = (uint32_t)(s - s_spu);
+    /* An imported image belongs to the one start that follows the import.
+     * These used to stay set, so every later raw SPU skipped its own lookup
+     * and ran the first one's program: Resistance's second raw SPU started
+     * image 2 instead of its own and stopped after four instructions. */
+    spu_lifted_entry_fn entry = s_pending_entry;
+    int image_id = s_pending_image_id;
+    uint32_t elf_entry = s_pending_elf_entry;
+    s_pending_entry = NULL;
+    const int loaded = s->get_runs > 0;   /* a program was streamed in */
     /* No image was imported: the PPU streamed the program in by proxy DMA.
      * Ports register each image's executable segment too (build_spu_workloads
      * .text fingerprint), so one of the GET runs matches it. */
-    for (int r = 0; !s_pending_entry && r < s->get_runs; r++) {
-        uint64_t fp = spu_workload_fingerprint(vm_base + s->base + s->get_lo[r],
-                                               s->get_hi[r] - s->get_lo[r]);
-        s_pending_entry = spu_workload_find_img(fp, &s_pending_image_id);
-        fprintf(stderr, "[spu-raw] spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX -> %s\n",
+    for (int r = 0; !entry && r < s->get_runs; r++) {
+        const uint8_t* run = vm_base + s->base + s->get_lo[r];
+        const uint32_t run_len = s->get_hi[r] - s->get_lo[r];
+        uint64_t fp = spu_workload_fingerprint(run, run_len);
+        uint64_t masked_fp = 0;
+        entry = spu_workload_find_img(fp, &image_id);
+        /* A program that carries a parameter block the PPU fills in before
+         * every load (pointers, per-level values) never fingerprints the same
+         * twice; it is registered with that area masked out. */
+        if (!entry)
+            entry = spu_workload_find_img_masked(run, run_len, &masked_fp, &image_id);
+        char how[64] = "";
+        if (entry && masked_fp)
+            snprintf(how, sizeof how, " (fp=0x%016llX with its parameter area zeroed)",
+                     (unsigned long long)masked_fp);
+        fprintf(stderr, "[spu-raw] spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX npc=0x%05X -> %s%s\n",
                 n, s->get_lo[r], s->get_hi[r], (unsigned long long)fp,
-                s_pending_entry ? "lifted entry registered" : "no match");
+                be32_load(s->base + SPU_RAW_NPC) & ~3u,
+                entry ? "lifted entry registered" : "no match", how);
+        /* SPU_RAW_DUMP_DIR=<dir>: write an unmatched run out as
+         * rawspu_<fp>_<lo>.bin -- the bytes exactly as they sit in local store
+         * at <lo>, which is the base to lift them at. */
+        { const char* dir = getenv("SPU_RAW_DUMP_DIR");
+          if (dir && *dir && !entry) {
+              char path[512];
+              snprintf(path, sizeof path, "%s/rawspu_%016llX_%05X.bin", dir,
+                       (unsigned long long)fp, s->get_lo[r]);
+              FILE* f = fopen(path, "wb");
+              if (f) {
+                  fwrite(vm_base + s->base + s->get_lo[r], 1, s->get_hi[r] - s->get_lo[r], f);
+                  fclose(f);
+                  fprintf(stderr, "[spu-raw] dumped -> %s\n", path);
+              }
+          } }
     }
     s->get_runs = 0;
-    if (!s_pending_entry) {
+    /* Restarted with nothing new loaded (a stop-and-signal serviced by the
+     * PPU): the program it already had. */
+    if (!entry && !loaded && s->entry && s->ctx) {
+        entry = s->entry;
+        image_id = s->ctx->image_id;
+    }
+    if (!entry) {
         fprintf(stderr, "[spu-raw] spu%u run requested but no lifted image is "
                         "registered -- the SPU cannot run. Lift the image and "
                         "register it (see a port's src/spu_images.c).\n", n);
         fflush(stderr);
         return;
     }
-#ifdef _WIN32
-    if (InterlockedCompareExchange(&s->started, 1, 0) != 0) return;  /* already up */
-#endif
+    if (RAW_CAS(&s->started, 1, 0) != 0) {        /* already up */
+        fprintf(stderr, "[spu-raw] spu%u run requested while it is still running: "
+                        "ignored\n", n);
+        fflush(stderr);
+        return;
+    }
 
     if (!s->ctx) {
         s->ctx = (spu_context*)malloc(sizeof(spu_context));
@@ -304,12 +417,12 @@ static void raw_spu_start(raw_spu* s)
     /* THE point of this whole file: local store is the guest window, not a copy.
      * The PPU keeps writing command buffers into it while the SPU runs. */
     s->ctx->ls       = vm_base + s->base;
-    s->ctx->image_id = s_pending_image_id;
-    s->entry         = s_pending_entry;
+    s->ctx->image_id = image_id;
+    s->entry         = entry;
     s->ctx->gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;      /* SPU ABI stack top */
 
     uint32_t npc = be32_load(s->base + SPU_RAW_NPC) & ~3u;
-    s->ctx->pc = npc ? npc : s_pending_elf_entry;
+    s->ctx->pc = npc ? npc : elf_entry;
 
     g_spu_force_ch_block = 1;   /* an empty RdInMbox must park, not fabricate 0 */
 
@@ -330,7 +443,17 @@ static void raw_spu_start(raw_spu* s)
 
 #ifdef _WIN32
     s->thread = CreateThread(NULL, 1u << 20, raw_spu_thread, s, 0, NULL);
-    if (!s->thread) InterlockedExchange(&s->started, 0);
+    if (!s->thread) RAW_XCHG(&s->started, 0);
+#else
+    {
+        pthread_t t;
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setstacksize(&a, 8u << 20);   /* lifted SPU code recurses on the host stack */
+        if (pthread_create(&t, &a, raw_spu_thread, s) == 0) pthread_detach(t);
+        else RAW_XCHG(&s->started, 0);
+        pthread_attr_destroy(&a);
+    }
 #endif
 }
 
@@ -351,7 +474,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
     switch (off) {
     case SPU_RAW_RUNCNTL:
         if (val == RUNCNTL_RUN) raw_spu_start(s);
-        else if (s->ctx)        s->ctx->status = SPU_STATUS_STOPPED;
+        else                    raw_spu_stop(s);
         break;
 
     case SPU_RAW_IN_MBOX:

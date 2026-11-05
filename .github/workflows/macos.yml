@@ -22,7 +22,7 @@ jobs:
         build_type: [Debug, Release]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # glslang and spirv-cross turn the decompilers' HLSL into MSL for the
       # Metal backend's guest-shader path; without them CMake builds the
@@ -47,7 +47,7 @@ jobs:
       # endianness bugs most recently). Running them here means they guard both
       # platforms, not just whoever last ran them on Windows.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
@@ -74,12 +74,33 @@ jobs:
           /tmp/test_savedata_fixed
           clang -std=gnu17 -I include                 libs/system/tests/test_savedata_root.c                 -Wl,-dead_strip -o /tmp/test_savedata_root
           /tmp/test_savedata_root
+          clang -std=gnu17 -I include                 libs/system/tests/test_sysconf.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_sysconf
+          /tmp/test_sysconf
 
       - name: Run self-contained SPU helper tests
         run: |
           clang -std=gnu17 -I include -I runtime/spu \
                 -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
+
+      # runtime/spu/tests/test_spu_int_neon.c and test_spu_float_neon.c check the
+      # SIMD helper forms against the exact scalar references. linux.yml runs the
+      # float one under -mavx2; the integer one was referenced by no workflow at
+      # all, so neither had ever been compiled for NEON on a real arm64 host.
+      # v0.18.0 lands four SIMD rewrites of spu_helpers.h, and a mis-merge there
+      # produces silently wrong float results rather than a build error, so these
+      # are the acceptance gate for that wave and they need to actually run.
+      - name: Run the SPU integer helper test (NEON)
+        run: |
+          clang -std=gnu17 -O2 -I include -I runtime/spu \
+                -o /tmp/test_spu_int_neon runtime/spu/tests/test_spu_int_neon.c -lm
+          /tmp/test_spu_int_neon
+
+      - name: Run the SPU float fast-path test (NEON)
+        run: |
+          clang -std=gnu17 -O2 -I include -I runtime/spu \
+                -o /tmp/test_spu_float_neon runtime/spu/tests/test_spu_float_neon.c -lm
+          /tmp/test_spu_float_neon
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
@@ -102,6 +123,14 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
           /tmp/test_np_identity
 
+      # The net-start dialog ends cancelled offline and connected with
+      # PS3_NET_ONLINE=1, its result word big-endian.
+      - name: Run the net-start dialog test
+        run: |
+          clang -std=gnu17 -I include -I libs/system -o /tmp/test_netctl_netstart libs/network/tests/test_netctl_netstart.c
+          /tmp/test_netctl_netstart
+          PS3_NET_ONLINE=1 /tmp/test_netctl_netstart
+
       # cellVideoOutSetGamma's float argument comes from f1, and the value
       # reaches the presenter.
       - name: Run the video out gamma test
@@ -119,6 +148,35 @@ jobs:
             -o /tmp/test_metal_present_post
           /tmp/test_metal_present_post
 
+      # Host-surface mode (tools/host_window, rsx_host_surface.h) against a
+      # launcher fixture in the same process: init attaches and opens no
+      # window, engine and vtable presents land in the shared IOSurfaces,
+      # unread frames are reclaimed rather than stalling, a resize asks for
+      # new surfaces, `closed` reaches the pump, and a second init (what an
+      # exec brings up) attaches again.
+      - name: Run the Metal host-surface test
+        run: |
+          # The translator is C++17 (ps3types.h); a .cpp on a plain clang line
+          # is compiled as C++98, so it is built on its own line.
+          clang++ -std=c++17 -I include -I libs/video -c libs/video/rsx_shader_msl.cpp \
+            -o /tmp/rsx_shader_msl.o
+          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_host_surface.m \
+            libs/video/rsx_texture_layout.c libs/video/rsx_vertex_fetch.c libs/video/rsx_vp_decompiler.c \
+            libs/video/rsx_fp_decompiler.c /tmp/rsx_shader_msl.o -lc++ -Wl,-dead_strip \
+            -framework Metal -framework Cocoa -framework QuartzCore -framework IOSurface \
+            -o /tmp/test_metal_host_surface
+          /tmp/test_metal_host_surface
+
+      # The host window off screen: it logs leaving and coming back, its
+      # [RSX FPS] lines say hidden=1 meanwhile, and coming back shows the
+      # newest frame the game published while it was away.
+      - name: Run the host window off-screen test
+        run: |
+          clang -fobjc-arc -I libs/video tools/host_window/test_host_window_offscreen.m \
+            -framework AppKit -framework Metal -framework QuartzCore -framework IOSurface \
+            -o /tmp/test_host_window_offscreen
+          /tmp/test_host_window_offscreen
+
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
@@ -132,6 +190,15 @@ jobs:
         run: |
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs)
           /tmp/test_pad_rumble
+          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_sensor_mode libs/input/tests/test_pad_sensor_mode.c $(sdl2-config --libs)
+          /tmp/test_pad_sensor_mode
+
+      # cellPad SDL hot-plug: a controller switched off and on again is
+      # reopened into its old port (fake SDL that behaves like sdl2-compat).
+      - name: Run the pad hot-plug test
+        run: |
+          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
+          /tmp/test_pad_hotplug
 
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
@@ -159,6 +226,16 @@ jobs:
           # built-in run proves the check has teeth: it must fail.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader --frames=60
+          # User clip planes: the same triangle with plane 1 enabled through
+          # SET_USER_CLIP_PLANE_CONTROL. ENABLE_LT clips all of it (the clear
+          # colour stays), ENABLE_GE keeps it (red). With the register
+          # ignored --clip draws red, so that run must fail.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip-keep
+          if PS3RECOMP_ENG_USER_CLIP=0 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip; then
+            echo "--clip passed with user clip planes off; the check is not checking"
+            exit 1
+          fi
           # A guest texture sampled by a guest fragment program: layout,
           # decode, upload, the CONTROL1 crossbar as a swizzle, and the
           # sampler registers. The quad is green and the texture is not.
@@ -174,6 +251,15 @@ jobs:
           PS3_ANISO=16 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso
           if PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso; then
             echo "--mip-aniso passed without PS3_ANISO; the check is not checking"
+            exit 1
+          fi
+          # SET_TEXTURE_BORDER_COLOR: a quad sampling only outside [0,1]
+          # with wrap BORDER and a white border colour, blended over the
+          # clear. It must present white, and with PS3RECOMP_ENG_BORDER=0
+          # (every border transparent black, as before) it must fail.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --border
+          if PS3RECOMP_ENG_BORDER=0 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --border; then
+            echo "--border passed with the border colour ignored; the check is not checking"
             exit 1
           fi
           # Render-to-texture: a red triangle drawn into a colour surface of
@@ -273,6 +359,15 @@ jobs:
           test -x build/test_shader_msl
           ./build/test_shader_msl
 
+      # The polygon offset reaches the GPU: a constant-depth triangle drawn
+      # with SET_POLY_OFFSET_FILL and a bias lands 256 Z24 (or one Z16) steps
+      # deeper, and PS3RECOMP_ENG_POLY_OFFSET=0 draws it without.
+      - name: Run the Metal polygon offset test
+        run: |
+          test -x build/test_metal_poly_offset
+          ./build/test_metal_poly_offset
+          PS3RECOMP_ENG_POLY_OFFSET=0 ./build/test_metal_poly_offset
+
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's
@@ -352,6 +447,10 @@ jobs:
           # 32 dwords and the registers after it are not constants.
           clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
           /tmp/test_rsx_transform_constants
+          # Vertex-program microcode and constant runs taken in one call leave the
+          # state exactly as the same words do one by one.
+          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_vp_run libs/video/tests/test_rsx_vp_run.c libs/video/rsx_commands.c
+          /tmp/test_rsx_vp_run
           # Texture offsets are 31 bits; bit 31 is not an address bit.
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
           /tmp/test_rsx_texture_offset
@@ -375,6 +474,15 @@ jobs:
         run: |
           clang -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
           /tmp/test_guest_ptr_trap
+
+      # Buffered stdout/stderr with a timed flush (runtime/platform/ps3_stdio.c):
+      # buffered by default, a line reaches the pipe within the flush interval,
+      # and nothing is lost at exit, on abort() or on a crash through the
+      # unhandled-exception filter; PS3_STDIO_UNBUFFERED=1 restores unbuffered.
+      - name: Run the stdio flush test
+        run: |
+          clang -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
+          /tmp/test_stdio_flush
 
       # The lv2 sync-primitive stress suite on host threads. Windows-only until
       # the shim grew joinable handles and multi-object waits; on Apple Silicon

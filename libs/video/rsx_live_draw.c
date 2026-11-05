@@ -85,7 +85,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(YZ_PERF_CLEAN)
+#if defined(YZ_PERF_CLEAN) || defined(_MSC_VER)
 #define LD_DIAG_ENABLED(name) 0
 #else
 /* Cached per call site: several of these sit on per-draw paths. */
@@ -4766,12 +4766,17 @@ static ID3D12PipelineState* get_pso(
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
+    /* BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). */
+    const int vp_branch_bits_used = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16);
+    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
+    if (vp_branch_bits_used)
+        key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
     /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
      * by the texture size in the shader -- D3D12 has no unnormalised addressing
      * mode. The divisor is baked into the HLSL, so the sizes are part of the
      * PSO identity and must be in the key. */
     u32 unnorm_mask = 0;
-    u32 unnorm_dim[16][2] = {{0}};
+    u32 unnorm_dim[16][3] = {{0}};
     for (u32 uu = 0; uu < 16; uu++) {
         rsx_dsp_texture ut; rsx_dsp_get_texture(&g.rsx, uu, &ut);
         if (!ut.enabled || !(ut.format & TEX_FMT_UNNORM)) continue;
@@ -4880,6 +4885,7 @@ static ID3D12PipelineState* get_pso(
     const LONGLONG decompile_begin = ld_profile_qpc();
 #endif
     rsx_vp_set_branch_base(rsx_dsp_vp_start(&g.rsx));
+    rsx_vp_set_branch_bits(vp_branch_bits);
     const int vi = masked_layout
         ? rsx_vp_decompile_compact_ex(
             vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
@@ -4901,7 +4907,7 @@ static ID3D12PipelineState* get_pso(
             fi = -1;
         if (fi > 0) {
             const int np = rsx_fp_apply_unnorm_scale(
-                ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask);
+                ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask, 0u);
             { static int n = 0;
               if (PS3_LOG_FIRST(n, 8))
                   fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
@@ -4921,7 +4927,7 @@ static ID3D12PipelineState* get_pso(
             fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(
                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
-                unnorm_dim, cube_mask) < 0)
+                unnorm_dim, cube_mask, 0u) < 0)
             fi = -1;
     }
 #if defined(YZ_PERF_PROFILE)
@@ -5224,7 +5230,9 @@ static int fetch_attr(u32 i, u32 base, u32 vertex_id, u32 base_index,
         p = dc.inl + at;
     } else {
         p = guest_ptr(
-            a.location, base + a.offset + source_element * stride, elem_size);
+            a.location,
+            rsx_dsp_resolve_vertex_offset(base, a.offset) + source_element * stride,
+            elem_size);
     }
     if (!p) return 0;
     for (u32 c = 0; c < a.size && c < 4; c++) {
@@ -5492,7 +5500,8 @@ static const float* dc_vertex_attr_canonical(
             ref->vertex_id, ref->base_index, fetch->desc.frequency,
             (dc.fetch_plan.divider_mask >> attr) & 1u);
         const u64 offset =
-            (u64)dc.fetch_plan.base_offset + fetch->desc.offset +
+            (u64)rsx_dsp_resolve_vertex_offset(dc.fetch_plan.base_offset,
+                                               fetch->desc.offset) +
             (u64)element * fetch->stride;
         if (offset <= UINT32_MAX) {
             const u8* source = guest_ptr(

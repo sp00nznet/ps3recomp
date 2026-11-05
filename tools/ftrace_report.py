@@ -7,7 +7,8 @@ PS3_FTRACE=<start s>:<seconds>:<path> (toolkit, include/ps3emu/ps3_ftrace.h)
 records spans: PPU syscalls that blocked and merged usleep poll runs (with the
 guest call site), SPU busy/wait spans (busy tagged with the lifted image and the
 SPURS workload id), the RSX walker blocked on a semaphore ACQUIRE, FIFO drains,
-flips and presents. A frame here is the time between two guest flip requests.
+flips, presents and HLE import calls. A frame here is the time between two
+guest flip requests.
 
 The report says, for the median frame, how each thread spent it, and draws a
 few frames as a timeline (one column per --ms-per-col ms):
@@ -22,7 +23,7 @@ import statistics
 import sys
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
- GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC) = range(1, 15)
+ GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE) = range(1, 16)
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 
 SYSCALL_NAMES = {   # runtime/syscalls/lv2_syscall_table.h
@@ -168,6 +169,25 @@ def main():
                   f"  ({sum(ms) / n:5.1f} ms/frame)  passes {statistics.median([s[1] for s in xs]):.0f}"
                   f"  depth resolves {statistics.median([s[2] & 0xFFFF for s in xs]):.0f}"
                   f"  colour copies {statistics.median([s[2] >> 16 for s in xs]):.0f}")
+
+    # Time inside HLE import calls, which includes waits that no syscall span
+    # shows (an lwcond wait, a file read). Names come from the NIDs of the
+    # functions the toolkit implements.
+    hle = collections.defaultdict(float)
+    for s in spans:
+        if s[0] == HLE:
+            hle[(s[1], s[2])] += overlap(s[4], s[5], flips[0], flips[-1])
+    if hle:
+        try:
+            import nid_database
+            db = nid_database.get_default_db()
+            db.load_implemented()
+        except Exception:
+            db = None
+        print("  HLE import calls (time inside, by thread and import):")
+        for (t, nid), ms in sorted(hle.items(), key=lambda x: -x[1])[:12]:
+            e = db.lookup_nid(nid) if db else None
+            print(f"    tid {t:3d} {names.get(t, '?')[:28]:28s} {ms / n:5.1f}  {e[1] if e else f'nid {nid:08X}'}")
 
     # Timelines.
     if args.threads:

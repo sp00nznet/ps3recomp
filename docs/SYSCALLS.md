@@ -122,6 +122,7 @@ Creates a new PPU thread with its own register context and stack.
    - Windows: `CreateThread(NULL, 0, thread_wrapper, ctx, 0, NULL)`
    - POSIX: `pthread_create(&handle, NULL, thread_wrapper, ctx)`
 5. Writes the thread ID to the output pointer
+6. With `PS3_PRIO_START=1` (off by default), if the new thread's priority is higher (a lower number) than the creator's, waits until the new thread reaches a blocking call, as lv2's scheduler would run it first. The blocking calls report themselves through `ppu_thread_note_block` (event queue receive, event flag, semaphore, cond and lwcond waits, a contended lwmutex, thread join, the sleeps). The wait is capped at 200 ms and logs once per thread that hits the cap. Main counts as priority 1000 until it sets its own.
 
 **Returns:** `CELL_OK` on success, `CELL_EAGAIN` if thread limit reached, `CELL_ENOMEM` if stack allocation fails.
 

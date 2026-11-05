@@ -28,29 +28,31 @@ Complete guide to building the ps3recomp runtime library and game projects.
 | **CMake** | 3.20 | Build system generator |
 | **C Compiler** | C17 support | Compile runtime and HLE modules |
 | **C++ Compiler** | C++20 support | Compile templates, module registration |
-| **Python** | 3.9+ | Recompiler tools |
+| **Python** | 3.10+ (CI uses 3.12) | Recompiler tools |
 
 ### Recommended
 
 | Tool | Purpose |
 |------|---------|
-| **Ninja** | Faster builds than Make/MSBuild (`pip install ninja`) |
+| **Ninja** | Faster builds than Make/MSBuild; CI and the commands in these docs use it (`pip install ninja`) |
 | **ccache** | Compiler cache for faster rebuilds |
 
 ### Platform-Specific Requirements
 
+CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
+
 **Windows:**
-- Visual Studio 2022 (MSVC 17.x) or Clang/LLVM 14+
+- clang-cl (LLVM) with Visual Studio 2022 (MSVC 17.x) for the headers and libraries (what CI uses); plain MSVC `cl` builds the runtime library (see the Windows notes below), but lifted game code needs clang-cl
 - Windows SDK 10.0.19041+
 - System libraries (auto-linked): `ws2_32.lib`, `xinput.lib`, `ole32.lib`, `bcrypt.lib`
 
 **Linux:**
-- GCC 12+ or Clang 14+
+- GCC or Clang
 - Development headers: `libpthread`, `libm`
 - Optional: SDL2 development package (`libsdl2-dev`) for input/audio
 
 **macOS:**
-- Xcode 14+ (Apple Clang 14+)
+- Xcode (Apple Clang)
 - Optional: SDL2 via Homebrew (`brew install sdl2`)
 
 ---
@@ -620,7 +622,7 @@ target_link_libraries(my_game PRIVATE
 cp -r ps3recomp/templates/project/ my_game/
 
 # Edit configuration
-# - config.toml: set elf_path, module settings, graphics/audio backends
+# - config.toml: reference only, not read by the tools yet
 # - CMakeLists.txt: set project name, add ps3recomp path
 # - stubs.cpp: add game-specific function overrides
 
@@ -642,12 +644,12 @@ cmake --build build
 |------|---------|
 | `main.cpp` | Entry point — initializes runtime subsystems, loads function table, creates main PPU thread |
 | `stubs.cpp` | Game-specific NID overrides and custom function implementations |
-| `config.toml` | Recompiler and runtime configuration |
+| `config.toml` | Reference only: not read by the tools yet |
 | `CMakeLists.txt` | Build configuration — links against ps3recomp_runtime |
 
 ### Configuration Reference (config.toml)
 
-See `templates/project/config.toml` for the full reference with comments. Key sections:
+Reference only: no tool or CMake file reads `config.toml` yet, so these settings have no effect. See `templates/project/config.toml` for the full reference with comments. Key sections:
 
 ```toml
 [input]

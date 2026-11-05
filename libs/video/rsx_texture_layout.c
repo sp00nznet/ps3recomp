@@ -300,16 +300,51 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
         return;
     }
 
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    /* Linear A8R8G8B8 / D8R8G8B8 is a byte rotation per texel (guest A,R,G,B
+     * to host R,G,B,A), which the compiler vectorizes; through decode_texel
+     * it was most of the cost of re-uploading a full-screen render target
+     * read back as a texture. Same bytes as decode_texel. */
+    if (!tl->swizzled && (tl->base_format == 0x85u || tl->base_format == 0x9Eu) &&
+        sbpp == 4u && dbpp == 4u) {
+        const u32 alpha = tl->base_format == 0x9Eu ? 0xFF000000u : 0u;
+        for (u32 y = 0; y < h; y++) {
+            const u8* srow = src + (size_t)y * tl->row_bytes;
+            u8* drow = d + (size_t)y * dst_pitch;
+            for (u32 x = 0; x < w; x++) {
+                u32 v;
+                memcpy(&v, srow + (size_t)x * 4u, 4);
+                if (!argb_as_rgba) v = (v >> 8) | (v << 24);
+                v |= alpha;
+                memcpy(drow + (size_t)x * 4u, &v, 4);
+            }
+        }
+        return;
+    }
+#endif
+
     /* Morton order interleaves the low bits of x and y, so a swizzled image
      * has to be walked texel by texel; so does anything the host cannot take
-     * as stored. */
+     * as stored. x's and y's bits land on separate positions of the swizzled
+     * offset, so it is the OR of a y part, computed once a row, and an x part
+     * stepped with the dilated increment (d - mask) & mask. Interleaving every
+     * texel's bits afresh was most of the decode in God of War HD's texture
+     * bursts. */
+    const u32 xmask = tl->swizzled ? rsx_swizzle_offset((1u << l2w) - 1u, 0, l2w, l2h) : 0;
     for (u32 y = 0; y < h; y++) {
         u8* drow = d + (size_t)y * dst_pitch;
-        for (u32 x = 0; x < w; x++) {
-            const u8* s = tl->swizzled
-                ? src + (size_t)rsx_swizzle_offset(x, y, l2w, l2h) * sbpp
-                : src + (size_t)y * tl->row_bytes + (size_t)x * sbpp;
-            decode_texel(tl, s, drow + (size_t)x * dbpp, argb_as_rgba);
+        if (tl->swizzled) {
+            const u32 yoff = rsx_swizzle_offset(0, y, l2w, l2h);
+            u32 xoff = 0;
+            for (u32 x = 0; x < w; x++) {
+                decode_texel(tl, src + (size_t)(xoff | yoff) * sbpp,
+                             drow + (size_t)x * dbpp, argb_as_rgba);
+                xoff = (xoff - xmask) & xmask;
+            }
+        } else {
+            const u8* srow = src + (size_t)y * tl->row_bytes;
+            for (u32 x = 0; x < w; x++)
+                decode_texel(tl, srow + (size_t)x * sbpp, drow + (size_t)x * dbpp, argb_as_rgba);
         }
     }
 }
@@ -327,13 +362,20 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * through lanes_argb its B source would be component 2, always zero.
      * X16 is one 16-bit channel decoded to R16 and is presented the same way:
      * God of War: Ascension samples its X16 font atlas through crossbar 0xAAEE
-     * (every output from G or B), which read zeros -- all menu text invisible. */
-    static const u8 lanes_argb[4] = {3, 0, 1, 2};
-    static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
-    static const u8 lanes_b8[4]   = {RSX_REMAP_ONE, 0, 0, 0};
+     * (every output from G or B), which read zeros -- all menu text invisible.
+     * The depth formats decode to one channel and present it on every source
+     * (RPCS3 VKFormats.cpp get_component_mapping: R,R,R,R): a retail title
+     * reads its DEPTH16 shadow maps through crossbar 0xA900, R, G and B from A,
+     * which through lanes_argb was the resource's opaque alpha -- every
+     * shadow compare saw depth 1.0. */
+    static const u8 lanes_argb[4]  = {3, 0, 1, 2};
+    static const u8 lanes_g8b8[4]  = {1, 0, 1, 0};
+    static const u8 lanes_b8[4]    = {RSX_REMAP_ONE, 0, 0, 0};
+    static const u8 lanes_depth[4] = {0, 0, 0, 0};
     const u32 base = rsx_fmt & 0x9Fu;
     const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
-                      : (base == 0x81u || base == 0x94u) ? lanes_b8 : lanes_argb;
+                      : (base == 0x81u || base == 0x94u) ? lanes_b8
+                      : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
 

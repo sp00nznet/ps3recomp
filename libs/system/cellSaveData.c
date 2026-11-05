@@ -842,11 +842,34 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
 }
 
 /* Core save/load implementation shared by List/Fixed/Auto variants */
+/* Saves in flight, for a host-side quit (cellSysutil.c ps3_host_quit): it
+ * waits for this to reach 0 so it never cuts a save file short. */
+static volatile int s_savedata_busy;
+int ps3_savedata_busy(void) { return __atomic_load_n(&s_savedata_busy, __ATOMIC_ACQUIRE); }
+
+static s32 savedata_execute_run(const char* dirName, int is_save,
+                                CellSaveDataSetBuf* setBuf,
+                                CellSaveDataStatCallback funcStat,
+                                CellSaveDataFileCallback funcFile,
+                                void* userdata);
+
 static s32 savedata_execute(const char* dirName, int is_save,
                              CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile,
                              void* userdata)
+{
+    __atomic_add_fetch(&s_savedata_busy, 1, __ATOMIC_ACQ_REL);
+    const s32 r = savedata_execute_run(dirName, is_save, setBuf, funcStat, funcFile, userdata);
+    __atomic_sub_fetch(&s_savedata_busy, 1, __ATOMIC_ACQ_REL);
+    return r;
+}
+
+static s32 savedata_execute_run(const char* dirName, int is_save,
+                                CellSaveDataSetBuf* setBuf,
+                                CellSaveDataStatCallback funcStat,
+                                CellSaveDataFileCallback funcFile,
+                                void* userdata)
 {
     if (!dirName || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;

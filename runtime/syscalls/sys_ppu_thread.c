@@ -23,10 +23,12 @@ static PPU_TLS int     s_exit_armed = 0;
 #include "sys_ppu_thread.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
+#include "ps3emu/ps3_tprof.h"            /* PS3_TPROF: in-process thread samples */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 #ifndef _WIN32
 #include <errno.h>
 #endif
@@ -79,12 +81,19 @@ static void table_unlock(void)
 #endif
 }
 
-/* Find a free slot. Returns index or -1. Must be called under lock. */
+/* Find a free slot. Returns index or -1. Must be called under lock.
+ * The thread id is the slot + 1. A title that polls sys_ppu_thread_get_priority(id) until it returns ESRCH (to see a
+ * worker finish) only gets its answer if the next thread does not take that slot, and so that id, at once. So the
+ * search continues after the slot used last (next-fit): an id comes back only after the other slots were used. */
 static int find_free_slot(void)
 {
-    for (int i = 0; i < PPU_THREAD_MAX; i++) {
-        if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE)
+    static int s_next = 0;
+    for (int n = 0; n < PPU_THREAD_MAX; n++) {
+        int i = (s_next + n) % PPU_THREAD_MAX;
+        if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE) {
+            s_next = (i + 1) % PPU_THREAD_MAX;
             return i;
+        }
     }
     return -1;
 }
@@ -99,6 +108,68 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
 }
 
 /* ---------------------------------------------------------------------------
+ * Priority at thread start (PS3_PRIO_START=1, off by default)
+ *
+ * On lv2 a thread created with a higher priority (a lower number) than its creator preempts the creator and runs
+ * until it blocks. SDK libraries rely on it: the SurMixer thread (prio 400, typically created by a prio 1000 thread)
+ * creates the event queue whose key its creator passes to cellAudioSetNotifyEventQueue right after the create
+ * returns, with no synchronisation of their own. Host threads run side by side, so the creator can read the key
+ * before it is written, and the mixer is never notified. With PS3_PRIO_START=1 sys_ppu_thread_create waits until
+ * such a thread reaches a blocking call (ppu_thread_note_block), for at most PRIO_START_TIMEOUT_MS so that a thread
+ * which blocks somewhere not reported, or never blocks, cannot hold its creator up for long.
+ *
+ * Off by default: it changes thread interleaving for every title, and the regression gate's goldens are recorded
+ * without it.
+ * -----------------------------------------------------------------------*/
+#define PPU_DEFAULT_PRIORITY   1000   /* what sys_ppu_thread_get_priority reports for a thread not in the table */
+#define PRIO_START_TIMEOUT_MS  200
+#define PRIO_START_SPIN_MS     2      /* yield instead of sleeping for this long: Sleep(1) is ~15 ms on Windows */
+
+static int prio_start_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PS3_PRIO_START") ? 1 : 0;
+    return on;
+}
+
+void ppu_thread_note_block(uint64_t tid)
+{
+    if (tid == 0 || tid > PPU_THREAD_MAX) return;
+    int* blocked = &g_ppu_threads[tid - 1].blocked;
+    /* Load first: the wait syscalls call this on every wait, and most threads blocked long ago. */
+    if (!__atomic_load_n(blocked, __ATOMIC_RELAXED))
+        __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
+}
+
+/* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
+ * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
+static int32_t creator_priority(uint64_t tid)
+{
+    const ppu_thread_info* c = find_thread(tid);
+    if (!c || (c == &g_ppu_threads[0] && c->priority == 0)) return PPU_DEFAULT_PRIORITY;
+    return c->priority;
+}
+
+/* Called without the table lock, right after the creator made `t`. The acquire load pairs with the release store in
+ * ppu_thread_note_block, so whatever `t` wrote before it blocked (the event queue key above) is visible here. */
+static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
+{
+    const ULONGLONG start = GetTickCount64();
+    for (;;) {
+        if (__atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE)) return;
+        const int state = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+        /* Ended before blocking (a detached thread is DETACHED while it still runs). */
+        if (state == PPU_THREAD_STATE_FINISHED || state == PPU_THREAD_STATE_FREE) return;
+        const ULONGLONG waited = GetTickCount64() - start;
+        if (waited >= PRIO_START_TIMEOUT_MS) break;
+        if (waited < PRIO_START_SPIN_MS) SwitchToThread();
+        else                             Sleep(1);
+    }
+    fprintf(stderr, "[SYS] PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
+            (unsigned long long)tid, t->name, t->priority, PRIO_START_TIMEOUT_MS);
+}
+
+/* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
@@ -108,6 +179,7 @@ static void* ppu_host_thread_proc(void* param)
 #endif
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
+    ps3_thread_name("ppu %s", info->name);
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -123,6 +195,7 @@ static void* ppu_host_thread_proc(void* param)
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+    ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
@@ -165,6 +238,7 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
+    ps3_tprof_thread_exit();
     /* Mark as finished */
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
@@ -253,6 +327,8 @@ uint64_t ppu_thread_register_main(void)
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
+        ps3_tprof_thread('P', 1);
+        ps3_thread_name("ppu main");      /* registered from the boot thread itself */
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else
@@ -524,7 +600,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     if (!t->joinable) pthread_detach(t->host_thread);   /* nobody pthread_joins it */
 #endif
 
+    const int preempts = prio_start_enabled() && priority < creator_priority(ctx->thread_id);
     table_unlock();
+    if (preempts) wait_first_block(t, thread_id);
     return CELL_OK;
 }
 
@@ -582,6 +660,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
     { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -1124,6 +1203,12 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
+    if (!t && tid >= 1 && tid <= PPU_THREAD_MAX && g_ppu_threads[tid - 1].entry_addr != 0) {
+        /* A thread created by sys_ppu_thread_create that has exited and been freed (the slot keeps its entry address):
+         * it is gone (ESRCH). */
+        table_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
     if (!t) {
         /* The main thread (and any thread we didn't spawn via sys_ppu_thread_create)
          * isn't in our table. Returning ESRCH here is fatal for engines that query
@@ -1131,7 +1216,7 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
          * "Error initializing PSSG"). Report a sane default priority + success. */
         table_unlock();
         if (prio_addr != 0) {
-            int32_t prio = 1000;
+            int32_t prio = PPU_DEFAULT_PRIORITY;
             int32_t* out = (int32_t*)vm_to_host(prio_addr);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
             uint32_t u = (uint32_t)prio;
@@ -1250,54 +1335,64 @@ int64_t sys_ppu_thread_get_join_state(ppu_context* ctx)
  * r3 = pointer to receive stack info struct
  *   struct { u32 addr; u32 size; }
  * -----------------------------------------------------------------------*/
+/* The main thread's stack, for a host that runs it on one of its own (the
+ * template's STACK_TOP, say). ppu_run takes only a stack top, so the host sets
+ * these before it; a size of 0 keeps the default below. */
+uint32_t g_ppu_main_stack_addr = 0;
+uint32_t g_ppu_main_stack_size = 0;
+
+/* What the main thread is told. The default names the first allocation in the
+ * thread stack region (VM_STACK_BASE), which is where a host that gives main an
+ * lv2-style stack puts it (boot_main.cpp, PS3_MAIN_STACK_LV2). */
+static void main_stack_info(uint32_t* addr, uint32_t* size)
+{
+    if (g_ppu_main_stack_size) {
+        *addr = g_ppu_main_stack_addr;
+        *size = g_ppu_main_stack_size;
+    } else {
+        *addr = VM_STACK_BASE;
+        *size = VM_PPU_STACK_SIZE;
+    }
+}
+
 int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 {
     uint32_t out_addr = LV2_ARG_PTR(ctx, 0);
     uint64_t tid = ctx->thread_id;
+    uint32_t sa, ss;
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
-    if (!t) {
-        table_unlock();
-        /* For the main thread, return sensible defaults */
-        if (out_addr != 0) {
-            uint32_t* out = (uint32_t*)vm_to_host(out_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-            /* byteswap both fields */
-            uint32_t sa = VM_STACK_BASE;
-            uint32_t ss = VM_PPU_STACK_SIZE;
-            sa = ((sa >> 24) & 0xFF) | ((sa >> 8) & 0xFF00) |
-                 ((sa <<  8) & 0xFF0000) | ((sa << 24) & 0xFF000000u);
-            ss = ((ss >> 24) & 0xFF) | ((ss >> 8) & 0xFF00) |
-                 ((ss <<  8) & 0xFF0000) | ((ss << 24) & 0xFF000000u);
-            out[0] = sa;
-            out[1] = ss;
-#else
-            out[0] = VM_STACK_BASE;
-            out[1] = VM_PPU_STACK_SIZE;
-#endif
-        }
-        return CELL_OK;
+    /* The main thread is in the table (ppu_thread_register_main, slot 0) but
+     * has no recorded stack. Reporting its 0 + 0 sent a title that looks for
+     * data at (addr + size - 0x1000) to 0xFFFFF000. A context with no table
+     * entry at all gets the same main-thread answer, as before. */
+    if (t && t->stack_size) {
+        sa = t->stack_addr;
+        ss = t->stack_size;
+    } else {
+        main_stack_info(&sa, &ss);
     }
+    table_unlock();
+
+    static int s_log = -1;
+    if (s_log < 0) s_log = getenv("PPU_STACKINFO_LOG") ? 1 : 0;
+    if (s_log)
+        fprintf(stderr, "[ppu_thread] get_stack_information tid=%llu -> 0x%08X+0x%X\n",
+                (unsigned long long)tid, sa, ss);
 
     if (out_addr != 0) {
         uint32_t* out = (uint32_t*)vm_to_host(out_addr);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        uint32_t sa = t->stack_addr;
-        uint32_t ss = t->stack_size;
+        /* byteswap both fields */
         sa = ((sa >> 24) & 0xFF) | ((sa >> 8) & 0xFF00) |
              ((sa <<  8) & 0xFF0000) | ((sa << 24) & 0xFF000000u);
         ss = ((ss >> 24) & 0xFF) | ((ss >> 8) & 0xFF00) |
              ((ss <<  8) & 0xFF0000) | ((ss << 24) & 0xFF000000u);
+#endif
         out[0] = sa;
         out[1] = ss;
-#else
-        out[0] = t->stack_addr;
-        out[1] = t->stack_size;
-#endif
     }
-
-    table_unlock();
     return CELL_OK;
 }
 

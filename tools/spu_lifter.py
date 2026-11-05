@@ -544,12 +544,23 @@ class SPULifter:
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
 
+        # Chunks merged into this function (--merge-chunks) are otherwise entered
+        # through the drain loop, which delivers a pending SPU interrupt before
+        # every transfer. As gotos they would not, and a job waiting in a loop
+        # for its interrupt handler (DMA-list stall-and-notify) never wakes. So
+        # each merged chunk entry hands back to the drain when one is pending.
+        merged_starts = {a for a in getattr(self, "func_starts", ()) if start < a < end}
         last_insn = None
         for insn in insns:
             if insn.addr < start or insn.addr >= end:
                 continue
-            if insn.addr in internal:
+            if insn.addr in internal or insn.addr in merged_starts:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
+            if insn.addr in merged_starts:
+                func.body_lines.append(
+                    f"    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
+                    f"{{ ctx->pc = 0x{insn.addr:X}; g_spu_trampoline_fn = "
+                    f"{self.prefix}spu_func_{insn.addr:08X}; return; }}")
             c = self._translate(insn, func)
             if c:
                 if self.trace:
@@ -572,8 +583,7 @@ class SPULifter:
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
+                f"    {{ SPU_DIRECT(ctx, 0x{end:X}, {self.prefix}spu_func_{end:08X}); }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -930,10 +940,11 @@ class SPULifter:
             if func.start_addr <= tgt < func.end_addr:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
-            # Cross-function conditional branch = conditional tail: hand the
-            # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
-            return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+            # Cross-function conditional branch = conditional tail: a direct
+            # tail call when the drain has nothing to do on this step, else
+            # the trampoline and unwind (SPU_DIRECT, spu_context.h).
+            return (f"if ({cond}) {{ SPU_DIRECT(ctx, 0x{tgt:X}, "
+                    f"{self.prefix}spu_func_{tgt:08X}); }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1042,10 +1053,11 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        # Cross-function unconditional tail: hand the target to the trampoline
-        # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
-        return (f"{{ ctx->pc = 0x{tgt:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+        # Cross-function unconditional tail: a direct tail call when the
+        # drain has nothing to do on this step, else hand the target to the
+        # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
+        # host-stack growth either way; SPU_DIRECT, spu_context.h).
+        return (f"{{ SPU_DIRECT(ctx, 0x{tgt:X}, {self.prefix}spu_func_{tgt:08X}); }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:

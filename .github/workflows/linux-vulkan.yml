@@ -34,7 +34,7 @@ jobs:
       VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # As in linux.yml: SDL2 is required off Windows, and Ubuntu's glslang
       # CMake config refuses to load without glslang-tools. spirv-tools is
@@ -88,7 +88,7 @@ jobs:
           # before any backend exists (the first pass still runs it).
           for m in "" "--draw" "--depth" "--quads" "--shader" \
                    "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube" \
-                   "--depthbounds" "--split-present" "--feedback"; do
+                   "--depthbounds" "--split-present" "--feedback" "--clip" "--clip-keep"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
             name=${m:-default}
             echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"

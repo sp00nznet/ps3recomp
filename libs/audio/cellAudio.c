@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -279,8 +280,13 @@ static int audio_backend_init(void)
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize          = 0;
 
-    /* Request event-driven mode with a ~20ms buffer */
-    REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
+    /* Event-driven, 60 ms by default (PS3_AUDIO_BUF_MS). The old 20 ms ran
+     * dry whenever the mixing thread lost the CPU for a moment -- with every
+     * core busy running SPU/PPU code that was often, and each time is an
+     * audible stutter (Bink cutscenes most of all). */
+    REFERENCE_TIME buf_duration = 600000; /* 60 ms in 100 ns units */
+    { const char* e = getenv("PS3_AUDIO_BUF_MS"); const int ms = e ? atoi(e) : 0;
+      if (ms >= 10 && ms <= 500) buf_duration = (REFERENCE_TIME)ms * 10000; }
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     /* Shared mode only takes the device's own mix format unless the stream
@@ -554,10 +560,24 @@ static void audio_notify_event_queues(void)
 }
 
 #ifdef _WIN32
+static unsigned long long g_audio_underruns;
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
+    ps3_thread_name("audio mix");
     printf("[cellAudio] Mixing thread started\n");
+
+    /* The device deadline is every few ms and the guest threads keep every
+     * core busy: run this one ahead of them (MMCSS "Pro Audio" when the
+     * service is there, the highest normal priority anyway). avrt.dll is
+     * loaded by hand so the runtime does not need avrt.lib to link. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    { HMODULE avrt = LoadLibraryW(L"avrt.dll");
+      typedef HANDLE (WINAPI *set_mm_fn)(LPCWSTR, LPDWORD);
+      set_mm_fn set_mm = avrt ? (set_mm_fn)(void*)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW") : NULL;
+      DWORD task = 0;
+      if (set_mm && !set_mm(L"Pro Audio", &task))
+          fprintf(stderr, "[cellAudio] MMCSS Pro Audio unavailable (%lu)%c", (unsigned long)GetLastError(), 10); }
 
     /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
      * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
@@ -570,6 +590,12 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     while (s_mix_thread_running) {
         const int room = audio_backend_room();
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+#if AUDIO_BACKEND_WASAPI
+        /* Device queue under half a block: it is about to play silence (an
+         * audible click/stutter). AUDIO_RATE reports how often. */
+        if (room >= 0 && blocks > 64 &&
+            (UINT32)room + CELL_AUDIO_BLOCK_SAMPLES / 2 >= s_wasapi_buf_frames) g_audio_underruns++;
+#endif
         if (room < 0) {
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
             const long long due = q0.QuadPart +
@@ -600,19 +626,20 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
-          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
+          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
             ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
             if (now - t0 >= 5000) {
-                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
+                        g_audio_underruns - u0,
                 #if AUDIO_BACKEND_WASAPI
                         (unsigned)s_wasapi_buf_frames, 10);
 #else
                         0u, 10);
 #endif
-                n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
+                n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
 
         /* Notify event queues */
         audio_notify_event_queues();

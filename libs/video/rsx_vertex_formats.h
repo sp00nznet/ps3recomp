@@ -46,14 +46,27 @@ static inline u32 rsx_vertex_attrib_size(u32 type, u32 num_components)
     return rsx_vertex_type_size(type) * num_components;
 }
 
+/* Is the attribute an ordinary per-vertex array under
+ * NV4097_SET_FREQUENCY_DIVIDER_OPERATION? Frequency 0 always is, and so is
+ * frequency 1 with division; frequency 1 with modulo is not: vertex % 1 is 0,
+ * one element for the whole draw. A retail title passes the per-draw values
+ * of its tracer trails (the trail's start point, its colour) that way; read
+ * per vertex, one side of the ribbon started at the next element and the
+ * trail drew a wedge across the screen. */
+static inline int rsx_vertex_freq_plain(u32 frequency, u32 modulo)
+{
+    return frequency == 0 || (frequency == 1 && !modulo);
+}
+
 /* Resolve one attribute's element under
- * NV4097_SET_FREQUENCY_DIVIDER_OPERATION. Frequency 0/1 is ordinary vertex
- * fetch, a set operation bit is modulo (instanced template), and a clear bit
- * is division (one per-instance datum shared by `frequency` vertices). */
+ * NV4097_SET_FREQUENCY_DIVIDER_OPERATION: an ordinary array (above) is
+ * indexed per vertex, a set operation bit is modulo (instanced template), and
+ * a clear bit is division (one per-instance datum shared by `frequency`
+ * vertices). */
 static inline u32 rsx_vertex_element_index(u32 vertex_id, u32 base_index,
                                            u32 frequency, u32 modulo)
 {
-    if (frequency <= 1)
+    if (rsx_vertex_freq_plain(frequency, modulo))
         return (vertex_id + base_index) & 0x000FFFFFu;
     if (modulo)
         return vertex_id % frequency;

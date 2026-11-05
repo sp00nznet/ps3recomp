@@ -333,6 +333,23 @@ static void upload_textured_quad(void)
             guest_f32(IO_ADDR + TVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[i][k]);
 }
 
+/* --border: the same quad with every texcoord shifted by 2, so the whole
+ * quad samples outside [0,1] and every pixel is the border wrap's answer.
+ * Layout as the textured quad. */
+#define RVTX_OFFSET (VTX_OFFSET + 0x8000u)
+#define BORDER_ARGB 0xFFFFFFFFu          /* SET_TEXTURE_BORDER_COLOR: white */
+static void upload_border_quad(void)
+{
+    static const float pos[6][2] = { {-1,-1}, {1,-1}, {1,1}, {-1,-1}, {1,1}, {-1,1} };
+    static const float uv[6][2]  = { {0,0}, {1,0}, {1,1}, {0,0}, {1,1}, {0,1} };
+    for (int i = 0; i < 6; i++) {
+        const float v[12] = { pos[i][0], pos[i][1], 0, 1,   0, 1, 0, 1,
+                              uv[i][0] + 2.0f, uv[i][1] + 2.0f, 0, 0 };
+        for (int k = 0; k < 12; k++)
+            guest_f32(IO_ADDR + RVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[k]);
+    }
+}
+
 /* The --cube texture: each face a flat colour of its own. */
 static void upload_cube_texture(void)
 {
@@ -651,6 +668,25 @@ static void emit_textured_draw_fmt(u32 tex_offset, u32 w, u32 h, u32 fmt_byte)
     emit_textured_draw_full(tex_offset, w, h, fmt_byte, 0, TVTX_OFFSET);
 }
 
+/* --border: --tex's green texture with SET_TEXTURE_ADDRESS BORDER (4) on s,
+ * t and r and an opaque white SET_TEXTURE_BORDER_COLOR, drawn with the quad
+ * whose texcoords are all outside [0,1]. The centre pixel has to be the
+ * border colour: the texture's green means the wrap clamped to the edge.
+ * The draw blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA over the clear, so a
+ * border read as transparent black (the register ignored) leaves the clear
+ * colour there -- unblended it would present 0, which reads as "no headless
+ * readback" and would pass. */
+static void emit_border_draw(void)
+{
+    emit(NV4097_SET_TEXTURE_ADDRESS      + 0, 4u | (4u << 8) | (4u << 16));
+    emit(NV4097_SET_TEXTURE_BORDER_COLOR + 0, BORDER_ARGB);
+    emit(NV4097_SET_BLEND_ENABLE,        1u);
+    emit(NV4097_SET_BLEND_FUNC_SFACTOR,  0x0302u | (0x0302u << 16));   /* SRC_ALPHA           */
+    emit(NV4097_SET_BLEND_FUNC_DFACTOR,  0x0303u | (0x0303u << 16));   /* ONE_MINUS_SRC_ALPHA */
+    emit(NV4097_SET_BLEND_EQUATION,      0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
+    emit_textured_draw_full(TEX_OFFSET, TEX_W, TEX_H, 0x85u | 0x20u, 0, RVTX_OFFSET);
+}
+
 /* The same quad on a cube map: SET_TEXTURE_FORMAT's bit 2 says cube, and the
  * vertices are the ones whose texcoord is a direction. */
 static void emit_cube_draw(void)
@@ -926,6 +962,34 @@ static void emit_shader_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
 }
 
+/* --clip / --clip-keep: the --shader triangle with a vertex program that
+ * also writes o5 = v3, the colour (0, 0, 1, 1), so user clip plane 1's
+ * distance (o5.z) is 1 everywhere. SET_USER_CLIP_PLANE_CONTROL (0x1478, one
+ * 4-bit op per plane) enables plane 1 as ENABLE_LT (keeps d <= 0: the whole
+ * triangle is clipped, the clear colour stays) or as ENABLE_GE (keeps d >= 0:
+ * the red comes through). A renderer that ignores the register draws red in
+ * both. The register goes back to 0 afterwards, as a title's reset would. */
+#define NV4097_SET_USER_CLIP_PLANE_CONTROL 0x00001478u
+static void emit_clip_draw(int keep)
+{
+    u8 vp[48];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 0);   /* MOV o1, v3      */
+    rsx_test_vp_mov_out(vp + 32, 3, RSX_TEST_VP_SWZ_IDENT, 5, 1);   /* MOV o5, v3, END */
+    emit_programs(vp, sizeof vp, FP_OFFSET);
+    emit(NV4097_SET_USER_CLIP_PLANE_CONTROL, (keep ? 2u : 1u) << 4);  /* plane 1 */
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(SVTX_OFFSET +  0));  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(SVTX_OFFSET + 16));  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3  */
+    emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
+    emit(NV4097_SET_USER_CLIP_PLANE_CONTROL, 0u);
+}
+
 /* Depth test on, LESS, writes on -- the state a title sets for opaque
  * geometry -- and the two triangles as separate BEGIN/END pairs, which is how
  * a title issues two draws rather than one split primitive stream. */
@@ -1020,7 +1084,8 @@ static void submit_frame(int with_draw)
             emit(NV4097_CLEAR_SURFACE,            0xF0u);
         }
     }
-    if (with_draw == 12)     emit_depth_bounds_draw();
+    if (with_draw == 15)     emit_border_draw();
+    else if (with_draw == 12) emit_depth_bounds_draw();
     else if (with_draw == 11) emit_cube_draw();
     else if (with_draw == 10) emit_mrt_draws(0);
     else if (with_draw == 9) emit_mrt_draws(1);
@@ -1031,6 +1096,7 @@ static void submit_frame(int with_draw)
     else if (with_draw == 5) emit_mip_draw();
     else if (with_draw == 4) emit_depth_draw();
     else if (with_draw == 3) emit_shader_draw();
+    else if (with_draw == 16 || with_draw == 17) emit_clip_draw(with_draw == 17);
     else if (with_draw == 2) emit_textured_draw();
     else if (with_draw == 1 || with_draw == 13) emit_triangle_draw();
 
@@ -1141,8 +1207,9 @@ static int run_thread_check(void)
  * Neither had ever been initialised off Windows -- the Windows build takes
  * WASAPI and XInput -- so nothing said whether they even run. This is not a
  * sound or input test: it is the assertion that init, a few polls and
- * shutdown complete, twice, and that a shutdown with no device open is
- * survivable. With SDL_AUDIODRIVER=dummy and no controller plugged in it
+ * shutdown complete, twice, that a shutdown with no device open is
+ * survivable, and that port 0 with no controller reports a pad at rest
+ * (sticks centred). With SDL_AUDIODRIVER=dummy and no controller plugged in it
  * needs no hardware, which is what lets CI run it.
  * -----------------------------------------------------------------------*/
 static int run_audio_pad_check(void)
@@ -1202,6 +1269,30 @@ static int run_audio_pad_check(void)
             nanosleep(&ts, NULL);
         }
 
+        /* Port 0 is served with no device behind it, and what it reports
+         * then must be a pad at rest: both sticks centred (128), not zero,
+         * which is full deflection up and left -- a title would steer and
+         * turn its camera on its own. */
+        r = cellPadGetData(0, (CellPadData*)(uintptr_t)HEAP_BASE);
+        if (r != CELL_OK) {
+            fprintf(stderr, "[host] cellPadGetData(0) -> 0x%08X\n", (unsigned)r);
+            rc = 6;
+        } else {
+            static const struct { int off; const char* name; } sticks[] = {
+                { CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X, "right x" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y, "right y" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X,  "left x" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y,  "left y" },
+            };
+            for (unsigned k = 0; k < sizeof sticks / sizeof sticks[0]; k++) {
+                const uint8_t* p = vm_base + HEAP_BASE + 4u + 2u * (unsigned)sticks[k].off;
+                unsigned v = ((unsigned)p[0] << 8) | p[1];
+                printf("[host] port 0 %s stick = %u %s\n", sticks[k].name, v,
+                       v == 128 ? "OK" : "NOT CENTRED");
+                if (v != 128) rc = 6;
+            }
+        }
+
         r = cellPadEnd();
         if (r != CELL_OK) { fprintf(stderr, "[host] cellPadEnd -> 0x%08X\n", (unsigned)r); rc = 6; }
         r = cellAudioQuit();
@@ -1233,7 +1324,8 @@ static int run_audio_pad_check(void)
 static int mode_needs_translator(int mode)
 {
     return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
-           mode == 9 || mode == 10 || mode == 11;
+           mode == 9 || mode == 10 || mode == 11 || mode == 15 ||
+           mode == 16 || mode == 17;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -1254,6 +1346,9 @@ static const char* mode_flag_name(int mode)
     case 9:  return "--mrt";
     case 10: return "--mrt-a";
     case 11: return "--cube";
+    case 15: return "--border";
+    case 16: return "--clip";
+    case 17: return "--clip-keep";
     default: return "(mode)";
     }
 }
@@ -1359,7 +1454,20 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--split-present") == 0) do_draw = 13;
         /* --feedback: see emit_feedback_draws. */
         else if (strcmp(argv[i], "--feedback") == 0) do_draw = 14;
+        /* --border: see emit_border_draw. Metal only for now: the Vulkan
+         * backend still samples every border as transparent black. */
+        else if (strcmp(argv[i], "--border") == 0) do_draw = 15;
+        /* --clip / --clip-keep: see emit_clip_draw. */
+        else if (strcmp(argv[i], "--clip") == 0) do_draw = 16;
+        else if (strcmp(argv[i], "--clip-keep") == 0) do_draw = 17;
     }
+#if !defined(__APPLE__)
+    if (do_draw == 15) {
+        printf("[host] --border: the %s backend does not honour SET_TEXTURE_BORDER_COLOR yet; skipped\n",
+               HOST_BACKEND_NAME);
+        return 0;
+    }
+#endif
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
     if (mode_needs_translator(do_draw) && !HOST_BACKEND_GUEST_SHADERS) {
@@ -1404,7 +1512,8 @@ int main(int argc, char** argv)
     }
     if (do_draw == 1 || do_draw == 13) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
-    if (do_draw == 3) upload_shader_triangle();
+    if (do_draw == 15) { upload_texture(); upload_border_quad(); }
+    if (do_draw == 3 || do_draw == 16 || do_draw == 17) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
     if (do_draw == 12) upload_depth_bounds_triangles();
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
@@ -1514,12 +1623,15 @@ int main(int argc, char** argv)
          * face's colour: any other face's colour means a face went missing on
          * the way up or the image was sampled as 2D.
          */
-        u32 want = (do_draw == 12) ? 0xFF0000FFu   /* blue, inside its bounds */
+        u32 want = (do_draw == 15) ? BORDER_ARGB   /* the border, not the texture */
+                 : (do_draw == 12) ? 0xFF0000FFu   /* blue, inside its bounds */
                  : (do_draw == 11) ? CUBE_ARGB
                  : (do_draw == 10) ? MRT_A_ARGB
                  : (do_draw == 9) ? MRT_B_ARGB
                  : (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
+                 : (do_draw == 17) ? 0xFFFF0000u  /* plane 1 keeps d >= 0        */
+                 : (do_draw == 16) ? CLEAR_ARGB   /* plane 1 clipped it all      */
                  : (do_draw == 14) ? 0xFFFF0000u  /* the copy kept the triangle  */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
                  : (do_draw == 5) ? (s_mip_aniso ? MIP_L0_ARGB : MIP_L1_ARGB)

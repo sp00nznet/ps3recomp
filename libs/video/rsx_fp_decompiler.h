@@ -86,11 +86,21 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref);
 float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 
 /* Scale texel-space (RSX_TEX_FMT_UNNORM) coordinates into HLSL's 0..1 range.
- * unnorm_mask selects the units; dim[u] gives that unit's {width, height};
- * cube units are skipped. Returns the number of Sample sites patched, or -1 if
+ * unnorm_mask selects the units; dim[u] gives that unit's {width, height,
+ * depth}; cube units are skipped and volume_mask units (Texture3D) are divided
+ * by their depth as well. Returns the number of Sample sites patched, or -1 if
  * the buffer would overflow. A no-op when unnorm_mask is 0. */
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
-                              const u32 dim[][2], u32 cube_mask);
+                              const u32 dim[][3], u32 cube_mask, u32 volume_mask);
+
+/* WPOS on an antialiased surface held at its sample resolution (sx x sy
+ * samples a pixel, as in guest memory). The RSX runs the program once a pixel
+ * and WPOS is that pixel's window position; the host shades each sample and
+ * SV_POSITION counts samples. Rewrites the program's WPOS to the centre of the
+ * pixel its sample belongs to. Returns 1 when patched, 0 when there is nothing
+ * to do (a 1x1 grid, or no WPOS read), or -1 without mutation when the entry
+ * point is not found, the grid is already applied, or the buffer is short. */
+int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy);
 
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
@@ -124,7 +134,8 @@ int rsx_fp_decompile_buffered_ex(
 /* Native depth texture comparison metadata. Disabled descriptors preserve the
  * original shader byte-for-byte. enabled=2 marks an active unsupported layout.
  * RSX ADDRESS zfunc0/7 and texture alpha-kill bypass comparison; modes1..6
- * compare the source reference against stored depth. R32 color snapshots are
+ * compare stored depth against the source reference (depth FUNC reference,
+ * the reverse of ARB_shadow's order). R32 color snapshots are
  * sampled explicitly, so no native depth texture/SampleCmp binding is needed.
  * Supported: decoded D24_D8/D16, 2D TEX/TXP, one level, matching nearest or
  * linear min/mag filters. Float-depth formats, cubes/3D, multiple levels and
@@ -143,7 +154,8 @@ int rsx_fp_decompile_buffered_shadow_ex(
     char* out, u32 out_size, u32* out_constant_count);
 
 /* Extract the exact runtime inline-CONST payload. Returns the slot count on
- * success or -1 for an unterminated/truncated/oversized program. */
+ * success or -1 for an unterminated/truncated/oversized program. Only the
+ * first `count` slots are written; the rest of `values` is left as it was. */
 int rsx_fp_collect_constants(
     const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
 

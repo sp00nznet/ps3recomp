@@ -32,6 +32,15 @@ extern "C" {
  * to the PS3 timebase. Called from every lifted mftb site (ppu_lifter.py). */
 uint64_t ppu_timebase_now(void);
 
+#ifndef _WIN32
+/* Nanoseconds on the host monotonic clock that every guest clock derives from
+ * (the timebase above, sys_time_get_system_time, timer expirations), so they
+ * stay consistent with each other. On macOS this is mach_absolute_time: the
+ * mftb site is hot in game loops, and clock_gettime(CLOCK_MONOTONIC) there
+ * goes through _mach_boottime_usec + gettimeofday on every read. */
+uint64_t host_monotonic_ns(void);
+#endif
+
 #ifdef _WIN32
 /* Sub-millisecond timed-wait support for the lv2 sync primitives.
  * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,

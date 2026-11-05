@@ -72,7 +72,9 @@ class Pipeline(unittest.TestCase):
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
                             channels.index('/* Which image registered')]
-        (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + channels)
+        # SPU_TLS is defined earlier in spu_channels.c, outside the extracted block.
+        tls = '#if defined(_MSC_VER)\n#define SPU_TLS __declspec(thread)\n#else\n#define SPU_TLS __thread\n#endif\n'
+        (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + tls + channels)
         return runtime
 
     def test_exact_dedup_and_same_address_isolation(self):
@@ -308,6 +310,55 @@ class Pipeline(unittest.TestCase):
         self.assertNotEqual(rebuild.returncode, 0)
         self.assertIn('SPU generation incomplete', rebuild.stdout + rebuild.stderr)
         self.assertFalse((build / 'spu' / 'spu_workloads.c').exists())
+
+    def digests(self, *blobs):
+        import hashlib
+        return [hashlib.sha256(b).hexdigest() for b in blobs]
+
+    def test_handled_programs_are_covered_without_a_second_registration(self):
+        a, b = elf(7), elf(9)
+        da, db = self.digests(a, b)
+        handled = self.root / 'handled.json'
+        handled.write_text(json.dumps({da: 'registered by the title build as image 102'}))
+        result = self.run_pipeline(('input.bin', a + b), extra=['--handled', str(handled)])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        report = self.manifest()
+        self.assertTrue(report['complete'])
+        by = {p['sha256']: p for p in report['programs']}
+        self.assertEqual(by[da]['status'], 'handled')
+        self.assertEqual(by[da]['reason'], 'registered by the title build as image 102')
+        self.assertFalse((self.output / by[da]['name']).exists())
+        self.assertEqual(by[db]['status'], 'registered')
+        registry = (self.output / 'spu_workloads.c').read_text()
+        self.assertNotIn(by[da]['fingerprint'], registry)
+        self.assertIn(by[db]['fingerprint'], registry)
+
+    def test_pinned_image_ids_are_used_and_required(self):
+        a, b = elf(7), elf(9)
+        da, db = self.digests(a, b)
+        ids = self.root / 'ids.json'
+        ids.write_text(json.dumps({da: 120, db: 121}))
+        result = self.run_pipeline(('input.bin', a + b), extra=['--image-ids', str(ids)])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        report = self.manifest()
+        self.assertEqual({p['sha256']: p['image_id'] for p in report['programs']}, {da: 120, db: 121})
+        self.assertIn('spu_begin_image(120)', (self.output / 'spu_workloads.c').read_text())
+        # A discovered program without a pinned id fails coverage instead of
+        # taking a content-derived id.
+        ids.write_text(json.dumps({da: 120}))
+        result = self.run_pipeline(('input.bin', a + b), extra=['--image-ids', str(ids)])
+        self.assertNotEqual(result.returncode, 0)
+        report = self.manifest()
+        self.assertFalse(report['complete'])
+        self.assertEqual({p['sha256']: p['status'] for p in report['programs']}[db], 'unsupported')
+
+    def test_stale_handled_or_pinned_entries_fail(self):
+        stale = self.root / 'stale.json'
+        stale.write_text(json.dumps({'0' * 64: 'gone'}))
+        result = self.run_pipeline(('input.bin', elf(7)), extra=['--handled', str(stale)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.manifest()['complete'])
+        self.assertTrue(any('not discovered' in e for e in self.manifest()['errors']))
 
     def test_legacy_images_mode_still_builds(self):
         images = self.root / 'images'

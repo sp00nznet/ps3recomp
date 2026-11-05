@@ -6,6 +6,7 @@
  * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
  */
 #include "sys_cond.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -120,6 +121,7 @@ int64_t sys_cond_destroy(ppu_context* ctx)
 
 int64_t sys_cond_wait(ppu_context* ctx)
 {
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
     const char* peek = getenv("PS3_COND_PEEK");
@@ -195,7 +197,10 @@ int64_t sys_cond_wait(ppu_context* ctx)
     while (*link != &waiter) link = &(*link)->next;
     *link = waiter.next;
     cond_unlock(c);
+    /* Re-acquiring counts as waiting on the mutex (sys_mutex_destroy). */
+    __atomic_add_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < depth; ++i) guest_lock(m);
+    __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
     return result;

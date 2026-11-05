@@ -44,6 +44,8 @@
  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
  */
 
+#include "spu_interp.h"
+#include "spu_overlay_residency.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -104,12 +106,15 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 void spu_wrch(spu_context*, uint32_t, u128);
 void spu_overlay_register_region(uint32_t, uint32_t, int);
 void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+void spu_overlay_register_source(uint32_t, int);
+void spu_overlay_register_sig(const uint8_t sig[16], int);
 
 /* The lifted-code registry (spu_channels.c), which the test registers into. */
 typedef void (*test_spu_fn)(spu_context*);
 void spu_begin_image(int image_id);
 void spu_register_function(uint32_t addr, test_spu_fn fn);
 test_spu_fn spu_lookup(uint32_t addr, int image_id);
+test_spu_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 void spu_stop(spu_context* ctx);
 
 /* ---------------------------------------------------------------------------
@@ -398,6 +403,9 @@ static void test_resident_code_regions(void)
     spu_overlay_note_get(ctx, 0x500000, ctx->ls + a, 0x100);
     spu_overlay_note_get(ctx, 0x600000, ctx->ls + b, 0x100);
     spu_overlay_note_get(ctx, 0x500100, ctx->ls + a + 0x100, 0x100);
+    /* The interpreter's rejoin probe has to agree with the dispatcher. */
+    check(spu_lifted_lookup(ctx, a) == code_a, "interpreter rejoins the first streamed job's code");
+    check(spu_lifted_lookup(ctx, b) == code_b, "interpreter rejoins the second streamed job's code");
     ctx->pc = a; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 81, "first streamed job survives second job and continuation DMA");
     ctx->pc = b; spu_indirect_branch(ctx);
@@ -405,10 +413,215 @@ static void test_resident_code_regions(void)
     spu_overlay_note_get(ctx, 0x700000, ctx->ls + a, 0x100);
     ctx->pc = a; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] != 81, "overwriting a code buffer invalidates its old image");
+    check(spu_lifted_lookup(ctx, a) == code_stale, "an overwritten buffer falls back to the base image");
     ctx->pc = b; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 82, "overwriting one buffer preserves the other");
     g_spu_trampoline_fn = 0;
     free(ctx);
+}
+
+
+/* A streamed region registered with its code bytes dispatches by residency
+ * after one exact comparison per load, never on stale or unverified bytes. */
+static void code_verified(spu_context* ctx) { ctx->gpr[3]._u32[0] = 84; }
+static void test_verified_resident_code_regions(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate verified streamed code context"); return; }
+    spu_context_init(ctx, 0);
+    const uint32_t base = 0x13000, ea = 0x800000;
+    uint8_t code[0x40];
+    for (unsigned i = 0; i < sizeof code; ++i) code[i] = (uint8_t)(0x40 + i);
+    spu_begin_image(84); spu_register_function(base, code_verified);
+    spu_begin_image(85); spu_register_function(base, code_stale);
+    spu_begin_image(0);
+    const spu_overlay_code_segment seg = {base, sizeof code, code};
+    const spu_overlay_code_segment outside = {base + 0x3F0, sizeof code, code};
+    check(!spu_overlay_register_verified_region(ea, base, 0x400, 84, &outside, 1),
+          "verified region rejects code outside its span");
+    check(spu_overlay_register_verified_region(ea, base, 0x400, 84, &seg, 1),
+          "verified region registers");
+    ctx->image_id = 85;
+
+    memcpy(ctx->ls + base, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base, 0x200);
+    check(ctx->resident_code[0].verify_state == 1, "a load leaves the region pending");
+    check(spu_lifted_lookup(ctx, base) == code_verified, "matching load dispatches its lifted code");
+    check(ctx->resident_code[0].verify_state == 2, "first dispatch verifies the load");
+    ctx->ls[base] ^= 0xFF; /* an untracked store is not re-compared per transfer */
+    check(spu_lifted_lookup(ctx, base) == code_verified, "verified load dispatches without recomparison");
+
+    spu_overlay_note_get(ctx, ea + 0x200, ctx->ls + base + 0x200, 0x100);
+    check(ctx->resident_code[0].verify_state == 1, "continuation GET re-arms verification");
+    check(spu_lifted_lookup(ctx, base) == NULL, "mismatching bytes stay interpreted");
+    check(spu_lifted_lookup(ctx, base) == NULL, "rejected load is not compared again");
+
+    memcpy(ctx->ls + base, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base, 0x200);
+    check(spu_lifted_lookup(ctx, base) == code_verified, "a fresh load is verified again");
+
+    spu_overlay_note_get(ctx, 0x900000, ctx->ls + base + 0x80, 0x80);
+    check(spu_lifted_lookup(ctx, base) != code_verified, "foreign DMA into the span clears residency");
+
+    memset(ctx->resident_code, 0, sizeof ctx->resident_code);
+    memcpy(ctx->ls + base + 0x1000, code, sizeof code);
+    spu_overlay_note_get(ctx, ea, ctx->ls + base + 0x1000, 0x200);
+    check(!ctx->resident_code[0].image_id, "a load at another LS address is not resident");
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
+/* Dispatch memoizes registry lookups per host thread, misses included. An
+ * image whose functions register after its address was first dispatched
+ * (and missed) must still be found: registration invalidates the memo. */
+static void test_registry_lookup_memo(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate lookup memo context"); return; }
+    spu_context_init(ctx, 0);
+    const uint32_t a = 0x13000;
+    spu_begin_image(92); spu_register_function(a, code_b);
+    spu_begin_image(0);
+    ctx->image_id = 91;
+    check(spu_lifted_lookup(ctx, a) == NULL, "another image's function is not served");
+    check(spu_lifted_lookup(ctx, a) == NULL, "a repeated miss stays a miss");
+    spu_begin_image(91); spu_register_function(a, code_a);
+    spu_begin_image(0);
+    check(spu_lifted_lookup(ctx, a) == code_a, "registration invalidates a memoized miss");
+    ctx->pc = a; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 81, "indirect dispatch reaches the newly registered function");
+    ctx->image_id = 92;
+    check(spu_lifted_lookup(ctx, a) == code_b, "memo entries are keyed by image");
+
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
+/* Streamed code owns an LS interval even when its registry has a hole.
+ * Rejoining a different image at that hole executes stale guest code. */
+static void rejoin_primary(spu_context* c) { c->gpr[7]._u32[0] = 11; }
+static void rejoin_overlay(spu_context* c) { c->gpr[7]._u32[0] = 22; }
+static void rejoin_task(spu_context* c) { c->gpr[7]._u32[0] = 33; }
+static void rejoin_region(spu_context* c) { c->gpr[7]._u32[0] = 44; }
+static void test_resident_interpreter_rejoin(void)
+{
+    const uint32_t a = 0x18000, hole = a + 4, outside = a + 0x100;
+    spu_context* c = calloc(1, sizeof *c);
+    if (!c) { check(0, "allocate rejoin context"); return; }
+    spu_context_init(c, 0);
+    spu_begin_image(91);
+    spu_register_function(a, rejoin_primary);
+    spu_register_function(hole, rejoin_primary);
+    spu_register_function(outside, rejoin_primary);
+    spu_begin_image(92); spu_register_function(a, rejoin_overlay);
+    spu_register_function(hole, rejoin_overlay);
+    spu_begin_image(93); spu_register_function(a, rejoin_task);
+    spu_begin_image(94); spu_register_function(a, rejoin_region);
+    spu_begin_image(0);
+    c->image_id = 91;
+    check(spu_lifted_lookup(c, a) == rejoin_primary, "no resident identity preserves primary rejoin");
+    c->resident_ovl = 92;
+    check(spu_lifted_lookup(c, a) == rejoin_overlay, "overlay rejoin wins over same-LSA primary");
+    c->gpr[7]._u32[0] = 0; spu_dispatch(c, a);
+    check(c->gpr[7]._u32[0] == 22, "dispatcher actually executes resident overlay");
+    c->resident_task = 93;
+    check(spu_lifted_lookup(c, a) == rejoin_task, "task rejoin wins over overlay and primary");
+    check(spu_lifted_lookup(c, hole) == rejoin_overlay, "task registry hole falls through to overlay");
+    spu_overlay_register_region(0x810000, 0x100, 94);
+    spu_overlay_note_get(c, 0x810000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_region, "resident code rejoin wins all identities");
+    c->gpr[7]._u32[0] = 0; spu_dispatch(c, a);
+    check(c->gpr[7]._u32[0] == 44, "dispatcher actually executes authoritative resident code");
+    check(spu_lifted_lookup(c, hole) == NULL, "authoritative resident-code hole never rejoins stale images");
+    check(spu_lifted_lookup(c, outside) == rejoin_primary, "exclusive region end leaves primary eligible");
+    check(spu_lifted_lookup(c, a-4) == NULL, "address before region is not its code");
+    /* IL r8,123; only real interpreter execution can set this register. */
+    const uint32_t il = 0x40800000u | (123u << 7) | 8u;
+    c->ls[hole] = (uint8_t)(il >> 24); c->ls[hole+1] = (uint8_t)(il >> 16);
+    c->ls[hole+2] = (uint8_t)(il >> 8); c->ls[hole+3] = (uint8_t)il;
+    c->status = 0; c->gpr[8]._u32[0] = 0;
+    uint32_t next = spu_interp_run_until(c, hole, hole + 4);
+    check(next == hole+4 && c->gpr[8]._u32[0] == 123,
+          "owner miss executes actual LS instruction instead of stale-primary rejoin");
+    c->pc = a; c->status = 0;
+    check(spu_interp_run_until(c, a, a+4) == a && c->pc == a,
+          "interpreter rejoins correct resident entry before guest execution");
+    spu_overlay_note_get(c, 0x810010, c->ls + a + 16, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_region, "continuation DMA preserves code owner");
+    spu_overlay_note_get(c, 0x820000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == rejoin_task, "conflicting DMA invalidation exposes task again");
+    c->resident_task = 0;
+    check(spu_lifted_lookup(c, a) == rejoin_overlay, "cleared task exposes overlay");
+    c->resident_ovl = 0;
+    check(spu_lifted_lookup(c, a) == rejoin_primary, "cleared resident identities expose primary");
+    check(spu_lifted_lookup(c, 0x19000) == NULL, "all registry misses stay unlifted");
+    g_spu_trampoline_fn = 0;
+    free(c);
+}
+
+/* The dispatch cache (on unless SPU_DISPATCH_CACHE=0) must answer exactly as
+ * the resolver would after each input it keys on changes: a registration, a
+ * resident-code change through spu_overlay_note_get, the resident task and
+ * overlay, and a context re-initialised at the same address. */
+static void dc_primary(spu_context* c) { c->gpr[9]._u32[0] = 1; }
+static void dc_overlay(spu_context* c) { c->gpr[9]._u32[0] = 2; }
+static void dc_task(spu_context* c)    { c->gpr[9]._u32[0] = 3; }
+static void dc_region(spu_context* c)  { c->gpr[9]._u32[0] = 4; }
+static void test_dispatch_cache(void)
+{
+    const uint32_t a = 0x1C000;
+    spu_context* c = calloc(1, sizeof *c);
+    spu_context* d = calloc(1, sizeof *d);
+    if (!c || !d) { check(0, "allocate dispatch cache contexts"); free(c); free(d); return; }
+    spu_context_init(c, 0); spu_context_init(d, 1);
+    spu_begin_image(121); spu_register_function(a, dc_primary);
+    spu_begin_image(122); spu_register_function(a, dc_overlay);
+    spu_begin_image(124); spu_register_function(a, dc_region);
+    spu_begin_image(0);
+    c->image_id = 121; d->image_id = 121;
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: first lookup resolves the primary image");
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: repeated lookup gives the same answer");
+
+    c->resident_ovl = 122;
+    check(spu_lifted_lookup(c, a) == dc_overlay, "dcache: a resident overlay changes the answer");
+    c->resident_task = 123;   /* nothing registered for the task here yet */
+    check(spu_lifted_lookup(c, a) == dc_overlay, "dcache: task miss falls through to the overlay");
+    spu_begin_image(123); spu_register_function(a, dc_task); spu_begin_image(0);
+    check(spu_lifted_lookup(c, a) == dc_task, "dcache: a later registration is seen at once");
+    c->resident_task = 0; c->resident_ovl = 0;
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: clearing task and overlay restores the primary");
+
+    spu_overlay_register_region(0x830000, 0x100, 124);
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: a resident region takes over");
+    check(spu_lifted_lookup(d, a) == dc_primary, "dcache: another context on the thread keeps its own answer");
+    spu_overlay_note_get(c, 0x840000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: a foreign GET into the region drops it");
+
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: the region is resident again");
+    spu_context_init(c, 0); c->image_id = 121;   /* same address, new lifetime */
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: a re-initialised context does not inherit entries");
+    /* A fresh lifetime that reaches the same residency count through another
+     * region must not meet the old lifetime's entry either. */
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+    check(spu_lifted_lookup(c, a) == dc_region, "dcache: region resident in this lifetime");
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_overlay_register_region(0x850000, 0x100, 125);
+    spu_overlay_note_get(c, 0x850000, c->ls + a + 0x800, 16);
+    check(spu_lifted_lookup(c, a) == dc_primary, "dcache: equal residency count in a new lifetime is a miss");
+
+    if (!getenv("SPU_DISPATCH_CACHE")) {
+        /* Only spu_overlay_note_get may change resident code; a direct write
+         * that bypasses it keeps the cached answer, which shows the cache is
+         * on by default. */
+        spu_overlay_note_get(c, 0x830000, c->ls + a, 16);
+        check(spu_lifted_lookup(c, a) == dc_region, "dcache: region resident before the bypass");
+        memset(c->resident_code, 0, sizeof c->resident_code);
+        check(spu_lifted_lookup(c, a) == dc_region, "dcache: on by default (a hit skips the resolver)");
+    }
+    free(c); free(d);
 }
 
 /* A real taskset also stores 0xA70 in its API table. That address alone
@@ -758,6 +971,84 @@ static void test_nonzero_link_return(void)
     free(ctx);
 }
 
+/* Small GETs (under 512 bytes) can only match an overlay source by EA, and
+ * spu_overlay_note_get skips the source scan for a small GET whose EA it has
+ * never seen registered. That shortcut must never hide a source: every
+ * registered EA still matches at every size, including while another thread
+ * is registering, and only unregistered EAs are skipped. */
+#define PREFILTER_SOURCES 120
+static uint32_t prefilter_ea(unsigned i)
+{
+    /* Dense runs, multiples of large powers of two and zero, so EAs that
+     * agree in their low or high bits all appear. */
+    if (i == 0) return 0;
+    if (i < 40) return 0x00700000u + i * 0x80u;
+    if (i < 80) return (i - 39u) << 23;
+    return 0x0A000000u + (i - 80u) * 0x10000u + 0x10u;
+}
+static volatile int g_prefilter_published;   /* sources registered so far */
+static void* prefilter_reader(void* arg)
+{
+    spu_context* ctx = (spu_context*)arg;
+    uintptr_t misses = 0;
+    for (unsigned round = 0; round < 20000; ++round) {
+        int n = __atomic_load_n(&g_prefilter_published, __ATOMIC_ACQUIRE);
+        if (!n) continue;
+        unsigned i = (round * 2654435761u) % (unsigned)n;
+        ctx->resident_ovl = 0;
+        spu_overlay_note_get(ctx, prefilter_ea(i), ctx->ls + 0x20000, 16);
+        if (ctx->resident_ovl != (int)(200 + i)) misses++;
+        if (n == PREFILTER_SOURCES && round > 10000) break;
+    }
+    return (void*)misses;
+}
+static void test_overlay_source_prefilter(void)
+{
+    spu_context* ctx[3];
+    for (int t = 0; t < 3; ++t) {
+        ctx[t] = (spu_context*)calloc(1, sizeof *ctx[t]);
+        if (!ctx[t]) { check(0, "allocate prefilter context"); return; }
+        spu_context_init(ctx[t], 0);
+    }
+    pthread_t th[3];
+    for (int t = 0; t < 3; ++t) pthread_create(&th[t], NULL, prefilter_reader, ctx[t]);
+    for (unsigned i = 0; i < PREFILTER_SOURCES; ++i) {
+        spu_overlay_register_source(prefilter_ea(i), (int)(200 + i));
+        __atomic_store_n(&g_prefilter_published, (int)(i + 1), __ATOMIC_RELEASE);
+    }
+    uintptr_t misses = 0;
+    for (int t = 0; t < 3; ++t) { void* r; pthread_join(th[t], &r); misses += (uintptr_t)r; }
+    check(misses == 0, "a small GET of an EA registered before it never misses, even mid-registration");
+
+    spu_context* c = ctx[0];
+    int all = 1;
+    static const uint32_t sizes[] = { 4, 16, 128, 511, 512, 0x400 };
+    for (unsigned i = 0; i < PREFILTER_SOURCES; ++i)
+        for (unsigned k = 0; k < sizeof sizes / sizeof sizes[0]; ++k) {
+            c->resident_ovl = 0;
+            spu_overlay_note_get(c, prefilter_ea(i), c->ls + 0x20000, sizes[k]);
+            if (c->resident_ovl != (int)(200 + i)) all = 0;
+        }
+    check(all, "every registered EA matches at every GET size");
+
+    c->resident_ovl = 5;
+    spu_overlay_note_get(c, 0x00700040u, c->ls + 0x20000, 16);
+    spu_overlay_note_get(c, 0x0BFF0000u, c->ls + 0x20000, 16);
+    check(c->resident_ovl == 5, "a small GET of an unregistered EA changes nothing");
+
+    /* Signature entries still need a sizeable GET; the EA set is not used for them. */
+    uint8_t sig[16];
+    for (int b = 0; b < 16; ++b) sig[b] = (uint8_t)(0xA0 + b);
+    spu_overlay_register_sig(sig, 330);
+    memcpy(c->ls + 0x20000, sig, 16);
+    c->resident_ovl = 5;
+    spu_overlay_note_get(c, 0x0C000040u, c->ls + 0x20000, 256);
+    check(c->resident_ovl == 5, "a small GET carrying a signature at an unregistered EA does not match");
+    spu_overlay_note_get(c, 0x0C000040u, c->ls + 0x20000, 512);
+    check(c->resident_ovl == 330, "a 512-byte GET still matches by signature");
+    for (int t = 0; t < 3; ++t) free(ctx[t]);
+}
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -767,12 +1058,17 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_verified_resident_code_regions();
+    test_registry_lookup_memo();
+    test_resident_interpreter_rejoin();
+    test_dispatch_cache();
     test_lle_taskset_syscall();
     test_taskset_resume_identity();
     test_guest_stack_reset();
     test_taskset_resume_stack();
     test_alternate_link_return();
     test_nonzero_link_return();
+    test_overlay_source_prefilter();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);

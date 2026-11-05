@@ -520,6 +520,77 @@ int main(void)
         check_absent("persp_off_no_helper", hlsl, "_rsx_inv_w");
     }
 
+    /* WPOS on an antialiased target held at its sample grid: every sample
+     * reads the centre of its pixel. A perspective-corrected texcoord keeps
+     * reading w from the same SV_POSITION, which the rewrite leaves alone. */
+    {
+        u8 prog[32];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0));            /* MOV r0, WPOS */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x17) | OUTMASK_ALL | OUTREG(1) | INSRC(6) | TEXU(0) | END);
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);              /* TEX r1, TC2 */
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 1u << 31);
+        u32 nk = 0;
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        char before[sizeof hlsl];
+        memcpy(before, hlsl, sizeof hlsl);
+
+        check_true("wpos_grid_1x1_noop", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 1, 1) == 0 &&
+                                         !strcmp(before, hlsl));
+        check_true("wpos_grid_short_buffer",
+                   rsx_fp_apply_wpos_grid(hlsl, (u32)strlen(hlsl) + 8, 2, 1) == -1 &&
+                   !strcmp(before, hlsl));
+        check_true("wpos_grid_2x1", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 1) == 1);
+        check("wpos_grid_first_line", hlsl,
+              "float4 main(PSInput input) : SV_TARGET {\n"
+              "    input.position.xy = floor(input.position.xy / float2(2, 1)) + 0.5;\n");
+        check("wpos_grid_inv_w_kept", hlsl, "_rsx_inv_w(input.position)");
+        check_true("wpos_grid_once", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 1) == -1);
+
+        /* Two colour exports: the PSOutput entry point. */
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | OUTREG(2) | INSRC(0) | END); /* MOV r2, WPOS */
+        put_word(prog + 28, 0);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_true("wpos_grid_mrt_2x2", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 2) == 1);
+        check("wpos_grid_mrt_line", hlsl,
+              "PSOutput main(PSInput input) {\n"
+              "    input.position.xy = floor(input.position.xy / float2(2, 2)) + 0.5;\n");
+
+        /* No WPOS read: byte-identical. */
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);      /* MOV r0, COL0 */
+        rsx_fp_decompile_buffered_ex(prog, 16, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        memcpy(before, hlsl, sizeof hlsl);
+        check_true("wpos_grid_no_wpos_noop", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 2) == 0 &&
+                                             !strcmp(before, hlsl));
+    }
+
+    /* WPOS follows the SET_SHADER_WINDOW convention through fp_alpha.y/.z in a
+     * buffered program; an unbuffered one has no fp_alpha and reads the host
+     * position as before. A program that does not read WPOS gets no helper. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0) | END); /* MOV r0, WPOS */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check("wpos_buffered_read",   hlsl, "_rsx_wpos(input.position)");
+        check("wpos_buffered_helper", hlsl,
+              "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
+              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)");
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        check("wpos_unbuffered_identity", hlsl, "#define _rsx_wpos(p) (p)\n");
+
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_absent("wpos_no_read_no_helper", hlsl, "_rsx_wpos");
+
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

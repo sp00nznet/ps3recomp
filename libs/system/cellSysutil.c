@@ -222,6 +222,9 @@ s32 cellSysutilCheckCallback(void)
     /* Turn psnr replies and pushes into queued NP callbacks first, so this
      * same poll delivers them. A no-op when no psnr server is configured. */
     { extern void np_psnr_pump(void); np_psnr_pump(); }
+    /* A pending PSN terms-of-service answer (cellSysutilNpEula.c) joins the
+     * completions, so this same poll runs the title's callback. */
+    { extern void ps3_np_eula_tick(void); ps3_np_eula_tick(); }
     drain_guest_completions();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll
@@ -428,6 +431,13 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:     v = 0; break; /* No DST */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:           v = 0; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT: v = 0; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_LICENSE_AREA: {
+        /* The console's licence area (a game picks region variants of its assets by it). $PS3_LICENSE_AREA (a number,
+         * the CELL_SYSUTIL_LICENSE_AREA_* values) wins; ASSUMPTION: without it, North America. */
+        const char* e = getenv("PS3_LICENSE_AREA");
+        v = (e && *e) ? (s32)atoi(e) : CELL_SYSUTIL_LICENSE_AREA_A;
+        break;
+    }
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:   v = 1; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:  v = 0; break; /* 60Hz */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:     v = 1; break; /* Rumble on */
@@ -662,6 +672,36 @@ s32 cellDiscGameUnregisterDiscChangeCallback(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * cellSysconf
+ *
+ * The accessory settings screen (audio devices, Bluetooth headsets) the system
+ * overlays on a title. There is no such screen here, so Open finishes at
+ * once: callback(CELL_OK, userdata) is queued as if the user had closed it,
+ * and it runs on the title's next cellSysutilCheckCallback like every other
+ * dialog completion, never from inside Open.
+ *
+ * Abort closes whatever settings screen is up; with none ever left open it is
+ * a successful no-op. Resistance: Fall of Man calls it whenever it tears its
+ * front end down -- starting the campaign, quitting, entering online play --
+ * and it reached the game as an unresolved import.
+ * -----------------------------------------------------------------------*/
+
+s32 cellSysconfOpen(u32 type, u32 func, u32 userdata, u32 extparam, u32 id)
+{
+    (void)extparam; (void)id;
+    printf("[cellSysutil] SysconfOpen(type=%u, func=0x%08X) -> closed\n", type, func);
+    if (func)
+        cellSysutilQueueGuestCallback(func, (u64)CELL_OK, (u64)userdata);
+    return CELL_OK;
+}
+
+s32 cellSysconfAbort(void)
+{
+    printf("[cellSysutil] SysconfAbort()\n");
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * Misc utilities
  * -----------------------------------------------------------------------*/
 
@@ -674,4 +714,87 @@ s32 cellSysutilGetLicenseArea(void)
 s32 cellSysutilIsMeetingApp(void)
 {
     return 0; /* Not a meeting app */
+}
+
+/* ---------------------------------------------------------------------------
+ * Host quit: the window's close button, Cmd+Q, a host menu's "Quit game".
+ *
+ * What the console's "Quit Game" does first: every registered sysutil
+ * callback gets CELL_SYSUTIL_REQUEST_EXITGAME, and the title tidies up and
+ * calls sys_process_exit, which ends the process here (exit()). A title that
+ * has not done so within PS3_QUIT_GRACE_MS (default 3000) is ended for it,
+ * as the console does: once no save is being written (cellSaveData.c
+ * ps3_savedata_busy, waited on for up to 10 s), with stdio flushed and the
+ * atexit handlers run, exit(0) -- a normal end for whatever launched the
+ * game. Runs on its own thread, so the caller (the main thread, the frame
+ * clock) returns at once; a second request is ignored.
+ * -----------------------------------------------------------------------*/
+#ifdef _WIN32
+static DWORD WINAPI host_quit_thread(LPVOID unused)
+#else
+#include <unistd.h>
+static void* host_quit_thread(void* unused)
+#endif
+{
+    (void)unused;
+    extern int ps3_savedata_busy(void);   /* cellSaveData.c */
+    int grace = 3000;
+    { const char* e = getenv("PS3_QUIT_GRACE_MS"); if (e && *e) grace = atoi(e); }
+    if (grace < 0) grace = 0;
+    int asked = 0;
+    for (int slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; ++slot) {
+        if (!s_callbacks[slot].registered || !s_callbacks[slot].guest_opd) continue;
+        const u64 args[8] = { CELL_SYSUTIL_REQUEST_EXITGAME, 0, s_callbacks[slot].userdata, 0, 0, 0, 0, 0 };
+        cellSysutilQueueGuestCallbackArgs(s_callbacks[slot].guest_opd, args);
+        asked++;
+    }
+    printf("[quit] REQUEST_EXITGAME to %d sysutil callback(s); waiting up to %d ms for the game\n",
+           asked, grace);
+    fflush(stdout);
+    const int step = 50;
+    for (int t = 0; t < grace; t += step) {
+#ifdef _WIN32
+        Sleep(step);
+#else
+        usleep(step * 1000);
+#endif
+    }
+    int waited = 0;
+    while (ps3_savedata_busy() && waited < 10000) {
+#ifdef _WIN32
+        Sleep(step);
+#else
+        usleep(step * 1000);
+#endif
+        waited += step;
+    }
+    printf("[quit] the game did not exit on its own; ending it (save in flight: %s, waited %d ms) -> exit 0\n",
+           ps3_savedata_busy() ? "yes, gave up" : "no", waited);
+    fflush(NULL);
+    exit(0);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static volatile int s_host_quit;
+
+int ps3_host_quitting(void) { return __atomic_load_n(&s_host_quit, __ATOMIC_ACQUIRE); }
+
+void ps3_host_quit(const char* why)
+{
+    if (__atomic_exchange_n(&s_host_quit, 1, __ATOMIC_ACQ_REL)) return;
+    printf("[quit] requested (%s)\n", why ? why : "host");
+    fflush(stdout);
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 0, host_quit_thread, NULL, 0, NULL);
+    if (h) { CloseHandle(h); return; }
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, host_quit_thread, NULL) == 0) { pthread_detach(th); return; }
+#endif
+    fflush(NULL);
+    exit(0);
 }

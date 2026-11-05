@@ -14,6 +14,7 @@
  */
 
 #include "../spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -487,7 +488,25 @@ static void test_float_compares(void) {
 /* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
+static void test_ls_quadwords(void) {
+    static spu_context ctx;
+    ctx.ls = ctx.ls_store;
+    for (unsigned i = 0; i < 16; ++i) ctx.ls[i] = (uint8_t)i;
+    TEST("lqd: big-endian words, aligned and wrapped address");
+    EXPECT_EQ(spu_ls_read128(&ctx, SPU_LS_SIZE + 7),
+              make128_words(0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F));
+    TEST("stqd: big-endian bytes, aligned and wrapped address");
+    spu_ls_write128(&ctx, SPU_LS_SIZE + 23,
+                   make128_words(0x01234567, 0x89ABCDEF, 0x76543210, 0xFEDCBA98));
+    static const uint8_t want[16] = {
+        0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,
+        0x76,0x54,0x32,0x10,0xFE,0xDC,0xBA,0x98};
+    if (!memcmp(ctx.ls + 16, want, sizeof want)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+}
+
 int main(void) {
+    test_ls_quadwords();
     test_immediate_loaders();
     test_simd_arith();
     test_multiply();

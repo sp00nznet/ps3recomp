@@ -149,6 +149,11 @@ render_timeout = 150
 [[port]]
 name    = "twistedmetal"
 dir     = "../ps3games/twistedmetal"
+# The FIOS file cache (cellSysCacheMount "TMX_FILECACHE", ~600 MB) is finalised
+# only on a clean shutdown. A gate run is killed at 90 s, so it leaves cache.idx
+# with a zeroed header, and the next boot loops over it and stops before
+# cellPadInit: 72 keys LOST, the same set every run.
+clean   = ["input/cache/TMX_FILECACHE"]
 cmd     = ["build-gate/twistedmetal", "input/EBOOT.elf"]
 timeout = 90
 expect  = "timeout"

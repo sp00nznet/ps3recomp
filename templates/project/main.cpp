@@ -47,6 +47,11 @@
 #include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
 #endif
 
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>   /* the main thread's run loop, see run_guest */
+#include <pthread.h>
+#endif
+
 #ifdef _WIN32
 /* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
  * excludes the multimedia timer API, so it is asked for by name -- and after
@@ -74,6 +79,12 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 void     ps3_load_prx_modules(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
+void     ps3_host_quit(const char* why);      /* cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
+
+/* sys_ppu_thread.c: the main thread's stack, as sys_ppu_thread_get_stack_information
+ * reports it. Left at 0 it names VM_STACK_BASE, the first created thread's stack. */
+extern uint32_t g_ppu_main_stack_addr;
+extern uint32_t g_ppu_main_stack_size;
 
 /* The status the guest handed to sys_process_exit. A title that exits that way
  * never returns through ppu_run, so this is only read on the path where the
@@ -143,6 +154,7 @@ extern "C" int  rsx_null_backend_pump_messages(void);
  * smaller arena makes every spawned thread's stack access out of bounds. */
 #define VM_SIZE       0x100010000ull   /* the full 32-bit guest space + a 64K guard */
 #define STACK_TOP     0x0FF00000u      /* main-thread stack, below the 0x10000000 segment */
+#define STACK_SIZE    0x00100000u      /* what the main thread is told it has */
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
 
@@ -228,6 +240,9 @@ static DWORD WINAPI frame_clock(LPVOID)
 
             if (rsx_backend_pump() != 0) {
                 rsx_ok = 0;              /* window closed */
+                /* ...so quit, as the console's Quit Game does, instead of
+                 * leaving the game running with no window. */
+                ps3_host_quit("window closed");
                 continue;
             }
             /* Present on a guest flip. A present on a fixed clock can catch the
@@ -297,18 +312,25 @@ static bool alloc_guest_vm(void)
 #else
     /* No vectored exception handlers off Windows, so the arena is mapped up
      * front and lazily backed by the OS: only pages the title touches cost
-     * anything. It stops below the 0xE0000000 mark, so ppu_vm_size arms the
-     * loader's bounds check for what is left.
+     * anything. It spans the whole 32-bit space plus the guard, as on Windows.
+     * It used to stop below 0xE0000000, but the raw SPU windows (local store
+     * and problem-state registers, runtime/spu/spu_raw.c) live from there up.
+     * Every load and store a title made into one was reported as an
+     * out-of-bounds access and dropped, so a raw SPU was never loaded or
+     * started, and sys_raw_spu_create, which clears the registers through
+     * vm_base directly, wrote past the end of the mapping. With the whole
+     * space backed, ppu_vm_size 0 also gives the loader's bounds check the
+     * one-compare fast path Windows already has.
      *
      * mmap, not calloc: vm_commit() hands vm_base + addr to mprotect, which
      * takes page-aligned addresses only. glibc serves an allocation this big
      * from its own mmap chunk and returns a pointer 16 bytes past the page
      * start, so every commit failed with EINVAL and sys_memory_allocate
      * answered ENOMEM to every call. mmap's base is page-aligned and zeroed. */
-    void* p = mmap(NULL, 0xE0000000u, PROT_READ | PROT_WRITE,
+    void* p = mmap(NULL, VM_SIZE, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     vm_base = (p == MAP_FAILED) ? nullptr : (uint8_t*)p;
-    ppu_vm_size = 0xE0000000u;
+    ppu_vm_size = 0;              /* the whole space is backed; no OOB guard needed */
 #endif
     return vm_base != nullptr;
 }
@@ -322,6 +344,55 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
 {
     ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7);
 }
+
+/* ---------------------------------------------------------------------------
+ * Running the guest
+ * -----------------------------------------------------------------------*/
+#if defined(__APPLE__)
+/* AppKit only runs on the process's main thread. The Metal backend creates
+ * its window and pumps its events with dispatch_sync onto the main queue
+ * when it is called from any other thread, as it is from the frame clock.
+ * With the guest on the main thread nothing ever serviced that queue: the
+ * frame clock blocked in its first rsx_backend_init, no vblank or flip was
+ * ever delivered and the FIFO never drained. A title that waits for a flip
+ * hangs there. So the guest runs on a thread of its own, with the same
+ * 256 MB host stack every guest thread gets (sys_ppu_thread.c), and the
+ * main thread turns the run loop until ppu_run returns. Headless runs never
+ * touch the main queue, which is why CI does not see the difference. */
+struct guest_run { uint32_t entry, stack_top; int rc; volatile int done; };
+
+static void* guest_thread(void* arg)
+{
+    guest_run* g = (guest_run*)arg;
+    g->rc = ppu_run(g->entry, g->stack_top);
+    __atomic_store_n(&g->done, 1, __ATOMIC_RELEASE);
+    CFRunLoopStop(CFRunLoopGetMain());
+    return nullptr;
+}
+
+static int run_guest(uint32_t entry, uint32_t stack_top)
+{
+    static guest_run g;
+    g.entry = entry; g.stack_top = stack_top; g.rc = 0; g.done = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256u * 1024u * 1024u);
+    pthread_t th;
+    int err = pthread_create(&th, &attr, guest_thread, &g);
+    pthread_attr_destroy(&attr);
+    if (err != 0) {
+        fprintf(stderr, "[boot] could not start the guest thread (%d)\n", err);
+        return -1;
+    }
+    /* Short slices: CFRunLoopStop only ends a run that is already going. */
+    while (!__atomic_load_n(&g.done, __ATOMIC_ACQUIRE))
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+    pthread_join(th, nullptr);
+    return g.rc;
+}
+#else
+static int run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry, stack_top); }
+#endif
 
 int main(int argc, char** argv)
 {
@@ -370,7 +441,12 @@ int main(int argc, char** argv)
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
 
-    int rc = ppu_run(entry, STACK_TOP);
+    /* A title that reads its own stack bounds (to find data its parent left
+     * below the top, say) gets the stack it really runs on. */
+    g_ppu_main_stack_addr = STACK_TOP - STACK_SIZE;
+    g_ppu_main_stack_size = STACK_SIZE;
+
+    int rc = run_guest(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
 
     /* A title that called sys_process_exit never reaches this line: that path

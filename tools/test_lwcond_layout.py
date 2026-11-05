@@ -41,16 +41,16 @@ static uint32_t vm_read32(uint32_t a) { return (uint32_t)mem[a] << 24 | mem[a + 
 static uint64_t vm_read64(uint32_t a) { return (uint64_t)vm_read32(a) << 32 | vm_read32(a + 4); }
 struct ppu_context { uint64_t gpr[32]; uint32_t thread_id; };
 /* The lwmutex side of sys_lwcond_wait: record which lwmutex it asked for and
- * hand back no semaphore, so the wait returns at once. */
-typedef void* HANDLE;
-#define INFINITE 0xFFFFFFFFu
+ * hand back no slot, so the wait returns at once. */
 #define LWM_OWNER 0x00
 #define LWM_RECUR 0x04
 static uint32_t s_asked = 0xFFFFFFFFu;
-static HANDLE lwm_sem(uint32_t lwmutex) { s_asked = lwmutex; return nullptr; }
-static void ReleaseSemaphore(HANDLE, long, void*) {}
+struct LwmSlot;
+static struct LwmSlot* lwm_slot(uint32_t lwmutex) { s_asked = lwmutex; return nullptr; }
+static void lwm_release(struct LwmSlot*) {}
+static int lwm_acquire(struct LwmSlot*, uint64_t) { return 1; }
 static void Sleep(unsigned) {}
-static unsigned WaitForSingleObject(HANDLE, unsigned) { return 0; }
+static void ppu_thread_note_block(uint64_t) {}
 %s
 %s
 int main() {

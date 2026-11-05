@@ -715,12 +715,13 @@ Each HLE module defines errors as `(base | local_code)`:
 | `0x80010700` | cellFs / sys_fs |
 | `0x80310700` | cellAudio |
 | `0x8002B100` | cellVideoOut |
-| `0x80210700` | cellGcmSys |
+| `0x80210000` | cellGcmSys |
 | `0x80130100` | cellNet |
 | `0x80121100` | cellPad |
 | `0x8002B000` | cellSysutil |
 | `0x80540000` | cellFont |
-| `0x80410700` | cellSpurs |
+| `0x80410700` | cellSpurs (core) |
+| `0x80410900` | cellSpurs (tasks) |
 | `0x80710100` | cellHttp |
 | `0x80720100` | cellSsl |
 

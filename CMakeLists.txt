@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # 2026 while the project shipped 0.6.x through 0.8.0, so every build printed
 # "ps3recomp runtime v0.3.0" and was believed. v0.9.0 is the first TAGGED one.
 project(ps3recomp_runtime
-    VERSION 0.11.0
+    VERSION 0.18.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
@@ -132,7 +132,6 @@ target_include_directories(ps3recomp_runtime PRIVATE
 if(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
         ws2_32      # Winsock for network modules
-        xinput      # XInput for gamepad
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
@@ -325,7 +324,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
-        $<$<CONFIG:Release,RelWithDebInfo>:-O2>
+        # Every configuration but Debug, including none: a port configured
+        # without CMAKE_BUILD_TYPE matched neither name and compiled the whole
+        # runtime -- the FIFO walker, the draw engine, the MFC -- at -O0.
+        $<$<NOT:$<CONFIG:Debug>>:-O2>
     )
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
     # hottest SPU op in lifted audio code. Probed rather than assumed: recent
@@ -405,6 +407,31 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
 
+    if(NOT WIN32)
+        # The vector single-precision ops against the exact per-lane references.
+        add_executable(test_spu_float_exact
+            runtime/spu/tests/test_spu_float_exact.c)
+        target_include_directories(test_spu_float_exact PRIVATE include runtime/spu)
+        target_compile_options(test_spu_float_exact PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_float_exact PRIVATE m)
+        add_test(NAME spu_float_exact COMMAND test_spu_float_exact)
+        set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
+
+        add_executable(test_spu_lockline_wait
+            runtime/spu/tests/test_spu_lockline_wait.c)
+        target_include_directories(test_spu_lockline_wait PRIVATE include)
+        target_compile_options(test_spu_lockline_wait PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_lockline_wait PRIVATE Threads::Threads)
+        add_test(NAME spu_lockline_wait COMMAND test_spu_lockline_wait)
+        set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
+
+    endif()
+    add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
+    target_include_directories(test_rsx_present_policy PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+
+
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME spinlock_word_width
@@ -419,6 +446,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
+        add_test(NAME spu_dma_repeat
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -485,6 +515,33 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+
+        # The polygon offset through the engine and the Metal backend on the
+        # GPU; the guest programs need the translation above.
+        if(APPLE)
+            add_executable(test_metal_poly_offset
+                libs/video/tests/test_metal_poly_offset.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_poly_offset.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_poly_offset PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_poly_offset PRIVATE
+                ps3recomp_msl_translation
+                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+            # Only what the engine and the backend reach; the rest of the
+            # runtime is not linked in.
+            target_link_options(test_metal_poly_offset PRIVATE "-Wl,-dead_strip")
+        endif()
     endif()
 
     # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang

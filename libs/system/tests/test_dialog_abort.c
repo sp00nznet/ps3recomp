@@ -14,6 +14,7 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void np_psnr_pump(void) {}
+void ps3_np_eula_tick(void) {}
 
 static unsigned failures, calls;
 static u32 last_opd;

@@ -96,6 +96,23 @@ int main(int argc, char** argv) {
     } else if (!strcmp(mode, "smc")) {
         word(0x4000, 0x40812003); /* il $3,0x240 (microstep supported) */
         word(0x4004, 0x35000180); /* bi $3 */
+    } else if (!strncmp(mode, "smc-ldst", 8)) {
+        /* A generated save/restore stub's shape: quadword stores and loads,
+         * then a branch. "smc-ldst" runs it on the microstep's load/store fast
+         * loop (LS diagnostics read as off); "smc-ldst-diag" leaves the gates
+         * unread, so the generic path runs it. Same result either way. */
+        if (!strcmp(mode, "smc-ldst")) g_spu_ls_watch_n = g_spu_ls_probe = g_spu_smc_watch = 0;
+        for (int k = 0; k < 4; k++) {
+            ctx.gpr[5]._u32[k] = 0x11223344u * (uint32_t)(k + 1);
+            ctx.gpr[6]._u32[k] = 0xA0B0C0D0u ^ (uint32_t)k;
+        }
+        ctx.gpr[1]._u32[0] = 0x3000;
+        word(0x4000, 0x40812003); /* il   $3,0x240 */
+        word(0x4004, 0x20FE0005); /* stqa $5,0x3F000 */
+        word(0x4008, 0x24008086); /* stqd $6,0x20($1) */
+        word(0x400C, 0x30FE0007); /* lqa  $7,0x3F000 */
+        word(0x4010, 0x34008088); /* lqd  $8,0x20($1) */
+        word(0x4014, 0x35000180); /* bi   $3 */
     } else if (!strcmp(mode, "stepcap") || !strcmp(mode, "negative-stepcap")) {
         word(0x4004, 0x04000082);
         word(0x4008, 0x30004800);
@@ -118,6 +135,17 @@ int main(int argc, char** argv) {
         puts("PASS"); return 0;
     }
     assert(ctx.gpr[21]._u32[0] == 0);
+    if (!strncmp(mode, "smc-ldst", 8)) {
+        for (int k = 0; k < 4; k++) {
+            const uint32_t v5 = ctx.gpr[5]._u32[k], v6 = ctx.gpr[6]._u32[k];
+            const uint8_t* a = &ctx.ls[0x3F000 + 4 * k];
+            const uint8_t* b = &ctx.ls[0x3020 + 4 * k];
+            assert(a[0] == (uint8_t)(v5 >> 24) && a[1] == (uint8_t)(v5 >> 16) &&
+                   a[2] == (uint8_t)(v5 >> 8) && a[3] == (uint8_t)v5);   /* big-endian in LS */
+            assert(b[0] == (uint8_t)(v6 >> 24) && b[3] == (uint8_t)v6);
+            assert(ctx.gpr[7]._u32[k] == v5 && ctx.gpr[8]._u32[k] == v6);
+        }
+    }
     if (!strncmp(mode, "stop", 4) || !strcmp(mode, "nested-stop") || !strcmp(mode, "halt")) {
         /* Baseline-equivalence controls, not assertions of architectural stop
          * correctness. The adapter's inherited numeric-stop-code behavior is
