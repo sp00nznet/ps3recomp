@@ -1,0 +1,16 @@
+--- tools/test_ppu_prio_start.py
++++ tools/test_ppu_prio_start.py
+@@ -16,8 +16,11 @@ with tempfile.TemporaryDirectory(prefix='ppu-prio-start-') as tmp:
+         '-ffunction-sections','-fdata-sections',
+         '-I'+str(root/'include'),'-I'+str(root/'runtime'),'-I'+str(root/'runtime/syscalls'),
+         str(root/'tests/test_ppu_prio_start.c'),*linker,'-o',str(binary)],check=True)
+-    quiet=subprocess.DEVNULL if os.environ.get('CI') else None
++    quiet=subprocess.PIPE if os.environ.get('CI') else None
+     for on in (False, True):
+         env={k:v for k,v in os.environ.items() if k!='PS3_PRIO_START'}
+         if on: env['PS3_PRIO_START']='1'
+-        subprocess.run([str(binary)],check=True,timeout=60,env=env,stderr=quiet)
++        result = subprocess.run([str(binary)], timeout=60, env=env, stderr=quiet, text=True)
++        if result.returncode and result.stderr:
++            print(result.stderr, file=sys.stderr, end='')
++        result.check_returncode()

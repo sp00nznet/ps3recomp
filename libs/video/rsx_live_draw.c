@@ -5288,9 +5288,7 @@ static void fetch_one(u32 base, u32 vertex_id, u32 base_index)
         if (a.type && a.size &&
             fetch_attr(i, base, vertex_id, base_index, v.a[i])) continue;
         if (i == 0) { dc.fetch_ok = 0; return; }
-        rsx_dsp_vertex_default(&g.rsx, i, v.a[i]);
-        if (i == 3 && v.a[3][0] == 0 && v.a[3][1] == 0 && v.a[3][2] == 0 && v.a[3][3] == 1)
-            v.a[3][0] = v.a[3][1] = v.a[3][2] = 1.0f;
+        rsx_vertex_fetch_default(&g.rsx, i, v.a[i]);
     }
     push_vert(&v);
 }

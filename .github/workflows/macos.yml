@@ -478,6 +478,10 @@ jobs:
           # walk they are now computed without.
           clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
           /tmp/test_vertex_fetch_plan
+          # Preserve explicitly written current colors, including black,
+          # while keeping the unwritten ATTR3 compatibility default.
+          clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_current_color libs/video/tests/test_vertex_current_color.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+          /tmp/test_vertex_current_color
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
