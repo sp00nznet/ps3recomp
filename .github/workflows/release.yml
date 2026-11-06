@@ -42,7 +42,7 @@ jobs:
           - platform: win-x64
             runs-on: windows-latest
           - platform: mac-arm64
-            runs-on: macos-14
+            runs-on: macos-15
           # Linux ships as the toolkit and the runtime library, not a game
           # runner: it has no renderer (the null backend's headless software path
           # is a CI check, not a graphics backend) and the PPU boot scaffold does
