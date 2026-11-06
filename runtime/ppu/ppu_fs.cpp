@@ -89,6 +89,7 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
 #define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
+#define CELL_FS_EBADF        (-2147418070)   /* 0x8001002A */
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
 #define CELL_FS_O_RDONLY     0
@@ -861,6 +862,22 @@ static void cellFsFsync(ppu_context* ctx)
     if (FILE* f = fd_file(fd)) fflush(f);
     ctx->gpr[3] = CELL_OK;
 }
+/* (fd, u64 size). The libs/filesystem version looks fds up in its own table,
+ * which cellFsOpen here never fills, so it always returned EBADF. */
+static void cellFsFtruncate(ppu_context* ctx)
+{
+    FILE* f = fd_file((int)(uint32_t)ctx->gpr[3]);
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    fflush(f);
+#ifdef _WIN32
+    int rc = _chsize_s(_fileno(f), (long long)ctx->gpr[4]);
+#else
+    int rc = ftruncate(fileno(f), (off_t)ctx->gpr[4]);
+#endif
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[FSDBG] cellFsFtruncate(fd=%d, size=0x%llX) -> %d\n",
+                                     (int)(uint32_t)ctx->gpr[3], (unsigned long long)ctx->gpr[4], rc);
+    ctx->gpr[3] = rc == 0 ? CELL_OK : (uint64_t)(int64_t)CELL_FS_EIO;
+}
 /* File-area preallocation (LBP cache warm-up spams this): host filesystems
  * grow files on write, so accepting is correct -- no preallocation needed. */
 static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
@@ -1001,6 +1018,7 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsFtruncate"), "cellFsFtruncate", cellFsFtruncate);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);
