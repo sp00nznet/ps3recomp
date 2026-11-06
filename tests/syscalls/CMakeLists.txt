@@ -55,6 +55,7 @@ set_tests_properties(lock_line PROPERTIES
 add_executable(test_sys_fs
     test_sys_fs.c
     "${PS3RECOMP_ROOT}/runtime/syscalls/sys_fs.c"
+    "${PS3RECOMP_ROOT}/runtime/platform/ps3_dev_flash.c"
 )
 target_include_directories(test_sys_fs PRIVATE
     "${PS3RECOMP_ROOT}/runtime/syscalls"
