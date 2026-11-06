@@ -141,12 +141,13 @@ void ppu_thread_note_block(uint64_t tid)
         __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
 }
 
-/* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
- * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
+/* Priority the creator runs at. Must be called under the table lock. Main
+ * registration now initializes a real priority; zero is the highest valid
+ * priority and must not be treated as an unset/default sentinel. */
 static int32_t creator_priority(uint64_t tid)
 {
     const ppu_thread_info* c = find_thread(tid);
-    if (!c || (c == &g_ppu_threads[0] && c->priority == 0)) return PPU_DEFAULT_PRIORITY;
+    if (!c) return PPU_DEFAULT_PRIORITY;
     return c->priority;
 }
 
@@ -325,6 +326,7 @@ uint64_t ppu_thread_register_main(void)
         t->ctx.thread_id = 1;
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
+        t->priority = 1001;                 /* default PS3 process priority */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
         ps3_tprof_thread('P', 1);
@@ -338,6 +340,18 @@ uint64_t ppu_thread_register_main(void)
     }
     table_unlock();
     return 1;
+}
+
+/* The ELF entry path may follow a host bootstrap which already claimed slot
+ * zero. Apply its process priority in either case, before guest dispatch. The
+ * legacy no-argument registration API remains available for other harnesses. */
+uint64_t ppu_thread_register_main_priority(int32_t priority)
+{
+    uint64_t id = ppu_thread_register_main();
+    table_lock();
+    g_ppu_threads[0].priority = (priority >= 0 && priority <= 3071) ? priority : 1001;
+    table_unlock();
+    return id;
 }
 
 /* ---------------------------------------------------------------------------

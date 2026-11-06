@@ -3523,9 +3523,12 @@ static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
         if (addr < r.end && r.begin < end && r.end > next) next = r.end;
     return next;
 }
+/* Default used by the PS3 executable entry path when PROC_PARAM is absent. */
+static int32_t g_ppu_primary_priority = 1001;
 
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
+    g_ppu_primary_priority = 1001;
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
     fseek(f, 0, SEEK_END);
@@ -3552,6 +3555,24 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         if (ph_off + 56 > fsz) break;   /* program header itself out of the file */
         const uint8_t* ph = file + ph_off;
         uint32_t p_type = be32(ph + 0);
+        if (p_type == 0x60000001u /*PT_PROC_PARAM*/) {
+            uint64_t offset = be64(ph + 8), size = be64(ph + 32);
+            /* size, magic, version, SDK version, primary priority, stack size,
+             * malloc page size and PPC segment are eight big-endian words.
+             * Check ranges by subtraction so hostile offsets cannot wrap. */
+            if (offset <= fsz && size >= 0x20 && size <= fsz - offset) {
+                const uint8_t* param = file + offset;
+                uint32_t declared = be32(param);
+                int32_t priority = (int32_t)be32(param + 0x10);
+                if (declared >= 0x20 && declared <= size &&
+                    be32(param + 4) == 0x13BCC5F6u &&
+                    priority >= 0 && priority <= 3071) {
+                    g_ppu_primary_priority = priority;
+                    fprintf(stderr, "[ppu] primary thread priority %d\n", priority);
+                }
+            }
+            continue;
+        }
         if (p_type == 7 /*PT_TLS*/) {
             /* The thread-local template: its initialised bytes live in vm_base
              * at p_vaddr (covered by a PT_LOAD too). ppu_run copies it into the
@@ -4039,8 +4060,8 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * owner stamps (0 -> LWM_TID collided with tid 1) and read as "free" in
      * sys_mutex -- LBP's main + bringup threads both held the GCM lock at once
      * and concurrently-emitted fences vanished (the boot-loading stall). */
-    { extern uint64_t ppu_thread_register_main(void);
-      ctx.thread_id = ppu_thread_register_main(); }
+    { extern uint64_t ppu_thread_register_main_priority(int32_t);
+      ctx.thread_id = ppu_thread_register_main_priority(g_ppu_primary_priority); }
     /* For samplers on other threads (a port's periodic stack dump): the main
      * thread's context lives on this frame, not in the thread table. */
     g_ppu_main_ctx = &ctx;

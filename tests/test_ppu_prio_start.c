@@ -95,7 +95,10 @@ int main(void)
     g_vm_stack_alloc.next_addr = 0x10000000u;   /* the guest stack region the threads bump-allocate from */
     g_vm_stack_alloc.region_end = 0xA0000000u;
     g_ppu_thread_entry_trampoline = guest_entry;
-    ppu_thread_register_main();                 /* main runs at the default priority, 1000 */
+    ppu_thread_register_main();
+    /* These cases compare against priority 1000, independently of the
+     * executable/default main-thread priority selected by the loader. */
+    set_main_priority(1000);
 
     /* 1. A higher-priority thread publishes, then blocks: with the option the creator sees what it published. */
     create(400, BODY_WRITE_THEN_BLOCK);
@@ -125,6 +128,12 @@ int main(void)
         else    EXPECT(ms < PRIO_START_TIMEOUT_MS / 2);
         finish_case();
     }
+
+    /* Priority zero is the highest valid priority, not an unset sentinel. */
+    set_main_priority(0);
+    create(400, BODY_WRITE_THEN_BLOCK);
+    EXPECT(__atomic_load_n(&g_published, __ATOMIC_RELAXED) == 0);
+    finish_case();
 
     /* 5. The creator's own priority counts once main has set one: at 300, a 400 thread no longer preempts it. */
     set_main_priority(300);
