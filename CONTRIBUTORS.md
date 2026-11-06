@@ -607,6 +607,12 @@ Runs the *inFAMOUS* port.
 - **Exact VMX and branch decode in the PPU lifter** (#286): about 45 VMX ops
   that were no-ops, VSCR/CR6, BO/BI decoding, and 64-bit CTR.
 - Both are pieces of the LLE firmware and conformance work in #213.
+- **First to propose** (in #213, opened 7 Oct 2026) several changes that later
+  landed from other PRs without crediting him: the lifter's source-chunk size
+  option and the POSIX-safe stack scan (#216, #217), real lwmutex/lwcond locking
+  on POSIX (#225), and the VMX ops, `spu_disasm.py` immediates, SMC `lqa`/`stqa`
+  fix and MFC table that #214 lists as overlapping. Credit for those is shared
+  with him.
 
 ### erikomis — [@erikomis](https://github.com/erikomis)
 Fixes found bringing up *inFAMOUS 2* on the inFamous branch, sent to master as
