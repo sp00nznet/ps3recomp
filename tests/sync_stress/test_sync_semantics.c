@@ -340,7 +340,11 @@ static void test_cond(void)
         for (int j = i; j > 0 && ms[j] < ms[j - 1]; j--) { double x = ms[j]; ms[j] = ms[j - 1]; ms[j - 1] = x; }
     printf("cond: 2000 us timed wait, median %.2f ms (min %.2f, max %.2f)\n", ms[4], ms[0], ms[8]);
     CHECK(ms[0] >= 1.5);                 /* never before the timeout */
+#ifdef __APPLE__
+    CHECK(ms[4] < 40.0);   /* macOS CI runners coalesce timers: ~17 ms medians (see #595) */
+#else
     CHECK(ms[4] < 10.0);
+#endif
 
     CHECK_RC(call(sys_cond_destroy, 1, cid, 0, 0, 0), CELL_OK);
     CHECK_RC(call(sys_mutex_destroy, 1, s_mid, 0, 0, 0), CELL_OK);
