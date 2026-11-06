@@ -76,9 +76,16 @@ endif()
 list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")
 # cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
 # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
-file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
-set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
-list(APPEND HLE_SOURCES ${AT3_SOURCES})
+# PS3RECOMP_ATRAC_LGPL=OFF swaps the decoder for a stub that fails every open, which keeps the library and any
+# binary linked from it free of LGPL code (third_party/at3_stub); the title then sees an ATRAC error.
+option(PS3RECOMP_ATRAC_LGPL "Link the LGPL-2.1 ATRAC3plus decoder (cellAtrac)" ON)
+if(PS3RECOMP_ATRAC_LGPL)
+    file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
+    set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
+    list(APPEND HLE_SOURCES ${AT3_SOURCES})
+else()
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/at3_stub/at3_stub.c")
+endif()
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES

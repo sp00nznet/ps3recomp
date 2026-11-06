@@ -79,6 +79,19 @@ jobs:
             exit 1
           fi
 
+      # PS3RECOMP_ATRAC_LGPL=OFF links a stub instead of the LGPL-2.1 ATRAC3plus
+      # decoder: the library builds, and no decoder object is in the archive.
+      - name: Build without the LGPL ATRAC decoder
+        if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+        run: |
+          CC=gcc CXX=g++ cmake -S . -B build-nolgpl -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_ATRAC_LGPL=OFF
+          cmake --build build-nolgpl --target ps3recomp_runtime
+          ar t build-nolgpl/libps3recomp_runtime.a | grep -q '^at3_stub.c.o$'
+          if ar t build-nolgpl/libps3recomp_runtime.a | grep -qE '^(atrac3|atrac3plus|at3_bridge)'; then
+            echo "an LGPL decoder object is in the library"
+            exit 1
+          fi
+
       # The Python suites are the project's real correctness net -- the
       # conformance one compiles and runs 1300+ lifted instruction cases with
       # the host compiler, so it is genuinely testing this platform's codegen
