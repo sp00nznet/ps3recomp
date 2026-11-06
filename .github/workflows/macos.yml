@@ -368,6 +368,15 @@ jobs:
           ./build/test_metal_poly_offset
           PS3RECOMP_ENG_POLY_OFFSET=0 ./build/test_metal_poly_offset
 
+      # SET_ZMIN_MAX_CONTROL reaches the GPU: a triangle in front of the near
+      # plane is clipped by default and clamped to depth 0 when the guest
+      # turns clipping off or the clamp on; PS3RECOMP_ENG_DEPTH_CLAMP=0 clips.
+      - name: Run the Metal depth clamp test
+        run: |
+          test -x build/test_metal_depth_clamp
+          ./build/test_metal_depth_clamp
+          PS3RECOMP_ENG_DEPTH_CLAMP=0 ./build/test_metal_depth_clamp
+
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's

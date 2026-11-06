@@ -95,6 +95,7 @@ extern u32 ppu_vm_size;
 #define M_POLY_OFFSET_FILL    0x0A68
 #define M_POLY_OFFSET_FACTOR  0x0A78
 #define M_POLY_OFFSET_BIAS    0x0A7C
+#define M_ZMIN_MAX_CONTROL    0x1D78
 
 /* ---- module state -------------------------------------------------------- */
 
@@ -314,6 +315,18 @@ static u32 eng_pipeline_slot(u64 key)
 
 /* ---- render state -------------------------------------------------------- */
 
+/* PS3RECOMP_ENG_DEPTH_CLAMP=0: always clip at the near and far planes, as
+ * before SET_ZMIN_MAX_CONTROL was honoured. */
+static int eng_depth_clamp_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_CLAMP");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on;
+}
+
 void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
                                          rsx_be_render_state* rs)
 {
@@ -357,6 +370,17 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->bs_zfail     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
     rs->depth_bounds_test = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_ENABLE) & 1;
+    /* SET_ZMIN_MAX_CONTROL (cellGcmSetZMinMaxControl): bits 0-3 clip at the
+     * near and far planes, 4-7 clamp the depth, 8-11 clip ignoring W; reset
+     * value 1 (rsx_dispatch_init). As RPCS3's Vulkan renderer: clamp when the
+     * clamp is on or near/far clipping is off. Shadow-map passes draw their
+     * casters this way ("pancaking"): a caster between the light and the
+     * cascade's near plane lands on depth 0 instead of being cut away, so
+     * clipped, the shadows of tall objects vanish from the near cascade. */
+    {
+        const u32 z = rsx_dsp_reg(rsx, M_ZMIN_MAX_CONTROL);
+        rs->depth_clamp = eng_depth_clamp_on() && ((z & 0xF0u) != 0 || (z & 0x0Fu) == 0);
+    }
 }
 
 u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
@@ -399,6 +423,7 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(bs_zfail);
     ENG_HASH_FIELD(bs_zpass);
     ENG_HASH_FIELD(depth_bounds_test);
+    ENG_HASH_FIELD(depth_clamp);
 #undef ENG_HASH_FIELD
     return hash;
 }

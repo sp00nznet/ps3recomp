@@ -2507,6 +2507,7 @@ typedef struct {
     id<MTLDepthStencilState>   ds;
     MTLCullMode cull;
     MTLWinding  winding;
+    MTLDepthClipMode clip;      /* rs->depth_clamp: encoder state, set per draw */
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -3463,6 +3464,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     s_eng_pipe[slot].winding = (rs->front_face == 0x0901u)
                                    ? MTLWindingCounterClockwise
                                    : MTLWindingClockwise;
+    s_eng_pipe[slot].clip = rs->depth_clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
     return slot + 1;
 }
 
@@ -3723,6 +3725,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setDepthStencilState:p->ds];
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:p->winding];
+    [enc setDepthClipMode:p->clip];
     [enc setStencilReferenceValue:r->stencil_ref];
     [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
