@@ -338,7 +338,10 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
             ctx->gpr[3] = 0;
             return;
         }
-        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+        /* Held by another thread: lv2 answers CELL_EBUSY (0x8001000A). 0x8001000B
+         * is ETIMEDOUT, which only a lock with an expired timeout returns; titles
+         * that poll with trylock and check for EBUSY treat it as a hard failure. */
+        if (!lwm_try(sl0)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; }
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
     vm_write32(lwm + LWM_OWNER, self);
