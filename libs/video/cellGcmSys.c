@@ -27,6 +27,7 @@ static u32 s_gcm_context_ea = 0;
 #include <stdlib.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "../../runtime/ps3_log.h"   /* ps3_log_verbose: the per-call tile/zcull lines */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -3800,8 +3801,9 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
-           index, location, offset, size, pitch);
+    if (ps3_log_verbose())
+        printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
+               index, location, offset, size, pitch);
 
     s_tiles[index].offset = offset;
     s_tiles[index].size   = size;
@@ -3827,8 +3829,9 @@ s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetZcull(index=%u, offset=0x%X, %ux%u)\n",
-           index, offset, width, height);
+    if (ps3_log_verbose())
+        printf("[cellGcmSys] SetZcull(index=%u, offset=0x%X, %ux%u)\n",
+               index, offset, width, height);
 
     s_zcull[index].offset      = offset;
     s_zcull[index].width       = width;
@@ -3852,7 +3855,7 @@ s32 cellGcmBindTile(u8 index)
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] BindTile(index=%u)\n", index);
+    if (ps3_log_verbose()) printf("[cellGcmSys] BindTile(index=%u)\n", index);
     s_tiles[index].bound = 1;
     return CELL_OK;
 }
@@ -3863,7 +3866,7 @@ s32 cellGcmBindZcull(u8 index)
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] BindZcull(index=%u)\n", index);
+    if (ps3_log_verbose()) printf("[cellGcmSys] BindZcull(index=%u)\n", index);
     s_zcull[index].bound = 1;
     return CELL_OK;
 }
@@ -3874,7 +3877,7 @@ s32 cellGcmUnbindTile(u8 index)
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] UnbindTile(index=%u)\n", index);
+    if (ps3_log_verbose()) printf("[cellGcmSys] UnbindTile(index=%u)\n", index);
     s_tiles[index].bound = 0;
     return CELL_OK;
 }
@@ -3885,7 +3888,7 @@ s32 cellGcmUnbindZcull(u8 index)
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] UnbindZcull(index=%u)\n", index);
+    if (ps3_log_verbose()) printf("[cellGcmSys] UnbindZcull(index=%u)\n", index);
     s_zcull[index].bound = 0;
     return CELL_OK;
 }
