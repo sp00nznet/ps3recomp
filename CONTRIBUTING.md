@@ -30,14 +30,26 @@ Run existing game ports, compare behavior with RPCS3, and report discrepancies. 
 - **Python 3.10+** — for recompiler tools
 - **CMake 3.20+** — build system
 - **C17/C++20 compiler** — MSVC 19.x (VS 2019+), GCC 12+, or Clang 15+
+- **Ninja** — build tool used by the commands below
+- **SDL2** — required on Linux and macOS for input and audio
 - **Git** — version control
+
+On macOS, install the command-line dependencies with:
+
+```bash
+brew install cmake ninja python@3.12 sdl2
+```
 
 ### Building from Source
 
 ```bash
 git clone https://github.com/sp00nznet/ps3recomp.git
 cd ps3recomp
-pip install -r requirements.txt
+
+# macOS (on Linux, use: python3 -m venv .venv)
+"$(brew --prefix python@3.12)/bin/python3.12" -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 
 # Build the runtime library
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -45,7 +57,10 @@ cmake --build build
 ```
 
 On Windows with Visual Studio:
-```bash
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 cmake -B build
 cmake --build build --config Release
 ```

@@ -34,7 +34,7 @@ Complete guide to building the ps3recomp runtime library and game projects.
 
 | Tool | Purpose |
 |------|---------|
-| **Ninja** | Faster builds than Make/MSBuild; CI and the commands in these docs use it (`pip install ninja`) |
+| **Ninja** | Faster builds than Make/MSBuild; CI and the commands in these docs use it |
 | **ccache** | Compiler cache for faster rebuilds |
 
 ### Platform-Specific Requirements
@@ -49,11 +49,13 @@ CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `
 **Linux:**
 - GCC or Clang
 - Development headers: `libpthread`, `libm`
-- Optional: SDL2 development package (`libsdl2-dev`) for input/audio
+- SDL2 development package (`libsdl2-dev` on Debian/Ubuntu) for input/audio
 
 **macOS:**
-- Xcode (Apple Clang)
-- Optional: SDL2 via Homebrew (`brew install sdl2`)
+- Xcode or the Xcode Command Line Tools (Apple Clang)
+- CMake, Ninja, Python 3.12 and SDL2:
+  `brew install cmake ninja python@3.12 sdl2`
+- Optional guest-shader translation: `brew install glslang spirv-cross`
 
 ---
 
@@ -99,8 +101,8 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ```bash
 cmake --build build
 
-# Parallel build (if not using Ninja which is parallel by default)
-cmake --build build -j$(nproc)
+# Parallel build (if not using Ninja, which is parallel by default)
+cmake --build build --parallel
 
 # Build specific target
 cmake --build build --target ps3recomp_runtime
@@ -439,18 +441,18 @@ that an NV4097 triangle covers the centre pixel. A green tick means the
 graphics bridge works, not merely that it compiled.
 
 ```bash
-brew install ninja sdl2
+brew install cmake ninja python@3.12 sdl2
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
 ```
 
-**No title has run from this tree on macOS yet.** The PPU boot scaffold
-(`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
-dispatch) compiles on POSIX with zero errors under a CI ratchet, but it is
-compiled per game rather than into the library, and booting a title with it on
-macOS is the remaining work. Downstream, inFamous runs on macOS/arm64 with
-patches that are on their way upstream (#213).
+The same workflow boots a synthetic PPU ELF twice: once through
+`ps3recomp_boot_smoke`, and once through the unmodified project template. Those
+runs cover the loader, HLE dispatch, guest threads, frame clock and Metal
+backend from guest code. No retail title has been validated from this tree on
+macOS yet; downstream, inFamous runs on macOS/arm64 with patches that are on
+their way upstream (#213).
 
 Thanks to [@slushiimusic](https://github.com/slushiimusic), who reported the
 original docs-vs-reality gap in
@@ -469,7 +471,7 @@ and the Metal backend ([#96](https://github.com/sp00nznet/ps3recomp/pull/96)).
 | MSVC | 19.35+ (VS 2022) | Windows | Full support |
 | GCC | 12+ | Linux | Full support |
 | Clang | 14+ | Linux | Full support |
-| Clang / Apple Clang | 14+ (Xcode 14) | macOS | **Not building** — see #94, fix in review (#95) |
+| Apple Clang | macOS 14 runner toolchain | macOS arm64 | Full support |
 | MinGW-w64 | GCC 12+ | Windows | Supported |
 
 ### Required C17 Features

@@ -34,11 +34,15 @@ Yes, under the same principles as all clean-room recompilation projects:
 
 ### What platforms are supported?
 
-- **Windows** (primary) — MSVC, XInput, WASAPI
-- **Linux** — GCC/Clang, SDL2
-- **macOS** — Clang, SDL2
+- **Windows** — clang-cl, D3D12, XInput, WASAPI
+- **Linux** — GCC/Clang, SDL2, Vulkan (opt-in) or the headless null backend
+- **macOS arm64** — Apple Clang, Metal, SDL2
 
-Windows gets the most testing. Linux and macOS should work but may need minor fixes.
+All three build and run their platform test suites on every pull request.
+Windows is the only host currently claimed to run a recompiled retail title
+from this tree. Linux and macOS also boot the synthetic PPU smoke title through
+the project template, but no retail title is validated from this tree on either
+POSIX host yet.
 
 ---
 

@@ -53,11 +53,12 @@ that.
 | Render backend | D3D12 | Metal | Vulkan (opt-in); null (headless, CI) |
 | Runs a recompiled game, in this tree | **yes** | **no** | **no** |
 
-**What stops macOS and Linux running a title is the PPU boot scaffold.**
-`ppu_loader.cpp`, `boot_main.cpp` and the HLE dispatch are compiled per game,
-not into the library. They compile on POSIX with zero errors (a CI ratchet
-keeps it that way) and the frame clock runs there, but no title has yet been
-booted to gameplay from this tree on either OS.
+**The POSIX boot path runs in CI, but not yet with a retail title in this
+tree.** `ps3recomp_boot_smoke` loads a synthetic PPU ELF through
+`ppu_loader.cpp`, the HLE dispatch, guest threads, the frame clock and the
+renderer. CI also builds and boots that ELF through `templates/project` on
+macOS and Linux. That proves the per-game scaffold runs on both hosts; it is
+not a compatibility claim for a retail game.
 
 **The renderers are further along than that.** `ps3recomp_host` drives cellGcm
 → RSX → backend end to end with no game. With guest programs on, Metal and
@@ -287,12 +288,22 @@ includes a prebuilt SDK bundle per platform (`ps3recomp-<version>-win-x64.zip`,
 runtime library, its headers and the Python pipeline. `VERSION.txt` inside it
 says what that platform can and cannot do yet.
 
-> **Prerequisites (building from source)**: Python 3.10+ (CI uses 3.12), CMake 3.20+, Ninja, and a C17/C++20 compiler: clang-cl with Visual Studio 2022 on Windows (plain MSVC builds the runtime library, but lifted game code needs clang-cl), GCC or Clang on Linux, Apple Clang (Xcode) on macOS. CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
+> **Prerequisites (building from source)**: Python 3.10+ (CI uses 3.12), CMake
+> 3.20+, Ninja, and a C17/C++20 compiler: clang-cl with Visual Studio 2022 on
+> Windows (plain MSVC builds the runtime library, but lifted game code needs
+> clang-cl), GCC or Clang on Linux, Apple Clang (Xcode) on macOS. SDL2 is
+> required on Linux and macOS. On macOS, install the command-line dependencies
+> with `brew install cmake ninja python@3.12 sdl2`. CI builds with the compilers on
+> GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no
+> older compiler version is tested.
 
 ```bash
 git clone https://github.com/sp00nznet/ps3recomp.git
 cd ps3recomp
-pip install -r requirements.txt
+# macOS (on Linux, use: python3 -m venv .venv)
+"$(brew --prefix python@3.12)/bin/python3.12" -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 
 # Stage 1: image, OPD function table, TOC and firmware imports
 python tools/ppu_loader.py /path/to/EBOOT.ELF -o out/
