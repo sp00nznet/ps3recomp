@@ -425,6 +425,11 @@ Contributors are credited in **[CONTRIBUTORS.md](CONTRIBUTORS.md)**.
 
 MIT License. See [LICENSE](LICENSE) for details.
 
+ps3recomp was created by Ned Heller ([@sp00nznet](https://github.com/sp00nznet)).
+Ports, videos and write-ups built on it are welcome. Please name ps3recomp and
+link this repository, and keep the copyright notice in LICENSE, which the MIT
+licence requires.
+
 
 ## Changelog
 
