@@ -3033,6 +3033,23 @@ int cellGcmOffsetIsDisplay(u32 offset)
     return 0;
 }
 
+/* Backend query (not a guest API): the display buffer the current flip names,
+ * as offset/pitch/size in RSX local memory. Backs the CPU-blit scanout
+ * fallback -- a software-rendered title writes its display buffer straight
+ * into guest VRAM and never records RSX work, so the D3D12 backend presents
+ * the guest bytes directly. Returns 1 when a buffer is registered. */
+int cellGcm_current_scanout(u32* offset, u32* pitch, u32* width, u32* height)
+{
+    const u32 id = s_current_display_buffer_id & 7u;
+    if (!s_display_buffer_set[id])
+        return 0;
+    if (offset) *offset = s_display_buffers[id].offset;
+    if (pitch)  *pitch  = s_display_buffers[id].pitch;
+    if (width)  *width  = s_display_buffers[id].width;
+    if (height) *height = s_display_buffers[id].height;
+    return 1;
+}
+
 /* NID: 0xEAA52F23 */
 /* How many display buffers the title has actually registered. cellResc needs
  * it to know how far to rotate its flip target; nothing else about the set is
