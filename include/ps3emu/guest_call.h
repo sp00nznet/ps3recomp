@@ -47,6 +47,15 @@ typedef void (*ps3_guest_caller_fn)(uint32_t opd_addr,
  * check for NULL before invoking. */
 extern ps3_guest_caller_fn g_ps3_guest_caller;
 
+/* Synchronous resolved callback dispatch. Returns 0 only when not dispatched,
+ * 1 after callback and trampoline completion; the guest r3 result is separate.
+ * Output is initialized to zero. Exceptions/nonlocal exits propagate and mean
+ * uncertain ownership; callers must quarantine rather than retry side effects.
+ * No guest memory is read by this code/TOC form. */
+int ppu_guest_call_ct_checked(uint32_t code, uint32_t toc,
+    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t* result);
+
 /* Convenience wrapper — checks for NULL and invokes if set. */
 static inline void ps3_invoke_guest(uint32_t opd_addr,
                                     uint64_t arg0, uint64_t arg1,
