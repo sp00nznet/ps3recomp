@@ -336,7 +336,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     include(CheckCCompilerFlag)
     check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
     if(PS3RECOMP_HAS_MSSE41)
-        target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
+        # Lifted consumers compile the same static-inline SPU helpers. Export
+        # the runtime's existing ISA requirement so their fast path agrees.
+        target_compile_options(ps3recomp_runtime PUBLIC -msse4.1)
     endif()
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
