@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     name: macOS arm64 (${{ matrix.build_type }})
-    runs-on: macos-14          # Apple Silicon runner
+    runs-on: macos-15          # Apple Silicon runner
     strategy:
       fail-fast: false
       matrix:
