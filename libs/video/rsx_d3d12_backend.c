@@ -297,6 +297,8 @@ typedef struct {
     HANDLE       fence_event;
     u64          fence_values[FRAME_COUNT];
     u32          frame_index;
+    u32          present_buffer_id;   /* buffer the current flip names (for
+                                       * the CPU-blit scanout fallback) */
 
     /* Pipeline */
     ID3D12RootSignature*  root_signature;
@@ -4417,6 +4419,106 @@ static void guest_fb_present(u32 fi)
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &gb);
 }
 
+/* SCANOUT_FB=0 disables. Automatic CPU-blit scanout fallback: when the frame
+ * recorded no RSX work at all (s_dbg_last_draws == 0) but the flip names a
+ * registered VRAM display buffer, the title renders on the CPU and writes its
+ * display buffer straight into guest VRAM (TanakaDOOM-cGcm: software 320x200
+ * renderer, zero RSX commands, ever). The normal path presents a never-rendered
+ * surface = black. Copy the guest bytes to the backbuffer instead,
+ * A,R,G,B -> R,G,B,A (the guest is big-endian; its 32-bit pixels land as
+ * A,R,G,B bytes -- verified against RPCS3 on TanakaDOOM: byte-as-is reads
+ * alpha as red, R/B swap reads blue as red). Skipped when
+ * GCM_GUEST_FB is set (that debug path pins its own fixed offset). */
+static void scanout_auto_present(u32 fi)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("SCANOUT_FB");
+        on = !(e && e[0] == '0') && !getenv("GCM_GUEST_FB");
+    }
+    if (!on || s_dbg_last_draws != 0) return;
+    /* The display-buffer registry that matters is cellGcmSys's own: the
+     * ticker-driven backend path never brings the draw engine up, so the
+     * engine's table stays empty. cellGcm tracks the buffer the current flip
+     * names (updated on every SetFlip path). */
+    extern int cellGcm_current_scanout(u32*, u32*, u32*, u32*);
+    u32 off = 0, gpitch = 0, gw = 0, gh = 0;
+    const int got = cellGcm_current_scanout(&off, &gpitch, &gw, &gh);
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("SCANOUT_FB_DBG") ? 1 : 0;
+      if (dbg) { static int n = 0;
+                 if (n < 12) { n++;
+                     fprintf(stderr, "[scanout-fb] last_draws=%u got=%d "
+                                     "off=0x%X pitch=%u %ux%u\n",
+                             s_dbg_last_draws, got, off, gpitch, gw, gh); } } }
+    if (!got || !gpitch || !gw || !gh)
+        return;
+    extern u8* vm_base;
+    if (!vm_base) return;
+    const u32 up_pitch = (gw * 4u + 255u) & ~255u;   /* 256-byte rows */
+    static ID3D12Resource* up = NULL;
+    static u32 up_w = 0, up_h = 0;
+    if (!up || up_w != gw || up_h != gh) {
+        if (up) { up->lpVtbl->Release(up); up = NULL; }
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bd = {0};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width  = (u64)up_pitch * gh; bd.Height = 1;
+        bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                &IID_ID3D12Resource, (void**)&up)))
+            return;
+        up_w = gw; up_h = gh;
+    }
+    /* RSX local memory is mapped at guest 0xC0000000. The guest is a
+     * big-endian PPC title: its 32-bit pixels land as A,R,G,B bytes, so
+     * route R,G,B to the backbuffer and force alpha (verified against
+     * RPCS3: byte-as-is copy reads alpha as red; a R/B swap reads blue
+     * as red -- TanakaDOOM title screen). */
+    { const u8* srow = vm_base + 0xC0000000u + off;
+      void* m = NULL; D3D12_RANGE nr = {0, 0};
+      if (FAILED(up->lpVtbl->Map(up, 0, &nr, &m)) || !m) return;
+      for (u32 y = 0; y < gh; y++) {
+          const u8* s = srow + (size_t)y * gpitch;
+          u8* dp = (u8*)m + (size_t)y * up_pitch;
+          for (u32 x = 0; x < gw; x++) {
+              dp[x*4+0] = s[x*4+1];
+              dp[x*4+1] = s[x*4+2];
+              dp[x*4+2] = s[x*4+3];
+              dp[x*4+3] = 0xFF;
+          }
+      }
+      D3D12_RANGE wr = {0, (SIZE_T)up_pitch * gh};
+      up->lpVtbl->Unmap(up, 0, &wr); }
+
+    D3D12_RESOURCE_BARRIER gb = {0};
+    gb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    gb.Transition.pResource   = s_d3d.render_targets[fi];
+    gb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    gb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    gb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &gb);
+
+    D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
+    dl.pResource = s_d3d.render_targets[fi];
+    dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
+    sl.pResource = up; sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    sl.PlacedFootprint.Offset = 0;
+    sl.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sl.PlacedFootprint.Footprint.Width    = gw;
+    sl.PlacedFootprint.Footprint.Height   = gh;
+    sl.PlacedFootprint.Footprint.Depth    = 1;
+    sl.PlacedFootprint.Footprint.RowPitch = up_pitch;
+    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dl, 0, 0, 0, &sl, NULL);
+
+    gb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    gb.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &gb);
+}
 
 static void render_frame(void)
 {
@@ -5634,6 +5736,7 @@ static void render_frame(void)
     if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
 skip_dump_consider: ;
     guest_fb_present(fi);
+    scanout_auto_present(fi);
     composite_present(fi);
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
@@ -5923,7 +6026,7 @@ static int blink_dbg(void)
 static void d3d12_present(void* ud, u32 buffer_id)
 {
     (void)ud;
-    (void)buffer_id;
+    s_d3d.present_buffer_id = buffer_id & 7u;
 
     if (blink_dbg())
         printf("[PRESENT] draws=%u clears_since_last=%u\n",
