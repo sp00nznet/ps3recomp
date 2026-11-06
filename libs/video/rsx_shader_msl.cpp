@@ -224,7 +224,16 @@ done:
  * this file's build: a file written by any other combination is a miss. */
 const u32 kCacheFormat = 1;
 const u32 kCacheMagic = 0x4C534D52u;   /* "RMSL" */
+/* The translator's identity: what it was built from stands for the front-end
+ * and spirv-cross options above and the binding contract in rsx_shader_msl.h.
+ * The build passes a hash of those two files (CMakeLists.txt), so the files an
+ * older translator wrote become misses and a plain rebuild keeps them; without
+ * it, this file's compile time stands in, which retires them on every rebuild. */
+#ifdef PS3RECOMP_MSL_TRANSLATOR_ID
+const char kTranslatorBuild[24] = PS3RECOMP_MSL_TRANSLATOR_ID;
+#else
 const char kTranslatorBuild[24] = __DATE__ " " __TIME__;
+#endif
 
 struct Cache {
     std::mutex lock;
