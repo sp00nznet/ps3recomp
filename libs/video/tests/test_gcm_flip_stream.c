@@ -28,8 +28,12 @@
  *   -o /tmp/test_gcm_flip_stream        (clang on macOS: -Wl,-dead_strip)
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
+/* GCM_REPORT_SPU_HOLD_MS asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
@@ -46,6 +50,11 @@ PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 u32 g_rsx_last_reference;
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
 void rsx_raise_user_cmd(uint32_t arg) { (void)arg; }
+/* gcm_fifo_next_segment wakes the drain thread; this fixture has none, and
+ * runtime/platform/win32_compat.c is not linked. */
+#ifndef _WIN32
+BOOL SetEvent(HANDLE h) { (void)h; return 1; }
+#endif
 void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
 void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
 void rsx_state_init(rsx_state* state) { (void)state; }

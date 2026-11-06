@@ -6,6 +6,7 @@
  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
  */
 #include <time.h>
+#include "../platform/mingw_timespec_get.h"   /* timespec_get on msvcrt MinGW */
 #include "spu_interp.h"
 #include "spu_helpers.h"
 #include <stdio.h>
@@ -17,7 +18,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 
-#include "spu_interp_tables.inc"   /* spu_op enum, spu_op_name[], spu_dec_* */
+#include "spu_interp_tables.inc"   /* spu_op enum, spu_op_name[], spu_decode_tab[] */
 
 /* Work descriptor for the next SYS_SPU_THREAD_STOP_RECEIVE_EVENT service, set
  * by the event-port send that wakes a sim SPU. Single-slot: dispatch is
@@ -25,7 +26,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 uint32_t g_spu_pending_evt[3];
 int      g_spu_pending_evt_valid;
 
-/* ---- decode: 32-bit insn -> fields (mirrors spu_disasm.spu_decode order) ---- */
+/* ---- decode: 32-bit insn -> fields (one lookup in spu_decode_tab) ---- */
 typedef struct {
     spu_op   op;
     uint8_t  rt, ra, rb, rc, ch;
@@ -38,61 +39,38 @@ static int32_t sx(uint32_t v, int bits) {
     return (int32_t)((v ^ m) - m);
 }
 
+/* Every opcode field is a prefix of bits 31..21, so the op and the immediate
+ * form come from one table load; the cascade precedence is baked into the
+ * table by tools/gen_spu_interp.py. Only the fields the form needs are
+ * computed. */
 static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
-    uint32_t op4 = (insn >> 28) & 0xF,  op7 = (insn >> 25) & 0x7F;
-    uint32_t op8 = (insn >> 24) & 0xFF, op9 = (insn >> 23) & 0x1FF;
-    uint32_t op10 = (insn >> 22) & 0x3FF, op11 = (insn >> 21) & 0x7FF;
+    const spu_decode_ent e = spu_decode_tab[insn >> 21];
+    d->op = (spu_op)e.op;
     d->rt = insn & 0x7F; d->ra = (insn >> 7) & 0x7F;
     d->rb = (insn >> 14) & 0x7F; d->rc = (insn >> 21) & 0x7F;
     d->ch = (insn >> 7) & 0x7F; d->imm = 0; d->tgt = 0;
-    int32_t i10 = sx((insn >> 14) & 0x3FF, 10);
-    int32_t i16 = sx((insn >> 7) & 0xFFFF, 16);
-    uint32_t i18 = (insn >> 7) & 0x3FFFF;
 
-    /* RRR (4) */
-    if ((d->op = spu_dec_rrr(op4)) != SPU_word) return;
-    /* RI18 (7) */
-    if ((d->op = spu_dec_ri18(op7)) != SPU_word) {
-        d->imm = (d->op == SPU_ila) ? (int32_t)i18 : (int32_t)(i18 & 0xFFFF);
-        return;
+    switch ((spu_decode_form)e.form) {
+    case SPU_F_NONE: break;
+    case SPU_F_I18:   d->imm = (int32_t)((insn >> 7) & 0x3FFFF); break;
+    case SPU_F_I18LO: d->imm = (int32_t)((insn >> 7) & 0xFFFF); break;
+    case SPU_F_LQA:
+        d->tgt = ((((insn >> 7) & 0xFFFF) << 2)) & 0x3FFF0; break;
+    case SPU_F_LQR:
+        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4) + pc) & 0x3FFF0; break;
+    case SPU_F_BREL:
+        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4) + pc) & 0x3FFFF; break;
+    case SPU_F_BABS:
+        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4)) & 0x3FFFF; break;
+    case SPU_F_I16S:  d->imm = sx((insn >> 7) & 0xFFFF, 16); break;
+    case SPU_F_I16U:  d->imm = (int32_t)((insn >> 7) & 0xFFFF); break;
+    case SPU_F_I10:   d->imm = sx((insn >> 14) & 0x3FF, 10); break;
+    case SPU_F_I10Q:  d->imm = (int32_t)((uint32_t)sx((insn >> 14) & 0x3FF, 10) << 4); break;
+    case SPU_F_I8:    d->imm = (insn >> 14) & 0xFF; break;
+    case SPU_F_STOP:  d->imm = insn & 0x3FFF; break;
+    case SPU_F_I7S:   d->imm = sx(d->rb, 7); break;
+    case SPU_F_I7U:   d->imm = d->rb; break;
     }
-    /* RI16 (9) — before RI10 (shared top-8-bit opcodes) */
-    if ((d->op = spu_dec_ri16(op9)) != SPU_word) {
-        switch (d->op) {
-        case SPU_lqa: case SPU_stqa: d->tgt = ((uint32_t)(i16 & 0xFFFF) << 2) & 0x3FFF0; break;
-        case SPU_lqr: case SPU_stqr: d->tgt = ((uint32_t)(i16 * 4) + pc) & 0x3FFF0; break;
-        case SPU_br: case SPU_brsl: case SPU_brz: case SPU_brnz:
-        case SPU_brhz: case SPU_brhnz: d->tgt = ((uint32_t)(i16 * 4) + pc) & 0x3FFFF; break;
-        case SPU_bra: case SPU_brasl: d->tgt = ((uint32_t)(i16 * 4)) & 0x3FFFF; break;
-        case SPU_il: d->imm = i16; break;
-        default: d->imm = (int32_t)(i16 & 0xFFFF); break; /* ilh/ilhu/iohl */
-        }
-        return;
-    }
-    /* channel ops (op11) — before RI10 (wrch/shli op8 clash) */
-    if (op11 == 0x00D) { d->op = SPU_rdch;   return; }
-    if (op11 == 0x10D) { d->op = SPU_wrch;   return; }
-    if (op11 == 0x00F) { d->op = SPU_rchcnt; return; }
-    /* RI10 (8) */
-    if ((d->op = spu_dec_ri10(op8)) != SPU_word) {
-        d->imm = (d->op == SPU_lqd || d->op == SPU_stqd) ? (i10 << 4) : i10;
-        return;
-    }
-    /* RI8 (10) float<->int conversions */
-    if ((d->op = spu_dec_ri8(op10)) != SPU_word) { d->imm = (insn >> 14) & 0xFF; return; }
-    /* RR (11) */
-    if ((d->op = spu_dec_rr(op11)) != SPU_word) {
-        if (d->op == SPU_stop) d->imm = insn & 0x3FFF;
-        return;
-    }
-    /* RI7 (11) rotate/shift/gen-control immediates */
-    if ((d->op = spu_dec_ri7(op11)) != SPU_word) {
-        d->imm = spu_ri7_unsigned(d->op) ? d->rb : sx(d->rb, 7);
-        return;
-    }
-    /* LSX (redundant with RR's lqx/stqx, kept for order-parity) */
-    if ((d->op = spu_dec_lsx(op11)) != SPU_word) return;
-    d->op = SPU_word;
 }
 
 /* spu_lifted_lookup() is defined by spu_fn_registry.c (the single owner of the
@@ -454,12 +432,17 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     if (interp_stats_on()) {
         /* Credit an entry inside a resident code region to the image that
          * owns it, so the list names the lift that's missing the entry. */
-        uint32_t pc = start_lsa & 0x3FFFC; int owner = ctx->image_id;
+        uint32_t pc = start_lsa & 0x3FFFC, key = pc; int owner = ctx->image_id;
         for (unsigned s = 0; s < 4; ++s)
             if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
-                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size)
+                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size) {
                 owner = ctx->resident_code[s].image_id;
-        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, pc);
+                /* Relocatable code: the CANONICAL pc (placement-independent), which
+                 * is the entry its --reloc lift needs. */
+                key = ctx->resident_code[s].canon
+                    ? pc - ctx->resident_code[s].lsa + ctx->resident_code[s].canon : pc;
+            }
+        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, key);
     }
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;

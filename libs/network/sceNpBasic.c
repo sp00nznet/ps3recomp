@@ -161,6 +161,17 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
     return CELL_OK;
 }
 
+s32 sceNpBasicSetPresenceDetails(const void* presence, u32 options)
+{
+    /* Retail imports this independently of the older local presence cache.
+     * The exact Basic errors differ from this header's legacy placeholders.
+     * Do not fabricate a successful publication or dereference unused payloads. */
+    if (!presence || options < 1 || options > 3)
+        return (s32)0x8002a665u; /* SCE_NP_BASIC_ERROR_INVALID_ARGUMENT */
+    printf("[sceNpBasic] SetPresenceDetails: publishing unavailable (options=%u)\n", options);
+    return (s32)0x8002a663u; /* SCE_NP_BASIC_ERROR_NOT_SUPPORTED */
+}
+
 s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
                            const void* body, u32 bodySize)
 {

@@ -40,13 +40,25 @@ static volatile long g_lockline = 0;
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
  * -- FMOD's mixer task among them, 25-40 ms at a time. */
+/* After ~1 ms of spinning (six rounds of 4096 pauses) the waiter sleeps instead.
+ * SwitchToThread only hands the core to a thread queued on this same processor,
+ * and Sleep(0) only to one of equal or higher priority -- neither reaches a
+ * lower-priority holder that is waiting for a core. With every core busy, waiters
+ * above the holder's priority could keep it off the CPU for tens of milliseconds.
+ * A normal wait is far under a microsecond and never gets here.
+ * SPU_LOCKLINE_SLEEP=0 keeps the plain spin. */
 void spu_lockline_lock(void)
 {
-    unsigned spins = 0;
+    static int s_sleep = -1;
+    unsigned spins = 0, rounds = 0;
     while (_InterlockedExchange(&g_lockline, 1)) {
+        if (s_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_sleep = !(e && e[0] == '0'); }
         do {
             _mm_pause();
-            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
+            if (++spins >= 4096) {
+                spins = 0;
+                if (rounds++ < 6 || !s_sleep) SwitchToThread(); else Sleep(1);
+            }
         } while (g_lockline);
     }
 }
@@ -131,12 +143,19 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
 
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
- * the lock-line lock. Nodes are removed before their context's lifetime ends. */
-typedef struct spu_coh_entry {
-    spu_context* ctx;
-    struct spu_coh_entry* next;
-} spu_coh_entry;
-static spu_coh_entry* s_coh_ctxs;
+ * the lock-line lock. Entries are removed before their context's lifetime ends.
+ *
+ * A contiguous array, not a linked list: every notifier walks all of it with
+ * the line held, and a list's scattered nodes were a cache miss per holder on
+ * top of the one on each holder's resv_valid, which the walk now prefetches a
+ * few entries ahead. */
+static spu_context** s_coh_ctxs;
+static unsigned s_coh_n, s_coh_cap;
+#define SPU_COH_PREFETCH 4
+static inline void spu_coh_prefetch_holder(unsigned i)
+{
+    if (i < s_coh_n) __builtin_prefetch(&s_coh_ctxs[i]->resv_valid);
+}
 static spu_coh_watch* s_coh_watches;
 
 unsigned long g_spu_lr_raise = 0;
@@ -155,17 +174,20 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
         g_spu_coh_bits = s_coh_bitmap;
 
     if (!ctx) return;
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
-        if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
-    spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
-    if (!entry) {
-        fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
-        fflush(stderr);
-        abort(); /* A missed holder loses invalidation events, including ABA. */
+    for (unsigned i = 0; i < s_coh_n; i++)
+        if (s_coh_ctxs[i] == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
+    if (s_coh_n == s_coh_cap) {
+        unsigned cap = s_coh_cap ? s_coh_cap * 2u : 64u;
+        spu_context** grown = (spu_context**)realloc(s_coh_ctxs, cap * sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
+            fflush(stderr);
+            abort(); /* A missed holder loses invalidation events, including ABA. */
+        }
+        s_coh_ctxs = grown;
+        s_coh_cap = cap;
     }
-    entry->ctx = ctx;
-    entry->next = s_coh_ctxs;
-    s_coh_ctxs = entry;
+    s_coh_ctxs[s_coh_n++] = ctx;
     __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED);
 }
 
@@ -217,11 +239,9 @@ void spu_coh_unregister(spu_context* ctx)
      * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
      * spu_coh_notify_write, reading a freed thread stack. */
     spu_lockline_lock();
-    for (spu_coh_entry** link = &s_coh_ctxs; *link; link = &(*link)->next) {
-        if ((*link)->ctx != ctx) continue;
-        spu_coh_entry* entry = *link;
-        *link = entry->next;
-        free(entry);
+    for (unsigned i = 0; i < s_coh_n; i++) {
+        if (s_coh_ctxs[i] != ctx) continue;
+        s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* order does not matter */
         break;
     }
     __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
@@ -237,18 +257,16 @@ void spu_coh_unregister(spu_context* ctx)
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 {
     spu_lockline_lock();
-    for (spu_coh_entry** link = &s_coh_ctxs; *link;) {
-        spu_coh_entry* entry = *link;
-        uintptr_t c = (uintptr_t)entry->ctx;
+    for (unsigned i = 0; i < s_coh_n;) {
+        uintptr_t c = (uintptr_t)s_coh_ctxs[i];
         if (c >= lo && c < hi) {
             static int _n = 0;
             if (PS3_LOG_FIRST(_n, 16))
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
-                        (void*)c, entry->ctx->image_id);
-            *link = entry->next;
-            free(entry);
+                        (void*)c, s_coh_ctxs[i]->image_id);
+            s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* re-check slot i */
         } else {
-            link = &entry->next;
+            i++;
         }
     }
     spu_lockline_unlock();
@@ -288,7 +306,7 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  *
  * Every SPURS policy module polls its workload lines with GETLLAR, so taking
  * the one global lock for each poll serialized every SPU on a 128-byte copy.
- * A poll is almost always a context that already holds a node in s_coh_ctxs
+ * A poll is almost always a context that is already in s_coh_ctxs
  * re-reading a line that is already marked, and for that case the lock buys
  * nothing the reservation itself does not:
  *
@@ -314,7 +332,7 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  * Two preconditions keep every writer of the line on that right-hand side:
  *  - the line is already marked. Marks are never cleared, so every store path
  *    that checks spu_coh_is_reserved takes the notifier for this line.
- *  - ctx is already in s_coh_ctxs (coh_listed). The node was linked under the
+ *  - ctx is already in s_coh_ctxs (coh_listed). The entry was added under the
  *    lock by an earlier GETLLAR of this same thread, so any writer whose
  *    critical section could overlap this read walks past it.
  * Anything else takes the lock and spu_coh_reserve as before.
@@ -353,8 +371,10 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
+    for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
+    for (unsigned i = 0; i < s_coh_n; i++) {
+        spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
+        spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
         if (spu_coh_holds(c, line)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
@@ -371,8 +391,10 @@ void spu_coh_notify_write(uint32_t ea)
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
+    for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
+    for (unsigned i = 0; i < s_coh_n; i++) {
+        spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
+        spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (spu_coh_holds(c, line)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);

@@ -26,6 +26,11 @@
 #define SYNC_YIELD() sched_yield()
 #endif
 
+/* CellSyncMutex is 4 bytes and must be 4-byte aligned: every entry point
+ * answers CELL_SYNC_ERROR_ALIGN for a misaligned one before touching it. A word
+ * that straddles two aligned words is not one atomic for the SPU side either. */
+#define SYNC_MUTEX_MISALIGNED(ea) (((ea) & 3u) != 0)
+
 /* =========================================================================
  * Mutex
  * =====================================================================*/
@@ -88,6 +93,8 @@ s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    if (SYNC_MUTEX_MISALIGNED(_ea))
+        return CELL_SYNC_ERROR_ALIGN;
 
     SYNC_WATCH_LOG("INIT", _ea, mutex);
     spu_lockline_lock();
@@ -103,6 +110,8 @@ s32 cellSyncMutexLock(CellSyncMutex* mutex)
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    if (SYNC_MUTEX_MISALIGNED(_ea))
+        return CELL_SYNC_ERROR_ALIGN;
     SYNC_WATCH_LOG("LOCK", _ea, mutex);
 
     /* Take a ticket. */
@@ -135,6 +144,8 @@ s32 cellSyncMutexTryLock(CellSyncMutex* mutex)
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    if (SYNC_MUTEX_MISALIGNED(_ea))
+        return CELL_SYNC_ERROR_ALIGN;
     SYNC_WATCH_LOG("TRYLOCK", _ea, mutex);
 
     uint32_t raw = atomic_load(&mutex->lock);
@@ -158,6 +169,8 @@ s32 cellSyncMutexUnlock(CellSyncMutex* mutex)
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    if (SYNC_MUTEX_MISALIGNED(_ea))
+        return CELL_SYNC_ERROR_ALIGN;
     SYNC_WATCH_LOG("UNLOCK", _ea, mutex);
 
     if (sync_trace()) fprintf(stderr, "[SYNC] UNLOCK  ea=0x%08X tid=%lu\n", _ea, SYNC_TID());

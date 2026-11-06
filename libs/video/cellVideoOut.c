@@ -249,7 +249,12 @@ s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
                                           u32 aspect, u32 option)
 {
     (void)aspect; (void)option;
-    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> 1\n",
-           videoOut, resolutionId);
-    return (videoOut == CELL_VIDEO_OUT_PRIMARY) ? 1 : 0;
+    /* Stereoscopic 3D and dual-view modes have ids from 0x80 up (0x81 is 720p
+     * frame packing). Reporting them available tells the title a 3D TV is
+     * attached: MLB The Show 16 then asks to switch to 3D and, on yes, renders
+     * every frame twice, stacked over-under. No host display here is one. */
+    const s32 avail = (videoOut == CELL_VIDEO_OUT_PRIMARY && resolutionId < 0x80) ? 1 : 0;
+    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> %d\n",
+           videoOut, resolutionId, avail);
+    return avail;
 }

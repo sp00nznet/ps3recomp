@@ -94,6 +94,23 @@ jobs:
       # did. That gap let a broken xswd case sit red on both POSIX runners
       # while Windows reported green, which is exactly the wrong way round for
       # the platform most contributors build on.
+      # ps3_env_once with plain MSVC (cl) as well as clang-cl: the helper must
+      # cache on the compiler the Windows CRT's environment lock matters for.
+      - name: Run the ps3_env_once test (cl and clang-cl)
+        run: |
+          cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_cl.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cl /nologo /W3 /WX /TP /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl_cpp.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_cl_cpp.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_clang.exe tests/test_env_once.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_env_once_clang.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Run self-contained SPU helper tests
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c
@@ -119,6 +136,15 @@ jobs:
           .\test_np_matching2.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # sceNpSignaling for Matching2 room members: context ids from 1,
+      # ActivateConnection, the events a title's handlers get, the peer address.
+      - name: Run the sceNpSignaling room connection test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_signaling_rooms.exe libs/network/tests/test_np_signaling_rooms.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_signaling_rooms.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
       # and PSN's online ID rules.
       - name: Run the player-name test
@@ -135,6 +161,15 @@ jobs:
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_np_nat.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+      - name: Run the Avc2 Load test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_avc2_load.exe libs/network/tests/test_avc2_load.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_avc2_load.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # arithmetic with no host API in it, so it runs everywhere, and it is the

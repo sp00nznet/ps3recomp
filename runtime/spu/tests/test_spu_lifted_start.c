@@ -105,6 +105,7 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 #include "../spu_helpers.h"
 void spu_wrch(spu_context*, uint32_t, u128);
 void spu_overlay_register_region(uint32_t, uint32_t, int);
+void spu_overlay_register_region_reloc(uint32_t, uint32_t, uint32_t, int);
 void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
 void spu_overlay_register_source(uint32_t, int);
 void spu_overlay_register_sig(const uint8_t sig[16], int);
@@ -386,6 +387,43 @@ static void test_smc_xori(void)
 static void code_a(spu_context* ctx) { ctx->gpr[3]._u32[0] = 81; }
 static void code_b(spu_context* ctx) { ctx->gpr[3]._u32[0] = 82; }
 static void code_stale(spu_context* ctx) { ctx->gpr[3]._u32[0] = 83; }
+/* Relocatable resident code (spu_overlay_register_region_reloc): one canonical lift
+ * served wherever the title copies the code, with ctx->reloc_delta set. */
+static void rl_fn0(spu_context* c) { c->gpr[9]._u32[0] = 0x40; }
+static void rl_fn1(spu_context* c) { c->gpr[9]._u32[0] = 0x41; }
+static void test_reloc_regions(void)
+{
+    spu_context* c = calloc(1, sizeof *c);
+    if (!c) { check(0, "reloc: allocate"); return; }
+    spu_context_init(c, 0); c->image_id = 121;
+    spu_begin_image(140); spu_register_function(0x10000, rl_fn0); spu_register_function(0x10040, rl_fn1);
+    spu_begin_image(0);
+    spu_overlay_register_region_reloc(0x910000, 0x100, 0, 141);          /* rejected: canon 0 */
+    spu_overlay_register_region_reloc(0x920000, 0x100, 0x3FF80, 142);    /* rejected: past LS */
+    spu_overlay_note_get(c, 0x910000, c->ls + 0x5000, 16);
+    spu_overlay_note_get(c, 0x920000, c->ls + 0x6000, 16);
+    check(!c->resident_code[0].image_id, "reloc: invalid canon registrations are refused");
+    spu_overlay_register_region_reloc(0x900000, 0x100, 0x10000, 140);
+    spu_overlay_note_get(c, 0x900000, c->ls + 0x23450, 16);
+    check(c->resident_code[0].image_id == 140 && c->resident_code[0].canon == 0x10000, "reloc: GET at any LSA makes the copy resident");
+    c->reloc_delta = 0;
+    check(spu_lifted_lookup(c, 0x23450) == rl_fn0, "reloc: placed entry runs the canonical lift");
+    check(c->reloc_delta == 0x13450, "reloc: lookup sets placement - canon");
+    check(spu_lifted_lookup(c, 0x23490) == rl_fn1, "reloc: second function at canon + offset");
+    c->reloc_delta = 0;
+    check(spu_lifted_lookup(c, 0x23450) == rl_fn0, "reloc: repeated lookup (cache hit)");
+    check(c->reloc_delta == 0x13450, "reloc: a cache hit restores the delta");
+    check(spu_lifted_lookup(c, 0x10000) == NULL, "reloc: the canonical address itself is not served");
+    spu_overlay_note_get(c, 0x900000, c->ls + 0x30000, 16);
+    int n = 0; for (unsigned s = 0; s < 4; ++s) n += c->resident_code[s].image_id == 140;
+    check(n == 1, "reloc: a new placement takes over the image's slot");
+    check(spu_lifted_lookup(c, 0x30040) == rl_fn1 && c->reloc_delta == 0x20000, "reloc: new placement, new delta");
+    check(spu_lifted_lookup(c, 0x23450) == NULL, "reloc: the old placement is no longer resident");
+    c->reloc_delta = 7;
+    check(spu_lifted_lookup(c, 0x30000) == rl_fn0 && c->reloc_delta == 0x20000, "reloc: delta after placement change");
+    free(c);
+}
+
 static void test_resident_code_regions(void)
 {
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
@@ -1058,6 +1096,7 @@ int main(void)
     test_smc_branch_hints();
     test_smc_xori();
     test_resident_code_regions();
+    test_reloc_regions();
     test_verified_resident_code_regions();
     test_registry_lookup_memo();
     test_resident_interpreter_rejoin();

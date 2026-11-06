@@ -145,6 +145,7 @@ void cellGame_set_content_path(const char* path);
  * Functions
  * -----------------------------------------------------------------------*/
 
+s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved);
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName);
 

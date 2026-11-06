@@ -201,6 +201,8 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
                         s32 ppuPriority, u8 exitIfNoWork);
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr);
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr);
 s32 cellSpursFinalize(CellSpurs* spurs);
 
 s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
@@ -211,6 +213,8 @@ s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
 s32 cellSpursAttributeSetSpuThreadGroupType(CellSpursAttribute* attr,
                                             s32 type);
 s32 cellSpursAttributeEnableSpuPrintfIfAvailable(CellSpursAttribute* attr);
+s32 cellSpursAttributeEnableSystemWorkload(u64 attr_ea, u64 priority_ea, u32 maxSpu,
+                                           u64 preemptible_ea);
 
 s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads);
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
@@ -231,6 +235,14 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         CellSpursTaskset* taskset,
                                         const CellSpursTasksetAttribute* attr);
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 attr_ea);
+s32 cellSpursCreateTask2(CellSpursTaskset* taskset, u64 id_ea, u64 elf_ea,
+                         u64 argument_ea, u64 attr_ea);
+s32 _cellSpursTaskAttribute2Initialize(u64 attr_ea, u32 revision);
+s32 _cellSpursSendSignal(void* taskset, u32 taskId);
+s32 cellSpursGetWorkloadFlag(u64 spurs_ea, u64 flag_pp);
+s32 _cellSpursWorkloadFlagReceiver(u64 spurs_ea, u32 wid, u32 is_set);
+s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision);
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset);
 s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset);
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset);

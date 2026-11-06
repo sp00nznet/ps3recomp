@@ -4,6 +4,8 @@ if(UNIX)
     set(VDEC_TEST_LIBS m)
 endif()
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/adec_tests.cmake")
+
 # The callback-only decoder, as every build without FFmpeg has it.
 add_executable(test_vdec_stub test_vdec_decode.c)
 target_include_directories(test_vdec_stub PRIVATE "${PROJECT_SOURCE_DIR}/include")

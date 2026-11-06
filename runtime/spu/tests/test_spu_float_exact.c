@@ -9,7 +9,7 @@
  *  3. random vectors from a mix of generators aimed at the hard spots: results near 2^-126 and
  *     2^128, cancellation in fa/fs and fma (z close to -x*y), fma sums rounded onto a 24-bit
  *     boundary, wide exponent gaps, zeros of every kind, extended-range words, raw words.
- * Build (arm64, or x86 with -mavx2 -mfma):
+ * Build (arm64; x86 with -msse4.1 for the SSE4.1 form, or -mavx2 -mfma for the AVX2 form):
  *   cc -O2 -I runtime/spu -I include runtime/spu/tests/test_spu_float_exact.c -lm -o t && ./t [scale]
  * scale (default 1) multiplies the pass-3 size: 1 = 64M vectors (256M lanes). */
 #include "spu_helpers.h"

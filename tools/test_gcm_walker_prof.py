@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """RSX_WALKER_PROF, the in-process FIFO walker sampler (diagnostic, macOS
-arm64): armed only when set, and it writes about a sample per millisecond for
-RSX_WALKER_PROF_SECONDS (libs/video/tests/test_gcm_walker_prof.c, which
-compiles cellGcmSys.c in)."""
+arm64): armed only when set, bounded by RSX_WALKER_PROF_SECONDS even when its
+nominal 1 ms sleeps are coalesced, and writes every sample on its own line
+(libs/video/tests/test_gcm_walker_prof.c compiles cellGcmSys.c in)."""
 import os
 from pathlib import Path
 import subprocess

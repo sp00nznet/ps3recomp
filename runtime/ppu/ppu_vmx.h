@@ -275,16 +275,37 @@ VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
 VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
 VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
 
+/* Fused multiply-add without a libm call per lane. Without -mfma, fmaf is a
+ * software routine on MinGW, and vmaddfp/vnmsubfp called it once per lane. The
+ * product of two floats is exact in double, so s = x*z + y has one double
+ * rounding; rounding s to float then equals the correctly rounded fused result
+ * unless s sits exactly on a float rounding midpoint (low 29 bits 0x10000000)
+ * or outside the normal float range (zero, subnormal, overflow, inf, NaN).
+ * Those rare cases still call fmaf, so every lane is bit-identical to fmaf.
+ * ASSUMPTION: the host rounding mode is round-to-nearest (nothing in the
+ * runtime changes MXCSR). */
+VMX_INL float vmx_fmaf(float x, float z, float y) {
+#if defined(__FMA__)
+    return fmaf(x, z, y);   /* one instruction with -mfma */
+#else
+    const double s = (double)x * (double)z + (double)y;
+    uint64_t u; memcpy(&u, &s, sizeof u);
+    const uint32_t e = (uint32_t)(u >> 52) & 0x7FFu;
+    if ((u & 0x1FFFFFFFull) != 0x10000000ull && e - (1023u - 126u) < 254u)
+        return (float)s;
+    return fmaf(x, z, y);
+#endif
+}
 VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(fmaf(x, z, y))), vscr)); } VMX_OUT; }
+        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(vmx_fmaf(x, z, y))), vscr)); } VMX_OUT; }
 VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-fmaf(x, z, -y))), vscr)); } VMX_OUT; }
+        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-vmx_fmaf(x, z, -y))), vscr)); } VMX_OUT; }
 
 #define VMX_FUN(name, expr, flush_in, nanmode) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \
@@ -300,20 +321,25 @@ VMX_FUN(vmx_vrfiz, truncf(f), 0, 2)
 VMX_FUN(vmx_vrfip, ceilf(f), 1, 2)
 VMX_FUN(vmx_vrfim, floorf(f), 1, 2)
 
-/* int <-> float with a 2^uimm scale */
+/* int <-> float with a 2^uimm scale. uimm is 5 bits, so 2^-uimm and 2^uimm are
+ * normal floats and the scaling is exact: the same results as ldexpf, without
+ * a libm call per lane (which also kept these helpers out of line). */
+VMX_INL float vmx_pow2(int e) { return vmx_f((uint32_t)(127 + e) << 23); }
 VMX_INL void vmx_vcfux(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(ldexpf((float)vmx_w(b, i), -(int)uimm))); VMX_OUT; }
+    const float s = vmx_pow2(-(int)(uimm & 31u));
+    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u((float)vmx_w(b, i) * s)); VMX_OUT; }
 VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(ldexpf((float)(int32_t)vmx_w(b, i), -(int)uimm))); VMX_OUT; }
+    const float s = vmx_pow2(-(int)(uimm & 31u));
+    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u((float)(int32_t)vmx_w(b, i) * s)); VMX_OUT; }
 VMX_INL void vmx_vctsxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * ldexpf(1.0f, (int)uimm); int32_t v;
+    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * vmx_pow2((int)(uimm & 31u)); int32_t v;
         if (f != f) v = 0;
         else if (f < -2147483648.0f) { v = INT32_MIN; *vscr |= VMX_SAT; }
         else if (f >= 2147483648.0f) { v = INT32_MAX; *vscr |= VMX_SAT; }
         else v = (int32_t)f;
         vmx_sw(r, i, (uint32_t)v); } VMX_OUT; }
 VMX_INL void vmx_vctuxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * ldexpf(1.0f, (int)uimm); uint32_t v;
+    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * vmx_pow2((int)(uimm & 31u)); uint32_t v;
         if (f != f) v = 0;
         else if (f < 0.0f) { v = 0; *vscr |= VMX_SAT; }
         else if (f >= 4294967296.0f) { v = 0xFFFFFFFFu; *vscr |= VMX_SAT; }

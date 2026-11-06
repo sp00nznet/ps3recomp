@@ -15,6 +15,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
 #include "rsx_test_programs.h"
+#include "rsx_tiling.c"        /* the engine looks the bound tiles up there */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,7 @@ void cellGcm_replay_display_buffers_to_engine(void) {}
 typedef struct {
     u32 next_handle;
     u8  alive[STUB_MAX_OBJECTS];
+    u8  n_released[STUB_MAX_OBJECTS];   /* release calls per handle: each object is released once */
 
     int n_texture_create, n_texture_release, n_texture_upload;
     int n_color_create, n_color_release, n_color_seeded;
@@ -126,18 +128,22 @@ static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
     return stub.last_created_texture;
 }
 
+/* The first 16 bytes of the last upload: four R,G,B,A texels. */
+static u8 g_upload_first[16];
+
 static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
                                 const void* src, u32 row, u32 rows)
 {
     (void)u; (void)t; (void)face; (void)mip; (void)w; (void)h;
-    (void)src; (void)row; (void)rows;
+    (void)row; (void)rows;
+    if (src) memcpy(g_upload_first, src, sizeof g_upload_first);
     stub.n_texture_upload++;
 }
 
 static void stub_release(void* u, u32 handle)
 {
     (void)u;
-    if (handle && handle < STUB_MAX_OBJECTS) stub.alive[handle] = 0;
+    if (handle && handle < STUB_MAX_OBJECTS) { stub.alive[handle] = 0; stub.n_released[handle]++; }
     stub.last_released = handle;
 }
 
@@ -796,6 +802,134 @@ static void test_texture_sparse_rehash(void)
 
 /* ---- 4. the pipeline key ------------------------------------------------- */
 
+/* A block-compressed volume (dimension 3, DXT) goes up slice by slice as a
+ * 3D texture. A retail title's explosion smoke is a 256x256x16 DXT5 volume;
+ * uploaded as the 2D image its first 64 KB make, it drew dark squares. */
+#define VOL_MIPS 3
+#define VOL_SLICES 8
+static struct {
+    int n_create, n_upload;
+    u32 depth, row_bytes[VOL_MIPS];
+    u8 slice[VOL_MIPS][VOL_SLICES][128];   /* the first bytes of each slice's upload */
+} g_vol;
+
+static u32 stub_texture_create_3d(void* u, rsx_be_format f, u32 w, u32 h, u32 depth,
+                                  u32 mips, u32 remap, u32 rsx_fmt)
+{
+    g_vol.n_create++;
+    g_vol.depth = depth;
+    return stub_texture_create(u, f, w, h, mips, 1, remap, rsx_fmt);
+}
+
+static void stub_texture_upload_3d(void* u, u32 t, u32 z, u32 mip, u32 w, u32 h,
+                                   const void* src, u32 row_bytes)
+{
+    (void)u; (void)t; (void)w;
+    g_vol.n_upload++;
+    if (mip >= VOL_MIPS || z >= VOL_SLICES || !src) return;
+    g_vol.row_bytes[mip] = row_bytes;
+    const u32 bytes = row_bytes * ((h + 3u) / 4u);   /* one slice of block rows */
+    memcpy(g_vol.slice[mip][z], src, bytes < 128u ? bytes : 128u);
+}
+
+/* Block i of slice z of level m, as the volume's guest bytes mark it. */
+static int volume_block_is(u32 m, u32 z, u32 i, u32 block_bytes)
+{
+    const u8* b = g_vol.slice[m][z] + i * block_bytes;
+    return b[0] == (u8)(0xA0u + m * 0x10u + z) && b[1] == (u8)i;
+}
+
+/* Lay level m (w x h blocks, d slices) out at `at` in VTC order (power-of-two
+ * sides) or slice after slice, each block marked with its level, slice and
+ * index. Returns the level's size. */
+static u32 volume_level(u32 at, u32 m, u32 blocks, u32 d, u32 block_bytes, int vtc)
+{
+    const u32 full = d & ~3u;
+    for (u32 z = 0; z < d; z++)
+        for (u32 i = 0; i < blocks; i++) {
+            u32 n = z * blocks + i;
+            if (vtc) {
+                const u32 group = z < full ? z & ~3u : full, stride = z < full ? 4u : d - full;
+                n = group * blocks + i * stride + (z - group);
+            }
+            vm_base[at + n * block_bytes]      = (u8)(0xA0u + m * 0x10u + z);
+            vm_base[at + n * block_bytes + 1u] = (u8)i;
+        }
+    return blocks * d * block_bytes;
+}
+
+static void bind_volume(u32 fmt, u32 w, u32 h, u32 depth, u32 mips)
+{
+    m(M_TEX_UNIT + 0x00, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x04, 2u | (3u << 4) | (fmt << 8) | (mips << 16));   /* main, 3D */
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    m(M_TEX_UNIT + 0x10, 0xAAE4u);
+    m(M_TEX_UNIT + 0x18, (w << 16) | h);
+    m(0x1840 /* control3 */, depth << 20);
+}
+
+static void test_compressed_volume(void)
+{
+    printf("-- compressed volume\n");
+    rsx_draw_backend be = g_stub_backend;
+    be.texture_create_3d = stub_texture_create_3d;
+    be.texture_upload_3d = stub_texture_upload_3d;
+
+    /* 8x8x6 DXT5: four blocks a slice. Power-of-two sides, so VTC order:
+     * slices 0-3 interleaved block by block, then 4-5 the same way. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    volume_level(TEX_OFFSET, 0, 4, 6, 16, 1);
+    bind_volume(0x88, 8, 8, 6, 1);
+    draw_triangle();
+    int ok = g_vol.n_create == 1 && g_vol.depth == 6 && g_vol.n_upload == 6 && g_vol.row_bytes[0] == 32;
+    for (u32 z = 0; z < 6 && ok; z++)
+        for (u32 i = 0; i < 4; i++) ok &= volume_block_is(0, z, i, 16);
+    CHECK(ok, "a power-of-two DXT5 volume goes up as 6 slices out of VTC order "
+              "(%d created, depth %u, %d uploads, row %u)",
+          g_vol.n_create, g_vol.depth, g_vol.n_upload, g_vol.row_bytes[0]);
+    engine_down();
+
+    /* 12x4x2: not a power of two, so slice after slice as they lie. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    volume_level(TEX_OFFSET, 0, 3, 2, 16, 0);
+    bind_volume(0x88, 12, 4, 2, 1);
+    draw_triangle();
+    ok = g_vol.n_create == 1 && g_vol.n_upload == 2 && g_vol.row_bytes[0] == 48;
+    for (u32 z = 0; z < 2 && ok; z++)
+        for (u32 i = 0; i < 3; i++) ok &= volume_block_is(0, z, i, 16);
+    CHECK(ok, "a non-power-of-two DXT5 volume goes up slice after slice "
+              "(%d created, %d uploads, row %u)",
+          g_vol.n_create, g_vol.n_upload, g_vol.row_bytes[0]);
+    engine_down();
+
+    /* 16x16x8 DXT1 with three levels: 16 blocks x 8 slices (two groups of
+     * four), 4 blocks x 4 slices (one group), 1 block x 2 slices (a group of
+     * two), each level in VTC order after the one before. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    u32 at = TEX_OFFSET;
+    at += volume_level(at, 0, 16, 8, 8, 1);
+    at += volume_level(at, 1, 4, 4, 8, 1);
+    volume_level(at, 2, 1, 2, 8, 1);
+    bind_volume(0x86, 16, 16, 8, 3);
+    draw_triangle();
+    static const u32 blocks[VOL_MIPS] = {16, 4, 1}, slices[VOL_MIPS] = {8, 4, 2}, rows[VOL_MIPS] = {32, 16, 8};
+    ok = g_vol.n_create == 1 && g_vol.n_upload == 8 + 4 + 2;
+    for (u32 lv = 0; lv < VOL_MIPS && ok; lv++) {
+        ok &= g_vol.row_bytes[lv] == rows[lv];
+        for (u32 z = 0; z < slices[lv]; z++)
+            for (u32 i = 0; i < blocks[lv]; i++) ok &= volume_block_is(lv, z, i, 8);
+    }
+    CHECK(ok, "a DXT1 volume's every level goes up out of its own VTC order "
+              "(%d created, %d uploads)", g_vol.n_create, g_vol.n_upload);
+    engine_down();
+}
+
 static void test_pipeline_key(void)
 {
     printf("-- pipeline key\n");
@@ -1202,6 +1336,143 @@ static void test_transfer_coherence(void)
     CHECK(rd[0] == 0x44 && rd[1] == 0x11 && rd[2] == 0x22 && rd[3] == 0x33 &&
           rd[4] == 0x44 && rd[7] == 0x33,
           "the surface's R,G,B,A pixels land in guest memory as A8R8G8B8");
+    engine_down();
+}
+
+/* A tile bound over main memory: the RSX's reads and writes of it go through the tiling, the guest's bytes lie
+ * where the tiling puts them. A retail title downsamples its scene into such a region with NV3089 for an SPU
+ * depth-of-field job and samples the job's output; read linearly it showed as bands over the scene. */
+#define TILE_OFF 0x00200000u
+static void test_tiled_main_memory(void)
+{
+    printf("-- tiled main memory\n");
+    const rsx_tile tile = { TILE_OFF, 0x80000u, 1024u, 2u };
+    memset(vm_base + TILE_OFF, 0, tile.size);
+    engine_up();
+    rsx_tiling_set(0, RSX_LOCATION_MAIN, tile.offset, tile.size, tile.pitch, tile.bank);
+    rsx_tiling_set(1, RSX_LOCATION_LOCAL, 0x40000u, 0x80000u, 1024u, 0u);   /* local: transparent */
+    m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
+    m(M_COLOR_A_OFFSET, TILE_OFF);
+    m(M_COLOR_A_PITCH, 1024u);
+    draw_triangle();
+    const u32 surface = stub.bound_rt[0];
+
+    /* A surface stored to guest memory lands where the tiling puts each byte. */
+    g_stub_ramp = 1;
+    const u32 row5 = TILE_OFF + 5u * 1024u;
+    rsx_draw_engine_guest_read(RSX_LOCATION_MAIN, row5, 1024u, 16u, 1u);
+    g_stub_ramp = 0;
+    int placed = 1, moved = 0;
+    for (u32 c = 0; c < 16u; c++) {
+        const u8* p = vm_base + rsx_tile_address(&tile, row5 + c * 4u);
+        placed &= p[0] == 0x80 && p[1] == (u8)(4u * c + 1u) && p[2] == (u8)(4u * c + 2u) && p[3] == (u8)(4u * c + 3u);
+        moved |= rsx_tile_address(&tile, row5 + c * 4u) != row5 + c * 4u;
+    }
+    CHECK(placed && moved, "a stored row lands at its tiled addresses (%s)", moved ? "they differ from the linear ones" : "same");
+
+    /* Guest bytes pushed into the surface are read through the tiling. */
+    const u32 px = TILE_OFF + 3u * 1024u + 2u * 4u;
+    u8* t = vm_base + rsx_tile_address(&tile, px);
+    t[0] = 0x80; t[1] = 0x01; t[2] = 0x02; t[3] = 0x03;
+    memset(&g_written, 0, sizeof g_written);
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_MAIN, px, 1024u, 5u, 4u);
+    CHECK(g_written.n == 1 && g_written.surface == surface &&
+          g_written.first[0] == 0x01 && g_written.first[1] == 0x02 && g_written.first[2] == 0x03 &&
+          g_written.first[3] == 0x80, "a transfer into it pushes the pixel from its tiled address");
+
+    /* A texture in the tile decodes the tiled bytes. */
+    const u32 tex = TILE_OFF + 0x40000u;           /* past the 256x256 target */
+    for (u32 c = 0; c < 4u; c++) {
+        u8* q = vm_base + rsx_tile_address(&tile, tex + c * 4u);
+        q[0] = 0xF0; q[1] = (u8)(0x10u + c); q[2] = (u8)(0x20u + c); q[3] = (u8)(0x30u + c);
+    }
+    bind_texture_unit(RSX_LOCATION_MAIN, tex);
+    draw_triangle();
+    CHECK(g_upload_first[0] == 0x10 && g_upload_first[3] == 0xF0 && g_upload_first[12] == 0x13 &&
+          g_upload_first[14] == 0x33, "a texture in the tile reads its texels through the tiling");
+
+    /* Unbound, the memory is linear again. */
+    rsx_tiling_set(0, 0, 0, 0, 0, 0);
+    memset(vm_base + row5, 0, 64);
+    rsx_draw_engine_guest_read(RSX_LOCATION_MAIN, row5, 1024u, 16u, 1u);
+    CHECK(vm_base[row5] == 0x44 && vm_base[row5 + 63] == 0x33, "an unbound tile is stored linearly");
+    rsx_tiling_set(1, 0, 0, 0, 0, 0);
+    engine_down();
+}
+
+/* Vertex, index and fragment program fetches out of a tile bound over main memory read through the tiling too:
+ * every RSX client sees the region that way. Each byte is put only at its tiled address. */
+static void tile_put_be(u8* p, u32 v, u32 bytes)
+{
+    for (u32 i = 0; i < bytes; i++) p[i] = (u8)(v >> (8u * (bytes - 1u - i)));
+}
+static char g_tiled_ps[65536];
+static u32 tiled_fp_pipeline(void* u, const char* vs, const char* ps, const rsx_be_render_state* rs,
+                             const rsx_vertex_layout_plan* layout, u32 stride, rsx_be_format rt, u32 rt_count)
+{
+    snprintf(g_tiled_ps, sizeof g_tiled_ps, "%s", ps ? ps : "");
+    return stub_pipeline_create(u, vs, ps, rs, layout, stride, rt, rt_count);
+}
+static void test_tiled_fetches(void)
+{
+    printf("-- vertex, index and program fetches from tiled main memory\n");
+    const rsx_tile tile = { TILE_OFF, 0x80000u, 1024u, 2u };
+    const u32 vtx = TILE_OFF + 0x1000u, idx = TILE_OFF + 0x3000u + 8u, fp = TILE_OFF + 0x5000u;
+    memset(vm_base + TILE_OFF, 0, tile.size);
+    for (u32 i = 0; i < 8; i++) {
+        const float f[4] = { (float)i, 0.0f, 0.0f, 1.0f };
+        for (u32 c = 0; c < 4; c++) {
+            u32 w; memcpy(&w, &f[c], 4);
+            tile_put_be(vm_base + rsx_tile_address(&tile, vtx + i * 16u + c * 4u), w, 4);
+        }
+    }
+    static const u32 tris[] = { 3, 1, 2, 7, 0, 5 };
+    for (u32 i = 0; i < 6; i++) tile_put_be(vm_base + rsx_tile_address(&tile, idx + i * 2u), tris[i], 2);
+    engine_up();
+    rsx_tiling_set(0, RSX_LOCATION_MAIN, tile.offset, tile.size, tile.pitch, tile.bank);
+    m(M_VTXBUF_OFFSET, 0x80000000u | vtx);
+    m(0x181C, idx - 8u);                                   /* index array offset */
+    m(0x1820, 1u | (1u << 4));                             /* main memory, 16-bit */
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    m(0x1824, 4u | (5u << 24));                            /* six indices past 8 bytes */
+    m(M_BEGIN_END, 0u);
+    u32 wrong = 0;
+    const u32 drawn = stub.draw_indices ? stub.draw_indices : stub.draw_vertices;
+    for (u32 k = 0; k < 6 && drawn == 6; k++) {
+        float x;
+        memcpy(&x, stub.captured_vertices[stub.draw_indices ? stub.captured_indices[k] : k], 4);
+        wrong += x != (float)tris[k];
+    }
+    CHECK(stub.n_draw == 1 && drawn == 6 && !wrong,
+          "an indexed draw reads its indices and vertices through the tiling (%u indices, %u vertices)",
+          stub.draw_indices, stub.draw_vertices);
+
+    rsx_draw_backend be = g_stub_backend;
+    be.pipeline_create = tiled_fp_pipeline;
+    rsx_draw_engine_set_backend(&be);
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);                                          /* TRANSFORM_PROGRAM_LOAD */
+    for (u32 i = 0; i < 4; i++) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);                                          /* TRANSFORM_PROGRAM_START */
+    /* One 16-byte instruction (half of a 32-byte block, which the tiling keeps whole) reading COL1 at its tiled
+     * address; read linearly the program would be the one reading COL0 instead. */
+    rsx_test_fp_instr(vm_base + rsx_tile_address(&tile, fp),
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC(2) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    rsx_test_fp_instr(vm_base + fp,
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC(1) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    m(0x08E4, fp | 2u);                                    /* SHADER_PROGRAM, main */
+    m(0x1D60, 0x40u);                                      /* SHADER_CONTROL: fp32 exports */
+    g_tiled_ps[0] = 0;
+    draw_triangle();
+    CHECK(stub.n_draw == 2 && strstr(g_tiled_ps, "input.col1") && !strstr(g_tiled_ps, "input.col0)"),
+          "a fragment program in the tile is read through the tiling");
+    m(0x08E4, 0);
+    rsx_tiling_set(0, 0, 0, 0, 0, 0);
     engine_down();
 }
 
@@ -1796,6 +2067,8 @@ static void test_depth_snapshot_release(void)
     CHECK(stub.n_depth_create >= 3 && !stub.alive[second],
           "a recreated depth target releases its old snapshot (%d depth targets)",
           stub.n_depth_create);
+    CHECK(stub.n_released[second] == 1,
+          "and releases it once (%d calls)", stub.n_released[second]);
     engine_down();
 }
 
@@ -2456,6 +2729,7 @@ int main(void)
     test_texture_cache();
     test_texture_lookup_memo();
     test_texture_sparse_rehash();
+    test_compressed_volume();
     test_pipeline_key();
     test_restart_expansion();
     test_indexed_runs();
@@ -2466,6 +2740,8 @@ int main(void)
     test_polygon_offset();
     test_queued_flip_buffer();
     test_transfer_coherence();
+    test_tiled_main_memory();
+    test_tiled_fetches();
     test_transfer_rows();
     test_transfer_reads_fp16();
     test_inline_array();

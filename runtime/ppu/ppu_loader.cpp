@@ -632,7 +632,12 @@ static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
     const uintptr_t* sp = (const uintptr_t*)c->Rsp;
     for (int i = 0; i < 512; i++) {          /* 4 KB of stack */
         uintptr_t v;
+#ifdef _MSC_VER
         __try { v = sp[i]; } __except (1) { return 0; }
+#else
+        /* no SEH in GCC/MinGW: ReadProcessMemory fails on an unreadable address where a plain read would fault */
+        if (!ReadProcessMemory(GetCurrentProcess(), sp + i, &v, sizeof v, NULL)) return 0;
+#endif
         uint32_t g = samp_lookup(v);
         if (g) return g;
     }
@@ -788,7 +793,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
  * Writing the word leaves memory self-consistent: lwarx, the CAS and the
  * polling reader all see the same thing, so the guest behaves as it would if
  * whatever should have cleared the counter had done so. */
-extern "C" void ppu_resv_break(uint64_t ea);
+static inline void ppu_resv_break(uint64_t ea);   /* defined below; GCC rejects extern followed by static */
 static DWORD WINAPI poke_thread(LPVOID p)
 {
     const uint32_t ea  = (uint32_t)(uintptr_t)p;
@@ -2139,6 +2144,7 @@ typedef void (*ppu_fn)(ppu_context*);
 static uint32_t g_addr[PPU_HASH_SIZE];
 static ppu_fn   g_fn[PPU_HASH_SIZE];
 static uint32_t g_fn_count = 0;
+static uint32_t g_fn_gen = 0;   /* bumped by every registration; see ppu_lookup_icall */
 
 extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
@@ -2147,8 +2153,10 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
     /* Bounded probe: never loop past the whole table. A full table (function
      * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
-        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
-        if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
+        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++;
+                                  __atomic_fetch_add(&g_fn_gen, 1u, __ATOMIC_RELEASE); return; }
+        if (g_addr[i] == a) { g_fn[i] = fn;   /* overwrite */
+                              __atomic_fetch_add(&g_fn_gen, 1u, __ATOMIC_RELEASE); return; }
         i = (i + 1) & PPU_HASH_MASK;
     }
     static int warned = 0;
@@ -2164,7 +2172,24 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
  * Built lazily on first use (registration is boot-time-only). */
 static struct { void* host; uint32_t guest; } g_inv[PPU_HASH_SIZE];
 static uint32_t g_inv_n = 0;
+static uint32_t ppu_prof_resolve_host_slow(void* ra);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra)
+{
+    /* Every lv2 syscall and HLE call stamps its caller for the sampling
+     * profiler, and the binary search below missed the cache on most of its
+     * steps: in God of War HD gameplay it was a third of lv2_syscall. Call
+     * sites are few, so each thread keeps its last answer per site. The
+     * inverse table is built once, so an answer does not go stale. */
+    struct RaSlot { void* ra; uint32_t guest; };
+    static PPU_THREAD_LOCAL RaSlot t_ra[256];
+    RaSlot& slot = t_ra[((uintptr_t)ra >> 2) & 255u];
+    if (slot.ra == ra && g_inv_n) return slot.guest;
+    const uint32_t g = ppu_prof_resolve_host_slow(ra);
+    if (g_inv_n) { slot.ra = ra; slot.guest = g; }
+    return g;
+}
+
+static uint32_t ppu_prof_resolve_host_slow(void* ra)
 {
     if (!g_inv_n) {
         for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
@@ -2183,6 +2208,25 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
     while (lo < hi) { uint32_t mid = (lo + hi) / 2;
         if (g_inv[mid].host <= ra) lo = mid + 1; else hi = mid; }
     return lo ? g_inv[lo - 1].guest : 0;
+}
+
+static ppu_fn ppu_lookup(uint32_t a);
+
+/* ppu_lookup for indirect calls. The table and its addresses are 3 MB, so the
+ * probe of an indirect call missed the cache: about a fifth of
+ * ps3_indirect_call_impl in God of War HD gameplay. Targets repeat (vtables,
+ * callbacks), so each thread keeps its last hits, tagged with the registration
+ * count they were found under; any later registration retires them. */
+static ppu_fn ppu_lookup_icall(uint32_t a)
+{
+    struct IcSlot { uint32_t addr, gen; ppu_fn fn; };
+    static PPU_THREAD_LOCAL IcSlot t_ic[512];
+    IcSlot& s = t_ic[(a >> 2) & 511u];
+    const uint32_t gen = __atomic_load_n(&g_fn_gen, __ATOMIC_ACQUIRE);
+    if (s.fn && s.addr == a && s.gen == gen) return s.fn;
+    ppu_fn fn = ppu_lookup(a);
+    if (fn) { s.addr = a; s.gen = gen; s.fn = fn; }
+    return fn;
 }
 
 static ppu_fn ppu_lookup(uint32_t a)
@@ -2844,7 +2888,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         }
     }
 
-    ppu_fn fn = ppu_lookup(addr);
+    ppu_fn fn = ppu_lookup_icall(addr);
     if (!fn) {
         /* OPD-swap clobber fixup: a malformed memcpy (game func_0036FA74) writes
          * some handler/vtable OPDs as {TOC, func} (code & toc SWAPPED), so lifted
@@ -3523,9 +3567,12 @@ static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
         if (addr < r.end && r.begin < end && r.end > next) next = r.end;
     return next;
 }
+/* Default used by the PS3 executable entry path when PROC_PARAM is absent. */
+static int32_t g_ppu_primary_priority = 1001;
 
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
+    g_ppu_primary_priority = 1001;
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
     fseek(f, 0, SEEK_END);
@@ -3552,6 +3599,24 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         if (ph_off + 56 > fsz) break;   /* program header itself out of the file */
         const uint8_t* ph = file + ph_off;
         uint32_t p_type = be32(ph + 0);
+        if (p_type == 0x60000001u /*PT_PROC_PARAM*/) {
+            uint64_t offset = be64(ph + 8), size = be64(ph + 32);
+            /* size, magic, version, SDK version, primary priority, stack size,
+             * malloc page size and PPC segment are eight big-endian words.
+             * Check ranges by subtraction so hostile offsets cannot wrap. */
+            if (offset <= fsz && size >= 0x20 && size <= fsz - offset) {
+                const uint8_t* param = file + offset;
+                uint32_t declared = be32(param);
+                int32_t priority = (int32_t)be32(param + 0x10);
+                if (declared >= 0x20 && declared <= size &&
+                    be32(param + 4) == 0x13BCC5F6u &&
+                    priority >= 0 && priority <= 3071) {
+                    g_ppu_primary_priority = priority;
+                    fprintf(stderr, "[ppu] primary thread priority %d\n", priority);
+                }
+            }
+            continue;
+        }
         if (p_type == 7 /*PT_TLS*/) {
             /* The thread-local template: its initialised bytes live in vm_base
              * at p_vaddr (covered by a PT_LOAD too). ppu_run copies it into the
@@ -3944,10 +4009,22 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
  * callbacks whose OPD is captured at registration time and may later be
  * clobbered in guest memory (e.g. the GCM flip/vblank handler OPDs). Same
  * scratch-stack + trampoline-drain behaviour as ppu_guest_call. */
-extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+/* Restore host context even when a synchronous callback throws. */
+struct ppu_active_context_scope {
+    ppu_context* previous;
+    explicit ppu_active_context_scope(ppu_context* current) : previous(g_active_ctx) {
+        g_active_ctx = current;
+    }
+    ~ppu_active_context_scope() { g_active_ctx = previous; }
+};
+
+extern "C" int ppu_guest_call_ct_checked(uint32_t code, uint32_t toc,
                                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                                      uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+                                      uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
+                                      uint64_t* result)
 {
+    if (!result) return 0;
+    *result = 0;
     if (!code) return 0;
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
@@ -3970,11 +4047,30 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
 #else
     ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
 #endif
-    g_active_ctx = &ctx;
+    ppu_active_context_scope active_scope(&ctx);
+    /* A callback owns only the continuations it enqueues. Preserve any caller
+     * continuation, and discard an abandoned tail if this callback unwinds. */
+    struct callback_trampoline_scope {
+        void (*previous)(void*);
+        callback_trampoline_scope() : previous(g_trampoline_fn) { g_trampoline_fn = nullptr; }
+        ~callback_trampoline_scope() { g_trampoline_fn = previous; }
+    } trampoline_scope;
+
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
-    g_active_ctx = saved_active;
-    return ctx.gpr[3];
+    *result = ctx.gpr[3];
+    return 1;
+}
+
+/* Legacy callers keep their result-only contract. Ownership-sensitive users
+ * use the checked entry point: zero-valued callback success is unambiguous. */
+extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+                                      uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                      uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{
+    uint64_t result = 0;
+    ppu_guest_call_ct_checked(code,toc,a0,a1,a2,a3,a4,a5,a6,a7,&result);
+    return result;
 }
 
 extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
@@ -4008,8 +4104,13 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * owner stamps (0 -> LWM_TID collided with tid 1) and read as "free" in
      * sys_mutex -- LBP's main + bringup threads both held the GCM lock at once
      * and concurrently-emitted fences vanished (the boot-loading stall). */
-    { extern uint64_t ppu_thread_register_main(void);
-      ctx.thread_id = ppu_thread_register_main(); }
+    { extern uint64_t ppu_thread_register_main_priority(int32_t);
+      ctx.thread_id = ppu_thread_register_main_priority(g_ppu_primary_priority); }
+    /* register_main() leaves stack_addr/stack_size zeroed; sys_ppu_thread_
+     * get_stack_information(49) would report a {0,0} stack for the main
+     * thread. Backfill the real region now that the harness chose it. */
+    { extern void ppu_thread_set_main_stack(uint32_t, uint32_t);
+      ppu_thread_set_main_stack(stack_top - VM_PPU_STACK_SIZE, VM_PPU_STACK_SIZE); }
     /* For samplers on other threads (a port's periodic stack dump): the main
      * thread's context lives on this frame, not in the thread table. */
     g_ppu_main_ctx = &ctx;

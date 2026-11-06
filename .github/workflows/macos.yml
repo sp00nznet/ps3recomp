@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     name: macOS arm64 (${{ matrix.build_type }})
-    runs-on: macos-14          # Apple Silicon runner
+    runs-on: macos-15          # Apple Silicon runner
     strategy:
       fail-fast: false
       matrix:
@@ -76,6 +76,17 @@ jobs:
           /tmp/test_savedata_root
           clang -std=gnu17 -I include                 libs/system/tests/test_sysconf.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_sysconf
           /tmp/test_sysconf
+          clang -std=gnu17 -I include                 libs/system/tests/test_game_space.c                   -Wl,-dead_strip -o /tmp/test_game_space
+          /tmp/test_game_space
+
+      # ps3_env_once: one getenv per name, compiled as C and as C++ (ppu_fs.cpp
+      # includes it too).
+      - name: Run the ps3_env_once test
+        run: |
+          clang -std=gnu17 -Wall -Werror -I include -o /tmp/test_env_once tests/test_env_once.c
+          /tmp/test_env_once
+          clang++ -x c++ -std=c++17 -Wall -Werror -I include -o /tmp/test_env_once_cpp tests/test_env_once.c
+          /tmp/test_env_once_cpp
 
       - name: Run self-contained SPU helper tests
         run: |
@@ -116,6 +127,13 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
           /tmp/test_np_matching2
 
+      # sceNpSignaling for Matching2 room members: context ids from 1,
+      # ActivateConnection, the events a title's handlers get, the peer address.
+      - name: Run the sceNpSignaling room connection test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_np_signaling_rooms libs/network/tests/test_np_signaling_rooms.c
+          /tmp/test_np_signaling_rooms
+
       # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
       # and PSN's online ID rules.
       - name: Run the player-name test
@@ -138,9 +156,11 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_avconf_gamma libs/misc/tests/test_avconf_gamma.c
           /tmp/test_avconf_gamma
 
-      # The draw engine's present with PS3_AA=fxaa and PS3_SHARPEN, on the
-      # runner's GPU: FXAA blends a staircase and nothing flat, CAS steepens
-      # a soft edge by the amount asked, and with both off it is a copy.
+      # The draw engine's present with PS3_AA=fxaa/smaa, PS3_SHARPEN,
+      # PS3_VIBRANCE and PS3_CONTRAST, on the runner's GPU: FXAA and SMAA
+      # blend a staircase and nothing flat, CAS steepens a soft edge by the
+      # amount asked, vibrance and contrast move colours as asked, and with
+      # all of them off it is a copy.
       - name: Run the Metal present post-processing test
         run: |
           clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_present_post.m \
@@ -184,6 +204,13 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
           /tmp/test_np_nat
 
+      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+      - name: Run the Avc2 Load test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_avc2_load libs/network/tests/test_avc2_load.c
+          /tmp/test_avc2_load
+
       # cellPadSetActDirect: the small motor is on/off at full strength, and
       # a rumble lasts until the title changes it (renewed from the pad poll).
       - name: Run the pad rumble test
@@ -199,6 +226,13 @@ jobs:
         run: |
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
           /tmp/test_pad_hotplug
+
+      # cellPad keyboard fallback on port 0 (read through SDL here too, with a
+      # fake keyboard and focus; the real macOS source is CGEventSourceKeyState).
+      - name: Run the pad keyboard test
+        run: |
+          clang -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_keyboard libs/input/tests/test_pad_keyboard.c $(sdl2-config --libs)
+          /tmp/test_pad_keyboard
 
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
@@ -368,6 +402,24 @@ jobs:
           ./build/test_metal_poly_offset
           PS3RECOMP_ENG_POLY_OFFSET=0 ./build/test_metal_poly_offset
 
+      # SET_ZMIN_MAX_CONTROL reaches the GPU: a triangle in front of the near
+      # plane is clipped by default and clamped to depth 0 when the guest
+      # turns clipping off or the clamp on; PS3RECOMP_ENG_DEPTH_CLAMP=0 clips.
+      - name: Run the Metal depth clamp test
+        run: |
+          test -x build/test_metal_depth_clamp
+          ./build/test_metal_depth_clamp
+          PS3RECOMP_ENG_DEPTH_CLAMP=0 ./build/test_metal_depth_clamp
+
+      # The depth-bounds test, which Metal lacks, emulated in the fragment
+      # program: a bounded draw lands only where the STORED depth is inside
+      # the bounds; PS3RECOMP_ENG_DEPTH_BOUNDS=0 ignores the test.
+      - name: Run the Metal depth bounds test
+        run: |
+          test -x build/test_metal_depth_bounds
+          ./build/test_metal_depth_bounds
+          PS3RECOMP_ENG_DEPTH_BOUNDS=0 ./build/test_metal_depth_bounds
+
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's
@@ -430,6 +482,9 @@ jobs:
           # SV_TARGETs a program that writes more than one export gets.
           clang -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_fp_decompiler
+          # The D3D12 device order as pure logic (no D3D12 needed).
+          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_d3d12_device_pick libs/video/tests/test_d3d12_device_pick.c
+          /tmp/test_d3d12_device_pick
           # The register-file draw engine's platform-neutral halves against a
           # stub backend -- surface keying and reallocation, render-target
           # aliasing on a texture bind, the texture cache's revalidation and
@@ -441,6 +496,10 @@ jobs:
           # walk they are now computed without.
           clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
           /tmp/test_vertex_fetch_plan
+          # Preserve explicitly written current colors, including black,
+          # while keeping the unwritten ATTR3 compatibility default.
+          clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_current_color libs/video/tests/test_vertex_current_color.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+          /tmp/test_vertex_current_color
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
@@ -483,6 +542,13 @@ jobs:
         run: |
           clang -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
           /tmp/test_stdio_flush
+
+      # PS3_DEV_FLASH may name several roots; the first one that holds the file wins
+      # (runtime/platform/ps3_dev_flash.c, shared by cellFs and the raw sys_fs).
+      - name: Run the dev_flash path test
+        run: |
+          clang -std=gnu17 -Wall -Wextra -o /tmp/test_dev_flash_path runtime/platform/tests/test_dev_flash_path.c runtime/platform/ps3_dev_flash.c
+          /tmp/test_dev_flash_path
 
       # The lv2 sync-primitive stress suite on host threads. Windows-only until
       # the shim grew joinable handles and multi-object waits; on Apple Silicon

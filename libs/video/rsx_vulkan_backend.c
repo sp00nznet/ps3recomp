@@ -214,6 +214,7 @@ typedef struct vk_state {
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              depth_bounds_ok; /* depthBounds enabled                */
+    int              depth_clamp_ok;  /* depthClamp enabled                 */
     int              indep_blend_ok;  /* independentBlend: per-target MRT state */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
@@ -1749,8 +1750,11 @@ static void vk_window_open(const char* title)
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;
     }
-    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
-    if (vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    /* Resizable and maximizable; F11 or Alt+Enter switches to borderless fullscreen and back. The frame keeps its
+     * aspect ratio inside whatever size the window has (vk_window_fit). */
+    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    /* PS3RECOMP_FULLSCREEN=1 (--fullscreen), the same for every backend; PS3RECOMP_VK_FULLSCREEN is the older name. */
+    if (vk_env_on("PS3RECOMP_FULLSCREEN") || vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                    (int)s_vk.width, (int)s_vk.height, flags);
@@ -1761,6 +1765,8 @@ static void vk_window_open(const char* title)
         vk_window_drop(why);
         return;
     }
+    SDL_SetWindowMinimumSize(s_vk.window, 320, 180);
+    if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) SDL_ShowCursor(SDL_DISABLE);
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
         !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
@@ -1776,6 +1782,7 @@ static void vk_window_open(const char* title)
            SDL_GetCurrentVideoDriver(), n);
 }
 
+/* 0 on success, 1 when the window has no drawable area right now (the old swapchain is kept), -1 on failure. */
 static int vk_create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -1820,7 +1827,7 @@ static int vk_create_swapchain(void)
         if (ext.width  > caps.maxImageExtent.width)  ext.width  = caps.maxImageExtent.width;
         if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
     }
-    if (!ext.width || !ext.height) { VK_LOG("window has no drawable area\n"); return -1; }
+    if (!ext.width || !ext.height) return 1;   /* minimized: no drawable area, try again once it is shown */
 
     u32 count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
@@ -1872,16 +1879,56 @@ static int vk_create_swapchain(void)
     return 0;
 }
 
+/* The window changed size (or fullscreen state) since the swapchain was made: it is recreated before the next acquire.
+ * Also set while the window is minimized, when there is no drawable area to make one for. */
+static int s_vk_resized;
+
+/* Minimized, or no drawable area: nothing can be presented, and a swapchain cannot be created for it. */
+static int vk_window_hidden(void)
+{
+    int w = 0, h = 0;
+    if (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) return 1;
+    SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &h);
+    return w <= 0 || h <= 0;
+}
+
 static void vk_swapchain_lost(void)
 {
+    if (vk_window_hidden()) { s_vk_resized = 1; return; }   /* recreated once it is shown again */
     vk_device_idle();
-    if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
+    const int r = vk_create_swapchain();
+    s_vk_resized = r > 0;     /* the surface is 0x0 before SDL reports the window minimized */
+    if (r < 0) vk_window_drop("the swapchain could not be recreated");
+}
+
+/* Where the frame goes in the swapchain image: the largest rectangle of the frame's aspect ratio, centred. The rest
+ * of the image is black (letterbox or pillarbox). */
+typedef struct { u32 x, y, w, h; } vk_rect;
+
+static vk_rect vk_window_fit(void)
+{
+    const u32 dw = s_vk.sc_extent.width, dh = s_vk.sc_extent.height;
+    vk_rect r = { 0, 0, dw, dh };
+    if (!s_vk.width || !s_vk.height) return r;
+    if ((u64)dw * s_vk.height > (u64)dh * s_vk.width) {
+        r.w = (u32)(((u64)dh * s_vk.width + s_vk.height / 2) / s_vk.height);
+        r.x = (dw - r.w) / 2;
+    } else {
+        r.h = (u32)(((u64)dw * s_vk.height + s_vk.width / 2) / s_vk.width);
+        r.y = (dh - r.h) / 2;
+    }
+    return r;
 }
 
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
+    if (vk_window_hidden()) return;
+    if (s_vk_resized) {
+        vk_swapchain_lost();
+        if (!s_vk.windowed || s_vk_resized) return;
+    }
 
     u32 idx = 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
@@ -1908,12 +1955,19 @@ static void vk_present_window(void)
     };
     pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                           0, 0, NULL, 0, NULL, 1, &b);
+    const vk_rect fit = vk_window_fit();
+    if (fit.w != s_vk.sc_extent.width || fit.h != s_vk.sc_extent.height) {
+        /* The bars. The clear and the blit write disjoint pixels, so they need no barrier between them. */
+        static const VkClearColorValue black = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+        pvkCmdClearColorImage(cb, s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
+                              &b.subresourceRange);
+    }
     VkImageBlit blit = {
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstOffsets = { { 0, 0, 0 },
-                        { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
+        .dstOffsets = { { (int32_t)fit.x, (int32_t)fit.y, 0 },
+                        { (int32_t)(fit.x + fit.w), (int32_t)(fit.y + fit.h), 1 } },
     };
     pvkCmdBlitImage(cb, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -2124,16 +2178,30 @@ static VkFormat vk_eng_format(rsx_be_format f, u32* bpp)
 }
 
 /* Colour formats the E2 passes render into: RGBA8 for ordinary and display
- * targets, RGBA16F for SET_SURFACE_FORMAT 0xB HDR targets. Both are required
- * colour attachment formats with blending in Vulkan 1.0. */
-#define VK_ENG_RT_FORMATS 2
+ * targets, RGBA16F for SET_SURFACE_FORMAT 0xB HDR targets, and R32F / RGBA32F
+ * for the float targets a title renders small reductions into. All four are
+ * required colour attachment formats in Vulkan 1.0; blending is guaranteed only
+ * for the first two (see vk_eng_rt_blendable). */
+#define VK_ENG_RT_FORMATS 4
 static int vk_eng_rt_index(VkFormat f)
 {
     switch (f) {
     case VK_FORMAT_R8G8B8A8_UNORM:      return 0;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return 1;
+    case VK_FORMAT_R32_SFLOAT:          return 2;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return 3;
     default:                            return -1;
     }
+}
+
+/* Whether the device blends into colour format `f` (guaranteed for RGBA8 and
+ * RGBA16F, optional for 32-bit float formats). */
+static int vk_eng_rt_blendable(VkFormat f)
+{
+    if (f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R16G16B16A16_SFLOAT) return 1;
+    VkFormatProperties fp;
+    pvkGetPhysicalDeviceFormatProperties(s_vk.phys, f, &fp);
+    return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
 }
 
 /* The largest image side the engine creates: the device's own limit once a
@@ -2142,8 +2210,17 @@ static u32 vk_max_dim(void) { return s_vk.max_dim ? s_vk.max_dim : 4096u; }
 
 static u32 vk_eng_alloc(void)
 {
-    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
-        if (s_eobj[i].kind == VK_ENG_FREE) return i;
+    /* Hand out slots round-robin rather than lowest-first, so a handle the
+     * engine releases is not immediately reused: a late or duplicated release
+     * of an old handle then finds a free slot instead of a live object. */
+    static u32 cursor;
+    for (u32 step = 0; step < VK_ENG_MAX_OBJ - 1; step++) {
+        const u32 i = 1 + (cursor + step) % (VK_ENG_MAX_OBJ - 1);
+        if (s_eobj[i].kind == VK_ENG_FREE) {
+            cursor = i % (VK_ENG_MAX_OBJ - 1);
+            return i;
+        }
+    }
     VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ);
     return 0;
 }
@@ -2291,6 +2368,42 @@ static void vk_eng_release(void* user, u32 handle)
         vk_eng_drop_framebuffers();
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
+}
+
+/* The engine releases each object through the call for its kind: colour
+ * targets through color_target_release, depth targets through
+ * depth_target_release, and textures, views and colour feedback copies
+ * through texture_release. Handles are slots that get reused, so a release
+ * naming an object of another kind can only be a stale handle, and freeing
+ * it would destroy the live object that now owns the slot. It is refused and
+ * reported instead. Free slots pass through: vk_eng_release ignores them. */
+static int vk_eng_release_kind_ok(u32 handle, int want_color, int want_depth)
+{
+    if (!handle || handle >= VK_ENG_MAX_OBJ) return 1;
+    const vk_eng_obj* o = &s_eobj[handle];
+    if (o->kind == VK_ENG_FREE) return 1;
+    const int color = o->kind == VK_ENG_COLOR && !o->snapshot, depth = o->kind == VK_ENG_DEPTH;
+    const int ok = want_color ? color : want_depth ? depth : (!color && !depth);
+    if (!ok) {
+        static u32 logs;
+        if (logs++ < 16)
+            VK_LOG("engine: stale %s release of object %u (kind %d%s, %ux%u) refused\n",
+                   want_color ? "colour target" : want_depth ? "depth target" : "texture", handle,
+                   (int)o->kind, o->snapshot ? " snapshot" : "", o->w, o->h);
+    }
+    return ok;
+}
+static void vk_eng_texture_release(void* user, u32 handle)
+{
+    if (vk_eng_release_kind_ok(handle, 0, 0)) vk_eng_release(user, handle);
+}
+static void vk_eng_color_target_release(void* user, u32 handle)
+{
+    if (vk_eng_release_kind_ok(handle, 1, 0)) vk_eng_release(user, handle);
+}
+static void vk_eng_depth_target_release(void* user, u32 handle)
+{
+    if (vk_eng_release_kind_ok(handle, 0, 1)) vk_eng_release(user, handle);
 }
 
 static void vk_eng_snapshot_pool_drain(void);
@@ -3119,6 +3232,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
      * screen the same one D3D's viewport produces. */
     VkPipelineRasterizationStateCreateInfo ras = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .depthClampEnable = (rs->depth_clamp && s_vk.depth_clamp_ok) ? VK_TRUE : VK_FALSE,
         .polygonMode = VK_POLYGON_MODE_FILL,
         .cullMode = !rs->cull_enable ? VK_CULL_MODE_NONE
                   : (rs->cull_face == 0x0404u || rs->cull_face == 0x0408u) ? VK_CULL_MODE_FRONT_BIT
@@ -3168,6 +3282,9 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     static int mrt_mode = -1;
     if (mrt_mode < 0) { const char* e = getenv("PS3RECOMP_VK_MRT_MASK"); mrt_mode = e ? atoi(e) : 1; }
     VkPipelineColorBlendAttachmentState cba[RSX_BE_MAX_COLOR_TARGETS];
+    /* A device without blending on a float target draws it unblended; that is
+     * reported once, never silently. */
+    const int blendable = vk_eng_rt_blendable(P->rt_fmt);
     for (u32 r = 0; r < P->rt_count; r++) {
         VkColorComponentFlags twm = wm;
         int tblend = rs->blend_enable != 0;
@@ -3181,6 +3298,14 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
                 if (nib & 8u) twm |= VK_COLOR_COMPONENT_B_BIT;
             }
             tblend = (rs->blend_mrt >> r) & 1u;
+        }
+        if (tblend && !blendable) {
+            tblend = 0;
+            if (!(s_e2.warned & 256u)) {
+                VK_LOG("engine: blending unsupported for colour format %d on this device; drawing unblended\n",
+                       (int)P->rt_fmt);
+                s_e2.warned |= 256u;
+            }
         }
         cba[r] = (VkPipelineColorBlendAttachmentState){
             .blendEnable = tblend ? VK_TRUE : VK_FALSE,
@@ -3756,12 +3881,12 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .submit_and_wait      = vk_eng_submit_and_wait,
     .texture_create       = vk_eng_texture_create,
     .texture_upload       = vk_eng_texture_upload,
-    .texture_release      = vk_eng_release,
+    .texture_release      = vk_eng_texture_release,
     .color_target_create  = vk_eng_color_target_create,
-    .color_target_release = vk_eng_release,
+    .color_target_release = vk_eng_color_target_release,
     .surface_view         = vk_eng_surface_view,
     .depth_target_create  = vk_eng_depth_target_create,
-    .depth_target_release = vk_eng_release,
+    .depth_target_release = vk_eng_depth_target_release,
     .depth_snapshot       = vk_eng_depth_snapshot,
     .color_snapshot       = vk_eng_color_snapshot,
     .pipeline_create      = vk_eng_pipeline_create,
@@ -3871,6 +3996,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * Vulkan; without it the test stays off, as before. */
     want.depthBounds = have.depthBounds;
     s_vk.depth_bounds_ok = have.depthBounds ? 1 : 0;
+    /* SET_ZMIN_MAX_CONTROL's depth clamp (rs->depth_clamp). Optional too;
+     * without it such draws are clipped, as before. */
+    want.depthClamp = have.depthClamp;
+    s_vk.depth_clamp_ok = have.depthClamp ? 1 : 0;
     /* Per-target colour mask and blend enable (an MRT set's targets B..D
      * have their own); without it every target takes target A's. */
     want.independentBlend = have.independentBlend;
@@ -4033,6 +4162,19 @@ int rsx_vulkan_backend_pump_messages(void)
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
+                 (e.key.keysym.sym == SDLK_F11 ||
+                  (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
+            /* Borderless fullscreen on the window's display, and back. */
+            const int full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+            if (SDL_SetWindowFullscreen(s_vk.window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
+                SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
+            s_vk_resized = 1;
+        } else if (e.type == SDL_WINDOWEVENT &&
+                   (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
+                    e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
+            s_vk_resized = 1;
+        }
     }
     return quit ? -1 : 0;
 }

@@ -589,7 +589,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 0;
 
     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
-    uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
+    /* The line moves to and from a 128-byte aligned local-store address: the
+     * low seven bits of MFC_LSA are ignored, as those of the EA are. Used
+     * unmasked, an unaligned LSA put the line at the wrong place, and one in
+     * the last 128 bytes of local store carried the copy past the end of the
+     * store and over the context behind it. */
+    uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
 
@@ -988,6 +993,20 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
+    /* The MFC parameter channels only latch a value in the context (see
+     * mfc_channel_write); the command write is what reaches the engine. Store
+     * them here and skip mfc_for for five or six of the eight or nine writes
+     * of every DMA. */
+    switch (channel) {
+    case MFC_LSA:       ctx->mfc_lsa = v;         return;
+    case MFC_EAH:       ctx->mfc_eah = v;         return;
+    case MFC_EAL:       ctx->mfc_eal = v;         return;
+    case MFC_Size:      ctx->mfc_size = v;        return;
+    case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+    default: break;
+    }
+
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
@@ -1073,7 +1092,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
             SPU_EVENT_SET(ctx, 0x2u);
         spu_lockline_unlock();
         break;
-    case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
+    case SPU_WrSRR0:         ctx->srr0 = v & 0x3FFFCu;   /* a word-aligned LS address */ break;
     default:
         /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */
         break;
@@ -1152,6 +1171,17 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
+    /* Pass through the waiter's lock first. spu_ch_wait tests its predicate and
+     * goes to sleep under ch_wait_lock, but a producer makes the predicate true
+     * outside it. A wake issued between the waiter's test and its sleep found
+     * nobody on the condition variable and was lost (on POSIX the shim's
+     * generation count is read when the sleep begins, so it misses it too);
+     * the read then completed only at the 10 ms re-poll. Taking the lock orders
+     * this wake after the waiter is either asleep or has not yet tested.
+     * Uncontended it is one lock/unlock pair. No caller holds ch_wait_lock, and
+     * the waiter takes no other lock while it does. */
+    AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
 }
 
@@ -1298,7 +1328,11 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         break;
     }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
-    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
+    /* The events that are pending AND enabled. A pending event the SPU has
+     * not unmasked (an Lr left by a lost reservation, an Sn) must not show up
+     * in a read that is waiting on a different set; this is the condition
+     * spu_ch_ready and rchcnt already use. */
+    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status & ctx->event_mask; break;
     /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.
      * This runtime models nonisolated SPUs, so the isolation bit stays clear. */
     case SPU_RdMachStat:    v = ctx->int_enable & 1u; break;
@@ -1715,7 +1749,7 @@ int spu_have_function(uint32_t addr)
  * through would execute stale code registered under another image. Task and
  * unbounded overlay misses retain their existing primary-image fallback. */
 static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
-static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
+static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa, int* reloc)
 {
     /* Every probe below goes through #436's per-thread memo rather than
      * spu_lookup() directly: the resolver makes up to three of them per
@@ -1730,7 +1764,18 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
              * unverified: other images' functions there would be stale. */
             if (ctx->resident_code[slot].verify_state &&
                 !spu_overlay_resident_verified((spu_context*)ctx, slot)) return NULL;
-            return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
+            const uint32_t canon = ctx->resident_code[slot].canon;
+            if (!canon)
+                return (spu_lifted_fn)spu_lookup_memoized(lsa, ctx->resident_code[slot].image_id);
+            /* Relocatable code (spu_overlay_register_region_reloc): its lift sits at
+             * canon + offset. The caller runs the function next, so set its delta now. */
+            spu_fn f = spu_lookup_memoized(lsa - ctx->resident_code[slot].lsa + canon,
+                                           ctx->resident_code[slot].image_id);
+            if (f) {
+                ((spu_context*)ctx)->reloc_delta = (int32_t)(ctx->resident_code[slot].lsa - canon);
+                if (reloc) *reloc = 1;
+            }
+            return (spu_lifted_fn)f;
         }
     spu_fn fn = NULL;
     if (ctx->resident_task) fn = spu_lookup_memoized(lsa, ctx->resident_task);
@@ -1762,6 +1807,10 @@ typedef struct {
     spu_lifted_fn fn;
     uint32_t id, lsa, rgen, residency;
     int image, ovl, task;
+    /* A relocatable resolution also sets ctx->reloc_delta, which a hit must
+     * repeat: residency fixes the placement, so the delta is part of the answer. */
+    int reloc;
+    int32_t reloc_delta;
 } spu_dcache_ent;
 #define SPU_DCACHE_ENTRIES 512u
 static SPU_TLS spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
@@ -1792,7 +1841,7 @@ static void spu_dcache_shadow_stats(void)
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
     const int mode = spu_dcache_mode();
-    if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
+    if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa, NULL);
     spu_context* c = (spu_context*)ctx;
     uint32_t id = c->dcache_id;
     if (!id) {
@@ -1806,9 +1855,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     if (e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
         e->residency == c->dcache_residency && e->image == c->image_id &&
         e->ovl == c->resident_ovl && e->task == c->resident_task) {
+        if (e->reloc) c->reloc_delta = e->reloc_delta;
         if (mode == 2) {
             __atomic_fetch_add(&s_dcache_hits, 1, __ATOMIC_RELAXED);
-            const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
+            const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa, NULL);
             if (full != e->fn) {
                 if (__atomic_fetch_add(&s_dcache_shadow_bad, 1, __ATOMIC_RELAXED) < 16)
                     fprintf(stderr, "[spu-dcache] shadow mismatch img=%d ovl=%d task=%d lsa=0x%05X "
@@ -1825,13 +1875,15 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         __atomic_fetch_add(&s_dcache_misses, 1, __ATOMIC_RELAXED);
         spu_dcache_shadow_stats();
     }
-    const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa);
+    int reloc = 0;
+    const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa, &reloc);
     if (fn) {
         /* The resolver may have verified a pending slot; the entry records the
          * residency it resolved against, read after it. */
         e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
         e->residency = c->dcache_residency; e->image = c->image_id;
         e->ovl = c->resident_ovl; e->task = c->resident_task;
+        e->reloc = reloc; e->reloc_delta = c->reloc_delta;
     }
     return fn;
 }
@@ -1842,12 +1894,17 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
 typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
-                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code; } spu_ovl_src;
+                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
+                 uint32_t canon; } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature). */
 #define SPU_OVL_SRC_MAX 128
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
+/* Monotonic: published before any signature entry becomes visible through
+ * s_ovl_src_count. A reader that acquired that count cannot miss the flag.
+ * This lets EA-only registries reject unrelated GETs of every size. */
+static atomic_int s_ovl_has_sig;
 
 /* Every MFC GET is checked against the registered sources, and a job that
  * streams its data in small pieces issues thousands of GETs a frame against
@@ -1894,6 +1951,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
+        s_ovl_src[s_ovl_src_count].canon = 0;
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
@@ -1905,6 +1963,22 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
     if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
     spu_overlay_register_source(content_ea, image_id);
     s_ovl_src[s_ovl_src_count - 1].span = span;
+}
+
+/* And for position-independent code the title copies to a different LS address at each
+ * load (GoW:A's BatchJobList jobs place four EBOOT blobs at a new 16-byte-aligned address
+ * every time): lifted ONCE at a canonical base with spu_lifter.py --reloc. A GET of the
+ * content at any address makes that copy resident; dispatch then looks the function up at
+ * canon + offset and sets ctx->reloc_delta, which the lifted code adds to every address
+ * it derives from its own pc. */
+void spu_overlay_register_region_reloc(uint32_t content_ea, uint32_t span, uint32_t canon, int image_id)
+{
+    if (!canon || canon >= SPU_LS_SIZE || span > SPU_LS_SIZE - canon) return;
+    { static int s_off = -1; if (s_off < 0) { const char* e = getenv("SPU_RELOC_OFF"); s_off = e && e[0] == '1'; }
+      if (s_off) return; }   /* SPU_RELOC_OFF=1: leave that code to the interpreter (A/B) */
+    const int n = s_ovl_src_count;
+    spu_overlay_register_region(content_ea, span, image_id);
+    if (s_ovl_src_count == n + 1) s_ovl_src[n].canon = canon;
 }
 
 /* Residency proves which load happened, not what the bytes are: the source EA
@@ -2071,7 +2145,8 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
-        s_ovl_src_count++;
+        atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
+        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -2148,7 +2223,12 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         }
     }
     int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
-    if (size < 512 && !spu_ovl_ea_known(ea)) return;
+    /* Invalidate destination code/residency above even for an unrelated EA.
+     * Acquire count before the signature flag: if this snapshot contains a
+     * signature, its earlier flag publication is visible. A racing future
+     * signature can only force an unnecessary scan of the older snapshot. */
+    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
+        !spu_ovl_ea_known(ea)) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
@@ -2159,7 +2239,10 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 /* Verified code was lifted for one load address. */
                 if (o->code && lsa != o->load_lsa) continue;
                 for (unsigned slot = 0; slot < 4; ++slot) {
-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                    /* A relocatable image takes over its own previous placement's slot: each load
+                     * lands somewhere new, and stale copies would fill the slots. */
+                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa &&
+                        !(o->canon && ctx->resident_code[slot].image_id == o->image_id))
                         continue;
                     ctx->resident_code[slot].lsa = lsa;
                     ctx->resident_code[slot].size = o->span;
@@ -2167,6 +2250,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].image_id = o->image_id;
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
                     ctx->resident_code[slot].source_index = i;
+                    ctx->resident_code[slot].canon = o->canon;
                     spu_dcache_residency_changed(ctx);
                     return;
                 }
@@ -2654,6 +2738,12 @@ void spu_indirect_branch(spu_context* ctx)
                   fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                           n, ctx->gpr[3]._u32[0]); }
             ctx->gpr[3] = spu_make_preferred_u32(0);
+            /* The kernel's selection copies the instance's first line into the
+             * context's tempArea (LS 0x100) on every call, not only at module
+             * entry, and jobs that ran since may have overwritten it. */
+            { const uint32_t sp = ((uint32_t)ctx->ls[0x1C4] << 24) | ((uint32_t)ctx->ls[0x1C5] << 16) |
+                                  ((uint32_t)ctx->ls[0x1C6] << 8) | ctx->ls[0x1C7];
+              if (sp) memcpy(ctx->ls + 0x100, vm_base + sp, 0x80); }
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }

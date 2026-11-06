@@ -5340,6 +5340,47 @@ def main() -> None:
                 if got_addr:
                     toc = (got_addr + 0x8000) & 0xFFFFFFFF
                     print(f"  TOC: entry descriptor bogus, using .got+0x8000 = 0x{toc:X}")
+                else:
+                    # Stripped homebrew ELFs (e.g. PSL1GHT EBOOT.BIN with an
+                    # emptied shstrtab) carry no usable section names, so the
+                    # .got lookup finds nothing and the bogus entry toc-word
+                    # (which repeats the code address) would be kept as THE
+                    # module TOC -- every `ld r2, N(r1)` restore lowering then
+                    # hardcodes that garbage and the guest spins in the first
+                    # OPD-hook poll (TanakaDOOM: 0x103F8 vs true 0xA3328).
+                    # Recover the TOC from the OPD instead: scan data segments
+                    # for descriptor pairs {known-function-start, toc} and take
+                    # the most frequent toc. The code half must be a detected
+                    # function start, so incidental pointer data can't vote.
+                    from collections import Counter
+                    _starts = set(s for s, _ in func_bounds)
+                    _toc_freq = Counter()
+                    for v0, v1, d in seg_map:
+                        if v0 <= text_lo < v1:
+                            continue    # skip the text segment itself
+                        # OPD descriptors are 16 bytes in ELF64:
+                        # {code(8), toc(8)}. Reading two consecutive
+                        # DWORDs instead would pair code_lo with
+                        # code_hi==0 and elect 0x0 as the "majority
+                        # TOC" (TanakaDOOM: 1832 bogus votes).
+                        _bo = 'big' if big_endian else 'little'
+                        for off in range(0, len(d) - 16, 4):
+                            c = int.from_bytes(d[off:off + 8], _bo)
+                            t = int.from_bytes(d[off + 8:off + 16], _bo)
+                            if c in _starts and (t & 3) == 0 and t != c:
+                                _toc_freq[t] += 1
+                    if _toc_freq:
+                        _t_best, _n_best = _toc_freq.most_common(1)[0]
+                        if _n_best >= 8:
+                            toc = _t_best
+                            print(f"  TOC: entry descriptor bogus, no .got; "
+                                  f"OPD-majority toc = 0x{toc:X} ({_n_best} descriptors)")
+                        else:
+                            print(f"  TOC: entry descriptor bogus, no .got; "
+                                  f"OPD scan inconclusive (best 0x{_t_best:X} x{_n_best})")
+                    else:
+                        print("  TOC: entry descriptor bogus, no .got; "
+                              "OPD scan found no descriptors")
             # Multi-TOC executables (large Sony-toolchain builds like LBP carry
             # two or more TOCs): harvest candidates by scanning the data
             # segments for OPD descriptor pairs {code-in-text, toc} and keeping

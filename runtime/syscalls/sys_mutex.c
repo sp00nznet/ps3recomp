@@ -111,8 +111,10 @@ int64_t sys_mutex_create(ppu_context* ctx)
 #endif
         m->recursive = (rec_be == SYS_SYNC_RECURSIVE) ? 1 : 0;
 
-        /* name at offset 24 */
-        memcpy(m->name, attr_raw + 24, 8);
+        /* name at offset 0x20: sys_mutex_attribute_t is protocol, recursive,
+         * pshared, adaptive (4 x u32), ipc_key u64 @0x10, flags @0x18, pad
+         * @0x1C, name[8] @0x20. Offset 24 read flags + pad. */
+        memcpy(m->name, attr_raw + 0x20, 8);
     }
 
     /* Initialize host mutex */
@@ -254,6 +256,12 @@ int64_t sys_mutex_lock(ppu_context* ctx)
 {
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
+    /* lv2_usec_deadline multiplies by the QPC frequency in 64 bits, which wraps
+     * for a timeout past about 1.8e12 us (21 days at 10 MHz) and lands on an
+     * arbitrary deadline: 2^63, say, comes out as "already passed" and times
+     * out at once. Anything beyond 2^40 us (12.7 days) is indistinguishable
+     * from waiting forever, so treat it as that. */
+    if (timeout_us > (1ull << 40)) timeout_us = 0;
     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -386,6 +394,14 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
         m->lock_count++;
         return CELL_OK;
     }
+
+    /* A non-recursive mutex the caller already holds is EDEADLK, as in
+     * sys_mutex_lock above. Without this the host try-acquire below SUCCEEDS --
+     * a CRITICAL_SECTION (and a recursive pthread mutex) is always re-enterable
+     * by its owner -- so the guest was told it had taken a second level of a
+     * mutex that has none. */
+    if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0)
+        return (int64_t)(int32_t)CELL_EDEADLK;
 
 #ifdef _WIN32
     if (!TryEnterCriticalSection(&m->cs)) {

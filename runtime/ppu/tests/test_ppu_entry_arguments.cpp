@@ -26,7 +26,8 @@ DWORD GetFileAttributesA(const char*) { std::abort(); }
 uint32_t ppu_load_elf(const char*);
 int ppu_run(uint32_t, uint32_t);
 extern uint32_t ppu_vm_size;
-uint64_t ppu_thread_register_main(void) { return 1; }
+uint64_t ppu_thread_register_main_priority(int32_t) { return 1; }
+void ppu_thread_set_main_stack(uint32_t, uint32_t) {}
 void (*g_ppu_thread_entry_trampoline)(uint32_t, uint64_t, uint32_t, uint64_t);
 }
 static unsigned failures;

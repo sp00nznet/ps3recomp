@@ -15,6 +15,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
+#include "rsx_tiling.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
@@ -95,6 +96,7 @@ extern u32 ppu_vm_size;
 #define M_POLY_OFFSET_FILL    0x0A68
 #define M_POLY_OFFSET_FACTOR  0x0A78
 #define M_POLY_OFFSET_BIAS    0x0A7C
+#define M_ZMIN_MAX_CONTROL    0x1D78
 
 /* ---- module state -------------------------------------------------------- */
 
@@ -130,6 +132,9 @@ typedef struct {
     u32 last_use;          /* g.frames when last bound or sampled             */
     u32 ext_w, ext_h;      /* the largest clip it was bound with: past it,
                             * nothing was drawn or cleared (eng_clear_rect) */
+    u32 dbz_copy;          /* float copy for the emulated depth-bounds test */
+    u32 dbz_w, dbz_h;
+    u64 dbz_serial;        /* depth_serial that copy holds                 */
 
 } eng_zdepth;
 
@@ -280,6 +285,96 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     return vm_base + ea;
 }
 
+/* Guest memory as the engine reaches it, for the tiled range copies (rsx_tiling.h). */
+static u8* eng_tiled_ptr(void* user, u32 location, u32 offset, u32 len)
+{
+    return (u8*)eng_guest_ptr(user, location, offset, len);
+}
+
+static const rsx_tiled_mem s_eng_mem = { eng_tiled_ptr, NULL, NULL };
+
+/* Whether [offset, offset + len) touches a tile bound over main memory. */
+static int eng_tiled(u32 location, u32 offset, u32 len)
+{
+    rsx_tile t;
+    return rsx_tiling_find(location, offset, len, &t);
+}
+
+static u8* s_detiled;
+static u32 s_detiled_cap;
+
+/* Guest bytes as the RSX reads them: through the tiling where a tile bound
+ * over main memory covers them, as they lie elsewhere. The result lasts
+ * until the next call. */
+static const u8* eng_guest_linear(u32 location, u32 offset, u32 len)
+{
+    const u8* raw = eng_guest_ptr(NULL, location, offset, len);
+    if (!raw || !eng_tiled(location, offset, len)) return raw;
+    if (s_detiled_cap < len) {
+        u8* n = (u8*)realloc(s_detiled, len);
+        if (!n) return NULL;
+        s_detiled = n;
+        s_detiled_cap = len;
+    }
+    rsx_tiled_read(&s_eng_mem, location, offset, s_detiled, len);
+    return s_detiled;
+}
+
+/* Detiled copies the vertex, index and program fetches of one draw read
+ * (eng_fetch_ptr). The fetch plan keeps pointers into them for the whole
+ * draw, so a chunk never moves; all are reused from the next draw on. */
+#define ENG_ARENA_CHUNK (1u << 20)
+typedef struct eng_arena_chunk {
+    struct eng_arena_chunk* next;
+    u32 cap, used;
+    u8 data[];
+} eng_arena_chunk;
+static eng_arena_chunk* s_arena;
+
+static u8* eng_arena_alloc(u32 bytes)
+{
+    bytes = (bytes + 15u) & ~15u;
+    for (eng_arena_chunk* c = s_arena; c; c = c->next)
+        if (c->cap - c->used >= bytes) {
+            u8* p = c->data + c->used;
+            c->used += bytes;
+            return p;
+        }
+    const u32 cap = bytes > ENG_ARENA_CHUNK ? bytes : ENG_ARENA_CHUNK;
+    eng_arena_chunk* c = (eng_arena_chunk*)malloc(sizeof(*c) + cap);
+    if (!c) return NULL;
+    c->next = s_arena;
+    c->cap = cap;
+    c->used = bytes;
+    s_arena = c;
+    return c->data;
+}
+
+static void eng_arena_reset(void)
+{
+    for (eng_arena_chunk* c = s_arena; c; c = c->next) c->used = 0;
+}
+
+/* [offset, offset + len) read through the tiling into the arena; what
+ * guest memory does not back reads as zero. */
+static const u8* eng_fetch_detiled(u32 location, u32 offset, u32 len)
+{
+    if ((u64)offset + len > 0x100000000ull) len = (u32)(0x100000000ull - offset);
+    u8* p = len ? eng_arena_alloc(len) : NULL;
+    if (p) rsx_tiled_read(&s_eng_mem, location, offset, p, len);
+    return p;
+}
+
+/* eng_guest_ptr for the vertex, index and program fetches: a range that
+ * touches a tiled main-memory region comes back detiled, valid until the
+ * next draw. */
+static const u8* eng_fetch_ptr(void* user, u32 location, u32 offset, u32 min_bytes)
+{
+    const u8* raw = eng_guest_ptr(user, location, offset, min_bytes);
+    if (!raw || !eng_tiled(location, offset, min_bytes)) return raw;
+    return eng_fetch_detiled(location, offset, min_bytes);
+}
+
 static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
 {
     const u8* p = (const u8*)data;
@@ -313,6 +408,18 @@ static u32 eng_pipeline_slot(u64 key)
 }
 
 /* ---- render state -------------------------------------------------------- */
+
+/* PS3RECOMP_ENG_DEPTH_CLAMP=0: always clip at the near and far planes, as
+ * before SET_ZMIN_MAX_CONTROL was honoured. */
+static int eng_depth_clamp_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_CLAMP");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on;
+}
 
 void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
                                          rsx_be_render_state* rs)
@@ -357,6 +464,17 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->bs_zfail     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
     rs->depth_bounds_test = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_ENABLE) & 1;
+    /* SET_ZMIN_MAX_CONTROL (cellGcmSetZMinMaxControl): bits 0-3 clip at the
+     * near and far planes, 4-7 clamp the depth, 8-11 clip ignoring W; reset
+     * value 1 (rsx_dispatch_init). As RPCS3's Vulkan renderer: clamp when the
+     * clamp is on or near/far clipping is off. Shadow-map passes draw their
+     * casters this way ("pancaking"): a caster between the light and the
+     * cascade's near plane lands on depth 0 instead of being cut away, so
+     * clipped, the shadows of tall objects vanish from the near cascade. */
+    {
+        const u32 z = rsx_dsp_reg(rsx, M_ZMIN_MAX_CONTROL);
+        rs->depth_clamp = eng_depth_clamp_on() && ((z & 0xF0u) != 0 || (z & 0x0Fu) == 0);
+    }
 }
 
 u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
@@ -399,6 +517,7 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(bs_zfail);
     ENG_HASH_FIELD(bs_zpass);
     ENG_HASH_FIELD(depth_bounds_test);
+    ENG_HASH_FIELD(depth_clamp);
 #undef ENG_HASH_FIELD
     return hash;
 }
@@ -589,7 +708,7 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
     /* A8R8G8B8 with the LN bit: a surface is linear, never swizzled. */
     rsx_texture_layout(0x85u | 0x20u, w, h, &tl);
     if (!tl.face_bytes || !tl.dst_row_bytes) return NULL;
-    const u8* src = eng_guest_ptr(NULL, location, offset, tl.face_bytes);
+    const u8* src = eng_guest_linear(location, offset, tl.face_bytes);
     if (!src) return NULL;
     const u32 bytes = tl.dst_row_bytes * tl.rows;
     if (g.tex_staging_cap < bytes) {
@@ -899,7 +1018,8 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
         } else if (!rgba) {
             eng_row_convert(src, src, n, 0, 1);   /* in place: one pixel per load/store */
         }
-        memcpy(dst, src + skip, bytes);
+        if (rsx_tiling_active()) rsx_tiled_write(&s_eng_mem, location, offset + r * pitch, src + skip, bytes);
+        else                     memcpy(dst, src + skip, bytes);
     }
 }
 
@@ -923,7 +1043,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
     if (!rows) return;
     const int rgba = rsx_texture_argb_is_rgba();
     for (u32 r = 0; r < h; r++) {
-        const u8* src = eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
+        const u8* src = eng_guest_linear(location, offset + r * pitch, w * 4u);
         if (!src) return;
         eng_row_convert(rows + (size_t)r * w * 4u, src, w, rgba, 0);
     }
@@ -996,10 +1116,11 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 
     eng_zdepth* z = &g.zdepths[slot];
     /* The old size's snapshot goes with it: it can never be valid again. */
-    if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     if (z->conv) g.be->texture_release(g.be->user, z->conv);
     if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
+    if (z->dbz_copy && g.be->texture_release) g.be->texture_release(g.be->user, z->dbz_copy);
+    z->dbz_copy = 0; z->dbz_w = z->dbz_h = 0; z->dbz_serial = 0;
     z->conv = 0;
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
@@ -1165,12 +1286,35 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, 
                    src + (size_t)rsx_swizzle_offset_3d(x, y, z, lw, lh, ld) * bpp, bpp);
 }
 
+/* Slice z of a block-compressed 3D level in NVIDIA's VTC layout
+ * (https://registry.khronos.org/OpenGL/extensions/NV/NV_texture_compression_vtc.txt),
+ * into dst in plain S3TC order. Slices go in groups of four, and each 4x4x4
+ * block is four consecutive 4x4 blocks, one per layer; the d % 4 slices left
+ * over form a last group of 4x4x1, 4x4x2 or 4x4x3 blocks. So block i of slice
+ * z is at (4 * floor(z / 4) * blocks + i * n + z % 4) * block_bytes, n the
+ * layer count of z's group. For full groups that is the spec's blockIndex; for
+ * the last group the spec's formula stores the slices one after another, which
+ * contradicts its prose for d % 4 >= 2, and the prose is followed. `blocks` is
+ * the blocks in one slice. Only a volume whose width and height are powers of
+ * two is stored this way; any other is slice after slice. */
+static void eng_unvtc_3d_slice(u8* dst, const u8* src, u32 blocks, u32 d, u32 z, u32 block_bytes)
+{
+    const u32 group = z & ~3u;
+    const u32 n = group + 4 <= d ? 4 : d - group;
+    const u8* base = src + (size_t)group * blocks * block_bytes;
+    for (u32 i = 0; i < blocks; i++)
+        memcpy(dst + (size_t)i * block_bytes,
+               base + ((size_t)i * n + (z & 3)) * block_bytes, block_bytes);
+}
+
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                     int* readable)
 {
+    /* in tiled main memory, every byte the texture's texels are stored in */
+    if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
@@ -1197,6 +1341,7 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
 static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
                                    int* readable)
 {
+    if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
@@ -1248,11 +1393,14 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (!nlv || !lv[0].tl.face_bytes) return 0;
     /* A volume: every slice of every level decoded and uploaded on its own.
      * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
-     * first slice and sampled in 2D it darkened whole boxes round every prop. */
+     * first slice and sampled in 2D it darkened whole boxes round every prop.
+     * A DXT volume too: a retail title's explosion smoke is a 256x256x16 DXT5
+     * animation, and its first 64 KB read as one 2D image (four slices'
+     * blocks interleaved) drew dark squares where the smoke was. */
     if (!into && depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
-        !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
+        (lv[0].tl.compressed || lv[0].tl.bytes_per_texel)) {
         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
-        const u8* src = eng_guest_ptr(NULL, location, offset, span);
+        const u8* src = eng_guest_linear(location, offset, span);
         if (!src) return 0;
         const u32 handle = g.be->texture_create_3d(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                                    w, h, depth, nlv, remap, fmt);
@@ -1261,13 +1409,19 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         u32 d = depth;
         for (u32 m = 0; m < nlv; m++) {
             const rsx_tex_layout* tl = &lv[m].tl;
+            const int vtc = tl->compressed && !(lv[m].w & (lv[m].w - 1u)) &&
+                            !(lv[m].h & (lv[m].h - 1u));
             const u32 lin_bytes = tl->swizzled ? tl->row_bytes * tl->rows : 0u;
             if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows + lin_bytes)) {
                 g.be->texture_release(g.be->user, handle);
                 return 0;
             }
             for (u32 z = 0; z < d; z++) {
-                if (tl->swizzled) {
+                if (vtc) {
+                    /* Block rows go up as they are (rsx_texture_decode only copies them). */
+                    eng_unvtc_3d_slice(g.tex_staging, level_src, tl->face_bytes / tl->block_bytes, d, z,
+                                       tl->block_bytes);
+                } else if (tl->swizzled) {
                     u8* lin = g.tex_staging + tl->dst_row_bytes * tl->rows;
                     eng_deswizzle_3d_slice(lin, level_src, lv[m].w, lv[m].h, d, z, tl->bytes_per_texel);
                     rsx_tex_layout ltl = *tl; ltl.swizzled = 0;
@@ -1290,7 +1444,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 face_stride = cube
         ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
-    const u8* src = eng_guest_ptr(NULL, location, offset, span);
+    const u8* src = eng_guest_linear(location, offset, span);
     if (!src) return 0;
 
     const u32 handle = into ? into
@@ -1547,10 +1701,22 @@ static int eng_zdepth_to_guest(u32 slot)
     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
                              w * (u32)sizeof(float)) != 0)
         return 0;
+    /* Rows of a zeta in tiled main memory are built here and stored through the tiling. */
+    const int tiled = eng_tiled(z->location, z->offset, z->pitch * h);
+    static u8* tile_row;
+    static u32 tile_row_cap;
+    if (tiled && tile_row_cap < w * bpp) {
+        u8* n = (u8*)realloc(tile_row, w * bpp);
+        if (!n) return 0;
+        tile_row = n;
+        tile_row_cap = w * bpp;
+    }
     for (u32 r = 0; r < h; r++) {
-        u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
-        if (!dst) return 0;
-        eng_depth_row_to_guest(dst, s_depth_rows + (size_t)r * w, w, bpp);
+        u8* const row = tiled ? tile_row
+                              : (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
+        if (!row) return 0;
+        eng_depth_row_to_guest(row, s_depth_rows + (size_t)r * w, w, bpp);
+        if (tiled) rsx_tiled_write(&s_eng_mem, z->location, z->offset + r * z->pitch, row, w * bpp);
     }
     z->guest_dirty = 0;
     eng_textures_touch(z->location, z->offset, z->pitch * h);
@@ -1719,8 +1885,11 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
         u32 fp_loc = 0;
         const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
         fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
+        /* in tiled main memory: as far as the size scan may look, detiled */
+        const int fp_tiled = fp_uc && eng_tiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
+        if (fp_tiled) fp_uc = eng_fetch_detiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
         fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
-        if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
+        if (fp_size && !fp_tiled) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
         if (!fp_uc) fp_size = 0;
     }
 
@@ -1911,6 +2080,74 @@ static u64 eng_fp_debug_hash(const u8* fp_uc, u32 fp_size)
         ? rsx_fp_structural_hash(fp_uc, fp_size, 1469598103934665603ull) : 0;
 }
 
+/* The depth-bounds test (SET_DEPTH_BOUNDS_TEST_ENABLE 0x0380, MIN 0x0384,
+ * MAX 0x0388) on a backend without one (no set_depth_bounds: Metal). A
+ * fragment survives only where the depth ALREADY STORED at its pixel lies in
+ * [min, max]; the fragment's own depth plays no part. Deferred renderers
+ * bound their light volumes and per-cascade shadow passes with it; ignored,
+ * those passes reach every pixel their geometry covers. The fragment program
+ * does the test instead: a float copy of the depth buffer, taken before the
+ * draw (so a bounded draw that also writes depth is tested against the
+ * depth before it, as one draw on the hardware is), goes on a texture unit
+ * the program does not sample, and rsx_fp_apply_depth_bounds reads it at the
+ * pixel and discards. The bounds go in the float4 after fp_alpha. A bound of
+ * [0, 1] is no bound. s_dbz says what eng_pipeline_get, the texture binding
+ * and the constants need for the current draw.
+ * PS3RECOMP_ENG_DEPTH_BOUNDS=0: the test is ignored there, as before. */
+static struct { u32 unit; u32 copy; float mn, mx; } s_dbz;   /* unit + 1, or 0 */
+
+static int eng_depth_bounds_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_BOUNDS");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on;
+}
+
+static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
+{
+    s_dbz.unit = 0; s_dbz.copy = 0;
+    if (g.be->set_depth_bounds || !g.be->depth_snapshot || !rs->depth_bounds_test ||
+        zslot == ENG_INVALID || !eng_depth_bounds_on())
+        return;
+    float mn, mx;
+    { const u32 a = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MIN), b = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MAX);
+      memcpy(&mn, &a, 4); memcpy(&mx, &b, 4); }
+    /* Saturated into the depth range, as the hardware does (RPCS3
+     * clamp_depth_bounds_value); NaN reads as 0. */
+    mn = mn > 0.0f ? (mn < 1.0f ? mn : 1.0f) : 0.0f;
+    mx = mx > 0.0f ? (mx < 1.0f ? mx : 1.0f) : 0.0f;
+    if (mn <= 0.0f && mx >= 1.0f) return;
+    const u8* vp_uc = NULL; const u8* fp_uc = NULL; u32 vp_instrs = 0, fp_size = 0;
+    if (!eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size)) return;
+    /* A unit the program neither samples nor has declared as a cube or a
+     * volume (rsx_fp_apply_depth_bounds reads it as a Texture2D). */
+    const u32 busy = rsx_fp_texture_units(fp_uc, fp_size) | eng_cube_mask() | eng_volume_mask();
+    int unit = -1;
+    for (int u = RSX_BE_MAX_TEXTURES - 1; u >= 0 && unit < 0; u--)
+        if (!((busy >> u) & 1u)) unit = u;
+    eng_zdepth* z = &g.zdepths[zslot];
+    if (unit < 0 || !z->handle) {
+        static u32 said;
+        if (PS3_LOG_FIRST(said, 4))
+            fprintf(stderr, "[rsx engine] depth bounds %.4f..%.4f not applied: %s\n",
+                    mn, mx, unit < 0 ? "no free texture unit" : "no depth target");
+        return;
+    }
+    if (!z->dbz_copy || z->dbz_serial != z->depth_serial || z->dbz_w != z->w || z->dbz_h != z->h) {
+        const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
+        if (!tex) return;
+        if (z->dbz_copy && z->dbz_copy != tex && g.be->texture_release)
+            g.be->texture_release(g.be->user, z->dbz_copy);
+        z->dbz_copy = tex; z->dbz_w = z->w; z->dbz_h = z->h;
+        z->dbz_serial = z->depth_serial;
+    }
+    s_dbz.unit = (u32)unit + 1u; s_dbz.copy = z->dbz_copy;
+    s_dbz.mn = mn; s_dbz.mx = mx;
+}
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
@@ -1937,6 +2174,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const int vp_branch_bits_used = !fixed && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
     const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
     const u32 ucp = fixed ? 0 : eng_user_clip_key();
+    const u32 dbz = fixed ? 0 : s_dbz.unit;   /* eng_depth_bounds_prepare: unit + 1 */
 
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
     u32 shadow_mask = 0;
@@ -2016,6 +2254,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         }
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
         if (ucp) key = eng_fnv1a(&ucp, sizeof ucp, key);
+        if (dbz) { const u32 tag = 0x5A424400u | dbz; key = eng_fnv1a(&tag, sizeof tag, key); }
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
         if (wpos_scaled) key = eng_fnv1a(wpos_grid, sizeof wpos_grid, key);
@@ -2043,6 +2282,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 handle = 0;
     int vi = 1, fi = 1;
     u32 nconst = 0;
+    u32 dbz_bit = 0;
     if (fixed) {
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
@@ -2076,6 +2316,16 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                              rs->alpha_func) < 0)
             fi = -1;
+        if (fi > 0 && dbz) {
+            if (rsx_fp_apply_depth_bounds(s_ps_hlsl, sizeof s_ps_hlsl, dbz - 1u) > 0) {
+                dbz_bit = 1u << (dbz - 1u);   /* read with Load: no rsx_samp[] names it */
+            } else {
+                static u32 said;   /* drawn unbounded rather than dropped */
+                if (PS3_LOG_FIRST(said, 8))
+                    fprintf(stderr, "[rsx engine] depth bounds not applied to a fragment program"
+                                    " (unexpected text)\n");
+            }
+        }
     }
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
@@ -2124,7 +2374,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
     g.pipelines[g.n_pipelines].tex_used =
-        (u16)(fixed ? 0xFFFFu : eng_sampled_units(s_ps_hlsl));
+        (u16)(fixed ? 0xFFFFu : (eng_sampled_units(s_ps_hlsl) | dbz_bit));
     *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
     *out_fp_hash = fp_hash;
     g.pipeline_index[slot] = (u16)(g.n_pipelines + 1u);
@@ -2285,7 +2535,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             const u8* run = NULL;
             if (count && start <= 0xFFFFFFFFull && bytes <= 0xFFFFFFFFull &&
                 start + bytes <= 0x100000000ull)
-                run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
+                run = eng_fetch_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
             if (run) {
                 if (!dc_push_index_run(run, count, ia.is_u32, base_index, restart_en, restart_val))
                     dc.fetch_ok = 0;
@@ -2293,7 +2543,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             }
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
                 const u8* p = run ? run + (size_t)i * esz
-                    : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
+                    : eng_fetch_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
                 if (!p) { dc.fetch_ok = 0; break; }
                 const u32 index = ia.is_u32
                     ? (((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3])
@@ -2323,7 +2573,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     }
 
     dc.layout = *layout;
-    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_fetch_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
@@ -3026,6 +3276,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
+    eng_arena_reset();
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
@@ -3087,6 +3338,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     u64 fp_hash = 0;
+    eng_depth_bounds_prepare(zslot, &rs);
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
@@ -3104,9 +3356,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
-    const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
-                                            textures, samplers);
+    /* The depth-bounds copy's unit is not the guest's: its texture state,
+     * whatever an earlier draw left there, is not resolved. */
+    const u32 dbz_bit = s_dbz.unit ? 1u << (s_dbz.unit - 1u) : 0u;
+    u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used & ~dbz_bit,
+                                      textures, samplers);
     if (tex_mask == ENG_INVALID) return;
+    if (dbz_bit && (tex_used & dbz_bit)) {
+        textures[s_dbz.unit - 1u] = s_dbz.copy;
+        memset(&samplers[s_dbz.unit - 1u], 0, sizeof samplers[0]);
+        tex_mask |= dbz_bit;
+    }
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
 
@@ -3142,7 +3402,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
     const u32 nslots = g.fp_constants.count ? g.fp_constants.count : 1u;
-    const u32 fp_bytes = (nslots + 1u) * 16u;
+    /* + fp_dbounds after fp_alpha for a depth-bounded draw. */
+    const u32 fp_bytes = (nslots + (s_dbz.unit ? 2u : 1u)) * 16u;
     if (g.fp_cb_cap < fp_bytes) {
         u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
         if (!n) return;
@@ -3160,7 +3421,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
       const u32 win = rsx_dsp_reg(&g.rsx, 0x1D88);
       alpha[1] = ((win >> 12) & 0xFu) ? (float)(win & 0xFFFu) : 0.0f;
       alpha[2] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
-      alpha[3] = 0.0f; }
+      alpha[3] = 0.0f;
+      if (s_dbz.unit) { alpha[4] = s_dbz.mn; alpha[5] = s_dbz.mx; alpha[6] = alpha[7] = 0.0f; } }
 
     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
 
@@ -3470,6 +3732,7 @@ void rsx_draw_engine_shutdown(void)
     }
     for (u32 i = 0; i < g.n_zdepths; i++) {
         if (g.zdepths[i].conv) g.be->texture_release(g.be->user, g.zdepths[i].conv);
+        if (g.zdepths[i].dbz_copy) g.be->texture_release(g.be->user, g.zdepths[i].dbz_copy);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
     }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);

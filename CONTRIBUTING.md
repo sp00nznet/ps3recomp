@@ -30,14 +30,26 @@ Run existing game ports, compare behavior with RPCS3, and report discrepancies. 
 - **Python 3.10+** — for recompiler tools
 - **CMake 3.20+** — build system
 - **C17/C++20 compiler** — MSVC 19.x (VS 2019+), GCC 12+, or Clang 15+
+- **Ninja** — build tool used by the commands below
+- **SDL2** — required on Linux and macOS for input and audio
 - **Git** — version control
+
+On macOS, install the command-line dependencies with:
+
+```bash
+brew install cmake ninja python@3.12 sdl2
+```
 
 ### Building from Source
 
 ```bash
 git clone https://github.com/sp00nznet/ps3recomp.git
 cd ps3recomp
-pip install -r requirements.txt
+
+# macOS (on Linux, use: python3 -m venv .venv)
+"$(brew --prefix python@3.12)/bin/python3.12" -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 
 # Build the runtime library
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -45,7 +57,10 @@ cmake --build build
 ```
 
 On Windows with Visual Studio:
-```bash
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 cmake -B build
 cmake --build build --config Release
 ```
@@ -248,6 +263,12 @@ compatible with MIT (MIT, BSD, zlib, Apache-2.0, public domain). Specifically:
   line. Reading it to understand what a syscall or HLE module does is fine;
   carrying its code or structure across is not. A fix you saw there is best
   submitted as a description of the behaviour, and we'll write it fresh.
+- **Cite the source of a fact, not an emulator that also knows it.** Cite the
+  Sony SDK, the Cell/SPU ISA manual or the hardware documentation for
+  constants, structure layouts and check orderings; cite RPCS3 only for
+  behaviour you observed it produce. A comment naming an RPCS3 source file as
+  the authority for a constant reads like a transcription even when the value
+  came from the SDK, and telling those two apart costs a review round-trip.
 - **If something came from elsewhere, say so in the PR**, with a link, and
   keep any copyright header. A licence problem found at review costs a
   comment; one found after release means untangling history.

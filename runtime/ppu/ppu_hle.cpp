@@ -50,6 +50,33 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
 
+/* NID -> handler, per calling thread. Both tables above are searched
+ * linearly, g_ctx with about a hundred entries and g_hle_nids with over a
+ * thousand, and a title calls a few imports tens of thousands of times a
+ * second: God of War HD makes ~95k HLE calls a second in gameplay, most of
+ * them cellGcmAddressToOffset and _sys_memcpy, and the two scans were most of
+ * ps3_hle_call's cost. A slot keeps the indexes and the table sizes it was
+ * filled against, so a registration made after the first call is still
+ * found. Per thread, so no slot is read half-written. */
+struct HleSlot { uint32_t nid, ctx_n, tab_n; int32_t ctx_i, tab_i; };
+static thread_local HleSlot t_hle_slot[1024];
+static const HleSlot* hle_slot(uint32_t nid)
+{
+    HleSlot* s = &t_hle_slot[(nid * 2654435761u) >> 22];
+    const uint32_t ctx_n = g_ctx_count, tab_n = g_hle_inited ? g_hle_nids.count : 0;
+    if (s->nid != nid || s->ctx_n != ctx_n || s->tab_n != tab_n || (!s->ctx_n && !s->tab_n)) {
+        s->ctx_i = s->tab_i = -1;
+        for (uint32_t i = 0; i < ctx_n; i++)
+            if (g_ctx[i].nid == nid) { s->ctx_i = (int32_t)i; break; }
+        if (s->ctx_i < 0 && tab_n) {
+            const ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
+            if (e) s->tab_i = (int32_t)(e - g_hle_nids.entries);
+        }
+        s->nid = nid; s->ctx_n = ctx_n; s->tab_n = tab_n;
+    }
+    return s;
+}
+
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
     if (g_ctx_count < HLE_CTX_CAP) {
@@ -700,8 +727,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         }
     }
 
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) {
+    const HleSlot* hs = hle_slot(nid);
+    if (hs->ctx_i >= 0) {
+            const uint32_t i = (uint32_t)hs->ctx_i;
             ps3_msf("hle:%s", g_ctx[i].name);
             /* Record the name here too. This loop dispatches every
              * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser
@@ -722,7 +750,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             return;
         }
 
-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    ps3_nid_entry* e = hs->tab_i >= 0 ? &g_hle_nids.entries[hs->tab_i] : nullptr;
     if (!e || !e->handler) {
         /* Recorded before the diagnostic paths below, several of which return
          * early. An import moving between resolved and unresolved is exactly the

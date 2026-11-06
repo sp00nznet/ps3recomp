@@ -725,6 +725,48 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- depth bounds (NV4097 0x0380), emulated in the program ----------
+     * The stored depth comes from a float copy on a unit the program does
+     * not sample (15 here); outside [fp_dbounds.x, fp_dbounds.y] the
+     * fragment is discarded before anything else runs. Single target behind
+     * the alpha-test wrapper, then the MRT form; a cube slot is refused. */
+    {
+        u8 fp[16];
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
+        check_count("dbounds FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 1);
+        const int at = rsx_fp_apply_alpha_test_buffered(g_hlsl, sizeof g_hlsl, 0x204u /* GREATER */);
+        const int db = rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15);
+        const int again = rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15);   /* refuses twice */
+        if (at == 1 && db == 1 && again == -1) { printf("[PASS] dbounds FP patches\n"); g_pass++; }
+        else { printf("[FAIL] dbounds FP patches %d %d %d (want 1 1 -1)\n", at, db, again); g_fail++; }
+        check("dbounds FP HLSL", g_hlsl, "    float4 fp_alpha;\n    float4 fp_dbounds;\n};");
+        check("dbounds FP HLSL", g_hlsl, "rsx_tex[15].Load(int3(int2(input.position.xy), 0)).r");
+        check("dbounds FP HLSL", g_hlsl, "_rsx_zs > fp_dbounds.y) discard;");
+        if (translate("dbounds FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("dbounds FP MSL", g_msl, "discard_fragment()");
+            check("dbounds FP MSL", g_msl, "fp_dbounds");
+        }
+    }
+    {
+        u8 fp[32];
+        rsx_test_fp_mrt_col0(fp, RSX_TEST_FP_SWZ_IDENT, RSX_TEST_FP_SWZ(2, 1, 0, 3));
+        check_count("dbounds MRT FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 2);
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 12) == 1) { printf("[PASS] dbounds MRT FP patch\n"); g_pass++; }
+        else { printf("[FAIL] dbounds MRT FP patch\n"); g_fail++; }
+        check("dbounds MRT FP HLSL", g_hlsl, "PSOutput main(PSInput input) {\n    { const float _rsx_zs = rsx_tex[12].Load(");
+        if (translate("dbounds MRT FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("dbounds MRT FP MSL", g_msl, "[[color(1)]]");
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
+        rsx_fp_decompile_buffered_ex(fp, 16, 0x40u, 1u << 3 /* unit 3 a cube */, g_hlsl, sizeof g_hlsl, NULL);
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 3) == -1) { printf("[PASS] dbounds refuses a cube slot\n"); g_pass++; }
+        else { printf("[FAIL] dbounds took a cube slot\n"); g_fail++; }
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15) == 1) { printf("[PASS] dbounds beside a cube\n"); g_pass++; }
+        else { printf("[FAIL] dbounds beside a cube\n"); g_fail++; }
+        check("dbounds cube FP HLSL", g_hlsl, "rsx_tex15.Load(int3(int2(input.position.xy), 0)).r");
+        if (translate("dbounds cube FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("dbounds cube FP MSL", g_msl, "[[texture(15)]]");
+    }
+
     test_cache();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

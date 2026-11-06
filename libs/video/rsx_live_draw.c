@@ -104,6 +104,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include "rsx_vertex_formats.h"
+#include "rsx_d3d12_device.h"
 #include <sys/stat.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -5287,9 +5288,7 @@ static void fetch_one(u32 base, u32 vertex_id, u32 base_index)
         if (a.type && a.size &&
             fetch_attr(i, base, vertex_id, base_index, v.a[i])) continue;
         if (i == 0) { dc.fetch_ok = 0; return; }
-        rsx_dsp_vertex_default(&g.rsx, i, v.a[i]);
-        if (i == 3 && v.a[3][0] == 0 && v.a[3][1] == 0 && v.a[3][2] == 0 && v.a[3][3] == 1)
-            v.a[3][0] = v.a[3][1] = v.a[3][2] = 1.0f;
+        rsx_vertex_fetch_default(&g.rsx, i, v.a[i]);
     }
     push_vert(&v);
 }
@@ -8339,7 +8338,11 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     ld_enable_dred();
     IDXGIFactory4* factory = NULL;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory))) return -1;
-    if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&g.dev))) {
+    /* The high-performance adapter first, then the default one, then WARP
+     * (rsx_d3d12_device.h); D3D12CreateDevice(NULL) alone is the integrated
+     * GPU on a dual-GPU laptop. */
+    if (rsx_d3d12_create_device(factory, &g.dev, "live renderer",
+                                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) < 0) {
         factory->lpVtbl->Release(factory); return -1;
     }
 #if defined(YZ_PERF_PROFILE)

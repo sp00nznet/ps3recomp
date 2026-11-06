@@ -141,12 +141,13 @@ void ppu_thread_note_block(uint64_t tid)
         __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
 }
 
-/* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
- * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
+/* Priority the creator runs at. Must be called under the table lock. Main
+ * registration now initializes a real priority; zero is the highest valid
+ * priority and must not be treated as an unset/default sentinel. */
 static int32_t creator_priority(uint64_t tid)
 {
     const ppu_thread_info* c = find_thread(tid);
-    if (!c || (c == &g_ppu_threads[0] && c->priority == 0)) return PPU_DEFAULT_PRIORITY;
+    if (!c) return PPU_DEFAULT_PRIORITY;
     return c->priority;
 }
 
@@ -325,6 +326,7 @@ uint64_t ppu_thread_register_main(void)
         t->ctx.thread_id = 1;
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
+        t->priority = 1001;                 /* default PS3 process priority */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
         ps3_tprof_thread('P', 1);
@@ -338,6 +340,36 @@ uint64_t ppu_thread_register_main(void)
     }
     table_unlock();
     return 1;
+}
+
+/* The ELF entry path may follow a host bootstrap which already claimed slot
+ * zero. Apply its process priority in either case, before guest dispatch. The
+ * legacy no-argument registration API remains available for other harnesses. */
+uint64_t ppu_thread_register_main_priority(int32_t priority)
+{
+    uint64_t id = ppu_thread_register_main();
+    table_lock();
+    g_ppu_threads[0].priority = (priority >= 0 && priority <= 3071) ? priority : 1001;
+    table_unlock();
+    return id;
+}
+
+/* Fill in the main thread's stack fields after the boot harness has chosen
+ * where the stack lives. register_main() memset()s the whole struct, so
+ * without this sys_ppu_thread_get_stack_information(49) finds tid 1 in the
+ * table with stack_addr/stack_size == 0 and reports a {0,0} stack -- a guest
+ * that dumps its own stack (RPCS3's dump_stack test) then calls
+ * cellFsWrite(fd, NULL, 0) and produces an empty file while the real kernel
+ * reports the actual region. RPCS3's main stack: base 0xD0010000, 1 MB. */
+void ppu_thread_set_main_stack(uint32_t stack_base, uint32_t stack_size)
+{
+    table_lock();
+    ppu_thread_info* t = &g_ppu_threads[0];
+    if (t->state != PPU_THREAD_STATE_FREE) {
+        t->stack_addr = stack_base;
+        t->stack_size = stack_size;
+    }
+    table_unlock();
 }
 
 /* ---------------------------------------------------------------------------
@@ -662,21 +694,43 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
+    /* Joining yourself is EDEADLK (it used to wait on its own finish event
+     * for good). */
+    if (tid == ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EDEADLK;
+
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (!t) {
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    if (!t->joinable || t->state == PPU_THREAD_STATE_DETACHED) {
+    /* A thread has one joiner: a second one gets EINVAL instead of both
+     * waiting, both closing the same handles and both freeing the slot. */
+    if (!t->joinable || t->joining || t->state == PPU_THREAD_STATE_DETACHED) {
         table_unlock();
         return (int64_t)(int32_t)CELL_EINVAL;
     }
+    t->joining = 1;
     table_unlock();
 
     /* Wait for completion */
 #ifdef _WIN32
     WaitForSingleObject(t->finish_event, INFINITE);
+    /* sys_ppu_thread_exit signals finish_event from INSIDE the thread, which
+     * then still unwinds through ppu_host_thread_proc's epilogue, touching the
+     * slot (it stamps the state and signals the event again). Freeing the slot
+     * and closing the handles before that finished let the epilogue write to
+     * a closed handle and put a slot this join had freed back to FINISHED, so
+     * it never came back. Wait for the host thread itself first, as
+     * pthread_join does below. Bounded, so that a thread kept running past its
+     * exit (PS3_NO_THREAD_EXIT_UNWIND=1) cannot hang the joiner. */
+    if (t->host_thread && WaitForSingleObject(t->host_thread, 5000) == WAIT_TIMEOUT) {
+        static int s_warned = 0;
+        if (s_warned++ < 4)
+            fprintf(stderr, "[SYS] ppu_thread_join(tid=%llu): host thread still running 5 s "
+                            "after exit -- freeing the slot anyway\n", (unsigned long long)tid);
+    }
 #else
     pthread_mutex_lock(&t->finish_mutex);
     while (!t->finished) {
@@ -759,8 +813,22 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
     if (t->state == PPU_THREAD_STATE_FINISHED) {
         /* Already finished, free it */
 #ifdef _WIN32
+        /* FINISHED is set by sys_ppu_thread_exit while the host thread still has
+         * its epilogue to run (it takes the table lock): let it end before the
+         * slot is freed, with the lock released while waiting, as in join. */
+        HANDLE h = t->host_thread;
+        t->joining = 1;                 /* nobody joins it meanwhile */
+        table_unlock();
+        if (h) WaitForSingleObject(h, 5000);
+        table_lock();
+        if (t->state != PPU_THREAD_STATE_FINISHED || t->host_thread != h) {
+            table_unlock();             /* freed or reused in the meantime */
+            return CELL_OK;
+        }
         CloseHandle(t->host_thread);
         CloseHandle(t->finish_event);
+        t->host_thread  = NULL;
+        t->finish_event = NULL;
 #else
         pthread_detach(t->host_thread);
         pthread_mutex_destroy(&t->finish_mutex);

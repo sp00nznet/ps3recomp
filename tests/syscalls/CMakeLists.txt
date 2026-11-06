@@ -48,3 +48,53 @@ set_tests_properties(lock_line PROPERTIES
     LABELS "runtime;syscalls"
     TIMEOUT 30
 )
+
+# The raw filesystem syscalls (open flags, seek, mkdir/unlink/rmdir codes,
+# readdir, fd-table limits and concurrency) against real files in a temporary
+# directory. Links sys_fs.c alone.
+add_executable(test_sys_fs
+    test_sys_fs.c
+    "${PS3RECOMP_ROOT}/runtime/syscalls/sys_fs.c"
+    "${PS3RECOMP_ROOT}/runtime/platform/ps3_dev_flash.c"
+)
+target_include_directories(test_sys_fs PRIVATE
+    "${PS3RECOMP_ROOT}/runtime/syscalls"
+    "${PS3RECOMP_ROOT}/runtime"
+    "${PS3RECOMP_ROOT}/include"
+    "${PS3RECOMP_ROOT}/libs/filesystem"
+)
+if(MSVC)
+    target_compile_definitions(test_sys_fs PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_sys_fs PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_sys_fs PRIVATE Threads::Threads)
+endif()
+add_test(NAME sys_fs COMMAND test_sys_fs)
+set_tests_properties(sys_fs PROPERTIES
+    LABELS "runtime;syscalls"
+    TIMEOUT 60
+)
+
+# sys_ppu_thread_join / detach through the real sys_ppu_thread.c with host
+# threads: the slot a join frees stays free (Windows), self-join, second joiner.
+add_executable(test_ppu_thread_join test_ppu_thread_join.c)
+target_include_directories(test_ppu_thread_join PRIVATE
+    "${PS3RECOMP_ROOT}/runtime/syscalls"
+    "${PS3RECOMP_ROOT}/runtime"
+    "${PS3RECOMP_ROOT}/include"
+)
+if(MSVC)
+    target_compile_definitions(test_ppu_thread_join PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_ppu_thread_join PRIVATE -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_ppu_thread_join PRIVATE Threads::Threads)
+endif()
+add_test(NAME ppu_thread_join COMMAND test_ppu_thread_join)
+set_tests_properties(ppu_thread_join PROPERTIES
+    LABELS "runtime;syscalls"
+    TIMEOUT 120
+)

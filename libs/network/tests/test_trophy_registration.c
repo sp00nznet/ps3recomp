@@ -13,7 +13,12 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
-ps3_guest_caller_fn g_ps3_guest_caller;
+/* g_ps3_guest_caller is cellSysutil.c's (defining it here too is a duplicate
+ * symbol under gcc). cellSysutilCheckCallback also pumps the message dialog,
+ * the PSN room transport and the PSN terms check; none is under test here. */
+void cellMsgDialog_tick(void) {}
+void np_psnr_pump(void) {}
+void ps3_np_eula_tick(void) {}
 static unsigned calls;
 static void callback(u32 opd, u64 context, u64 status, u64 completed, u64 total,
                      u64 arg, u64 a, u64 b, u64 c)

@@ -9,6 +9,7 @@
  *
  * Build:
  *   gcc -std=c11 -I../.. test_spu_helpers.c -o test_spu_helpers
+ *   (add -mssse3 on x86 to cover the SPU_LS_VEC quadword path of spu_context.h)
  *
  * Exit code: 0 if all passed, 1 if any failed. Final line prints summary.
  */

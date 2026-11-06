@@ -79,6 +79,19 @@ jobs:
             exit 1
           fi
 
+      # PS3RECOMP_ATRAC_LGPL=OFF links a stub instead of the LGPL-2.1 ATRAC3plus
+      # decoder: the library builds, and no decoder object is in the archive.
+      - name: Build without the LGPL ATRAC decoder
+        if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+        run: |
+          CC=gcc CXX=g++ cmake -S . -B build-nolgpl -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_ATRAC_LGPL=OFF
+          cmake --build build-nolgpl --target ps3recomp_runtime
+          ar t build-nolgpl/libps3recomp_runtime.a | grep -q '^at3_stub.c.o$'
+          if ar t build-nolgpl/libps3recomp_runtime.a | grep -qE '^(atrac3|atrac3plus|at3_bridge)'; then
+            echo "an LGPL decoder object is in the library"
+            exit 1
+          fi
+
       # The Python suites are the project's real correctness net -- the
       # conformance one compiles and runs 1300+ lifted instruction cases with
       # the host compiler, so it is genuinely testing this platform's codegen
@@ -98,6 +111,17 @@ jobs:
             python "$t"
           done
 
+      # ps3_env_once: one getenv per name, compiled as C and as C++ (ppu_fs.cpp
+      # includes it too).
+      - name: Run the ps3_env_once test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Werror -I include \
+            -o /tmp/test_env_once tests/test_env_once.c
+          /tmp/test_env_once
+          ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }} -x c++ -std=c++17 -Wall -Werror -I include \
+            -o /tmp/test_env_once_cpp tests/test_env_once.c
+          /tmp/test_env_once_cpp
+
       - name: Run self-contained SPU helper tests
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
@@ -116,6 +140,18 @@ jobs:
           else
             echo "no AVX2 on this runner: skipped"
           fi
+
+      # The SSE4.1 single-precision form (the default x86-64 build) against the scalar per-lane
+      # forms and against the exact references, bit for bit, built as the runtime is.
+      - name: Run the SPU float vector tests (SSE4.1)
+        run: |
+          for t in test_spu_float_vector_scalar test_spu_float_exact; do
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -msse4.1 -ffp-contract=off -UNDEBUG -I include -I runtime/spu \
+              -o /tmp/${t}_sse41 runtime/spu/tests/$t.c -lm
+          done
+          /tmp/test_spu_float_vector_scalar_sse41 4
+          /tmp/test_spu_float_exact_sse41
 
       # runtime/spu/tests/test_spu_int_x86.c checks #512's SSE4.1 and AVX2 integer
       # and quadword-shift forms against their scalar spu_X_ref references. #512
@@ -174,6 +210,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
           /tmp/test_np_matching2
 
+      # sceNpSignaling for Matching2 room members: context ids from 1,
+      # ActivateConnection, the events a title's handlers get, the peer address.
+      - name: Run the sceNpSignaling room connection test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_signaling_rooms libs/network/tests/test_np_signaling_rooms.c
+          /tmp/test_np_signaling_rooms
+
       # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
       # and PSN's online ID rules.
       - name: Run the player-name test
@@ -203,6 +246,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
           /tmp/test_np_nat
 
+      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+      - name: Run the Avc2 Load test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_avc2_load libs/network/tests/test_avc2_load.c
+          /tmp/test_avc2_load
+
       # sceNpCommerce2CreateCtx takes the SDK's five arguments and stores the context id through the fifth.
       - name: Run the Commerce2 CreateCtx test
         run: |
@@ -224,6 +274,12 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -lm
           /tmp/test_pad_hotplug
+
+      # cellPad keyboard fallback on port 0 (SDL source, fake keyboard and focus).
+      - name: Run the pad keyboard test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(sdl2-config --cflags) -o /tmp/test_pad_keyboard libs/input/tests/test_pad_keyboard.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_keyboard
 
 
       # Guest vertex and fragment programs through the decompilers, glslang
@@ -348,6 +404,10 @@ jobs:
           # had rotted to the point of not compiling while nothing ran it.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_fp_decompiler
+          # The D3D12 device order (adapter preference, software adapters
+          # skipped, default adapter, WARP, RSX_D3D12_WARP) as pure logic.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_d3d12_device_pick libs/video/tests/test_d3d12_device_pick.c
+          /tmp/test_d3d12_device_pick
           # The register-file draw engine's platform-neutral halves, driven
           # through its dispatch sink against a stub backend: the surface set's
           # keying and reallocation, a texture unit that names a render target
@@ -362,6 +422,10 @@ jobs:
           # walk they are now computed without.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
           /tmp/test_vertex_fetch_plan
+          # Preserve explicitly written current colors, including black,
+          # while keeping the unwritten ATTR3 compatibility default.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_current_color libs/video/tests/test_vertex_current_color.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+          /tmp/test_vertex_current_color
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
@@ -404,6 +468,13 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
           /tmp/test_stdio_flush
+
+      # PS3_DEV_FLASH may name several roots; the first one that holds the file wins
+      # (runtime/platform/ps3_dev_flash.c, shared by cellFs and the raw sys_fs).
+      - name: Run the dev_flash path test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_dev_flash_path runtime/platform/tests/test_dev_flash_path.c runtime/platform/ps3_dev_flash.c
+          /tmp/test_dev_flash_path
 
       # PARAM.SFO is written as a binary PSF and read back (PSF and the old text file).
       - name: Run the savedata PARAM.SFO test

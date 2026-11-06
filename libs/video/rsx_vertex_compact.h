@@ -97,6 +97,11 @@ void rsx_vertex_fetch_plan_set_inline(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
     const u8* data, u32 bytes);
 
+/* Renderer default for a disabled attribute. The legacy white ATTR3 fallback
+ * applies only before a current color has been explicitly written. Shared by
+ * the compact and legacy fetch paths. */
+void rsx_vertex_fetch_default(const rsx_dispatch* rsx, u32 attr, float out[4]);
+
 /* Decode all 16 descriptors/defaults once for a draw. */
 void rsx_vertex_fetch_plan_init(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,

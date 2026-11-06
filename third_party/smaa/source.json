@@ -1,0 +1,44 @@
+{
+  "repository": "https://github.com/iryoku/smaa",
+  "commit": "71c806a838bdd7d517df19192a20f0c61b3ca29d",
+  "license": "MIT",
+  "upstream_files": [
+    {
+      "path": "SMAA.hlsl",
+      "upstream_path": "SMAA.hlsl",
+      "sha256": "06b71714c2c2f8f1fd6ec8747a9700d6fbfd6d807ece87f0fb874d24b64e9cbc"
+    },
+    {
+      "path": "AreaTex.h",
+      "upstream_path": "Textures/AreaTex.h",
+      "sha256": "1933bf43ce86ba71f7ed5f0fa94b148610c634dc3395b9bc67a817d51ee73af2"
+    },
+    {
+      "path": "SearchTex.h",
+      "upstream_path": "Textures/SearchTex.h",
+      "sha256": "1fac315ab5f87b60083c9b8387af17f056204d3d1bf21500f2acc5b3e8c1a37a"
+    },
+    {
+      "path": "LICENSE.txt",
+      "upstream_path": "LICENSE.txt",
+      "sha256": "2b848b67ba50ac40b53e11cf1ccdaee2a190ca83b4652cba695a5f1ce81f52ae"
+    }
+  ],
+  "local_files": [
+    {
+      "path": "smaa_passes.hlsl",
+      "origin": "written for this repository: the three SMAA 1x passes (SMAA_PRESET_HIGH, luma edges) as HLSL entry points over SMAA.hlsl",
+      "sha256": "16ffb33d3bb0b79c3c7586477fb1ccceb64081d8ab07dfa445e6e9cb0e0d74ea"
+    },
+    {
+      "path": "smaa_msl.h",
+      "origin": "generated, not vendored: gen_smaa_msl.py output from smaa_passes.hlsl + SMAA.hlsl (glslang 16.6.0, spirv-cross 1.4.363.0); regenerating reproduces it byte for byte",
+      "sha256": "df6b99abac650b8b6abcc951a64245a59cbbd9ba8d0470228c3a6b5c02e4a5b0"
+    },
+    {
+      "path": "gen_smaa_msl.py",
+      "origin": "written for this repository: regenerates smaa_msl.h",
+      "sha256": "59a38be340e032973589fddf10af4b65fe2b01eacfa877044d0787e80a8b32cc"
+    }
+  ]
+}

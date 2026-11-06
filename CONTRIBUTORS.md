@@ -518,7 +518,17 @@ came from this work.
   and the porting guide (#426), prerequisites reconciled across five documents
   (#427), template paths matched to the CMake (#428), and `CITATION.cff`
   (#535).
-
+- **v0.19.0, 10 PRs.** The FIFO walker decodes the new-style JUMP (#675),
+  and the tile and zcull call lines print only in verbose mode (#676).
+  Fragment programs honour the per-source input precision modifiers (#670).
+  Both D3D12 renderers pick the high-performance adapter, with a WARP
+  fallback (#669). cellAdec decodes AC3 through the run-time FFmpeg loader
+  (#671). sceNpSignaling gives connections for Matching2 room members, with
+  context ids from 1 and `ActivateConnection` (#690), and cellSysutilAvc2
+  exports Load, Unload and the setters (#689). `vmaddfp`/`vnmsubfp` without a
+  libm call per lane (#674). MinGW: header-defined shared data with
+  `selectany`, and `timespec_get` on msvcrt (#668). `sync_stress` takes tick
+  differences modulo 2^32, so it passes after 24.8 days of uptime (#627).
 
 ### robbe1912 — [@robbe1912](https://github.com/robbe1912)
 - **D3D12 fragment-program source capacity** (#230): a 256-instruction program
@@ -577,7 +587,17 @@ came from this work.
     go behind one inlined load (#483), the PUT poison scan runs only when it
     can be reported (#454), and `PS3_TPROF` (#480) and `RSX_WALKER_PROF`
     (#467) arrive as opt-in samplers.
-
+- **v0.19.0, 13 PRs.** The executable's primary thread priority is
+  honoured (#651), and completed callbacks are told apart from a missing
+  dispatch (#652). Address-only overlay registries reject unrelated large
+  GETs (#654). NEON `fi` and `cflts` on ARM64 (#677) and a four-lane SSE4.1
+  form of the single-precision helpers (#683). Vulkan R32F and RGBA32F colour
+  targets (#681), stale engine releases kept off live Vulkan objects (#682),
+  and explicit current vertex colours preserved (#658). sceNp answers
+  presence details and entitlement lists offline (#679), and Sail keeps its
+  allocator argument (#653). The runtime exports its probed SSE4.1
+  requirement to consumers (#678), macOS CI runs on `macos-15` (#680), and the
+  cellVoice port functions cite their SDK references (#487).
 
 ### Noah Peterson — [@NoahBPeterson](https://github.com/NoahBPeterson)
 Runs the *inFAMOUS* port.
@@ -634,6 +654,14 @@ well:
     `SPU_IRQWAIT_DIAG` (#491), per-thread HLE→guest callback stacks (#489),
     `lift_jobmods` at the link base each header names (#488), and
     `ppu_lifter --insn-patches` (#539).
+- **v0.19.0, 5 PRs.** `PS3_AA=smaa` (the reference SMAA 1x, high preset),
+  `PS3_VIBRANCE` and `PS3_CONTRAST` in the Metal present pass, all off by
+  default (#470). The depth-bounds test emulated where the backend has none
+  (#694), and `SET_ZMIN_MAX_CONTROL`'s depth clamp honoured (#693). cellGame
+  reports 40 GiB − 256 KiB free above 4 GiB, so `hddFreeSizeKB * 1024` cannot
+  wrap — inFAMOUS 2 refused to boot with 41.7 GB free (#692). And
+  `ps3_env_once()`, which looks an environment switch up once per name and
+  takes `getenv` off the SPURS job, workload dispatch and cellFs paths (#515).
 
 ### deucebucket — [@deucebucket](https://github.com/deucebucket)
 - Reported that `fw_spu/` was tracking decrypted firmware PRXs and lifted C,
@@ -665,6 +693,18 @@ Fixes from a *SoulCalibur II HD* port
   near plane (#526). Frequency 1 under a modulo divider bit is one element for
   the whole draw (#547). A thread created above its creator's priority runs
   until it blocks, under `PS3_PRIO_START=1` (#416).
+- **v0.19.0, 13 PRs.** **Tiles over main memory are tiled for every RSX
+  access** (#569), where they had been read and written linearly; a title's
+  SPU depth-of-field job depends on it. DXT 3D textures go up as volumes in
+  NVIDIA's VTC slice order (#585), and a recreated depth target's snapshot is
+  released once (#604). The MSL cache names the translator by a hash of its
+  sources (#609). On macOS: a Quit menu item and no alert sound on a key
+  press (#613), a window that keeps its aspect ratio and
+  `PS3RECOMP_FULLSCREEN` (#614), and the pad-0 keyboard fallback there and
+  with SDL (#612). `PS3_DEV_FLASH` may name several roots (#605), cellAudio's
+  `AUDIO_WAV`/`AUDIO_PEAK` on the POSIX mix thread (#606),
+  `PS3RECOMP_ATRAC_LGPL=OFF` (#611), `ppu_loader` with MinGW GCC (#610), and
+  two tests linked and run in CI again (#607, #608).
 
 ### kalpakprod — [@kalpakprod](https://github.com/kalpakprod)
 - `CELL_FS_O_*` flag values corrected so `O_CREAT` creates (#349).
@@ -708,6 +748,14 @@ capability in it.
   instead of re-interleaving each texel (#578), an empty XInput slot polled once
   a second instead of every frame (#581), and `--merge-chunks` in the SPU
   program build (#549).
+- **v0.19.0, 4 PRs from God of War HD and Ascension.** SPURS: `CellSpurs2`
+  with 32 workloads, `cellSpursInitializeWithAttribute2`, Taskset2/Task2 and
+  tasks an SPU creates (#629). GCM: `GCM_FIFO_SEGMENT` hands the command ring
+  out in segments, as libgcm does (#566); offset tables follow map and unmap,
+  a report waits for the SPU task round it signals, FP helpers are emitted on
+  branched programs, and X16 and DDX/DDY are handled (#635). PPU: per-thread
+  caches for HLE NID lookups, profiler breadcrumbs and indirect-call targets,
+  and exact VMX converts (#634).
 
 ### MaChInEgUn3 — [@MaChInEgUn3](https://github.com/MaChInEgUn3)
 First release here, 5 PRs in **v0.18.0**.
@@ -719,6 +767,14 @@ First release here, 5 PRs in **v0.18.0**.
 - Straight quadword load/store sequences run in the SMC microstep on a tight
   loop (#571), and halt and `iret` longjmp without unwinding on 64-bit Windows
   (#572).
+- **v0.19.0, 6 PRs.** **Relocatable SPU lifts** (#636): `spu_lifter.py
+  --reloc` lifts position-independent code once and runs it wherever a title
+  copies it in LS (one capture saw 299 loads at 299 addresses). Quadword LS
+  access as one load/store and a `pshufb` word swap on SSSE3 x86
+  (`SPU_LS_VEC`, #637). MFC parameter channel writes latch without `mfc_for`
+  (#626, applied by hand as its 14-line change). The lock-line spin sleeps
+  after about 1 ms (#666), the holder list is a contiguous, prefetched array
+  (#672), and `SPURS_IDLE_MAX` caps the kernel's idle back-off (#659).
 
 ### xuxinsss — [@xuxinsss](https://github.com/xuxinsss)
 First release here, 2 PRs in **v0.18.0**.
@@ -726,6 +782,10 @@ First release here, 2 PRs in **v0.18.0**.
   five files across the SPU and PPU, mostly SIMD intrinsics and statement
   expressions that only the Clang front end accepted.
 - lv2 syscall 22 is registered as `_sys_process_exit` (#587).
+- **v0.19.0, 3 PRs.** The lifter recovers a module's TOC from the OPD
+  majority when there is no `.got` section name (#691); the main thread's
+  stack address and size are filled in after it registers (#596); and D3D12
+  presents the CPU-blit scanout when a frame has no RSX commands (#695).
 
 ### feanor-noldorin — [@feanor-noldorin](https://github.com/feanor-noldorin)
 First release here, 1 PR in **v0.18.0**.
@@ -739,6 +799,66 @@ First release here, 1 PR in **v0.18.0**.
 - **Duplicate clear-presented flips are skipped in D3D12, and only those**
   (#486) — the narrow form matters: a title that legitimately presents the
   same cleared frame twice still gets both.
+- **v0.19.0, 2 PRs.** The Apple Silicon setup docs match CI (#656), and
+  macOS walker profiling is bounded by elapsed time (#657).
+
+### DriifterSelf — [@DriifterSelf](https://github.com/DriifterSelf)
+First release here, 5 PRs in **v0.19.0**.
+- **D3D12 descriptor capacity** (#600): descriptor ranges cover all 16
+  texture units instead of 4, the offscreen target limit goes from 16 to 64,
+  linear texture row pitch is tracked from `SET_TEXTURE_CONTROL3`, and
+  `D3D12_NO_DBG` turns off the debug layer.
+- `QUAD_STRIP` and `POLYGON` primitives in D3D12 (#617), and unnormalized
+  texture scaling in the fragment-program pipeline (#618).
+- Missing vertex attribute components expand with w = 1.0 (#597), and a
+  `cellSysutilNpEulaCheck` legacy stub (#616).
+
+### MaxLeiter — [@MaxLeiter](https://github.com/MaxLeiter)
+First release here, 7 PRs in **v0.19.0**: a conformance pass over lv2.
+- **Sync primitives** (#621): trylock `EDEADLK`, timeouts, rwlock timed locks
+  and destroy rules, lwmutex `EBUSY`.
+- **Events and threads**: event queue destroy honours its mode, and a timed
+  receive runs to an absolute deadline (#622); the Windows join no longer
+  frees the slot under the exiting thread (#623).
+- **SPU**: thread group destroy while running, start state and error returns
+  (#624); ordered channel wakeups, a masked `RdEventStat`, a word-sized SRR0
+  and an aligned atomic LSA (#619).
+- **Files**: SDK open flags and error codes in `sys_fs`, and
+  `EBADF`/`EMFILE`/`EINVAL`, file times and dot entries in cellFs (#620).
+- HLE heap `delete_heap` and bounds, and `boot_main`'s window close quitting
+  through `ps3_host_quit` (#625).
+
+### MatRanc — [@MatRanc](https://github.com/MatRanc)
+First release here, 9 PRs in **v0.19.0**.
+- **cellFs**: `cellFsAioWrite` alongside `cellFsAioRead` (#641), and
+  `cellFsFtruncate` on the active fd table (#645).
+- **cellGcm**: the context end at the wrap JUMP slot, `begin + size - 4`
+  (#648), and opt-in handler delivery from a dedicated thread,
+  `GCM_HANDLER_THREAD=1` (#647).
+- **cellSpurs**: `argTaskset` carried through the taskset attribute (#643),
+  `maxContention` clamped and `cellSpursRequestIdleSpu` implemented (#649).
+- `sys_memory_container_get_size` semantics fixed and syscall 350 registered
+  (#644); stereoscopic 3D resolutions reported unavailable by cellVideoOut
+  (#642); the templates use Vulkan on Linux when it is built (#640).
+
+### StepanovGV2021 — [@StepanovGV2021](https://github.com/StepanovGV2021)
+First release here, 1 PR in **v0.19.0**.
+- **cellGcmSys reports 249 MiB of local memory** (#660). *Bleach: Soul
+  Resurrección*'s allocator keeps a block size in 28 bits; 256 MiB needs 29,
+  stored as zero, and the title spun at 100% CPU on its first allocation.
+
+### ohkora — [@ohkora](https://github.com/ohkora)
+First release here, 2 PRs in **v0.19.0**.
+- A contended `sys_lwmutex_trylock` returns `CELL_EBUSY` (#684), and cellPamf
+  reader calls on an uninitialised reader return `INVALID_ARG` (#685).
+
+### mmkzer0 — [@mmkzer0](https://github.com/mmkzer0)
+First release here, 1 PR in **v0.19.0**.
+- **The SPU interpreter decodes through one 2048-entry table** indexed by
+  `insn >> 21` (#688), generated by `tools/gen_spu_interp.py` and checked for
+  freshness, in place of a cascade of switches that a profile put at up to 37%
+  of an interpreted job queue's worker CPU. Decode only; execution is
+  unchanged.
 
 ---
 
@@ -749,6 +869,10 @@ First release here, 1 PR in **v0.18.0**.
   standalone library by the [PPSSPP](https://github.com/hrydgard/ppsspp) project
   (`ext/at3_standalone`). LGPL-2.1-or-later, kept as a separable component; see
   its `README.txt` and `COPYING.LGPLv2.1`.
+
+- **SMAA** (used by the Metal engine's `PS3_AA=smaa`) — Jorge Jimenez et al.'s
+  [SMAA](https://github.com/iryoku/smaa), MIT. The AreaTex and SearchTex
+  tables and the MSL generated from the reference shader.
 
 ---
 

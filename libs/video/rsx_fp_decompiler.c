@@ -315,8 +315,35 @@ typedef struct {
     int half;
     int negate;
     int abs;
+    int prec;       /* input precision modifier, 0 = none (see fp_src_prec_clamp) */
     char swz[5];    /* e.g. "xyzw" */
 } Src;
+
+/* Each source operand carries a 3-bit input precision modifier in DWORD2:
+ * bits 19-21 for SRC0, 22-24 for SRC1, 25-27 for SRC2. The hardware clamps the
+ * operand to that precision's range after abs and before negate:
+ *   1 half    [-65504, 65504]
+ *   2 fixed12 [-2, 2]
+ *   3 fixed9  [-1, 1]
+ *   4 saturate [0, 1]
+ * 0 (and the values above 4) leave the operand as it is. A soft-particle
+ * program that fades with MUL r, tex, |depth difference| and marks that source
+ * fixed9 relies on it: unclamped, the difference in metres saturates every
+ * fade to full opacity. */
+#define FP_SRC0_PREC_SHIFT  19
+#define FP_SRC1_PREC_SHIFT  22
+#define FP_SRC2_PREC_SHIFT  25
+
+static const char* fp_src_prec_clamp(int prec)
+{
+    switch (prec) {
+    case 1: return "-65504.0, 65504.0";
+    case 2: return "-2.0, 2.0";
+    case 3: return "-1.0, 1.0";
+    case 4: return "0.0, 1.0";
+    default: return NULL;
+    }
+}
 
 static void decode_src(u32 w, int abs_bit, Src* s)
 {
@@ -326,6 +353,7 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->half   = (w & FP_SRC_HALF) ? 1 : 0;
     s->negate = (w & FP_SRC_NEGATE) ? 1 : 0;
     s->abs    = abs_bit ? 1 : 0;
+    s->prec   = 0;
     for (int i = 0; i < 4; i++)
         s->swz[i] = comp[(w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3];
     s->swz[4] = '\0';
@@ -394,6 +422,12 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
     const char* pre = "";
     const char* post = "";
     if (s->abs)    { pre = "abs("; post = ")"; }
+    const char* range = fp_src_prec_clamp(s->prec);
+    if (range) {   /* abs, then the precision clamp, then negate */
+        snprintf(buf, bufsz, s->negate ? "-(clamp(%s%s%s, %s))" : "clamp(%s%s%s, %s)",
+                 pre, swz, post, range);
+        return;
+    }
     if (s->negate) snprintf(buf, bufsz, "-(%s%s%s)", pre, swz, post);
     else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
 }
@@ -780,6 +814,11 @@ static int rsx_fp_decompile_internal(
         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
         decode_src(w3, 0,                &s2);
+        if (!(w2 & FP_BRANCH)) {   /* a branch's DWORD2 holds other fields */
+            s0.prec = (int)((w2 >> FP_SRC0_PREC_SHIFT) & 7u);
+            s1.prec = (int)((w2 >> FP_SRC1_PREC_SHIFT) & 7u);
+            s2.prec = (int)((w2 >> FP_SRC2_PREC_SHIFT) & 7u);
+        }
 
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
@@ -905,6 +944,11 @@ static int rsx_fp_decompile_internal(
         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+        /* Screen-space derivatives. God of War: Ascension's font is a distance
+         * field whose edge width is max(|ddx|, |ddy|) of the sampled value; as
+         * an unhandled op the destination kept 0 and every glyph bloated. */
+        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
          * builtins): the packed word is a scalar that replicates. */
@@ -1320,8 +1364,13 @@ static int rsx_fp_decompile_internal(
     if (shadow) for (u32 u = 0; u < 16; u++)
         if ((sampled_units & (1u << u)) && shadow[u].enabled)
             fp_shadow_helper(&p, u, tex_sep_mask, &shadow[u]);
-    if (gamma_units) fp_gamma_helper(&p);
-    if (expand_units || bx2_units) fp_expand_helper(&p);
+    /* Also wherever the body calls one: the unit scanners above skip an inline
+     * constant only after a non-branch instruction, the body walk after any,
+     * so a program with branches can desynchronise them. God of War:
+     * Ascension's level had programs that called _rsx_expand_input with no
+     * definition and failed to compile. */
+    if (gamma_units || strstr(o.p, "_rsx_gamma_input(")) fp_gamma_helper(&p);
+    if (expand_units || bx2_units || strstr(o.p, "_rsx_expand_input(")) fp_expand_helper(&p);
     /* NV40 pack/unpack. A packed word travels on in a float's bits, so the
      * packs bitcast and the unpacks bitcast back; the sRGB forms follow
      * RPCS3's _builtin_pkg/_builtin_upg (linear_to_srgb, srgb_to_linear).
@@ -1520,6 +1569,44 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
     if (prefix + (size_t)n + 1 > out_size)
         return -1;
     memcpy(marker, suffix, (size_t)n + 1);
+    return 1;
+}
+
+int rsx_fp_apply_depth_bounds(char* hlsl, u32 capacity, u32 unit)
+{
+    if (!hlsl || capacity == 0 || unit >= 16u) return -1;
+    const size_t len = strlen(hlsl);
+    if (len >= capacity || strstr(hlsl, "fp_dbounds")) return -1;
+    /* The units are declared one by one (Texture2D, TextureCube, Texture3D)
+     * or, when none is a cube or a volume, as one Texture2D array. */
+    char decl[64], name[24];
+    snprintf(decl, sizeof decl, "Texture2D   rsx_tex%u : register(t%u);\n", unit, unit);
+    if (strstr(hlsl, decl)) snprintf(name, sizeof name, "rsx_tex%u", unit);
+    else if (strstr(hlsl, "Texture2D    rsx_tex[16] : register(t0);\n"))
+        snprintf(name, sizeof name, "rsx_tex[%u]", unit);
+    else return -1;   /* a cube or volume slot */
+    static const char cb[] = "    float4 fp_alpha;\n";
+    static const char cb_add[] = "    float4 fp_dbounds;\n";
+    char* at_cb = strstr(hlsl, cb);
+    char* at_main = strstr(hlsl, " main(PSInput input)");
+    if (!at_cb || !at_main || at_cb > at_main) return -1;
+    char* body = strstr(at_main, "{\n");
+    if (!body) return -1;
+    body += 2;
+    char test[256];
+    const int tn = snprintf(test, sizeof test,
+        "    { const float _rsx_zs = %s.Load(int3(int2(input.position.xy), 0)).r;\n"
+        "      if (_rsx_zs < fp_dbounds.x || _rsx_zs > fp_dbounds.y) discard; }\n", name);
+    if (tn < 0 || (size_t)tn >= sizeof test) return -1;
+    const size_t add = (sizeof cb_add - 1) + (size_t)tn;
+    if (len + add + 1 > capacity) return -1;
+    const size_t a = (size_t)(at_cb - hlsl) + (sizeof cb - 1);   /* after fp_alpha's line */
+    const size_t b = (size_t)(body - hlsl);                      /* after main's brace    */
+    /* Shift the tail, then the middle, then write the two insertions. */
+    memmove(hlsl + b + add, hlsl + b, len - b + 1);
+    memmove(hlsl + a + (sizeof cb_add - 1), hlsl + a, b - a);
+    memcpy(hlsl + a, cb_add, sizeof cb_add - 1);
+    memcpy(hlsl + b + (sizeof cb_add - 1), test, (size_t)tn);
     return 1;
 }
 

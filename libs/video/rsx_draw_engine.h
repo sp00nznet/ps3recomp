@@ -94,6 +94,10 @@ typedef struct rsx_be_render_state {
     u32 rt_fp16;                    /* the target is an FP16 HDR surface */
     u32 stencil_enable, stencil_two_sided;
     u32 depth_bounds_test;          /* SET_DEPTH_BOUNDS_TEST_ENABLE */
+    /* 1: clamp the depth to [0, 1] instead of clipping at the near and far
+     * planes (SET_ZMIN_MAX_CONTROL 0x1D78: clamp set, or near/far clipping
+     * off). A backend without depth clamping draws it clipped. */
+    u32 depth_clamp;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
 } rsx_be_render_state;
