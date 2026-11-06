@@ -1523,6 +1523,44 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
     return 1;
 }
 
+int rsx_fp_apply_depth_bounds(char* hlsl, u32 capacity, u32 unit)
+{
+    if (!hlsl || capacity == 0 || unit >= 16u) return -1;
+    const size_t len = strlen(hlsl);
+    if (len >= capacity || strstr(hlsl, "fp_dbounds")) return -1;
+    /* The units are declared one by one (Texture2D, TextureCube, Texture3D)
+     * or, when none is a cube or a volume, as one Texture2D array. */
+    char decl[64], name[24];
+    snprintf(decl, sizeof decl, "Texture2D   rsx_tex%u : register(t%u);\n", unit, unit);
+    if (strstr(hlsl, decl)) snprintf(name, sizeof name, "rsx_tex%u", unit);
+    else if (strstr(hlsl, "Texture2D    rsx_tex[16] : register(t0);\n"))
+        snprintf(name, sizeof name, "rsx_tex[%u]", unit);
+    else return -1;   /* a cube or volume slot */
+    static const char cb[] = "    float4 fp_alpha;\n";
+    static const char cb_add[] = "    float4 fp_dbounds;\n";
+    char* at_cb = strstr(hlsl, cb);
+    char* at_main = strstr(hlsl, " main(PSInput input)");
+    if (!at_cb || !at_main || at_cb > at_main) return -1;
+    char* body = strstr(at_main, "{\n");
+    if (!body) return -1;
+    body += 2;
+    char test[256];
+    const int tn = snprintf(test, sizeof test,
+        "    { const float _rsx_zs = %s.Load(int3(int2(input.position.xy), 0)).r;\n"
+        "      if (_rsx_zs < fp_dbounds.x || _rsx_zs > fp_dbounds.y) discard; }\n", name);
+    if (tn < 0 || (size_t)tn >= sizeof test) return -1;
+    const size_t add = (sizeof cb_add - 1) + (size_t)tn;
+    if (len + add + 1 > capacity) return -1;
+    const size_t a = (size_t)(at_cb - hlsl) + (sizeof cb - 1);   /* after fp_alpha's line */
+    const size_t b = (size_t)(body - hlsl);                      /* after main's brace    */
+    /* Shift the tail, then the middle, then write the two insertions. */
+    memmove(hlsl + b + add, hlsl + b, len - b + 1);
+    memmove(hlsl + a + (sizeof cb_add - 1), hlsl + a, b - a);
+    memcpy(hlsl + a, cb_add, sizeof cb_add - 1);
+    memcpy(hlsl + b + (sizeof cb_add - 1), test, (size_t)tn);
+    return 1;
+}
+
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func)
 {
