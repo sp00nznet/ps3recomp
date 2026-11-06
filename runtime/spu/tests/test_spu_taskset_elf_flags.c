@@ -29,6 +29,9 @@ static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint
  * where production returns without touching memory. */
 static void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint32_t code)
 { (void)taskset_ea; (void)task; (void)exited; (void)code; }
+/* A task that exits leaves the set of tasks that work in signal rounds. */
+void spu_taskset_round_drop(uint32_t taskset_ea, uint32_t task)
+{ (void)taskset_ea; (void)task; }
 /* PRODUCTION_FUNCTIONS */
 static unsigned passed, failed;
 #define CHECK(test, message) do { if (test) passed++; else { failed++; fprintf(stderr, "FAIL: %s\n", message); } } while (0)
