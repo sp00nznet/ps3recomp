@@ -1898,10 +1898,12 @@ static void* wprof_thread(void* arg)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGPROF, &sa, NULL);
     fprintf(stderr, "[walker prof] sampling for %d s\n", secs);
-    for (int k = 0; k < secs * 1000 && atomic_load(&s_wprof_n) < WPROF_MAX; k++) {
+    const u64 deadline = get_timestamp_ns() + (u64)secs * 1000000000ULL;
+    do {
         pthread_kill(s_wprof_target, SIGPROF);
         nanosleep(&tick, NULL);
-    }
+    } while (atomic_load(&s_wprof_n) < WPROF_MAX &&
+             get_timestamp_ns() < deadline);
     nanosleep(&poll, NULL);
     const int n = atomic_load_explicit(&s_wprof_n, memory_order_acquire);
     FILE* f = fopen(out, "w");
