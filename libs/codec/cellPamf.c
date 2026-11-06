@@ -129,6 +129,24 @@ static CellPamfReader* pamf_host(CellPamfReader* guest_ea)
     return NULL;
 }
 
+/* The reader a successful cellPamfReaderInitialize set up at this EA, or NULL.
+ * Every call except Initialize goes through this. pamf_host hands out a fresh,
+ * zeroed slot for an EA it hasn't seen, which only Initialize should do: a
+ * getter called on a reader the title never initialised (its movie never
+ * opened, say) got a slot with pamfAddr NULL and read the header through it.
+ * An Initialize that failed leaves its slot with pamfAddr NULL, so that reader
+ * stays invalid too. */
+static CellPamfReader* pamf_get(CellPamfReader* guest_ea)
+{
+    u32 ea = (u32)(uintptr_t)guest_ea;
+    if (!ea)
+        return NULL;
+    for (int i = 0; i < PAMF_MAX_READERS; i++)
+        if (s_readers[i].in_use && s_readers[i].ea == ea)
+            return s_readers[i].r.pamfAddr ? &s_readers[i].r : NULL;
+    return NULL;
+}
+
 /* --------------------------------------------------------------------------- 
  * Reader lifecycle
  * -----------------------------------------------------------------------*/
@@ -186,7 +204,7 @@ s32 cellPamfReaderInitialize(CellPamfReader* reader, void* pamfAddr,
 
 s32 cellPamfReaderGetPresentationStartTime(CellPamfReader* reader, u64* startTime)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader || !startTime)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -197,7 +215,7 @@ s32 cellPamfReaderGetPresentationStartTime(CellPamfReader* reader, u64* startTim
 
 s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, u64* endTime)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader || !endTime)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -208,7 +226,7 @@ s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, u64* endTime)
 
 u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader)
         return 0;
 
@@ -222,7 +240,7 @@ u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader)
 
 s32 cellPamfReaderGetNumberOfStreams(CellPamfReader* reader)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -249,7 +267,7 @@ static s32 get_stream_sdk_type(CellPamfReader* reader, u32 index)
 
 s32 cellPamfReaderGetNumberOfSpecificStreams(CellPamfReader* reader, u8 streamType)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -263,7 +281,7 @@ s32 cellPamfReaderGetNumberOfSpecificStreams(CellPamfReader* reader, u8 streamTy
 
 s32 cellPamfReaderSetStreamWithType(CellPamfReader* reader, u8 streamType, u32 streamIndex)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -283,14 +301,14 @@ s32 cellPamfReaderSetStreamWithType(CellPamfReader* reader, u8 streamType, u32 s
 s32 cellPamfReaderSetStreamWithTypeAndChannel(CellPamfReader* reader, u8 streamType, u32 channel)
 {
     /* Forward the GUEST pointer untouched: cellPamfReaderSetStreamWithType
-     * resolves it itself, and pamf_host keys on the guest EA -- handing it an
+     * resolves it itself, and pamf_get keys on the guest EA -- handing it an
      * already-resolved host pointer would key a second, empty slot. */
     return cellPamfReaderSetStreamWithType(reader, streamType, channel);
 }
 
 s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u32 streamIndex)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -361,7 +379,7 @@ static u8 lpcm_bits(u8 code)
 
 s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader || !info)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -450,7 +468,7 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
 
 s32 cellPamfReaderGetStreamIndex(CellPamfReader* reader)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -477,7 +495,7 @@ s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
 
 s32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader, s32* numEp)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader || !numEp)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -488,7 +506,7 @@ s32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader, s32* numEp)
 
 s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep)
 {
-    reader = pamf_host(reader);
+    reader = pamf_get(reader);
     if (!reader || !ep)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
