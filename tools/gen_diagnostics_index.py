@@ -1,7 +1,7 @@
 import os, re, collections
 NL = chr(10)
 ROOTS = ['runtime', 'libs', 'tools']
-PAT = re.compile(r'getenv\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)')
+PAT = re.compile(r'(?:getenv|ps3_env_once)\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)')
 COMMENT = re.compile(r'^\s*(?:/\*|\*|//)\s?(.*)$')
 
 hits = collections.defaultdict(list)   # name -> [(file, line, desc)]
