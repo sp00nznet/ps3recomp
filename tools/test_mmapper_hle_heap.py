@@ -11,7 +11,7 @@ def main():
         return 0
     source = (ROOT / 'libs/system/sysPrxForUser.c').read_text()
     begin = source.index('#define YZ_HEAP_BASE')
-    end = source.index('/* _sys_heap_create_heap', begin)
+    end = source.index('/* The plain libc allocator sysPrxForUser exports', begin)
     body = source[begin:end]
     with tempfile.TemporaryDirectory(prefix='ps3-mmapper-hle-heap-') as tmp:
         temp = Path(tmp)
