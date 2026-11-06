@@ -1848,6 +1848,10 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
 #define SPU_OVL_SRC_MAX 128
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
+/* Monotonic: published before any signature entry becomes visible through
+ * s_ovl_src_count. A reader that acquired that count cannot miss the flag.
+ * This lets EA-only registries reject unrelated GETs of every size. */
+static atomic_int s_ovl_has_sig;
 
 /* Every MFC GET is checked against the registered sources, and a job that
  * streams its data in small pieces issues thousands of GETs a frame against
@@ -2071,7 +2075,8 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
-        s_ovl_src_count++;
+        atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
+        __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -2148,7 +2153,12 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         }
     }
     int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
-    if (size < 512 && !spu_ovl_ea_known(ea)) return;
+    /* Invalidate destination code/residency above even for an unrelated EA.
+     * Acquire count before the signature flag: if this snapshot contains a
+     * signature, its earlier flag publication is visible. A racing future
+     * signature can only force an unnecessary scan of the older snapshot. */
+    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
+        !spu_ovl_ea_known(ea)) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
