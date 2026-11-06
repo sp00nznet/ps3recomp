@@ -464,6 +464,9 @@ jobs:
           # SV_TARGETs a program that writes more than one export gets.
           clang -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_fp_decompiler
+          # The D3D12 device order as pure logic (no D3D12 needed).
+          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_d3d12_device_pick libs/video/tests/test_d3d12_device_pick.c
+          /tmp/test_d3d12_device_pick
           # The register-file draw engine's platform-neutral halves against a
           # stub backend -- surface keying and reallocation, render-target
           # aliasing on a texture bind, the texture cache's revalidation and

@@ -45,6 +45,7 @@
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
+#include "rsx_d3d12_device.h"
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
@@ -749,47 +750,17 @@ static int init_d3d12(u32 width, u32 height)
         return -1;
     }
 
-    /* Create D3D12 device. On a dual-GPU laptop a NULL adapter usually lands on
-     * the integrated GPU; explicitly pick the high-performance (discrete)
-     * adapter via IDXGIFactory6. Set CELLMARK_IGPU to force the low-power one
-     * (for A/B testing a suspected iGPU-driver stall). */
-    {
-        IDXGIFactory6* factory6 = NULL;
-        if (SUCCEEDED(factory->lpVtbl->QueryInterface(
-                factory, &IID_IDXGIFactory6, (void**)&factory6))) {
-            DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU")
-                ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
-                : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
-            IDXGIAdapter1* adapter = NULL;
-            for (UINT ai = 0; factory6->lpVtbl->EnumAdapterByGpuPreference(
-                     factory6, ai, pref, &IID_IDXGIAdapter1, (void**)&adapter)
-                     != DXGI_ERROR_NOT_FOUND; ai++) {
-                DXGI_ADAPTER_DESC1 ad;
-                adapter->lpVtbl->GetDesc1(adapter, &ad);
-                if (!(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-                    SUCCEEDED(D3D12CreateDevice((IUnknown*)adapter,
-                        D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
-                        (void**)&s_d3d.device))) {
-                    printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
-                           (unsigned long long)(ad.DedicatedVideoMemory >> 20));
-                    adapter->lpVtbl->Release(adapter);
-                    break;
-                }
-                adapter->lpVtbl->Release(adapter);
-                adapter = NULL;
-            }
-            factory6->lpVtbl->Release(factory6);
-        }
-    }
-    if (!s_d3d.device) {
-        hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0,
-                               &IID_ID3D12Device, (void**)&s_d3d.device);
-        if (FAILED(hr)) {
-            printf("[D3D12] ERROR: D3D12CreateDevice failed (0x%08lX)\n", hr);
-            factory->lpVtbl->Release(factory);
-            return -1;
-        }
-        printf("[D3D12] Device created on default adapter (feature level 11.0)\n");
+    /* Create D3D12 device: the high-performance (discrete) adapter first, as
+     * a NULL adapter usually lands on the integrated GPU of a dual-GPU laptop;
+     * then the default adapter; then WARP (rsx_d3d12_device.h). Set
+     * CELLMARK_IGPU to order the low-power one first (for A/B testing a
+     * suspected iGPU-driver stall). */
+    if (rsx_d3d12_create_device(factory, &s_d3d.device, "d3d12 backend",
+                                getenv("CELLMARK_IGPU")
+                                    ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
+                                    : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) < 0) {
+        factory->lpVtbl->Release(factory);
+        return -1;
     }
 
     /* Create command queue */

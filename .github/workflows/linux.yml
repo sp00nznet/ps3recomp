@@ -374,6 +374,10 @@ jobs:
           # had rotted to the point of not compiling while nothing ran it.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_fp_decompiler
+          # The D3D12 device order (adapter preference, software adapters
+          # skipped, default adapter, WARP, RSX_D3D12_WARP) as pure logic.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_d3d12_device_pick libs/video/tests/test_d3d12_device_pick.c
+          /tmp/test_d3d12_device_pick
           # The register-file draw engine's platform-neutral halves, driven
           # through its dispatch sink against a stub backend: the surface set's
           # keying and reallocation, a texture unit that names a render target
