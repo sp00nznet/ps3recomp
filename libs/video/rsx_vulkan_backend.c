@@ -2125,16 +2125,30 @@ static VkFormat vk_eng_format(rsx_be_format f, u32* bpp)
 }
 
 /* Colour formats the E2 passes render into: RGBA8 for ordinary and display
- * targets, RGBA16F for SET_SURFACE_FORMAT 0xB HDR targets. Both are required
- * colour attachment formats with blending in Vulkan 1.0. */
-#define VK_ENG_RT_FORMATS 2
+ * targets, RGBA16F for SET_SURFACE_FORMAT 0xB HDR targets, and R32F / RGBA32F
+ * for the float targets a title renders small reductions into. All four are
+ * required colour attachment formats in Vulkan 1.0; blending is guaranteed only
+ * for the first two (see vk_eng_rt_blendable). */
+#define VK_ENG_RT_FORMATS 4
 static int vk_eng_rt_index(VkFormat f)
 {
     switch (f) {
     case VK_FORMAT_R8G8B8A8_UNORM:      return 0;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return 1;
+    case VK_FORMAT_R32_SFLOAT:          return 2;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return 3;
     default:                            return -1;
     }
+}
+
+/* Whether the device blends into colour format `f` (guaranteed for RGBA8 and
+ * RGBA16F, optional for 32-bit float formats). */
+static int vk_eng_rt_blendable(VkFormat f)
+{
+    if (f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R16G16B16A16_SFLOAT) return 1;
+    VkFormatProperties fp;
+    pvkGetPhysicalDeviceFormatProperties(s_vk.phys, f, &fp);
+    return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
 }
 
 /* The largest image side the engine creates: the device's own limit once a
@@ -3215,6 +3229,9 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     static int mrt_mode = -1;
     if (mrt_mode < 0) { const char* e = getenv("PS3RECOMP_VK_MRT_MASK"); mrt_mode = e ? atoi(e) : 1; }
     VkPipelineColorBlendAttachmentState cba[RSX_BE_MAX_COLOR_TARGETS];
+    /* A device without blending on a float target draws it unblended; that is
+     * reported once, never silently. */
+    const int blendable = vk_eng_rt_blendable(P->rt_fmt);
     for (u32 r = 0; r < P->rt_count; r++) {
         VkColorComponentFlags twm = wm;
         int tblend = rs->blend_enable != 0;
@@ -3228,6 +3245,14 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
                 if (nib & 8u) twm |= VK_COLOR_COMPONENT_B_BIT;
             }
             tblend = (rs->blend_mrt >> r) & 1u;
+        }
+        if (tblend && !blendable) {
+            tblend = 0;
+            if (!(s_e2.warned & 256u)) {
+                VK_LOG("engine: blending unsupported for colour format %d on this device; drawing unblended\n",
+                       (int)P->rt_fmt);
+                s_e2.warned |= 256u;
+            }
         }
         cba[r] = (VkPipelineColorBlendAttachmentState){
             .blendEnable = tblend ? VK_TRUE : VK_FALSE,
