@@ -191,6 +191,163 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
     *hi = small_on ? 0xFFFFu : 0u;
 }
 
+/* Keyboard fallback for port 0.
+ *
+ * On a machine with no controller plugged in a title gets a pad that is reported
+ * present and never presses anything -- it can be watched but not played. That is
+ * what The Simpsons Arcade Game hit: it reached its attract loop and no input
+ * existed to start a game.
+ *
+ * Only fills in for port 0, only when the backend found no controller there, so a
+ * real controller always wins and nothing changes for a port that has one. Keys
+ * are read only while a window of THIS process is in the foreground, so typing in
+ * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
+ * disable it entirely.
+ *
+ * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
+ * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
+ * so a title that reads the stick instead is playable too.
+ *
+ * Where the keys come from: GetAsyncKeyState with the XInput backend; on macOS
+ * CGEventSourceKeyState, which needs no event tap and no window; elsewhere SDL's
+ * keyboard state, which is kept current by whoever pumps SDL's events (in
+ * practice the window of the video backend). PS3RECOMP_PAD_KEYBOARD_SDL selects
+ * the SDL source on macOS too, which is how the keyboard test is built. */
+#if PAD_BACKEND_XINPUT
+static int pad_host_window_focused(void)
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+#define PADKEY_UP VK_UP
+#define PADKEY_DOWN VK_DOWN
+#define PADKEY_LEFT VK_LEFT
+#define PADKEY_RIGHT VK_RIGHT
+#define PADKEY_Z 'Z'
+#define PADKEY_X 'X'
+#define PADKEY_A 'A'
+#define PADKEY_S 'S'
+#define PADKEY_Q 'Q'
+#define PADKEY_W 'W'
+#define PADKEY_1 '1'
+#define PADKEY_2 '2'
+#define PADKEY_RETURN VK_RETURN
+#define PADKEY_TAB VK_TAB
+#elif defined(__APPLE__) && !defined(PS3RECOMP_PAD_KEYBOARD_SDL)
+/* macOS: virtual key codes (Carbon HIToolbox/Events.h kVK_*), polled with CGEventSourceKeyState,
+ * which needs no event tap and no window. "Focused" is NSApplication.isActive of this process,
+ * queried through the Objective-C runtime so this file stays plain C. */
+/* The system headers are not included on purpose: ApplicationServices / objc.h clash with this
+ * project's own `bool` and GetCurrentThread/GetCurrentProcess names, so the three entry points
+ * are declared by hand (CGKeyCode is uint16_t, kCGEventSourceStateCombinedSessionState is 0). */
+extern unsigned char CGEventSourceKeyState(int stateID, unsigned short key);
+extern void* objc_getClass(const char* name);
+extern void* sel_registerName(const char* name);
+extern void objc_msgSend(void);
+static int pad_host_window_focused(void)
+{
+    void* cls = objc_getClass("NSApplication");
+    if (!cls) return 0;
+    void* app = ((void* (*)(void*, void*))objc_msgSend)(cls, sel_registerName("sharedApplication"));
+    return app && ((signed char (*)(void*, void*))objc_msgSend)(app, sel_registerName("isActive"));
+}
+static int pad_key_down(int key)
+{
+    return CGEventSourceKeyState(0, (unsigned short)key) != 0;
+}
+#define PADKEY_UP 126
+#define PADKEY_DOWN 125
+#define PADKEY_LEFT 123
+#define PADKEY_RIGHT 124
+#define PADKEY_Z 6
+#define PADKEY_X 7
+#define PADKEY_A 0
+#define PADKEY_S 1
+#define PADKEY_Q 12
+#define PADKEY_W 13
+#define PADKEY_1 18
+#define PADKEY_2 19
+#define PADKEY_RETURN 36
+#define PADKEY_TAB 48
+#elif PAD_BACKEND_SDL2
+/* Everywhere else the keyboard is SDL's: scancodes are physical keys, like the macOS codes above. The state is kept
+ * current by whoever pumps SDL's events (the window of the RSX backend); without a video subsystem nothing is ever
+ * pressed. "Focused" is that some window of this process has the keyboard focus. */
+static int pad_host_window_focused(void)
+{
+    return SDL_GetKeyboardFocus() != NULL;
+}
+static int pad_key_down(int key)
+{
+    return SDL_GetKeyboardState(NULL)[key] != 0;
+}
+#define PADKEY_UP SDL_SCANCODE_UP
+#define PADKEY_DOWN SDL_SCANCODE_DOWN
+#define PADKEY_LEFT SDL_SCANCODE_LEFT
+#define PADKEY_RIGHT SDL_SCANCODE_RIGHT
+#define PADKEY_Z SDL_SCANCODE_Z
+#define PADKEY_X SDL_SCANCODE_X
+#define PADKEY_A SDL_SCANCODE_A
+#define PADKEY_S SDL_SCANCODE_S
+#define PADKEY_Q SDL_SCANCODE_Q
+#define PADKEY_W SDL_SCANCODE_W
+#define PADKEY_1 SDL_SCANCODE_1
+#define PADKEY_2 SDL_SCANCODE_2
+#define PADKEY_RETURN SDL_SCANCODE_RETURN
+#define PADKEY_TAB SDL_SCANCODE_TAB
+#endif
+
+static void pad_poll_keyboard(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (off) return;
+
+    PadHostState* hs = &s_host_state[0];
+    if (!pad_host_window_focused()) {
+        /* Release everything on focus loss, or a key held while alt-tabbing
+         * would stay down forever. */
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = 128;
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->connected = 1;
+        return;
+    }
+
+    static const struct { int vk; u16 btn; } map[] = {
+        { PADKEY_UP,     CELL_PAD_CTRL_UP },      { PADKEY_DOWN,  CELL_PAD_CTRL_DOWN },
+        { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_RIGHT, CELL_PAD_CTRL_RIGHT },
+        { PADKEY_Z,      CELL_PAD_CTRL_CROSS },   { PADKEY_X,     CELL_PAD_CTRL_CIRCLE },
+        { PADKEY_A,      CELL_PAD_CTRL_SQUARE },  { PADKEY_S,     CELL_PAD_CTRL_TRIANGLE },
+        { PADKEY_Q,      CELL_PAD_CTRL_L1 },      { PADKEY_W,     CELL_PAD_CTRL_R1 },
+        { PADKEY_1,      CELL_PAD_CTRL_L2 },      { PADKEY_2,     CELL_PAD_CTRL_R2 },
+        { PADKEY_RETURN, CELL_PAD_CTRL_START },   { PADKEY_TAB,   CELL_PAD_CTRL_SELECT },
+    };
+
+    u16 btns = 0;
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (pad_key_down(map[i].vk)) btns |= map[i].btn;
+
+    hs->buttons   = btns;
+    hs->connected = 1;
+    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+    hs->analog_rx = hs->analog_ry = 128;
+    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+
+    { static int said = 0;
+      if (!said && btns) { said = 1;
+          printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
+          fflush(stdout); } }
+}
+
 /* ---------------------------------------------------------------------------
  * XInput backend
  * -----------------------------------------------------------------------*/
@@ -250,80 +407,6 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
     if (val > 255) val = 255;
     return (u8)val;
 }
-
-/* Keyboard fallback for port 0.
- *
- * The only backend here is XInput, so on a machine with no controller plugged
- * in a title gets a pad that is reported present and never presses anything --
- * it can be watched but not played. That is what The Simpsons Arcade Game hit:
- * it reached its attract loop and no input existed to start a game.
- *
- * Only fills in for port 0, only when XInput found nothing there, so a real
- * controller always wins and nothing changes for a port that has one. Keys are
- * read only while a window of THIS process is in the foreground, so typing in
- * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
- * disable it entirely.
- *
- * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
- * so a title that reads the stick instead is playable too. */
-#ifdef _WIN32
-static int pad_host_window_focused(void)
-{
-    HWND fg = GetForegroundWindow();
-    if (!fg) return 0;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(fg, &pid);
-    return pid == GetCurrentProcessId();
-}
-
-static void pad_poll_keyboard(void)
-{
-    static int off = -1;
-    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
-    if (off) return;
-
-    PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused()) {
-        /* Release everything on focus loss, or a key held while alt-tabbing
-         * would stay down forever. */
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
-        return;
-    }
-
-    static const struct { int vk; u16 btn; } map[] = {
-        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
-        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
-        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
-        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
-        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
-    };
-
-    u16 btns = 0;
-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
-
-    hs->buttons   = btns;
-    hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
-
-    { static int said = 0;
-      if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
-          fflush(stdout); } }
-}
-#endif
 
 /* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
  * a connected one), and the backend is polled at least once a frame: three
@@ -710,9 +793,7 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
-#ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
-#endif
     pad_track_assign();
     pad_unlock();
 }
