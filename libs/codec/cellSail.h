@@ -122,19 +122,17 @@ s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc, s32* type);
 s32 cellSailDescriptorSetAutoSelection(CellSailDescriptorHandle desc, s32 enable);
 s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLen);
 
-/* Memory allocator */
-typedef struct CellSailMemAllocator {
-    void* (*alloc)(void* arg, u32 boundary, u32 size);
-    void  (*free)(void* arg, u32 boundary, void* ptr);
-    void* arg;
-} CellSailMemAllocator;
-
-/* Mirrors RPCS3's CellSailMemAllocatorFuncs: a guest struct of two callback
- * pointers, passed as one pointer arg (not two separate function pointers). */
+/* Guest storage layout: 32-bit big-endian callback OPDs followed by pArg.
+ * SDK 4.00 cell/sail/common.h embeds the callback pair by value. */
 typedef struct CellSailMemAllocatorFuncs {
-    void* pAlloc;
-    void* pFree;
+    u32 pAlloc;
+    u32 pFree;
 } CellSailMemAllocatorFuncs;
+
+typedef struct CellSailMemAllocator {
+    CellSailMemAllocatorFuncs callbacks;
+    u32 pArg;
+} CellSailMemAllocator;
 
 /* Named pFuncs (not "callbacks") so the import-bridge generator's naming
  * heuristic (gen_imports.py param_marshal) treats this as a real guest
@@ -143,7 +141,7 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
                               u32 pUserParam, u32 pAttribute, u32 pResource);
 s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
-                                     CellSailMemAllocatorFuncs* pFuncs);
+                                     CellSailMemAllocatorFuncs* pFuncs, void* pArg);
 
 #ifdef __cplusplus
 }
