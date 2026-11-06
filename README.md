@@ -572,7 +572,10 @@ pass brings the sync, event, file and SPU-group syscalls closer to the SDK.*
   run in CI again (*@n0madic*). `sync_stress` takes tick differences modulo
   2^32, so it passes after 24.8 days of host uptime (*@undecuple*, #627).
 
-<!-- known issues: pending gate -->
+**Known issue**
+- You Don't Know Jack's boot hang from v0.18.0 is unchanged: v0.18.0 and
+  this release reach the same point on the regression gate. The other four
+  gate ports match v0.18.0 too.
 
 ### v0.18.0 — *"One Hundred Fifty-Five"* (October 2026)
 
