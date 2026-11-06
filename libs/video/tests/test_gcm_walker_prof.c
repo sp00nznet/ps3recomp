@@ -11,6 +11,7 @@
  *   -ffunction-sections -fdata-sections -Wl,-dead_strip -o /tmp/test_gcm_walker_prof
  * Run: /tmp/test_gcm_walker_prof on <file>   (RSX_WALKER_PROF=<file> RSX_WALKER_PROF_SECONDS=1)
  *      /tmp/test_gcm_walker_prof off <file>  (RSX_WALKER_PROF unset)
+#include "../rsx_tiling.c"
  */
 #include <time.h>
 #if defined(__APPLE__) && defined(__aarch64__)

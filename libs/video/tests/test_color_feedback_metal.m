@@ -4,6 +4,7 @@
 #define eng_texture_upload test_engine_texture_upload
 #define eng_present test_engine_present
 #include "rsx_draw_engine.c"
+#include "rsx_tiling.c"
 #undef eng_texture_upload
 #undef eng_present
 #include "rsx_test_programs.h"

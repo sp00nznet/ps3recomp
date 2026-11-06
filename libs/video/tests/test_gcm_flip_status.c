@@ -11,6 +11,7 @@
  * here is executed before the tick that is to complete it.
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <assert.h>
 uint8_t* vm_base;
 uint32_t ppu_vm_size;

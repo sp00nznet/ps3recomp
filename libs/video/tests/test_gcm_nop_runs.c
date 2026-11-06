@@ -12,6 +12,7 @@
  *   (clang on macOS: -Wl,-dead_strip)
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 /* GCM_REPORT_SPU_HOLD_MS asks the SPU task layer whether a task round is

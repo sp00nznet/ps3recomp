@@ -1,6 +1,7 @@
 /* Include the real implementation to inspect both host tables and mapping
  * slots; no copy of the mapping algorithm or production-only test API. */
 #include "../libs/video/cellGcmSys.c"
+#include "../libs/video/rsx_tiling.c"
 #include <assert.h>
 
 uint8_t* vm_base;
