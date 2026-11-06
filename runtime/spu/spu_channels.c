@@ -589,7 +589,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 0;
 
     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
-    uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
+    /* The line moves to and from a 128-byte aligned local-store address: the
+     * low seven bits of MFC_LSA are ignored, as those of the EA are. Used
+     * unmasked, an unaligned LSA put the line at the wrong place, and one in
+     * the last 128 bytes of local store carried the copy past the end of the
+     * store and over the context behind it. */
+    uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
 
@@ -1073,7 +1078,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
             SPU_EVENT_SET(ctx, 0x2u);
         spu_lockline_unlock();
         break;
-    case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
+    case SPU_WrSRR0:         ctx->srr0 = v & 0x3FFFCu;   /* a word-aligned LS address */ break;
     default:
         /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */
         break;
@@ -1152,6 +1157,17 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
+    /* Pass through the waiter's lock first. spu_ch_wait tests its predicate and
+     * goes to sleep under ch_wait_lock, but a producer makes the predicate true
+     * outside it. A wake issued between the waiter's test and its sleep found
+     * nobody on the condition variable and was lost (on POSIX the shim's
+     * generation count is read when the sleep begins, so it misses it too);
+     * the read then completed only at the 10 ms re-poll. Taking the lock orders
+     * this wake after the waiter is either asleep or has not yet tested.
+     * Uncontended it is one lock/unlock pair. No caller holds ch_wait_lock, and
+     * the waiter takes no other lock while it does. */
+    AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
 }
 
@@ -1298,7 +1314,11 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         break;
     }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
-    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
+    /* The events that are pending AND enabled. A pending event the SPU has
+     * not unmasked (an Lr left by a lost reservation, an Sn) must not show up
+     * in a read that is waiting on a different set; this is the condition
+     * spu_ch_ready and rchcnt already use. */
+    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status & ctx->event_mask; break;
     /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.
      * This runtime models nonisolated SPUs, so the isolation bit stays clear. */
     case SPU_RdMachStat:    v = ctx->int_enable & 1u; break;
