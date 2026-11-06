@@ -3821,11 +3821,6 @@ static uint32_t ppu_tls_new_block(void)
         if (!__atomic_exchange_n(&s_warned, 1, __ATOMIC_RELAXED))
             fprintf(stderr, "[ppu] TLS window full after %u thread blocks: later "
                     "threads share the main thread's TLS\n", (unsigned)(off / total));
-    /* register_main() leaves stack_addr/stack_size zeroed; sys_ppu_thread_
-     * get_stack_information(49) would report a {0,0} stack for the main
-     * thread. Backfill the real region now that the harness chose it. */
-    { extern void ppu_thread_set_main_stack(uint32_t, uint32_t);
-      ppu_thread_set_main_stack(stack_top - VM_PPU_STACK_SIZE, VM_PPU_STACK_SIZE); }
         return 0;
     }
     if (g_tls_filesz) memcpy(vm_base + base, vm_base + g_tls_vaddr, g_tls_filesz);
@@ -4111,6 +4106,11 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * and concurrently-emitted fences vanished (the boot-loading stall). */
     { extern uint64_t ppu_thread_register_main_priority(int32_t);
       ctx.thread_id = ppu_thread_register_main_priority(g_ppu_primary_priority); }
+    /* register_main() leaves stack_addr/stack_size zeroed; sys_ppu_thread_
+     * get_stack_information(49) would report a {0,0} stack for the main
+     * thread. Backfill the real region now that the harness chose it. */
+    { extern void ppu_thread_set_main_stack(uint32_t, uint32_t);
+      ppu_thread_set_main_stack(stack_top - VM_PPU_STACK_SIZE, VM_PPU_STACK_SIZE); }
     /* For samplers on other threads (a port's periodic stack dump): the main
      * thread's context lives on this frame, not in the thread table. */
     g_ppu_main_ctx = &ctx;
