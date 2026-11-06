@@ -68,6 +68,7 @@ void cellGcm_replay_display_buffers_to_engine(void) {}
 typedef struct {
     u32 next_handle;
     u8  alive[STUB_MAX_OBJECTS];
+    u8  n_released[STUB_MAX_OBJECTS];   /* release calls per handle: each object is released once */
 
     int n_texture_create, n_texture_release, n_texture_upload;
     int n_color_create, n_color_release, n_color_seeded;
@@ -137,7 +138,7 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
 static void stub_release(void* u, u32 handle)
 {
     (void)u;
-    if (handle && handle < STUB_MAX_OBJECTS) stub.alive[handle] = 0;
+    if (handle && handle < STUB_MAX_OBJECTS) { stub.alive[handle] = 0; stub.n_released[handle]++; }
     stub.last_released = handle;
 }
 
@@ -1796,6 +1797,8 @@ static void test_depth_snapshot_release(void)
     CHECK(stub.n_depth_create >= 3 && !stub.alive[second],
           "a recreated depth target releases its old snapshot (%d depth targets)",
           stub.n_depth_create);
+    CHECK(stub.n_released[second] == 1,
+          "and releases it once (%d calls)", stub.n_released[second]);
     engine_down();
 }
 
