@@ -165,6 +165,17 @@ static void gcm_set_current_display_buffer(u32 bufferId)
 }
 
 
+/* The two JUMP encodings of the RSX FIFO: the old 0x20000000 | offset, and the new offset | 1 (the low two bits are 01
+ * and the top three are 000, so the offset is the whole word with those bits cleared). Returns 1 and the target for
+ * either. A new-style word read as a method header would be a count-0 header, and the walker would run on into the
+ * data after the jump. */
+static inline int gcm_fifo_jump_target(u32 w, u32* tgt)
+{
+    if ((w >> 29) == 1u)                  { *tgt = w & 0x1FFFFFFCu; return 1; }
+    if ((w & 0xE0000003u) == 1u)          { *tgt = w & 0xFFFFFFFCu; return 1; }
+    return 0;
+}
+
 /* The RSX puts its 3D state back to the reset values at a flip, and a title
  * may count on that: one sets ZSTENCIL_CLEAR_VALUE to 0 for a single clear
  * and never writes it again, so its later depth clears are to the far plane
@@ -2276,8 +2287,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * does that -- and that park then inherited a grace that had already
          * run out, so the jump-park resync fired at once and dropped the
          * commands the title was about to link in. */
-        if (park_off && (s_fifo_getoff != park_off ||
-                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off))
+        u32 jump_tgt = 0;
+        const int is_jump = gcm_fifo_jump_target(w, &jump_tgt);
+        if (park_off && (s_fifo_getoff != park_off || !is_jump || jump_tgt != park_off))
             park_off = 0;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
@@ -2334,11 +2346,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
             continue;
         }
 
-        if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+        if (is_jump) {                         /* JUMP: 0x20000000 | offset, or offset | 1 */
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
-                               s_fifo_getoff, w & 0x1FFFFFFCu, put); }
-            { u32 tgt = w & 0x1FFFFFFCu;
+                               s_fifo_getoff, jump_tgt, put); }
+            { u32 tgt = jump_tgt;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it

@@ -401,6 +401,8 @@ if(PS3RECOMP_BUILD_TESTS)
     add_subdirectory(libs/codec/tests)
     # cellGcm's FIFO walker without a backend: where GET_REPORT writes for
     # each report DMA context. Links the runtime like the POSIX host below.
+        # The same walker's JUMP decode: the old and the new form.
+        add_subdirectory(tests/gcm_fifo_jump)
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
         # The per-call tile and zcull log lines, gated on PS3_VERBOSE.
