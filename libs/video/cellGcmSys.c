@@ -928,6 +928,9 @@ static int gcm_handler_thread_on(void)
     if (v < 0) { const char* e = getenv("GCM_HANDLER_THREAD"); v = (e && *e && *e != '0') ? 1 : 0; }
     return v;
 }
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 static DWORD WINAPI gcm_intr_main(LPVOID unused)
 {
     (void)unused;
@@ -939,6 +942,10 @@ static DWORD WINAPI gcm_intr_main(LPVOID unused)
 #endif
     return 0;
 }
+
+#ifndef _WIN32
+static void* gcm_intr_posix(void* a) { gcm_intr_main(a); return NULL; }
+#endif
 
 void ppu_gcm_pump(void)
 {
@@ -952,7 +959,11 @@ void ppu_gcm_pump(void)
     if (gcm_handler_thread_on() && (unsigned long)GetCurrentThreadId() != s_gcm_intr_tid) {
         static volatile long started = 0;
         if (!started && InterlockedCompareExchange(&started, 1, 0) == 0)
+#ifdef _WIN32
             CreateThread(NULL, 1u << 20, gcm_intr_main, NULL, 0, NULL);
+#else
+        { pthread_t t; if (pthread_create(&t, NULL, gcm_intr_posix, NULL) == 0) pthread_detach(t); }
+#endif
         return;   /* only the interrupt thread delivers */
     }
     if (!GCM_PUMP_TRY_ENTER()) return;

@@ -4,9 +4,12 @@
 static int fail_allocation;
 static void* registry_malloc(size_t n) { return fail_allocation ? NULL : malloc(n); }
 #define malloc registry_malloc
+static void* registry_realloc(void* p, size_t n) { return fail_allocation ? NULL : realloc(p, n); }
+#define realloc registry_realloc
 #include "../spu_channels.c"
 #include "../spu_coherency.c"
 #undef malloc
+#undef realloc
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int main(int argc, char** argv)

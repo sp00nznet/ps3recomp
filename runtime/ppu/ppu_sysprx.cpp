@@ -126,9 +126,12 @@ static void sys_lwmutex_create(ppu_context* ctx)
       if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
         fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
     uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
+    /* sys_lwmutex_t.attribute is protocol | recursive (the two words of
+     * sys_lwmutex_attribute_t OR-ed together); the recursive word was dropped. */
+    uint32_t recursive = attr ? vm_read32(attr + 4) : 0;
     vm_write32(lwm + 0x00, 0);          /* owner */
     vm_write32(lwm + 0x04, 0);          /* waiter */
-    vm_write32(lwm + LWM_ATTR, protocol);
+    vm_write32(lwm + LWM_ATTR, protocol | recursive);
     vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
     vm_write32(lwm + 0x14, 0);

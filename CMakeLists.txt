@@ -638,6 +638,7 @@ if(UNIX)
                 libs/video/rsx_texture_layout.c
                 libs/video/rsx_vp_decompiler.c
                 libs/video/rsx_fp_decompiler.c
+                libs/video/rsx_tiling.c
             )
             set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_depth_bounds.m"

@@ -16,6 +16,8 @@
  *   tools/test_ppu_fs_errors.py [--exe-out PATH]
  *   test_fs_errors [DIR]      (DIR: scratch directory; default the system temp dir)
  */
+/* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash. */
+#include "../../platform/ps3_dev_flash.c"
 #include "ppu_fs.cpp"
 #ifdef _WIN32
 #  include <windows.h>
