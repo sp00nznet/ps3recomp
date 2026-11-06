@@ -17,6 +17,13 @@ uint32_t g_spu_image_src_ea,g_spu_image_ls_start,g_spu_image_span;
 unsigned long long ps3_ms_now(void) { LARGE_INTEGER n,f; QueryPerformanceCounter(&n); QueryPerformanceFrequency(&f); return n.QuadPart*1000/f.QuadPart; }
 void ppu_resv_break_store(uint64_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
+/* A commit to a registered taskset's first line starts its pending tasks,
+ * which keeps spu_async_run's task start in the link. This fixture makes
+ * no taskset, so none of these is called. */
+uint64_t spurs_pm_build_context(uint8_t* ls,uint32_t ts,uint32_t id,uint32_t spu,uint32_t tag)
+{(void)ls;(void)ts;(void)id;(void)spu;(void)tag;return 0;}
+void spu_thread_publish_ctx(uint32_t tid,void* c){(void)tid;(void)c;}
+void ydkj_wake_all_event_flags(void){}
 static atomic_uint canceled_queues;
 void sys_event_queue_cancel_by_id(u32 id) { assert(id==3 || id==4);atomic_fetch_or(&canceled_queues,1u<<id); }
 void sys_event_queue_uncancel_by_id(u32 id) {(void)id;}
