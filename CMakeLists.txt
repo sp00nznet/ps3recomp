@@ -436,6 +436,19 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
 
+    # ps3_fma / ps3_fmaf (runtime/ppu/ps3_fma.h) against the CPU's FMA instruction, bit for bit. Built with
+    # -mno-fma so the integer path is the one tested; skips itself on a CPU without FMA.
+    if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        add_executable(test_ps3_fma tests/test_ps3_fma.c)
+        target_include_directories(test_ps3_fma PRIVATE runtime/ppu)
+        target_compile_options(test_ps3_fma PRIVATE -UNDEBUG -mno-fma -ffp-contract=off)
+        if(NOT WIN32)
+            target_link_libraries(test_ps3_fma PRIVATE m)
+        endif()
+        add_test(NAME ps3_fma COMMAND test_ps3_fma)
+        set_tests_properties(ps3_fma PROPERTIES TIMEOUT 120)
+    endif()
+
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.
         add_executable(test_spu_float_exact

@@ -129,6 +129,15 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # ps3_fma / ps3_fmaf (runtime/ppu/ps3_fma.h): the integer path (built with -mno-fma) against the FMA instruction,
+      # bit for bit. The test skips itself on a CPU without FMA.
+      - name: Run the correctly rounded fma test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -O2 -mno-fma -ffp-contract=off -I runtime/ppu \
+            -o /tmp/test_ps3_fma tests/test_ps3_fma.c -lm
+          /tmp/test_ps3_fma
+
       # The AVX2 single-precision fast path must match the exact scalar path bit for bit.
       - name: Run the SPU float fast-path test (AVX2)
         run: |
