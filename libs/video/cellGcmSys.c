@@ -536,7 +536,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      * In a real implementation these would reflect actual allocated memory.
      */
     s_config.localAddress    = 0xC0000000;  /* typical RSX local mem base */
-    s_config.localSize       = 256 * 1024 * 1024;  /* 256 MB */
+    s_config.localSize       = 0x0F900000u;  /* 249 MB: retail PS3 value; 256 MB overflows 28-bit heap size field */
     s_config.ioAddress       = ioAddress;
     s_config.ioSize          = ioSize;
     s_config.memoryFrequency = 650000000;   /* 650 MHz */
