@@ -275,16 +275,37 @@ VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
 VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
 VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
 
+/* Fused multiply-add without a libm call per lane. Without -mfma, fmaf is a
+ * software routine on MinGW, and vmaddfp/vnmsubfp called it once per lane. The
+ * product of two floats is exact in double, so s = x*z + y has one double
+ * rounding; rounding s to float then equals the correctly rounded fused result
+ * unless s sits exactly on a float rounding midpoint (low 29 bits 0x10000000)
+ * or outside the normal float range (zero, subnormal, overflow, inf, NaN).
+ * Those rare cases still call fmaf, so every lane is bit-identical to fmaf.
+ * ASSUMPTION: the host rounding mode is round-to-nearest (nothing in the
+ * runtime changes MXCSR). */
+VMX_INL float vmx_fmaf(float x, float z, float y) {
+#if defined(__FMA__)
+    return fmaf(x, z, y);   /* one instruction with -mfma */
+#else
+    const double s = (double)x * (double)z + (double)y;
+    uint64_t u; memcpy(&u, &s, sizeof u);
+    const uint32_t e = (uint32_t)(u >> 52) & 0x7FFu;
+    if ((u & 0x1FFFFFFFull) != 0x10000000ull && e - (1023u - 126u) < 254u)
+        return (float)s;
+    return fmaf(x, z, y);
+#endif
+}
 VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(fmaf(x, z, y))), vscr)); } VMX_OUT; }
+        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(vmx_fmaf(x, z, y))), vscr)); } VMX_OUT; }
 VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-fmaf(x, z, -y))), vscr)); } VMX_OUT; }
+        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-vmx_fmaf(x, z, -y))), vscr)); } VMX_OUT; }
 
 #define VMX_FUN(name, expr, flush_in, nanmode) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \
