@@ -1789,6 +1789,53 @@ SPU__XE_INLINE u128 spu_cuflt(u128 a, int i8) {
     const __m128i nz = _mm_xor_si128(_mm_cmpeq_epi32(v, _mm_setzero_si128()), _mm_set1_epi32(-1));
     return spu__xe_st(spu__xe_cxflt(d, _mm_setzero_si128(), nz, i8));
 }
+#elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#include <arm_neon.h>
+/* fi and cflts four lanes at a time on ARM64 (the others keep their references).
+ * test_spu_float_est.c checks both against the scalar references.
+ *
+ * fi: the reference's arithmetic in 32-bit lanes. (2^13 + base) * 2^19 is 2^32 plus
+ * u0 = base << 19, so with t = step * y (< 2^29) the magnitude is 2^32 + d, d = u0 - t.
+ * Without a borrow (d >= 0) the fraction is d >> 9; with one, u = d mod 2^32 lies in
+ * [2^32 - 2^29, 2^32), the value is normalised by one shift and the fraction is
+ * (u >> 8) & 0x7FFFFF, one exponent lower. */
+static inline u128 spu_fi(u128 a, u128 b) {
+    uint32x4_t est, av; memcpy(&est, &b, 16); memcpy(&av, &a, 16);
+    const uint32x4_t exp  = vandq_u32(vshrq_n_u32(est, 23), vdupq_n_u32(0xFFu));
+    const uint32x4_t u0   = vshlq_n_u32(vandq_u32(vshrq_n_u32(est, 10), vdupq_n_u32(0x1FFFu)), 19);
+    const uint32x4_t t    = vmulq_u32(vandq_u32(est, vdupq_n_u32(0x3FFu)), vandq_u32(av, vdupq_n_u32(0x7FFFFu)));
+    const uint32x4_t u    = vsubq_u32(u0, t);
+    const uint32x4_t brw  = vcltq_u32(u0, t);
+    const uint32x4_t frac = vbslq_u32(brw, vandq_u32(vshrq_n_u32(u, 8), vdupq_n_u32(0x7FFFFFu)), vshrq_n_u32(u, 9));
+    const uint32x4_t e2   = vaddq_u32(exp, brw);                 /* a borrow lowers it by one */
+    uint32x4_t r = vorrq_u32(vorrq_u32(vandq_u32(est, vdupq_n_u32(0x80000000u)), vshlq_n_u32(e2, 23)), frac);
+    r = vbicq_u32(r, vorrq_u32(vceqzq_u32(exp), vceqzq_u32(e2))); /* zero operand, underflow: +0 */
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }
+static inline u128 spu_frsqest(u128 a)         { return spu_frsqest_ref(a); }
+/* cflts, scales 0..127: scaling by 2^scale is exact or overflows (an infinity, or
+ * FLT_MAX under round-toward-zero, both of which FCVTZS saturates like the SPU), and an
+ * underflow truncates to 0 either way. FCVTZS truncates toward zero and saturates
+ * exactly as cflts does. Exponent 0 is an SPU zero and exponent 255 an ordinary huge
+ * value, so those lanes are patched to 0 and to the saturated bound of their sign.
+ * Other scales use the reference. */
+static inline u128 spu_cflts(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cflts_ref(a, i8);
+    uint32x4_t x; memcpy(&x, &a, 16);
+    const float32x4_t f = vmulq_f32(vreinterpretq_f32_u32(x),
+                                    vreinterpretq_f32_u32(vdupq_n_u32((uint32_t)(scale + 127) << 23)));
+    uint32x4_t r = vreinterpretq_u32_s32(vcvtq_s32_f32(f));
+    const uint32x4_t e = vandq_u32(vshrq_n_u32(x, 23), vdupq_n_u32(0xFFu));
+    const uint32x4_t sat = vaddq_u32(vshrq_n_u32(x, 31), vdupq_n_u32(0x7FFFFFFFu));
+    r = vbslq_u32(vceqq_u32(e, vdupq_n_u32(0xFFu)), sat, r);
+    r = vbicq_u32(r, vceqzq_u32(e));
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+static inline u128 spu_cfltu(u128 a, int i8)   { return spu_cfltu_ref(a, i8); }
+static inline u128 spu_csflt(u128 a, int i8)   { return spu_csflt_ref(a, i8); }
+static inline u128 spu_cuflt(u128 a, int i8)   { return spu_cuflt_ref(a, i8); }
 #else
 static inline u128 spu_fi(u128 a, u128 b)      { return spu_fi_ref(a, b); }
 static inline u128 spu_frest(u128 a)           { return spu_frest_ref(a); }
