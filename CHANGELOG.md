@@ -1,5 +1,67 @@
 # Changelog
 
+### v0.16.0 — *"Forty-Four"* (October 2026)
+
+*44 pull requests from six contributors, merged in #377. They come from
+inFAMOUS 2, Twisted Metal and SoulCalibur II HD, plus Tornado Outbreak.*
+
+**RSX and graphics**
+- **3D textures** in the draw engine (*[@erikomis](https://github.com/erikomis)*, #335).
+  The fragment decompiler also gains FACING, TC8 and TC9 (#328), the
+  perspective-correct flag on texcoord reads (#329), and signed results from
+  biased-remap and `_bx2` fetches (#331). Y16_X16/HILO8 crossbars present
+  R-G-R-G (#332).
+- **A flip in the command stream completes when the RSX reaches it**
+  (*[@Kurtisone](https://github.com/Kurtisone)*, #343), and a late flip
+  completion no longer marks a newer flip done (*@erikomis*, #354). Also:
+  get follows the walker across a JUMP (#347), the semaphore acquire is
+  bounded (#327), and GCM callbacks are delivered at `sys_timer_usleep`/`sleep`
+  (#353).
+- NV3089: the source origin is 12.4 fixed point, and copies were 256 times too
+  short (*[@n0madic](https://github.com/n0madic)*, #358). Unscaled blits copy
+  a row at a time (#334). 2D transfers read FP16 targets (#367) and convert a
+  pixel at a time (#348).
+- Speed: the D3D12 vertex program cache is keyed on the program instead of the
+  store behind it, which took most of the D3DCompile calls off the FIFO thread
+  (*@n0madic*, #361). HLSL to SPIR-V translations are cached (#346), cached
+  textures are re-hashed sparsely (#375), and the per-vertex span is found once
+  per draw (#357).
+- Vulkan: colour feedback snapshots for draws that sample their own target
+  (#352), and present on its own command buffer (#351).
+- Metal: per-MRT colour mask and blend (#330), `PS3_ANISO` (#373),
+  `PS3_AA=fxaa` and `PS3_SHARPEN` (#374), `cellVideoOutSetGamma` (#355), and
+  `precise::` math from spirv-cross (#356).
+- Diagnostics: `PS3_FTRACE`, a frame timeline of who waits for whom (#339), and
+  fragment-program debug knobs keyed by structural hash (#336).
+
+**SPU and SPURS**
+- An SPU thread starts in the lifted image its own bytes identify, instead of
+  whichever image registered first at that entry point (*@n0madic*, #362). An
+  SPU user event finds the port the PPU binds, and waits for it (#363).
+- A task's signalled bit is updated atomically against SPU commits (#340), and
+  a job's first frame stays below its cache buffers (#366)
+  (*@Kurtisone*).
+- Single-precision fast paths run four lanes at a time with AVX2 (#369) and
+  SSE2 (#370).
+- Syscall 14 classifies lock-line addresses by guest segment
+  (*[@kalpakprod](https://github.com/kalpakprod)*, #341).
+
+**System libraries**
+- cellFs: the `CELL_FS_O_*` flag values are corrected, so `O_CREAT` creates
+  (*@kalpakprod*, #349); `/dev_hdd1` maps to a writable host root (#350); and
+  an AIO read keeps the fd's position (*@Kurtisone*, #376).
+- `cellGameBootCheck` reports the game type from PARAM.SFO (#359), and
+  `CELL_MSGDIALOG_BUTTON_NONE`/`INVALID` are no longer swapped (#360)
+  (*@n0madic*). An HDD title's `/dev_hdd0/game/<id>/` now resolves to the
+  booted game tree, which kept Simpsons Arcade reading its data once #359
+  reported it as an HDD game.
+- `PS3_LANG` picks the system language (#333), and `PS3_GAMEDATA_ROOT` moves
+  saves and trophies out of the working directory (#338). The small rumble
+  motor runs at full strength (#372) (*@erikomis*).
+- Guest spinlocks use a 32-bit atomic on LP64 hosts, which fixes a fault on
+  arm64 (*[@tekulvw](https://github.com/tekulvw)*, #326).
+- Tornado Outbreak: the 2x zoomed frames from #281 are fixed (#344).
+
 ### v0.15.0 — *"Seventy-Six"* (October 2026)
 
 *76 pull requests from six contributors, merged in #325. They come from five
