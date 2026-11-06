@@ -65,6 +65,12 @@ typedef struct sys_event_queue_info {
      * arrive; later receives fail the same way rather than re-blocking. */
     int          cancelled;
 
+    /* Receivers currently inside sys_event_queue_receive's locked section (under
+     * `lock`). sys_event_queue_destroy needs it: lv2 answers EBUSY to a plain
+     * destroy while receivers wait, and a FORCE destroy wakes them with
+     * ECANCELED and has to let them leave before the slot can be reused. */
+    int          waiters;
+
 #ifdef _WIN32
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE not_empty;
@@ -74,6 +80,9 @@ typedef struct sys_event_queue_info {
 #endif
 
 } sys_event_queue_info;
+
+/* sys_event_queue_destroy's mode argument. */
+#define SYS_EVENT_QUEUE_DESTROY_FORCE  1
 
 extern sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 
