@@ -840,6 +840,13 @@ void cellGcm_request_tick(void)
      * it had not reached, and the title rebuilt command segments the walker
      * was still waiting to execute. Flips that never went through the stream
      * are unaffected. The completion is stamped with the flip requested last
+    /* Every HLE call and timer sleep pumps, tens of thousands of times a
+     * second, and almost always nothing is pending. Look before taking the
+     * pump and swapping the pending words out: three atomic operations on
+     * lines the ticker thread writes. A notification posted just after this
+     * read is delivered by the next pump, as one posted while another thread
+     * holds the pump is. */
+    if (!s_gcm_pending && !s_user_pending) return;
      * (see ppu_gcm_pump). */
     if (gcm_flip_executed_take()) {
         FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();

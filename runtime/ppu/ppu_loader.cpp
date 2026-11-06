@@ -2139,6 +2139,7 @@ typedef void (*ppu_fn)(ppu_context*);
 static uint32_t g_addr[PPU_HASH_SIZE];
 static ppu_fn   g_fn[PPU_HASH_SIZE];
 static uint32_t g_fn_count = 0;
+static uint32_t g_fn_gen = 0;   /* bumped by every registration; see ppu_lookup_icall */
 
 extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
@@ -2147,8 +2148,10 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
     /* Bounded probe: never loop past the whole table. A full table (function
      * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
-        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
-        if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
+        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++;
+                                  __atomic_fetch_add(&g_fn_gen, 1u, __ATOMIC_RELEASE); return; }
+        if (g_addr[i] == a) { g_fn[i] = fn;   /* overwrite */
+                              __atomic_fetch_add(&g_fn_gen, 1u, __ATOMIC_RELEASE); return; }
         i = (i + 1) & PPU_HASH_MASK;
     }
     static int warned = 0;
@@ -2164,7 +2167,24 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
  * Built lazily on first use (registration is boot-time-only). */
 static struct { void* host; uint32_t guest; } g_inv[PPU_HASH_SIZE];
 static uint32_t g_inv_n = 0;
+static uint32_t ppu_prof_resolve_host_slow(void* ra);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra)
+{
+    /* Every lv2 syscall and HLE call stamps its caller for the sampling
+     * profiler, and the binary search below missed the cache on most of its
+     * steps: in God of War HD gameplay it was a third of lv2_syscall. Call
+     * sites are few, so each thread keeps its last answer per site. The
+     * inverse table is built once, so an answer does not go stale. */
+    struct RaSlot { void* ra; uint32_t guest; };
+    static PPU_THREAD_LOCAL RaSlot t_ra[256];
+    RaSlot& slot = t_ra[((uintptr_t)ra >> 2) & 255u];
+    if (slot.ra == ra && g_inv_n) return slot.guest;
+    const uint32_t g = ppu_prof_resolve_host_slow(ra);
+    if (g_inv_n) { slot.ra = ra; slot.guest = g; }
+    return g;
+}
+
+static uint32_t ppu_prof_resolve_host_slow(void* ra)
 {
     if (!g_inv_n) {
         for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
@@ -2183,6 +2203,25 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
     while (lo < hi) { uint32_t mid = (lo + hi) / 2;
         if (g_inv[mid].host <= ra) lo = mid + 1; else hi = mid; }
     return lo ? g_inv[lo - 1].guest : 0;
+}
+
+static ppu_fn ppu_lookup(uint32_t a);
+
+/* ppu_lookup for indirect calls. The table and its addresses are 3 MB, so the
+ * probe of an indirect call missed the cache: about a fifth of
+ * ps3_indirect_call_impl in God of War HD gameplay. Targets repeat (vtables,
+ * callbacks), so each thread keeps its last hits, tagged with the registration
+ * count they were found under; any later registration retires them. */
+static ppu_fn ppu_lookup_icall(uint32_t a)
+{
+    struct IcSlot { uint32_t addr, gen; ppu_fn fn; };
+    static PPU_THREAD_LOCAL IcSlot t_ic[512];
+    IcSlot& s = t_ic[(a >> 2) & 511u];
+    const uint32_t gen = __atomic_load_n(&g_fn_gen, __ATOMIC_ACQUIRE);
+    if (s.fn && s.addr == a && s.gen == gen) return s.fn;
+    ppu_fn fn = ppu_lookup(a);
+    if (fn) { s.addr = a; s.gen = gen; s.fn = fn; }
+    return fn;
 }
 
 static ppu_fn ppu_lookup(uint32_t a)
@@ -2844,7 +2883,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         }
     }
 
-    ppu_fn fn = ppu_lookup(addr);
+    ppu_fn fn = ppu_lookup_icall(addr);
     if (!fn) {
         /* OPD-swap clobber fixup: a malformed memcpy (game func_0036FA74) writes
          * some handler/vtable OPDs as {TOC, func} (code & toc SWAPPED), so lifted
