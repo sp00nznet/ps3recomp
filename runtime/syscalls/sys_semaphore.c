@@ -251,8 +251,10 @@ int64_t sys_semaphore_create(ppu_context* ctx)
                    ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
 #endif
         s->protocol = proto_be;
-        /* name at offset 8 */
-        memcpy(s->name, attr_raw + 8, 8);
+        /* name at offset 0x18: sys_semaphore_attribute_t is protocol, pshared,
+         * ipc_key u64 @0x08, flags @0x10, pad @0x14, name[8] @0x18. Offset 8
+         * logged the ipc_key as the name. */
+        memcpy(s->name, attr_raw + 0x18, 8);
     }
 
 #ifdef _WIN32
@@ -306,10 +308,29 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* lv2 refuses to destroy a semaphore threads are blocked on (CELL_EBUSY).
+     * Closing the handle under them turned each waiter's wait into an instant
+     * failure and its loop into a spin on a deleted lock. A waiter a pending
+     * post already covers (waiters <= value) is on its way out; only the ones
+     * left over are blocked, which is lv2's condition. */
 #ifdef _WIN32
+    EnterCriticalSection(&s->value_lock);
+    const int blocked = s->waiters > s->value;
+    LeaveCriticalSection(&s->value_lock);
+    if (blocked) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     CloseHandle(s->sem_handle);
     DeleteCriticalSection(&s->value_lock);
 #else
+    pthread_mutex_lock(&s->mtx);
+    const int blocked = s->waiters > s->value;
+    pthread_mutex_unlock(&s->mtx);
+    if (blocked) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mtx);
 #endif
@@ -354,6 +375,10 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
                   (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    /* lv2_usec_deadline multiplies by the QPC frequency in 64 bits and wraps
+     * for a timeout past about 21 days; 2^63, say, comes out as "already
+     * passed". Beyond 2^40 us (12.7 days) is indistinguishable from forever. */
+    if (timeout_us > (1ull << 40)) timeout_us = 0;
     /* Per-port hook: an engine job manager may spin on sys_semaphore_wait /
      * trywait waiting for SPU-job completions a lifted policy module never
      * writes, so a port can satisfy them here. Defined weakly below, so this is
