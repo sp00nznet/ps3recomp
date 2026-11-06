@@ -30,6 +30,19 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; 
 s32 sceNpInit(u32 poolSize, void* poolPtr) { (void)poolSize; (void)poolPtr; return 0; }
 s32 sceNpTerm(void) { return 0; }
 
+/* sceNpSignaling: the member connections Matching2 reports to it */
+static char s_peer[17];
+static u8 s_peer_ip[4];
+static u16 s_peer_port;
+static int s_peer_up = -1;
+void np_signaling_room_peer(const char* online_id, const u8 ip[4], u16 port, int up)
+{
+    snprintf(s_peer, sizeof(s_peer), "%s", online_id);
+    memcpy(s_peer_ip, ip, 4);
+    s_peer_port = port;
+    s_peer_up = up;
+}
+
 /* psnr: always connected; requests are captured, not sent */
 static np_psnr_reply_fn s_fn;
 static void* s_user;
@@ -156,6 +169,7 @@ int main(void)
     assert(s_cb_opd == 0x1100);
     for (s_sig[0].due = 0; s_cb_opd != 0x5100; ) m2_tick();
     assert(s_cb_opd == 0x5100 && s_cb[2] == 2 && s_cb[3] == 0x5102);   /* Established for member 2 */
+    assert(s_peer_up == 1 && !strcmp(s_peer, "bart") && s_peer_ip[0] == 127 && s_peer_port == 3659);   /* and to sceNpSignaling */
     vm_write32(REQ, 0);
     assert(sceNpMatching2SignalingGetConnectionStatus(ctx, 9, 2, REQ, REQ + 4, REQ + 8) == 0);
     assert(vm_read32(REQ) == 2 && vm_read8(REQ + 4) == 127 && vm_read16(REQ + 8) == 3659);
