@@ -5,6 +5,7 @@
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
+#include "../platform/ps3_dev_flash.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -193,7 +194,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         static const char* fw = NULL; static int fw_init = 0;
         if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
         if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", fw, ps3_path + 11);
+            ps3_dev_flash_path(host_path, (size_t)host_path_size, fw, ps3_path + 11);
             fs_normalize_sep(host_path);
             return;
         }
