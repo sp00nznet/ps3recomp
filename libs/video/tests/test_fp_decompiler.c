@@ -591,6 +591,92 @@ int main(void)
 
     }
 
+    /* Per-source input precision modifiers: DWORD2 bits 19-21 (SRC0), 22-24
+     * (SRC1) and 25-27 (SRC2) clamp the operand after abs and before negate.
+     * 1 half, 2 fixed12, 3 fixed9, 4 saturate; 0 and 5-7 leave it alone. */
+    {
+        static const char* const range[8] = {
+            NULL, "-65504.0, 65504.0", "-2.0, 2.0", "-1.0, 1.0", "0.0, 1.0",
+            NULL, NULL, NULL };
+        static const char* const slot_name[3] = { "src0", "src1", "src2" };
+        for (int slot = 0; slot < 3; slot++) {
+            for (u32 v = 0; v < 8; v++) {
+                u8 prog[16];
+                u32 w1 = T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS;
+                u32 w2 = T_TEMP | REG(0) | SWZ_IDENT;
+                u32 w3 = T_TEMP | REG(0) | SWZ_IDENT;
+                w2 |= v << (19 + 3 * slot);
+                put_word(prog + 0, OPC(0x04) | OUTMASK_ALL | OUTREG(1) | END); /* MAD r1, r0, r0, r0 */
+                put_word(prog + 4, w1);
+                put_word(prog + 8, w2);
+                put_word(prog + 12, w3);
+                rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+                char name[64], want[128];
+                snprintf(name, sizeof name, "prec_mod_%s_%u", slot_name[slot], v);
+                if (range[v]) {
+                    snprintf(want, sizeof want, "clamp((r[0]).xyzw, %s)", range[v]);
+                    check(name, hlsl, want);
+                } else {
+                    check_absent(name, hlsl, "clamp(");
+                }
+            }
+        }
+
+        /* abs is applied first, then the clamp, then the negate:
+         * MUL r1, -|r0|, r0 with SRC0 fixed9. */
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x02) | OUTMASK_ALL | OUTREG(1) | END);
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS | (1u << 29) | (1u << 17));
+        put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT | (3u << 19));
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("prec_mod_abs_clamp_negate", hlsl,
+              "-(clamp(abs((r[0]).xyzw), -1.0, 1.0))");
+    }
+
+    /* Soft-particle fade through the whole decompile: a synthetic, hand-encoded
+     * four-instruction program (not taken from any title) in the shape the
+     * clamp matters for, MUL r0, tex, |depth difference| with SRC1 fixed9.
+     *   TEX r1, TC0, unit 0          particle colour
+     *   TEX r5, TC1, unit 1          scene depth
+     *   ADD r5, r5, -{0.25}          minus the fragment's depth (inline const)
+     *   MUL r0, r1, |r5| (fixed9)    fade, END
+     * Without the clamp the colour is multiplied by the raw difference. */
+    {
+        u8 prog[80];
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | OUTREG(1) | INSRC(4) | TEXU(0));
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x17) | OUTMASK_ALL | OUTREG(5) | INSRC(5) | TEXU(1));
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        put_word(prog + 32, OPC(0x03) | OUTMASK_ALL | OUTREG(5));
+        put_word(prog + 36, T_TEMP | REG(5) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 40, T_CONST | SWZ_IDENT | (1u << 17));          /* -CONST */
+        put_word(prog + 44, 0);
+        for (int i = 0; i < 4; i++) put_float(prog + 48 + 4 * i, 0.25f);
+        put_word(prog + 64, OPC(0x02) | OUTMASK_ALL | OUTREG(0) | END);
+        put_word(prog + 68, T_TEMP | REG(1) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 72, T_TEMP | REG(5) | SWZ_IDENT | (1u << 18) | (3u << 22)); /* |r5|, fixed9 */
+        put_word(prog + 76, 0);
+        int n = rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_true("soft_particle_count", n == 4);
+        check("soft_particle_body", hlsl,
+              "    { float4 _v = (float4)(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)); r[1].xyzw = _v.xyzw; }\n"
+              "    { float4 _v = (float4)(rsx_tex[1].Sample(rsx_samp[1], ((input.tc1).xyzw).xy)); r[5].xyzw = _v.xyzw; }\n"
+              "    { float4 _v = (float4)(((r[5]).xyzw) + (-((float4(0.25,0.25,0.25,0.25)).xyzw))); r[5].xyzw = _v.xyzw; }\n"
+              "    { float4 _v = (float4)(((r[1]).xyzw) * (clamp(abs((r[5]).xyzw), -1.0, 1.0))); r[0].xyzw = _v.xyzw; }\n");
+        check("soft_particle_export", hlsl, "    float4 _o = r[0];\n");
+
+        /* The same program with the modifier cleared keeps the raw operand. */
+        put_word(prog + 72, T_TEMP | REG(5) | SWZ_IDENT | (1u << 18));
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("soft_particle_no_mod", hlsl, "(((r[1]).xyzw) * (abs((r[5]).xyzw)))");
+        check_absent("soft_particle_no_mod_clamp", hlsl, "clamp(");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

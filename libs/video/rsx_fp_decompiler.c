@@ -315,8 +315,35 @@ typedef struct {
     int half;
     int negate;
     int abs;
+    int prec;       /* input precision modifier, 0 = none (see fp_src_prec_clamp) */
     char swz[5];    /* e.g. "xyzw" */
 } Src;
+
+/* Each source operand carries a 3-bit input precision modifier in DWORD2:
+ * bits 19-21 for SRC0, 22-24 for SRC1, 25-27 for SRC2. The hardware clamps the
+ * operand to that precision's range after abs and before negate:
+ *   1 half    [-65504, 65504]
+ *   2 fixed12 [-2, 2]
+ *   3 fixed9  [-1, 1]
+ *   4 saturate [0, 1]
+ * 0 (and the values above 4) leave the operand as it is. A soft-particle
+ * program that fades with MUL r, tex, |depth difference| and marks that source
+ * fixed9 relies on it: unclamped, the difference in metres saturates every
+ * fade to full opacity. */
+#define FP_SRC0_PREC_SHIFT  19
+#define FP_SRC1_PREC_SHIFT  22
+#define FP_SRC2_PREC_SHIFT  25
+
+static const char* fp_src_prec_clamp(int prec)
+{
+    switch (prec) {
+    case 1: return "-65504.0, 65504.0";
+    case 2: return "-2.0, 2.0";
+    case 3: return "-1.0, 1.0";
+    case 4: return "0.0, 1.0";
+    default: return NULL;
+    }
+}
 
 static void decode_src(u32 w, int abs_bit, Src* s)
 {
@@ -326,6 +353,7 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->half   = (w & FP_SRC_HALF) ? 1 : 0;
     s->negate = (w & FP_SRC_NEGATE) ? 1 : 0;
     s->abs    = abs_bit ? 1 : 0;
+    s->prec   = 0;
     for (int i = 0; i < 4; i++)
         s->swz[i] = comp[(w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3];
     s->swz[4] = '\0';
@@ -394,6 +422,12 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
     const char* pre = "";
     const char* post = "";
     if (s->abs)    { pre = "abs("; post = ")"; }
+    const char* range = fp_src_prec_clamp(s->prec);
+    if (range) {   /* abs, then the precision clamp, then negate */
+        snprintf(buf, bufsz, s->negate ? "-(clamp(%s%s%s, %s))" : "clamp(%s%s%s, %s)",
+                 pre, swz, post, range);
+        return;
+    }
     if (s->negate) snprintf(buf, bufsz, "-(%s%s%s)", pre, swz, post);
     else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
 }
@@ -780,6 +814,11 @@ static int rsx_fp_decompile_internal(
         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
         decode_src(w3, 0,                &s2);
+        if (!(w2 & FP_BRANCH)) {   /* a branch's DWORD2 holds other fields */
+            s0.prec = (int)((w2 >> FP_SRC0_PREC_SHIFT) & 7u);
+            s1.prec = (int)((w2 >> FP_SRC1_PREC_SHIFT) & 7u);
+            s2.prec = (int)((w2 >> FP_SRC2_PREC_SHIFT) & 7u);
+        }
 
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
