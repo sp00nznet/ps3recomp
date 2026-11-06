@@ -117,6 +117,18 @@ jobs:
             echo "no AVX2 on this runner: skipped"
           fi
 
+      # The SSE4.1 single-precision form (the default x86-64 build) against the scalar per-lane
+      # forms and against the exact references, bit for bit, built as the runtime is.
+      - name: Run the SPU float vector tests (SSE4.1)
+        run: |
+          for t in test_spu_float_vector_scalar test_spu_float_exact; do
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -msse4.1 -ffp-contract=off -UNDEBUG -I include -I runtime/spu \
+              -o /tmp/${t}_sse41 runtime/spu/tests/$t.c -lm
+          done
+          /tmp/test_spu_float_vector_scalar_sse41 4
+          /tmp/test_spu_float_exact_sse41
+
       # runtime/spu/tests/test_spu_int_x86.c checks #512's SSE4.1 and AVX2 integer
       # and quadword-shift forms against their scalar spu_X_ref references. #512
       # added the file and wired it into nothing -- no workflow step, no CMake
