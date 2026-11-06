@@ -124,4 +124,14 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
         for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
         break;
     }
+
+    /* When an attribute array is enabled with fewer than 4 components,
+     * missing components expand according to standard graphics hardware rules:
+     * missing y,z = 0.0, missing w = 1.0. A game may clear the constant
+     * register vertex_data4f to all zeros; leaving w=0 on a 3-component position
+     * array drops translation in the vertex shader and produces clip-space w=0,
+     * which causes the hardware clipper to discard every vertex. */
+    if (n < 4) out[3] = 1.0f;
+    if (n < 3) out[2] = 0.0f;
+    if (n < 2) out[1] = 0.0f;
 }
