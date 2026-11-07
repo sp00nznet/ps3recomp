@@ -171,7 +171,7 @@ int main(void)
     }
     for(unsigned i=0;i<3;i++)wait_for(&held[i],1,"configured capacity");
     Sleep(20);assert(atomic_load(&peak_count)==3 && atomic_load(&lane_mask)==7);
-    assert((u32)cellSpursRemoveWorkload((CellSpurs*)0x1000,0)==CELL_SPURS_CORE_ERROR_BUSY);
+    assert((u32)cellSpursRemoveWorkload((CellSpurs*)0x1000,0)==CELL_SPURS_POLICY_MODULE_ERROR_BUSY);
     assert(cellSpursSetMaxContention((CellSpurs*)0x1000,0,0)==0);
     assert(vm_read8(0x1000+SPURS_WKL_MAXCONT)==0);
     assert(!atomic_load(&held[3]));
@@ -199,7 +199,7 @@ int main(void)
         wait_for(&incarnation_runs,incarnation+1,"same policy/data workload incarnation");
         for(unsigned i=0;;i++) {
             s32 rc=cellSpursRemoveWorkload((CellSpurs*)0x1000,0);
-            if(!rc)break;assert((u32)rc==CELL_SPURS_CORE_ERROR_BUSY && i<3000);Sleep(1);
+            if(!rc)break;assert((u32)rc==CELL_SPURS_POLICY_MODULE_ERROR_BUSY && i<3000);Sleep(1);
         }
     }
     finalize(0x1000);puts("SPURS removal retires resident LS even with unchanged policy/data PASS");
