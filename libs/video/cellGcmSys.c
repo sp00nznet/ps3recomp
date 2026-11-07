@@ -3572,7 +3572,11 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
 
-    return CELL_OK;
+    /* The buffer id, not CELL_OK: a title can keep this and later pass it to
+     * cellGcmSetFlipImmediate. MLB The Show 16 does, so with 0 here every
+     * flip named buffer 0 while it rendered into 0 and 1 in turn, and the
+     * picture stepped back to the older buffer. */
+    return (s32)bufferId;
 }
 
 /* NID: 0x1BFAB6EE */
