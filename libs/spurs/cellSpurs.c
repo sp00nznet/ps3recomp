@@ -1401,20 +1401,46 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
      * task under, and the tasks then park in WAIT_SIGNAL forever doing 0 ms of
      * work apiece, which is the symptom this title shows. Off by default: the
      * R8-form above is right for YDKJ and Jackbox and they are unaffected. */
+    /* Auto-detect the descriptor form for the six-argument callers that pass
+     * r8 = 0. MLB The Show 16's Bink task is one: r7 = a three-word descriptor
+     * on the PPU stack, r8 = 0. The R8 branch above then leaves sizeContext
+     * and lsPattern zero, which the SPU task library cannot run a blocking
+     * wait with -- the Bink SPU task parks in WAIT_SIGNAL (live log:
+     * `TaskAttr R8-form: argument_ea=0x00000000`, `szctx=0 lsp=0`) and no
+     * movie ever decodes. Only r8 == 0 is treated as a candidate, so the
+     * YDKJ/Jackbox R8 form (r8 = CellSpursTaskArgument*) is untouched; the
+     * descriptor words are validated before use so a genuine zero-size
+     * six-argument context is not misread. SPURS_TASKATTR_DESC forces the
+     * old always-descriptor behaviour for other callers (Saints Row 2). */
     { static int s_desc = -1;
       if (s_desc < 0) s_desc = getenv("SPURS_TASKATTR_DESC") ? 1 : 0;
-      if (s_desc) {
+      int desc_auto = 0;
+      if (!s_desc && sizeContext == 0 && eaContext != 0) {
+          uint32_t d = (uint32_t)eaContext;          /* r7 */
+          extern u32 ppu_vm_size;
+          if (d >= 0x10000u && d < 0x30000000u &&
+              (!ppu_vm_size || (uint64_t)d + 12 <= ppu_vm_size)) {
+              /* Heap EAs here are 0x10..0x2F (e.g. 0x16xxxxxx), not < 0x10000000.
+               * d[2] (lsPattern) is allowed to be 0: spurs_pm_build_context
+               * installs a full-coverage pattern for every task anyway. */
+              uint32_t c = vm_read32(d), sz = vm_read32(d + 4), lsp = vm_read32(d + 8);
+              if (c >= 0x10000u && c < 0x30000000u && sz >= 0x100u && sz <= 0x100000u &&
+                  (lsp == 0 || (lsp >= 0x10000u && lsp < 0x30000000u)))
+                  desc_auto = 1;
+          }
+      }
+      if (s_desc || desc_auto) {
           uint32_t d = (uint32_t)eaContext;          /* r7 */
           attr->eaContext    = vm_read32(d + 0);
           attr->sizeContext  = vm_read32(d + 4);
           attr->lsPattern_ea = vm_read32(d + 8);
           attr->argument_ea  = (u32)sizeContext;     /* r8 */
-          printf("[cellSpurs] TaskAttr DESC-form: desc=0x%08X -> ctx=0x%08X size=%u lsp=0x%08X arg=0x%08X\n",
-                 d, (u32)attr->eaContext, attr->sizeContext,
+          printf("[cellSpurs] TaskAttr DESC-form%s: desc=0x%08X -> ctx=0x%08X size=%u lsp=0x%08X arg=0x%08X\n",
+                 s_desc ? "" : " (auto)", d, (u32)attr->eaContext, attr->sizeContext,
                  attr->lsPattern_ea, attr->argument_ea);
       } }
     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
-           (u32)eaElf, (u32)eaContext, sizeContext,
+           (u32)eaElf, (u32)attr->eaContext, attr->sizeContext,
            attr->lsPattern_ea, attr->argument_ea);
     return CELL_OK;
 }
