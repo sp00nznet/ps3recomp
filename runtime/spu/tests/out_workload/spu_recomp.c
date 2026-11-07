@@ -10,7 +10,7 @@ void spu_func_00000000(spu_context* ctx) {
         spu_ls_write128(ctx, ctx->gpr[0]._u32[0] + 0x110, ctx->gpr[11]);
         ctx->gpr[3] = spu_il(256);
         ctx->gpr[4] = spu_il(0);
-        ctx->gpr[5] = spu_il(0);
+        ctx->gpr[5] = spu_ilhu(0x1);
         ctx->gpr[6] = spu_il(32);
         ctx->gpr[7] = spu_il(0);
         ctx->gpr[8] = spu_il(32);

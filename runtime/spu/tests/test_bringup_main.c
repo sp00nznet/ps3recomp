@@ -18,7 +18,7 @@
 #include <string.h>
 
 /* Backing buffer for the SPU's "main memory" view (DMA dereferences vm_base+ea). */
-static uint8_t g_mem[1024];
+static uint8_t g_mem[0x10400];
 uint8_t* vm_base = g_mem;
 
 static mfc_engine g_mfc;
@@ -65,7 +65,7 @@ int main(void) {
     spu_func_00000000(&ctx);
 
     const uint32_t kExpect = 0x00001234u;
-    uint32_t put_val = be32(&g_mem[0]);                       /* SPU -> main memory */
+    uint32_t put_val = be32(&g_mem[0x10000]);                       /* SPU -> main memory */
     int put_ok  = (put_val == kExpect);
     int mbox_ok = (g_mbox_wrote && g_mbox == kExpect);        /* SPU -> PPU signal  */
 

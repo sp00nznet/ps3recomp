@@ -42,7 +42,7 @@ static int evq_receive(ev_queue* q, ev_t* out) {     /* blocking-style pop */
 #define EV_SOURCE_SPU_GROUP  0x0000000000000007ULL
 
 /* ---- "main memory" + the SPU's connected event queue ---- */
-static uint8_t  g_mem[1024];
+static uint8_t  g_mem[0x10400];
 uint8_t*        vm_base = g_mem;
 static mfc_engine g_mfc;
 static ev_queue g_spu_evq;   /* event queue connected to the SPU (group id 7) */
@@ -96,7 +96,7 @@ int main(void) {
     int got = (evq_receive(&g_spu_evq, &evt) == 0);
 
     const uint32_t kExpect = 0x00001234u;
-    uint32_t put_val = be32(&g_mem[0]);
+    uint32_t put_val = be32(&g_mem[0x10000]);
     int put_ok   = (put_val == kExpect);                                  /* SPU -> main memory   */
     int event_ok = (got && evt.source == EV_SOURCE_SPU_GROUP
                         && evt.data1 == kExpect);                         /* SPU -> event -> PPU  */
