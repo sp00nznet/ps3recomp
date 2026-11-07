@@ -35,8 +35,10 @@
 
 #define LWC_HASH 4096u
 /* A destroyed lwcond leaves a tombstone: the open-addressed probe chain past
- * it must stay intact, but the slot may be reused by a later create. */
-#define LWC_TOMBSTONE ((long)-1)
+ * it must stay intact, but the slot may be reused by a later create. Slot keys
+ * are 64-bit so this cannot equal a guest address: long is 32-bit on Windows,
+ * where -1 would be address 0xFFFFFFFF. */
+#define LWC_TOMBSTONE ((int64_t)-1)
 
 enum { LWC_SIGNALLED = 0, LWC_TIMEDOUT = 1, LWC_FALLBACK = 2 };
 
@@ -47,7 +49,7 @@ typedef struct lwc_waiter {
 } lwc_waiter;
 
 typedef struct lwc_slot {
-    volatile long addr;    /* guest EA of the sys_lwcond_t; 0 = free */
+    volatile int64_t addr; /* guest EA of the sys_lwcond_t; 0 = free */
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE cv;
     lwc_waiter* waiters;   /* FIFO, under `lock` */
@@ -82,7 +84,7 @@ static inline void lwc_slot_init(lwc_slot* s, uint32_t addr, int fresh)
         InitializeConditionVariable(&s->cv);
     }
     s->waiters = NULL;
-    s->addr = (long)addr;
+    s->addr = (int64_t)addr;
 }
 
 static inline lwc_slot* lwc_slot_get(uint32_t addr, int create)
@@ -94,7 +96,7 @@ static inline lwc_slot* lwc_slot_get(uint32_t addr, int create)
     AcquireSRWLockExclusive(&g_lwc_tab);
     for (uint32_t i = 0; i < LWC_HASH; i++) {
         lwc_slot* s = &g_lwc[(h + i) & (LWC_HASH - 1)];
-        const long cur = s->addr;
+        const int64_t cur = s->addr;
         if (cur != LWC_TOMBSTONE && (uint32_t)cur == addr) { r = s; break; }
         if (cur == 0) {
             if (create) {
@@ -124,7 +126,7 @@ static inline int lwc_slot_free(uint32_t addr)
     AcquireSRWLockExclusive(&g_lwc_tab);
     for (uint32_t i = 0; i < LWC_HASH; i++) {
         lwc_slot* s = &g_lwc[(h + i) & (LWC_HASH - 1)];
-        const long cur = s->addr;
+        const int64_t cur = s->addr;
         if (cur != LWC_TOMBSTONE && (uint32_t)cur == addr) {
             EnterCriticalSection(&s->lock);
             if (s->waiters) rc = 0;
