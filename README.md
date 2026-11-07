@@ -285,8 +285,10 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 **Downloads:** each [release](https://github.com/sp00nznet/ps3recomp/releases/latest)
 includes a prebuilt SDK bundle per platform (`ps3recomp-<version>-win-x64.zip`,
 `-mac-arm64.zip`, `-linux-x64.zip`) plus `SHA256SUMS.txt`. A bundle contains the
-runtime library, its headers and the Python pipeline. `VERSION.txt` inside it
-says what that platform can and cannot do yet.
+runtime library, its headers, the Python dependency manifest and pipeline, and
+the project template with the support sources it builds. Point `PS3RECOMP_DIR`
+at the extracted bundle just as you would at a source checkout. `VERSION.txt`
+inside it says what that platform can and cannot do yet.
 
 > **Prerequisites (building from source)**: Python 3.10+ (CI uses 3.12), CMake
 > 3.20+, Ninja, and a C17/C++20 compiler: clang-cl with Visual Studio 2022 on
