@@ -228,12 +228,50 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
     if (i == n_seen && n_seen < 512) { seen[n_seen] = nid; hits[n_seen] = 0; n_seen++; }
     uint32_t count = (i < 512) ? ++hits[i] : 0;
     (void)count;
-    if (count == 1)
+    if (count == 1) {
         fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> faking %s "
                         "(unregistered import%s)\n",
                 nid, s_fake ? "CELL_OK" : "CELL_ERROR_ERROR",
                 s_fake ? "; PS3_HLE_UNRESOLVED=fail to find load-bearing ones"
                        : "");
+        /* The caller's signature, observed black-box: r3..r10 are arguments
+         * 1..8, and the PPC64 ELFv1 parameter save area at SP+112 carries
+         * arg9 onward -- the same ABI libs/network/sceNpScore.c documents for
+         * its ctx handlers. First hit only: one dump per distinct NID, the
+         * same visibility contract as the report above. This is what lets
+         * whoever implements the missing handler write it from an observed
+         * call rather than from anyone else's source. */
+        const uint64_t* g = ctx->gpr;
+        uint32_t sp = (uint32_t)g[1];
+        fprintf(stderr,
+                "[hle]   0x%08X tid=%-3u r3 =%016llX r4 =%016llX "
+                "r5 =%016llX r6 =%016llX\n"
+                "[hle]   0x%08X          r7 =%016llX r8 =%016llX "
+                "r9 =%016llX r10=%016llX\n"
+                "[hle]   0x%08X          sp =%016llX lr =%016llX\n",
+                nid, (unsigned)ctx->thread_id,
+                (unsigned long long)g[3], (unsigned long long)g[4],
+                (unsigned long long)g[5], (unsigned long long)g[6],
+                nid,
+                (unsigned long long)g[7], (unsigned long long)g[8],
+                (unsigned long long)g[9], (unsigned long long)g[10],
+                nid, (unsigned long long)g[1], (unsigned long long)ctx->lr);
+        if (sp) {   /* sp==0 means a synthetic context; skip the guest read */
+            fprintf(stderr,
+                    "[hle]   0x%08X          arg9=%016llX arg10=%016llX "
+                    "arg11=%016llX arg12=%016llX  @SP+112 "
+                    "(0 = unreadable)\n",
+                    nid,
+                    (unsigned long long)(((uint64_t)vm_read32((uint64_t)sp + 112) << 32) |
+                                          vm_read32((uint64_t)sp + 116)),
+                    (unsigned long long)(((uint64_t)vm_read32((uint64_t)sp + 120) << 32) |
+                                          vm_read32((uint64_t)sp + 124)),
+                    (unsigned long long)(((uint64_t)vm_read32((uint64_t)sp + 128) << 32) |
+                                          vm_read32((uint64_t)sp + 132)),
+                    (unsigned long long)(((uint64_t)vm_read32((uint64_t)sp + 136) << 32) |
+                                          vm_read32((uint64_t)sp + 140)));
+        }
+    }
 
     ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
 }
@@ -768,8 +806,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */
@@ -816,7 +852,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
               return;
           } } }
-        ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
+        /* The generic fallback: distinct-once report, first-hit signature
+         * dump, and PS3_HLE_UNRESOLVED (ok|fail) honored -- i.e. the function
+         * below, which existed but was never called, so `=fail` was a no-op
+         * and the first-40 cap above hid every import past the 40th unique
+         * one (exactly what its comment says not to do). */
+        ps3_hle_unresolved(nid, ctx);
         return;
     }
     g_last_hle_name = e->name;
