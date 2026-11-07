@@ -99,7 +99,7 @@
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
-    X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
+    X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) X(vkCmdSetDepthBias) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
 /* Window-system entry points, loaded only when a window was requested, so a
@@ -2955,6 +2955,7 @@ static struct {
     int          have_vp, have_sc;
     u32          stencil_ref;
     float        depth_bounds[2];     /* min, max for the next draw */
+    float        depth_bias[2];       /* constant, slope for the next draw */
     vk_buffer    indices;
     u32          warned;
     /* The split set layout (vk_eng_split_layout) and its one set, made the
@@ -3239,6 +3240,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
                                                                            : VK_CULL_MODE_BACK_BIT,
         .frontFace = (rs->front_face == 0x0901u) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                                  : VK_FRONT_FACE_CLOCKWISE,
+        .depthBiasEnable = VK_TRUE,   /* the values are dynamic (vk_eng_set_depth_bias) */
         .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
@@ -3320,11 +3322,12 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = P->rt_count, .pAttachments = cba };
-    VkDynamicState dyn[4] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                              VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BOUNDS };
+    VkDynamicState dyn[5] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                              VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS,
+                              VK_DYNAMIC_STATE_DEPTH_BOUNDS };
     VkPipelineDynamicStateCreateInfo dy = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = s_vk.depth_bounds_ok ? 4u : 3u, .pDynamicStates = dyn };
+        .dynamicStateCount = s_vk.depth_bounds_ok ? 5u : 4u, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo gci = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
@@ -3430,6 +3433,18 @@ static void vk_eng_set_depth_bounds(void* user, float min, float max)
     (void)user;
     s_e2.depth_bounds[0] = vk_depth_bound(min, 0.0f);
     s_e2.depth_bounds[1] = vk_depth_bound(max, 1.0f);
+}
+
+/* Polygon offset. glPolygonOffset's units are steps of the guest depth buffer,
+ * 2^-16 for Z16 and 2^-24 for Z24S8. On the D32F targets a Vulkan unit is
+ * 2^(e-23) for a primitive whose largest depth has exponent e: 2^-24 over
+ * [0.5, 1), where nearly all of a perspective scene's depth sits, so Z24 units
+ * carry over as they are and a Z16 unit is 256 of them. */
+static void vk_eng_set_depth_bias(void* user, float slope, float units, u32 depth_bits)
+{
+    (void)user;
+    s_e2.depth_bias[0] = depth_bits == 16u ? units * 256.0f : units;
+    s_e2.depth_bias[1] = slope;
 }
 
 static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, VkImageView dview,
@@ -3858,6 +3873,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
     if (s_vk.depth_bounds_ok)
         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
+    pvkCmdSetDepthBias(s_vk.cmd, s_e2.depth_bias[0], 0.0f, s_e2.depth_bias[1]);
     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                              P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
                              0, 1, &set, 0, NULL);
@@ -3901,6 +3917,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .set_scissor          = vk_eng_set_scissor,
     .set_stencil_ref      = vk_eng_set_stencil_ref,
     .set_depth_bounds     = vk_eng_set_depth_bounds,
+    .set_depth_bias       = vk_eng_set_depth_bias,
     .draw                 = vk_eng_draw,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
