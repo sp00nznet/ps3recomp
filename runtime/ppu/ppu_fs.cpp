@@ -241,11 +241,27 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir 
  * claim the same slot, and every handler reads its slot once (fd_file/fd_dir)
  * rather than re-reading a pointer another thread's close may have cleared. */
 static std::mutex g_fd_lock;
+/* runtime/syscalls/sys_fs.c keeps its own descriptor table, but on hardware
+ * cellFs and the raw sys_fs_* calls share ONE kernel fd space. Never hand out
+ * a number the other table already owns; the bridge in sys_fs.c reads an fd
+ * this table owns (MLB's Bink SDK does sys_fs_read on a cellFs fd). */
+#ifdef _MSC_VER
+extern "C" int sys_fs_fd_active_absent(int fd) { (void)fd; return 0; }
+extern "C" int sys_fs_fd_active(int fd);
+#  ifdef _M_IX86
+#    pragma comment(linker, "/alternatename:_sys_fs_fd_active=_sys_fs_fd_active_absent")
+#  else
+#    pragma comment(linker, "/alternatename:sys_fs_fd_active=sys_fs_fd_active_absent")
+#  endif
+#else
+extern "C" __attribute__((weak)) int sys_fs_fd_active(int fd) { (void)fd; return 0; }
+#endif
+static bool sys_fs_owns_fd(int fd) { return sys_fs_fd_active(fd) != 0; }
 static int fd_alloc_file(FILE* f)
 {
     std::lock_guard<std::mutex> hold(g_fd_lock);
     for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i]) {
+        if (!g_files[i] && !g_dirs[i] && !sys_fs_owns_fd(i)) {
             g_fd_dir[i] = 0;
             __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
             return i;
@@ -256,7 +272,10 @@ static int fd_alloc_dir(DIR* d)
 {
     std::lock_guard<std::mutex> hold(g_fd_lock);
     for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
+        if (!g_files[i] && !g_dirs[i] && !sys_fs_owns_fd(i)) {
+            __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE);
+            return i;
+        }
     return -1;
 }
 static FILE* fd_file(int fd)
@@ -266,6 +285,13 @@ static FILE* fd_file(int fd)
 static DIR* fd_dir(int fd)
 {
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
+}
+/* Bridged fd accessor for runtime/syscalls/sys_fs.c. One kernel fd space on
+ * hardware: MLB's Bink SDK opens the .BIK with cellFs and then reads it with
+ * sys_fs_read, which used to hit the empty sys_fs table and return EBADF. */
+extern "C" FILE* ppu_cellfs_file_for_fd(int fd)
+{
+    return fd_file(fd);
 }
 
 /* ---- handlers ---- */
