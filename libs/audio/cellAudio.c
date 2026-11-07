@@ -14,6 +14,7 @@
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
+#include "audio_pace.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
@@ -221,14 +222,6 @@ static int audio_backend_room(void)
 }
 
 static void audio_backend_wait(void) { SDL_Delay(1); }
-
-static u32 audio_backend_queued_samples(void)
-{
-    if (s_sdl_audio_dev) {
-        return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
-    }
-    return 0;
-}
 
 #endif /* AUDIO_BACKEND_SDL2 */
 
@@ -678,13 +671,44 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+static long long audio_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000ll + (long long)ts.tv_nsec;
+}
+
+static void audio_sleep_ns(long long ns)
+{
+    struct timespec ts = { (time_t)(ns / 1000000000ll), (long)(ns % 1000000000ll) };
+    nanosleep(&ts, NULL);
+}
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    /* Pace to the device, as the Windows loop does, and to the clock with no
+     * device. A fixed sleep after each block ran ahead of the real 187.5
+     * blocks/s, about 480 with no device, so the read index the guest follows
+     * ran fast and it was told to produce audio too quickly. */
+    audio_pace pace;
+    audio_pace_start(&pace, audio_now_ns());
     unsigned long blocks = 0; float peak = 0.0f;
     while (s_mix_thread_running) {
+        const int room = audio_backend_room();
+        if (room >= 0) {
+            if (room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+        } else {
+            long long sleep_ns = 0;
+            if (!audio_pace_ready(&pace, audio_now_ns(), AUDIO_PACE_PERIOD_NS, &sleep_ns)) {
+                audio_sleep_ns(sleep_ns);
+                continue;
+            }
+            audio_pace_next(&pace);
+        }
+
         audio_mix_one_block();
         audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
@@ -695,13 +719,6 @@ static void* audio_mix_thread_func(void* arg)
               const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
               if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
           } }
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
