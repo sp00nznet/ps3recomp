@@ -482,7 +482,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
 /* Clear offset table entries for an IO mapping */
 static void clear_offset_table(u32 ea, u32 io, u32 size)
 {
-    u32 pages = size >> 20;
+    u32 pages = (size + 0xFFFFFu) >> 20;  /* rounded up, as populate_offset_table mapped them */
     u32 ea_page = ea >> 20;
     u32 io_page = io >> 20;
 
