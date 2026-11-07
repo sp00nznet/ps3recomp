@@ -207,3 +207,26 @@ else()
 endif()
 add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
 set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
+
+# The host-backed sys_lwcond (PS3_LWCOND_REAL=1, runtime/ppu/lwcond_real.h):
+# producer/consumer, timeouts, signal/signal_all/signal_to, the fallback wake,
+# a no-fallback ping-pong that hangs on a lost wakeup, and destroy. Header-only,
+# so it links nothing of the runtime but the shim.
+add_executable(test_lwcond_real test_lwcond_real.c)
+if(NOT WIN32)
+    target_sources(test_lwcond_real PRIVATE
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_lwcond_real PRIVATE Threads::Threads)
+endif()
+if(MSVC)
+    target_compile_options(test_lwcond_real PRIVATE /W3 /experimental:c11atomics)
+    target_compile_definitions(test_lwcond_real PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_lwcond_real PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+foreach(phase table prodcons timeouts signal pingpong destroy)
+    add_test(NAME lwcond_real_${phase} COMMAND test_lwcond_real ${phase})
+    set_tests_properties(lwcond_real_${phase} PROPERTIES
+        LABELS "stress;runtime;sync" TIMEOUT 120)
+endforeach()
