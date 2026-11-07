@@ -7,6 +7,7 @@
 
 #include "cellFsUtility.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
+#include "ps3emu/fs_write_check.h"
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -81,10 +82,11 @@ s32 cellFsUtilWriteFile(const char* path, const void* buf, u64 size, u64* bytesW
     if (!f) return (s32)CELL_FS_UTIL_ERROR_IO;
 
     size_t n = fwrite(buf, 1, (size_t)size, f);
-    fclose(f);
+    const int failed = ps3_fs_write_failed(n, size, ferror(f));
+    const int close_failed = fclose(f) != 0;   /* the close flushes */
 
     if (bytesWritten) vm_write64((u32)(uintptr_t)bytesWritten, (u64)n);
-    return CELL_OK;
+    return (failed || close_failed) ? (s32)CELL_FS_UTIL_ERROR_IO : CELL_OK;
 }
 
 s32 cellFsUtilCopyFile(const char* srcPath, const char* dstPath)
