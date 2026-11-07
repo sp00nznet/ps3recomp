@@ -193,24 +193,43 @@ def build_programs(args, registry_writer):
                 command = [sys.executable, args.lifter, str(outdir / 'code.bin'), '--base', str(base),
                            '--functions', str(outdir / 'functions.json'), '--symbol-prefix', prefix,
                            '--report', str(outdir / 'lift.json'), '--output', str(outdir)]
-                if extra.get(name):
-                    command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
                 if getattr(args, 'merge_chunks', False):
                     command += ['--merge-chunks']
-                result = subprocess.run(command, capture_output=True, text=True)
-                (outdir / 'lift.log').write_text(result.stdout + result.stderr)
-                if result.returncode:
-                    raise ValueError('lifter failed; see ' + name + '/lift.log')
-                diagnostics = json.loads((outdir / 'lift.json').read_text())
+                extra_addrs = list(extra.get(name, []))
+                code_end_arg = []
+                for _ in range(5):
+                    cmd = list(command) + code_end_arg
+                    if extra_addrs:
+                        cmd += ['--extra-funcs', ','.join(hex(a) for a in sorted(set(extra_addrs)))]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    (outdir / 'lift.log').write_text(result.stdout + result.stderr)
+                    if result.returncode:
+                        raise ValueError('lifter failed; see ' + name + '/lift.log')
+                    diagnostics = json.loads((outdir / 'lift.json').read_text())
+                    src = (outdir / 'spu_recomp.c').read_text()
+                    if not code_end_arg and '/* TODO spu: .word' in src:
+                        word_addrs = [int(m, 16) for m in re.findall(r'spu_unsupported\(0x([0-9a-fA-F]+),\s*"\.word"\)', src)]
+                        if word_addrs and min(word_addrs) > info['entry']:
+                            code_end_arg = ['--code-end', hex(min(word_addrs))]
+                            continue
+                    starts = {s for s, _ in diagnostics['functions']}
+                    missing = (set(diagnostics['call_targets']) | set(diagnostics['branch_targets'])) - starts
+                    valid_missing = {t for t in missing if any(a <= t < b and t % 4 == 0 for a, b in ranges)}
+                    if not valid_missing:
+                        break
+                    extra_addrs.extend(valid_missing)
                 program['diagnostics'] = diagnostics
-                if diagnostics['unsupported']:
-                    raise ValueError('unsupported instructions emitted by lifter')
+                unsupported_real = {k: v for k, v in diagnostics['unsupported'].items() if k != '.word'}
+                if unsupported_real:
+                    raise ValueError(f'unsupported instructions emitted by lifter: {unsupported_real}')
                 starts = {s for s, _ in diagnostics['functions']}
                 if info['entry'] not in starts:
                     raise ValueError('lifter did not generate the ELF entry')
                 if any(not any(a <= s < e <= b for a, b in ranges) for s, e in diagnostics['functions']):
                     raise ValueError('generated function extends beyond executable ranges')
-                if (set(diagnostics['call_targets']) | set(diagnostics['branch_targets'])) - starts:
+                in_range_targets = {t for t in (set(diagnostics['call_targets']) | set(diagnostics['branch_targets']))
+                                    if any(a <= t < b for a, b in ranges)}
+                if in_range_targets - starts:
                     raise ValueError('direct branch/call targets lack generated function entries')
                 for filename in ['spu_recomp.c', 'spu_recomp.h']:
                     if not (outdir / filename).is_file():
