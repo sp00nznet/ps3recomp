@@ -1874,7 +1874,7 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
     }
 
     if (si->active[wid] || spurs_policy_release_workload(si->ea, wid)) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_BUSY;
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_BUSY;
     }
     s_workloads[wid].in_use = 0;
     vm_write8(si->ea + wkl_state_off(wid), 3);
@@ -3484,10 +3484,43 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     return CELL_OK;
 }
 
+static u32 spurs_shutdown_timeout_ms(void)
+{
+    static u32 v;
+    if (!v) {
+        const char* e = getenv("SPURS_SHUTDOWN_MS");
+        long n = e ? atol(e) : 0;
+        v = (n > 0) ? (u32)n : 2000u;
+    }
+    return v;
+}
+
+/* Shutdown stops new dispatch: the coordinator only starts a workload that is
+ * enabled and in the runnable state. A policy already running carries on, and
+ * WaitForWorkloadShutdown drains it, bounded by SPURS_SHUTDOWN_MS (default
+ * 2000), so a title's teardown cannot free memory a policy is still using. */
 s32 cellSpursShutdownWorkload(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] ShutdownWorkload(wid=%u)\n", wid);
+    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
+
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+    if (rc) return rc;
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+    }
+    spu_lockline_lock();
+    vm_base[si->ea + wkl_ready_off(wid)] = 0;
+    ef_w16(si->ea + wkl_signal_off(wid),
+           (u16)(vm_read16(si->ea + wkl_signal_off(wid)) & ~wkl_signal_bit(wid)));
+    ef_line_end(si->ea);
+    si->idle[wid] = 0;
+    vm_write8(si->ea + wkl_state_off(wid), 3);
+    vm_write32(si->ea + SPURS_WKL_ENABLED,
+               vm_read32(si->ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
+    spurs_api_unlock(si);
     return CELL_OK;
 }
 
@@ -3495,7 +3528,26 @@ s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u)\n", wid);
-    return CELL_OK;
+    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
+
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+    if (rc) return rc;
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+    }
+    /* Drop the registry lock while waiting: a policy on its way out takes
+     * si->lock and then the registry lock, so holding it would stop the drain. */
+    ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    const u32 timeout_ms = spurs_shutdown_timeout_ms();
+    const DWORD t0 = GetTickCount();
+    while (si->active[wid]) {
+        const DWORD elapsed = GetTickCount() - t0;
+        if (elapsed >= timeout_ms) { rc = CELL_SPURS_POLICY_MODULE_ERROR_BUSY; break; }
+        SleepConditionVariableSRW(&si->wake, &si->lock, timeout_ms - elapsed, 0);
+    }
+    ReleaseSRWLockExclusive(&si->lock);
+    return rc;
 }
 
 /* =========================================================================

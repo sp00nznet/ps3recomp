@@ -29,6 +29,9 @@ extern "C" {
 #define CELL_SPURS_CORE_ERROR_ALIGN             (CELL_ERROR_BASE_SPURS | 0x10)
 #define CELL_SPURS_CORE_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x11)
 #define CELL_SPURS_CORE_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x09)
+/* cellSpursRemoveWorkload while a policy module still runs. A title's teardown
+ * loop retries on exactly this value. */
+#define CELL_SPURS_POLICY_MODULE_ERROR_BUSY     0x8041080A
 
 #define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS_TASK | 0x01)
 #define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS_TASK | 0x02)
