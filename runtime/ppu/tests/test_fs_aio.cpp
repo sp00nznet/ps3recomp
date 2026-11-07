@@ -83,9 +83,12 @@ static bool holds(uint32_t buf, uint64_t off, uint32_t len)
 static uint8_t* g_res; static size_t g_res_len;
 static void commit_page(int, siginfo_t* si, void*)
 {
-    uintptr_t a = (uintptr_t)si->si_addr & ~(uintptr_t)0xFFF;
+    /* The host's page size: Apple Silicon's is 16 KB, and mprotect refuses an
+     * address that is only 4 KB aligned, so the fault would repeat forever. */
+    const uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
+    uintptr_t a = (uintptr_t)si->si_addr & ~(page - 1);
     if (a < (uintptr_t)g_res || a >= (uintptr_t)g_res + g_res_len) _exit(3);
-    mprotect((void*)a, 0x1000, PROT_READ | PROT_WRITE);
+    mprotect((void*)a, page, PROT_READ | PROT_WRITE);
 }
 
 /* cellFsAioWrite must pre-fault its source like cellFsWrite and cellFsAioRead. */
@@ -97,6 +100,7 @@ static void test_aio_write_prefault(const char* dir)
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = commit_page; sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);    /* what macOS raises on a PROT_NONE page */
     uint8_t* saved = vm_base; uint32_t saved_sz = ppu_vm_size;
     vm_base = g_res; ppu_vm_size = (uint32_t)g_res_len;
 
@@ -121,6 +125,7 @@ static void test_aio_write_prefault(const char* dir)
     }
     remove(host);
     signal(SIGSEGV, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
     vm_base = saved; ppu_vm_size = saved_sz;
     munmap(g_res, g_res_len);
 }
