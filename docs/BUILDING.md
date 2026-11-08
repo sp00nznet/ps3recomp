@@ -285,6 +285,7 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
 | `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
+| `PS3RECOMP_VK_DIRECT_PRESENT=1` | On the draw engine path, present without reading the frame back: one submission blits the flipped surface into the window, waiting for the swapchain image on the GPU, and the CPU waits for nothing (a ring of three presents stays in flight). The presents `PS3RECOMP_VK_DUMP` writes still read back. Off (the default): every present copies the frame to host memory and waits for it, then blits it to the window and waits again |
 | `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
