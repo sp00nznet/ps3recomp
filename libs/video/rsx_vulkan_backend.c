@@ -38,9 +38,18 @@
  * with spaces.
  */
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(PS3RECOMP_RSX_VULKAN)
 
 #define VK_NO_PROTOTYPES
+#ifdef _WIN32
+/* Windows (opt-in): a Win32 window with VK_KHR_win32_surface instead of SDL,
+ * and vulkan-1.dll loaded at run time like libvulkan elsewhere. */
+#define VK_USE_PLATFORM_WIN32_KHR
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include <vulkan/vulkan.h>
 
 #include "rsx_vulkan_backend.h"
@@ -54,12 +63,14 @@
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
- * opens the optional window. Same include style as those two. */
+ * opens the optional window. Same include style as those two. Windows opens
+ * a plain Win32 window instead. */
+#ifndef _WIN32
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
-
 #include <dlfcn.h>
-#include <pthread.h>
+#endif
+#include "rsx_vk_thread.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -218,7 +229,14 @@ typedef struct vk_state {
     int              indep_blend_ok;  /* independentBlend: per-target MRT state */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
+#ifdef _WIN32
+    HWND             window;
+    int              window_closed;   /* WM_CLOSE or Esc */
+    int              fullscreen;      /* borderless, F11 or Alt+Enter */
+    WINDOWPLACEMENT  restore;         /* the windowed placement to go back to */
+#else
     SDL_Window*      window;
+#endif
     const char*      inst_exts[16];
     u32              inst_ext_count;
     VkSurfaceKHR     surface;
@@ -250,6 +268,25 @@ static vk_state s_vk;
 /* ---------------------------------------------------------------------------
  * Loading
  * -------------------------------------------------------------------------*/
+#ifdef _WIN32
+static int vk_load_library(void)
+{
+    s_vk.lib = (void*)LoadLibraryA("vulkan-1.dll");
+    if (!s_vk.lib) {
+        VK_LOG("no Vulkan loader found (LoadLibrary vulkan-1.dll: error %lu)\n", GetLastError());
+        return -1;
+    }
+    FARPROC entry = GetProcAddress((HMODULE)s_vk.lib, "vkGetInstanceProcAddr");
+    memcpy(&pvkGetInstanceProcAddr, &entry, sizeof entry);
+    if (!pvkGetInstanceProcAddr) { VK_LOG("vulkan-1.dll has no vkGetInstanceProcAddr\n"); return -1; }
+#define LOAD_G(name) \
+    if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(VK_NULL_HANDLE, #name))) \
+        { VK_LOG("missing global function " #name "\n"); return -1; }
+    VK_GLOBAL_FNS(LOAD_G)
+#undef LOAD_G
+    return 0;
+}
+#else
 static int vk_load_library(void)
 {
     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
@@ -268,6 +305,7 @@ static int vk_load_library(void)
     VK_GLOBAL_FNS(LOAD_G)
     return 0;
 }
+#endif
 
 static int vk_load_instance_functions(void)
 {
@@ -1732,8 +1770,14 @@ static void vk_window_drop(const char* why)
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
     if (s_vk.window) {
+#ifdef _WIN32
+        if (s_vk.fullscreen) ShowCursor(TRUE);
+        s_vk.fullscreen = 0;
+        DestroyWindow(s_vk.window);
+#else
         SDL_DestroyWindow(s_vk.window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
+#endif
     }
     s_vk.window = NULL;
     s_vk.surface = VK_NULL_HANDLE;
@@ -1743,6 +1787,130 @@ static void vk_window_drop(const char* why)
     s_vk.windowed = 0;
 }
 
+#ifdef _WIN32
+static int s_vk_resized;   /* defined here on Windows: the window procedure sets it */
+
+/* Borderless fullscreen on the window's monitor, and back to the placement
+ * the window had. */
+static void vk_window_set_fullscreen(int on)
+{
+    if (!s_vk.window || on == s_vk.fullscreen) return;
+    if (on) {
+        MONITORINFO mi;
+        memset(&mi, 0, sizeof mi);
+        mi.cbSize = sizeof mi;
+        s_vk.restore.length = sizeof s_vk.restore;
+        if (!GetWindowPlacement(s_vk.window, &s_vk.restore) ||
+            !GetMonitorInfoA(MonitorFromWindow(s_vk.window, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        SetWindowLongPtrA(s_vk.window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(s_vk.window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        ShowCursor(FALSE);
+    } else {
+        SetWindowLongPtrA(s_vk.window, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPlacement(s_vk.window, &s_vk.restore);
+        SetWindowPos(s_vk.window, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        ShowCursor(TRUE);
+    }
+    s_vk.fullscreen = on;
+    s_vk_resized = 1;
+}
+
+static LRESULT CALLBACK vk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CLOSE:
+        s_vk.window_closed = 1;
+        return 0;   /* vk_window_drop destroys it on the backend's own terms */
+    case WM_SIZE:
+        s_vk_resized = 1;
+        return 0;
+    case WM_GETMINMAXINFO: {
+        RECT r = { 0, 0, 320, 180 };
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        ((MINMAXINFO*)lp)->ptMinTrackSize.x = r.right - r.left;
+        ((MINMAXINFO*)lp)->ptMinTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) { s_vk.window_closed = 1; return 0; }
+        if (wp == VK_F11 && !(lp & (1 << 30))) { vk_window_set_fullscreen(!s_vk.fullscreen); return 0; }
+        break;
+    case WM_SYSKEYDOWN:   /* Alt+Enter */
+        if (wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) {
+            vk_window_set_fullscreen(!s_vk.fullscreen);
+            return 0;
+        }
+        break;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void vk_window_open(const char* title)
+{
+    if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+    WNDCLASSEXA wc;
+    memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = vk_wndproc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = "ps3recomp_vulkan";
+    RegisterClassExA(&wc);   /* a second init finds the class already registered */
+    RECT wr = { 0, 0, (LONG)s_vk.width, (LONG)s_vk.height };
+    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    /* Keep the display awake, as the D3D12 and null backends do. */
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    s_vk.window_closed = 0;
+    s_vk.fullscreen = 0;
+    s_vk.window = CreateWindowExA(0, "ps3recomp_vulkan",
+                                  title && title[0] ? title : "ps3recomp",
+                                  WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+                                  wr.right - wr.left, wr.bottom - wr.top,
+                                  NULL, NULL, GetModuleHandleA(NULL), NULL);
+    s_vk.windowed = 1;
+    if (!s_vk.window) {
+        char why[128];
+        snprintf(why, sizeof why, "CreateWindowEx failed (error %lu)", GetLastError());
+        vk_window_drop(why);
+        return;
+    }
+    /* PS3RECOMP_FULLSCREEN=1 (--fullscreen), the same for every backend; PS3RECOMP_VK_FULLSCREEN is the older name. */
+    if (vk_env_on("PS3RECOMP_FULLSCREEN") || vk_env_on("PS3RECOMP_VK_FULLSCREEN"))
+        vk_window_set_fullscreen(1);
+    s_vk.inst_exts[0] = VK_KHR_SURFACE_EXTENSION_NAME;
+    s_vk.inst_exts[1] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+    s_vk.inst_ext_count = 2;
+    const char* hold = getenv("PS3RECOMP_VK_HOLD");
+    s_vk.hold_seconds = hold ? atof(hold) : 0.0;
+    VK_LOG("window: Win32, %u surface extension(s)\n", s_vk.inst_ext_count);
+}
+
+static int vk_create_window_surface(void)
+{
+    PFN_vkCreateWin32SurfaceKHR create = (PFN_vkCreateWin32SurfaceKHR)
+        pvkGetInstanceProcAddr(s_vk.instance, "vkCreateWin32SurfaceKHR");
+    if (!create) return -1;
+    VkWin32SurfaceCreateInfoKHR info = { .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                                         .hinstance = GetModuleHandleA(NULL), .hwnd = s_vk.window };
+    return create(s_vk.instance, &info, NULL, &s_vk.surface) == VK_SUCCESS ? 0 : -1;
+}
+
+static void vk_window_drawable_size(int* w, int* h)
+{
+    RECT r = { 0, 0, 0, 0 };
+    GetClientRect(s_vk.window, &r);
+    *w = (int)(r.right - r.left); *h = (int)(r.bottom - r.top);
+}
+
+static int vk_window_minimized(void) { return IsIconic(s_vk.window) != 0; }
+
+static const char* vk_window_error(void) { return "vkCreateWin32SurfaceKHR failed"; }
+#else
 static void vk_window_open(const char* title)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
@@ -1782,6 +1950,24 @@ static void vk_window_open(const char* title)
            SDL_GetCurrentVideoDriver(), n);
 }
 
+static int vk_create_window_surface(void)
+{
+    return SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface) ? 0 : -1;
+}
+
+static void vk_window_drawable_size(int* w, int* h)
+{
+    SDL_Vulkan_GetDrawableSize(s_vk.window, w, h);
+}
+
+static int vk_window_minimized(void)
+{
+    return (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) != 0;
+}
+
+static const char* vk_window_error(void) { return SDL_GetError(); }
+#endif
+
 /* 0 on success, 1 when the window has no drawable area right now (the old swapchain is kept), -1 on failure. */
 static int vk_create_swapchain(void)
 {
@@ -1820,7 +2006,7 @@ static int vk_create_swapchain(void)
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) {
         int w = 0, hh = 0;
-        SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &hh);
+        vk_window_drawable_size(&w, &hh);
         ext.width = (u32)w; ext.height = (u32)hh;
         if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
         if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
@@ -1880,15 +2066,18 @@ static int vk_create_swapchain(void)
 }
 
 /* The window changed size (or fullscreen state) since the swapchain was made: it is recreated before the next acquire.
- * Also set while the window is minimized, when there is no drawable area to make one for. */
+ * Also set while the window is minimized, when there is no drawable area to make one for. (On Windows it is defined
+ * with the window procedure, which sets it.) */
+#ifndef _WIN32
 static int s_vk_resized;
+#endif
 
 /* Minimized, or no drawable area: nothing can be presented, and a swapchain cannot be created for it. */
 static int vk_window_hidden(void)
 {
     int w = 0, h = 0;
-    if (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) return 1;
-    SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &h);
+    if (vk_window_minimized()) return 1;
+    vk_window_drawable_size(&w, &h);
     return w <= 0 || h <= 0;
 }
 
@@ -3965,9 +4154,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed) {
         if (vk_load_wsi_instance_functions()) {
             vk_window_drop("the driver has no surface functions");
-        } else if (!SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface)) {
+        } else if (vk_create_window_surface()) {
             char why[256];
-            snprintf(why, sizeof why, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+            snprintf(why, sizeof why, "window surface creation failed: %s", vk_window_error());
             vk_window_drop(why);
         }
     }
@@ -4102,6 +4291,13 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
     return 0;
 }
 
+static double vk_hold_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
 void rsx_vulkan_backend_shutdown(void)
 {
     rsx_vulkan_backend_present_finish();   /* a host that began one and quit */
@@ -4111,8 +4307,8 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed && s_vk.swapchain && s_vk.presented && s_vk.hold_seconds > 0.0) {
         VK_LOG("holding the last frame on screen for %.1f s "
                "(Esc or closing the window ends it early)\n", s_vk.hold_seconds);
-        const Uint32 end = SDL_GetTicks() + (Uint32)(s_vk.hold_seconds * 1000.0);
-        while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
+        const double end = vk_hold_now() + s_vk.hold_seconds;
+        while (s_vk.windowed && vk_hold_now() < end) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
             vk_present_window();         /* FIFO: paced by the display */
         }
@@ -4147,7 +4343,11 @@ void rsx_vulkan_backend_shutdown(void)
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
+#ifdef _WIN32
+    if (s_vk.lib) FreeLibrary((HMODULE)s_vk.lib);
+#else
     if (s_vk.lib) dlclose(s_vk.lib);
+#endif
     free(s_vk.cpu_verts);
     pthread_mutex_destroy(&s_vk.queue_mu);
     pthread_mutex_destroy(&s_vk.present_mu);
@@ -4156,6 +4356,19 @@ void rsx_vulkan_backend_shutdown(void)
 
 int rsx_vulkan_backend_pump_messages(void)
 {
+#ifdef _WIN32
+    /* The message queue belongs to the thread that created the window: the
+     * host pumps from that thread, as for the D3D12 backend. */
+    if (!s_vk.windowed) return 0;
+    MSG msg;
+    int quit = 0;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) { quit = 1; continue; }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return (quit || s_vk.window_closed) ? -1 : 0;
+#else
     if (!s_vk.windowed) return 0;
     int quit = 0;
     SDL_Event e;
@@ -4177,6 +4390,7 @@ int rsx_vulkan_backend_pump_messages(void)
         }
     }
     return quit ? -1 : 0;
+#endif
 }
 
 void rsx_vulkan_backend_present(void)
@@ -4225,4 +4439,4 @@ int rsx_vulkan_backend_depth_bounds(void)
     return s_vk.eng_active && s_vk.depth_bounds_ok;
 }
 
-#endif /* !_WIN32 */
+#endif /* !_WIN32 || PS3RECOMP_RSX_VULKAN */

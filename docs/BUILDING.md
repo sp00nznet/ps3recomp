@@ -133,7 +133,7 @@ cmake --install build --prefix /usr/local
 | CMake Option | Default | Description |
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
-| `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
+| `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux, and opt-in on Windows: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
 | `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded-opt-in) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
@@ -248,6 +248,7 @@ which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
 | Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
 | Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
+| Windows (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Built beside D3D12 with `-DPS3RECOMP_RSX_VULKAN=ON`; D3D12 stays the default and a port selects Vulkan by calling `rsx_vulkan_backend_init`. `vulkan-1.dll` is loaded at run time and the optional window is a plain Win32 one. |
 | Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
 
 So on Windows a plain `cmake --build` already gives you the working renderer --
@@ -280,12 +281,25 @@ also keeps cross-compiling for aarch64 simple (point
 Vulkan 1.0 entry points are used; it has been run on Mesa's lavapipe and on
 NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 
+On Windows the same option builds the backend beside D3D12 (clang-cl, with
+the Vulkan SDK's headers on the include path or
+`-DPS3RECOMP_VULKAN_INCLUDE_DIR=<sdk>/Include`). `ps3recomp_host` is
+POSIX-only, so `test_vulkan_backend_smoke` covers the Windows platform layer:
+it loads `vulkan-1.dll`, presents a few frames headless (or in the Win32 window
+with `PS3RECOMP_VK_WINDOW=1`), shuts down and comes up again.
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPS3RECOMP_RSX_VULKAN=ON
+cmake --build build --target test_vulkan_backend_smoke
+build\test_vulkan_backend_smoke.exe
+```
+
 | Environment variable | Effect |
 |---|---|
 | `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
 | `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
-| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
+| `PS3RECOMP_VK_WINDOW=1` | Also show frames in a window (SDL2; Win32 on Windows), resizable, with F11 or Alt+Enter for borderless full screen; if it cannot, the run continues headless and says why |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
 

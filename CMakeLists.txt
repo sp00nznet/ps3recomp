@@ -47,13 +47,18 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux; opt-in on Windows)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    # Windows: a Win32 window and vulkan-1.dll loaded at run time. The D3D12
+    # backend is still built and stays the Windows default; a port selects
+    # Vulkan by calling rsx_vulkan_backend_init.
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is not available on macOS")
     endif()
-    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+    # VULKAN_SDK: the LunarG SDK on Windows sets it (Include/vulkan/vulkan.h).
+    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h
+        HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{VULKAN_SDK}/include")
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
         message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
             "libvulkan-dev, Fedora: vulkan-headers -- or pass "
@@ -313,6 +318,11 @@ endif()
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
+    # The lookup above is POSIX-only (it also serves the Metal translation);
+    # the opt-in Windows Vulkan backend looks glslang up on its own.
+    if(WIN32 AND NOT glslang_FOUND)
+        find_package(glslang CONFIG QUIET)
+    endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
@@ -558,6 +568,25 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
     endif()
+endif()
+
+# Vulkan backend bring-up smoke test (Linux and Windows): loader, optional
+# window, pump, present and shutdown, twice, with no command stream.
+if(PS3RECOMP_RSX_VULKAN)
+    add_executable(test_vulkan_backend_smoke
+        libs/video/tests/test_vulkan_backend_smoke.c
+        runtime/host/host_stubs.c
+    )
+    target_link_libraries(test_vulkan_backend_smoke PRIVATE ps3recomp_runtime)
+    if(NOT WIN32)
+        target_link_libraries(test_vulkan_backend_smoke PRIVATE m)
+    endif()
+    target_include_directories(test_vulkan_backend_smoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${PS3RECOMP_VULKAN_INCLUDE_DIR}"
+    )
+    set_target_properties(test_vulkan_backend_smoke PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
 # ---------------------------------------------------------------------------
