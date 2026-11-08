@@ -57,6 +57,7 @@
  * opens the optional window. Same include style as those two. */
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
+#include "../misc/osk_native.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -1732,6 +1733,9 @@ static void vk_window_drop(const char* why)
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
     if (s_vk.window) {
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+        osk_native_sdl_set_window(NULL);   /* retire a dialog before SDL video goes */
+#endif
         SDL_DestroyWindow(s_vk.window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     }
@@ -1780,6 +1784,10 @@ static void vk_window_open(const char* title)
     s_vk.hold_seconds = hold ? atof(hold) : 0.0;
     VK_LOG("window: SDL video driver '%s', %u surface extension(s)\n",
            SDL_GetCurrentVideoDriver(), n);
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+    /* This thread owns SDL video and pumps it, so the OSK dialog lives here. */
+    osk_native_sdl_set_window(s_vk.window);
+#endif
 }
 
 /* 0 on success, 1 when the window has no drawable area right now (the old swapchain is kept), -1 on failure. */
@@ -4160,8 +4168,16 @@ int rsx_vulkan_backend_pump_messages(void)
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+        /* An open dialog owns the keyboard and its own window's events. */
+        if (osk_native_sdl_handle_event(&e)) continue;
+#endif
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        /* With a dialog open the game window is not the last one, so SDL sends
+         * no SDL_QUIT when it closes; its own close event still ends the run. */
+        else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE &&
+                 s_vk.window && e.window.windowID == SDL_GetWindowID(s_vk.window)) quit = 1;
         else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
                  (e.key.keysym.sym == SDLK_F11 ||
                   (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
@@ -4176,6 +4192,9 @@ int rsx_vulkan_backend_pump_messages(void)
             s_vk_resized = 1;
         }
     }
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+    osk_native_sdl_pump();   /* queued open/close/confirm, then redraw */
+#endif
     return quit ? -1 : 0;
 }
 
