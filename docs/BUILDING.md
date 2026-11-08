@@ -265,6 +265,26 @@ cmake --build build --target ps3recomp_host
 ./build/ps3recomp_host
 ```
 
+### Present thread (opt-in)
+
+By default a present runs on the thread that walks the FIFO, which then waits
+for the window system to hand out a display image; while it waits it applies
+no label, report or get/ref update the guest may be polling.
+`PS3RECOMP_RSX_PRESENT_THREAD=1` splits a draw-engine present in two
+(`libs/video/rsx_present_thread.h`). The presenting thread records and commits
+a GPU copy of the frame, present pass included, into one of a few staging
+images and returns at once. A present thread of its own then takes the oldest
+staged frame, acquires a display image, copies the frame into it and presents
+it. The presenting thread never waits for that thread or for a display
+image: with every staging slot taken, the oldest staged frame is dropped and
+counted.
+
+| Environment variable | Effect |
+|---|---|
+| `PS3RECOMP_RSX_PRESENT_THREAD=1` | Turn it on (Metal draw engine, windowed or headless). Elsewhere -- the Metal vtable path, host-surface mode, Vulkan, D3D12, live draw -- it says once that it is unsupported and presents as before |
+| `PS3RECOMP_RSX_PRESENT_THREAD_DEPTH=<n>` | Staging slots, 2 or 3 (default 3) |
+| `PS3RECOMP_RSX_PRESENT_THREAD_REPORT_S=<sec>` | Seconds between the counter lines on stderr (default 5; 0 = only the final one at shutdown): staged, presented, dropped, failures, ring occupancy, and stage, acquire and blit times |
+
 ### The Vulkan backend (Linux, opt-in)
 
 ```bash
