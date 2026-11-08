@@ -210,6 +210,27 @@ if(PS3RECOMP_FFMPEG_RUNTIME)
     message(STATUS "  FFmpeg:       run-time loaded (headers in ${PS3RECOMP_FFMPEG_INCLUDE_DIR})")
 endif()
 
+# Native on-screen keyboard hosts for cellOskDialog (libs/misc/osk_native.h).
+# All are off by default; without one the legacy cellOskDialog stub is used.
+if(NOT WIN32 AND NOT APPLE)
+    # No toolkit dialog: a dialog opens with its initial text and is confirmed
+    # only through OSK_NATIVE_CONTROL_FILE (libs/misc/osk_headless.c).
+    option(PS3RECOMP_NATIVE_OSK_HEADLESS "Build the headless native OSK host (mailbox-confirmed)" OFF)
+    if(PS3RECOMP_NATIVE_OSK_HEADLESS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_HEADLESS=1)
+        message(STATUS "  OSK:          headless native host")
+    endif()
+endif()
+if(WIN32)
+    # A small Win32 dialog owned by the game window, run on the thread that
+    # pumps it: the null/live and D3D12 backends (libs/misc/osk_win32.c).
+    option(PS3RECOMP_NATIVE_OSK_WINDOWS "Build the Windows native OSK host" OFF)
+    if(PS3RECOMP_NATIVE_OSK_WINDOWS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_WINDOWS=1)
+        message(STATUS "  OSK:          Windows native host")
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Guest shaders on Metal: HLSL -> SPIR-V -> MSL
 # ---------------------------------------------------------------------------
