@@ -519,6 +519,9 @@ if(PS3RECOMP_BUILD_TESTS)
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME ppu_hle_toc
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_hle_toc.py")
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
@@ -538,6 +541,21 @@ if(PS3RECOMP_BUILD_TESTS)
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
+            add_test(NAME spu_interpreter_mpyui
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_mpyui.py")
+            add_test(NAME spu_interpreter_double_arithmetic
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_double_arithmetic.py")
+            add_test(NAME spu_interpreter_rothmi
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_rothmi.py")
+            add_test(NAME spu_interpreter_xorbi
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_xorbi.py")
+            add_test(NAME ppu_ctr64
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_ctr64.py")
             add_test(NAME spu_fnms_zero_extended
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
