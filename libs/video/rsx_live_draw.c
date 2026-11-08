@@ -105,6 +105,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <d3dcompiler.h>
 #include "rsx_vertex_formats.h"
 #include "rsx_d3d12_device.h"
+#include "rsx_fence_wait.h"
 #include <sys/stat.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -1750,13 +1751,28 @@ static void ld_flush(ld_flush_reason reason)
         g.ready = 0;
         return;
     }
-    if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+    const u64 completed = g.fence->lpVtbl->GetCompletedValue(g.fence);
+    if (completed == UINT64_MAX) {
+        fprintf(stderr,
+                "[d3d-fail] device removed before fence wait frame=%u\n",
+                g_ld_frames);
+        ld_dump_dred("GetCompletedValue", DXGI_ERROR_DEVICE_REMOVED);
+        g.ready = 0;
+        return;
+    }
+    if (!rsx_fence_ready(1, completed, v)) {
+        HRESULT event_hr;
+        DWORD wait_result;
+        DWORD wait_error;
+        u64 after;
+        HRESULT wait_hr;
 #if defined(YZ_PERF_PROFILE)
-        const LONGLONG wait_begin = ld_profile_qpc();
+        LONGLONG wait_begin;
+        u64 wait_ticks;
+        wait_begin = ld_profile_qpc();
 #endif
-        const HRESULT event_hr =
-            g.fence->lpVtbl->SetEventOnCompletion(
-                g.fence, v, g.fence_event);
+        event_hr = g.fence->lpVtbl->SetEventOnCompletion(
+            g.fence, v, g.fence_event);
         if (FAILED(event_hr)) {
             fprintf(stderr,
                     "[d3d-fail] fence SetEventOnCompletion "
@@ -1766,12 +1782,35 @@ static void ld_flush(ld_flush_reason reason)
             g.ready = 0;
             return;
         }
-        WaitForSingleObject(g.fence_event, INFINITE);
+        wait_result = WaitForSingleObject(g.fence_event, INFINITE);
+        wait_error =
+            wait_result == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
 #if defined(YZ_PERF_PROFILE)
-        const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
+        wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
         g_ld_profile.total.fence_wait_qpc += wait_ticks;
         g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
 #endif
+        after = g.fence->lpVtbl->GetCompletedValue(g.fence);
+        if (!rsx_fence_ready(
+                wait_result == WAIT_OBJECT_0, after, v)) {
+            fprintf(stderr,
+                    "[d3d-fail] fence wait result=0x%08lX "
+                    "error=%lu completed=%llu required=%llu frame=%u\n",
+                    (unsigned long)wait_result,
+                    (unsigned long)wait_error,
+                    (unsigned long long)after,
+                    (unsigned long long)v,
+                    g_ld_frames);
+            wait_hr = E_FAIL;
+            if (wait_result == WAIT_FAILED &&
+                wait_error != ERROR_SUCCESS)
+                wait_hr = HRESULT_FROM_WIN32(wait_error);
+            else if (after == UINT64_MAX)
+                wait_hr = DXGI_ERROR_DEVICE_REMOVED;
+            ld_dump_dred("FenceWait", wait_hr);
+            g.ready = 0;
+            return;
+        }
     }
     ld_drain_info_queue("flush");
     /* Dynamic guest textures can replace a cached D3D resource while an
