@@ -2117,6 +2117,17 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
  * (ctx->pc, updated by lifted code at block boundaries) of a host AV. */
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx = nullptr;
 
+/* Restore host context even when a synchronous callback throws, including a
+ * configured guest nonlocal return crossing a dispatcher or callback. Host-only
+ * bookkeeping: never restore guest registers in these guards. */
+struct ppu_active_context_scope {
+    ppu_context* previous;
+    explicit ppu_active_context_scope(ppu_context* current) : previous(g_active_ctx) {
+        g_active_ctx = current;
+    }
+    ~ppu_active_context_scope() { g_active_ctx = previous; }
+};
+
 /* Caller LR of the guest function currently in an HLE call (for HLE-side
  * diagnostics: pin which lifted function invoked us). 0 if none. */
 extern "C" uint32_t ppu_active_lr(void)
@@ -2918,6 +2929,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             return;
         }
         s_depth++;
+        struct depth_scope { int& value; ~depth_scope() { --value; } } depth_guard{s_depth};
         /* PPU_TOCFIX: the dispatched function's TOC (r2) is the OPD toc we were
          * called with. Tail-call trampoline links (`b target`) are intra-module, so
          * they must all run with THIS same r2. A link that does a cross-module call
@@ -2929,6 +2941,8 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         static int _tf=-1; if(_tf<0)_tf=getenv("PPU_TOCFIX")?1:0;
         if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
         g_vcall_sp++;
+        struct vcall_scope { ~vcall_scope() { if (g_vcall_sp > 0) --g_vcall_sp; } };
+        { vcall_scope vcall_guard;
         fn(ctx);
         while (g_trampoline_fn) {
             void (*tf)(void*) = g_trampoline_fn;
@@ -2936,7 +2950,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             if (_tf) ctx->gpr[2] = _toc0;
             tf(ctx);
         }
-        if (g_vcall_sp > 0) g_vcall_sp--;
+        }
         /* PPU_RETWATCH=<hex>: catch the first vcall(s) whose RETURN value (r3)
          * equals this, pinning the exact virtual method that produces the poison. */
         { static int64_t rw=-2; if(rw==-2){const char*e=getenv("PPU_RETWATCH"); rw=e?(int64_t)strtoul(e,0,16):-1;}
@@ -2951,7 +2965,6 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             fprintf(stderr,"%s\n",ln);
 #endif
           } } }
-        s_depth--;
         return;
     }
     /* Garbage virtual-call guard: a call target that resolves to no registered
@@ -3998,10 +4011,9 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
 #else
     ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
 #endif
-    g_active_ctx = &ctx;
+    ppu_active_context_scope active_scope(&ctx);
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
-    g_active_ctx = saved_active;
     return ctx.gpr[3];
 }
 
@@ -4009,15 +4021,6 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
  * callbacks whose OPD is captured at registration time and may later be
  * clobbered in guest memory (e.g. the GCM flip/vblank handler OPDs). Same
  * scratch-stack + trampoline-drain behaviour as ppu_guest_call. */
-/* Restore host context even when a synchronous callback throws. */
-struct ppu_active_context_scope {
-    ppu_context* previous;
-    explicit ppu_active_context_scope(ppu_context* current) : previous(g_active_ctx) {
-        g_active_ctx = current;
-    }
-    ~ppu_active_context_scope() { g_active_ctx = previous; }
-};
-
 extern "C" int ppu_guest_call_ct_checked(uint32_t code, uint32_t toc,
                                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                       uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,

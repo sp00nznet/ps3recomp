@@ -3,6 +3,7 @@
  */
 
 #include <setjmp.h>
+#include "ppu_host_unwind.h"
 
 /* sys_ppu_thread_exit never returns on hardware. Returning CELL_OK to the
  * guest lets it run on past the call: Twisted Metal has a thread that exits
@@ -676,7 +677,13 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     {
         static int allow = -1;
         if (allow < 0) allow = getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1;
-        if (allow && s_exit_armed) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
+        if (allow && s_exit_armed) {
+            s_exit_armed = 0;
+            /* C longjmp skips generated C++ frame guards. Interrupt handlers
+             * may reenter this host thread, so discard their stale registry. */
+            ps3_ppu_notify_host_unwind();
+            longjmp(s_exit_jmp, 1);
+        }
     }
     return CELL_OK;
 }

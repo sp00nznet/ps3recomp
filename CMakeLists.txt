@@ -114,6 +114,17 @@ add_library(ps3recomp_runtime STATIC
     ${RUNTIME_SOURCES}
 )
 
+option(PS3RECOMP_PPU_NONLOCAL_CONTROL_FLOW
+       "MSVC/clang-cl: let C++ exceptions cross extern-C bridges (/EHsc-), as code lifted with --nonlocal-control-flow needs"
+       OFF)
+if(MSVC AND PS3RECOMP_PPU_NONLOCAL_CONTROL_FLOW)
+    # Generated PPU nonlocal transfers are C++ exceptions that cross extern "C"
+    # HLE/dispatcher bridges. Keep synchronous C++ unwinding, but undo /EHsc's
+    # assumption that C-linkage calls cannot throw. PUBLIC so the port's
+    # generated and loader C++ sources get it too. C sources are unchanged.
+    target_compile_options(ps3recomp_runtime PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/EHsc->)
+endif()
+
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
