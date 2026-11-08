@@ -152,6 +152,91 @@ int rsx_vertex_topology_plan(
 int rsx_vertex_decode_element(
     u32 type, u32 size, const u8* source, float out[4]);
 
+/* ---- converted-vertex cache ----------------------------------------------
+ *
+ * A draw engine converts a draw's vertices to compact float4 vertices and
+ * rebuilds its topology into an index buffer, on the CPU, every time. A game
+ * repeats most of its draws unchanged: in Resistance 3's Haven firefight 95-97%
+ * of ~7800 draws a frame had the same indices, layout and vertex bytes as a draw
+ * of this frame or the last, and their conversion was a third of the RSX
+ * thread. This cache keeps the converted vertices and indices of a draw in
+ * memory the GPU reads, keyed by a hash of everything they were made from:
+ * index bytes, layout, attribute state and the vertex bytes themselves. A
+ * changed byte is a different key, so nothing is ever invalidated; entries
+ * nobody uses age out.
+ *
+ * The cache only does bookkeeping. Memory comes from the backend as chunks
+ * (a GPU buffer and a CPU pointer to its contents); blocks are handed out
+ * from them by a buddy allocator. A block the GPU may still read is not
+ * reused: the engine tags every use with the serial of the submission it
+ * goes into and passes in the serial the GPU has completed. */
+
+typedef struct rsx_vc_key {
+    u64 lo, hi;
+} rsx_vc_key;
+
+/* 128-bit key of n bytes, chained on seed. Not cryptographic, and a 64-bit
+ * margin: two different inputs share a key with a probability of about
+ * 2^-64. */
+rsx_vc_key rsx_vc_hash(const void* data, size_t n, rsx_vc_key seed);
+rsx_vc_key rsx_vc_mix(rsx_vc_key k, u64 v);
+
+typedef struct rsx_vc_chunks {
+    void* user;
+    /* A chunk of `bytes` the GPU can read; *cpu gets its contents. Returns a
+     * handle > 0, or 0 when it cannot. */
+    u32 (*create)(void* user, u32 bytes, u8** cpu);
+    void (*release)(void* user, u32 chunk);
+} rsx_vc_chunks;
+
+typedef struct rsx_vc_entry {
+    rsx_vc_key key;
+    u32 chunk;          /* backend chunk handle                              */
+    u32 offset;         /* of the block in the chunk; vertices start here    */
+    u32 ib_off;         /* indices, from the start of the chunk; 0 = none    */
+    u32 n_verts;        /* compact vertices stored                           */
+    u32 n_draw;         /* indices to draw, or vertices when not indexed     */
+    u32 stride;
+    u32 topology;       /* the engine's own topology value                   */
+    u8  indexed;
+    u8  order;          /* buddy order of the block                          */
+    u64 last_serial;    /* submission that last read it                      */
+    u64 last_frame;
+} rsx_vc_entry;
+
+typedef struct rsx_vc_stats {
+    u64 hits, misses, inserts, insert_failures, evictions, bytes_in_use;
+} rsx_vc_stats;
+
+typedef struct rsx_vertex_cache rsx_vertex_cache;
+
+/* budget: total bytes of chunks; chunk_bytes: a power of two >= 64 KB,
+ * halved (down to 64 KB) while it is larger than the budget. */
+rsx_vertex_cache* rsx_vc_create(const rsx_vc_chunks* chunks, u64 budget,
+                                u32 chunk_bytes);
+void rsx_vc_destroy(rsx_vertex_cache* c);
+
+/* The entry for key, or NULL. The pointer stays valid until the next insert. */
+rsx_vc_entry* rsx_vc_find(rsx_vertex_cache* c, rsx_vc_key key);
+/* Record that the entry is read by submission `serial` in `frame`. */
+void rsx_vc_touch(rsx_vc_entry* e, u64 serial, u64 frame);
+
+/* A new entry with a block of `bytes`; *cpu points at the block. `completed`
+ * is the newest submission serial the GPU has finished, `frame` the current
+ * frame: entries unused for a while are evicted when memory runs out. NULL
+ * when the block cannot be had (larger than a chunk, or every byte is in use
+ * by the GPU or by this frame); the caller then draws uncached. */
+rsx_vc_entry* rsx_vc_insert(rsx_vertex_cache* c, rsx_vc_key key, u32 bytes,
+                            u64 completed, u64 frame, u8** cpu);
+
+/* The element range [first, last] a draw's indices span, remembered by a
+ * hash of those indices, so a repeated draw finds its vertex range without
+ * reading every index. */
+int rsx_vc_range_find(rsx_vertex_cache* c, rsx_vc_key key, u32* first, u32* last);
+void rsx_vc_range_put(rsx_vertex_cache* c, rsx_vc_key key, u32 first, u32 last);
+
+void rsx_vc_get_stats(const rsx_vertex_cache* c, rsx_vc_stats* out);
+
 #ifdef __cplusplus
 }
 #endif

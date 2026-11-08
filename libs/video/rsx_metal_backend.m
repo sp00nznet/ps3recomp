@@ -2595,6 +2595,9 @@ typedef struct {
     MTLPrimitiveType topology;
     u32 vb_off, stride, vertex_count;
     u32 ib_off, index_count;
+    /* 0: vertices and indices are in the staging arena; else the
+     * converted-vertex cache chunk (s_eng_vc_buf index + 1) holding both. */
+    u32 vb_chunk;
     u32 vs_cb_off, vs_cb_bytes;
     u32 ps_cb_off, ps_cb_bytes;
     u32 tex[RSX_BE_MAX_TEXTURES];
@@ -2617,6 +2620,15 @@ typedef struct {
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
 static u32 s_eng_rec_count;
 static u32 s_eng_dropped;
+
+/* The converted-vertex cache's chunks (rsx_vertex_compact.h): shared buffers
+ * the engine fills once and the GPU reads in every frame after. */
+enum { ENG_VC_MAX_CHUNKS = 64 };
+static id<MTLBuffer> s_eng_vc_buf[ENG_VC_MAX_CHUNKS];
+/* Serial of the last committed engine command buffer (walker thread), and of
+ * the newest one the GPU has completed (completion handlers). */
+static u64 s_eng_commit_serial;
+static _Atomic u64 s_eng_completed_serial;
 
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
@@ -3112,6 +3124,7 @@ static void eng_shutdown(void* user)
     s_eng_rec_count = 0;
     s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
+    for (u32 i = 0; i < ENG_VC_MAX_CHUNKS; i++) s_eng_vc_buf[i] = nil;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
     [s_eng_stage_pool removeAllObjects];
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
@@ -3732,6 +3745,23 @@ static void eng_set_depth_bias(void* user, float slope, float units, u32 depth_b
     s_eng_pending.depth_bias  = depth_bits == 16u ? units * 256.0f : units;
 }
 
+/* A draw record over the pending state; the caller has checked the cap.
+ * vb_chunk 0: the offsets are in the staging arena. */
+static void eng_record_draw(rsx_topology topology, u32 vb_chunk, u32 vb_off,
+                            u32 vertex_count, u32 stride, u32 ib_off, u32 index_count)
+{
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    *r = s_eng_pending;
+    r->kind         = ENG_REC_DRAW;
+    r->topology     = topo_to_metal(topology);
+    r->vb_off       = vb_off;
+    r->stride       = stride;
+    r->vertex_count = vertex_count;
+    r->ib_off       = ib_off;
+    r->index_count  = index_count;
+    r->vb_chunk     = vb_chunk;
+}
+
 static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                      u32 vertex_count, u32 stride, const u32* indices,
                      u32 index_count)
@@ -3744,16 +3774,62 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
     if (indices && index_count &&
         !eng_stage_copy(indices, index_count * (u32)sizeof(u32), &ib_off))
         return;
+    eng_record_draw(topology, 0, vb_off, vertex_count, stride, ib_off,
+                    indices ? index_count : 0);
+}
 
-    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
-    *r = s_eng_pending;
-    r->kind         = ENG_REC_DRAW;
-    r->topology     = topo_to_metal(topology);
-    r->vb_off       = vb_off;
-    r->stride       = stride;
-    r->vertex_count = vertex_count;
-    r->ib_off       = ib_off;
-    r->index_count  = indices ? index_count : 0;
+static u32 eng_vcache_chunk_create(void* user, u32 bytes, u8** cpu)
+{
+    (void)user;
+    for (u32 i = 0; i < ENG_VC_MAX_CHUNKS; i++) {
+        if (s_eng_vc_buf[i]) continue;
+        @autoreleasepool {
+            id<MTLBuffer> b = [s_dev newBufferWithLength:bytes
+                                                 options:MTLResourceStorageModeShared];
+            if (!b || ![b contents]) return 0;
+            s_eng_vc_buf[i] = b;
+            *cpu = (u8*)[b contents];
+        }
+        return i + 1u;
+    }
+    return 0;
+}
+
+static void eng_vcache_chunk_release(void* user, u32 chunk)
+{
+    (void)user;
+    if (chunk && chunk <= ENG_VC_MAX_CHUNKS) s_eng_vc_buf[chunk - 1u] = nil;
+}
+
+static void eng_draw_cached(void* user, rsx_topology topology, u32 chunk,
+                            u32 vb_off, u32 vertex_count, u32 stride,
+                            u32 ib_off, u32 index_count)
+{
+    (void)user;
+    if (!vertex_count || !stride || !chunk || chunk > ENG_VC_MAX_CHUNKS ||
+        !s_eng_vc_buf[chunk - 1u]) return;
+    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    eng_record_draw(topology, chunk, vb_off, vertex_count, stride, ib_off, index_count);
+}
+
+static u64 eng_commit_serial(void* user, u64* completed)
+{
+    (void)user;
+    if (completed) *completed = atomic_load(&s_eng_completed_serial);
+    return s_eng_commit_serial + 1u;
+}
+
+/* Tag a command buffer about to be committed with the next serial; its
+ * completion makes every cache block it read reusable. */
+static void eng_tag_commit(id<MTLCommandBuffer> cb)
+{
+    const u64 serial = ++s_eng_commit_serial;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+        (void)_unused;
+        u64 cur = atomic_load(&s_eng_completed_serial);
+        while (cur < serial &&
+               !atomic_compare_exchange_weak(&s_eng_completed_serial, &cur, serial)) {}
+    }];
 }
 
 static void eng_clear_color(void* user, u32 surface, const float rgba[4])
@@ -3837,7 +3913,8 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setViewport:vp];
     if (r->sc[2] && r->sc[3])
         [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
-    [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
+    id<MTLBuffer> geometry = r->vb_chunk ? s_eng_vc_buf[r->vb_chunk - 1u] : stage;
+    [enc setVertexBuffer:geometry offset:r->vb_off atIndex:MTL_VB_INDEX];
     if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
     if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
@@ -3862,7 +3939,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
         [enc drawIndexedPrimitives:r->topology
                         indexCount:r->index_count
                          indexType:MTLIndexTypeUInt32
-                       indexBuffer:stage
+                       indexBuffer:geometry
                  indexBufferOffset:r->ib_off];
     else
         [enc drawPrimitives:r->topology
@@ -4534,10 +4611,12 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 dispatch_semaphore_signal(sem);
             }];
             eng_stage_hand_off(cb, stage);
+            eng_tag_commit(cb);
             [cb commit];
         } else {
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             eng_stage_hand_off(cb, stage);
+            eng_tag_commit(cb);
             [cb commit];
             [cb waitUntilCompleted];
             if (ft_w0) {
@@ -4724,6 +4803,10 @@ static const rsx_draw_backend s_engine_backend = {
     .set_stencil_ref      = eng_set_stencil_ref,
     .set_depth_bias       = eng_set_depth_bias,
     .draw                 = eng_draw,
+    .vcache_chunk_create  = eng_vcache_chunk_create,
+    .vcache_chunk_release = eng_vcache_chunk_release,
+    .draw_cached          = eng_draw_cached,
+    .commit_serial        = eng_commit_serial,
     .clear_color          = eng_clear_color,
     .clear_depth_stencil  = eng_clear_depth_stencil,
     .clear_color_rect     = eng_clear_color_rect,
