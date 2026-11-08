@@ -19,6 +19,7 @@ def main():
                         "-Iinclude", "-Ilibs/video", "-o", str(binary),
                         *["libs/video/" + s for s in sources]], cwd=root, check=True)
         subprocess.run([str(binary)], cwd=root, check=True)
+        subprocess.run([str(binary), "single"], cwd=root, check=True)
 
 
 if __name__ == "__main__":
