@@ -12,7 +12,11 @@
 #include <stdlib.h>
 #include "rsx_vulkan_backend.h"
 
+/* The runtime library references these; a lifted title provides them. */
 uint8_t* vm_base = NULL;   /* the backend reads guest memory only for draws */
+struct smoke_func_entry { uint64_t addr; void* func; const char* name; };
+const struct smoke_func_entry function_table[1] = { { 0, NULL, NULL } };
+const uint64_t function_table_count = 0;
 
 static int g_failures;
 #define CHECK(cond, ...) do { \
