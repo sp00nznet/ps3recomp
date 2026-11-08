@@ -68,6 +68,38 @@ jobs:
           cmake --build build --target test_shader_spirv
           ./build/test_shader_spirv
 
+      # PS3RECOMP_VK_DIRECT_PRESENT: a direct engine present (no read-back, no
+      # CPU wait) must leave the same frame a read-back present does, with
+      # the validation layer's synchronization checks on, unbatched and
+      # under VK_DRAW_BATCH. So must a present through the present thread
+      # (PS3RECOMP_RSX_PRESENT_THREAD=1), which also checks that the last
+      # frame it showed is the final frame.
+      - name: Direct, threaded and read-back engine presents
+        env:
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+        run: |
+          cmake --build build --target test_vulkan_direct_present
+          printf 'khronos_validation.validate_core = true\nkhronos_validation.validate_sync = true\n' > vk_layer_settings.txt
+          export VK_LAYER_SETTINGS_PATH=$PWD/vk_layer_settings.txt
+          fail=0
+          for batch in 0 1; do
+            for mode in 0 1 thread; do
+              rc=0
+              direct=0; thread=0
+              [ "$mode" = 1 ] && direct=1
+              [ "$mode" = thread ] && thread=1
+              VK_DRAW_BATCH=$batch PS3RECOMP_VK_DIRECT_PRESENT=$direct PS3RECOMP_RSX_PRESENT_THREAD=$thread \
+                ./build/test_vulkan_direct_present "batch$batch" "frame-$batch-$mode.bin" > run.log 2>&1 || rc=$?
+              echo "::group::batch=$batch mode=$mode -> exit $rc"; cat run.log; echo "::endgroup::"
+              [ "$rc" -eq 0 ] || { echo "::error::batch=$batch mode=$mode: exit $rc"; fail=1; }
+              if grep -qE "VUID|SYNC-HAZARD" run.log; then echo "::error::batch=$batch mode=$mode: validation messages"; fail=1; fi
+              if grep -q "SKIP" run.log; then echo "::error::batch=$batch mode=$mode: skipped"; fail=1; fi
+            done
+            cmp "frame-$batch-0.bin" "frame-$batch-1.bin" || { echo "::error::batch=$batch: direct and read-back frames differ"; fail=1; }
+            cmp "frame-$batch-0.bin" "frame-$batch-thread.bin" || { echo "::error::batch=$batch: threaded and read-back frames differ"; fail=1; }
+          done
+          exit $fail
+
       - name: Fixed-function path (no guest programs)
         run: |
           fail=0

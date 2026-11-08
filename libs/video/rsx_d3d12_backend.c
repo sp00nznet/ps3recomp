@@ -24,6 +24,7 @@
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "rsx_present_thread.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -7857,6 +7858,9 @@ static rsx_backend s_d3d12_backend = {0};
 
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
+    /* PS3RECOMP_RSX_PRESENT_THREAD has no half here: say so once and present
+     * as always. */
+    if (rsx_present_thread_requested()) rsx_present_thread_unsupported("d3d12", NULL);
     memset(&s_d3d, 0, sizeof(s_d3d));
     s_d3d.width = width;
     s_d3d.height = height;
