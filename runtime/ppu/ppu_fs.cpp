@@ -14,6 +14,8 @@
  * through vm_base in big-endian.
  */
 #define PPU_NO_INLINE_STORES   /* declares its own out-of-line vm_write32/64 below */
+#include "../memory/vm_watch_hooks.h"
+#include <errno.h>
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
@@ -493,7 +495,9 @@ static void cellFsRead(ppu_context* ctx)
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     fs_set_dir(fd, f, 1);
+    vm_note_write(buf, (size_t)nbytes);   /* kernel write into guest memory */
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
+    vm_note_write_check(n < (size_t)nbytes && ferror(f) && errno == EFAULT, "cellFsRead");
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -1016,8 +1020,11 @@ static void cellFsAioRead(ppu_context* ctx)
          * and the seek back (stdio's own calls take the same lock). */
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
-        if (HOST_FSEEK64(f, offset) == 0)
+        if (HOST_FSEEK64(f, offset) == 0) {
+            vm_note_write(buf, (size_t)size);   /* kernel write into guest memory */
             n = fread(vm_base + buf, 1, (size_t)size, f);
+            vm_note_write_check(n < (size_t)size && ferror(f) && errno == EFAULT, "cellFsReadWithOffset");
+        }
         if (pos >= 0) HOST_FSEEK64(f, pos);
         HOST_UNLOCKFILE(f);
         err = CELL_OK;

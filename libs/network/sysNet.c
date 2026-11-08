@@ -47,6 +47,7 @@
 #endif
 
 #include "host_socket_send.h"
+#include "../../runtime/memory/vm_watch_hooks.h"
 #include "sysNet.h"
 #include "../../runtime/ppu/ppu_context.h"
 #include "../../runtime/ppu/ppu_memory.h"
@@ -629,11 +630,24 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
 
+/* Whether the last socket call failed because it could not write its buffer
+ * (a guest page the write watch protects without an announcement). */
+static int host_access_fault(void)
+{
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEFAULT;
+#else
+    return errno == EFAULT;
+#endif
+}
+
 int32_t sys_net_bnet_recv(int32_t s, void* buf, uint32_t len, int32_t flags)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
+    vm_note_host_write(GUEST_PTR(EA(buf), char*), len);   /* kernel write into guest memory */
     int n = recv(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len, host_recv_flags(flags));
+    vm_note_write_check(n == HOST_SOCKET_ERROR && host_access_fault(), "sys_net recv");
     if (net_trace() && n != HOST_SOCKET_ERROR) trace("recv", s, n, NULL);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
@@ -652,8 +666,10 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
         if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
         memset(&a, 0, sizeof(a));
         alen = sizeof(a);
+        vm_note_host_write(GUEST_PTR(EA(buf), char*), len);   /* kernel write into guest memory */
         n = recvfrom(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len,
                      host_recv_flags(flags), (struct sockaddr*)&a, &alen);
+        vm_note_write_check(n == HOST_SOCKET_ERROR && host_access_fault(), "sys_net recvfrom");
         if (n == HOST_SOCKET_ERROR) return host_fail();
         if (s_sockets[s].p2p && n > 0) {
             uint32_t un = (uint32_t)n;
