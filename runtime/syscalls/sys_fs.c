@@ -368,9 +368,11 @@ int64_t sys_fs_open(ppu_context* ctx)
     /* NPDRM: a file that begins "NPD\0" is an EDAT, and on hardware the guest never
      * sees its ciphertext -- sceNpDrmIsAvailable primes the kernel and cellFsOpen
      * returns plaintext. Decrypt once into a cache file and open that instead, so
-     * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c) */
+     * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c)
+     * SDATA is the exception: a plain open returns its raw container on hardware,
+     * and only cellFsSdataOpen decrypts it. */
     { char dec_path[1200];
-      const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
+      const char* use = edat_resolve_open(host_path, dec_path, sizeof dec_path);
       if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
 
     /* (The fd slot is claimed at the end, under fs_slot_lock, once the host

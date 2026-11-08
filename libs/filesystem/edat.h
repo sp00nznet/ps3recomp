@@ -43,9 +43,18 @@ int edat_decrypt_file(const char* in_path, const char* out_path);
  * Returns host_path unchanged when it is not an EDAT, or when decryption fails (the
  * caller then opens the original and the guest reports its own error -- better than
  * an open() failure it cannot attribute). Otherwise returns a cache path, written
- * into `buf`. The cache lives beside the source as "<name>.dec" and is reused while
- * it is newer than the source. Set PS3_EDAT=0 to disable the whole path. */
+ * into `buf`. The cache lives in $PS3RECOMP_EDAT_CACHE (default: a ps3recomp-edat
+ * directory under the host temp directory), never beside the source, which is
+ * usually the read-only disc tree; it is reused while it is newer than the source.
+ * Set PS3_EDAT=0 to disable the whole path. */
 const char* edat_resolve(const char* host_path, char* buf, size_t cap);
+
+/* The same resolution for a plain open (cellFsOpen, sys_fs_open): SDATA is left
+ * as its raw container, since only cellFsSdataOpen decrypts it; EDAT resolves as
+ * above. */
+const char* edat_resolve_open(const char* host_path, char* buf, size_t cap);
+/* 1 when `host_path` is an NPD container flagged as SDATA. */
+int edat_is_sdata(const char* host_path);
 
 /* Hand the runtime a klicensee the guest supplied. On hardware a game that owns
  * free (license type 3) or disc-bound EDATs passes its own klicensee to

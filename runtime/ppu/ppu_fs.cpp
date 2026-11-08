@@ -278,9 +278,10 @@ static void cellFsOpen(ppu_context* ctx)
     host_path(hpath, sizeof hpath, gpath);
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
-     * file and that is opened in its place. */
+     * file and that is opened in its place. SDATA stays raw here: only
+     * cellFsSdataOpen decrypts it. */
     { char dec_path[1200];
-      const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
+      const char* use = edat_resolve_open(hpath, dec_path, sizeof dec_path);
       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
 
     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.

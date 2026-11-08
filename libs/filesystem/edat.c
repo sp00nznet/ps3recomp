@@ -24,6 +24,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <direct.h>
+#endif
 
 /* ---------------------------------------------------------------------------
  * AES-128
@@ -668,6 +673,62 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
     return rc;
 }
 
+/* SDATA: an NPD container whose EDAT header flags (big-endian at 0x80) carry
+ * SDAT_FLAG. */
+static int npd_is_sdata(const char* host_path)
+{
+    FILE* f = fopen(host_path, "rb");
+    if (!f) return 0;
+    uint8_t h[0x84] = {0};
+    size_t n = fread(h, 1, sizeof h, f);
+    fclose(f);
+    return n == sizeof h && memcmp(h, "NPD\0", 4) == 0 && (be32(h + 0x80) & SDAT_FLAG) != 0;
+}
+
+int edat_is_sdata(const char* host_path)
+{
+    return host_path && npd_is_sdata(host_path);
+}
+
+/* Where the decrypted copy of `host_path` lives. Never beside the source: that is
+ * usually the read-only disc tree (dev_bdvd), and a stray <file>.dec there is a
+ * file the title never had. $PS3RECOMP_EDAT_CACHE names the directory; otherwise
+ * a ps3recomp-edat directory under the host temp directory. The name keys the
+ * full source path (FNV-1a 64) and keeps its base name for diagnostics. */
+static int edat_cache_path(const char* host_path, char* buf, size_t cap)
+{
+    char dir[1024];
+    const char* base_dir = getenv("PS3RECOMP_EDAT_CACHE");
+    if (base_dir && *base_dir) {
+        if ((size_t)snprintf(dir, sizeof dir, "%s", base_dir) >= sizeof dir) return -1;
+    } else {
+#ifdef _WIN32
+        char tmp[MAX_PATH + 1];
+        DWORD n = GetTempPathA((DWORD)sizeof tmp, tmp);
+        if (n == 0 || n > sizeof tmp) return -1;
+        if ((size_t)snprintf(dir, sizeof dir, "%sps3recomp-edat", tmp) >= sizeof dir) return -1;
+#else
+        const char* tmp = getenv("TMPDIR");
+        if (!tmp || !*tmp) tmp = "/tmp";
+        if ((size_t)snprintf(dir, sizeof dir, "%s/ps3recomp-edat", tmp) >= sizeof dir) return -1;
+#endif
+    }
+#ifdef _WIN32
+    _mkdir(dir);
+#else
+    mkdir(dir, 0700);
+#endif
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char* p = (const unsigned char*)host_path; *p; p++) {
+        unsigned char c = *p == '\\' ? '/' : *p;
+        h = (h ^ c) * 1099511628211ull;
+    }
+    const char* name = host_path;
+    for (const char* p = host_path; *p; p++)
+        if (*p == '/' || *p == '\\') name = p + 1;
+    return (size_t)snprintf(buf, cap, "%s/%016llx-%s.dec", dir, (unsigned long long)h, name) >= cap ? -1 : 0;
+}
+
 const char* edat_resolve(const char* host_path, char* buf, size_t cap)
 {
     static int enabled = -1;
@@ -677,7 +738,7 @@ const char* edat_resolve(const char* host_path, char* buf, size_t cap)
     }
     if (!enabled || !host_path || !edat_is_npd(host_path)) return host_path;
 
-    if ((size_t)snprintf(buf, cap, "%s.dec", host_path) >= cap) return host_path;
+    if (edat_cache_path(host_path, buf, cap) != 0) return host_path;
 
     struct stat ss, ds;
     if (stat(host_path, &ss) == 0 && stat(buf, &ds) == 0 && ds.st_mtime >= ss.st_mtime)
@@ -685,4 +746,16 @@ const char* edat_resolve(const char* host_path, char* buf, size_t cap)
 
     if (edat_decrypt_file(host_path, buf) != 0) return host_path;
     return buf;
+}
+
+/* A plain open (cellFsOpen, sys_fs_open). On hardware an EDAT reads back as
+ * plaintext once the title has primed its key, but SDATA is decrypted only by
+ * cellFsSdataOpen: a plain open of a .sdat returns the container's own bytes,
+ * the same ones stat sizes. A title that copies its .sdat elsewhere reads it
+ * raw, stat-size bytes; serving the shorter plaintext made that copy fail on
+ * the final short read. */
+const char* edat_resolve_open(const char* host_path, char* buf, size_t cap)
+{
+    if (edat_is_sdata(host_path)) return host_path;
+    return edat_resolve(host_path, buf, cap);
 }
