@@ -8,6 +8,7 @@ at configure time; without one nothing changes.
 | CMake option | Platforms | Host |
 |---|---|---|
 | `PS3RECOMP_NATIVE_OSK_HEADLESS` | POSIX other than macOS | No window: the dialog opens with its initial text and is confirmed only through the control mailbox (below). |
+| `PS3RECOMP_NATIVE_OSK_WINDOWS` | Windows | A small dialog owned by the game window of the null/live or D3D12 backend (below). |
 
 ## Lifecycle
 
@@ -42,6 +43,25 @@ user interface.
   Every file found is consumed, valid or not; commands written before the
   dialog opened, for another token, or repeated are ignored.
 
+## Windows host
+
+With `PS3RECOMP_NATIVE_OSK_WINDOWS=ON` the null/live and D3D12 backends
+register their game window, and a request shows as a small window owned by it:
+the prompt, an edit control with the initial text (masked for password panels,
+read-only for a zero limit), OK and Cancel. The dialog is created, fed and
+destroyed only on the thread that owns the game window, from that backend's
+message pump, which then reads messages as Unicode and routes the dialog's
+keyboard messages to it. Other threads only queue copied requests, closes and
+confirmations, and wake that thread. Closing the game window closes the dialog
+and makes the host unavailable. The dialog takes focus only when the game
+window was in the foreground.
+
+While a dialog is queued or open, until the title unloads it, it owns the
+keyboard: the keyboard pad fallback in `cellPad` reports nothing, and a key
+still held when it closes is ignored until it is released.
+`OSK_NATIVE_CONTROL_FILE` and `PS3RECOMP_OSK_INITIAL_TEXT` are read as UTF-16
+from the environment.
+
 ## Tests
 
 - `python3 tools/test_native_osk.py` builds the real `cellOskDialog.c`,
@@ -50,3 +70,10 @@ user interface.
   the initial-text override and the mailbox.
 - `python3 tools/test_native_osk_headless.py` runs the headless host end to end.
 - `python3 tools/test_native_osk_control.py` checks the confirm helper.
+- `python tools/test_native_osk_windows.py --runtime-library <ps3recomp_runtime.lib>`
+  (Windows; a `/MT` runtime built with `PS3RECOMP_NATIVE_OSK_WINDOWS=ON`) drives
+  real NID dispatch and the real dialog controls over a real parent window on
+  a private desktop: Unicode prompt, prefill and typed text, limits, secure
+  Cancel, read-only zero limit, abort before and after opening, closes that
+  race the owner thread, stale requests, a worker-thread caller, the control
+  mailbox, both backends' pumps and closing the parent.

@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include "ps3emu/log_first.h"
 #include "rsx_d3d12_backend.h"
+#include "../misc/osk_native.h"
 #include "rsx_present_policy.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -7920,11 +7921,17 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     s_d3d.last_fps_time = GetTickCount64();
 
     printf("[D3D12] Backend ready: %ux%u\n", width, height);
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_set_window(s_d3d.hwnd);
+#endif
     return 0;
 }
 
 void rsx_d3d12_backend_shutdown(void)
 {
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_set_window(NULL);
+#endif
     if (!s_d3d.initialized) return;
 
     wait_for_gpu();
@@ -7963,12 +7970,25 @@ void rsx_d3d12_backend_shutdown(void)
 
 int rsx_d3d12_backend_pump_messages(void)
 {
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    /* The native OSK dialog lives on this thread: open, close or confirm what
+     * other threads queued, and route its keyboard messages (Unicode). */
+    osk_native_win32_pump();
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) return -1;
+        if (osk_native_win32_handle_message(&msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+#else
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+#endif
     return s_d3d.window_closed ? -1 : 0;
 }
 

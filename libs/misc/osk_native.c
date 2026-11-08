@@ -17,9 +17,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 extern uint32_t ppu_vm_size;   /* zero denotes the whole 32-bit mapping */
 
@@ -58,17 +63,26 @@ static void unlock(void) { atomic_flag_clear_explicit(&s_lock, memory_order_rele
  * discarded. Writers publish atomically (tools/native_osk_confirm.py).
  * -----------------------------------------------------------------------*/
 static int  s_control_initialized;
+#ifdef _WIN32
+static WCHAR s_control_path[4096];   /* the variable's own UTF-16 value */
+#else
 static char s_control_path[4096];
+#endif
 
 static void control_init(void)   /* caller holds the lock */
 {
     if (s_control_initialized) return;
     s_control_initialized = 1;
+#ifdef _WIN32
+    DWORD n = GetEnvironmentVariableW(L"OSK_NATIVE_CONTROL_FILE", s_control_path, 4096);
+    if (!n || n >= 4096) s_control_path[0] = 0;
+#else
     const char* path = getenv("OSK_NATIVE_CONTROL_FILE");
     if (path && *path) {
         size_t n = strnlen(path, sizeof(s_control_path));
         if (n < sizeof(s_control_path)) memcpy(s_control_path, path, n + 1);
     }
+#endif
 }
 
 static uint64_t control_command(const unsigned char* command, size_t n)
@@ -91,6 +105,26 @@ static uint64_t control_poll(void)   /* caller holds the lock */
 {
     control_init();
     if (!s_control_path[0]) return 0;
+#ifdef _WIN32
+    /* Same rules as below: a regular file only (no reparse points), at most
+     * 64 bytes, deleted through the handle that read it. */
+    HANDLE file = CreateFileW(s_control_path, GENERIC_READ | DELETE, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    unsigned char command[64];
+    DWORD count = 0;
+    uint64_t token = 0;
+    BY_HANDLE_FILE_INFORMATION info;
+    LARGE_INTEGER size;
+    const int regular = GetFileType(file) == FILE_TYPE_DISK && GetFileInformationByHandle(file, &info) &&
+                        !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+    if (regular && GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= 64 &&
+        ReadFile(file, command, sizeof(command), &count, NULL) && count == (DWORD)size.QuadPart)
+        token = control_command(command, count);
+    FILE_DISPOSITION_INFO dispose = {TRUE};
+    const int consumed = regular && SetFileInformationByHandle(file, FileDispositionInfo, &dispose, sizeof(dispose));
+    if (!CloseHandle(file) || !consumed) token = 0;
+#else
     int fd = open(s_control_path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
     if (fd < 0) return 0;
     struct stat st;
@@ -101,6 +135,7 @@ static uint64_t control_poll(void)   /* caller holds the lock */
     close(fd);
     unlink(s_control_path);
     uint64_t token = (n > 0 && n == st.st_size) ? control_command(command, (size_t)n) : 0;
+#endif
     if (token && token == s.token && s.state == ST_OPEN && !s.control_confirmed) {
         s.control_confirmed = 1;
         return token;
@@ -166,8 +201,30 @@ static void host_initial_utf8(uint16_t* initial, uint32_t limit, const unsigned 
 
 static void host_initial_text(uint16_t* initial, uint32_t limit)
 {
+#ifdef _WIN32
+    /* The CRT's getenv gives the ANSI code page; read the UTF-16 value and
+     * convert it strictly, so the rules above apply unchanged. */
+    SetLastError(ERROR_SUCCESS);
+    DWORD count = GetEnvironmentVariableW(L"PS3RECOMP_OSK_INITIAL_TEXT", NULL, 0);
+    if (!count) {
+        if (GetLastError() == ERROR_SUCCESS) initial[0] = 0;   /* set and empty */
+        return;
+    }
+    if (count > 32768) return;
+    WCHAR* wide = malloc((size_t)count * sizeof(WCHAR));
+    if (!wide) return;
+    DWORD copied = GetEnvironmentVariableW(L"PS3RECOMP_OSK_INITIAL_TEXT", wide, count);
+    if (!copied || copied >= count) { free(wide); return; }
+    int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, NULL, 0, NULL, NULL);
+    unsigned char* utf8 = bytes > 0 ? malloc((size_t)bytes) : NULL;
+    if (utf8 && WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1, (char*)utf8, bytes, NULL, NULL))
+        host_initial_utf8(initial, limit, utf8);
+    free(utf8);
+    free(wide);
+#else
     const unsigned char* p = (const unsigned char*)getenv("PS3RECOMP_OSK_INITIAL_TEXT");
     if (p) host_initial_utf8(initial, limit, p);
+#endif
 }
 
 /* ---------------------------------------------------------------------------

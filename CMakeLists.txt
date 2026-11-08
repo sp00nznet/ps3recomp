@@ -221,6 +221,15 @@ if(NOT WIN32 AND NOT APPLE)
         message(STATUS "  OSK:          headless native host")
     endif()
 endif()
+if(WIN32)
+    # A small Win32 dialog owned by the game window, run on the thread that
+    # pumps it: the null/live and D3D12 backends (libs/misc/osk_win32.c).
+    option(PS3RECOMP_NATIVE_OSK_WINDOWS "Build the Windows native OSK host" OFF)
+    if(PS3RECOMP_NATIVE_OSK_WINDOWS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_WINDOWS=1)
+        message(STATUS "  OSK:          Windows native host")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Guest shaders on Metal: HLSL -> SPIR-V -> MSL
