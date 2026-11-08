@@ -75,6 +75,16 @@ ctest --test-dir build-tests --output-on-failure
 
 This builds and runs the deterministic runtime synchronization stress suite.
 
+The `tools/test_*.py` scripts are the other half of CI; run any that cover what you changed.
+
+### Opt-in flags
+
+Every environment variable and CMake option the code reads is listed in
+[docs/OPT_IN_FLAGS.md](docs/OPT_IN_FLAGS.md). If your change adds, renames or removes one, or
+changes its default, update that file in the same change and run
+`python tools/check_opt_in_flags.py`. [AGENTS.md](AGENTS.md) has the details, for people and
+coding agents alike.
+
 ---
 
 ## Project Architecture
