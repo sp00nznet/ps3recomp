@@ -13,6 +13,10 @@
  */
 #include "../rsx_metal_backend.m"
 
+/* A full record array submits mid-frame (eng_record_room), which reaches
+ * eng_blit_to_display's gamma; no display here. */
+float cellAvconfExt_display_gamma(void) { return 1.0f; }
+
 static int g_fail;
 
 #define CHECK(cond, ...)                                                      \
