@@ -962,12 +962,108 @@ extern "C" void ppu_report_guest_lrs(void)
     fflush(stderr);
 }
 
+/* PS3RECOMP_PPU_RESV_OPEN_COUNT=1 (opt-in): count the reservations that are
+ * open -- taken by a load-reserve and not yet consumed by a store-conditional --
+ * per 128-byte line (a hashed table), so the reservation breaks below can skip
+ * their scan of every registered context when no other context can hold a
+ * reservation on the line they write. That is the usual case: a break
+ * runs on every successful stwcx./stdcx. and every write to an SPU-reserved
+ * line, while a context sits between lwarx and stwcx. only briefly.
+ *
+ * Every load-reserve must report itself through ppu_resv_open_note() BEFORE it
+ * reads the reserved value: the ppu_memory.h helpers do, and lifted code does
+ * when the lifter runs with --resv-open-count. Set the variable only when every
+ * lifted image in the process was lifted with that option: a reservation taken
+ * without the note is invisible to the counts. As a guard, the breaks keep
+ * scanning until some note has run, so the variable alone does nothing on a
+ * lift made without the option.
+ *
+ * Why skipping is safe: the note raises its line's count (seq_cst RMW, then a
+ * seq_cst fence) before the load-reserve reads its value, and a break reads the
+ * count (seq_cst fence, then a seq_cst load) after the store it follows. If a
+ * break sees no other open reservation, a load-reserve it did not see counted reads
+ * its value after that store, so its reservation already includes the store
+ * and there is nothing to break. A slot shared by several lines, or a count
+ * left high (a context that never reaches its store-conditional, or fibers
+ * that interleave load-reserves on one host thread), only keeps the scan.
+ *
+ * Counts are tracked per host thread for the context that took them. A thread
+ * that load-reserves for a different context than the one it is tracking
+ * leaves the earlier counts in place (they only keep the scan) and starts
+ * tracking the new one. Off (the default), nothing is counted and the breaks
+ * scan as before. */
+extern "C" int g_resv_open_active = -1;          /* -1 unresolved, 0 off, 1 on */
+static int s_resv_open_armed;                    /* a note has run */
+#define PPU_RESV_LINE_SLOTS 4096u
+static int s_resv_line_open[PPU_RESV_LINE_SLOTS];   /* the same, by line hash */
+static PPU_THREAD_LOCAL ppu_context* t_resv_open_ctx;   /* context this thread counted */
+static PPU_THREAD_LOCAL uint32_t     t_resv_open_line;
+static inline int* ppu_resv_line_slot(uint32_t ea)
+{
+    return &s_resv_line_open[(ea >> 7) & (PPU_RESV_LINE_SLOTS - 1u)];
+}
+static int ppu_resv_open_resolve(void)
+{
+    int on = __atomic_load_n(&g_resv_open_active, __ATOMIC_RELAXED);
+    if (__builtin_expect(on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_PPU_RESV_OPEN_COUNT");
+        on = (e && !strcmp(e, "1")) ? 1 : 0;
+        int expected = -1;
+        if (__atomic_compare_exchange_n(&g_resv_open_active, &expected, on, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED) && on) {
+            fprintf(stderr, "[ppu-resv] open reservation counts on\n");
+            fflush(stderr);
+        }
+        on = __atomic_load_n(&g_resv_open_active, __ATOMIC_RELAXED);
+    }
+    return on;
+}
+extern "C" void ppu_resv_open_note(ppu_context* ctx, uint32_t ea)
+{
+    if (ppu_resv_open_resolve() <= 0) return;
+    const uint32_t line = ea & ~127u;
+    if (t_resv_open_ctx == ctx && ctx) {
+        if (t_resv_open_line != line) {
+            __atomic_fetch_add(ppu_resv_line_slot(line), 1, __ATOMIC_SEQ_CST);
+            __atomic_fetch_sub(ppu_resv_line_slot(t_resv_open_line), 1, __ATOMIC_RELEASE);
+            t_resv_open_line = line;
+        }
+    } else {
+        __atomic_fetch_add(ppu_resv_line_slot(line), 1, __ATOMIC_SEQ_CST);
+        t_resv_open_ctx = ctx;
+        t_resv_open_line = line;
+    }
+    if (!__atomic_load_n(&s_resv_open_armed, __ATOMIC_RELAXED))
+        __atomic_store_n(&s_resv_open_armed, 1, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+/* ctx's reservation has been consumed (its store-conditional ran). Call only
+ * after the conditional store and its breaks. */
+extern "C" void ppu_resv_open_done(ppu_context* ctx)
+{
+    if (!ctx || t_resv_open_ctx != ctx) return;
+    t_resv_open_ctx = nullptr;
+    __atomic_fetch_sub(ppu_resv_line_slot(t_resv_open_line), 1, __ATOMIC_RELEASE);
+}
+/* True when no context but `self` (nullptr: none) can hold an open reservation
+ * on ea's line: a break of that line that spares `self` has nothing to do. */
+static inline bool ppu_resv_line_clear(ppu_context* self, uint32_t ea)
+{
+    if (__atomic_load_n(&g_resv_open_active, __ATOMIC_RELAXED) <= 0 ||
+        !__atomic_load_n(&s_resv_open_armed, __ATOMIC_RELAXED)) return false;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int* slot = ppu_resv_line_slot(ea);
+    const int own = self && t_resv_open_ctx == self && ppu_resv_line_slot(t_resv_open_line) == slot;
+    return __atomic_load_n(slot, __ATOMIC_SEQ_CST) <= own;
+}
+
 /* Break every reservation on ea's word (real-PPC granule semantics on a store).
  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
  * recheck reads reserve_addr under its slot lock and the value-CAS backstops the
  * narrow race. Skips already-invalid slots. */
 extern "C" void ppu_resv_break_store(uint64_t ea)
 {
+    if (ppu_resv_line_clear(nullptr, (uint32_t)ea)) return;   /* opt-in, see ppu_resv_open_note */
     uint32_t a = (uint32_t)ea & ~3u;
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
@@ -987,6 +1083,7 @@ extern "C" void ppu_resv_break_line(uint32_t ea)
 {
     const uint32_t line = ea & ~127u;
     ppu_context* self = g_active_ctx;
+    if (ppu_resv_line_clear(self, ea)) return;   /* opt-in, see ppu_resv_open_note */
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
@@ -1000,6 +1097,10 @@ static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L
 static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
 static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 {
+    /* Opt-in skip (see ppu_resv_open_note). The caller's own reservation is the
+     * one its store-conditional just consumed, so it is spared from the count. */
+    ppu_context* self = g_active_ctx;
+    if (ppu_resv_line_clear(self, (uint32_t)addr)) return;
     uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
@@ -1038,8 +1139,18 @@ static inline int resv_off() { static int v = -1; if (v < 0) v = getenv("PPU_RES
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
 extern "C" uint32_t g_ww_lo, g_ww_hi;
 
+namespace {
+struct PpuResvOpenRelease {
+    ppu_context* ctx;
+    explicit PpuResvOpenRelease(ppu_context* c) : ctx(c) {}
+    ~PpuResvOpenRelease() { if (g_resv_open_active > 0) ppu_resv_open_done(ctx); }
+};
+}
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
+    /* Consumes the caller's open reservation count on every return, after
+     * the conditional store and its breaks (see ppu_resv_open_note). */
+    PpuResvOpenRelease release_open_count(g_active_ctx);
     uint32_t exp_raw = __builtin_bswap32(expected);
     uint32_t new_raw = __builtin_bswap32(val);
     if (resv_off())
@@ -1131,6 +1242,9 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 }
 extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
 {
+    /* Consumes the caller's open reservation count on every return, after
+     * the conditional store and its breaks (see ppu_resv_open_note). */
+    PpuResvOpenRelease release_open_count(g_active_ctx);
     uint64_t exp_raw = __builtin_bswap64(expected);
     uint64_t new_raw = __builtin_bswap64(val);
     if (resv_off())

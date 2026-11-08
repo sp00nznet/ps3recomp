@@ -19,6 +19,11 @@ extern uint8_t* vm_base;
  * threads there is never a live reservation. */
 int  g_resv_store_active = 0;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+/* The opt-in open-reservation counts (PS3RECOMP_PPU_RESV_OPEN_COUNT): with
+ * nothing to break, there is nothing to count. */
+int  g_resv_open_active = 0;
+void ppu_resv_open_note(ppu_context* ctx, uint32_t ea) { (void)ctx; (void)ea; }
+void ppu_resv_open_done(ppu_context* ctx) { (void)ctx; }
 
 /* ppu_loader.cpp - each guest thread registers its context so a concurrent
  * stwcx can break its reservation. With g_resv_store_active off there is
