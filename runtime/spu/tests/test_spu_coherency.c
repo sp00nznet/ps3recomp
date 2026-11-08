@@ -44,6 +44,9 @@ uint8_t* vm_base = g_guest_mem;
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 int      g_resv_store_active = 0;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+int g_resv_open_active = 0;
+void ppu_resv_open_note(ppu_context* ctx, uint32_t ea) { (void)ctx; (void)ea; }
+void ppu_resv_open_done(ppu_context* ctx) { (void)ctx; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
     (void)addr; (void)val; (void)width;
