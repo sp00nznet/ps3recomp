@@ -6,6 +6,7 @@
  * Heap uses standard malloc with tracking.
  */
 
+#include "../../runtime/memory/vm_watch_hooks.h"
 #include "sysPrxForUser.h"
 #include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
@@ -1123,6 +1124,7 @@ s32 sys_get_random_number(void* buf, u64 size)
     /* Use /dev/urandom on Unix */
     FILE* f = fopen("/dev/urandom", "rb");
     if (f) {
+        vm_note_host_write(buf, (size_t)size);   /* kernel write into guest memory */
         fread(buf, 1, (size_t)size, f);
         fclose(f);
     } else {

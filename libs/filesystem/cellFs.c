@@ -5,6 +5,8 @@
  * to host filesystem paths and performs real I/O.
  */
 
+#include "../../runtime/memory/vm_watch_hooks.h"
+#include <errno.h>
 #include "cellFs.h"
 #include "../../runtime/platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/endian.h"
@@ -527,7 +529,10 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
          * which made this look handled -- but the file contents were being read
          * to a raw guest address interpreted as a host one, so nothing the
          * title loaded ever landed in guest memory. */
+        vm_note_host_write(gptr(buf), (size_t)nbytes);   /* kernel write into guest memory */
         bytes_read = (u64)fread(gptr(buf), 1, (size_t)nbytes, s_files[fd].host_fp);
+        vm_note_write_check(bytes_read < nbytes && ferror(s_files[fd].host_fp) && errno == EFAULT,
+                            "cellFsRead (libs)");
     }
 
     { static int _n = 0;
