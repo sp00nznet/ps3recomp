@@ -31,6 +31,8 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
+void spu_linelock_lock(uint32_t a) { (void)a; }
+void spu_linelock_release(uint32_t a) { (void)a; }
 void spu_lockline_unlock(void) {}
 
 static int fails = 0;
