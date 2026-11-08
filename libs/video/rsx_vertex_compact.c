@@ -523,3 +523,502 @@ int rsx_vertex_topology_plan(
         return 0;
     }
 }
+
+/* ---- converted-vertex cache ---------------------------------------------- */
+
+/* The hash: four independent lanes, each folding 16 bytes per step with a
+ * 64x64->128 multiply whose halves are xor-ed together, the "mum" step of
+ * wyhash (Wang Yi, public domain / Unlicense). The constants are wyhash's
+ * default secret. Lanes keep the multiplies independent, so a frame's tens of
+ * megabytes of vertex data hash at memory speed. The key is 128 bits, but a
+ * difference in the input reaches it through one 64-bit lane: two different
+ * inputs share a key with a probability of about 2^-64. */
+#define VC_S0 0xa0761d6478bd642full
+#define VC_S1 0xe7037ed1a0b428dbull
+#define VC_S2 0x8ebc6af09c88c6e3ull
+#define VC_S3 0x589965cc75374cc3ull
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static u64 vc_mum(u64 a, u64 b)
+{
+#if defined(_M_X64)
+    u64 hi;
+    const u64 lo = _umul128(a, b, &hi);
+    return lo ^ hi;
+#else
+    return (a * b) ^ __umulh(a, b);
+#endif
+}
+#else
+static u64 vc_mum(u64 a, u64 b)
+{
+    const __uint128_t r = (__uint128_t)a * b;
+    return (u64)r ^ (u64)(r >> 64);
+}
+#endif
+
+static u64 vc_rd64(const u8* p)
+{
+    u64 v;
+    memcpy(&v, p, sizeof v);
+    return v;
+}
+
+rsx_vc_key rsx_vc_hash(const void* data, size_t n, rsx_vc_key seed)
+{
+    const u8* p = (const u8*)data;
+    const u64 len = (u64)n;
+    u64 a = seed.lo ^ VC_S0, b = seed.hi ^ VC_S1;
+    u64 c = seed.lo ^ VC_S2 ^ len, d = seed.hi ^ VC_S3;
+    while (n >= 64) {
+        a = vc_mum(vc_rd64(p)      ^ VC_S0, vc_rd64(p + 8)  ^ a);
+        b = vc_mum(vc_rd64(p + 16) ^ VC_S1, vc_rd64(p + 24) ^ b);
+        c = vc_mum(vc_rd64(p + 32) ^ VC_S2, vc_rd64(p + 40) ^ c);
+        d = vc_mum(vc_rd64(p + 48) ^ VC_S3, vc_rd64(p + 56) ^ d);
+        p += 64;
+        n -= 64;
+    }
+    while (n >= 16) {
+        a = vc_mum(vc_rd64(p) ^ VC_S1, vc_rd64(p + 8) ^ a);
+        p += 16;
+        n -= 16;
+    }
+    u8 tail[16] = {0};
+    if (n) memcpy(tail, p, n);
+    b = vc_mum(vc_rd64(tail) ^ VC_S2, vc_rd64(tail + 8) ^ b ^ (u64)n);
+    rsx_vc_key out;
+    const u64 x = vc_mum(a ^ VC_S1, b ^ len ^ VC_S3);
+    const u64 y = vc_mum(c ^ VC_S0, d ^ VC_S2);
+    out.lo = vc_mum(x ^ VC_S2, y ^ VC_S1);
+    out.hi = vc_mum(x ^ VC_S3, y ^ seed.hi ^ VC_S0) ^ out.lo;
+    return out;
+}
+
+rsx_vc_key rsx_vc_mix(rsx_vc_key k, u64 v)
+{
+    return rsx_vc_hash(&v, sizeof v, k);
+}
+
+/* Blocks are multiples of 256 bytes, so every offset is aligned for any
+ * vertex or index buffer a host API binds. */
+#define VC_MIN_SHIFT   8u
+#define VC_MIN_CHUNK   (64u << 10)
+#define VC_TAG_FREE    0x80u
+#define VC_MAX_ENTRIES 32768u
+/* Ranges: 4-way sets, the least recently stored way replaced. A firefight
+ * frame has ~7800 distinct index keys; direct-mapped at 16K slots a fifth of
+ * them collided every frame and their draws converted again. */
+#define VC_RANGES      65536u
+#define VC_RANGE_WAYS  4u
+/* Entries unused for this many frames go first when memory runs out; past
+ * that, anything not used this frame or the last. */
+#define VC_AGE_OLD     30u
+#define VC_AGE_MIN     2u
+
+typedef struct {
+    u32 handle;
+    u8* cpu;
+    u8* tag;           /* per granule at a block start: order + 1 | FREE */
+} vc_chunk;
+
+typedef struct {
+    u32 chunk, granule;
+    u8 order;
+    u64 serial;
+} vc_deferred;
+
+typedef struct {
+    rsx_vc_key key;
+    u32 first, last;
+    u64 stamp;          /* 0 = empty */
+} vc_range;
+
+struct rsx_vertex_cache {
+    rsx_vc_chunks be;
+    u32 chunk_bytes, max_chunks, max_order;
+    vc_chunk* chunks;
+    u32 n_chunks;
+
+    /* Free blocks per order, as (chunk << 32 | granule). An entry is only a
+     * hint: it stands for a free block while the tag there still says so. */
+    u64** free_list;
+    u32* free_n;
+    u32* free_cap;
+
+    vc_deferred* deferred;
+    u32 n_deferred, cap_deferred;
+    u64 deferred_min;        /* smallest serial among them, while there are any */
+
+    rsx_vc_entry* entries;   /* VC_MAX_ENTRIES */
+    u8* live;
+    u32* entry_free;
+    u32 n_entry_free;
+    u32* slots;              /* 2 * VC_MAX_ENTRIES; entry index + 1, 0 empty */
+    u32 slot_mask;
+
+    vc_range* ranges;
+    u64 range_stamp;
+    u64 last_failed_scan_frame;
+    rsx_vc_stats stats;
+};
+
+static int vc_push_free(rsx_vertex_cache* c, u32 order, u32 chunk, u32 granule)
+{
+    if (c->free_n[order] == c->free_cap[order]) {
+        const u32 cap = c->free_cap[order] ? c->free_cap[order] * 2u : 64u;
+        u64* p = (u64*)realloc(c->free_list[order], (size_t)cap * sizeof(u64));
+        if (!p) return 0;
+        c->free_list[order] = p;
+        c->free_cap[order] = cap;
+    }
+    c->free_list[order][c->free_n[order]++] = ((u64)chunk << 32) | granule;
+    return 1;
+}
+
+static int vc_chunk_add(rsx_vertex_cache* c)
+{
+    if (c->n_chunks >= c->max_chunks || !c->be.create) return 0;
+    const u32 granules = c->chunk_bytes >> VC_MIN_SHIFT;
+    u8* tag = (u8*)calloc(granules, 1);
+    if (!tag) return 0;
+    u8* cpu = NULL;
+    const u32 handle = c->be.create(c->be.user, c->chunk_bytes, &cpu);
+    if (!handle || !cpu) { free(tag); return 0; }
+    vc_chunk* ch = &c->chunks[c->n_chunks];
+    ch->handle = handle;
+    ch->cpu = cpu;
+    ch->tag = tag;
+    tag[0] = (u8)(VC_TAG_FREE | (c->max_order + 1u));
+    if (!vc_push_free(c, c->max_order, c->n_chunks, 0)) {
+        if (c->be.release) c->be.release(c->be.user, handle);
+        free(tag);
+        return 0;
+    }
+    c->n_chunks++;
+    return 1;
+}
+
+/* Pop a block of exactly `order` that is still free, or -1. */
+static int vc_pop_free(rsx_vertex_cache* c, u32 order, u32* chunk, u32* granule)
+{
+    const u8 want = (u8)(VC_TAG_FREE | (order + 1u));
+    while (c->free_n[order]) {
+        const u64 v = c->free_list[order][--c->free_n[order]];
+        const u32 ci = (u32)(v >> 32), g = (u32)v;
+        if (c->chunks[ci].tag[g] == want) {
+            /* Mark it taken now: a stale duplicate of this entry further
+             * down the list must not hand the same block out twice. */
+            c->chunks[ci].tag[g] = (u8)(order + 1u);
+            *chunk = ci;
+            *granule = g;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int vc_alloc(rsx_vertex_cache* c, u32 order, u32* chunk, u32* granule)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        for (u32 o = order; o <= c->max_order; o++) {
+            u32 ci, g;
+            if (vc_pop_free(c, o, &ci, &g) != 0) continue;
+            u8* tag = c->chunks[ci].tag;
+            while (o > order) {
+                o--;
+                const u32 buddy = g + (1u << o);
+                /* Tagged free even when its list cannot take it: vc_free
+                 * merges by the tags, so the block comes back when its
+                 * buddy is freed. */
+                tag[buddy] = (u8)(VC_TAG_FREE | (o + 1u));
+                vc_push_free(c, o, ci, buddy);
+            }
+            tag[g] = (u8)(order + 1u);
+            *chunk = ci;
+            *granule = g;
+            return 1;
+        }
+        if (pass == 0 && !vc_chunk_add(c)) break;
+    }
+    return 0;
+}
+
+static void vc_free(rsx_vertex_cache* c, u32 ci, u32 g, u32 order)
+{
+    u8* tag = c->chunks[ci].tag;
+    tag[g] = 0;
+    while (order < c->max_order) {
+        const u32 buddy = g ^ (1u << order);
+        if (tag[buddy] != (u8)(VC_TAG_FREE | (order + 1u))) break;
+        tag[buddy] = 0;
+        if (buddy < g) g = buddy;
+        order++;
+    }
+    tag[g] = (u8)(VC_TAG_FREE | (order + 1u));
+    vc_push_free(c, order, ci, g);
+}
+
+static void vc_reclaim(rsx_vertex_cache* c, u64 completed)
+{
+    /* Every insert asks; a walk only pays once the oldest reader is done. */
+    if (!c->n_deferred || completed < c->deferred_min) return;
+    u32 keep = 0;
+    u64 min = ~0ull;
+    for (u32 i = 0; i < c->n_deferred; i++) {
+        const vc_deferred d = c->deferred[i];
+        if (d.serial <= completed) {
+            vc_free(c, d.chunk, d.granule, d.order);
+        } else {
+            c->deferred[keep++] = d;
+            if (d.serial < min) min = d.serial;
+        }
+    }
+    c->n_deferred = keep;
+    c->deferred_min = min;
+}
+
+static u32 vc_slot_of(const rsx_vertex_cache* c, rsx_vc_key key)
+{
+    return (u32)(key.lo ^ (key.hi >> 17)) & c->slot_mask;
+}
+
+static int vc_key_eq(rsx_vc_key a, rsx_vc_key b)
+{
+    return a.lo == b.lo && a.hi == b.hi;
+}
+
+/* Remove the table slot holding entry index `ei` (linear probing, backward
+ * shift so no tombstones are left). */
+static void vc_slot_remove(rsx_vertex_cache* c, u32 ei)
+{
+    u32 s = vc_slot_of(c, c->entries[ei].key);
+    while (c->slots[s] != ei + 1u) s = (s + 1u) & c->slot_mask;
+    for (;;) {
+        c->slots[s] = 0;
+        u32 n = s;
+        for (;;) {
+            n = (n + 1u) & c->slot_mask;
+            if (!c->slots[n]) return;
+            const u32 home = vc_slot_of(c, c->entries[c->slots[n] - 1u].key);
+            /* Move n back into the hole at s unless its home lies in (s, n]. */
+            const int in_range = s <= n ? (home > s && home <= n)
+                                        : (home > s || home <= n);
+            if (!in_range) break;
+        }
+        c->slots[s] = c->slots[n];
+        s = n;
+    }
+}
+
+/* Drop one entry: its block is freed now when the GPU is done with it, or
+ * once it is. */
+static void vc_evict(rsx_vertex_cache* c, u32 ei, u64 completed)
+{
+    rsx_vc_entry* e = &c->entries[ei];
+    vc_slot_remove(c, ei);
+    c->live[ei] = 0;
+    c->entry_free[c->n_entry_free++] = ei;
+    c->stats.evictions++;
+    c->stats.bytes_in_use -= (u64)1 << (e->order + VC_MIN_SHIFT);
+    u32 ci = 0;
+    while (ci < c->n_chunks && c->chunks[ci].handle != e->chunk) ci++;
+    if (ci == c->n_chunks) return;
+    const u32 g = e->offset >> VC_MIN_SHIFT;
+    if (e->last_serial <= completed) {
+        vc_free(c, ci, g, e->order);
+        return;
+    }
+    if (c->n_deferred == c->cap_deferred) {
+        const u32 cap = c->cap_deferred ? c->cap_deferred * 2u : 256u;
+        vc_deferred* p = (vc_deferred*)realloc(c->deferred, (size_t)cap * sizeof(*p));
+        if (!p) return;   /* the block leaks; better than a GPU reading reused memory */
+        c->deferred = p;
+        c->cap_deferred = cap;
+    }
+    c->deferred[c->n_deferred].chunk = ci;
+    c->deferred[c->n_deferred].granule = g;
+    c->deferred[c->n_deferred].order = e->order;
+    c->deferred[c->n_deferred].serial = e->last_serial;
+    if (!c->n_deferred || e->last_serial < c->deferred_min) c->deferred_min = e->last_serial;
+    c->n_deferred++;
+}
+
+static u32 vc_evict_older(rsx_vertex_cache* c, u64 frame, u32 age, u64 completed)
+{
+    u32 n = 0;
+    for (u32 i = 0; i < VC_MAX_ENTRIES; i++)
+        if (c->live[i] && frame >= c->entries[i].last_frame + age) {
+            vc_evict(c, i, completed);
+            n++;
+        }
+    return n;
+}
+
+rsx_vertex_cache* rsx_vc_create(const rsx_vc_chunks* chunks, u64 budget,
+                                u32 chunk_bytes)
+{
+    if (!chunks || !chunks->create || chunk_bytes < VC_MIN_CHUNK ||
+        (chunk_bytes & (chunk_bytes - 1u)) || chunk_bytes > (1u << 30))
+        return NULL;
+    rsx_vertex_cache* c = (rsx_vertex_cache*)calloc(1, sizeof *c);
+    if (!c) return NULL;
+    c->be = *chunks;
+    /* A budget under one chunk gets smaller chunks, not one past it. */
+    while (chunk_bytes > budget && chunk_bytes > VC_MIN_CHUNK) chunk_bytes >>= 1;
+    c->chunk_bytes = chunk_bytes;
+    c->max_chunks = (u32)(budget / chunk_bytes);
+    if (!c->max_chunks) c->max_chunks = 1;
+    u32 order = 0;
+    while ((1u << (order + VC_MIN_SHIFT)) < chunk_bytes) order++;
+    c->max_order = order;
+    c->chunks = (vc_chunk*)calloc(c->max_chunks, sizeof(vc_chunk));
+    c->free_list = (u64**)calloc(order + 1u, sizeof(u64*));
+    c->free_n = (u32*)calloc(order + 1u, sizeof(u32));
+    c->free_cap = (u32*)calloc(order + 1u, sizeof(u32));
+    c->entries = (rsx_vc_entry*)calloc(VC_MAX_ENTRIES, sizeof(rsx_vc_entry));
+    c->live = (u8*)calloc(VC_MAX_ENTRIES, 1);
+    c->entry_free = (u32*)malloc(VC_MAX_ENTRIES * sizeof(u32));
+    c->slots = (u32*)calloc(2u * VC_MAX_ENTRIES, sizeof(u32));
+    c->ranges = (vc_range*)calloc(VC_RANGES, sizeof(vc_range));
+    if (!c->chunks || !c->free_list || !c->free_n || !c->free_cap || !c->entries ||
+        !c->live || !c->entry_free || !c->slots || !c->ranges) {
+        rsx_vc_destroy(c);
+        return NULL;
+    }
+    c->slot_mask = 2u * VC_MAX_ENTRIES - 1u;
+    for (u32 i = 0; i < VC_MAX_ENTRIES; i++)
+        c->entry_free[i] = VC_MAX_ENTRIES - 1u - i;
+    c->n_entry_free = VC_MAX_ENTRIES;
+    c->last_failed_scan_frame = ~0ull;
+    return c;
+}
+
+void rsx_vc_destroy(rsx_vertex_cache* c)
+{
+    if (!c) return;
+    for (u32 i = 0; i < c->n_chunks; i++) {
+        if (c->be.release) c->be.release(c->be.user, c->chunks[i].handle);
+        free(c->chunks[i].tag);
+    }
+    if (c->free_list)
+        for (u32 o = 0; o <= c->max_order; o++) free(c->free_list[o]);
+    free(c->free_list); free(c->free_n); free(c->free_cap);
+    free(c->chunks); free(c->deferred);
+    free(c->entries); free(c->live); free(c->entry_free); free(c->slots);
+    free(c->ranges);
+    free(c);
+}
+
+rsx_vc_entry* rsx_vc_find(rsx_vertex_cache* c, rsx_vc_key key)
+{
+    if (!c) return NULL;
+    for (u32 s = vc_slot_of(c, key); c->slots[s]; s = (s + 1u) & c->slot_mask) {
+        rsx_vc_entry* e = &c->entries[c->slots[s] - 1u];
+        if (vc_key_eq(e->key, key)) {
+            c->stats.hits++;
+            return e;
+        }
+    }
+    c->stats.misses++;
+    return NULL;
+}
+
+void rsx_vc_touch(rsx_vc_entry* e, u64 serial, u64 frame)
+{
+    if (!e) return;
+    if (serial > e->last_serial) e->last_serial = serial;
+    e->last_frame = frame;
+}
+
+rsx_vc_entry* rsx_vc_insert(rsx_vertex_cache* c, rsx_vc_key key, u32 bytes,
+                            u64 completed, u64 frame, u8** cpu)
+{
+    if (!c || !bytes || bytes > c->chunk_bytes || !cpu) return NULL;
+    u32 order = 0;
+    while ((1ull << (order + VC_MIN_SHIFT)) < bytes) order++;
+
+    /* An entry already under this key (the caller missed it) goes first. */
+    for (u32 s = vc_slot_of(c, key); c->slots[s]; s = (s + 1u) & c->slot_mask)
+        if (vc_key_eq(c->entries[c->slots[s] - 1u].key, key)) {
+            vc_evict(c, c->slots[s] - 1u, completed);
+            break;
+        }
+
+    vc_reclaim(c, completed);
+    u32 ci = 0, g = 0;
+    int ok = c->n_entry_free && vc_alloc(c, order, &ci, &g);
+    if (!ok && c->last_failed_scan_frame != frame) {
+        static const u32 ages[2] = { VC_AGE_OLD, VC_AGE_MIN };
+        for (u32 a = 0; a < 2 && !ok; a++) {
+            if (!vc_evict_older(c, frame, ages[a], completed)) continue;
+            vc_reclaim(c, completed);
+            ok = c->n_entry_free && vc_alloc(c, order, &ci, &g);
+        }
+        /* Nothing more can be had until the frame changes: do not scan
+         * every entry again on each miss of this frame. */
+        if (!ok) c->last_failed_scan_frame = frame;
+    }
+    if (!ok) {
+        c->stats.insert_failures++;
+        return NULL;
+    }
+
+    const u32 ei = c->entry_free[--c->n_entry_free];
+    rsx_vc_entry* e = &c->entries[ei];
+    memset(e, 0, sizeof *e);
+    e->key = key;
+    e->chunk = c->chunks[ci].handle;
+    e->offset = g << VC_MIN_SHIFT;
+    e->order = (u8)order;
+    e->last_frame = frame;
+    c->live[ei] = 1;
+    u32 s = vc_slot_of(c, key);
+    while (c->slots[s]) s = (s + 1u) & c->slot_mask;
+    c->slots[s] = ei + 1u;
+    c->stats.inserts++;
+    c->stats.bytes_in_use += (u64)1 << (order + VC_MIN_SHIFT);
+    *cpu = c->chunks[ci].cpu + e->offset;
+    return e;
+}
+
+static vc_range* vc_range_set(rsx_vertex_cache* c, rsx_vc_key key)
+{
+    return &c->ranges[((key.lo ^ key.hi) & (VC_RANGES / VC_RANGE_WAYS - 1u)) * VC_RANGE_WAYS];
+}
+
+int rsx_vc_range_find(rsx_vertex_cache* c, rsx_vc_key key, u32* first, u32* last)
+{
+    if (!c) return 0;
+    vc_range* set = vc_range_set(c, key);
+    for (u32 w = 0; w < VC_RANGE_WAYS; w++)
+        if (set[w].stamp && vc_key_eq(set[w].key, key)) {
+            set[w].stamp = ++c->range_stamp;
+            *first = set[w].first;
+            *last = set[w].last;
+            return 1;
+        }
+    return 0;
+}
+
+void rsx_vc_range_put(rsx_vertex_cache* c, rsx_vc_key key, u32 first, u32 last)
+{
+    if (!c) return;
+    vc_range* set = vc_range_set(c, key);
+    vc_range* r = &set[0];
+    for (u32 w = 0; w < VC_RANGE_WAYS; w++) {
+        if (set[w].stamp && vc_key_eq(set[w].key, key)) { r = &set[w]; break; }
+        if (set[w].stamp < r->stamp) r = &set[w];
+    }
+    r->key = key;
+    r->first = first;
+    r->last = last;
+    r->stamp = ++c->range_stamp;
+}
+
+void rsx_vc_get_stats(const rsx_vertex_cache* c, rsx_vc_stats* out)
+{
+    if (!out) return;
+    if (!c) { memset(out, 0, sizeof *out); return; }
+    *out = c->stats;
+}
