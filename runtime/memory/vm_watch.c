@@ -7,8 +7,9 @@
  * PINNED (the runtime made it non-writable: never watched). One global epoch
  * counter orders watches and writes.
  *
- * The fault handler only touches atomics and the protection of the faulting
- * page, so it is safe on a thread that holds runtime locks. A thread whose
+ * The fault handler only touches atomics, the protection of the faulting
+ * page and (for a preserved page) a copy into a preallocated slot, so it is
+ * safe on a thread that holds runtime locks and needs no allocation. A thread whose
  * fault lands just after another thread released the same page finds it no
  * longer watched but EVER; it retries the write (at most a few times for the
  * same address, so a page protected for another reason still reaches the
@@ -33,7 +34,7 @@
 
 extern uint8_t* vm_base;
 
-enum { WATCHED = 1, BUSY = 2, EVER = 4, PINNED = 8 };
+enum { WATCHED = 1, BUSY = 2, EVER = 4, PINNED = 8, PRESERVE = 16 };
 #define SPACE UINT64_C(0x100000000)
 
 static int s_active;
@@ -45,6 +46,32 @@ static uint64_t* s_epoch;
 static uint64_t s_global = 1;
 static vm_watch_stats_t s_stats;
 static int s_strict;
+/* Epoch at which each page last became WATCHED. */
+static uint64_t* s_arm;
+
+/* Preservation (vm_preserve_*): a pool of one-page slots, allocated by the
+ * first vm_preserve_begin. A slot holds a page's bytes from before the first
+ * write after its arming; it is reachable from the page's chain (newest
+ * first) and reusable once no sealed session needs it. */
+#define SESSIONS 4
+#define SESSION_OPEN UINT64_C(1)
+#define SESSION_SEALING UINT64_MAX
+typedef struct {
+    uint32_t gen;   /* seqlock: odd while being written */
+    uint8_t taken;  /* a writer owns the slot */
+    uint32_t next;  /* older slot of the same page + 1, or 0 */
+    uint64_t page;
+    uint64_t arm;   /* the page's arming epoch */
+    uint64_t write; /* epoch of the write that preserved it */
+} slot_t;
+static uint64_t s_sessions[SESSIONS]; /* 0 free, OPEN, SEALING, or the epoch */
+static uint32_t* s_head;              /* per page: newest slot + 1, or 0 */
+static slot_t* s_slots;
+static uint8_t* s_pool;
+static uint32_t s_slot_count;
+static uint32_t s_cursor;
+static vm_preserve_stats_t s_pstats;
+#define PCOUNT(f, n) __atomic_add_fetch(&s_pstats.f, (n), __ATOMIC_RELAXED)
 
 #define LOAD8(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define STORE8(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
@@ -66,16 +93,71 @@ static int protect(size_t first, size_t count, int writable)
 #endif
 }
 
+/* Whether a sealed (or sealing) session needs a copy of page content armed at
+ * `arm` and overwritten at `write`: one with arm <= E < write. */
+static int needed(uint64_t arm, uint64_t write)
+{
+    for (int i = 0; i < SESSIONS; ++i) {
+        const uint64_t e = __atomic_load_n(&s_sessions[i], __ATOMIC_ACQUIRE);
+        if (e == SESSION_SEALING) return 1;
+        if (e > SESSION_OPEN && arm <= e && e < write) return 1;
+    }
+    return 0;
+}
+
+/* Copies page `p` (still read-only, BUSY) into a free slot and links it.
+ * Called from the fault handler: atomics and memcpy into preallocated memory
+ * only. A full pool loses the page (readers then report it unpreserved). */
+static void preserve(size_t p)
+{
+    uint32_t* head = __atomic_load_n(&s_head, __ATOMIC_ACQUIRE);
+    if (!head) return;
+    const uint64_t arm = __atomic_load_n(&s_arm[p], __ATOMIC_ACQUIRE);
+    const uint64_t write = BUMP();
+    if (!needed(arm, write)) return;
+    for (uint32_t tries = 0; tries < s_slot_count; ++tries) {
+        const uint32_t i = __atomic_fetch_add(&s_cursor, 1, __ATOMIC_RELAXED) % s_slot_count;
+        slot_t* sl = &s_slots[i];
+        uint8_t free_ = 0;
+        if (!__atomic_compare_exchange_n(&sl->taken, &free_, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            continue;
+        const uint32_t g = __atomic_load_n(&sl->gen, __ATOMIC_ACQUIRE);
+        if (g && needed(__atomic_load_n(&sl->arm, __ATOMIC_RELAXED),
+                        __atomic_load_n(&sl->write, __ATOMIC_RELAXED))) {
+            __atomic_store_n(&sl->taken, 0, __ATOMIC_RELEASE);
+            continue;
+        }
+        __atomic_store_n(&sl->gen, g + 1, __ATOMIC_RELEASE); /* odd: writing */
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        __atomic_store_n(&sl->page, (uint64_t)p, __ATOMIC_RELAXED);
+        __atomic_store_n(&sl->arm, arm, __ATOMIC_RELAXED);
+        __atomic_store_n(&sl->write, write, __ATOMIC_RELAXED);
+        memcpy(s_pool + ((size_t)i << s_shift), (const void*)host_of((uint64_t)p << s_shift),
+               (size_t)s_page);
+        uint32_t old = __atomic_load_n(&head[p], __ATOMIC_ACQUIRE);
+        __atomic_store_n(&sl->next, old, __ATOMIC_RELAXED);
+        __atomic_store_n(&sl->gen, g + 2, __ATOMIC_RELEASE); /* even: complete */
+        /* Only this thread releases page p (it holds BUSY): a plain store. */
+        __atomic_store_n(&head[p], i + 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&sl->taken, 0, __ATOMIC_RELEASE);
+        PCOUNT(preserved_pages, 1);
+        return;
+    }
+    PCOUNT(lost_pages, 1);
+}
+
 /* Releases watched page `p`: writable, a new write epoch, no longer watched.
+ * A page armed for preservation is copied first, while still read-only.
  * Returns 1 when this thread released it. */
 static int release(size_t p)
 {
     uint8_t st = LOAD8(&s_state[p]);
     while (st & WATCHED) {
-        if (CAS8(&s_state[p], &st, (uint8_t)((st & ~WATCHED) | BUSY | EVER))) {
+        if (CAS8(&s_state[p], &st, (uint8_t)((st & ~(WATCHED | PRESERVE)) | BUSY | EVER))) {
+            if (st & PRESERVE) preserve(p);
             protect(p, 1, 1);
             __atomic_store_n(&s_epoch[p], BUMP(), __ATOMIC_RELEASE);
-            STORE8(&s_state[p], (uint8_t)((st & ~(WATCHED | BUSY)) | EVER));
+            STORE8(&s_state[p], (uint8_t)((st & ~(WATCHED | BUSY | PRESERVE)) | EVER));
             return 1;
         }
     }
@@ -196,9 +278,11 @@ int vm_watch_enable(void)
     s_pages = (size_t)(SPACE >> s_shift);
     s_state = (uint8_t*)calloc(s_pages, 1);
     s_epoch = (uint64_t*)calloc(s_pages, sizeof *s_epoch);
-    if (!s_state || !s_epoch) {
+    s_arm = (uint64_t*)calloc(s_pages, sizeof *s_arm);
+    if (!s_state || !s_epoch || !s_arm) {
         free(s_state);
         free(s_epoch);
+        free(s_arm);
         return 0;
     }
     s_strict = flag("PS3RECOMP_VM_WRITE_WATCH_STRICT");
@@ -236,7 +320,10 @@ static int span(uint64_t ea, uint64_t len, size_t* first, size_t* last)
     return 1;
 }
 
-uint64_t vm_watch(uint32_t ea, uint32_t len)
+static uint64_t watch(uint32_t ea, uint32_t len, int keep);
+uint64_t vm_watch(uint32_t ea, uint32_t len) { return watch(ea, len, 0); }
+uint64_t vm_watch_preserve(uint32_t ea, uint32_t len) { return watch(ea, len, 1); }
+static uint64_t watch(uint32_t ea, uint32_t len, int keep)
 {
     size_t first, last;
     if (!vm_watch_active() || !span(ea, len, &first, &last)) return 0;
@@ -253,11 +340,18 @@ uint64_t vm_watch(uint32_t ea, uint32_t len)
         if (p <= last) {
             wait_not_busy(p);
             uint8_t st = LOAD8(&s_state[p]);
+            /* Claimed BUSY until protected: WATCHED, with its arming epoch,
+             * only once a write would fault. */
             while (!(st & (WATCHED | PINNED | BUSY))) {
-                if (CAS8(&s_state[p], &st, (uint8_t)(st | WATCHED | EVER))) {
+                if (CAS8(&s_state[p], &st, (uint8_t)(st | BUSY | EVER | (keep ? PRESERVE : 0)))) {
                     take = 1;
                     break;
                 }
+            }
+            /* Already watched (unwritten since its own arming): preserve it
+             * from now on too. */
+            while (keep && (st & WATCHED) && !(st & (PRESERVE | BUSY))) {
+                if (CAS8(&s_state[p], &st, (uint8_t)(st | PRESERVE))) break;
             }
         }
         if (take) {
@@ -269,9 +363,17 @@ uint64_t vm_watch(uint32_t ea, uint32_t len)
             if (protect(start, run, 0) != 0) {
                 for (size_t q = start; q < p; ++q) {
                     uint8_t st = LOAD8(&s_state[q]);
-                    STORE8(&s_state[q], (uint8_t)(st & ~WATCHED));
+                    STORE8(&s_state[q], (uint8_t)(st & ~(BUSY | PRESERVE)));
                 }
                 return 0;
+            }
+            /* After the protection: preserved content is the content of
+             * every epoch from this one until the first write. */
+            const uint64_t armed = BUMP();
+            for (size_t q = start; q < p; ++q) {
+                __atomic_store_n(&s_arm[q], armed, __ATOMIC_RELEASE);
+                uint8_t st = LOAD8(&s_state[q]);
+                STORE8(&s_state[q], (uint8_t)((st & ~BUSY) | WATCHED));
             }
             protected_pages += run;
             run = 0;
@@ -339,14 +441,17 @@ static void forget(uint32_t addr, uint32_t size, int writable)
         uint8_t st = LOAD8(&s_state[p]);
         uint8_t next;
         do {
-            next = (uint8_t)(st & ~(WATCHED | PINNED));
+            next = (uint8_t)(st & ~(WATCHED | PINNED | PRESERVE));
             if (!writable) next |= PINNED;
-        } while (!CAS8(&s_state[p], &st, next));
+        } while (!CAS8(&s_state[p], &st, (uint8_t)(next | ((st & WATCHED) ? BUSY : 0))));
         if (st & WATCHED) {
-            /* Our read-only protection must not outlive the watch: undo it,
-             * and let the caller's own protection change follow. */
+            /* Our read-only protection must not outlive the watch: undo it
+             * (after preserving the page), and let the caller's own
+             * protection change follow. */
+            if (st & PRESERVE) preserve(p);
             protect(p, 1, 1);
             __atomic_store_n(&s_epoch[p], BUMP(), __ATOMIC_RELEASE);
+            STORE8(&s_state[p], next);
             ++forgotten;
         }
     }
@@ -366,6 +471,206 @@ static void forget_host(const void* host, size_t size, int writable)
         ea += part;
         len -= part;
     }
+}
+
+/* ---- preservation sessions ---- */
+
+static uint64_t pool_bytes(void)
+{
+    const char* v = getenv("PS3RECOMP_VM_PRESERVE_POOL_MB");
+    long mb = v ? strtol(v, NULL, 10) : 32;
+    if (mb < 1) mb = 1;
+    if (mb > 1024) mb = 1024;
+    return (uint64_t)mb << 20;
+}
+
+/* Allocates the pool and chains once, outside any fault handler. */
+static int preserve_ready(void)
+{
+    static int s_state_ready; /* 0 untried, 1 ready, 2 failed */
+    int st = __atomic_load_n(&s_state_ready, __ATOMIC_ACQUIRE);
+    if (st) return st == 1;
+    static int s_lock;
+    while (__atomic_exchange_n(&s_lock, 1, __ATOMIC_ACQUIRE)) {
+#ifdef _WIN32
+        YieldProcessor();
+#else
+        sched_yield();
+#endif
+    }
+    st = __atomic_load_n(&s_state_ready, __ATOMIC_ACQUIRE);
+    if (!st) {
+        const uint64_t bytes = pool_bytes();
+        s_slot_count = (uint32_t)(bytes >> s_shift);
+        s_slots = (slot_t*)calloc(s_slot_count, sizeof *s_slots);
+        s_pool = (uint8_t*)malloc((size_t)bytes);
+        uint32_t* head = (uint32_t*)calloc(s_pages, sizeof *head);
+        if (s_slots && s_pool && head && s_slot_count) {
+            __atomic_store_n(&s_head, head, __ATOMIC_RELEASE);
+            st = 1;
+        } else {
+            free(s_slots);
+            free(s_pool);
+            free(head);
+            st = 2;
+        }
+        __atomic_store_n(&s_state_ready, st, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&s_lock, 0, __ATOMIC_RELEASE);
+    return st == 1;
+}
+
+int vm_preserve_begin(void)
+{
+    if (!vm_watch_active() || !preserve_ready()) return 0;
+    for (int i = 0; i < SESSIONS; ++i) {
+        uint64_t free_ = 0;
+        if (__atomic_compare_exchange_n(&s_sessions[i], &free_, SESSION_OPEN, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            PCOUNT(sessions, 1);
+            return i + 1;
+        }
+    }
+    PCOUNT(refused_sessions, 1);
+    return 0;
+}
+
+uint64_t vm_preserve_seal(int session)
+{
+    if (session < 1 || session > SESSIONS) return 0;
+    uint64_t* s = &s_sessions[session - 1];
+    if (__atomic_load_n(s, __ATOMIC_ACQUIRE) != SESSION_OPEN) return 0;
+    /* While the epoch is taken every release copies conservatively. */
+    __atomic_store_n(s, SESSION_SEALING, __ATOMIC_SEQ_CST);
+    const uint64_t e = BUMP();
+    __atomic_store_n(s, e, __ATOMIC_SEQ_CST);
+    return e;
+}
+
+void vm_preserve_end(int session)
+{
+    if (session < 1 || session > SESSIONS) return;
+    __atomic_store_n(&s_sessions[session - 1], 0, __ATOMIC_RELEASE);
+}
+
+/* Copies page `p`'s preserved bytes for `e` ([offset, offset+n) of it) from
+ * its chain. 1 when found. */
+static int from_slot(size_t p, uint64_t e, size_t offset, size_t n, uint8_t* dst)
+{
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        uint32_t at = __atomic_load_n(&s_head[p], __ATOMIC_ACQUIRE);
+        int retry = 0;
+        while (at) {
+            slot_t* sl = &s_slots[at - 1];
+            const uint32_t g = __atomic_load_n(&sl->gen, __ATOMIC_ACQUIRE);
+            if (g & 1) {
+                retry = 1;
+                break;
+            }
+            const uint64_t page_ = __atomic_load_n(&sl->page, __ATOMIC_RELAXED);
+            const uint64_t arm = __atomic_load_n(&sl->arm, __ATOMIC_RELAXED);
+            const uint64_t write = __atomic_load_n(&sl->write, __ATOMIC_RELAXED);
+            const uint32_t next = __atomic_load_n(&sl->next, __ATOMIC_RELAXED);
+            /* Newest first: a reused slot (another page) or one written
+             * before `e` ends what can matter. */
+            if (page_ != (uint64_t)p || write <= e) {
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                if (__atomic_load_n(&sl->gen, __ATOMIC_RELAXED) != g) retry = 1;
+                break;
+            }
+            if (arm <= e) {
+                memcpy(dst, s_pool + ((size_t)(at - 1) << s_shift) + offset, n);
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                if (__atomic_load_n(&sl->gen, __ATOMIC_RELAXED) != g) {
+                    retry = 1;
+                    break;
+                }
+                return 1;
+            }
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (__atomic_load_n(&sl->gen, __ATOMIC_RELAXED) != g) {
+                retry = 1;
+                break;
+            }
+            at = next;
+        }
+        if (!retry) return 0;
+    }
+    return 0;
+}
+
+int vm_preserve_read(int session, uint32_t ea, void* dst, uint32_t len, uint32_t* preserved_pages)
+{
+    size_t first, last;
+    if (preserved_pages) *preserved_pages = 0;
+    if (session < 1 || session > SESSIONS || !dst || !len || !vm_watch_active() ||
+        !span(ea, len, &first, &last))
+        return -1;
+    const uint64_t e = __atomic_load_n(&s_sessions[session - 1], __ATOMIC_ACQUIRE);
+    if (e <= SESSION_OPEN || e == SESSION_SEALING || !__atomic_load_n(&s_head, __ATOMIC_ACQUIRE))
+        return -1;
+    int result = 0;
+    uint8_t* out = (uint8_t*)dst;
+    uint64_t at = ea;
+    const uint64_t end = (uint64_t)ea + len;
+    for (size_t p = first; p <= last; ++p) {
+        const uint64_t page_start = (uint64_t)p << s_shift;
+        const uint64_t piece_end = page_start + s_page < end ? page_start + s_page : end;
+        const size_t offset = (size_t)(at - page_start), n = (size_t)(piece_end - at);
+        uint8_t* to = out + (at - ea);
+        int done = 0;
+        for (int attempt = 0; attempt < 64 && !done; ++attempt) {
+            if (from_slot(p, e, offset, n, to)) {
+                PCOUNT(read_preserved, 1);
+                if (preserved_pages) ++*preserved_pages;
+                done = 1;
+                break;
+            }
+            wait_not_busy(p);
+            const uint8_t st = LOAD8(&s_state[p]);
+            const uint64_t arm = __atomic_load_n(&s_arm[p], __ATOMIC_ACQUIRE);
+            if (!(st & WATCHED) || arm > e) {
+                /* Released meanwhile: its copy was published before the
+                 * release ended. None: written since e without a copy. */
+                if (from_slot(p, e, offset, n, to)) {
+                    PCOUNT(read_preserved, 1);
+                    if (preserved_pages) ++*preserved_pages;
+                    done = 1;
+                }
+                break;
+            }
+            /* Read-only now: the bytes are those of `e` unless a write
+             * released the page meanwhile, which publishes its copy first. */
+            memcpy(to, (const void*)host_of(at), n);
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            const uint8_t st2 = LOAD8(&s_state[p]);
+            if ((st2 & (WATCHED | BUSY)) == WATCHED &&
+                __atomic_load_n(&s_arm[p], __ATOMIC_ACQUIRE) == arm) {
+                PCOUNT(read_live, 1);
+                done = 1;
+            }
+        }
+        if (!done) {
+            /* Unpreserved: live bytes for the caller's own check. */
+            memcpy(to, (const void*)host_of(at), n);
+            PCOUNT(read_unpreserved, 1);
+            result = -1;
+        }
+        at = piece_end;
+    }
+    return result;
+}
+
+void vm_preserve_stats(vm_preserve_stats_t* out)
+{
+    if (!out) return;
+    out->sessions = __atomic_load_n(&s_pstats.sessions, __ATOMIC_RELAXED);
+    out->refused_sessions = __atomic_load_n(&s_pstats.refused_sessions, __ATOMIC_RELAXED);
+    out->preserved_pages = __atomic_load_n(&s_pstats.preserved_pages, __ATOMIC_RELAXED);
+    out->lost_pages = __atomic_load_n(&s_pstats.lost_pages, __ATOMIC_RELAXED);
+    out->read_preserved = __atomic_load_n(&s_pstats.read_preserved, __ATOMIC_RELAXED);
+    out->read_live = __atomic_load_n(&s_pstats.read_live, __ATOMIC_RELAXED);
+    out->read_unpreserved = __atomic_load_n(&s_pstats.read_unpreserved, __ATOMIC_RELAXED);
 }
 
 void vm_watch_stats(vm_watch_stats_t* out)

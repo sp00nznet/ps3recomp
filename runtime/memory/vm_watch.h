@@ -91,6 +91,46 @@ typedef struct {
 } vm_watch_stats_t;
 void vm_watch_stats(vm_watch_stats_t* out);
 
+/* Preservation (copy on first write), for a consumer that reads guest memory
+ * after it was released to the guest but needs it as of one moment:
+ *
+ *   int s = vm_preserve_begin();          // 0: unavailable
+ *   vm_watch_preserve(ea, len) ...        // arm what it will read
+ *   uint64_t e = vm_preserve_seal(s);     // the moment
+ *   ... the guest runs and writes ...
+ *   vm_preserve_read(s, ea, dst, len, &pages);  // bytes as of e
+ *   vm_preserve_end(s);
+ *
+ * A write to a page armed with vm_watch_preserve copies the page's bytes into
+ * a preallocated slot before the page becomes writable (in the fault handler:
+ * no allocation), when a sealed session needs them. vm_preserve_read takes a
+ * page from its slot, or live while it is still protected since before e.
+ * It returns -1 when some page could not be had as of e (never armed, armed
+ * after e, or released with no free slot); dst then holds live bytes for those
+ * pages and the caller must check them itself. Kernel writes (vm_note_write)
+ * and runtime protection changes preserve the same way first.
+ *
+ * Pool: PS3RECOMP_VM_PRESERVE_POOL_MB (default 32), allocated by the first
+ * vm_preserve_begin. At most 4 sessions are open at once. */
+#define PS3RECOMP_VM_PRESERVE_API 1
+uint64_t vm_watch_preserve(uint32_t ea, uint32_t len);
+int vm_preserve_begin(void);
+uint64_t vm_preserve_seal(int session);
+int vm_preserve_read(int session, uint32_t ea, void* dst, uint32_t len,
+                     uint32_t* preserved_pages);
+void vm_preserve_end(int session);
+
+typedef struct {
+    uint64_t sessions;         /* sessions begun */
+    uint64_t refused_sessions; /* none free */
+    uint64_t preserved_pages;  /* pages copied before a write */
+    uint64_t lost_pages;       /* needed, but no free slot */
+    uint64_t read_preserved;   /* page reads answered from a slot */
+    uint64_t read_live;        /* page reads answered live (still protected) */
+    uint64_t read_unpreserved; /* page reads with no copy as of the session */
+} vm_preserve_stats_t;
+void vm_preserve_stats(vm_preserve_stats_t* out);
+
 #ifdef __cplusplus
 }
 #endif
