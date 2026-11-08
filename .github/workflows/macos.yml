@@ -168,6 +168,16 @@ jobs:
             -o /tmp/test_metal_present_post
           /tmp/test_metal_present_post
 
+      # The converted-vertex cache's Metal side: chunks are shared buffers,
+      # a cached draw records its chunk, and every engine command buffer
+      # takes the serial announced for it and reports it completed.
+      - name: Run the Metal vertex cache test
+        run: |
+          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_vertex_cache.m \
+            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
+            -o /tmp/test_metal_vertex_cache
+          /tmp/test_metal_vertex_cache
+
       # Host-surface mode (tools/host_window, rsx_host_surface.h) against a
       # launcher fixture in the same process: init attaches and opens no
       # window, engine and vtable presents land in the shared IOSurfaces,
@@ -502,6 +512,10 @@ jobs:
           /tmp/test_vertex_current_color
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_color_feedback_engine
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_engine_vertex_cache libs/video/tests/test_engine_vertex_cache.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_engine_vertex_cache
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_vertex_cache libs/video/tests/test_vertex_cache.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c
+          /tmp/test_vertex_cache
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
           clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c

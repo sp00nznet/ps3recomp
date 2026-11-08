@@ -121,6 +121,13 @@ typedef struct rsx_be_render_state {
  * where the boundary is rather than assuming a number. */
 #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
 
+/* GPU memory the converted-vertex cache may hold, in MB, when the backend
+ * offers one (rsx_draw_backend.vcache_chunk_create). The Haven firefight in
+ * Resistance 3 keeps ~40 MB of converted vertices in use a frame. */
+#ifndef RSX_DRAW_ENGINE_VCACHE_MB
+#define RSX_DRAW_ENGINE_VCACHE_MB 256
+#endif
+
 /* ---- the backend interface ---------------------------------------------- */
 
 #define RSX_BE_HAS_COLOR_SNAPSHOT 1
@@ -300,6 +307,20 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional, all four or none: the converted-vertex cache
+     * (rsx_vertex_compact.h). A chunk is memory the GPU reads and the CPU
+     * writes through *cpu, and stays put until released. draw_cached is draw
+     * with the vertices and the indices already in a chunk, at byte offsets
+     * from its start (index_count 0: not indexed). commit_serial returns the
+     * serial of the submission the next recorded draw goes into and stores
+     * in *completed the newest one the GPU has finished; serials only grow.
+     * Without them every draw is converted and staged as before. */
+    u32  (*vcache_chunk_create)(void* user, u32 bytes, u8** cpu);
+    void (*vcache_chunk_release)(void* user, u32 chunk);
+    void (*draw_cached)(void* user, rsx_topology topology, u32 chunk,
+                        u32 vb_off, u32 vertex_count, u32 stride,
+                        u32 ib_off, u32 index_count);
+    u64  (*commit_serial)(void* user, u64* completed);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

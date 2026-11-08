@@ -516,6 +516,14 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
+    # The converted-vertex cache's bookkeeping, without a GPU.
+    add_executable(test_vertex_cache
+        libs/video/tests/test_vertex_cache.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_dispatch.c)
+    target_include_directories(test_vertex_cache PRIVATE include libs/video)
+    add_test(NAME vertex_cache COMMAND test_vertex_cache)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
