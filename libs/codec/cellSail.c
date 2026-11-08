@@ -199,8 +199,9 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
     return CELL_OK;
 }
 
-s32 cellSailPlayerStart(CellSailPlayerHandle handle)
+s32 cellSailPlayerStart(CellSailPlayerHandle handle, u32 command, u64 userParam)
 {
+    (void)command;
     printf("[cellSail] PlayerStart(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
@@ -208,7 +209,7 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
     /* Immediately signal finished since we don't play anything */
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
-    sail_call(_sp, SAIL_CALL_START, SAIL_ST_START_TRANSITION, SAIL_ST_RUNNING, 0);
+    sail_call(_sp, SAIL_CALL_START, SAIL_ST_START_TRANSITION, SAIL_ST_RUNNING, userParam);
     /* Nothing decodes the stream, so it has already ended: a finished stream
      * drops the player back to OPENED, which is what a title waiting out a
      * movie (Midway's logo AVIs) watches for. */
@@ -217,14 +218,14 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
     return CELL_OK;
 }
 
-s32 cellSailPlayerStop(CellSailPlayerHandle handle)
+s32 cellSailPlayerStop(CellSailPlayerHandle handle, u64 userParam)
 {
     printf("[cellSail] PlayerStop(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
-    sail_call(_sp, SAIL_CALL_STOP, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED, 0);
+    sail_call(_sp, SAIL_CALL_STOP, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED, userParam);
     return CELL_OK;
 }
 

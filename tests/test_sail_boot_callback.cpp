@@ -36,7 +36,7 @@ void vm_write64(uint64_t a,uint64_t x) { x=__builtin_bswap64(x);std::memcpy(vm_b
 extern "C" void ppu_dump_guest_stack(ppu_context*,const char*) {}
 extern "C" void ppu_dump_bctrl_ring(uint32_t,const char*) {}
 extern "C" void ppu_guest_callstack(const char*) {}
-uint32_t g_ydkj_real_spurs_ea=0,g_ydkj_real_taskset_ea=0;
+extern "C" { uint32_t g_ydkj_real_spurs_ea=0,g_ydkj_real_taskset_ea=0; }
 
 #include <array>
 #include <vector>
@@ -59,7 +59,7 @@ static bool event_is(size_t i,uint64_t major,uint64_t minor,uint64_t arg0,uint64
 }
 int main() {
     static uint8_t memory[0x10000];vm_base=memory;ppu_hle_register_all();g_ps3_guest_caller=callback;
-    constexpr uint32_t INIT=0x23654375,BOOT=0xBDF21B0F,CLOSE=0x85BEFFCC,STOP=0xEBA8D4EC,DESTROY=0x24F4E900;
+    constexpr uint32_t INIT=0x23654375,BOOT=0xBDF21B0F,CLOSE=0x85BEFFCC,START=0xE535B0D3,STOP=0xEBA8D4EC,DESTROY=0x24F4E900;
     CHECK(ps3_hle_has(INIT));CHECK(ps3_hle_has(BOOT));
     CHECK(call(INIT,0x1000,0,0x4000,0x4567)==0);
     for(uint64_t param : {UINT64_C(0xFEDCBA9876543210),UINT64_C(0),UINT64_C(0x0FEF7800)}) {
@@ -68,8 +68,14 @@ int main() {
         CHECK(event_is(1,2,1,0,param)); // Completion must echo the whole call userParam.
         CHECK(event_is(2,3,0,2,0));
     }
-    events.clear();CHECK(call(STOP,0x1000)==0);CHECK(events.size()==3);
-    CHECK(event_is(0,3,0,7,0));CHECK(event_is(1,2,11,0,0));CHECK(event_is(2,3,0,4,0));
+    // Every asynchronous call must echo the full token, including its high half.
+    for(uint64_t param : {UINT64_C(0xFEDCBA9876543210),UINT64_C(0),UINT64_C(0x0FEF7800)}) {
+        events.clear();CHECK(call(START,0x1000,0,param)==0);CHECK(events.size()==5);
+        CHECK(event_is(0,3,0,5,0));CHECK(event_is(1,2,10,0,param));CHECK(event_is(2,3,0,6,0));
+        CHECK(event_is(3,3,0,7,0));CHECK(event_is(4,3,0,4,0));
+        events.clear();CHECK(call(STOP,0x1000,param)==0);CHECK(events.size()==3);
+        CHECK(event_is(0,3,0,7,0));CHECK(event_is(1,2,11,0,param));CHECK(event_is(2,3,0,4,0));
+    }
     events.clear();CHECK(call(CLOSE,0x1000)==0);CHECK(events.size()==3);
     CHECK(event_is(0,3,0,8,0));CHECK(event_is(1,2,3,0,0));CHECK(event_is(2,3,0,2,0));
     CHECK(call(INIT,0x2000,0,0x5000,0x9876)==0);
