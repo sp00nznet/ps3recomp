@@ -41,6 +41,7 @@ picked up.
 |------|---------|
 | `main.cpp` | Boots the runtime and runs the ELF entry point. |
 | `stubs.cpp` | Where you add HLE bridges for functions the runtime does not implement yet. |
+| `guest_arena.h` | Maps the POSIX guest arena on a 4 GB boundary, as the HLE's pointer truncation needs. |
 | `CMakeLists.txt` | Links `ps3recomp_runtime`, compiles the per-game PPU scaffold from `runtime/ppu/`, and sets `/bigobj` for the large generated translation units. |
 | `config.toml` | Reference settings for the title. Reference only: no tool or CMake file reads it yet. |
 
