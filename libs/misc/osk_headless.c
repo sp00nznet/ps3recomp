@@ -15,12 +15,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Under the SDL host this is its no-window fallback rather than the host. */
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+#define OSK_HEADLESS(name) osk_headless_##name
+#else
+#define OSK_HEADLESS(name) osk_native_##name
+#endif
+
 static pthread_mutex_t s_mu = PTHREAD_MUTEX_INITIALIZER;
 static OskNativeRequest s_dialog;   /* token 0: none open */
 
-int osk_native_available(void) { return 1; }
+int OSK_HEADLESS(available)(void) { return 1; }
 
-void osk_native_open(const OskNativeRequest* request)
+void OSK_HEADLESS(open)(const OskNativeRequest* request)
 {
     if (!osk_native_is_pending(request->token)) return;
     pthread_mutex_lock(&s_mu);
@@ -33,14 +40,14 @@ void osk_native_open(const OskNativeRequest* request)
                         "so it cannot be confirmed (abort only)\n", (unsigned long long)request->token);
 }
 
-void osk_native_close(uint64_t token)
+void OSK_HEADLESS(close)(uint64_t token)
 {
     pthread_mutex_lock(&s_mu);
     if (s_dialog.token == token) s_dialog.token = 0;
     pthread_mutex_unlock(&s_mu);
 }
 
-void osk_native_confirm(uint64_t token)
+void OSK_HEADLESS(confirm)(uint64_t token)
 {
     pthread_mutex_lock(&s_mu);
     OskNativeRequest dialog = s_dialog;

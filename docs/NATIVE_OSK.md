@@ -8,6 +8,7 @@ at configure time; without one nothing changes.
 | CMake option | Platforms | Host |
 |---|---|---|
 | `PS3RECOMP_NATIVE_OSK_HEADLESS` | POSIX other than macOS | No window: the dialog opens with its initial text and is confirmed only through the control mailbox (below). |
+| `PS3RECOMP_NATIVE_OSK_SDL` | POSIX other than macOS | An SDL2 dialog beside the Vulkan backend's game window (`PS3RECOMP_RSX_VULKAN`, `PS3RECOMP_VK_WINDOW=1`). With the headless host also built, requests made while no window exists go to it; otherwise the OSK reports unavailable once on stderr. |
 
 ## Lifecycle
 
@@ -30,6 +31,25 @@ user interface.
 - The prohibit flags for spaces and line breaks are applied to the result.
   Password panels are never prefilled, and prompts and input are not logged.
 
+## SDL dialog
+
+The thread that creates the game window and pumps its SDL events registers the
+window and alone creates, draws, feeds and destroys the dialog; guest calls only
+queue copied requests. The dialog is a small separate window with the prompt,
+the initial text, OK and Cancel. Enter or OK accepts; Escape, Cancel or closing
+it cancels. Text comes from SDL text input, so keyboard layouts and input
+methods work (composition is shown and committed only when the IME commits).
+Backspace deletes a character and Ctrl+V or Shift+Insert pastes. The length
+limit is enforced in UTF-16 units as text is entered, and a password panel is
+drawn masked. SDL has no fonts, so an embedded public-domain 8x8 font
+(`libs/misc/osk_font8x8.h`) draws printable ASCII and shows other characters as
+`?`; the text returned is the real text.
+
+While a dialog is open it owns the keyboard: key and text events from the game
+window are routed to it, Escape does not reach the game window's quit handling,
+and the `cellPad` keyboard fallback releases its keys, so typing does not also
+drive the pad.
+
 ## Unattended runs
 
 - `PS3RECOMP_OSK_INITIAL_TEXT` (UTF-8) prefills the first non-password dialog of
@@ -50,3 +70,6 @@ user interface.
   the initial-text override and the mailbox.
 - `python3 tools/test_native_osk_headless.py` runs the headless host end to end.
 - `python3 tools/test_native_osk_control.py` checks the confirm helper.
+- `python3 tools/test_native_osk_sdl.py` builds the SDL host with and without
+  the headless fallback and runs real SDL windows under the dummy and offscreen
+  video drivers, plus a private Xvfb server when one is installed.

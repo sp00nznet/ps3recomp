@@ -220,6 +220,14 @@ if(NOT WIN32 AND NOT APPLE)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_HEADLESS=1)
         message(STATUS "  OSK:          headless native host")
     endif()
+    # A text-entry dialog in an SDL2 window, opened by the thread that owns
+    # the Vulkan backend's game window (PS3RECOMP_VK_WINDOW=1) and pumps its
+    # events (libs/misc/osk_sdl.c). Needs SDL2, as the Vulkan window does.
+    option(PS3RECOMP_NATIVE_OSK_SDL "Build the SDL2 native OSK dialog" OFF)
+    if(PS3RECOMP_NATIVE_OSK_SDL)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_SDL=1)
+        message(STATUS "  OSK:          SDL2 dialog on the game window")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

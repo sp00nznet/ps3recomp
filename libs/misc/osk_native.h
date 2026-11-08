@@ -12,6 +12,11 @@
  *   PS3RECOMP_NATIVE_OSK_HEADLESS  POSIX without a toolkit dialog; a dialog is
  *                                  confirmed only through the control mailbox
  *                                  (osk_headless.c).
+ *   PS3RECOMP_NATIVE_OSK_SDL       POSIX other than macOS: an SDL2 dialog owned
+ *                                  by the thread that pumps the game window
+ *                                  (osk_sdl.c). With the headless host also
+ *                                  built, requests made while no window is
+ *                                  registered go to it.
  * PS3RECOMP_DISABLE_NATIVE_OSK forces the legacy stub. PS3RECOMP_TEST_NATIVE_OSK
  * builds the lifecycle for a test that supplies its own host.
  */
@@ -19,9 +24,16 @@
 #define PS3RECOMP_OSK_NATIVE_H
 #include <stdint.h>
 
-#if (!defined(_WIN32) && !defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_HEADLESS) && \
+#if (!defined(_WIN32) && !defined(__APPLE__) && \
+     (defined(PS3RECOMP_NATIVE_OSK_HEADLESS) || defined(PS3RECOMP_NATIVE_OSK_SDL)) && \
      !defined(PS3RECOMP_DISABLE_NATIVE_OSK)) || defined(PS3RECOMP_TEST_NATIVE_OSK)
 #define PS3RECOMP_NATIVE_OSK 1
+#endif
+/* The SDL host owns the host entry points; the headless host becomes its
+ * no-window fallback under the osk_headless_* names. */
+#if !defined(_WIN32) && !defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_SDL) && \
+    !defined(PS3RECOMP_DISABLE_NATIVE_OSK) && !defined(PS3RECOMP_TEST_NATIVE_OSK)
+#define OSK_NATIVE_HAS_SDL_HOST 1
 #endif
 
 #ifdef __cplusplus
@@ -60,6 +72,24 @@ int32_t osk_native_get_text(uint32_t result);
 int32_t osk_native_abort(void);
 /* Delivers pending lifecycle events; run from cellSysutilCheckCallback. */
 void cellOskDialog_tick(void);
+
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+/* Called only on the thread that owns SDL video and pumps its events (the
+ * game window's owner). set_window(NULL) retires any dialog before the window
+ * goes away. */
+void osk_native_sdl_set_window(void* sdl_window);
+void osk_native_sdl_pump(void);
+/* Nonzero when the event belonged to the dialog (the caller drops it). */
+int  osk_native_sdl_handle_event(const void* sdl_event);
+/* Any thread: a dialog is queued or open and owns the keyboard. */
+int  osk_native_sdl_input_active(void);
+#ifdef PS3RECOMP_NATIVE_OSK_HEADLESS
+int  osk_headless_available(void);
+void osk_headless_open(const OskNativeRequest* request);
+void osk_headless_close(uint64_t token);
+void osk_headless_confirm(uint64_t token);
+#endif
+#endif
 
 #ifdef __cplusplus
 }

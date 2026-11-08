@@ -20,6 +20,7 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "../misc/osk_native.h"                   /* the SDL OSK dialog owns the keyboard */
 
 /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
  * wall-clock seconds. A loaded machine runs a title at a third of its usual
@@ -279,6 +280,11 @@ static int pad_key_down(int key)
  * pressed. "Focused" is that some window of this process has the keyboard focus. */
 static int pad_host_window_focused(void)
 {
+#ifdef OSK_NATIVE_HAS_SDL_HOST
+    /* An open native OSK dialog owns the keyboard: typing into it must not
+     * also drive the pad. */
+    if (osk_native_sdl_input_active()) return 0;
+#endif
     return SDL_GetKeyboardFocus() != NULL;
 }
 static int pad_key_down(int key)
