@@ -17,6 +17,9 @@
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #endif
+#ifndef _WIN32
+#include <sched.h>    /* sched_yield: the opt-in short-usleep yield */
+#endif
 #include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
@@ -276,7 +279,33 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
-    if (usec > 0) {
+    /* PS3RECOMP_USLEEP_SPIN_US=<n> (opt-in; unset or 0 = off): a usleep
+     * shorter than n microseconds yields to a CLOCK_MONOTONIC deadline instead
+     * of calling nanosleep, as the Windows branch above does for every
+     * sub-millisecond wait. Guests commonly poll a flag with usleep(1..10); a
+     * nanosleep that short returns only after the kernel's timer slack (50 us
+     * by default on Linux) plus a wakeup, so each poll sees the flag tens of
+     * microseconds late. Yielding keeps the core available to the sibling
+     * thread the guest is waiting on. Longer sleeps still nanosleep. */
+    static long s_spin_us = -1;
+    long spin_us = __atomic_load_n(&s_spin_us, __ATOMIC_RELAXED);
+    if (spin_us < 0) {
+        const char* e = getenv("PS3RECOMP_USLEEP_SPIN_US");
+        const long v = e ? strtol(e, NULL, 10) : 0;
+        spin_us = v > 0 ? v : 0;
+        if (__atomic_exchange_n(&s_spin_us, spin_us, __ATOMIC_RELAXED) < 0 && spin_us)
+            fprintf(stderr, "[sys_timer] usleep below %ld us yields to its deadline\n", spin_us);
+    }
+    if (usec > 0 && usec < (uint64_t)spin_us) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const uint64_t deadline = (uint64_t)now.tv_sec * 1000000000ull +
+                                  (uint64_t)now.tv_nsec + usec * 1000ull;
+        do {
+            sched_yield();
+            clock_gettime(CLOCK_MONOTONIC, &now);
+        } while ((uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec < deadline);
+    } else if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);
