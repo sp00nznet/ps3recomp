@@ -221,6 +221,17 @@ if(NOT WIN32 AND NOT APPLE)
         message(STATUS "  OSK:          headless native host")
     endif()
 endif()
+if(APPLE)
+    # An AppKit sheet on the Metal backend's game window (libs/misc/osk_macos.m).
+    option(PS3RECOMP_NATIVE_OSK_MACOS "Build the macOS AppKit native OSK host" OFF)
+    if(PS3RECOMP_NATIVE_OSK_MACOS)
+        target_sources(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m")
+        set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m"
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_MACOS=1)
+        message(STATUS "  OSK:          macOS AppKit native host")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Guest shaders on Metal: HLSL -> SPIR-V -> MSL

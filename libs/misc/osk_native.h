@@ -12,6 +12,8 @@
  *   PS3RECOMP_NATIVE_OSK_HEADLESS  POSIX without a toolkit dialog; a dialog is
  *                                  confirmed only through the control mailbox
  *                                  (osk_headless.c).
+ *   PS3RECOMP_NATIVE_OSK_MACOS     macOS: an AppKit sheet on the window the
+ *                                  Metal backend registers (osk_macos.m).
  * PS3RECOMP_DISABLE_NATIVE_OSK forces the legacy stub. PS3RECOMP_TEST_NATIVE_OSK
  * builds the lifecycle for a test that supplies its own host.
  */
@@ -19,7 +21,8 @@
 #define PS3RECOMP_OSK_NATIVE_H
 #include <stdint.h>
 
-#if (!defined(_WIN32) && !defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_HEADLESS) && \
+#if (((!defined(_WIN32) && !defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_HEADLESS)) || \
+      (defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_MACOS))) && \
      !defined(PS3RECOMP_DISABLE_NATIVE_OSK)) || defined(PS3RECOMP_TEST_NATIVE_OSK)
 #define PS3RECOMP_NATIVE_OSK 1
 #endif
@@ -41,6 +44,13 @@ void osk_native_open(const OskNativeRequest* request);   /* any thread */
 void osk_native_close(uint64_t token);                   /* any thread */
 /* Press the host's own OK for an open generation (control mailbox). */
 void osk_native_confirm(uint64_t token);
+
+/* macOS host: the window a dialog attaches to as a sheet (an NSWindow*), or
+ * NULL. Main thread only; closing the window makes the host unavailable. */
+void osk_native_macos_set_window(void* window);
+/* Any thread: a sheet is up and owns the keyboard (cellPad's keyboard pad
+ * stands down meanwhile). */
+int  osk_native_macos_input_active(void);
 
 /* ---- implemented by osk_native.c, called by the host ---------------------- */
 int  osk_native_is_pending(uint64_t token);   /* loaded, not yet shown */
