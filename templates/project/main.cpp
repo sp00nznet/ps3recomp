@@ -38,6 +38,9 @@
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
 
+#include "port_extension.h"   /* optional build extensions (PORT_EXTENSIONS) */
+
+#include <atomic>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,6 +237,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             fired++;
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
+        if (auto poll = port_extension()->frame_poll) poll();
 
         /* Drain at the outer cadence too, not only on the 16 ms tick: titles
          * fence every render pass on a label the drain writes, and one wave of
@@ -402,6 +406,15 @@ static int run_guest(uint32_t entry, uint32_t stack_top)
 static int run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry, stack_top); }
 #endif
 
+/* Registered with atexit when an extension has a stop callback; the flag keeps
+ * it to one call even if exit is reached twice. */
+static void port_extension_stop_once(void)
+{
+    static std::atomic<bool> stopped{false};
+    if (stopped.exchange(true)) return;
+    if (auto stop = port_extension()->stop) stop();
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -419,6 +432,9 @@ int main(int argc, char** argv)
 #endif
 
     printf("=== ps3recomp game runner ===\n");
+
+    /* Build extensions (port_extension.h): null unless one is registered. */
+    if (auto prepare = port_extension()->prepare) prepare(argv[1]);
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
@@ -444,6 +460,9 @@ int main(int argc, char** argv)
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */
     g_ps3_guest_caller = harness_guest_caller;
+    if (auto start = port_extension()->start) start(argv[1]);
+    /* stop runs once at process exit, whichever path ends the run. */
+    if (port_extension()->stop) std::atexit(port_extension_stop_once);
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
