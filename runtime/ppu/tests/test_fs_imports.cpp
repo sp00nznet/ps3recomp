@@ -30,6 +30,7 @@ void ydkj_host_bt(const char* tag) { (void)tag; }
 #include "../../platform/ps3_dev_flash.c"
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
+const char* edat_resolve_open(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
 
 struct Reg { uint32_t nid; const char* name; void (*fn)(ppu_context*); };
 static std::vector<Reg> g_regs;
