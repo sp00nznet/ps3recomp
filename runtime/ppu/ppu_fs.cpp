@@ -36,6 +36,13 @@ extern "C" void ydkj_host_bt(const char* tag);
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>          /* open/close on MinGW */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>     /* SetEndOfFile: cellFsAllocateFileAreaWithoutZeroFill */
 #else
 #include <unistd.h>
 #endif
@@ -914,9 +921,57 @@ static void cellFsFtruncate(ppu_context* ctx)
                                      (int)(uint32_t)ctx->gpr[3], (unsigned long long)ctx->gpr[4], rc);
     ctx->gpr[3] = rc == 0 ? CELL_OK : (uint64_t)(int64_t)CELL_FS_EIO;
 }
-/* File-area preallocation (LBP cache warm-up spams this): host filesystems
- * grow files on write, so accepting is correct -- no preallocation needed. */
-static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+/* Grow an existing host file to `size` bytes without writing the new space.
+ * SetEndOfFile (Windows) and truncate (POSIX) move the end of file, and the
+ * filesystem reads the gap back as zeroes. The CRT's _chsize_s writes those
+ * zeroes itself: about 5 s for a 1.75 GB file, which is what one title asks
+ * for. Returns 0 when the file is now at least `size` long (a longer file is
+ * left alone), 1 when there is no such file, -1 when it cannot be grown. */
+static int host_grow_file(const char* path, uint64_t size)
+{
+    fs_stat64_t st;
+    if (FS_STAT64(path, &st) != 0) return 1;
+    if ((uint64_t)st.st_size >= size) return 0;
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    LARGE_INTEGER end;
+    end.QuadPart = (LONGLONG)size;
+    const BOOL ok = SetFilePointerEx(h, end, NULL, FILE_BEGIN) && SetEndOfFile(h);
+    CloseHandle(h);
+    return ok ? 0 : -1;
+#else
+    return truncate(path, (off_t)size) == 0 ? 0 : -1;
+#endif
+}
+
+/* cellFsAllocateFileAreaWithoutZeroFill(path, u64 size): reserve `size` bytes
+ * for the file without clearing them, so that afterwards the file is that long.
+ *
+ * Accepting the call and doing nothing left the file at whatever length its
+ * writes had reached, and a title that checks the length when it next opens
+ * the file finds it short. Red Dead Redemption sizes its disk cache this way
+ * (cache.dat under /dev_hdd1, 0x6FE02000 bytes), reads the size back on the
+ * next boot, and rebuilt the whole cache on every boot ("Cache file is wrong
+ * size").
+ *
+ * This allocates; it never shrinks, and a file already long enough costs one
+ * stat (LBP calls it repeatedly while it warms its cache). A missing file keeps
+ * the previous answer, CELL_OK with nothing created. */
+static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx)
+{
+    char gpath[1024], hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    host_path(hpath, sizeof hpath, gpath);
+    const uint64_t size = ctx->gpr[4];
+    const int rc = host_grow_file(hpath, size);
+    if (ps3_env_once("PS3_FSLOG"))
+        fprintf(stderr, "[fs] AllocateFileAreaWithoutZeroFill '%s' -> '%s' size=0x%llX (%s)\n",
+                gpath, hpath, (unsigned long long)size,
+                rc == 0 ? "OK" : rc > 0 ? "no such file" : "FAIL");
+    ctx->gpr[3] = rc < 0 ? (uint64_t)(int64_t)CELL_FS_EIO : CELL_OK;
+}
 
 /* Free space for (path, u32* block_size, u64* free_block_count). Unregistered,
  * the call took the unresolved-NID path: CELL_OK with both out-params left as
