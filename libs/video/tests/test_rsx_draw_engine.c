@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>            /* dup/dup2: capture the churn report */
 
 static int g_failures;
 
@@ -2711,6 +2712,64 @@ static void test_clear_rect(void)
     engine_down();
 }
 
+/* Runs `body` with stderr captured into `out` (NUL-terminated, truncated). */
+static void capture_stderr(void (*body)(void), char* out, size_t cap)
+{
+    fflush(stderr);
+    FILE* tmp = tmpfile();
+    const int saved = dup(2);
+    if (!tmp || saved < 0) { out[0] = 0; body(); return; }
+    dup2(fileno(tmp), 2);
+    body();
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    rewind(tmp);
+    const size_t n = fread(out, 1, cap - 1, tmp);
+    out[n] = 0;
+    fclose(tmp);
+}
+
+static void churn_body(void)
+{
+    engine_up();
+    m(M_CLEAR_BUFFERS, 0xF0u);                 /* first colour target: new */
+    for (int i = 0; i < 3; i++) {              /* size flips back and forth */
+        m(M_SURFACE_CLIP_H, 512u << 16);
+        m(M_SURFACE_CLIP_V, 512u << 16);
+        m(M_CLEAR_BUFFERS, 0xF0u);
+        m(M_SURFACE_CLIP_H, 256u << 16);
+        m(M_SURFACE_CLIP_V, 256u << 16);
+        m(M_CLEAR_BUFFERS, 0xF0u);
+    }
+    engine_down();                             /* the final report */
+}
+
+static void test_target_churn(void)
+{
+    printf("-- render-target churn counter\n");
+    static char log[16384];
+
+    unsetenv("PS3RECOMP_RSX_TARGET_CHURN");
+    capture_stderr(churn_body, log, sizeof log);
+    CHECK(!strstr(log, "[target churn]"), "off by default: no churn report");
+    const int creates_off = stub.n_color_create;
+
+    setenv("PS3RECOMP_RSX_TARGET_CHURN", "1", 1);
+    capture_stderr(churn_body, log, sizeof log);
+    unsetenv("PS3RECOMP_RSX_TARGET_CHURN");
+    CHECK(stub.n_color_create == creates_off,
+          "counting changes no engine behaviour (%d vs %d creates)",
+          stub.n_color_create, creates_off);
+    char want[64];
+    snprintf(want, sizeof want, "creates=%d ", stub.n_color_create);
+    CHECK(strstr(log, want) != NULL, "the summary counts every creation (%s)\n%s", want, log);
+    CHECK(strstr(log, "color 0:0x00040000 new -> ") != NULL,
+          "the first target at the address is reported as new\n%s", log);
+    CHECK(strstr(log, "256x256 -> fmt") && strstr(log, "512x512 -> fmt"),
+          "both size transitions are reported\n%s", log);
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -2759,6 +2818,7 @@ int main(void)
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
     test_clear_rect();
+    test_target_churn();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

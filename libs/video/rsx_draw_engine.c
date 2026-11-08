@@ -750,6 +750,95 @@ static u32 eng_oldest_slot(const char* what, const u32* last_use, size_t stride,
     return best;
 }
 
+/* PS3RECOMP_RSX_TARGET_CHURN=1 (diagnostic, off by default; read at engine
+ * init): count colour and depth target creations per guest address,
+ * aggregated by transition (kind, location, offset, old format and size ->
+ * new format and size; a first creation at an address shows "new"), and
+ * print the busiest twelve with per-second rates every two seconds and once
+ * more at shutdown. A title that re-creates the same target every frame
+ * shows up here as a steady rate. Numbers only. */
+#define ENG_CHURN_ROWS 256u
+#define ENG_CHURN_NONE 0xFFFFFFFFu
+typedef struct {
+    u32 kind, location, offset, ofmt, ow, oh, nfmt, nw, nh;
+    unsigned long long n;
+} eng_churn_row;
+static int s_churn_on;
+static eng_churn_row s_churn[ENG_CHURN_ROWS];
+static unsigned long long s_churn_creates, s_churn_releases, s_churn_flips, s_churn_t0;
+
+static unsigned long long eng_churn_now_ns(void)
+{
+    struct timespec ts;
+#if defined(_WIN32)
+    timespec_get(&ts, TIME_UTC);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+static void eng_churn_reset(unsigned long long now)
+{
+    memset(s_churn, 0, sizeof s_churn);
+    s_churn_creates = s_churn_releases = s_churn_flips = 0;
+    s_churn_t0 = now;
+}
+
+/* Prints and resets when two seconds have passed, or always when `final`. */
+static void eng_churn_report(int final)
+{
+    if (!s_churn_on) return;
+    const unsigned long long now = eng_churn_now_ns();
+    if (!final && now - s_churn_t0 < 2000000000ull) return;
+    if (final && !s_churn_creates && !s_churn_flips) return;
+    double secs = (double)(now - s_churn_t0) / 1e9;
+    if (secs < 1e-3) secs = 1e-3;
+    fprintf(stderr, "[target churn] %.1f s: engine flips=%llu creates=%llu (%.1f/s) releases=%llu (%.1f/s)\n",
+            secs, s_churn_flips, s_churn_creates, (double)s_churn_creates / secs,
+            s_churn_releases, (double)s_churn_releases / secs);
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (u32 i = 0; i < ENG_CHURN_ROWS; i++)
+            if (s_churn[i].n && (best < 0 || s_churn[i].n > s_churn[best].n)) best = (int)i;
+        if (best < 0) break;
+        const eng_churn_row* r = &s_churn[best];
+        if (r->ofmt == ENG_CHURN_NONE)
+            fprintf(stderr, "[target churn]   %s %u:0x%08X new -> fmt %u %ux%u: %llu (%.1f/s)\n",
+                    r->kind ? "depth" : "color", r->location, r->offset,
+                    r->nfmt, r->nw, r->nh, r->n, (double)r->n / secs);
+        else
+            fprintf(stderr, "[target churn]   %s %u:0x%08X fmt %u %ux%u -> fmt %u %ux%u: %llu (%.1f/s)\n",
+                    r->kind ? "depth" : "color", r->location, r->offset,
+                    r->ofmt, r->ow, r->oh, r->nfmt, r->nw, r->nh, r->n, (double)r->n / secs);
+        s_churn[best].n = 0;
+    }
+    eng_churn_reset(now);
+}
+
+/* A target was created at (location, offset). `ofmt` is ENG_CHURN_NONE when
+ * no target of this address was replaced; `released` when an old target
+ * (of this or an evicted address) was released for it. */
+static void eng_churn_note(u32 kind, u32 location, u32 offset, u32 ofmt, u32 ow, u32 oh,
+                           u32 nfmt, u32 nw, u32 nh, int released)
+{
+    if (!s_churn_on) return;
+    eng_churn_report(0);   /* on time, whether or not flips reach the engine */
+    s_churn_creates++;
+    if (released) s_churn_releases++;
+    for (u32 i = 0; i < ENG_CHURN_ROWS; i++) {
+        eng_churn_row* r = &s_churn[i];
+        if (!r->n) {
+            *r = (eng_churn_row){kind, location, offset, ofmt, ow, oh, nfmt, nw, nh, 1};
+            return;
+        }
+        if (r->kind == kind && r->location == location && r->offset == offset &&
+            r->ofmt == ofmt && r->ow == ow && r->oh == oh &&
+            r->nfmt == nfmt && r->nw == nw && r->nh == nh) { r->n++; return; }
+    }
+    /* Table full: the totals above still count it. */
+}
+
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690).
@@ -817,6 +906,13 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         return (!evicted && slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 
     eng_surface* s = &g.surfaces[slot];
+    if (s_churn_on) {
+        const int same = slot < g.n_surfaces && s->handle &&
+                         s->location == location && s->offset == offset;
+        eng_churn_note(0, location, offset, same ? (u32)s->fmt : ENG_CHURN_NONE,
+                       same ? s->w : 0, same ? s->h : 0, (u32)want_fmt, want_w, want_h,
+                       slot < g.n_surfaces && s->handle != 0);
+    }
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
@@ -1115,6 +1211,13 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         return (!evicted && slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
     eng_zdepth* z = &g.zdepths[slot];
+    if (s_churn_on) {
+        const int same = slot < g.n_zdepths && z->handle &&
+                         z->location == location && z->offset == offset;
+        eng_churn_note(1, location, offset, same ? 0u : ENG_CHURN_NONE,
+                       same ? z->w : 0, same ? z->h : 0, 0u, want_w, want_h,
+                       slot < g.n_zdepths && z->handle != 0);
+    }
     /* The old size's snapshot goes with it: it can never be valid again. */
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     if (z->conv) g.be->texture_release(g.be->user, z->conv);
@@ -3649,6 +3752,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
+    if (s_churn_on) { s_churn_flips++; eng_churn_report(0); }
     eng_present(g.last_flip_buffer);
 }
 
@@ -3692,6 +3796,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
       s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_RSX_TARGET_CHURN");
+      s_churn_on = e && !strcmp(e, "1");
+      eng_churn_reset(s_churn_on ? eng_churn_now_ns() : 0); }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
@@ -3720,6 +3827,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
 void rsx_draw_engine_shutdown(void)
 {
     if (!g.be) return;
+    eng_churn_report(1);
+    s_churn_on = 0;
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
     for (u32 i = 0; i < g.n_textures; i++)
