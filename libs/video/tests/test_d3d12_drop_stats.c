@@ -40,7 +40,8 @@ int main(void)
     CHECK(s_d3d12_stats.drop[D3D12_DROP_NOT_READY] == 2, "draws before the pipeline drop as not_ready");
 
     /* A pipeline but an empty or oversized draw: bad_count. */
-    s_d3d.pipeline_ready = 1; s_d3d.vb_mapped = 1;
+    static u8 mapped[64];
+    s_d3d.pipeline_ready = 1; s_d3d.vb_mapped = mapped;
     d3d12_draw_arrays(NULL, RSX_PRIMITIVE_TRIANGLES, 0, 0);
     d3d12_draw_indexed(NULL, RSX_PRIMITIVE_TRIANGLES, 0, MAX_VERTICES + 1);
     CHECK(s_d3d12_stats.drop[D3D12_DROP_BAD_COUNT] == 2, "empty and oversized draws drop as bad_count");
@@ -49,7 +50,7 @@ int main(void)
     d3d12_draw_indexed(NULL, RSX_PRIMITIVE_TRIANGLES, 0, 3);
     CHECK(s_d3d12_stats.drop[D3D12_DROP_NO_VP_RESOURCES] == 1, "indexed draw without VP resources is counted");
     CHECK(s_d3d12_stats.calls == 5, "every call is counted once");
-    s_d3d.pipeline_ready = 0; s_d3d.vb_mapped = 0;
+    s_d3d.pipeline_ready = 0; s_d3d.vb_mapped = NULL;
 
     /* The report: the driver checks stdout for the line (or its absence). */
     s_d3d12_stats.flips = 1;
