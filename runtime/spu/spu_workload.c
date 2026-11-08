@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
+#include "spu_task_pool.h"              /* PS3RECOMP_SPU_TASK_POOL */
 #endif
 #include "ps3emu/thread_name.h"
 
@@ -394,6 +395,9 @@ typedef struct {
     int                 have_r3;
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
+#ifndef _WIN32
+    spu_task_pool_item  pool_item;    /* PS3RECOMP_SPU_TASK_POOL hand-off */
+#endif
 } spu_async_job;
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
@@ -1022,6 +1026,28 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
 }
 #else
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+
+/* PS3RECOMP_SPU_TASK_POOL=1 (opt-in, POSIX): run async SPU tasks on reused
+ * host threads instead of one new detached thread per task. Every task still
+ * starts at once on a thread of its own (see spu_task_pool.h), so a task that
+ * waits for another can never be queued behind it. Pool threads keep the
+ * 256 MB stack reservation below and exit after 2 s idle. Off: a new thread
+ * per task, as before. */
+static spu_task_pool s_spu_task_pool = SPU_TASK_POOL_INIT(2000u, (size_t)256u << 20);
+static unsigned long long s_spu_task_pool_tasks;   /* for the periodic report */
+static int spu_task_pool_enabled(void)
+{
+    static int on = -1;
+    int v = __atomic_load_n(&on, __ATOMIC_RELAXED);
+    if (v < 0) {
+        const char* e = ps3_env_once("PS3RECOMP_SPU_TASK_POOL");
+        v = e && e[0] == '1' && !e[1];
+        if (__atomic_exchange_n(&on, v, __ATOMIC_RELAXED) < 0 && v)
+            fprintf(stderr, "[spu_workload] async SPU task thread pool on\n");
+    }
+    return v;
+}
+static void spu_async_pool_run(void* p) { spu_async_run((spu_async_job*)p); }
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
@@ -1679,6 +1705,21 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * mmap'd and committed on touch, so this reserves address space rather
      * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
      * the guard page above. */
+    if (spu_task_pool_enabled()) {
+        if (!spu_task_pool_submit(&s_spu_task_pool, &j->pool_item, spu_async_pool_run, j)) {
+            free(j);
+            return 0;
+        }
+        const unsigned long long n = __atomic_add_fetch(&s_spu_task_pool_tasks, 1, __ATOMIC_RELAXED);
+        if (n == 1 || n % 2000 == 0) {
+            pthread_mutex_lock(&s_spu_task_pool.mu);
+            fprintf(stderr, "[spu_workload] task pool: tasks=%llu reused=%llu created=%llu retired=%llu threads=%u\n",
+                    n, s_spu_task_pool.reused, s_spu_task_pool.created,
+                    s_spu_task_pool.retired, s_spu_task_pool.threads);
+            pthread_mutex_unlock(&s_spu_task_pool.mu);
+        }
+        return 1;
+    }
     pthread_t th;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
