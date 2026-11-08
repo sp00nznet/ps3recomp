@@ -5,6 +5,7 @@
  * Save data is stored under: {root}/gamedata/dev_hdd0/home/00000001/savedata/{dirName}/
  */
 
+#include "../../runtime/memory/vm_watch_hooks.h"
 #include "cellSaveData.h"
 #include "ps3_psf.h"
 #include "ps3emu/guest_call.h"
@@ -702,6 +703,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         }
         size_t read_size = (size_t)set->fileSize;
         if (read_size > set->fileBufSize) read_size = set->fileBufSize;
+        vm_note_host_write(set->fileBuf, read_size);   /* a guest buffer: kernel write */
         size_t got = fread(set->fileBuf, 1, read_size, fp);
         int failed = ferror(fp);
         if (fclose(fp) != 0) failed = 1;

@@ -1298,6 +1298,9 @@ extern "C" void ppu_guard_page(uint32_t guest_ea)
     /* The whole 64 KB demand-commit block: vm_commit_veh commits a block at a
      * time on first touch, and doing so later re-commits this page read-write,
      * silently disarming the guard. */
+    /* This guard owns the page's protection from here on: pin it out of the
+     * guest write watch (vm_watch_hooks.h), so the two never fight over it. */
+    vm_watch_forget_host((const void*)s_guard_page, 0x1000, 0);
     VirtualAlloc((void*)(s_guard_page & ~(uintptr_t)0xFFFF), 0x10000, MEM_COMMIT, PAGE_READWRITE);
     DWORD old;
     VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READONLY, &old);

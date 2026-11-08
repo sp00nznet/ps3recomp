@@ -6,6 +6,8 @@
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
 #include "../platform/ps3_dev_flash.h"
+#include "../memory/vm_watch_hooks.h"
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -548,7 +550,11 @@ int64_t sys_fs_read(ppu_context* ctx)
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
     if (size) vm_commit(buf_addr, (uint32_t)size);
+    /* A kernel write into guest memory: announce it to the write watch (the
+     * commit above already released the range; this states the contract). */
+    vm_note_write(buf_addr, (size_t)size);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
+    vm_note_write_check(nread < (size_t)size && ferror(f->fp) && errno == EFAULT, "sys_fs read");
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
      *

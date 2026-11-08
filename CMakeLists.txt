@@ -431,6 +431,17 @@ if(PS3RECOMP_BUILD_TESTS)
         # The same walker's JUMP decode: the old and the new form.
         add_subdirectory(tests/gcm_fifo_jump)
     endif()
+    # The guest write watch (default off) on synthetic guest memory.
+    add_executable(test_vm_write_watch tests/test_vm_write_watch.c runtime/memory/vm_watch.c)
+    target_include_directories(test_vm_write_watch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(NOT WIN32)
+        target_link_libraries(test_vm_write_watch PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME vm_write_watch COMMAND test_vm_write_watch)
+    add_test(NAME vm_write_watch_off COMMAND test_vm_write_watch off)
+    add_test(NAME vm_write_watch_strict COMMAND test_vm_write_watch strict)
+    set_tests_properties(vm_write_watch vm_write_watch_off vm_write_watch_strict PROPERTIES TIMEOUT 60)
+    set_tests_properties(vm_write_watch_strict PROPERTIES WILL_FAIL TRUE)
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
