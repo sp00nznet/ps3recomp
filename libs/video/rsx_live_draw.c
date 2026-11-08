@@ -5082,6 +5082,7 @@ typedef struct {
     batch_t idx[256]; u32 n_idx;
     u32     n_packets;
     vtx_t*  verts; u32 n_verts, cap_verts;
+    u32     n_immediate;
     rsx_vertex_ref* refs; u32 n_refs, cap_refs;
     u32     n_source_refs;
     int     refs_remapped;
@@ -5103,6 +5104,7 @@ static draw_ctx dc;
 static void dc_reset(void)
 {
     dc.n_arr = dc.n_idx = dc.n_verts = dc.n_refs = 0;
+    dc.n_immediate = 0;
     dc.n_source_refs = 0;
     dc.refs_remapped = 0;
     dc.n_packets = 0;
@@ -5471,6 +5473,8 @@ static const float* dc_vertex_attr(
         return (const float*)(
             dc.compact_verts + (u64)vertex * dc.layout.stride +
             (u32)slot * 16u);
+    if (dc.n_immediate && vertex < dc.n_verts)
+        return dc.verts[vertex].a[attr];
     memcpy(fallback, dc.fetch_plan.attr[attr].default_value, 16);
     return fallback;
 }
@@ -5483,7 +5487,7 @@ static const float* dc_vertex_attr(
 static const float* dc_vertex_attr_canonical(
     u32 vertex, u32 attr, float fallback[4])
 {
-    if (!ld_vertex_compact_payload())
+    if (dc.n_immediate || !ld_vertex_compact_payload())
         return dc.verts[vertex].a[attr];
     const s8 slot = dc.layout.slot_by_attr[attr];
     if (slot >= 0 && vertex < dc.n_verts)
@@ -6305,6 +6309,26 @@ static void ld_movie_capture_overlay(void)
 }
 
 static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
+/* Immediate positions latch the current attribute values at that point in the
+ * stream. Their payload is independent of array formats and guest addresses.
+ * Keep a bounded complete group; never draw a truncated allocation prefix. */
+static void sink_immediate_vertex(void* user,const rsx_dispatch* r)
+{
+    (void)user;g_ld_stats.packets_seen++;
+    if(g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {g_ld_stats.packets_movie++;return;}
+    dc.n_packets++;
+    if(!dc.fetch_ok)return;
+    if(dc.n_immediate>=4096u) {dc.fetch_ok=0;return;}
+    vtx_t vertex;
+    for(u32 attr=0;attr<16;attr++) {
+        rsx_dsp_vertex_default(r,attr,vertex.a[attr]);
+        const u32 base=(0x1C00u+attr*16u)>>2;
+        if(r->seen[base] || r->seen[base+1] || r->seen[base+2] || r->seen[base+3])
+            memcpy(vertex.a[attr],r->regs+base,16);
+    }
+    push_vert(&vertex);
+    if(dc.fetch_ok) {dc.n_immediate++;g_ld_stats.packets_queued++;}
+}
 static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)u; (void)r; g_ld_stats.packets_seen++;
@@ -6331,6 +6355,8 @@ static void sink_inline_array(void* u, const rsx_dispatch* r,
         g_ld_stats.packets_movie++;
         return;
     }
+
+    if(dc.n_immediate) {dc.n_packets++;dc.fetch_ok=0;return;}
 
     const u32 stride = rsx_vertex_inline_layout(&g.rsx, dc.inl_off);
     if (!stride || bytes < stride) { g_ld_stats.packets_queue_full++; return; }
@@ -7123,7 +7149,18 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_profile.total_used_attribute_max = used_layout.count;
     const LONGLONG fetch_pack_begin = ld_profile_qpc();
 #endif
-    if (ld_vertex_compact_payload()) {
+    if (dc.n_immediate) {
+        if(dc.n_arr || dc.n_idx || dc.inl)dc.fetch_ok=0;
+        dc.layout=used_layout;
+        dc.n_source_refs=dc.n_immediate;
+        if(dc.fetch_ok && ld_vertex_compact_payload()) {
+            if(!reserve_compact_vertices((u64)dc.n_immediate*used_layout.stride))dc.fetch_ok=0;
+            if(dc.fetch_ok)for(u32 vertex=0;vertex<dc.n_immediate;vertex++)
+                for(u32 slot=0;slot<used_layout.count;slot++)
+                    memcpy(dc.compact_verts+(u64)vertex*used_layout.stride+slot*16u,
+                           dc.verts[vertex].a[used_layout.attrs[slot]],16u);
+        }
+    } else if (ld_vertex_compact_payload()) {
         fetch_batches_hoisted(&used_layout, 1);
     } else if (ld_vertex_hoist_fetch()) {
         rsx_vertex_layout_plan legacy_layout;
@@ -8506,6 +8543,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     sink.inline_array = sink_inline_array;
     sink.draw_index_array = sink_draw_index;
     sink.flip = sink_flip;
+    sink.immediate_vertex = sink_immediate_vertex;
     rsx_dispatch_init(&g.rsx, &sink);
 
     g.ready = 1;
