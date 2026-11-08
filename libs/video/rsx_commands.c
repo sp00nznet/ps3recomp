@@ -22,6 +22,24 @@
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "ps3emu/log_first.h"
 
+/* PS3RECOMP_RSX_RELEASE_LINE_WAKE=1 (opt-in): after an NV4097 semaphore
+ * release into main memory (context DMA 0xFEED0001), call this hook with the
+ * 128-byte line the value landed in. A title can signal a SPURS ready count or
+ * workload flag from its command stream that way; the store is a host write,
+ * so nothing that waits on that line is woken, and the SPURS coordinator only
+ * sees it on its next timed pass. cellSpurs installs its line wake here, the
+ * same wake an SPU commit to the line gets. Unset, the hook is never called. */
+void (*g_rsx_main_release_hook)(uint32_t line) = 0;
+static int rsx_release_line_wake(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_RELEASE_LINE_WAKE");
+        on = e && !strcmp(e, "1");
+    }
+    return on;
+}
+
 /* ---------------------------------------------------------------------------
  * Global backend
  * -----------------------------------------------------------------------*/
@@ -529,7 +547,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 ea = gcm_io_offset_to_ea(s_sem_off);
         u32 val = method == 0x1D74 ? data
                 : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
-        if (ea) vm_write32(ea, val);
+        if (ea) {
+            vm_write32(ea, val);
+            if (g_rsx_main_release_hook && rsx_release_line_wake())
+                g_rsx_main_release_hook(ea & ~127u);
+        }
         return 0;
       }
       if (method == 0x1D70) {
