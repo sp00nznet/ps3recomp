@@ -1,6 +1,9 @@
 /* Vulkan engine presents: a direct present (PS3RECOMP_VK_DIRECT_PRESENT=1)
+ * and a present through the present thread (PS3RECOMP_RSX_PRESENT_THREAD=1)
  * must leave the same frame a read-back present (the default) does, keep
- * the counters honest, and say how much CPU a present call costs.
+ * the counters honest, and say how much CPU a present call costs. In the
+ * thread mode the frame the show thread put into the offscreen target last
+ * must also be the final frame, byte for byte.
  *
  * Each frame clears a target, draws blended full-screen quads into it and
  * presents it through the engine's present callback; the fixture times the
@@ -65,7 +68,9 @@ int main(int argc, char** argv)
     CHECK(s_vk.eng_active, "the register-file engine drives the backend");
     CHECK(s_g.on, "guest programs (glslang) available");
     if (!s_vk.eng_active || !s_g.on) { rsx_vulkan_backend_shutdown(); return 1; }
-    const int direct = vk_env_on("PS3RECOMP_VK_DIRECT_PRESENT");
+    const int threaded = s_vpt.pt != NULL;
+    CHECK(threaded == rsx_present_thread_requested(), "the present thread runs exactly when asked for");
+    const int direct = !threaded && vk_env_on("PS3RECOMP_VK_DIRECT_PRESENT");
 
     const u32 rt = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, W, H, NULL, 0);
     rsx_be_render_state rs; memset(&rs, 0, sizeof rs);
@@ -108,16 +113,53 @@ int main(int argc, char** argv)
     }
     vk_eng_submit_and_wait(NULL, 0);
     const double total = now_ms() - t0;
+    rsx_present_thread_stats st;
+    memset(&st, 0, sizeof st);
+    if (threaded) {
+        /* Let the show thread take every staged frame: the last one is never
+         * dropped, since nothing is staged after it. */
+        for (int i = 0; i < 5000; i++) {
+            rsx_present_thread_get_stats(s_vpt.pt, &st);
+            if (st.presented + st.dropped + st.show_failed >= st.staged) break;
+            struct timespec ts = { 0, 1000000 };
+            nanosleep(&ts, NULL);
+        }
+        vk_device_idle();
+    }
 
     static u8 out[W * H * 4];
     vk_eng_readback(NULL, rt, 0, 0, W, H, out, W * 4);
     const u8* c = out + ((size_t)(H / 2) * W + W / 2) * 4;
     const u32 centre = ((u32)c[0] << 16) | ((u32)c[1] << 8) | c[2];
-    CHECK(s_vk.presented == frames, "every present counted");
+    if (threaded) {
+        printf("present thread: %llu staged, %llu presented, %llu dropped, %llu failed\n",
+               (unsigned long long)st.staged, (unsigned long long)st.presented,
+               (unsigned long long)st.dropped, (unsigned long long)(st.stage_failed + st.show_failed));
+        CHECK(st.staged == frames && !st.stage_failed && !st.show_failed, "every frame staged, every show done");
+        CHECK(st.presented + st.dropped == frames && st.presented >= 1, "every frame shown or dropped");
+        CHECK(s_vk.presented == st.presented, "every show counted");
+        CHECK(s_vk.present_direct == 0 && s_vk.present_readback_count == 0, "no present on the presenting thread");
+        CHECK(rsx_vulkan_backend_presented_center() == 0, "the present thread keeps no centre pixel");
+        /* What the show thread blitted into the offscreen target last. */
+        int shown_ok = 0;
+        if (!vk_begin()) {
+            vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+            VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                         .imageExtent = { W, H, 1 } };
+            pvkCmdCopyImageToBuffer(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, s_vk.readback.buf, 1, &region);
+            if (!vk_submit_and_wait()) {
+                vk_invalidate(&s_vk.readback);
+                shown_ok = !memcmp(s_vk.readback.ptr, out, sizeof out);
+            }
+        }
+        CHECK(shown_ok, "the last frame shown is the final frame");
+    } else {
+        CHECK(s_vk.presented == frames, "every present counted");
+    }
     if (direct) {
         CHECK(s_vk.present_direct == frames && s_vk.present_readback_count == 0, "every present direct");
         CHECK(rsx_vulkan_backend_presented_center() == 0, "a direct present keeps no centre pixel");
-    } else {
+    } else if (!threaded) {
         CHECK(s_vk.present_readback_count == frames && s_vk.present_direct == 0, "every present read back");
         CHECK((rsx_vulkan_backend_presented_center() & 0xFFFFFFu) == centre,
               "a read-back present kept the centre pixel");
@@ -133,7 +175,7 @@ int main(int argc, char** argv)
     qsort(cost, frames, sizeof *cost, cmp_double);
     double sum = 0; for (u32 f = 0; f < frames; f++) sum += cost[f];
     printf("%s (%s): %u frames x %u draws at %ux%u, present call median %.1f us, p90 %.1f us, mean %.1f us; "
-           "loop %.2f ms/frame\n", argv[1], direct ? "direct" : "read-back", frames, draws, W, H,
+           "loop %.2f ms/frame\n", argv[1], threaded ? "present thread" : direct ? "direct" : "read-back", frames, draws, W, H,
            cost[frames / 2] * 1e3, cost[frames * 9 / 10] * 1e3, sum / frames * 1e3, total / frames);
     free(cost);
     vk_eng_release(NULL, rt);

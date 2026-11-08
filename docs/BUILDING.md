@@ -279,9 +279,16 @@ it. The presenting thread never waits for that thread or for a display
 image: with every staging slot taken, the oldest staged frame is dropped and
 counted.
 
+On Vulkan the stage blits the flipped surface into a staging image on its own
+command pool and submits it; the walker's next command buffer is ordered after
+that copy. The present thread acquires a swapchain image with a finite
+timeout, blits the staging image into the offscreen target and the window, and
+presents. Like a direct present (`PS3RECOMP_VK_DIRECT_PRESENT`), it reads
+nothing back, so `rsx_vulkan_backend_presented_center()` reports no pixel.
+
 | Environment variable | Effect |
 |---|---|
-| `PS3RECOMP_RSX_PRESENT_THREAD=1` | Turn it on (Metal draw engine, windowed or headless). Elsewhere -- the Metal vtable path, host-surface mode, Vulkan, D3D12, live draw -- it says once that it is unsupported and presents as before |
+| `PS3RECOMP_RSX_PRESENT_THREAD=1` | Turn it on (Metal or Vulkan draw engine, windowed or headless). Elsewhere -- the Metal and Vulkan vtable paths, host-surface mode, a Vulkan run with `PS3RECOMP_VK_DUMP`, D3D12, live draw -- it says once that it is unsupported and presents as before |
 | `PS3RECOMP_RSX_PRESENT_THREAD_DEPTH=<n>` | Staging slots, 2 or 3 (default 3) |
 | `PS3RECOMP_RSX_PRESENT_THREAD_REPORT_S=<sec>` | Seconds between the counter lines on stderr (default 5; 0 = only the final one at shutdown): staged, presented, dropped, failures, ring occupancy, and stage, acquire and blit times |
 
