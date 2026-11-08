@@ -50,6 +50,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "metal_frame_rate.h"   /* portable bounded present-rate statistics */
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -236,6 +237,11 @@ typedef struct vk_state {
     u32              presented;
     const char*      dump_path;
     u32              dump_every;       /* write every nth presented frame */
+    /* PS3RECOMP_VK_FPS=1: once a second, guest presents and window present
+     * calls. Window times are host clock readings when vkQueuePresentKHR
+     * returns, not compositor presentation timestamps. present_mu held. */
+    int              fps_on;
+    MetalFrameRate   fps;
 } vk_state;
 
 static vk_state s_vk;
@@ -447,6 +453,7 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
 }
 
 static void vk_present_wait_gpu(void);
+static double vk_now_seconds(void);
 
 /* VK_DRAW_BATCH (vk_eng_draw): draws recorded into s_vk.cmd and not yet
  * submitted. Anything that records other work, destroys an object or reads
@@ -2000,8 +2007,27 @@ static void vk_present_window(void)
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
     r = vk_queue_present(&pi);
+    if (s_vk.fps_on && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR))
+        metal_frame_rate_presented(&s_vk.fps, vk_now_seconds());
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
+}
+
+static double vk_now_seconds(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+/* present_mu held. Same line shape as the Metal backend's, plus the clock.
+ * `final` reports the partial last interval at shutdown. */
+static void vk_fps_report(int final)
+{
+    const double now = vk_now_seconds();
+    if (final ? (s_vk.fps.guest == 0 && s_vk.fps.displayed == 0) : now - s_vk.fps.epoch < 1.0) return;
+    MetalFrameRateSample r = metal_frame_rate_sample(&s_vk.fps, now);
+    fprintf(stderr, "[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f clock=host_present_call window=%d\n",
+            r.display_fps, r.guest_fps, r.average_ms, r.p95_ms, r.worst_ms, r.age_seconds, s_vk.windowed && s_vk.swapchain ? 1 : 0);
 }
 
 static void vk_dump_ppm(const unsigned char* rgba)
@@ -2054,7 +2080,9 @@ static void vk_present_complete_locked(void)
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
     if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
+    if (s_vk.fps_on) metal_frame_rate_guest(&s_vk.fps);
     vk_present_window();
+    if (s_vk.fps_on) vk_fps_report(0);
 }
 
 /* present_mu held: a previous present finished, the present's command
@@ -3940,6 +3968,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * live title wants one now and then, not all of them. */
     { const char* e = getenv("PS3RECOMP_VK_DUMP_EVERY");
       s_vk.dump_every = (e && atoi(e) > 0) ? (u32)atoi(e) : 1; }
+    { const char* e = getenv("PS3RECOMP_VK_FPS");
+      s_vk.fps_on = e && !strcmp(e, "1");
+      metal_frame_rate_reset(&s_vk.fps, vk_now_seconds()); }
 
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;
@@ -4105,6 +4136,12 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 void rsx_vulkan_backend_shutdown(void)
 {
     rsx_vulkan_backend_present_finish();   /* a host that began one and quit */
+    if (s_vk.fps_on) {
+        pthread_mutex_lock(&s_vk.present_mu);
+        vk_fps_report(1);
+        s_vk.fps_on = 0;
+        pthread_mutex_unlock(&s_vk.present_mu);
+    }
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }
     rsx_draw_engine_set_backend(NULL);
