@@ -36,6 +36,19 @@ void sys_event_queue_uncancel_by_id(u32 id) { (void)id; }
 int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
                                uint64_t data1, uint64_t data2, uint64_t data3)
 { (void)queue_id; (void)source; (void)data1; (void)data2; (void)data3; return 0; }
+/* Referenced from spu_workload.c and spu_channels.c paths this test never takes
+ * (task and policy-module dispatch); the same stubs test_spu_dispatch_miss.c uses. */
+void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
+void ydkj_wake_all_event_flags(void) {}
+uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskId,
+                                uint32_t spuNum, uint32_t dmaTagId)
+{ (void)ls; (void)taskset_ea; (void)taskId; (void)spuNum; (void)dmaTagId; return 0; }
+unsigned long long ps3_ms_now(void)
+{
+    struct timespec t;
+    timespec_get(&t, TIME_UTC);
+    return (unsigned long long)t.tv_sec * 1000ull + (unsigned long long)t.tv_nsec / 1000000ull;
+}
 
 enum {
     BIN      = 0x08000u,   /* the job binary every job points at (16 bytes) */
