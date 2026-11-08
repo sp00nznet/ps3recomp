@@ -29,6 +29,9 @@ u32 cellGcm_flip_request_count(void) { return 0; }   /* PAD_CLOCK=flips */
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+void spu_linelock_lock(uint32_t ea) { (void)ea; }
+void spu_linelock_unlock(uint32_t ea) { (void)ea; }
+void spu_linelock_release(uint32_t ea) { (void)ea; }
 
 /* ---- the fake SDL: no controller, a keyboard the test drives ----------------- */
 static Uint8 s_keys[SDL_NUM_SCANCODES];
