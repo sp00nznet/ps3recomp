@@ -526,6 +526,7 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
+          PS3RECOMP_SPU_LIVE_HOLDERS=1 /tmp/test_spu_lockline_peer
 
       # A task parked in WAIT_SIGNAL, signalled by another SPU. libspurs does
       # that with PUTLLC on the taskset line, which never woke the parked
