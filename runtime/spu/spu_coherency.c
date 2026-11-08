@@ -160,6 +160,88 @@ static spu_coh_watch* s_coh_watches;
 
 unsigned long g_spu_lr_raise = 0;
 
+/* ===========================================================================
+ * Live holder counts (PS3RECOMP_SPU_LIVE_HOLDERS=1, default off)
+ *
+ * Marks are sticky, so once any SPU has reserved a line every later write to
+ * it -- PPU stores and store-conditionals, MFC puts, PUTLLC commits -- walks
+ * every registered context under the lock-line lock to raise lost-reservation
+ * events, although usually no SPU holds that line any more.
+ *
+ * On, each context counts itself in s_coh_live for the line of its GETLLAR,
+ * before it reads the line, and stays counted until its reservation ends on
+ * its own thread (PUTLLC either way, PUTLLUC, a GETLLAR of another line,
+ * unregister). A reservation that another agent takes away stays counted until
+ * then, so a line's count is never below the number of contexts holding it. A
+ * notify that finds the count at zero does everything else as before -- the
+ * PPU reservation break, the watch wakes -- and skips only the holder walk.
+ * The lock-line lock is still taken by every such write: host code relies on
+ * it to make read-modify-writes of these lines atomic against guest stores.
+ *
+ * Why skipping is safe. A GETLLAR on the lock-free path (spu_coh_reserve_fast)
+ * raises the count, then issues the seq_cst fence that already separates
+ * publishing its reservation from copying the line. A notify runs after the
+ * write and spu_coh_writer_fence(), and only then reads the count. That is the
+ * same store-buffering shape as the reservation itself: of the two seq_cst
+ * fences one comes first, so either the notify's read sees the increment (and
+ * walks), or the GETLLAR's copy already holds the write. A count only drops on
+ * the owner's thread after its reservation was consumed, and each decrement
+ * follows that context's own increment in the counter's modification order,
+ * so a notify that reads the counter after an increment never sees it at zero
+ * while that reservation is live. The locked GETLLAR (spu_coh_reserve) counts
+ * under the lock-line lock that every notifier holds, so it needs nothing
+ * more. Lines share counters (a hashed table), which only keeps the walk.
+ * ===========================================================================*/
+#define SPU_COH_LIVE_SLOTS 65536u
+static uint32_t s_coh_live[SPU_COH_LIVE_SLOTS];
+static int s_coh_live_on = -1;
+unsigned long g_spu_coh_live_skips;
+
+int spu_coh_live_enabled(void)
+{
+    int on = __atomic_load_n(&s_coh_live_on, __ATOMIC_RELAXED);
+    if (__builtin_expect(on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_SPU_LIVE_HOLDERS");
+        on = e && e[0] == '1' && !e[1];
+        __atomic_store_n(&s_coh_live_on, on, __ATOMIC_RELAXED);
+        if (on) { fprintf(stderr, "[spu-coh] live reservation holder counts on\n"); fflush(stderr); }
+    }
+    return on;
+}
+
+static inline uint32_t* spu_coh_live_slot(uint32_t ea)
+{
+    return &s_coh_live[(ea >> SPU_COH_LINE_SHIFT) & (SPU_COH_LIVE_SLOTS - 1u)];
+}
+
+void spu_coh_live_end(spu_context* c)
+{
+    if (!c || !c->coh_live_counted) return;
+    c->coh_live_counted = 0;
+    __atomic_fetch_sub(spu_coh_live_slot(c->coh_live_line), 1u, __ATOMIC_RELEASE);
+}
+
+/* Owner thread, at a GETLLAR, before the line is read. */
+static void spu_coh_live_begin(spu_context* c, uint32_t ea)
+{
+    if (!c || spu_coh_live_enabled() <= 0) return;
+    const uint32_t line = ea & ~127u;
+    if (c->coh_live_counted && c->coh_live_line == line) return;
+    spu_coh_live_end(c);
+    __atomic_fetch_add(spu_coh_live_slot(line), 1u, __ATOMIC_SEQ_CST);
+    c->coh_live_line = line;
+    c->coh_live_counted = 1;
+}
+
+/* After the writer's fence: may this notify skip the holder walk? */
+static inline int spu_coh_live_idle(uint32_t line)
+{
+    if (spu_coh_live_enabled() <= 0) return 0;
+    if (__atomic_load_n(spu_coh_live_slot(line), __ATOMIC_RELAXED) != 0) return 0;
+    __atomic_fetch_add(&g_spu_coh_live_skips, 1ul, __ATOMIC_RELAXED);
+    return 1;
+}
+
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     /* Read before writing. The kernel reserves the same few lines over and
@@ -174,6 +256,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
         g_spu_coh_bits = s_coh_bitmap;
 
     if (!ctx) return;
+    spu_coh_live_begin(ctx, ea);   /* counted before the caller reads the line */
     for (unsigned i = 0; i < s_coh_n; i++)
         if (s_coh_ctxs[i] == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
     if (s_coh_n == s_coh_cap) {
@@ -245,6 +328,7 @@ void spu_coh_unregister(spu_context* ctx)
         break;
     }
     __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
+    spu_coh_live_end(ctx);
     spu_lockline_unlock();
 }
 
@@ -357,7 +441,9 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
         !spu_coh_is_reserved(ea))
         return 0;
     /* Retire any older reservation before retargeting it. The fence is what
-     * the argument above rests on. */
+     * the argument above rests on, and what orders the live count (raised
+     * here, before it) against the caller's copy of the line. */
+    spu_coh_live_begin(ctx, ea);
     __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
@@ -371,6 +457,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
+    if (spu_coh_live_idle(line)) return;   /* no SPU can hold this line now */
     for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
     for (unsigned i = 0; i < s_coh_n; i++) {
         spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
@@ -391,6 +478,7 @@ void spu_coh_notify_write(uint32_t ea)
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
+    if (spu_coh_live_idle(line)) return;   /* no SPU can hold this line now */
     for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
     for (unsigned i = 0; i < s_coh_n; i++) {
         spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);

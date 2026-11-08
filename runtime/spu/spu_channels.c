@@ -932,6 +932,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
+        spu_coh_live_end(ctx);
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
@@ -952,6 +953,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        spu_coh_live_end(ctx);
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);

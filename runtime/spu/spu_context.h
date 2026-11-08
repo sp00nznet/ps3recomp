@@ -433,6 +433,12 @@ typedef struct spu_context {
      * spu_coh_reserve_fast). Written under that lock, read by the context's
      * own thread. */
     int coh_listed;
+
+    /* PS3RECOMP_SPU_LIVE_HOLDERS (spu_coherency.c): the line this context is
+     * counted on in the live-holder table, from its GETLLAR until its
+     * reservation ends on this thread. Owner thread only. */
+    uint32_t coh_live_line;
+    int coh_live_counted;
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own
