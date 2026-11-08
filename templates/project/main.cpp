@@ -44,7 +44,7 @@
 #include <string.h>
 
 #ifndef _WIN32
-#include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
+#include "guest_arena.h"   /* the 4 GB aligned guest arena, see alloc_guest_vm */
 #endif
 
 #if defined(__APPLE__)
@@ -334,11 +334,17 @@ static bool alloc_guest_vm(void)
      * takes page-aligned addresses only. glibc serves an allocation this big
      * from its own mmap chunk and returns a pointer 16 bytes past the page
      * start, so every commit failed with EINVAL and sys_memory_allocate
-     * answered ENOMEM to every call. mmap's base is page-aligned and zeroed. */
-    void* p = mmap(NULL, VM_SIZE, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    vm_base = (p == MAP_FAILED) ? nullptr : (uint8_t*)p;
+     * answered ENOMEM to every call. And 4 GB aligned, not merely page
+     * aligned: the HLE recovers guest addresses by truncating host pointers
+     * to 32 bits, as vm_init() guarantees for the toolkit's own arena (see
+     * guest_arena.h). */
+    vm_base = guest_arena_map(VM_SIZE);
     ppu_vm_size = 0;              /* the whole space is backed; no OOB guard needed */
+    if (vm_base && ((uintptr_t)vm_base & 0xFFFFFFFFu)) {
+        fprintf(stderr, "guest arena at %p is not 4 GB aligned\n", (void*)vm_base);
+        guest_arena_unmap(vm_base, VM_SIZE);
+        vm_base = nullptr;
+    }
 #endif
     return vm_base != nullptr;
 }
