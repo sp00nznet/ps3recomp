@@ -69,6 +69,113 @@ FENCE_PREAMBLE = """\
 #endif
 """
 
+NONLOCAL_PREAMBLE = r"""
+/* Explicit opt-in support for guest nonlocal returns. No guest register or
+ * buffer layout is emulated here: the original lifted restore runs first. */
+#ifndef PS3RECOMP_PPU_NONLOCAL_SUPPORT
+#define PS3RECOMP_PPU_NONLOCAL_SUPPORT
+#include <cstdio>
+#include <cstdlib>
+extern "C" void ps3_ppu_set_host_unwind_handler(void (*handler)(void));
+extern "C" void ps3_ppu_notify_host_unwind(void);
+extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
+namespace ps3recomp_nonlocal {
+struct frame;
+struct checkpoint { uint64_t target; uint64_t sp; bool armed; };
+struct transfer { frame* owner; ppu_context* ctx; uint64_t thread; uint64_t sp; uint64_t target; };
+inline thread_local frame* live = nullptr;
+inline void host_unwind() { live = nullptr; }
+[[noreturn]] inline void fail(const char* why, ppu_context* ctx) {
+    std::fprintf(stderr, "[ppu-nonlocal] %s ctx=%p thread=%llu sp=0x%llx lr=0x%llx\n",
+                 why, static_cast<void*>(ctx), static_cast<unsigned long long>(ctx->thread_id),
+                 static_cast<unsigned long long>(ctx->gpr[1]), static_cast<unsigned long long>(ctx->lr));
+    std::abort();
+}
+struct frame {
+    ppu_context* ctx;
+    uint64_t thread;
+    checkpoint* slots;
+    size_t count;
+    frame* previous;
+    frame(ppu_context* context, checkpoint* entries, size_t size)
+        : ctx(context), thread(context->thread_id), slots(entries), count(size), previous(live) {
+        ps3_ppu_set_host_unwind_handler(host_unwind);
+        live = this;
+    }
+    frame(const frame&) = delete;
+    frame& operator=(const frame&) = delete;
+    ~frame() {
+        if (live != this) fail("corrupt continuation lifetime", ctx);
+        live = previous;
+    }
+    void arm(size_t index) {
+        if (ctx->thread_id != thread || index >= count) fail("invalid checkpoint", ctx);
+        slots[index].sp = ctx->gpr[1];
+        slots[index].armed = true;
+    }
+    bool matches(ppu_context* context, uint64_t sp, uint64_t target) const {
+        if (context != ctx || context->thread_id != thread) return false;
+        for (size_t i = 0; i < count; ++i)
+            if (slots[i].armed && slots[i].sp == sp && slots[i].target == target) return true;
+        return false;
+    }
+    void verify(const transfer& signal) const {
+        if (signal.owner != this || signal.ctx != ctx || signal.thread != thread ||
+            signal.sp != ctx->gpr[1] || signal.target != ctx->lr ||
+            !matches(ctx, signal.sp, signal.target)) fail("invalid accepted transfer", ctx);
+    }
+};
+[[noreturn]] inline void raise(ppu_context* ctx) {
+    for (frame* owner = live; owner; owner = owner->previous) {
+        if (owner->matches(ctx, ctx->gpr[1], ctx->lr)) {
+            // Discard a pending tail only after resolving the actual live target.
+            g_trampoline_fn = nullptr;
+            throw transfer{owner, ctx, ctx->thread_id, ctx->gpr[1], ctx->lr};
+        }
+    }
+    fail("no live continuation", ctx);
+}
+} // namespace ps3recomp_nonlocal
+#endif
+"""
+
+
+def load_nonlocal_control_flow(path):
+    """Read a strict, title-independent address allowlist; never infer jmp_buf ABI."""
+    with open(path) as stream:
+        config = json.load(stream)
+    if not isinstance(config, dict) or set(config) != {"nonlocal_return_functions", "continuations"}:
+        raise ValueError("nonlocal config requires nonlocal_return_functions and continuations")
+    def address(value):
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError("nonlocal address must be an integer or integer string")
+        number = int(value, 0) if isinstance(value, str) else value
+        if not 0 < number <= 0xfffffffc or number % 4:
+            raise ValueError("nonlocal address must be aligned guest code")
+        return number
+    returns = set()
+    continuations = {}
+    if not isinstance(config["nonlocal_return_functions"], list) or not isinstance(config["continuations"], list):
+        raise ValueError("nonlocal address lists required")
+    for raw in config["nonlocal_return_functions"]:
+        value = address(raw)
+        if value in returns: raise ValueError("duplicate nonlocal return function")
+        returns.add(value)
+    seen = set()
+    for item in config["continuations"]:
+        if not isinstance(item, dict) or set(item) != {"function", "address"}:
+            raise ValueError("continuation requires function and address")
+        owner, target = address(item["function"]), address(item["address"])
+        if target in seen: raise ValueError("duplicate or ambiguous continuation")
+        seen.add(target)
+        continuations.setdefault(owner, set()).add(target)
+    if bool(returns) != bool(continuations):
+        raise ValueError("nonlocal restore functions and continuations must be configured together")
+    if returns & continuations.keys():
+        raise ValueError("restore function cannot own a continuation")
+    return returns, continuations
+
+
 HEADER_PREAMBLE = """\
 /* Auto-generated by ppu_lifter.py -- do not edit by hand. */
 #pragma once
@@ -990,7 +1097,7 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
         # returned mid-function with r31 unrestored.
         if t.startswith("if ("):
             return False
-        return (t.startswith("return") or "goto " in t or
+        return (t.startswith("return") or t.startswith("ps3recomp_nonlocal::raise(") or "goto " in t or
                 t.startswith("func_") or
                 "{ func_" in t or t.startswith("{ g_trampoline_fn"))
     return False
@@ -999,7 +1106,10 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
 class PPULifter:
     """Translates PPU instructions into C source."""
 
-    def __init__(self, prefix: str = "", weak_emit: bool = False):
+    def __init__(self, prefix: str = "", weak_emit: bool = False, *,
+                 nonlocal_return_functions=None, nonlocal_continuations=None):
+        self.nonlocal_return_functions = set(nonlocal_return_functions or ())
+        self.nonlocal_continuations = {owner: set(targets) for owner, targets in (nonlocal_continuations or {}).items()}
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
@@ -1116,8 +1226,22 @@ class PPULifter:
         # this is O(log N + span) rather than a full O(N) scan per call.
         range_insns = self._range_insns(instructions, start, end)
 
-        # Collect branch targets within the function for labels
-        internal_targets: set[int] = set()
+        resumes = sorted(self.nonlocal_continuations.get(start, ()))
+        by_address = {insn.addr: insn for insn in range_insns}
+        for target in resumes:
+            if target not in by_address or target <= start or target >= end or target % 4:
+                raise ValueError(f"nonlocal continuation 0x{target:X} outside decoded owner 0x{start:X}")
+            previous = by_address.get(target - 4)
+            if previous is None or previous.mnemonic != "bl":
+                raise ValueError(f"nonlocal continuation 0x{target:X} must follow a supported linked call")
+        if start in self.nonlocal_return_functions:
+            if not any(insn.mnemonic == "blr" for insn in range_insns):
+                raise ValueError(f"nonlocal restore 0x{start:X} has no decoded blr")
+            if any(insn.mnemonic.startswith("b") and insn.mnemonic.endswith("lr") and insn.mnemonic != "blr" for insn in range_insns):
+                raise ValueError("conditional nonlocal returns are unsupported")
+
+        # Collect branch targets within the function for labels.
+        internal_targets: set[int] = set(resumes)
         for insn in range_insns:
             if insn.mnemonic.startswith("b") and insn.mnemonic not in (
                     "blr", "bctr", "bctrl", "bl", "blrl"):
@@ -1148,11 +1272,15 @@ class PPULifter:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
                 emitted_labels.add(insn.addr)
 
+            if insn.addr + 4 in resumes:
+                func.body_lines.append(f"    _nonlocal_frame.arm({resumes.index(insn.addr + 4)});")
             patch = self.insn_patches.get(insn.addr)
             if patch is not None:
                 c_line = self._patched_translate(insn, func, patch)
             else:
                 c_line = self._translate(insn, func)
+            if insn.addr + 4 in resumes and (not c_line or "ctx->lr =" not in c_line or "(ctx);" not in c_line):
+                raise ValueError("nonlocal checkpoint call was not emitted")
             if c_line:
                 func.body_lines.append(f"    {c_line}")
 
@@ -2073,6 +2201,8 @@ class PPULifter:
 
         # ------- Branches -------
         if mn == "blr":
+            if func.start_addr in self.nonlocal_return_functions:
+                return "ps3recomp_nonlocal::raise(ctx);"
             return "return;"
 
         # blrl = branch to LR *with link* = an indirect CALL through LR, not a
@@ -3983,8 +4113,37 @@ class PPULifter:
     # Output generation
     # ------------------------------------------------------------------ #
 
+    def _validate_nonlocal_emission(self):
+        if not self.nonlocal_return_functions and not self.nonlocal_continuations:
+            return
+        functions = {f.start_addr: f for f in self._emit_functions()}
+        if bool(self.nonlocal_return_functions) != bool(self.nonlocal_continuations):
+            raise ValueError("nonlocal restores and continuations must be configured together")
+        configured = self.nonlocal_return_functions | self.nonlocal_continuations.keys()
+        if self.nonlocal_return_functions & self.nonlocal_continuations.keys():
+            raise ValueError("restore function cannot own a continuation")
+        seen = set()
+        for owner, targets in self.nonlocal_continuations.items():
+            if not targets: raise ValueError("empty nonlocal owner")
+            for target in targets:
+                if target in seen: raise ValueError("ambiguous continuation address")
+                seen.add(target)
+        for address in configured:
+            if not isinstance(address, int) or isinstance(address, bool) or address <= 0 or address % 4 or address > 0xfffffffc:
+                raise ValueError("nonlocal function address must be aligned guest code")
+            if address not in functions or address in self.hle_stub_nids:
+                raise ValueError(f"configured nonlocal function 0x{address:X} was not emitted as guest code")
+            func = functions[address]
+            if func.fallthrough_to or any("g_trampoline_fn =" in line or
+                                        ("ps3_indirect_call(ctx)" in line and "return;" in line)
+                                        for line in func.body_lines):
+                raise ValueError(f"nonlocal function 0x{address:X} has unsupported tail/fallthrough fragments")
+            if address in self.nonlocal_return_functions and any("return;" in line for line in func.body_lines):
+                raise ValueError("nonlocal restore has an ordinary-return path")
+
     def emit_header(self) -> str:
         """Generate the C header file content."""
+        self._validate_nonlocal_emission()
         # function_table / function_table_count are per-image; prefix their
         # extern declarations (and the matching comment) to match the source.
         # 'function_table_count' starts with 'function_table', so a single
@@ -3992,6 +4151,8 @@ class PPULifter:
         preamble = (HEADER_PREAMBLE.replace("function_table",
                                             self.prefix + "function_table")
                     if self.prefix else HEADER_PREAMBLE)
+        if self.nonlocal_return_functions:
+            preamble += NONLOCAL_PREAMBLE
         lines = [preamble]
         # Forward declarations
         for func in self.functions:
@@ -4178,8 +4339,27 @@ class PPULifter:
                       f"extern int {g};", "#endif"]
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
         lines.append("    PPU_MM_SNAP")
-        for bline in _fuse_cr(func.body_lines):
+        resumes = sorted(self.nonlocal_continuations.get(func.start_addr, ()))
+        body = list(func.body_lines)
+        if resumes:
+            # Caches belong to this invocation, never the resume iteration.
+            while body and body[0].strip().startswith("uint64_t _cs_"):
+                lines.append("    " + body.pop(0))
+            slots = ", ".join(f"{{0x{target:08X}ULL, 0, false}}" for target in resumes)
+            lines += [f"    ps3recomp_nonlocal::checkpoint _nonlocal_slots[] = {{{slots}}};",
+                      f"    ps3recomp_nonlocal::frame _nonlocal_frame(ctx, _nonlocal_slots, {len(resumes)});",
+                      "    uint64_t _nonlocal_resume = 0;",
+                      "    for (;;) {", "      try {", "        switch (_nonlocal_resume) {", "        case 0: break;"]
+            lines += [f"        case 0x{target:08X}ULL: goto loc_{target:08X};" for target in resumes]
+            lines += ['        default: ps3recomp_nonlocal::fail("unknown resume label", ctx);', "        }"]
+        for bline in _fuse_cr(body):
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
+        if resumes:
+            lines += ["      } catch (const ps3recomp_nonlocal::transfer& _nonlocal_signal) {",
+                      "        if (_nonlocal_signal.owner != &_nonlocal_frame) throw;",
+                      "        _nonlocal_frame.verify(_nonlocal_signal);",
+                      "        _nonlocal_resume = _nonlocal_signal.target;",
+                      "      }", "    }"]
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional
         # branch), PPC execution falls through to the next address. The lifter
@@ -4236,6 +4416,7 @@ class PPULifter:
         """Full single-file C source (kept for small binaries and tests; the
         default build path uses write_source_files, which splits the output
         to stay under the MSVC source-line limit)."""
+        self._validate_nonlocal_emission()
         emit_funcs = self._emit_functions()
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
@@ -4285,6 +4466,7 @@ class PPULifter:
         table. The ranges depend only on the function list, so a relift that
         changes one function's body rewrites one file and leaves the others
         byte-identical (and, through write_if_changed, untouched)."""
+        self._validate_nonlocal_emission()
         emit_funcs = self._emit_functions()
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
@@ -4905,12 +5087,15 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, insn_patches=None):
+                 toc_base=0, insn_patches=None, nonlocal_return_functions=None,
+                 nonlocal_continuations=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
     _WORKER_STATE["prefix"] = prefix
     _WORKER_STATE["toc_base"] = toc_base
+    _WORKER_STATE["nonlocal_return_functions"] = nonlocal_return_functions or set()
+    _WORKER_STATE["nonlocal_continuations"] = nonlocal_continuations or {}
     _WORKER_STATE["hle_stub_nids"] = hle_stub_nids or {}
     # Branch-routing context the body lift needs -- previously omitted, so the
     # parallel path lost the code-window filter (out-of-range branches became
@@ -4925,7 +5110,9 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
 
 def _worker_lift(task):
     idx0, bounds = task
-    lifter = PPULifter(prefix=_WORKER_STATE.get("prefix", ""))
+    lifter = PPULifter(prefix=_WORKER_STATE.get("prefix", ""),
+                       nonlocal_return_functions=_WORKER_STATE.get("nonlocal_return_functions"),
+                       nonlocal_continuations=_WORKER_STATE.get("nonlocal_continuations"))
     lifter.name_map = _WORKER_STATE["names"]
     # Import stubs must dispatch as ps3_hle_call in workers too, else the literal
     # .lib.stub trampoline (which derefs an unpopulated import table) is lifted as
@@ -4972,7 +5159,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             lifter.insn_patches))
+                             lifter.insn_patches,
+                             lifter.nonlocal_return_functions, lifter.nonlocal_continuations))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -5064,7 +5252,11 @@ def main() -> None:
                              "is emitted as `if (guard) {new} else {orig}`, guard "
                              "being an int the port defines. The input must hold "
                              "`orig` at `addr` or the lift stops.")
+    parser.add_argument("--nonlocal-control-flow", metavar="FILE",
+                        help="Explicit JSON nonlocal_return_functions and owning function/address continuations; C++ exception support required")
     args = parser.parse_args()
+    nonlocal_returns, nonlocal_continuations = (load_nonlocal_control_flow(args.nonlocal_control_flow)
+                                               if args.nonlocal_control_flow else (set(), {}))
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
     # and the lifter below.
@@ -5539,7 +5731,9 @@ def main() -> None:
 
     print(f"Lifting {len(func_bounds)} functions...")
 
-    lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak)
+    lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak,
+                       nonlocal_return_functions=nonlocal_returns,
+                       nonlocal_continuations=nonlocal_continuations)
     lifter.header_name = args.header_name
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has
