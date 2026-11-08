@@ -106,3 +106,41 @@ registrations while keeping `complete=false` in the report; the template always
 requires complete coverage. `--extra-funcs` accepts the discovered `spu_<sha256>`
 name for explicit entry overrides. The existing `--images` interface is still
 available for manually extracted programs.
+
+## Keeping the port's repository publishable
+
+A port's repository should hold only its own source. Never commit the game's
+files, anything extracted, decrypted or lifted from them (`recompiled/`,
+`build/generated_spu/`), captures, or paths from your machine. Run the SDK's
+checker over the port's tracked files, locally and in CI:
+
+```bash
+python /path/to/ps3recomp/tools/check_public_tree.py --root .
+```
+
+It flags game and build file types, binary or oversized files, lifter output,
+embedded byte images, base64 blobs, disassembly listings and absolute home or
+temp paths, and exits 1 with every finding. Tune it with an optional
+`public-tree.json` at the port root (extra or allowed suffixes, excluded globs,
+extra patterns); see the script's header.
+
+## Pinning the SDK revision
+
+Record the exact ps3recomp revision the port was tested with in a pin file, for
+example `sdk-pins.json`:
+
+```json
+{
+  "format": 1,
+  "repository": "https://github.com/sp00nznet/ps3recomp",
+  "pins": {
+    "sdk": {"tag": "v0.19.0", "commit": "ae92407bb1d899e3d32143e360fe6e6d4d8fa1b5",
+            "path": "third_party/ps3recomp"}
+  }
+}
+```
+
+`python /path/to/ps3recomp/tools/fetch_sdk_pins.py sdk-pins.json` clones or
+updates each pinned checkout, detaches it at the commit, and refuses a tag that
+names a different commit or a checkout with local changes. Point
+`-DPS3RECOMP_DIR` at that checkout.
