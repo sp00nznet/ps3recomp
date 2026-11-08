@@ -245,7 +245,7 @@ which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
 
 | Host | Backend | Source | Status |
 |------|---------|--------|--------|
-| Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
+| Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. `PS3RECOMP_D3D12_DRAW_ENGINE=1` (opt-in) runs it on the shared register-file draw engine instead of its own vtable renderer, as Metal and Vulkan do (`libs/video/rsx_d3d12_engine.inc`; `python tools/test_d3d12_engine_backend.py` checks it on a real adapter). |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
 | Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
 | Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
