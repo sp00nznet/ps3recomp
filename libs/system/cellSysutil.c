@@ -213,6 +213,13 @@ s32 cellSysutilUnregisterCallback(s32 slot)
 static int s_pump_seen = 0;
 int cellSysutil_pump_seen(void) { return s_pump_seen; }
 
+/* A native on-screen keyboard host (libs/misc/osk_native.c) installs its pump
+ * with its first request, so sysutil never links against the OSK and builds
+ * without one are unchanged. The pump turns host completions into queued
+ * OSK events, which the drain below then delivers on this same poll. */
+static void (*volatile s_osk_pump)(void);
+void cellSysutil_set_osk_pump(void (*pump)(void)) { s_osk_pump = pump; }
+
 s32 cellSysutilCheckCallback(void)
 {
     /* Give a no-button dialog the title has left open past its grace period
@@ -225,6 +232,7 @@ s32 cellSysutilCheckCallback(void)
     /* A pending PSN terms-of-service answer (cellSysutilNpEula.c) joins the
      * completions, so this same poll runs the title's callback. */
     { extern void ps3_np_eula_tick(void); ps3_np_eula_tick(); }
+    { void (*pump)(void) = s_osk_pump; if (pump) pump(); }
     drain_guest_completions();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll

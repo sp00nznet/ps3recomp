@@ -210,6 +210,29 @@ if(PS3RECOMP_FFMPEG_RUNTIME)
     message(STATUS "  FFmpeg:       run-time loaded (headers in ${PS3RECOMP_FFMPEG_INCLUDE_DIR})")
 endif()
 
+# Native on-screen keyboard hosts for cellOskDialog (libs/misc/osk_native.h).
+# All are off by default; without one the legacy cellOskDialog stub is used.
+if(NOT WIN32 AND NOT APPLE)
+    # No toolkit dialog: a dialog opens with its initial text and is confirmed
+    # only through OSK_NATIVE_CONTROL_FILE (libs/misc/osk_headless.c).
+    option(PS3RECOMP_NATIVE_OSK_HEADLESS "Build the headless native OSK host (mailbox-confirmed)" OFF)
+    if(PS3RECOMP_NATIVE_OSK_HEADLESS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_HEADLESS=1)
+        message(STATUS "  OSK:          headless native host")
+    endif()
+endif()
+if(APPLE)
+    # An AppKit sheet on the Metal backend's game window (libs/misc/osk_macos.m).
+    option(PS3RECOMP_NATIVE_OSK_MACOS "Build the macOS AppKit native OSK host" OFF)
+    if(PS3RECOMP_NATIVE_OSK_MACOS)
+        target_sources(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m")
+        set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/libs/misc/osk_macos.m"
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_MACOS=1)
+        message(STATUS "  OSK:          macOS AppKit native host")
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Guest shaders on Metal: HLSL -> SPIR-V -> MSL
 # ---------------------------------------------------------------------------

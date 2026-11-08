@@ -82,6 +82,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#if defined(PS3RECOMP_NATIVE_OSK_MACOS) && !defined(PS3RECOMP_DISABLE_NATIVE_OSK)
+#include "../misc/osk_native.h"   /* the OSK sheet attaches to the game window */
+#endif
 
 /* ------------------------------------------------------------------------- */
 
@@ -911,6 +914,9 @@ static int create_window_impl(const char* title)
 
     [s_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
     [s_window makeKeyAndOrderFront:nil];
+#if defined(PS3RECOMP_NATIVE_OSK_MACOS) && !defined(PS3RECOMP_DISABLE_NATIVE_OSK)
+    osk_native_macos_set_window((__bridge void*)s_window);
+#endif
     [NSApp activateIgnoringOtherApps:YES];
     if (was_fullscreen) [s_window toggleFullScreen:nil];
     fps_start();
@@ -4914,8 +4920,11 @@ static int pump_messages_impl(void)
                 continue;
             }
             /* The pad reads the keyboard by polling (cellPad), so the other key events have no consumer here: the
-             * window would answer each with the system alert sound. */
+             * window would answer each with the system alert sound. An open native OSK sheet does consume them. */
             if ([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) {
+#if defined(PS3RECOMP_NATIVE_OSK_MACOS) && !defined(PS3RECOMP_DISABLE_NATIVE_OSK)
+                if (osk_native_macos_input_active()) [NSApp sendEvent:ev];
+#endif
                 continue;
             }
             [NSApp sendEvent:ev];
