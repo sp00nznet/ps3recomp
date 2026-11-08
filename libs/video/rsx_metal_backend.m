@@ -2532,7 +2532,13 @@ static void release_surfaces(void)
 
 #define ENG_MAX_OBJECTS  4096
 #define ENG_MAX_PIPES    4096
+/* Draws, clears and copies recorded per submission; past it the frame so
+ * far is submitted and waited for (eng_record_room), a stall mid-frame. A
+ * title with more defines a larger cap at build time: a Resistance 3
+ * firefight records ~7800 draws besides its clears and copies. */
+#ifndef ENG_MAX_RECORDS
 #define ENG_MAX_RECORDS  8192
+#endif
 #define ENG_MAX_VIEWS    256
 #define ENG_MAX_FUNCS    4096
 #define ENG_MAX_SAMPLERS 256
@@ -2985,6 +2991,7 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 /* ---- staging ------------------------------------------------------------- */
 
 static void eng_encode_and_commit(id<MTLTexture> present_dst);
+static void eng_flush_recorded(void);
 
 static id<MTLBuffer> eng_stage_buffer_acquire(u32 cap)
 {
@@ -3026,11 +3033,12 @@ static void eng_stage_hand_off(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
+    if (bytes > ENG_STAGE_MAX - ENG_ALIGN) return 0;   /* fits no arena */
     const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
     if ((u64)start + bytes > ENG_STAGE_MAX) {
         /* Submit and wait rather than drop the rest of the frame; everything
          * already recorded has been encoded, so the arena is free again. */
-        eng_encode_and_commit(nil);
+        eng_flush_recorded();
         return eng_stage_reserve(bytes, out_off);
     }
     if (start + bytes > s_eng_stage_cap) {
@@ -3063,6 +3071,47 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
     if (!eng_stage_reserve(bytes, out_off)) return 0;
     memcpy(s_eng_stage + *out_off, src, bytes);
     return 1;
+}
+
+/* Submit what has been recorded so far, mid-frame, and go on recording: the
+ * arena or the record array is full. The bound constants were staged in the
+ * arena the commit hands off, so they are staged again in the next one;
+ * without that the next draw read whatever the new arena held at their old
+ * offsets. */
+static void eng_flush_recorded(void)
+{
+    EngRecord* p = &s_eng_pending;
+    const int keep_vs = p->vs_cb_bytes && s_eng_stage &&
+                        (u64)p->vs_cb_off + p->vs_cb_bytes <= s_eng_stage_used;
+    const int keep_ps = p->ps_cb_bytes && s_eng_stage &&
+                        (u64)p->ps_cb_off + p->ps_cb_bytes <= s_eng_stage_used;
+    const u32 vs_bytes = keep_vs ? p->vs_cb_bytes : 0;
+    const u32 ps_bytes = keep_ps ? p->ps_cb_bytes : 0;
+    u8* keep = (vs_bytes || ps_bytes) ? malloc((size_t)vs_bytes + ps_bytes) : NULL;
+    if (keep) {
+        memcpy(keep, s_eng_stage + p->vs_cb_off, vs_bytes);
+        memcpy(keep + vs_bytes, s_eng_stage + p->ps_cb_off, ps_bytes);
+    }
+    eng_encode_and_commit(nil);
+    /* Unrestorable constants are unbound rather than left pointing into
+     * the next arena. */
+    if (!keep || !eng_stage_copy(keep, vs_bytes, &p->vs_cb_off)) p->vs_cb_bytes = 0;
+    if (!keep || !eng_stage_copy(keep + vs_bytes, ps_bytes, &p->ps_cb_off)) p->ps_cb_bytes = 0;
+    free(keep);
+}
+
+/* Room for one more record: a full array is submitted (eng_flush_recorded)
+ * rather than the rest of the frame dropped. */
+static int eng_record_room(void)
+{
+    if (s_eng_rec_count < ENG_MAX_RECORDS) return 1;
+    { static int n = 0; if (PS3_LOG_FIRST(n, 4))
+        fprintf(stderr, "[rsx engine/metal] %d records in one submission: submitting mid-frame\n",
+                ENG_MAX_RECORDS); }
+    eng_flush_recorded();
+    if (s_eng_rec_count < ENG_MAX_RECORDS) return 1;
+    s_eng_dropped++;   /* the commit failed and kept the records */
+    return 0;
 }
 
 /* ---- lifecycle ----------------------------------------------------------- */
@@ -3284,8 +3333,9 @@ static u32 eng_color_snapshot(void* user, u32 surface)
 {
     (void)user;
     id<MTLTexture> src = eng_obj(surface);
-    if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
-        s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+    if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1)
+        { s_eng_dropped++; return 0; }
+    if (!eng_record_room()) return 0;
     MTLTextureDescriptor* td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
                          width:[src width] height:[src height] mipmapped:NO];
@@ -3323,7 +3373,7 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 {
     (void)user;
     if (!eng_obj(depth) || !s_eng_helper_lib) return 0;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+    if (!eng_record_room()) return 0;
     if (!s_eng_depth_pso) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
@@ -3360,7 +3410,7 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
     const int k = rsx_fmt == RSX_TEX_FMT_A8R8G8B8 ? 0 : rsx_fmt == RSX_TEX_FMT_DEPTH16 ? 1 : -1;
     if (k < 0 || !src || !w || !h || w > [src width] || h > [src height] || s_eng_depth_color_failed)
         return 0;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+    if (!eng_record_room()) return 0;
     static const MTLPixelFormat formats[2] = { MTLPixelFormatRGBA8Unorm, MTLPixelFormatR16Unorm };
     if (!s_eng_depth_color_pso[k]) {
         NSError* err = nil;
@@ -3738,12 +3788,18 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
 {
     (void)user;
     if (!vertex_count || !stride) return;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
-    u32 vb_off = 0, ib_off = 0;
-    if (!eng_stage_copy(vertices, vertex_count * stride, &vb_off)) return;
-    if (indices && index_count &&
-        !eng_stage_copy(indices, index_count * (u32)sizeof(u32), &ib_off))
-        return;
+    if (!eng_record_room()) return;
+    /* One reservation for both: a second one that filled the arena would
+     * submit it and leave the vertices' offset pointing into the next. */
+    const u64 vb_bytes = (u64)vertex_count * stride;
+    const u64 vb_span = (vb_bytes + ENG_ALIGN - 1u) & ~(u64)(ENG_ALIGN - 1u);
+    const u64 ib_bytes = (indices && index_count) ? (u64)index_count * sizeof(u32) : 0;
+    u32 vb_off = 0;
+    if (vb_span + ib_bytes > ENG_STAGE_MAX ||
+        !eng_stage_reserve((u32)(vb_span + ib_bytes), &vb_off)) return;
+    memcpy(s_eng_stage + vb_off, vertices, (size_t)vb_bytes);
+    if (ib_bytes) memcpy(s_eng_stage + vb_off + vb_span, indices, (size_t)ib_bytes);
+    const u32 ib_off = ib_bytes ? vb_off + (u32)vb_span : 0;
 
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     *r = s_eng_pending;
@@ -3765,7 +3821,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
                    ((u32)(rgba[0] * 255.0f + 0.5f) << 16) |
                    ((u32)(rgba[1] * 255.0f + 0.5f) <<  8) |
                     (u32)(rgba[2] * 255.0f + 0.5f);
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    if (!eng_record_room()) return;
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind  = ENG_REC_CLEAR_COLOR;
@@ -3778,7 +3834,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
                                     float depth_value, u8 stencil)
 {
     (void)user;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    if (!eng_record_room()) return;
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind = ENG_REC_CLEAR_DS;
@@ -4564,8 +4620,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         }
 
         if (s_eng_dropped) {
-            fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
-                    s_eng_dropped, ENG_MAX_RECORDS);
+            fprintf(stderr, "[rsx engine/metal] dropped %u record(s)\n", s_eng_dropped);
             s_eng_dropped = 0;
         }
         s_eng_rec_count  = 0;
