@@ -265,6 +265,20 @@ cmake --build build --target ps3recomp_host
 ./build/ps3recomp_host
 ```
 
+### Where the FIFO consumer thread's time goes (opt-in)
+
+`PS3RECOMP_RSX_FIFO_BUSY=1` charges the RSX FIFO consumer thread's wall time
+to exclusive, nested categories (`libs/video/rsx_fifo_busy.h`): idle waits
+split by why the pass before stopped (put reached, semaphore acquire, held
+GET_REPORT, other), the FIFO walk, draws, engine flushes, presents, a host's
+own present calls, the display-image wait (Metal's in-flight bound and
+`nextDrawable`, Vulkan's swapchain acquire and present) and the event pump.
+About every two seconds (`PS3RECOMP_RSX_FIFO_BUSY_PERIOD_MS`) one
+`[rsx fifo busy]` line on stderr gives per-flip wall and busy time, the busy
+distribution, and each category's milliseconds and span count per flip. The
+consumer thread is the one that waits in `cellGcm_fifo_kick_wait`. It
+complements `RSX_WALKER_PROF`, which samples where the walk's CPU time goes.
+
 ### The Vulkan backend (Linux, opt-in)
 
 ```bash

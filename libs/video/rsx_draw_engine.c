@@ -11,6 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_fifo_busy.h"
 
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
@@ -956,6 +957,15 @@ static u8* eng_coherence_buffer(u32 bytes)
     return s_coherence_rows;
 }
 
+/* Submit what is recorded and wait for it, where the guest is about to see
+ * the result (PS3RECOMP_RSX_FIFO_BUSY counts it as "flush"). */
+static void eng_flush_for_reference(void)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_FLUSH);
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_FLUSH);
+}
+
 /* One row of 32-bit pixels between the backend's R,G,B,A and the guest's
  * A8R8G8B8 bytes (or straight through with TEX_RGBA). Copied a byte at a
  * time, with the TEX_RGBA test inside the loop, these two conversions were
@@ -964,6 +974,7 @@ static u8* eng_coherence_buffer(u32 bytes)
  * one 32-bit rotate instead: bytes s0..s3 load as s0 | s1<<8 | s2<<16 | s3<<24
  * on a little-endian host (ps3emu/endian.h), so rotating left by 8 gives
  * s3,s0,s1,s2 (to the guest) and right by 8 gives s1,s2,s3,s0 (from it). */
+
 static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_guest)
 {
     if (rgba) { memcpy(dst, src, (size_t)w * 4u); return; }
@@ -998,7 +1009,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     const u32 n = (skip + bytes + bpp - 1u) / bpp;
     u8* rows = eng_coherence_buffer(n * bpp * h);
     if (!rows) return;
-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    eng_flush_for_reference();
     g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
     if (eng_coherence_log())
         fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
@@ -1697,7 +1708,7 @@ static int eng_zdepth_to_guest(u32 slot)
         s_depth_rows = n;
         s_depth_cap = w * h;
     }
-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    eng_flush_for_reference();
     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
                              w * (u32)sizeof(float)) != 0)
         return 0;
@@ -3272,7 +3283,15 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                 what, rc[0], rc[1], rc[2], rc[3], w, h);
 }
 
+static void sink_end_core(void* user, const rsx_dispatch* r);
+/* PS3RECOMP_RSX_FIFO_BUSY: a draw handed to the engine is "draw" time. */
 static void sink_end(void* user, const rsx_dispatch* r)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAW);
+    sink_end_core(user, r);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAW);
+}
+static void sink_end_core(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
@@ -3622,7 +3641,14 @@ static u32 eng_present_surface(u32 buffer_id)
     return eng_current_surface();
 }
 
+static void eng_present_core(u32 buffer_id);
 static void eng_present(u32 buffer_id)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT);
+    eng_present_core(buffer_id);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT);
+}
+static void eng_present_core(u32 buffer_id)
 {
     if (!g.ready) return;
     const u32 target = eng_present_surface(buffer_id);
@@ -3775,8 +3801,7 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 
 void rsx_draw_engine_flush(void)
 {
-    if (g.ready && g.be->submit_and_wait)
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    if (g.ready && g.be->submit_and_wait) eng_flush_for_reference();
 }
 
 void rsx_draw_engine_present(void)

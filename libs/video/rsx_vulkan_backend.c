@@ -50,6 +50,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "rsx_fifo_busy.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -558,11 +559,15 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
     return r;
 }
 
+/* PS3RECOMP_RSX_FIFO_BUSY: the swapchain acquire and present block the
+ * presenting thread as Metal's drawable wait does; both count as "drawable". */
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
 {
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
     pthread_mutex_lock(&s_vk.queue_mu);
     const VkResult r = pvkQueuePresentKHR(s_vk.queue, pi);
     pthread_mutex_unlock(&s_vk.queue_mu);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
     return r;
 }
 
@@ -1931,8 +1936,10 @@ static void vk_present_window(void)
     }
 
     u32 idx = 0;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
@@ -4159,6 +4166,7 @@ int rsx_vulkan_backend_pump_messages(void)
     if (!s_vk.windowed) return 0;
     int quit = 0;
     SDL_Event e;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PUMP);
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
@@ -4176,6 +4184,7 @@ int rsx_vulkan_backend_pump_messages(void)
             s_vk_resized = 1;
         }
     }
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PUMP);
     return quit ? -1 : 0;
 }
 
@@ -4188,18 +4197,22 @@ void rsx_vulkan_backend_present(void)
 void rsx_vulkan_backend_present_begin(void)
 {
     if (!s_vk.device) return;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT_HOST);
     s_vk.present_split = 1;
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
     s_vk.present_split = 0;
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
 }
 
 void rsx_vulkan_backend_present_finish(void)
 {
     if (!s_vk.device) return;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT_HOST);
     pthread_mutex_lock(&s_vk.present_mu);
     vk_present_complete_locked();
     pthread_mutex_unlock(&s_vk.present_mu);
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
 }
 
 u32 rsx_vulkan_backend_presented_center(void)
