@@ -1074,6 +1074,45 @@ static void cellFsAioWrite(ppu_context* ctx)
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
 
+/* cellFsReadWithOffset(fd, u64 offset, void* buf, u64 size, u64* nread) and
+ * cellFsWriteWithOffset(fd, u64 offset, const void* buf, u64 size, u64* nwrite):
+ * the synchronous form of the AIO pair above, I/O at an absolute offset.
+ *
+ * Unregistered, both took the unresolved-NID path: CELL_OK with nothing read or
+ * written and the count left unwritten. Red Dead Redemption reads its RPF
+ * archives with the first -- the header came back empty and the title stopped
+ * at "Cannot load archive" -- and writes its disk cache with the second, which
+ * stayed at 0 bytes. Like the AIO pair they leave the fd's own position where it
+ * was, under the stream lock, since a title issues them from several threads on
+ * one fd alongside its plain reads. */
+static void fs_io_with_offset(ppu_context* ctx, int write)
+{
+    int      fd     = (int)(uint32_t)ctx->gpr[3];
+    uint64_t offset = ctx->gpr[4];
+    uint32_t buf    = (uint32_t)ctx->gpr[5];
+    uint64_t size   = ctx->gpr[6];
+    uint32_t n_ptr  = (uint32_t)ctx->gpr[7];
+    FILE* f = fd_file(fd);
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+    fs_prefault(buf, size);   /* written by a read, read by a write: same reserved-page trap */
+    size_t n = 0;
+    HOST_LOCKFILE(f);
+    const int64_t pos = (int64_t)HOST_FTELL64(f);
+    if (HOST_FSEEK64(f, offset) == 0)
+        n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
+                  : fread(vm_base + buf, 1, (size_t)size, f);
+    if (pos >= 0) HOST_FSEEK64(f, pos);
+    HOST_UNLOCKFILE(f);
+    if (ps3_env_once("PS3_FSLOG"))
+        fprintf(stderr, "[fs] %s@ fd=%d off=%llu size=%llu -> %zu\n", write ? "write" : "read",
+                fd, (unsigned long long)offset, (unsigned long long)size, n);
+    if (n_ptr) vm_write64(n_ptr, n);
+    ctx->gpr[3] = CELL_OK;
+}
+static void cellFsReadWithOffset(ppu_context* ctx)  { fs_io_with_offset(ctx, 0); }
+static void cellFsWriteWithOffset(ppu_context* ctx) { fs_io_with_offset(ctx, 1); }
+
 extern "C" void ppu_fs_register(void)
 {
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
@@ -1084,6 +1123,8 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClose"),    "cellFsClose",    cellFsClose);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsReadWithOffset"),  "cellFsReadWithOffset",  cellFsReadWithOffset);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsWriteWithOffset"), "cellFsWriteWithOffset", cellFsWriteWithOffset);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);
