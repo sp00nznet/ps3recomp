@@ -24,6 +24,7 @@
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "cellGcmSys.h"   /* cellGcmGetDisplayBufferByFlipIndex: the flipped buffer, for the drop counters */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -4526,6 +4527,50 @@ static void scanout_auto_present(u32 fi)
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &gb);
 }
 
+/* Draw accounting for the vtable path (diagnostic, opt-in). Every draw the
+ * backend is handed and does not record, and every flip that does not render,
+ * is counted by reason. D3D12_DROP_STATS_EVERY=<n> prints one line every n
+ * flips when any count is nonzero, so unsupported input is visible instead of
+ * silently skipped. Unset or 0: nothing is printed. */
+enum { D3D12_DROP_NOT_READY, D3D12_DROP_BAD_COUNT, D3D12_DROP_NO_VP_RESOURCES,
+       D3D12_DROP_PRIM_UNWIRED, D3D12_DROP_UPLOAD_EMPTY, D3D12_DROP_RECORDS_FULL,
+       D3D12_DROP_REASONS };
+static const char* const s_d3d12_drop_names[D3D12_DROP_REASONS] = {
+    "not_ready", "bad_count", "no_vp_resources", "prim_unwired", "upload_empty", "records_full" };
+static struct {
+    u64 calls, drop[D3D12_DROP_REASONS];
+    u64 vp_guest_fp, vp_fallback_ps;           /* VP-pass draws issued, by pixel shader */
+    u64 flips, flips_rendered, flips_deferred; /* deferred: no draw targeted offset 0 */
+    u64 deferred_with_display_draw;            /* ...although one targeted the flipped buffer */
+    u32 last_display_offset;
+} s_d3d12_stats;
+#define D3D12_DROP(reason) do { s_d3d12_stats.drop[reason]++; return; } while (0)
+static void d3d12_count_record(u32 emitted)
+{
+    if (!emitted) s_d3d12_stats.drop[D3D12_DROP_UPLOAD_EMPTY]++;
+    else if (s_d3d.draw_count >= MAX_DRAWS) s_d3d12_stats.drop[D3D12_DROP_RECORDS_FULL]++;
+}
+static void d3d12_print_stats(void)
+{
+    static long every = -1;
+    if (every < 0) { const char* e = getenv("D3D12_DROP_STATS_EVERY"); every = e ? atol(e) : 0; }
+    if (every <= 0 || s_d3d12_stats.flips % (u64)every) return;
+    u64 dropped = 0;
+    for (int i = 0; i < D3D12_DROP_REASONS; i++) dropped += s_d3d12_stats.drop[i];
+    if (!dropped && !s_d3d12_stats.flips_deferred && !s_d3d12_stats.vp_fallback_ps) return;
+    printf("[D3D12 drops] flips=%llu rendered=%llu deferred_no_offset0_draw=%llu"
+           " (with_draw_to_flipped_buffer=%llu last_display_offset=0x%X) draw_calls=%llu",
+           (unsigned long long)s_d3d12_stats.flips, (unsigned long long)s_d3d12_stats.flips_rendered,
+           (unsigned long long)s_d3d12_stats.flips_deferred,
+           (unsigned long long)s_d3d12_stats.deferred_with_display_draw,
+           s_d3d12_stats.last_display_offset, (unsigned long long)s_d3d12_stats.calls);
+    for (int i = 0; i < D3D12_DROP_REASONS; i++)
+        printf(" %s=%llu", s_d3d12_drop_names[i], (unsigned long long)s_d3d12_stats.drop[i]);
+    printf(" vp_guest_fp=%llu vp_fallback_ps=%llu\n", (unsigned long long)s_d3d12_stats.vp_guest_fp,
+           (unsigned long long)s_d3d12_stats.vp_fallback_ps);
+    fflush(stdout);
+}
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
@@ -5414,6 +5459,8 @@ static void render_frame(void)
                                                 dr->fp_ctrl, dr->cmask, dr->cull,
                                                 dr_cube_mask(dr),
                                                 unnorm_mask, unnorm_dim, dr->zs_key) : NULL;
+                if (dpso) s_d3d12_stats.vp_guest_fp++;
+                else s_d3d12_stats.vp_fallback_ps++;   /* no guest FP, or its PSO failed */
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
@@ -6056,8 +6103,24 @@ static void d3d12_present(void* ud, u32 buffer_id)
             break;
         }
 
-    if (s_d3d.initialized && flip_has_display)
+    s_d3d12_stats.flips++;
+    {
+        const CellGcmDisplayInfo* di = cellGcmGetDisplayBufferByFlipIndex(buffer_id);
+        s_d3d12_stats.last_display_offset = di ? di->offset : 0;
+    }
+    if (s_d3d.initialized && flip_has_display) {
+        s_d3d12_stats.flips_rendered++;
         render_frame();
+    } else if (s_d3d.initialized) {
+        s_d3d12_stats.flips_deferred++;
+        for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+            if (!s_d3d.draws[_i].is_clear && s_d3d12_stats.last_display_offset &&
+                s_d3d.draws[_i].rt_off == s_d3d12_stats.last_display_offset) {
+                s_d3d12_stats.deferred_with_display_draw++;
+                break;
+            }
+    }
+    d3d12_print_stats();
 
     /* FPS tracking */
     ULONGLONG now = GetTickCount64();
@@ -7201,6 +7264,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
           if (((++n) % 20000) == 0)
               printf("[backend] arrays callbacks=%lld (prim=%u count=%u)\n", n, primitive, count), fflush(stdout); } }
     (void)ud;
+    s_d3d12_stats.calls++;
     /* Log the first 20 calls in detail, then every 1000th to show liveness
      * without flooding. */
     static u64 s_total = 0;
@@ -7210,8 +7274,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     }
     s_total++;
 
-    if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
-    if (count == 0 || count > MAX_VERTICES) return;
+    if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) D3D12_DROP(D3D12_DROP_NOT_READY);
+    if (count == 0 || count > MAX_VERTICES) D3D12_DROP(D3D12_DROP_BAD_COUNT);
     vs_arrays(s_d3d.current_rsx_state, primitive, count);
 
     /* QUADS (prim 8) have no D3D12 topology; expand to a triangle list.
@@ -7228,6 +7292,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         if (s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
             u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
+            d3d12_count_record(emitted);
             if (emitted && s_d3d.draw_count < MAX_DRAWS) {
                 D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
                 dr->vb_byte_offset = rec;
@@ -7297,7 +7362,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         }
         u32 record_offset = s_d3d.vb_offset;
         u32 emitted = upload_quads_from_rsx(first, count);
-        if (emitted == 0) return;
+        if (emitted == 0) D3D12_DROP(D3D12_DROP_UPLOAD_EMPTY);
         if (s_d3d.draw_count < MAX_DRAWS) {
             s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
             s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
@@ -7360,6 +7425,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 return;
             }
         }
+        d3d12_count_record(emitted);
         if (emitted && s_d3d.draw_count < MAX_DRAWS) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
             dr->vb_byte_offset = rec;
@@ -7471,9 +7537,10 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                primitive, first, count);
         log_count++;
     }
-    if (!s_d3d.pipeline_ready) return;
-    if (count == 0 || count > MAX_VERTICES) return;
-    if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return;
+    s_d3d12_stats.calls++;
+    if (!s_d3d.pipeline_ready) D3D12_DROP(D3D12_DROP_NOT_READY);
+    if (count == 0 || count > MAX_VERTICES) D3D12_DROP(D3D12_DROP_BAD_COUNT);
+    if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) D3D12_DROP(D3D12_DROP_NO_VP_RESOURCES);
 
     /* Expand through the VP path (indices resolved CPU-side): QUADS -> two
      * triangles per quad, TRIANGLES straight through, STRIP/FAN -> triangle
@@ -7499,7 +7566,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         static int _skip = 0;
         if (PS3_LOG_FIRST(_skip, 3))
             printf("[D3D12] draw_indexed: skipping prim=%u (not wired)\n", primitive);
-        return;
+        D3D12_DROP(D3D12_DROP_PRIM_UNWIRED);
     }
     vs_end(vs_t0, emitted);
     if (ix_used && ix_cont) {          /* a batch of the previous record's run */
@@ -7528,6 +7595,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             return;
         }
     }
+    d3d12_count_record(emitted);
     if (emitted && s_d3d.draw_count < MAX_DRAWS) {
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
         dr->vb_byte_offset = rec;
@@ -8009,6 +8077,25 @@ void rsx_d3d12_backend_present(void)
       if (gfb) has_display = 1; }
     if (s_composite_src) has_display = 1;
     if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
+    /* The same accounting as d3d12_present: this ticker is the present many
+     * titles reach. A title that renders only to offscreen surfaces had
+     * every flip skipped here with nothing logged. */
+    s_d3d12_stats.flips++;
+    {
+        const CellGcmDisplayInfo* di = cellGcmGetDisplayBufferByFlipIndex(cellGcmGetCurrentDisplayBufferId());
+        s_d3d12_stats.last_display_offset = di ? di->offset : 0;
+    }
+    if (s_d3d.initialized && has_display) s_d3d12_stats.flips_rendered++;
+    else if (s_d3d.initialized && s_d3d.draw_count) {
+        s_d3d12_stats.flips_deferred++;
+        for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+            if (!s_d3d.draws[_i].is_clear && s_d3d12_stats.last_display_offset &&
+                s_d3d.draws[_i].rt_off == s_d3d12_stats.last_display_offset) {
+                s_d3d12_stats.deferred_with_display_draw++;
+                break;
+            }
+    }
+    d3d12_print_stats();
 
     /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
      * records all target an OFFSCREEN rt (rt_off != 0) presents without ever
