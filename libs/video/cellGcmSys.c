@@ -12,6 +12,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_tiling.h"
 #include "cellGcmSys.h"
+#include "rsx_fifo_busy.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
@@ -2013,8 +2014,10 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    rsx_fifo_busy_idle_begin();     /* PS3RECOMP_RSX_FIFO_BUSY: the consumer's idle wait */
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
+    rsx_fifo_busy_idle_end();
 }
 
 
@@ -2177,6 +2180,8 @@ void cellGcm_rsx_process_fifo(void)
 {
     wprof_note_walker();
     g_gcm_drain_tid = GetCurrentThreadId();
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAIN);
+    rsx_fifo_busy_pass_stopped(RSX_FIFO_BUSY_STOP_OTHER);   /* a pass that returns early */
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
@@ -2186,6 +2191,7 @@ void cellGcm_rsx_process_fifo(void)
         if (t1 - ft_t0 >= ps3_ft_min_ns())
             ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
     }
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAIN);
 }
 
 /* The methods rsx_process_method acts on beyond its own rsx_state: the notify
@@ -2570,6 +2576,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           flips, 10); }
             if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                                ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
+            rsx_fifo_busy_flip();
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
@@ -3018,6 +3025,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
               burned = 0;
           }
       } else burned = 0; }
+
+    /* PS3RECOMP_RSX_FIFO_BUSY: why this pass stopped picks the next idle wait's category. */
+    rsx_fifo_busy_pass_stopped(s_sema_blocked_pass ? RSX_FIFO_BUSY_STOP_SEMA :
+                               s_report_hold_pass ? RSX_FIFO_BUSY_STOP_REPORT :
+                               (!s_park_pass && s_fifo_getoff == put) ? RSX_FIFO_BUSY_STOP_PUT :
+                               RSX_FIFO_BUSY_STOP_OTHER);
 
     /* A drain stopped on a semaphore acquire (GCM_SEMA_ACQUIRE) holds `get`
      * on purpose: that is the wait, not a stuck walker, and the acquire's own

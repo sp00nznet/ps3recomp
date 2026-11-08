@@ -2529,6 +2529,7 @@ static void release_surfaces(void)
  * --------------------------------------------------------------------------*/
 
 #include "rsx_draw_engine.h"
+#include "rsx_fifo_busy.h"
 
 #define ENG_MAX_OBJECTS  4096
 #define ENG_MAX_PIPES    4096
@@ -4480,7 +4481,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         const u32 host_gen = s_host_gen;
         const int windowed_present = (present_dst && !s_headless);
         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-          if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+          if (windowed_present) {
+              rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+              dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+              rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
+          }
           if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
               if (w1 - w0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 2, 0, w0, w1); } }
         if (present_dst) {
@@ -4502,7 +4507,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                     s_layer.drawableSize = CGSizeMake((CGFloat)ww, (CGFloat)wh);
                     fprintf(stderr, "[RSX metal] drawable %ux%u (window)\n", ww, wh);
                 }
+                rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
                 drawable = [s_layer nextDrawable];
+                rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);
                     return;
@@ -4934,20 +4941,32 @@ static int pump_messages_impl(void)
 int rsx_metal_backend_pump_messages(void)
 {
     if (s_headless || !s_ready) return 0;
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PUMP);
 #if !TARGET_OS_IPHONE
-    if ([NSThread isMainThread])
-        return pump_messages_impl();
     __block int result = 0;
-    dispatch_sync(dispatch_get_main_queue(), ^{
+    if ([NSThread isMainThread])
         result = pump_messages_impl();
-    });
-    return result;
+    else
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            result = pump_messages_impl();
+        });
 #else
-    return pump_messages_impl();
+    const int result = pump_messages_impl();
 #endif
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PUMP);
+    return result;
 }
 
+static void metal_present_core(void);
+/* PS3RECOMP_RSX_FIFO_BUSY: a host's own present call is "present_host" time,
+ * outside the engine present (or display-image wait) it makes. */
 void rsx_metal_backend_present(void)
+{
+    rsx_fifo_busy_enter(RSX_FIFO_BUSY_PRESENT_HOST);
+    metal_present_core();
+    rsx_fifo_busy_leave(RSX_FIFO_BUSY_PRESENT_HOST);
+}
+static void metal_present_core(void)
 {
     if (!s_ready) return;
     /* Under the draw engine the frame belongs to it: a host that drives the
@@ -4963,7 +4982,11 @@ void rsx_metal_backend_present(void)
      * be the display's size; a resize waits for the frames in flight first. */
     if (s_host && host_match_size(s_width, s_height) != 0) return;
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
-    if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+    if (!s_headless) {
+        rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
+        dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+        rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
+    }
     @autoreleasepool {
         id<MTLTexture> target = nil;
         id<CAMetalDrawable> drawable = nil;
@@ -4980,7 +5003,9 @@ void rsx_metal_backend_present(void)
             }
             target = s_host_tex[host_slot];
         } else {
+            rsx_fifo_busy_enter(RSX_FIFO_BUSY_DRAWABLE);
             drawable = [s_layer nextDrawable];
+            rsx_fifo_busy_leave(RSX_FIFO_BUSY_DRAWABLE);
             if (!drawable) {            /* compositor is busy; skip this frame */
                 dispatch_semaphore_signal(s_inflight);
                 return;
