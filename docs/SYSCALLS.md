@@ -384,7 +384,7 @@ PS3 time is measured in **timebase ticks** at 79,800,000 Hz (79.8 MHz). This is 
 | 74 | `sys_timer_stop` | Stop timer. |
 | 75 | `sys_timer_connect_event_queue` | Connect timer to an event queue. |
 | 76 | `sys_timer_disconnect_event_queue` | Disconnect timer from queue. |
-| 141 | `sys_timer_usleep` | Sleep for N microseconds. |
+| 141 | `sys_timer_usleep` | Sleep for N microseconds. Windows spins sub-millisecond sleeps to a QPC deadline; on POSIX, `PS3RECOMP_USLEEP_SPIN_US=<n>` (off by default) makes sleeps shorter than n microseconds yield to a monotonic deadline instead of calling nanosleep. |
 | 142 | `sys_timer_sleep` | Sleep for N seconds. |
 | 145 | `sys_time_get_current_time` | Get current time (seconds + nanoseconds since epoch). |
 | 147 | `sys_time_get_timebase_frequency` | Returns 79,800,000. |
