@@ -17,6 +17,9 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t ea, uint64_t v, int size) { (void)ea; (void)v; (void)size; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+void spu_linelock_lock(uint32_t ea) { (void)ea; }
+void spu_linelock_unlock(uint32_t ea) { (void)ea; }
+void spu_linelock_release(uint32_t ea) { (void)ea; }
 int  spu_coh_is_reserved(uint32_t ea) { (void)ea; return 0; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 
