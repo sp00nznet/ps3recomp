@@ -2711,7 +2711,30 @@ static void test_clear_rect(void)
     engine_down();
 }
 
-int main(void)
+/* ---- PS3RECOMP_RSX_SINGLE_PRESENT: one present per flip ----------------- */
+
+/* Runs in its own process (main's "single" mode): the switch is read once. */
+static void test_single_present(void)
+{
+    printf("-- single present\n");
+    engine_up();
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    const int before = stub.n_present;
+    m(0xE944u, 0);                          /* the FIFO reaches a flip: the engine presents it */
+    CHECK(stub.n_present == before + 1, "the flip method presents once");
+    rsx_draw_engine_present();              /* the host frame clock presents the same flip */
+    CHECK(stub.n_present == before + 1, "a host present right after the engine's is skipped");
+    rsx_draw_engine_present();              /* no newer flip: a host present still presents */
+    CHECK(stub.n_present == before + 2, "a host present with no engine flip before it presents");
+    m(0xE944u, 1);
+    m(0xE944u, 0);                          /* two flips between host presents */
+    CHECK(stub.n_present == before + 4, "each flip method presents");
+    rsx_draw_engine_present();
+    CHECK(stub.n_present == before + 4, "one host present after them is skipped");
+    engine_down();
+}
+
+int main(int argc, char** argv)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
     if (!vm_base) { printf("[FAIL] guest memory\n"); return 1; }
@@ -2723,6 +2746,12 @@ int main(void)
         p[0] = 0x3F; p[1] = 0x80; p[2] = 0; p[3] = 0;    /* 1.0f big-endian */
     }
 
+    if (argc > 1 && !strcmp(argv[1], "single")) {
+        setenv("PS3RECOMP_RSX_SINGLE_PRESENT", "1", 1);
+        test_single_present();
+        printf("%s\n", g_failures ? "FAIL" : "PASS single present");
+        return g_failures ? 1 : 0;
+    }
     test_surface_set();
     test_surface_aliasing();
     test_mrt_set();
