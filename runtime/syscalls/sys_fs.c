@@ -106,8 +106,10 @@ static void fs_normalize_sep(char* p) {
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
  * their own translation (see docs), and a guest path can arrive at any of them. */
-/* cellGame.c; weak so fixtures that link sys_fs.c without it still link. The
- * only weak reference to it: under COFF each one emits its own fallback. */
+/* cellGame.c; weak so fixtures that link sys_fs.c without it still link on
+ * ELF. ld64 does not accept an undefined weak symbol, so on macOS such a
+ * fixture defines it (test_sys_fs.c). The only weak reference to it: under
+ * COFF each one emits its own fallback. */
 extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
 
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)

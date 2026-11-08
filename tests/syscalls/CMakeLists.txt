@@ -90,6 +90,10 @@ if(MSVC)
     target_compile_definitions(test_ppu_thread_join PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(test_ppu_thread_join PRIVATE -Wall -Wextra -Wno-unused-parameter -UNDEBUG)
+    # The test's own background joiner uses CreateThread / WaitForSingleObject /
+    # CloseHandle, which win32_compat.h declares off Windows and win32_compat.c
+    # implements on pthreads.
+    target_sources(test_ppu_thread_join PRIVATE "${PS3RECOMP_ROOT}/runtime/platform/win32_compat.c")
     find_package(Threads REQUIRED)
     target_link_libraries(test_ppu_thread_join PRIVATE Threads::Threads)
 endif()

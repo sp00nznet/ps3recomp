@@ -830,7 +830,19 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         t->host_thread  = NULL;
         t->finish_event = NULL;
 #else
-        pthread_detach(t->host_thread);
+        /* The same on POSIX: freeing at once let the epilogue put the freed
+         * slot back to FINISHED, where it stayed, and signal through the
+         * mutex and condition variable destroyed here. pthread_join reaps
+         * the thread as pthread_detach did. */
+        const pthread_t h = t->host_thread;
+        t->joining = 1;                 /* nobody joins it meanwhile */
+        table_unlock();
+        pthread_join(h, NULL);
+        table_lock();
+        if (t->state != PPU_THREAD_STATE_FINISHED || !pthread_equal(t->host_thread, h)) {
+            table_unlock();             /* freed or reused in the meantime */
+            return CELL_OK;
+        }
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
 #endif
