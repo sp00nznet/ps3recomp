@@ -27,6 +27,7 @@ void ydkj_wake_all_event_flags(void){}
 static atomic_uint canceled_queues;
 void sys_event_queue_cancel_by_id(u32 id) { assert(id==3 || id==4);atomic_fetch_or(&canceled_queues,1u<<id); }
 void sys_event_queue_uncancel_by_id(u32 id) {(void)id;}
+void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c */
 /* Observe the legacy bypass without substituting any policy completion. */
 static atomic_uint unbounded_dispatches;
 int fixture_unbounded_dispatch(const uint8_t* pm,uint32_t size,uint32_t data)

@@ -135,13 +135,17 @@ static EventFlagSync* ef_sync_find(uint32_t ea)
 }
 
 static void spurs_commit_hook(uint32_t line);
+static void spurs_line_committed(uint32_t line);
+/* libs/video/rsx_commands.c: an RSX semaphore release into main memory. */
+extern void (*g_rsx_main_release_hook)(uint32_t line);
 static EventFlagSync* ef_sync_alloc(uint32_t ea)
 {
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
         if (!s_ef_sync[i].initialized) {
             s_ef_sync[i].ea = ea;
             { extern void (*g_spu_line_commit_hook)(uint32_t);
-              g_spu_line_commit_hook = spurs_commit_hook; }
+              g_spu_line_commit_hook = spurs_commit_hook;
+              g_rsx_main_release_hook = spurs_line_committed; }
 #ifdef _WIN32
             InitializeCriticalSection(&s_ef_sync[i].cs);
             InitializeConditionVariable(&s_ef_sync[i].cv);
@@ -2108,7 +2112,8 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     si->stopping = 0; si->cursor = si->pass_no = 0;
     __atomic_store_n(&si->kick, 0, __ATOMIC_RELAXED);
     { extern void (*g_spu_line_commit_hook)(uint32_t);
-      g_spu_line_commit_hook = spurs_commit_hook; }
+      g_spu_line_commit_hook = spurs_commit_hook;
+      g_rsx_main_release_hook = spurs_line_committed; }
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     for (u32 sn = 0; sn < si->nspus; sn++) {
