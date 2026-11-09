@@ -28,7 +28,13 @@ sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 /* Table lock for allocation */
 #ifdef _WIN32
 static CRITICAL_SECTION s_evt_table_lock;
-static int              s_evt_table_lock_init = 0;
+static INIT_ONCE        s_evt_table_lock_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK evt_table_lock_init(PINIT_ONCE once, PVOID param, PVOID* ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&s_evt_table_lock);
+    return TRUE;
+}
 #else
 static pthread_mutex_t  s_evt_table_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
@@ -36,10 +42,9 @@ static pthread_mutex_t  s_evt_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static void evt_table_lock(void)
 {
 #ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
+    /* Host producers (cellAudio's thread, SPURS, SPU groups) take this lock too, so the
+     * first use can race: initialise exactly once. */
+    InitOnceExecuteOnce(&s_evt_table_lock_once, evt_table_lock_init, NULL, NULL);
     EnterCriticalSection(&s_evt_table_lock);
 #else
     pthread_mutex_lock(&s_evt_table_lock);
@@ -133,7 +138,6 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
-    q->active   = 1;
     q->key      = key;
     q->capacity = size;
     q->type     = SYS_PPU_QUEUE;
@@ -150,6 +154,8 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
     pthread_mutex_init(&q->lock, NULL);
     pthread_cond_init(&q->not_empty, NULL);
 #endif
+    /* Publish last: a reader that sees active also sees an initialised lock. */
+    __atomic_store_n(&q->active, 1, __ATOMIC_RELEASE);
 
     evt_table_unlock();
 
@@ -181,7 +187,6 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
-    q->active   = 1;
     q->key      = key;
     q->capacity = size;
     q->head     = 0;
@@ -219,6 +224,8 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     pthread_mutex_init(&q->lock, NULL);
     pthread_cond_init(&q->not_empty, NULL);
 #endif
+    /* Publish last: a reader that sees active also sees an initialised lock. */
+    __atomic_store_n(&q->active, 1, __ATOMIC_RELEASE);
 
     uint32_t queue_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
@@ -1036,13 +1043,20 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
 {
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) return -1;
     sys_event_t evt;
     evt.source = source;
     evt.data1  = data1;
     evt.data2  = data2;
     evt.data3  = data3;
-    return event_queue_push(q, &evt);
+    /* Host producers run on their own threads (cellAudio's period thread, SPURS, SPU
+     * groups), concurrently with guest create and destroy. Hold the table lock across
+     * the check and the push so the queue cannot be created or destroyed under it.
+     * event_queue_push does not block (a full queue returns -1). */
+    evt_table_lock();
+    int rc = -1;
+    if (__atomic_load_n(&q->active, __ATOMIC_ACQUIRE)) rc = event_queue_push(q, &evt);
+    evt_table_unlock();
+    return rc;
 }
 
 /* Public helper: resolve an event queue by its ipc_key (as registered at
@@ -1051,11 +1065,17 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
 uint32_t sys_event_find_queue_by_key(uint64_t key)
 {
     if (key == 0) return 0;
+    uint32_t id = 0;
+    evt_table_lock();
     for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
-        if (g_sys_event_queues[i].active && g_sys_event_queues[i].key == key)
-            return (uint32_t)(i + 1);
+        if (__atomic_load_n(&g_sys_event_queues[i].active, __ATOMIC_ACQUIRE) &&
+            g_sys_event_queues[i].key == key) {
+            id = (uint32_t)(i + 1);
+            break;
+        }
     }
-    return 0;
+    evt_table_unlock();
+    return id;
 }
 
 int64_t sys_event_port_send(ppu_context* ctx)
@@ -1647,10 +1667,7 @@ void sys_event_init(lv2_syscall_table* tbl)
     memset(g_sys_event_flags,  0, sizeof(g_sys_event_flags));
 
 #ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
+    InitOnceExecuteOnce(&s_evt_table_lock_once, evt_table_lock_init, NULL, NULL);
 #endif
 
     /* Event queues */
