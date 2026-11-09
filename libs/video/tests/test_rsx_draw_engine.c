@@ -170,8 +170,18 @@ static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
 static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
 
+/* Set by a test: the backend keeps one snapshot texture per depth target and
+ * hands the same handle back, refilled, while it is alive (as the Vulkan
+ * backend does). Otherwise every request returns a new texture. */
+static int g_snapshot_in_place;
+static u32 g_snapshot_kept;
 static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
-{ (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++; return stub_handle(); }
+{
+    (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++;
+    if (g_snapshot_in_place && g_snapshot_kept && stub.alive[g_snapshot_kept]) return g_snapshot_kept;
+    g_snapshot_kept = stub_handle();
+    return g_snapshot_kept;
+}
 
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
@@ -2072,6 +2082,43 @@ static void test_depth_snapshot_release(void)
     engine_down();
 }
 
+/* The same clear, depth pass and read, against a backend that refills one
+ * texture per depth target in place: the handle it returns again is the one
+ * the engine already holds, and it has to stay alive for the draw that
+ * samples it. Releasing the previous snapshot without comparing handles
+ * releases the one just returned, so every second pass samples a released
+ * texture and the next request makes a new one. */
+static void test_depth_snapshot_refilled_in_place(void)
+{
+    printf("-- depth snapshot refilled in place stays alive\n");
+    engine_up();
+    g_snapshot_in_place = 1; g_snapshot_kept = 0;
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+
+    int taken = 0, dead = 0;
+    u32 first = 0;
+    for (int pass = 0; pass < 4; pass++) {
+        depth_pass();
+        const int before = stub.n_depth_snapshot;
+        const u32 snap = sample_depth();
+        if (stub.n_depth_snapshot != before + 1) continue;
+        taken++;
+        if (!first) first = snap;
+        if (!snap || snap != g_snapshot_kept || !stub.alive[snap]) dead++;
+    }
+    CHECK(taken == 4, "each pass after a clear asks for a snapshot (%d of 4)", taken);
+    CHECK(dead == 0, "every pass samples the live refilled snapshot (%d sampled a released one)",
+          dead);
+    CHECK(first && g_snapshot_kept == first && stub.n_released[first] == 0,
+          "one texture serves every pass and is never released (%u, %u, %d release calls)",
+          first, g_snapshot_kept, first ? stub.n_released[first] : -1);
+    g_snapshot_in_place = 0; g_snapshot_kept = 0;
+    engine_down();
+}
+
 /* depth_as_color: the zeta's bytes made on the GPU, no store to guest memory. */
 static int g_argb_calls, g_argb_fail;
 static u32 g_argb_w, g_argb_h, g_argb_fmt;
@@ -2751,6 +2798,7 @@ int main(void)
     test_antialiased_wpos();
     test_depth_read_as_color();
     test_depth_snapshot_release();
+    test_depth_snapshot_refilled_in_place();
     test_depth_read_as_argb_on_gpu();
     test_z16_read_as_depth16_on_gpu();
     test_full_tables_evict_the_oldest();

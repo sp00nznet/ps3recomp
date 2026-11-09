@@ -89,7 +89,7 @@ jobs:
           for m in "" "--draw" "--depth" "--quads" "--shader" \
                    "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube" \
                    "--depthbounds" "--split-present" "--feedback" "--clip" "--clip-keep" \
-                   "--float-rt" "--float-rt-r"; do
+                   "--float-rt" "--float-rt-r" "--unbound"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
             name=${m:-default}
             echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"

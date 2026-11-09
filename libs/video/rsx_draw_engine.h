@@ -168,7 +168,11 @@ typedef struct rsx_draw_backend {
     u32  (*depth_target_create)(void* user, u32 w, u32 h);
     void (*depth_target_release)(void* user, u32 depth);
     /* Resolve a depth target into a sampleable texture and return it; 0 when
-     * the backend cannot. The engine only asks after a depth-writing draw. */
+     * the backend cannot. The engine only asks after a depth-writing draw. The
+     * engine owns the result and releases it with texture_release once it has
+     * a newer snapshot of the same target. A backend may keep one texture per
+     * depth target and return that same handle again, refilled: the engine
+     * then keeps it and releases nothing. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
