@@ -1919,8 +1919,18 @@ s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
  * wklSignal1 bit into the instance — mostly with INLINED atomics (LBP never
  * calls an API for it beyond cellSpursReadyCountStore). The kernel thread
  * polls those real BE fields, consumes one ready unit (decrement / clear the
- * signal bit, like the real kernel's dispatch), and runs the workload's
- * policy module to completion via spu_run_policy_module.
+ * signal bit), and runs the workload's policy module to completion via
+ * spu_run_policy_module. Work that arrives without a kick is found by idle
+ * probes (spurs_idle_max).
+ *
+ * SPURS_IDLE_PROBE=0 admits the way the real kernel does instead: no probes,
+ * and the ready count is not spent on admission. It is the number of SPUs the
+ * workload asks for; the workload stays runnable while the count exceeds its
+ * contention, and its own policy module stores it back to zero when it runs out
+ * of work. Signal bits and the workload flag are consumed on admission either
+ * way. Resistance 3's WWS job manager needs it: it asks once with a count of 1,
+ * clears it when the list is drained, and asserts (IsListFinished) when it
+ * finds its workload still contended by a probe.
  * -----------------------------------------------------------------------*/
 typedef struct {
     spu_lifted_entry_fn fn;
@@ -1961,6 +1971,19 @@ static WklPm* spurs_resolve_pm(u32 wid)
         }
     }
     return r->fn ? r : NULL;
+}
+
+/* SPURS_IDLE_PROBE=0: real-kernel admission (see above). Only a ready count
+ * above the workload's contention, a signal bit or the workload flag admits a
+ * policy module; the count is left as the guest wrote it. */
+static int spurs_real_admission(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("SPURS_IDLE_PROBE");
+        s_on = e && *e == '0';
+    }
+    return s_on;
 }
 
 /* SPURS_IDLE_MAX=<n> (default 4, 0..8): cap of the idle back-off, as log2 of
@@ -2070,14 +2093,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  * receiver workload ready (cellSpursGetWorkloadFlag). */
                 int flagged = vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid &&
                               vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
-                int kicked = ready || (signal & wkl_signal_bit(wid)) || flagged;
+                const int real = spurs_real_admission();
+                int kicked = (real ? ready > si->active[wid] : ready != 0) ||
+                             (signal & wkl_signal_bit(wid)) || flagged;
                 if (kicked) si->idle[wid] = 0;
-                if (!kicked && (kick_pass || (si->pass_no & ((1u << si->idle[wid]) - 1))))
+                if (!kicked && (kick_pass || real || (si->pass_no & ((1u << si->idle[wid]) - 1))))
                     continue;
                 spu_lockline_lock();
                 ready = vm_read8(ea + wkl_ready_off(wid));
                 signal = vm_read16(ea + wkl_signal_off(wid));
-                if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
+                if (ready && !real) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
                 if (signal & wkl_signal_bit(wid))
                     ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));
                 if (vm_read8(ea + SPURS_WKL_FLAG_RECV) == wid)
