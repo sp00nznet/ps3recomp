@@ -296,6 +296,10 @@ jobs:
             echo "--border passed with the border colour ignored; the check is not checking"
             exit 1
           fi
+          # A fragment program sampling a texture unit that is switched off
+          # reads transparent black, blended over the clear: the clear colour
+          # must come through, the texture behind the unit must not.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --unbound
           # Render-to-texture: a red triangle drawn into a colour surface of
           # the guest's own, then sampled by a full-screen quad through the
           # guest programs. The guest bytes behind that surface are green, so
