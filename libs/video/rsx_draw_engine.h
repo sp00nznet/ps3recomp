@@ -300,6 +300,13 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional. depth_snapshot into `dst`, a texture an earlier depth_snapshot
+     * of the same size returned, instead of a new one: the engine re-takes a
+     * depth-bounds copy with it rather than allocating one per snapshot.
+     * Ordered after every draw already handed over that samples `dst`.
+     * Returns dst, or 0 when the backend cannot (the engine then takes a new
+     * snapshot). */
+    u32  (*depth_snapshot_into)(void* user, u32 depth, u32 dst);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

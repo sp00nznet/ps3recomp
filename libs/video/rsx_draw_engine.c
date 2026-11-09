@@ -135,6 +135,7 @@ typedef struct {
     u32 dbz_copy;          /* float copy for the emulated depth-bounds test */
     u32 dbz_w, dbz_h;
     u64 dbz_serial;        /* depth_serial that copy holds                 */
+    u32 dbz_pass;          /* s_dbz_pass_id when that copy was taken       */
 
 } eng_zdepth;
 
@@ -2092,22 +2093,86 @@ static u64 eng_fp_debug_hash(const u8* fp_uc, u32 fp_size)
  * the program does not sample, and rsx_fp_apply_depth_bounds reads it at the
  * pixel and discards. The bounds go in the float4 after fp_alpha. A bound of
  * [0, 1] is no bound. s_dbz says what eng_pipeline_get, the texture binding
- * and the constants need for the current draw.
- * PS3RECOMP_ENG_DEPTH_BOUNDS=0: the test is ignored there, as before. */
+ * and the constants need for the current draw. The modes are below
+ * (eng_depth_bounds_mode). */
 static struct { u32 unit; u32 copy; float mn, mx; } s_dbz;   /* unit + 1, or 0 */
 
-static int eng_depth_bounds_on(void)
+/* PS3RECOMP_ENG_DEPTH_BOUNDS, for a backend without a depth-bounds test of
+ * its own. Each snapshot is a pass of its own on a tile-based GPU: Metal ends
+ * the render pass it falls in, stores and reloads every attachment around a
+ * resolve pass, so its count is the cost.
+ *   0: off. The test is ignored, as before the emulation existed.
+ *   1 (the default): exact. A new snapshot whenever depth was written since
+ *      the last one, into the same texture where the backend can
+ *      (depth_snapshot_into) rather than a new allocation each time.
+ *   2: per pass. At most one snapshot per render pass (a run of draws on the
+ *      same colour targets and zeta), taken at its first bounded draw: depth
+ *      written later in the same pass is not seen by its later bounded
+ *      draws. Exact for the usual deferred shape (geometry writes depth,
+ *      then bounded lights or material passes that do not), and it bounds
+ *      the cost at one pass split per pass.
+ * s_dbz_mode is file-level so the GPU test can switch modes in one process. */
+static int s_dbz_mode = -1;
+static int eng_depth_bounds_mode(void)
 {
-    static int on = -1;
-    if (on < 0) {
+    if (s_dbz_mode < 0) {
         const char* e = getenv("PS3RECOMP_ENG_DEPTH_BOUNDS");
-        on = !(e && *e && atoi(e) == 0);
+        const int v = e && *e ? atoi(e) : 1;   /* default: exact */
+        s_dbz_mode = v == 0 || v == 2 ? v : 1;
     }
-    return on;
+    return s_dbz_mode;
+}
+static int eng_depth_bounds_on(void) { return eng_depth_bounds_mode() != 0; }
+
+/* The render pass a draw belongs to, for mode 2: its colour targets and zeta.
+ * Tracked on every draw (so returning to an earlier target set is a new
+ * pass) and restarted at every present. */
+static u64 s_dbz_pass_key;
+static u32 s_dbz_pass_id;
+static void eng_dbz_pass_note(const u32* targets, u32 n_targets, u32 zslot)
+{
+    u64 k = eng_fnv1a(targets, n_targets * sizeof *targets, 1469598103934665603ull);
+    k = eng_fnv1a(&zslot, sizeof zslot, k);
+    if (k != s_dbz_pass_key) { s_dbz_pass_key = k; s_dbz_pass_id++; }
 }
 
-static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
+/* RSX_ENG_DBZ_STATS=1: what the emulation costs, per frame, averaged and
+ * printed every 60 frames: draws with the test on, those whose bounds were
+ * the whole range (skipped), snapshots taken and reused, and the distinct
+ * non-trivial bounds the frames used (up to 8 listed). */
+static struct {
+    int on; u32 flips, draws, trivial, snaps, reused;
+    u32 n_pairs; float pairs[8][2];
+} s_dbz_stats = { -1 };
+static void eng_dbz_stats_pair(float mn, float mx)
 {
+    for (u32 i = 0; i < s_dbz_stats.n_pairs; i++)
+        if (s_dbz_stats.pairs[i][0] == mn && s_dbz_stats.pairs[i][1] == mx) return;
+    if (s_dbz_stats.n_pairs < 8) {
+        s_dbz_stats.pairs[s_dbz_stats.n_pairs][0] = mn;
+        s_dbz_stats.pairs[s_dbz_stats.n_pairs][1] = mx;
+        s_dbz_stats.n_pairs++;
+    }
+}
+static void eng_dbz_stats_frame(void)
+{
+    if (s_dbz_stats.on < 0) s_dbz_stats.on = getenv("RSX_ENG_DBZ_STATS") ? 1 : 0;
+    if (!s_dbz_stats.on || ++s_dbz_stats.flips < 60) return;
+    const float n = (float)s_dbz_stats.flips;
+    fprintf(stderr, "[rsx engine dbz] per frame over %u frames: bounded draws %.1f, whole-range %.1f, "
+            "snapshots %.1f, reused %.1f; bounds seen:", s_dbz_stats.flips,
+            s_dbz_stats.draws / n, s_dbz_stats.trivial / n, s_dbz_stats.snaps / n, s_dbz_stats.reused / n);
+    for (u32 i = 0; i < s_dbz_stats.n_pairs; i++)
+        fprintf(stderr, " [%.4f,%.4f]", s_dbz_stats.pairs[i][0], s_dbz_stats.pairs[i][1]);
+    fprintf(stderr, "%s\n", s_dbz_stats.n_pairs == 8 ? " ..." : "");
+    s_dbz_stats.flips = s_dbz_stats.draws = s_dbz_stats.trivial = 0;
+    s_dbz_stats.snaps = s_dbz_stats.reused = s_dbz_stats.n_pairs = 0;
+}
+
+static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs,
+                                     const u32* targets, u32 n_targets)
+{
+    eng_dbz_pass_note(targets, n_targets, zslot);
     s_dbz.unit = 0; s_dbz.copy = 0;
     if (g.be->set_depth_bounds || !g.be->depth_snapshot || !rs->depth_bounds_test ||
         zslot == ENG_INVALID || !eng_depth_bounds_on())
@@ -2119,7 +2184,9 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
      * clamp_depth_bounds_value); NaN reads as 0. */
     mn = mn > 0.0f ? (mn < 1.0f ? mn : 1.0f) : 0.0f;
     mx = mx > 0.0f ? (mx < 1.0f ? mx : 1.0f) : 0.0f;
-    if (mn <= 0.0f && mx >= 1.0f) return;
+    if (s_dbz_stats.on > 0) s_dbz_stats.draws++;
+    if (mn <= 0.0f && mx >= 1.0f) { if (s_dbz_stats.on > 0) s_dbz_stats.trivial++; return; }
+    if (s_dbz_stats.on > 0) eng_dbz_stats_pair(mn, mx);
     const u8* vp_uc = NULL; const u8* fp_uc = NULL; u32 vp_instrs = 0, fp_size = 0;
     if (!eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size)) return;
     /* A unit the program neither samples nor has declared as a cube or a
@@ -2136,14 +2203,24 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
                     mn, mx, unit < 0 ? "no free texture unit" : "no depth target");
         return;
     }
-    if (!z->dbz_copy || z->dbz_serial != z->depth_serial || z->dbz_w != z->w || z->dbz_h != z->h) {
-        const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
+    const int same_size = z->dbz_copy && z->dbz_w == z->w && z->dbz_h == z->h;
+    const int current = same_size &&
+        (z->dbz_serial == z->depth_serial ||
+         (eng_depth_bounds_mode() == 2 && z->dbz_pass == s_dbz_pass_id));
+    if (!current) {
+        if (s_dbz_stats.on > 0) s_dbz_stats.snaps++;
+        u32 tex = 0;
+        if (same_size && g.be->depth_snapshot_into)   /* reuse the copy's texture */
+            tex = g.be->depth_snapshot_into(g.be->user, z->handle, z->dbz_copy);
+        if (!tex) tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
         if (!tex) return;
         if (z->dbz_copy && z->dbz_copy != tex && g.be->texture_release)
             g.be->texture_release(g.be->user, z->dbz_copy);
         z->dbz_copy = tex; z->dbz_w = z->w; z->dbz_h = z->h;
         z->dbz_serial = z->depth_serial;
+        z->dbz_pass = s_dbz_pass_id;
     }
+    else if (s_dbz_stats.on > 0) s_dbz_stats.reused++;
     s_dbz.unit = (u32)unit + 1u; s_dbz.copy = z->dbz_copy;
     s_dbz.mn = mn; s_dbz.mx = mx;
 }
@@ -3338,7 +3415,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     u64 fp_hash = 0;
-    eng_depth_bounds_prepare(zslot, &rs);
+    eng_depth_bounds_prepare(zslot, &rs, targets, n_targets);
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
@@ -3622,6 +3699,20 @@ static u32 eng_present_surface(u32 buffer_id)
     return eng_current_surface();
 }
 
+/* Per-frame bookkeeping, run from every present once per guest flip: the
+ * FIFO flip method (sink_flip), a flip the GCM layer names
+ * (rsx_draw_engine_note_flip, the path a title that flips through the host
+ * frame clock takes) or a host present of a named buffer each advance
+ * s_eng_flip_serial, and a second present of the same flip does not count.
+ * With no flip ever noted, every present is a frame. */
+static u32 s_eng_flip_serial, s_eng_hooked_serial;
+static void eng_frame_hooks(void)
+{
+    if (s_eng_flip_serial && s_eng_flip_serial == s_eng_hooked_serial) return;
+    s_eng_hooked_serial = s_eng_flip_serial;
+    eng_dbz_stats_frame();
+}
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -3641,6 +3732,8 @@ static void eng_present(u32 buffer_id)
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
+    s_dbz_pass_key = 0;   /* a present ends the pass (eng_dbz_pass_note) */
+    eng_frame_hooks();
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
 }
@@ -3649,6 +3742,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
+    s_eng_flip_serial++;
     eng_present(g.last_flip_buffer);
 }
 
@@ -3793,12 +3887,14 @@ void rsx_draw_engine_present(void)
 void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+    s_eng_flip_serial++;
     eng_present(g.last_flip_buffer);
 }
 
 void rsx_draw_engine_note_flip(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+    s_eng_flip_serial++;
 }
 
 u32 rsx_draw_engine_guest_draws(void)
