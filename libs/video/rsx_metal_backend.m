@@ -1345,6 +1345,7 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
     else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+    rsx_vp_set_epilogue_branch_bits(vpx, st->transform_branch_bits);
 
     u8* fp = s_cb + fp_off;
     memset(fp, 0, fp_len);

@@ -57,11 +57,18 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
  * to the ucode pointer handed in. Defaults to 0. */
 void rsx_vp_set_branch_base(u32 start_slot);
 
-/* SET_TRANSFORM_BRANCH_BITS for the next program decompiled. BRB and CLB
- * branch on one of these bits; the decompiler bakes the outcome in, so a
- * program that rsx_vp_uses_branch_bits() must be keyed on them too. */
-void rsx_vp_set_branch_bits(u32 bits);
-int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes);
+/* BRB and CLB branch on one of SET_TRANSFORM_BRANCH_BITS (0x1FF8), which the
+ * program reads at run time from vp_posoffset.w, whose bits the caller sets
+ * per draw: the epilogue after vp_c is vp_posscale then vp_posoffset, eight
+ * floats, and the bits go in the last (the shader reads only .xyz of both).
+ * One program then serves every value of the bits. */
+#define RSX_VP_BRANCH_BITS_LANE 7
+static inline void rsx_vp_set_epilogue_branch_bits(float epilogue[8], u32 bits)
+{
+    union { u32 u; float f; } v;
+    v.u = bits;
+    epilogue[RSX_VP_BRANCH_BITS_LANE] = v.f;
+}
 
 /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).

@@ -104,6 +104,20 @@ static inline void rsx_test_vp_txl_out(u8* p, u32 input, u32 swz, u32 unit,
     rsx_test_vp_vec_out_tex(p, RSX_TEST_VP_OP_TXL, input, swz, unit, out, end);
 }
 
+/* A flow-control instruction with no ALU write: scalar opcode `sca_op`
+ * (BRA 0x08, BRI 0x09, CAL 0x0A, CLI 0x0B, RET 0x0C, BRB 0x11, CLB 0x12) to
+ * slot `target`, condition "always". BRB and CLB test branch bit `bit`
+ * (D3[23:27]) against `if_set` (D3[28]). */
+static inline void rsx_test_vp_branch(u8* p, u32 sca_op, u32 target, u32 bit, u32 if_set)
+{
+    const u32 d0 = (0x3Fu << 15) | (7u << 10) | (((target >> 9) & 1u) << 23);
+    const u32 d1 = sca_op << 27;
+    const u32 d2 = (target >> 3) & 0x3Fu;
+    const u32 d3 = (0x3Fu << 7) | (bit << 23) | (if_set << 28) | ((target & 7u) << 29);
+    rsx_test_put_le32(p + 0, d0); rsx_test_put_le32(p + 4, d1);
+    rsx_test_put_le32(p + 8, d2); rsx_test_put_le32(p + 12, d3);
+}
+
 /* ---- fragment program --------------------------------------------------------
  * Four words per instruction in guest memory, each stored big-endian with its
  * 16-bit halves swapped (rsx_fp_read_word undoes both).
