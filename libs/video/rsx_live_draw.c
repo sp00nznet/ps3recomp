@@ -4767,11 +4767,6 @@ static ID3D12PipelineState* get_pso(
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
-    /* BRB/CLB outcomes are baked into the program (rsx_vp_set_branch_bits). */
-    const int vp_branch_bits_used = rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16);
-    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
-    if (vp_branch_bits_used)
-        key = fnv1a(&vp_branch_bits, sizeof(vp_branch_bits), key);
     /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
      * by the texture size in the shader -- D3D12 has no unnormalised addressing
      * mode. The divisor is baked into the HLSL, so the sizes are part of the
@@ -4886,7 +4881,6 @@ static ID3D12PipelineState* get_pso(
     const LONGLONG decompile_begin = ld_profile_qpc();
 #endif
     rsx_vp_set_branch_base(rsx_dsp_vp_start(&g.rsx));
-    rsx_vp_set_branch_bits(vp_branch_bits);
     const int vi = masked_layout
         ? rsx_vp_decompile_compact_ex(
             vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
@@ -7756,6 +7750,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
+    rsx_vp_set_epilogue_branch_bits(xf, rsx_dsp_reg(&g.rsx, 0x1FF8u));
     u8* cbdst = g.cb_mapped + g.cb_used;
     memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
     memcpy(cbdst + 512 * 16, xf, sizeof(xf));

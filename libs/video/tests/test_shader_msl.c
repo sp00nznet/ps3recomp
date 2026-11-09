@@ -80,21 +80,7 @@ static void check_count(const char* what, int got, int want)
 
 static char g_hlsl[262144];
 static char g_msl[262144];
-static u8 g_long_vp[519 * 16];   /* the 519-slot program; also has no BRB/CLB */
-
-/* Flow instruction `sca_op` (0x09 BRI, 0x11 BRB, 0x12 CLB) to VP slot
- * `target`: cond [10:12] = 7 (TR), the target split over D0[23], D2[0:5] and
- * D3[29:31]; a boolean branch tests branch bit `bit` (D3[23:27]) for
- * `if_set` (D3[28]). No ALU writes. */
-static void vp_branch(u8* p, u32 sca_op, u32 target, u32 bit, u32 if_set)
-{
-    const u32 d0 = (0x3Fu << 15) | (7u << 10) | (((target >> 9) & 1u) << 23);
-    const u32 d1 = sca_op << 27;
-    const u32 d2 = (target >> 3) & 0x3Fu;
-    const u32 d3 = (0x3Fu << 7) | (bit << 23) | (if_set << 28) | ((target & 7u) << 29);
-    rsx_test_put_le32(p + 0, d0); rsx_test_put_le32(p + 4, d1);
-    rsx_test_put_le32(p + 8, d2); rsx_test_put_le32(p + 12, d3);
-}
+static u8 g_long_vp[519 * 16];   /* the 519-slot program */
 static char g_log[4096];
 
 static int translate(const char* what, int stage)
@@ -288,10 +274,10 @@ int main(int argc, char** argv)
         u8* vp = g_long_vp;
         for (u32 i = 0; i < 513; i++)
             rsx_test_vp_mov_out(vp + i * 16, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0 */
-        vp_branch(vp + 513 * 16, 0x09, 515, 0, 0);
+        rsx_test_vp_branch(vp + 513 * 16, 0x09, 515, 0, 0);
         rsx_test_vp_mov_out(vp + 514 * 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 0);      /* skipped */
         rsx_test_vp_mov_out(vp + 515 * 16, 1, RSX_TEST_VP_SWZ_IDENT, 1, 0);      /* MOV o1, v1 */
-        vp_branch(vp + 516 * 16, 0x09, 518, 0, 0);
+        rsx_test_vp_branch(vp + 516 * 16, 0x09, 518, 0, 0);
         rsx_test_vp_mov_out(vp + 517 * 16, 3, RSX_TEST_VP_SWZ_IDENT, 2, 0);      /* skipped */
         rsx_test_vp_mov_out(vp + 518 * 16, 2, RSX_TEST_VP_SWZ_IDENT, 2, 1);      /* MOV o2, v2, END */
         rsx_vp_set_branch_base(0);
@@ -311,51 +297,38 @@ int main(int argc, char** argv)
      * BRB and CLB branch on one bit of SET_TRANSFORM_BRANCH_BITS, not on a
      * condition code. An uber effects program skips its optional paths with
      * "BRB !bN"; run straight through, every path was taken and the glows
-     * came out as red stretched polygons.
+     * came out as red stretched polygons. The bits are read at run time from
+     * vp_posoffset.w: baked into the text, each combination the title set was
+     * a program of its own to translate and compile (Resistance 3: 70 of a
+     * 543-slot one, ~0.4 s each, on the RSX thread).
      *   0 MOV o0, v0       1 BRB !b3 -> 3     2 MOV o1, v1
      *   3 CLB b12 -> 6     4 MOV o2, v2       5 BRI -> 8
      *   6 MOV o3, v3       7 RET              8 MOV o4, v4 (END) */
     {
         static u8 vp[9 * 16];
         rsx_test_vp_mov_out(vp + 0 * 16, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
-        vp_branch(vp + 1 * 16, 0x11, 3, 3, 0);
+        rsx_test_vp_branch(vp + 1 * 16, 0x11, 3, 3, 0);
         rsx_test_vp_mov_out(vp + 2 * 16, 1, RSX_TEST_VP_SWZ_IDENT, 1, 0);
-        vp_branch(vp + 3 * 16, 0x12, 6, 12, 1);
+        rsx_test_vp_branch(vp + 3 * 16, 0x12, 6, 12, 1);
         rsx_test_vp_mov_out(vp + 4 * 16, 2, RSX_TEST_VP_SWZ_IDENT, 2, 0);
-        vp_branch(vp + 5 * 16, 0x09, 8, 0, 0);
+        rsx_test_vp_branch(vp + 5 * 16, 0x09, 8, 0, 0);
         rsx_test_vp_mov_out(vp + 6 * 16, 3, RSX_TEST_VP_SWZ_IDENT, 3, 0);
-        vp_branch(vp + 7 * 16, 0x0C, 0, 0, 0);
+        rsx_test_vp_branch(vp + 7 * 16, 0x0C, 0, 0, 0);
         rsx_test_vp_mov_out(vp + 8 * 16, 4, RSX_TEST_VP_SWZ_IDENT, 4, 1);
-        if (rsx_vp_uses_branch_bits(vp, sizeof vp) &&
-            !rsx_vp_uses_branch_bits(g_long_vp, sizeof g_long_vp)) {
-            printf("[PASS] bool VP -- keyed on the branch bits, the BRI-only program not\n");
-            g_pass++;
+        rsx_vp_set_branch_base(0);
+        if (rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl) > 0) {
+            check("bool VP HLSL", g_hlsl, "BRB @1 -> 3 cond=7 test=0 swz=xxxx */\n"
+                  "        _pc = (((asuint(vp_posoffset.w) >> 3u) & 1u) == 0u) ? 3 : 2;");
+            check("bool VP HLSL", g_hlsl, "CLB @3 -> 6 cond=7 test=0 swz=xxxx */\n"
+                  "        if (((asuint(vp_posoffset.w) >> 12u) & 1u) == 1u) "
+                  "{ _cs[_csp] = 4; _csp = min(_csp + 1, 7); _pc = 6; } else _pc = 4;");
+            check_absent("bool VP HLSL", g_hlsl, "not modelled");
+            if (translate("bool VP", RSX_SHADER_STAGE_VERTEX) == 0)
+                check("bool VP MSL", g_msl, "vertex ");
         } else {
-            printf("[FAIL] bool VP -- rsx_vp_uses_branch_bits\n");
+            printf("[FAIL] bool VP -- decompile failed\n");
             g_fail++;
         }
-        static const struct { u32 bits; const char* brb; const char* clb; } cases[] = {
-            { 0x0000u, "BRB @1 -> 3 cond=7 test=0 swz=xxxx */\n        _pc = 3;",
-                       "CLB @3 -> 6 cond=7 test=0 swz=xxxx */\n        _pc = 4;" },
-            { 0x1008u, "BRB @1 -> 3 cond=7 test=0 swz=xxxx */\n        _pc = 2;",
-                       "CLB @3 -> 6 cond=7 test=0 swz=xxxx */\n"
-                       "        _cs[_csp] = 4; _csp = min(_csp + 1, 7); _pc = 6;" },
-        };
-        for (u32 i = 0; i < 2; i++) {
-            rsx_vp_set_branch_base(0);
-            rsx_vp_set_branch_bits(cases[i].bits);
-            if (rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl) > 0) {
-                check("bool VP HLSL", g_hlsl, cases[i].brb);
-                check("bool VP HLSL", g_hlsl, cases[i].clb);
-                check_absent("bool VP HLSL", g_hlsl, "not modelled");
-                if (translate("bool VP", RSX_SHADER_STAGE_VERTEX) == 0)
-                    check("bool VP MSL", g_msl, "vertex ");
-            } else {
-                printf("[FAIL] bool VP -- decompile failed\n");
-                g_fail++;
-            }
-        }
-        rsx_vp_set_branch_bits(0);
     }
 
     /* ---- user clip planes: MOV o0, v0 ; MOV o5, v3 ------------------------

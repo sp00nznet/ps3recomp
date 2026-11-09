@@ -1549,6 +1549,7 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
     else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+    rsx_vp_set_epilogue_branch_bits(vpx, st->transform_branch_bits);
     /* PSConstants: inline constants as host-order bit patterns, then fp_alpha. */
     u8* fpc = (u8*)s_g.ubo.ptr + s_g.ps_off;
     memset(fpc, 0, fp_len);

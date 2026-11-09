@@ -2169,10 +2169,6 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 cube_mask = eng_cube_mask();
     const u32 vol_mask = eng_volume_mask();
     const u32 vtex_mask = eng_vtex_mask();
-    /* BRB/CLB outcomes are baked into the program: the branch bits are
-     * identity only for a program that tests them. */
-    const int vp_branch_bits_used = !fixed && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
-    const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
     const u32 ucp = fixed ? 0 : eng_user_clip_key();
     const u32 dbz = fixed ? 0 : s_dbz.unit;   /* eng_depth_bounds_prepare: unit + 1 */
 
@@ -2238,7 +2234,6 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
-        if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
         if (!key) return 0;
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
@@ -2287,7 +2282,6 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
     } else {
-        rsx_vp_set_branch_bits(vp_branch_bits);
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
@@ -3396,6 +3390,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
+    rsx_vp_set_epilogue_branch_bits(xf, rsx_dsp_reg(&g.rsx, 0x1FF8u));
     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
     memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
 

@@ -411,6 +411,14 @@ jobs:
           ./build/test_metal_depth_clamp
           PS3RECOMP_ENG_DEPTH_CLAMP=0 ./build/test_metal_depth_clamp
 
+      # SET_TRANSFORM_BRANCH_BITS reaches the GPU at run time: one vertex
+      # program whose BRB picks the colour draws green or red as the bits say,
+      # and no other value of the bits compiles a shader.
+      - name: Run the Metal VP branch bits test
+        run: |
+          test -x build/test_metal_vp_branch_bits
+          ./build/test_metal_vp_branch_bits
+
       # The depth-bounds test, which Metal lacks, emulated in the fragment
       # program: a bounded draw lands only where the STORED depth is inside
       # the bounds; PS3RECOMP_ENG_DEPTH_BOUNDS=0 ignores the test.
@@ -492,6 +500,10 @@ jobs:
           # restart cuts bounding topology expansion. Runs on Linux too.
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_rsx_draw_engine
+          # Pipeline identity across many programs; a BRB program is one
+          # pipeline whatever SET_TRANSFORM_BRANCH_BITS holds.
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_engine_program_identity libs/video/tests/test_engine_program_identity.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_engine_program_identity
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without.
           clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
