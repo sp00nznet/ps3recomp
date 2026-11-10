@@ -68,6 +68,8 @@ int  rsx_process_method(rsx_state* state, u32 method, u32 data)
     return 0;
 }
 int  rsx_draw_engine_enabled(void) { return g_engine_on; }
+int rsx_draw_engine_plain_run(u32 m, const u8* p, u32 n, int inc)
+{ (void)m; (void)p; (void)n; (void)inc; return 0; }
 void rsx_draw_engine_method(u32 method, u32 arg)
 {
     if ((method & 0x1FFCu) == 0x1D8Cu && g_n_zs_engine < 4) g_zs_engine[g_n_zs_engine++] = arg;

@@ -2225,6 +2225,20 @@ static int gcm_word_diag(void)
     return on;
 }
 
+/* Bulk ingestion may bypass only pure state setters. The ordinary word path
+ * remains authoritative when tracing, a mirror or legacy state is consumed.
+ * Keep this diagnostic list in sync with gcm_word_diag; the draw engine alone
+ * is not an observer. Settings have the same first-use lifetime as that path. */
+static int gcm_plain_runs_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = !(getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") ||
+                    getenv("GCM_WORD_STATS") || getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") ||
+                    getenv("RSX_LIVE_FEED_DBG") || rsx_live_draw_enabled());
+    return enabled;
+}
+
 /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
  * plus the methods whose answer the walker writes itself. */
 static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
@@ -2785,6 +2799,21 @@ static void gcm_rsx_process_fifo_unlocked(void)
             }
             static int s1_2d = -1;
             if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+            /* Only this fully published packet, within one IO page. A park
+             * or branch remains a header for the outer walker; no lookahead
+             * crosses it. Rejected ranges (including uploads/effects) retain
+             * scalar delivery and all its diagnostics and callbacks. */
+            if (!legacy_state_live && count > 1 && gcm_plain_runs_enabled() &&
+                (subch == 0 || (subch == 1 && !s1_2d)) &&
+                put > s_fifo_getoff && put - s_fifo_getoff >= 4u + count * 4u &&
+                ((s_fifo_getoff + 4u) >> 20) == ((s_fifo_getoff + count * 4u) >> 20)) {
+                const u32 dea = gcm_io2ea(s_fifo_getoff + 4u);
+                if (dea && (u64)dea + count * 4u <= (ppu_vm_size ? ppu_vm_size : VM_TOTAL_SIZE) &&
+                    rsx_draw_engine_plain_run(method, vm_base + dea, count, type == 0)) {
+                    s_fifo_getoff += 4u + count * 4u;
+                    continue;
+                }
+            }
             /* A run of 3D methods inside one 1 MB IO page, with no per-word
              * diagnostic on: its words are contiguous in guest memory, so the
              * offset is translated once and the per-word checks below, none of

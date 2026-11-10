@@ -328,6 +328,10 @@ void rsx_draw_engine_shutdown(void);
  * SPU-built command lists bind NV4097 to another subchannel would otherwise
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
+/* Complete plain-state packet; see rsx_dispatch_plain_run. Returns 0 without
+ * changes when not ready or unsupported. Callers with per-method observers
+ * must keep their scalar entry point instead. Standard 3D methods only. */
+int rsx_draw_engine_plain_run(u32 method, const u8* be_words, u32 count, int increment);
 
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */

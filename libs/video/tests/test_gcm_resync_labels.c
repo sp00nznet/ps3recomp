@@ -57,6 +57,8 @@ int  rsx_draw_engine_enabled(void) { return 0; }
 int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 { (void)state; (void)method; (void)src; (void)count; return 0; }
 rsx_backend* rsx_get_backend(void) { return NULL; }
+int rsx_draw_engine_plain_run(u32 m, const u8* p, u32 n, int inc)
+{ (void)m; (void)p; (void)n; (void)inc; return 0; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_set_display_buffer(u32 id, u32 location, u32 offset, u32 pitch, u32 width, u32 height)

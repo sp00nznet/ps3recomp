@@ -160,6 +160,17 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
 
+/* Try one complete packet of plain register state, with big-endian payload.
+ * Returns 1 iff every word was consumed; a rejection changes nothing. Only
+ * explicit state ranges without callbacks, uploads or folded current-vertex
+ * attributes are eligible. count is 1..2047; method must be aligned and the
+ * incrementing packet must stay within a single supported range. The caller
+ * owns source mapping/publication and must retain scalar observers/diagnostics.
+ * Like rsx_dispatch_method, accepted writes update regs[] and seen[]. */
+#define RSX_DSP_PLAIN_RUN 1
+int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, const u8* be_words,
+                           u32 count, int increment);
+
 /* ---- decoded state getters -------------------------------------------- */
 
 static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)

@@ -311,6 +311,37 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
     }
 }
 
+/* Conservative packet-level admission. In particular, klass==STATE alone
+ * is insufficient: current vertex attributes can fold into other registers
+ * and emit immediate vertices. Unknown methods retain the scalar path. */
+int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, const u8* be_words,
+                           u32 count, int increment)
+{
+    if (!be_words || !count || count > 2047 || (method & 3u)) return 0;
+    u32 last;
+    if (method >= 0x0200 && method <= 0x022C) last = 0x022C;       /* surface */
+    else if (method >= 0x0280 && method <= 0x028C) last = 0x028C;
+    else if (method >= 0x0A00 && method <= 0x0A04) last = 0x0A04;  /* viewport */
+    else if (method >= 0x0A20 && method <= 0x0A3C) last = 0x0A3C;
+    else if (method >= 0x1680 && method <= 0x16BC) last = 0x16BC;  /* arrays */
+    else if (method >= 0x1738 && method <= 0x177C) last = 0x177C;
+    else if (method >= 0x181C && method <= 0x1820) last = 0x1820;  /* indices */
+    else if (method >= 0x1840 && method <= 0x187C) last = 0x187C;  /* texture */
+    else if (method >= 0x1A00 && method <= 0x1BFC) last = 0x1BFC;
+    else if (method >= 0x1D8C && method <= 0x1D90) last = 0x1D90;  /* clear values */
+    else return 0;
+    if (increment && count > (last - method) / 4u + 1u) return 0;
+
+    u32 idx = method >> 2;
+    for (u32 i = 0; i < count; i++, idx += increment != 0) {
+        const u8* p = be_words + i * 4u;
+        const u32 arg = (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3];
+        rsx->seen[idx]++;
+        rsx->regs[idx] = arg;
+    }
+    return 1;
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;

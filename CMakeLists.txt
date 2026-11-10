@@ -489,6 +489,17 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
 
     endif()
+    # Plain packet ingestion is a CPU register-machine operation, no backend.
+    add_executable(test_rsx_plain_run
+        libs/video/tests/test_rsx_plain_run.c libs/video/rsx_dispatch.c)
+    target_include_directories(test_rsx_plain_run PRIVATE include libs/video)
+    if(MSVC)
+        target_compile_options(test_rsx_plain_run PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_rsx_plain_run PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME rsx_plain_run COMMAND test_rsx_plain_run)
+
     add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
     target_include_directories(test_rsx_present_policy PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")

@@ -3806,6 +3806,12 @@ void rsx_draw_engine_shutdown(void)
     g.be = be;
 }
 
+int rsx_draw_engine_plain_run(u32 method, const u8* be_words, u32 count, int increment)
+{
+    if (!g.ready) return 0;
+    return rsx_dispatch_plain_run(&g.rsx, method, be_words, count, increment);
+}
+
 void rsx_draw_engine_method(u32 method, u32 arg)
 {
     if (!g.ready) return;

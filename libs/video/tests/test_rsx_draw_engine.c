@@ -2711,6 +2711,27 @@ static void test_clear_rect(void)
     engine_down();
 }
 
+static void test_plain_state_packet(void)
+{
+    const u8 clear_values[] = {0x12,0x34,0x56,0x78, 0xFF,0x11,0x22,0x33};
+    CHECK(!rsx_draw_engine_plain_run(M_ZSTENCIL_CLEAR, clear_values, 2, 1),
+          "plain packet rejected before engine init");
+    engine_up();
+    CHECK(rsx_draw_engine_plain_run(M_ZSTENCIL_CLEAR, clear_values, 2, 1),
+          "complete clear-value packet admitted");
+    CHECK(!rsx_draw_engine_plain_run(M_CLEAR_BUFFERS, clear_values, 2, 0),
+          "clear action rejected without executing");
+    CHECK(stub.n_clear_color == 0 && stub.n_clear_ds == 0,
+          "plain ingestion has no backend effects");
+    m(M_CLEAR_BUFFERS, 0xF3u);
+    CHECK(stub.n_clear_color == 1 && stub.n_clear_ds == 1 &&
+          stub.last_clear_depth > 0.07f && stub.last_clear_depth < 0.08f,
+          "later scalar clear consumes batched depth state");
+    engine_down();
+    CHECK(!rsx_draw_engine_plain_run(M_ZSTENCIL_CLEAR, clear_values, 2, 1),
+          "shutdown rejects old packet without resource use");
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -2723,6 +2744,7 @@ int main(void)
         p[0] = 0x3F; p[1] = 0x80; p[2] = 0; p[3] = 0;    /* 1.0f big-endian */
     }
 
+    test_plain_state_packet();
     test_surface_set();
     test_surface_aliasing();
     test_mrt_set();
