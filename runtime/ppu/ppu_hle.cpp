@@ -87,7 +87,7 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
 }
 
 /* Leaf imports that can finish without the dispatcher: no guest code, no
- * change to r2, no blocking. The module that implements one registers a fast
+ * change to r2, no blocking (ps3_hle_call still stores the TOC slot). The module that implements one registers a fast
  * form beside the full handler. ps3_hle_call tries it first, and the fast form
  * returns 0 to take the full call instead (a contended lock that has to wait,
  * say). God of War HD takes an lwmutex about 640,000 times in one frame (its
@@ -281,8 +281,12 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
-    if (const hle_fast_fn f = hle_fast(nid))
-        if (f(ctx)) return;
+    if (const hle_fast_fn f = hle_fast(nid)) {
+        /* Import callers reload r2 from 0x28(r1), even when a fast handler
+         * finishes before the full dispatcher's TOC guard runs. */
+        const uint64_t toc = ctx->gpr[2], sp = ctx->gpr[1];
+        if (f(ctx)) { ctx->gpr[2] = toc; vm_write64(sp + 0x28, toc); return; }
+    }
 
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
