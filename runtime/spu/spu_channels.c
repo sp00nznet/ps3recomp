@@ -340,6 +340,9 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
         g_spu_trampoline_fn = 0;
+        /* The restart abandoned every drain frame, including its return PC.
+         * A stale stop point can terminate a later interpreter fallback. */
+        ctx->drain_ret_pc = 0;
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
         break;

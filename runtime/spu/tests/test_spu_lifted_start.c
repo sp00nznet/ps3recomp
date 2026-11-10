@@ -715,14 +715,17 @@ extern void spu_register_stack_reset_entry(uint32_t, int);
 extern void spu_halt(spu_context*);
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 static int stack_reset_depth, stale_caller_ran;
+static uint32_t stack_reset_ret;
 static void reset_target(spu_context* ctx)
 {
     stack_reset_depth = (int)ctx->host_depth;
+    stack_reset_ret = ctx->drain_ret_pc;
     spu_halt(ctx);
 }
 static void nested_reset(spu_context* ctx)
 {
     ctx->host_depth += 4;
+    ctx->drain_ret_pc = 0x1234;
     ctx->pc = 0x838;
     spu_indirect_branch(ctx);
     stale_caller_ran = 1;
@@ -730,6 +733,7 @@ static void nested_reset(spu_context* ctx)
 static void direct_reset(spu_context* ctx)
 {
     ctx->host_depth = 3;
+    ctx->drain_ret_pc = 0x2348;
     ctx->pc = 0x838;
     g_spu_trampoline_fn = reset_target;
     SPU_DRAIN(ctx);
@@ -748,16 +752,19 @@ static void test_guest_stack_reset(void)
     spu_run_with_halt(nested_reset, ctx);
     check(stack_reset_depth == 0, "one-way kernel entry discards nested host call frames");
     check(!stale_caller_ran, "exited workload cannot resume its obsolete caller");
+    check(stack_reset_ret == 0, "stack reset discards abandoned drain return point");
     stack_reset_depth = -1; stale_caller_ran = 0;
     spu_run_with_halt(direct_reset, ctx);
     check(stack_reset_depth == 0 && !stale_caller_ran,
           "direct trampoline transfers honor registered stack resets");
+    check(stack_reset_ret == 0, "direct reset discards abandoned drain return point");
     free(ctx);
 }
 
 static void nested_task_resume(spu_context* ctx)
 {
     ctx->host_depth = 5;
+    ctx->drain_ret_pc = 0x345C;
     ctx->pc = 0x7BD4;
     spu_indirect_branch(ctx);
     stale_caller_ran = 1;
@@ -776,6 +783,7 @@ static void test_taskset_resume_stack(void)
     spu_run_with_halt(nested_task_resume, ctx);
     check(stack_reset_depth == 0, "restored task runs without the scheduler's host frames");
     check(!stale_caller_ran, "task resume discards the old scheduler continuation");
+    check(stack_reset_ret == 0, "task resume discards abandoned drain return point");
     free(ctx);
 }
 
