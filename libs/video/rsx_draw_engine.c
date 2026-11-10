@@ -1808,7 +1808,7 @@ u64 rsx_draw_engine_test_texture_decodes(void) { return s_texture_decodes; }
 /* A texture descriptor depends only on its eight-word register block and
  * SIZE1 word. Keep this pure decode across draws; guest content, aliases,
  * uploads and bindings are still checked at every normal consumption point.
- * All writes to these registers enter through rsx_draw_engine_method. */
+ * Scalar and admitted plain-packet writes invalidate before changing state. */
 static void eng_texture_decode_invalidate(u32 method, u32 arg)
 {
     u32 unit;
@@ -3808,7 +3808,18 @@ void rsx_draw_engine_shutdown(void)
 
 int rsx_draw_engine_plain_run(u32 method, const u8* be_words, u32 count, int increment)
 {
-    if (!g.ready) return 0;
+    if (!g.ready || !be_words || !rsx_dispatch_plain_run_supported(method, count, increment)) return 0;
+    /* Admission precedes source access and cache mutation: a mixed packet
+     * still belongs entirely to the scalar path. Only texture dependencies
+     * need this prewrite pass; unchanged values retain decoded-state reuse. */
+    if ((method >= 0x1A00u && method < 0x1C00u) ||
+        (method >= 0x1840u && method < 0x1880u)) {
+        for (u32 i = 0; i < count; i++) {
+            const u8* p = be_words + i * 4u;
+            const u32 arg = (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3];
+            eng_texture_decode_invalidate(method + (increment ? i * 4u : 0u), arg);
+        }
+    }
     return rsx_dispatch_plain_run(&g.rsx, method, be_words, count, increment);
 }
 

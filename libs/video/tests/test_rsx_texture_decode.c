@@ -89,6 +89,106 @@ static void texture_decode_equivalence(void)
     engine_down();
 }
 
+/* Combined FIFO/decode-cache regression: exercise the actual bulk wrapper,
+ * with the scalar register decoder as the oracle. No host graphics API. */
+static void plain_be32(u8* p, u32 v)
+{
+    p[0] = (u8)(v >> 24); p[1] = (u8)(v >> 16);
+    p[2] = (u8)(v >> 8); p[3] = (u8)v;
+}
+
+static int plain_texture_matches(u32 unit, const rsx_dispatch* oracle)
+{
+    rsx_dsp_texture actual, expected;
+    rsx_draw_engine_test_get_texture(unit, &actual);
+    rsx_dsp_get_texture(oracle, unit, &expected);
+    return !memcmp(&actual, &expected, sizeof actual);
+}
+
+static void texture_decode_plain_packets(void)
+{
+    rsx_dispatch oracle;
+    rsx_dispatch_init(&oracle, NULL);
+    engine_up();
+    rsx_draw_engine_test_texture_decode_bypass(0);
+    u8 payload[16 * 4];
+    for (u32 unit = 0; unit < 16; unit++)
+        CHECK(plain_texture_matches(unit, &oracle), "prime plain-packet unit %u", unit);
+
+    /* NI writes first the old value, then a changed value to each of the
+     * nine dependency registers. Every unit must decode once, then reuse. */
+    for (u32 unit = 0; unit < 16; unit++) for (u32 word = 0; word < 9; word++) {
+        const u32 method = word < 8 ? 0x1A00u + unit * 32u + word * 4u : 0x1840u + unit * 4u;
+        const u32 old = rsx_dsp_reg(&oracle, method), changed = old ^ (1u << (word + 1u));
+        plain_be32(payload, old); plain_be32(payload + 4, changed);
+        const u64 before = rsx_draw_engine_test_texture_decodes();
+        CHECK(rsx_draw_engine_plain_run(method, payload, 2, 0), "admit NI texture dependency");
+        rsx_dispatch_method(&oracle, method, old); rsx_dispatch_method(&oracle, method, changed);
+        if (!plain_texture_matches(unit, &oracle) || rsx_draw_engine_test_texture_decodes() != before + 1) {
+            CHECK(0, "NI dependency unit %u word %u invalidates exactly once", unit, word);
+            engine_down(); return;
+        }
+        plain_be32(payload, changed);
+        CHECK(rsx_draw_engine_plain_run(method, payload, 2, 0) &&
+              plain_texture_matches(unit, &oracle) && rsx_draw_engine_test_texture_decodes() == before + 1,
+              "same-value NI dependency preserves reuse");
+    }
+    CHECK(1, "all nine dependencies and all units invalidate under NI packets");
+
+    for (u32 unit = 0; unit < 16; unit++) {
+        const u32 method = 0x1A00u + unit * 32u;
+        for (u32 word = 0; word < 8; word++) {
+            const u32 value = rsx_dsp_reg(&oracle, method + word * 4u) ^ (0x101u + word);
+            plain_be32(payload + word * 4u, value);
+            rsx_dispatch_method(&oracle, method + word * 4u, value);
+        }
+        const u64 before = rsx_draw_engine_test_texture_decodes();
+        CHECK(rsx_draw_engine_plain_run(method, payload, 8, 1) &&
+              plain_texture_matches(unit, &oracle) && rsx_draw_engine_test_texture_decodes() == before + 1,
+              "incrementing texture block invalidates its unit once");
+        CHECK(rsx_draw_engine_plain_run(method, payload, 8, 1) &&
+              plain_texture_matches(unit, &oracle) && rsx_draw_engine_test_texture_decodes() == before + 1,
+              "same-value incrementing texture block preserves reuse");
+    }
+    for (u32 unit = 0; unit < 16; unit++) {
+        const u32 method = 0x1840u + unit * 4u, value = rsx_dsp_reg(&oracle, method) ^ 1u;
+        plain_be32(payload + unit * 4u, value); rsx_dispatch_method(&oracle, method, value);
+    }
+    const u64 size_before = rsx_draw_engine_test_texture_decodes();
+    CHECK(rsx_draw_engine_plain_run(0x1840u, payload, 16, 1), "admit complete SIZE1 packet");
+    for (u32 unit = 0; unit < 16; unit++) CHECK(plain_texture_matches(unit, &oracle), "bulk SIZE1 unit %u", unit);
+    CHECK(rsx_draw_engine_test_texture_decodes() == size_before + 16, "SIZE1 packet invalidates all changed units");
+    CHECK(rsx_draw_engine_plain_run(0x1840u, payload, 16, 1), "repeat complete SIZE1 packet");
+    for (u32 unit = 0; unit < 16; unit++) CHECK(plain_texture_matches(unit, &oracle), "same SIZE1 unit %u", unit);
+    CHECK(rsx_draw_engine_test_texture_decodes() == size_before + 16, "same SIZE1 packet retains all decoded units");
+
+    /* Unsupported packets must not read even the first source byte or dirty
+     * any valid unit. The boundary case starts on an eligible dependency. */
+    const u8* unreadable = (const u8*)(uintptr_t)1;
+    const u64 rejected_before = rsx_draw_engine_test_texture_decodes();
+    CHECK(!rsx_draw_engine_plain_run(0x1BFCu, unreadable, 2, 1) &&
+          !rsx_draw_engine_plain_run(0x183Cu, unreadable, 2, 1) &&
+          !rsx_draw_engine_plain_run(0x1A01u, unreadable, 2, 1) &&
+          !rsx_draw_engine_plain_run(0x1A00u, unreadable, 2048, 0) &&
+          !rsx_draw_engine_plain_run(0x1A00u, unreadable, 0, 0) &&
+          !rsx_draw_engine_plain_run(0x1A00u, NULL, 2, 1),
+          "invalid packets reject before source access");
+    for (u32 unit = 0; unit < 16; unit++) CHECK(plain_texture_matches(unit, &oracle), "rejected packets preserve unit %u", unit);
+    CHECK(rsx_draw_engine_test_texture_decodes() == rejected_before, "rejected packets do not mutate cache validity");
+
+    plain_be32(payload, rsx_dsp_reg(&oracle, 0x1BFCu) ^ 1u); plain_be32(payload + 4, 0x3F800000u);
+    CHECK(!rsx_draw_engine_plain_run(0x1BFCu, payload, 2, 1), "mixed boundary packet takes scalar fallback");
+    for (u32 i = 0; i < 2; i++) {
+        const u32 method = 0x1BFCu + i * 4u;
+        const u32 value = i ? 0x3F800000u : rsx_dsp_reg(&oracle, method) ^ 1u;
+        m(method, value); rsx_dispatch_method(&oracle, method, value);
+    }
+    CHECK(plain_texture_matches(15, &oracle) && rsx_draw_engine_test_texture_decodes() == rejected_before + 1,
+          "scalar fallback retains changed texture invalidation");
+    engine_down();
+    CHECK(!rsx_draw_engine_plain_run(0x1A00u, unreadable, 2, 0), "unready wrapper rejects before source access");
+}
+
 static u32 captured_ps[4];
 static u8 captured_texture_byte;
 static void capture_upload(void* user, u32 texture, u32 face, u32 mip, u32 width, u32 height,
@@ -219,7 +319,7 @@ int main(int argc, char** argv)
             for (int mode = 0; mode < 3; mode++)
                 benchmark(draws, changing, (mode + repeat) % 3);
         }
-    } else { texture_decode_equivalence(); texture_decode_dynamic_inputs(); }
+    } else { texture_decode_equivalence(); texture_decode_plain_packets(); texture_decode_dynamic_inputs(); }
     free(vm_base);
     return g_failures ? 1 : 0;
 }

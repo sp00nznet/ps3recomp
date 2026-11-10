@@ -168,6 +168,9 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
  * owns source mapping/publication and must retain scalar observers/diagnostics.
  * Like rsx_dispatch_method, accepted writes update regs[] and seen[]. */
 #define RSX_DSP_PLAIN_RUN 1
+/* Pure admission preflight, with no register/source access or mutation. A
+ * consumer with derived state can validate before inspecting dependencies. */
+int rsx_dispatch_plain_run_supported(u32 method, u32 count, int increment);
 int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, const u8* be_words,
                            u32 count, int increment);
 

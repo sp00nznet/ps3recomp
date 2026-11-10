@@ -314,10 +314,9 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
 /* Conservative packet-level admission. In particular, klass==STATE alone
  * is insufficient: current vertex attributes can fold into other registers
  * and emit immediate vertices. Unknown methods retain the scalar path. */
-int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, const u8* be_words,
-                           u32 count, int increment)
+int rsx_dispatch_plain_run_supported(u32 method, u32 count, int increment)
 {
-    if (!be_words || !count || count > 2047 || (method & 3u)) return 0;
+    if (!count || count > 2047 || (method & 3u)) return 0;
     u32 last;
     if (method >= 0x0200 && method <= 0x0220) last = 0x0220;       /* surface */
     else if (method == 0x022C) last = 0x022C; /* no reserved 0x224/0x228 gap */
@@ -331,8 +330,13 @@ int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, const u8* be_words,
     else if (method >= 0x1A00 && method <= 0x1BFC) last = 0x1BFC;
     else if (method >= 0x1D8C && method <= 0x1D90) last = 0x1D90;  /* clear values */
     else return 0;
-    if (increment && count > (last - method) / 4u + 1u) return 0;
+    return !increment || count <= (last - method) / 4u + 1u;
+}
 
+int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, const u8* be_words,
+                           u32 count, int increment)
+{
+    if (!be_words || !rsx_dispatch_plain_run_supported(method, count, increment)) return 0;
     u32 idx = method >> 2;
     for (u32 i = 0; i < count; i++, idx += increment != 0) {
         const u8* p = be_words + i * 4u;
