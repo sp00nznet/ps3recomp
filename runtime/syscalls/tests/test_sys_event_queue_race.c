@@ -8,9 +8,47 @@
  * the key and push. Pass: no crash and no lost bookkeeping. On Windows, before the
  * fix, a producer could EnterCriticalSection on a zeroed CRITICAL_SECTION and fault
  * writing near 0x24. */
+#include "../sys_event.h"
+#ifdef _WIN32
+static void checked_mutex_init(CRITICAL_SECTION* lock);
+#define InitializeCriticalSection checked_mutex_init
+#else
+static int checked_mutex_init(pthread_mutex_t* lock, const pthread_mutexattr_t* attr);
+#define pthread_mutex_init checked_mutex_init
+#endif
 #include "../sys_event.c"
+#ifdef _WIN32
+#undef InitializeCriticalSection
+#else
+#undef pthread_mutex_init
+#endif
 #include <stdio.h>
 #include <stdlib.h>
+
+/* Observe the real initialization boundary without changing runtime code.
+ * This fails deterministically if either creation path publishes early,
+ * even on hosts whose zeroed mutex happens to tolerate the race. */
+static void require_unpublished(const void* lock)
+{
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; ++i)
+        if (lock == &g_sys_event_queues[i].lock && g_sys_event_queues[i].active) {
+            fprintf(stderr, "FAIL: queue published before mutex initialization\n");
+            abort();
+        }
+}
+#ifdef _WIN32
+static void checked_mutex_init(CRITICAL_SECTION* lock)
+{
+    require_unpublished(lock);
+    InitializeCriticalSection(lock);
+}
+#else
+static int checked_mutex_init(pthread_mutex_t* lock, const pthread_mutexattr_t* attr)
+{
+    require_unpublished(lock);
+    return pthread_mutex_init(lock, attr);
+}
+#endif
 
 /* Symbols sys_event.c references that this test never reaches. */
 uint8_t* vm_base;
@@ -21,6 +59,7 @@ int spu_dispatch_frame_by_queue(uint32_t a, uint32_t b) { (void)a; (void)b; retu
 size_t spu_elf_image_size(const uint8_t* i, size_t m) { (void)i; (void)m; return 0; }
 int spu_workload_dispatch_async(const uint8_t* i, uint32_t s, uint32_t e) { (void)i; (void)s; (void)e; return 0; }
 void ydkj_release_pending_threads(void) {}
+void ppu_thread_note_block(uint64_t tid) { (void)tid; }
 #ifdef _WIN32
 /* sys_timer.c provides these on Windows (inline elsewhere); the timed waits are never reached. */
 int64_t lv2_usec_deadline(uint64_t usec) { (void)usec; return 0; }
