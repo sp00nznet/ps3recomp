@@ -142,12 +142,12 @@ int main(int argc,char** argv) {
                 scalar_calls=bulk_calls=bulk_words=0;
                 clock_t t0=clock();
                 for(unsigned j=0;j<3000;j++) {
-                    if(changing) gw32(IO_ADDR+4,j);
+                    if(changing) { gw32(IO_ADDR+4,j); gw32(IO_ADDR+end-168,j); }
                     drain(ctrl,0,end);
                 }
-                printf("fifo stream=%s sample=%u cpu_seconds=%.6f words=18432000 packets=1536000 bulk_calls=%u bulk_words=%u scalar_calls=%u seen=%u value=%u\n",
+                printf("fifo stream=%s sample=%u cpu_seconds=%.6f words=18432000 packets=1536000 bulk_calls=%u bulk_words=%u scalar_calls=%u seen=%u value=%u viewport=%u\n",
                     changing?"changing":"repeated",sample,(double)(clock()-t0)/CLOCKS_PER_SEC,
-                    bulk_calls,bulk_words,scalar_calls,captured.seen[0x1a00/4],captured.regs[0x1a00/4]);
+                    bulk_calls,bulk_words,scalar_calls,captured.seen[0x1a00/4],captured.regs[0x1a00/4],captured.regs[0xa20/4]);
             }
         }
         free(vm_base); return 0;
@@ -163,7 +163,14 @@ int main(int argc,char** argv) {
     u32 prior=bulk_calls;
     /* A packet crossing a page, a packet crossing a safe range, and a packet
      * whose payload extends past PUT retain scalar behavior. */
-    end=packet_at(0xffff8,0xa20,8,1); drain(ctrl,0xffff8,end);
+    end=packet_at(0xffff8,0xa20,8,1);
+    const u16 second_page=s_ea_address_table[1];
+    s_ea_address_table[1]=9; /* adjacent IO pages need not be adjacent EAs */
+    for(u32 i=1;i<8;i++) gw32(0x00900000u+(i-1)*4,0xface0000u+i);
+    drain(ctrl,0xffff8,end);
+    check(captured.regs[0xa24/4]==0xface0001u && captured.regs[0xa3c/4]==0xface0007u,
+          "cross-page scalar fallback translates each remapped source page");
+    s_ea_address_table[1]=second_page;
     end=packet_at(0,0x1bf8,4,1); drain(ctrl,0,end);
     end=packet_at(0,0xa20,8,1); drain(ctrl,0,end-4);
     check(bulk_calls==prior,"page/range/publication boundaries use scalar fallback");

@@ -319,7 +319,8 @@ int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, const u8* be_words,
 {
     if (!be_words || !count || count > 2047 || (method & 3u)) return 0;
     u32 last;
-    if (method >= 0x0200 && method <= 0x022C) last = 0x022C;       /* surface */
+    if (method >= 0x0200 && method <= 0x0220) last = 0x0220;       /* surface */
+    else if (method == 0x022C) last = 0x022C; /* no reserved 0x224/0x228 gap */
     else if (method >= 0x0280 && method <= 0x028C) last = 0x028C;
     else if (method >= 0x0A00 && method <= 0x0A04) last = 0x0A04;  /* viewport */
     else if (method >= 0x0A20 && method <= 0x0A3C) last = 0x0A3C;

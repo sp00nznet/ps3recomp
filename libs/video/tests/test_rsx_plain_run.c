@@ -101,6 +101,8 @@ int main(int argc,char** argv)
     packet(0x1a00,bytes,32,0,0);
     be_write(bytes,0xabcdef01); packet(0x1a00,bytes,32,0,0);
     before=batched;
+    assert(!candidate(0x0224,bytes,2,0)); /* reserved surface gap is not an admitted method */
+    assert(!candidate(0x0220,bytes,4,1)); /* crossing that gap remains wholly scalar */
     assert(!candidate(0x1a01,bytes,4,1));
     assert(!candidate(0x1a00,bytes,0xffffffffu,1));
     assert(!candidate(0x1a00,bytes,0,1));
