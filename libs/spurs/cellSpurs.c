@@ -3782,51 +3782,54 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, const void* buffer, u32 isBlocking)
     }
 
     uint32_t q = (uint32_t)queue_ea;
-    uint32_t buf = (uint32_t)vm_read64(q + 0x68);
-    uint32_t sz  = vm_read32(q + 0x18);
-    uint32_t dep = vm_read32(q + 0x1C);
-    uint32_t tsp = (uint32_t)vm_read64(q + 0x70);
+    uint32_t sz  = vm_read32(q + 0x10);
+    uint32_t dep = vm_read32(q + 0x14);
+    uint32_t buf = (uint32_t)vm_read64(q + 0x18);
+    uint32_t tsp = (uint32_t)vm_read64(q + 0x70); // eaSignal: taskset
 
-    if (sz == 0 || dep == 0)
+    if (sz == 0 || dep == 0 || buf == 0)
     {
         return CELL_SPURS_TASK_ERROR_INVAL;
     }
 
-    int32_t pop = (int32_t)(vm_read32(q + 0x04) & 0xFFFF);
-    int32_t nsync = (pop < 0) ? ~pop : pop;
-    int32_t tail = (int32_t)vm_read16(q + 0x08);
-    int32_t cur = (tail < 0) ? ~tail : tail;
-    uint32_t mod = dep;
-    uint32_t occ = (uint32_t)((cur >= nsync) ? (cur - nsync) : (cur + 2 * mod - nsync));
-    if (occ >= dep)
+    int32_t mod = (int32_t)vm_read32(q + 0x0C);
+    if (mod <= 0)
     {
+        mod = (int32_t)dep;
+    }
+
+    int32_t cur = 0;
+    for (int spins = 0;; ++spins)
+    {
+        int32_t pop = (int32_t)(int16_t)(uint16_t)(vm_read32(q + 0x04) & 0xFFFFu); // W1: consumer pop
+        int32_t tail = (int32_t)(int16_t)vm_read16(q + 0x08);                     // W2: producer push
+        int32_t nsync = (pop < 0) ? ~pop : pop;
+        cur = (tail < 0) ? ~tail : tail;
+        uint32_t occ = (uint32_t)((cur >= nsync) ? (cur - nsync) : (cur + 2 * mod - nsync));
+        if (occ < dep)
+        {
+            break;
+        }
         if (!isBlocking)
         {
             return CELL_SPURS_TASK_ERROR_BUSY;
         }
-        int spins = 0;
-        while (occ >= dep)
+        if (spins >= 200)
         {
-            if (++spins > 200)
-            {
 #ifdef _WIN32
-                Sleep(1);
+            Sleep(1);
 #else
-                usleep(1000);
+            usleep(1000);
 #endif
-                spins = 0;
-            }
-            pop = (int32_t)(vm_read32(q + 0x04) & 0xFFFF);
-            nsync = (pop < 0) ? ~pop : pop;
-            tail = (int32_t)vm_read16(q + 0x08);
-            cur = (tail < 0) ? ~tail : tail;
-            occ = (uint32_t)((cur >= nsync) ? (cur - nsync) : (cur + 2 * mod - nsync));
+            spins = 0;
         }
     }
 
     uint32_t slot = (uint32_t)(cur % mod);
-    uint32_t src_ea = (uint32_t)(uintptr_t)buffer;
-    memcpy(vm_base + buf + (size_t)slot * sz, vm_base + src_ea, sz);
+    const void* src = ((uintptr_t)buffer < 0x100000000ull)
+        ? (const void*)(vm_base + (uint32_t)(uintptr_t)buffer)
+        : buffer;
+    memcpy(vm_base + buf + (size_t)slot * sz, src, sz);
 
     int32_t nxt = (cur + 1) % (2 * mod);
     // W1 (q+0x04) belongs to the consumer SPU; DO NOT overwrite it.
