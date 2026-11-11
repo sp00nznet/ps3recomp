@@ -3188,6 +3188,19 @@ s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
     return CELL_OK;
 }
 
+s32 cellSpursGetJobChainId(u64 jc_ea, u64 id_out_ea)
+{
+    if (!jc_ea || !id_out_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (s_jobchains[i].jc_ea == (u32)jc_ea) {
+            vm_write32((u32)id_out_ea, (u32)i);
+            return CELL_OK;
+        }
+    }
+    vm_write32((u32)id_out_ea, 0);
+    return CELL_OK;
+}
+
 /* cellSpursKickJobChain(CellSpursJobChain* jobChain, u8 numReadyCount)
  *
  * Two arguments, jobChain in r3 -- the same one-handle shape as Run/Join, not

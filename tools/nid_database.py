@@ -280,6 +280,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSpurs", "cellSpursRunJobChain"),
     ("cellSpurs", "cellSpursGetJobPipelineInfo"),
     ("cellSpurs", "cellSpursGetJobChainInfo"),
+    ("cellSpurs", "cellSpursGetJobChainId"),
     # SPURS Lock-Free Queue
     ("cellSpurs", "_cellSpursQueueInitialize"),
     ("cellSpurs", "cellSpursQueuePush"),
