@@ -8,6 +8,7 @@
  */
 
 #include "cellL10n.h"
+#include "../../runtime/ppu/ppu_memory.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -492,6 +493,24 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
         return rc;
     }
 
+    /* UTF-32 -> UTF-8 */
+    if (src_encoding == L10N_UTF32 && dst_encoding == L10N_UTF8) {
+        u32 out_len = dst_max;
+        s32 rc = UTF32toUTF8((const u32*)src, src_len / sizeof(u32),
+                             (u8*)dst, &out_len);
+        *dst_len = out_len;
+        return rc;
+    }
+
+    /* UCS-2 -> UTF-8 */
+    if (src_encoding == L10N_UCS2 && dst_encoding == L10N_UTF8) {
+        u32 out_len = dst_max;
+        s32 rc = UCS2toUTF8((const u16*)src, src_len / sizeof(u16),
+                            (u8*)dst, &out_len);
+        *dst_len = out_len;
+        return rc;
+    }
+
     /* Same encoding - just copy */
     if (src_encoding == dst_encoding) {
         u32 copy_len = src_len < dst_max ? src_len : dst_max;
@@ -508,8 +527,9 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
         return CELL_OK;
     }
 
-    /* ISO-8859-1 -> UTF-8 */
-    if (src_encoding == L10N_ISO_8859_1 && dst_encoding == L10N_UTF8) {
+    /* Single-byte ISO-8859-1..15 -> UTF-8 (Latin-1 exact; single-byte fallback for 8859-2..15) */
+    if (dst_encoding == L10N_UTF8 &&
+        src_encoding >= L10N_ISO_8859_1 && src_encoding <= L10N_ISO_8859_15) {
         const u8* s = (const u8*)src;
         u8* d = (u8*)dst;
         u32 out_pos = 0;
@@ -517,7 +537,7 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
             int w = encode_utf8(s[i], d + out_pos, dst_max - out_pos);
             if (w == 0)
                 return (s32)CELL_L10N_ERROR_INSUFFICIENT;
-            out_pos += w;
+            out_pos += (u32)w;
         }
         *dst_len = out_pos;
         return CELL_OK;
@@ -532,24 +552,6 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
         for (u32 i = 0; i < count; i++)
             d[i] = s[i]; /* ISO-8859-1 codepoints = Unicode codepoints */
         *dst_len = count * sizeof(u16);
-        return CELL_OK;
-    }
-
-    /* Fallback for converting to UTF-8 from other encodings (handles ASCII & single-byte cleanly) */
-    if (dst_encoding == L10N_UTF8) {
-        const u8* s = (const u8*)src;
-        u8* d = (u8*)dst;
-        u32 out_pos = 0;
-        for (u32 i = 0; i < src_len && out_pos < dst_max; i++) {
-            if (s[i] < 0x80) {
-                d[out_pos++] = s[i];
-            } else {
-                int w = encode_utf8(s[i], d + out_pos, dst_max - out_pos);
-                if (w == 0) break;
-                out_pos += w;
-            }
-        }
-        *dst_len = out_pos;
         return CELL_OK;
     }
 
@@ -570,14 +572,43 @@ s32 l10n_convert_str(s32 src_code, const void* src, u32* src_len,
     return rc;
 }
 
+static s32 l10n_convert_str_abi(s32 src_code, const void* src, u32* src_len,
+                                s32 dst_code, void* dst, u32* dst_len)
+{
+    if (!src || !src_len || !dst || !dst_len)
+        return (s32)CELL_L10N_ERROR_INVALID_PARAM;
+
+    /* HLE dispatch forwards 32-bit guest EAs and big-endian length words */
+    if (vm_base &&
+        (uintptr_t)src     < 0x100000000ull &&
+        (uintptr_t)src_len < 0x100000000ull &&
+        (uintptr_t)dst     < 0x100000000ull &&
+        (uintptr_t)dst_len < 0x100000000ull) {
+        u32 src_ea     = (u32)(uintptr_t)src;
+        u32 src_len_ea = (u32)(uintptr_t)src_len;
+        u32 dst_ea     = (u32)(uintptr_t)dst;
+        u32 dst_len_ea = (u32)(uintptr_t)dst_len;
+        u32 in_len     = vm_read32(src_len_ea);
+        u32 out_cap    = vm_read32(dst_len_ea);
+        u32 out_written = 0;
+        s32 rc = l10n_convert((u32)src_code, vm_base + src_ea, in_len,
+                              (u32)dst_code, vm_base + dst_ea, out_cap, &out_written);
+        if (rc == CELL_OK)
+            vm_write32(dst_len_ea, out_written);
+        return rc;
+    }
+
+    return l10n_convert_str(src_code, src, src_len, dst_code, dst, dst_len);
+}
+
 s32 cellL10nConvertStr(s32 src_code, const void* src, u32* src_len,
                        s32 dst_code, void* dst, u32* dst_len)
 {
-    return l10n_convert_str(src_code, src, src_len, dst_code, dst, dst_len);
+    return l10n_convert_str_abi(src_code, src, src_len, dst_code, dst, dst_len);
 }
 
 s32 L10nConvertStr(s32 src_code, const void* src, u32* src_len,
                    s32 dst_code, void* dst, u32* dst_len)
 {
-    return l10n_convert_str(src_code, src, src_len, dst_code, dst, dst_len);
+    return l10n_convert_str_abi(src_code, src, src_len, dst_code, dst, dst_len);
 }
