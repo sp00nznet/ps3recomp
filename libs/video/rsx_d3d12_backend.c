@@ -2308,6 +2308,23 @@ static u32 dr_unnorm_units(const D3D12DrawRecord* dr, u32 dim[16][3])
     return mask;
 }
 
+/* Sparse sample across a guest texture buffer to detect whether any texel is
+ * non-zero before substituting a captured render target (SCREEN_AS_TEX /
+ * SUBVP). Sampling only the first 128 KB misses bottom-aligned UI/intro art,
+ * so distribute up to ~256 probes across the full buffer extent. */
+static int guest_tex_nonzero(u32 off, u32 w, u32 h)
+{
+    extern uint8_t* vm_base;
+    if (!vm_base || !off || !w || !h) return 0;
+    u64 sz = (u64)w * h * 4u;
+    u32 step = (sz > 256ull * 997ull) ? (u32)(sz / 256ull) : 997u;
+    if (step == 0) step = 1;
+    for (u64 i = 0; i < sz; i += step) {
+        if (vm_base[off + i]) return 1;
+    }
+    return 0;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
                                           u32 cube_mask, u32 unnorm_mask, const u32 unnorm_dim[16][3], u64 zs)
@@ -4931,9 +4948,11 @@ static void render_frame(void)
                     continue;
                 }
             }
-            /* Display-sized sampler source -> the rendered frame. */
+            /* Display-sized sampler source -> the rendered frame (only when
+             * guest RAM contains no actual pixel data for this texture). */
             if (dr->tex[_u].set && s_screen_copy &&
-                dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
+                dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height &&
+                !guest_tex_nonzero(dr->tex[_u].off, dr->tex[_u].w, dr->tex[_u].h)) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
                 if (en) {
@@ -4953,19 +4972,13 @@ static void render_frame(void)
                 for (int i = 0; i < s_subvp_n; i++)
                     if (s_subvp[i].res && s_subvp[i].w == dr->tex[_u].w &&
                         s_subvp[i].h == dr->tex[_u].h) { hit = i; break; }
-                if (hit >= 0) {
-                    extern uint8_t* vm_base;
-                    u32 nz = 0, sz = dr->tex[_u].w * dr->tex[_u].h * 4u;
-                    for (u32 i5 = 0; i5 < sz && i5 < 0x20000u; i5 += 997)
-                        if (vm_base[dr->tex[_u].off + i5]) { nz = 1; break; }
-                    if (!nz) {
-                        { static int _n = 0; if (getenv("SUBVP_DBG") && PS3_LOG_FIRST(_n, 8))
-                            fprintf(stderr, "[SUBVP] unit %d fp=0x%X <- captured %ux%u%c",
-                                    _u, dr->fp_addr, dr->tex[_u].w, dr->tex[_u].h, 10); }
-                        srv_write(wslot, s_subvp[hit].res, DXGI_FORMAT_R8G8B8A8_UNORM,
-                                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
-                        continue;
-                    }
+                if (hit >= 0 && !guest_tex_nonzero(dr->tex[_u].off, dr->tex[_u].w, dr->tex[_u].h)) {
+                    { static int _n = 0; if (getenv("SUBVP_DBG") && PS3_LOG_FIRST(_n, 8))
+                        fprintf(stderr, "[SUBVP] unit %d fp=0x%X <- captured %ux%u%c",
+                                _u, dr->fp_addr, dr->tex[_u].w, dr->tex[_u].h, 10); }
+                    srv_write(wslot, s_subvp[hit].res, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    continue;
                 }
             }
             if (dr->tex[_u].set) {
