@@ -110,6 +110,7 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
             out[1] = (float)y / 1023.0f;
             out[2] = (float)z / 511.0f;
             out[3] = 1.0f;
+            n = 4;
         }
         break;
     case 7: /* UB256: u8 unnormalized */
