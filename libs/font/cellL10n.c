@@ -535,6 +535,24 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
         return CELL_OK;
     }
 
+    /* Fallback for converting to UTF-8 from other encodings (handles ASCII & single-byte cleanly) */
+    if (dst_encoding == L10N_UTF8) {
+        const u8* s = (const u8*)src;
+        u8* d = (u8*)dst;
+        u32 out_pos = 0;
+        for (u32 i = 0; i < src_len && out_pos < dst_max; i++) {
+            if (s[i] < 0x80) {
+                d[out_pos++] = s[i];
+            } else {
+                int w = encode_utf8(s[i], d + out_pos, dst_max - out_pos);
+                if (w == 0) break;
+                out_pos += w;
+            }
+        }
+        *dst_len = out_pos;
+        return CELL_OK;
+    }
+
     printf("[cellL10n] convert: unsupported %u -> %u\n",
            src_encoding, dst_encoding);
     return (s32)CELL_L10N_ERROR_NOT_SUPPORTED;
@@ -550,4 +568,16 @@ s32 l10n_convert_str(s32 src_code, const void* src, u32* src_len,
     s32 rc = l10n_convert((u32)src_code, src, *src_len,
                           (u32)dst_code, dst, out_len, dst_len);
     return rc;
+}
+
+s32 cellL10nConvertStr(s32 src_code, const void* src, u32* src_len,
+                       s32 dst_code, void* dst, u32* dst_len)
+{
+    return l10n_convert_str(src_code, src, src_len, dst_code, dst, dst_len);
+}
+
+s32 L10nConvertStr(s32 src_code, const void* src, u32* src_len,
+                   s32 dst_code, void* dst, u32* dst_len)
+{
+    return l10n_convert_str(src_code, src, src_len, dst_code, dst, dst_len);
 }
