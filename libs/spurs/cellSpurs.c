@@ -3772,3 +3772,98 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }
+
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, const void* buffer, u32 isBlocking)
+{
+    extern uint8_t* vm_base;
+    if (!queue_ea || !buffer || !vm_base)
+    {
+        return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    }
+
+    uint32_t q = (uint32_t)queue_ea;
+    uint32_t sz  = vm_read32(q + 0x10);
+    uint32_t dep = vm_read32(q + 0x14);
+    uint32_t buf = (uint32_t)vm_read64(q + 0x18);
+    uint32_t tsp = (uint32_t)vm_read64(q + 0x70); // eaSignal: taskset
+
+    if (sz == 0 || dep == 0 || buf == 0)
+    {
+        return CELL_SPURS_TASK_ERROR_INVAL;
+    }
+
+    int32_t mod = (int32_t)vm_read32(q + 0x0C);
+    if (mod <= 0)
+    {
+        mod = (int32_t)dep;
+    }
+
+    int32_t cur = 0;
+    for (int spins = 0;; ++spins)
+    {
+        int32_t pop = (int32_t)(int16_t)(uint16_t)(vm_read32(q + 0x04) & 0xFFFFu); // W1: consumer pop
+        int32_t tail = (int32_t)(int16_t)vm_read16(q + 0x08);                     // W2: producer push
+        int32_t nsync = (pop < 0) ? ~pop : pop;
+        cur = (tail < 0) ? ~tail : tail;
+        uint32_t occ = (uint32_t)((cur >= nsync) ? (cur - nsync) : (cur + 2 * mod - nsync));
+        if (occ < dep)
+        {
+            break;
+        }
+        if (!isBlocking)
+        {
+            return CELL_SPURS_TASK_ERROR_BUSY;
+        }
+        if (spins >= 200)
+        {
+#ifdef _WIN32
+            Sleep(1);
+#else
+            usleep(1000);
+#endif
+            spins = 0;
+        }
+    }
+
+    uint32_t slot = (uint32_t)(cur % mod);
+    const void* src = ((uintptr_t)buffer < 0x100000000ull)
+        ? (const void*)(vm_base + (uint32_t)(uintptr_t)buffer)
+        : buffer;
+    memcpy(vm_base + buf + (size_t)slot * sz, src, sz);
+
+    int32_t nxt = (cur + 1) % (2 * mod);
+    // W1 (q+0x04) belongs to the consumer SPU; DO NOT overwrite it.
+    // W2 (q+0x08) belongs to the producer PPU; write new push index:
+    vm_write16(q + 0x08, (uint16_t)nxt);
+    vm_write16(q + 0x0A, (uint16_t)nxt);
+
+    // Notify any registered waiters
+    uint8_t* qp = vm_base + q;
+    uint32_t waiters = qp[0x20];
+    int woke = -1;
+    extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
+    if (waiters > 0 && waiters <= 3 && tsp)
+    {
+        woke = qp[0x21];
+        qp[0x21] = qp[0x22];
+        qp[0x22] = qp[0x23];
+        qp[0x23] = 0;
+        qp[0x20] = (uint8_t)(waiters - 1);
+        spu_taskset_signal_task(tsp, (uint32_t)woke);
+    }
+    if (tsp)
+    {
+        // Wake any worker tasks waiting on this taskset
+        spu_taskset_signal_task(tsp, 0);
+        spu_taskset_signal_task(tsp, 1);
+    }
+
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 20))
+    {
+        printf("[cellSpurs] _cellSpursLFQueuePushBody#%d q=0x%08X slot=%u (cur=%u->%u) "
+               "buf=0x%08X size=%u depth=%u waiters=%u woke=%d taskset=0x%08X\n",
+               _n, q, slot, cur, nxt, buf + slot * sz, sz, dep, waiters, woke, tsp);
+    }
+    return CELL_OK;
+}
