@@ -3351,22 +3351,6 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         ctx->gpr[3] = 0;
         return;
     }
-    case 630: {   /* sys_gpio_set(u64 device_id, u64 mask, u64 value) */
-        uint64_t dev  = ctx->gpr[3];
-        uint64_t mask = ctx->gpr[4];
-        uint64_t val  = ctx->gpr[5];
-        if (dev < 8) s_gpio_dev[dev] = (s_gpio_dev[dev] & ~mask) | (val & mask);
-        ctx->gpr[3] = 0;   /* CELL_OK */
-        return;
-    }
-    case 631: {   /* sys_gpio_get(u64 device_id, u64* value) */
-        uint64_t dev = ctx->gpr[3];
-        uint32_t outp = (uint32_t)ctx->gpr[4];
-        uint64_t val = (dev < 8) ? s_gpio_dev[dev] : 0;
-        if (outp) vm_write64(outp, val);
-        ctx->gpr[3] = 0;   /* CELL_OK */
-        return;
-    }
     case 988:     /* sys_tty_write — canonical LV2 number (psdevwiki); some CRTs
                    * use this instead of 403. Same ABI. */
     case 403: {   /* sys_tty_write(s32 ch, cptr buf, u32 len, ptr pwritelen) */
@@ -3491,6 +3475,22 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         fflush(out);
         if (pwl) vm_write32(pwl, len);
         ctx->gpr[3] = 0;
+        return;
+    }
+    case 630: {   /* sys_gpio_set(u64 device_id, u64 mask, u64 value) */
+        uint64_t dev  = ctx->gpr[3];
+        uint64_t mask = ctx->gpr[4];
+        uint64_t val  = ctx->gpr[5];
+        if (dev < 8) s_gpio_dev[dev] = (s_gpio_dev[dev] & ~mask) | (val & mask);
+        ctx->gpr[3] = 0;   /* CELL_OK */
+        return;
+    }
+    case 631: {   /* sys_gpio_get(u64 device_id, u64* value) */
+        uint64_t dev = ctx->gpr[3];
+        uint32_t outp = (uint32_t)ctx->gpr[4];
+        uint64_t val = (dev < 8) ? s_gpio_dev[dev] : 0;
+        if (outp) vm_write64(outp, val);
+        ctx->gpr[3] = 0;   /* CELL_OK */
         return;
     }
     default: {
