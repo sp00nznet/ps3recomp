@@ -3624,17 +3624,24 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                if (lock && s_lock_valid) { ux = s_lock_x; uy = s_lock_y; }
                vpx[0] = k; vpx[1] = k; vpx[4] = -ux * k; vpx[5] = -uy * k; } }
 
-    /* Garbage-projection fallback (vkcube; see the original comment). */
+    /* Fallback projection: only if explicitly requested via VP_FIXPROJ=1 or when
+     * all 16 matrix elements are zero (uninitialized). Never clobber valid matrices
+     * with negative elements (e.g. rotation/mirroring transforms where c00 <= 0). */
     int uses_c03 = (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)
                        ? s_d3d.vp_vs[vs_idx].uses_c03 : s_d3d.vp_uses_c03;
     float* c = (float*)dst;
-    float c00 = c[0];
-    int garbage = !(c00 > 0.0f && c00 < 8.0f);
+    int all_zero = 1;
+    for (int _i = 0; _i < 16; _i++) {
+        if (c[_i] != 0.0f) { all_zero = 0; break; }
+    }
+    int garbage = (all_zero && uses_c03);
+    /* VP_NOFIXPROJ=1 disables projection fallback override */
     if (env_on("VP_NOFIXPROJ", &s_env_vp_nofixproj)) garbage = 0;
-    if ((garbage && uses_c03) || env_on("VP_FIXPROJ", &s_env_vp_fixproj)) {
+    /* VP_FIXPROJ=1 forces fallback projection override */
+    if (garbage || env_on("VP_FIXPROJ", &s_env_vp_fixproj)) {
         { static int _fb = 0; if (PS3_LOG_FIRST(_fb, 6))
             printf("[VPFB] fallback proj on draw slot %u (c00=%g vs_idx=%d)\n",
-                   slot, c00, vs_idx); }
+                   slot, c[0], vs_idx); }
         for (int _i = 0; _i < 16; _i++) c[_i] = 0.0f;
         c[0]=1.358f; c[5]=2.414f; c[11]=1.0f;
         c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
