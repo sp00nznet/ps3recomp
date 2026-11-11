@@ -168,7 +168,7 @@ typedef struct {
     D3D12_RESOURCE_STATES st;          /* tracked resource state */
     int                   used;        /* referenced this frame */
 } OffRT;
-#define MAX_OFF_RTS  64  /* titles with bloom pyramids and cubemap RTT passes allocate 20+ surfaces */
+#define MAX_OFF_RTS  128 /* titles with bloom pyramids and cubemap RTT passes allocate 20+ surfaces */
 
 /* Depth surface, one per guest zeta offset. The pass chain keeps several
  * (God of War HD: the scene's 2x-AA depth at 0x17F0000 and the resolved depth
@@ -184,8 +184,8 @@ typedef struct {
     u64                   last_frame;  /* frame_count of the last pass that bound it */
 } OffDS;
 #define MAX_OFF_DS   6
-#define RT_SRV_BASE  5   /* SRV heap slots 5..68 hold offscreen-RT SRVs */
-#define DS_SRV_BASE  70  /* SRV heap slots 70..81 hold depth + stencil SRVs (2 per OffDS) */
+#define RT_SRV_BASE  5   /* SRV heap slots 5..132 hold offscreen-RT SRVs */
+#define DS_SRV_BASE  135 /* SRV heap slots 135..146 hold depth + stencil SRVs (2 per OffDS) */
 /* Per-draw SRV windows: each VP draw gets 16 consecutive descriptors (t0-t15)
  * so multi-unit fragment programs see all their textures. */
 #define DRAW_SRV_BASE 256
@@ -231,7 +231,7 @@ typedef struct {
     ID3DBlob* vs;
     int uses_c03;
 } VPVSEntry;
-#define VP_VS_CACHE 128 /* wave uses 5+ distinct VPs; at 4 the cache
+#define VP_VS_CACHE 512 /* wave uses 5+ distinct VPs; at 4 the cache
                          * thrashed every frame and eviction shifted slots
                          * under recorded vs_idx values -- the display mesh
                          * drew with the WRONG vertex program (sub-rect +
@@ -269,7 +269,7 @@ typedef struct {
  * single frame, so the FIFO evicted entries that were needed again immediately
  * and ~17 shaders were recompiled EVERY frame -- about half the frame's CPU
  * time. Entries are small (a PSO pointer plus key fields). */
-#define VP_FP_CACHE 256
+#define VP_FP_CACHE 2048
 
 /* ---------------------------------------------------------------------------
  * Internal state
