@@ -168,6 +168,16 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
+    /* /dev/null / dev/null device mapping */
+    if (ps3_path && (strcmp(ps3_path, "/dev/null") == 0 || strcmp(ps3_path, "dev/null") == 0)) {
+#ifdef _WIN32
+        snprintf(host_path, (size_t)host_path_size, "NUL");
+#else
+        snprintf(host_path, (size_t)host_path_size, "/dev/null");
+#endif
+        return;
+    }
+
     /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
      * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
     if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {

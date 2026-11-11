@@ -139,6 +139,15 @@ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
  * prefixes are stripped; the rest is appended to the root. */
 static void host_path(char* out, size_t cap, const char* guest)
 {
+    if (guest && (strcmp(guest, "/dev/null") == 0 || strcmp(guest, "dev/null") == 0)) {
+#ifdef _WIN32
+        snprintf(out, cap, "NUL");
+#else
+        snprintf(out, cap, "/dev/null");
+#endif
+        return;
+    }
+
     const char* rel = guest;
     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
