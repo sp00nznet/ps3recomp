@@ -107,6 +107,10 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
                  u32 dst_encoding, void* dst, u32 dst_max, u32* dst_len);
 s32 l10n_convert_str(s32 src_code, const void* src, u32* src_len,
                      s32 dst_code, void* dst, u32* dst_len);
+s32 cellL10nConvertStr(s32 src_code, const void* src, u32* src_len,
+                       s32 dst_code, void* dst, u32* dst_len);
+s32 L10nConvertStr(s32 src_code, const void* src, u32* src_len,
+                   s32 dst_code, void* dst, u32* dst_len);
 
 /* Single codepoint length in UTF-8 */
 s32 UTF8Len(const u8* utf8);
