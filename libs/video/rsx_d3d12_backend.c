@@ -2364,7 +2364,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     for (int i = 0; i < s_d3d.vp_fp_n; i++)
         if (s_d3d.vp_fp[i].ucode_hash != uhash) continue;   /* cheap reject first */
         else if (s_d3d.vp_fp[i].vs_idx == vs_idx &&
-            s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen &&
+            s_d3d.vp_fp[i].vs_hash == vs_hash &&
+            (vs_idx >= 0 || s_d3d.vp_fp[i].gen == s_d3d.vp_gen) &&
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].ctrl == ctrl &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
@@ -2400,7 +2401,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(stderr, "[PSOMISS] fp=0x%X differs:%s%s%s%s%s%s%s%s%c", fp_addr,
                     q->vs_idx != vs_idx        ? " vs_idx"     : "",
                     q->vs_hash != vs_hash      ? " vs_hash"    : "",
-                    q->gen != s_d3d.vp_gen     ? " gen"        : "",
+                    (vs_idx < 0 && q->gen != s_d3d.vp_gen) ? " gen"        : "",
                     q->blend != blend          ? " blend"      : "",
                     q->nrt != nrt              ? " nrt"        : "",
                     q->rtfmt != (u32)rtfmt     ? " rtfmt"      : "",
