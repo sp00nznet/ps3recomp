@@ -52,6 +52,14 @@
 #if !TARGET_OS_IPHONE
 #  import <AppKit/AppKit.h>
 #endif
+/* PS3_UPSCALE=metalfx. MetalFX (macOS 13+) is looked up when it is first
+ * asked for rather than linked, so nothing that builds this file needs
+ * another framework on its link line, and an older system just goes
+ * without it. */
+#if !TARGET_OS_IPHONE && __has_include(<MetalFX/MetalFX.h>)
+#  import <MetalFX/MetalFX.h>
+#  define ENG_HAVE_METALFX 1
+#endif
 
 #include <pthread.h>
 #include "metal_frame_rate.h"
@@ -2663,12 +2671,20 @@ static id<MTLDepthStencilState>   s_eng_clear_ds[4];
  *                      skin and sky do not blow out; negative mutes; 0 = off
  *   PS3_CONTRAST=0.5..1.5  contrast around mid-grey; 1 = off. Both in the
  *                      present pass, before the video out's gamma
+ *   PS3_UPSCALE=metalfx  when the window shows the picture larger than the
+ *                      guest drew it, a MetalFX spatial scaler (macOS 13+)
+ *                      takes it to that size after the AA, in place of the
+ *                      bilinear stretch, and the present pass samples the
+ *                      result 1:1. Off with one log line if MetalFX is
+ *                      missing or fails. Headless and host-surface targets
+ *                      are the guest's size and never scaled.
  * Out of range (-1, and -2 for the vibrance) = not read yet. */
 static int   s_eng_fxaa = -1;
 static int   s_eng_smaa;                 /* read with s_eng_fxaa */
 static float s_eng_sharpen = -1.0f;
 static float s_eng_vibrance = -2.0f;
 static float s_eng_contrast = -1.0f;
+static int   s_eng_upscale = -1;
 static id<MTLRenderPipelineState> s_eng_fxaa_pso;
 static MTLPixelFormat             s_eng_fxaa_pso_fmt;
 static id<MTLTexture>             s_eng_fxaa_tex;
@@ -2679,6 +2695,10 @@ static id<MTLRenderPipelineState> s_eng_smaa_edge_pso, s_eng_smaa_weight_pso, s_
 static MTLPixelFormat             s_eng_smaa_blend_fmt;
 static id<MTLTexture>             s_eng_smaa_area, s_eng_smaa_search;
 static id<MTLTexture>             s_eng_smaa_edges, s_eng_smaa_weights, s_eng_smaa_out;
+/* PS3_UPSCALE=metalfx: the scaler (an id<MTLFXSpatialScaler>) and its output,
+ * rebuilt when the input or output size or the format changes. */
+static id                         s_eng_mfx_scaler;
+static id<MTLTexture>             s_eng_mfx_out;
 
 static float eng_sharpen_from(const char* e)
 {
@@ -2711,12 +2731,19 @@ static void eng_post_options(void)
     if (s_eng_sharpen < 0.0f) s_eng_sharpen = eng_sharpen_from(getenv("PS3_SHARPEN"));
     if (s_eng_vibrance < -1.0f) s_eng_vibrance = eng_vibrance_from(getenv("PS3_VIBRANCE"));
     if (s_eng_contrast < 0.0f) s_eng_contrast = eng_contrast_from(getenv("PS3_CONTRAST"));
+    if (s_eng_upscale < 0) {
+        const char* e = getenv("PS3_UPSCALE");
+        s_eng_upscale = (e && !strcasecmp(e, "metalfx"));
+        if (e && *e && !s_eng_upscale && strcasecmp(e, "off") && strcmp(e, "0"))
+            fprintf(stderr, "[RSX metal] PS3_UPSCALE=%s unknown (metalfx); off\n", e);
+    }
     static int logged;
     if (!logged++ && (s_eng_fxaa || s_eng_smaa || s_eng_sharpen > 0.0f ||
-                      s_eng_vibrance != 0.0f || s_eng_contrast != 1.0f))
-        fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f, vibrance %.2f, contrast %.2f\n",
+                      s_eng_vibrance != 0.0f || s_eng_contrast != 1.0f || s_eng_upscale))
+        fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f, vibrance %.2f, contrast %.2f, "
+                        "upscale %s\n",
                 s_eng_fxaa ? "FXAA" : s_eng_smaa ? "SMAA" : "off", (double)s_eng_sharpen,
-                (double)s_eng_vibrance, (double)s_eng_contrast);
+                (double)s_eng_vibrance, (double)s_eng_contrast, s_eng_upscale ? "MetalFX" : "off");
 }
 
 static NSString* const kEngHelperMSL = @
@@ -3132,6 +3159,8 @@ static void eng_shutdown(void* user)
     s_eng_smaa_edge_pso = s_eng_smaa_weight_pso = s_eng_smaa_blend_pso = nil;
     s_eng_smaa_area = s_eng_smaa_search = nil;
     s_eng_smaa_edges = s_eng_smaa_weights = s_eng_smaa_out = nil;
+    s_eng_mfx_scaler = nil;
+    s_eng_mfx_out = nil;
     s_eng_active = 0;
     s_eng_encoding_failed = 0;
     s_eng_checked_completed = 0;
@@ -4399,14 +4428,105 @@ static id<MTLTexture> eng_smaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
     return s_eng_smaa_out;
 }
 
+/* PS3_UPSCALE=metalfx gave up: say why, once, and present the way it does
+ * without it from now on. */
+static void eng_upscale_off(const char* why)
+{
+    s_eng_upscale = 0;
+    s_eng_mfx_scaler = nil;
+    s_eng_mfx_out = nil;
+    fprintf(stderr, "[rsx engine/metal] MetalFX upscaling unavailable (%s); PS3_UPSCALE off\n", why);
+}
+
+#if ENG_HAVE_METALFX
+/* MTLFXSpatialScalerDescriptor, from the system's MetalFX loaded on first use;
+ * Nil where there is none. */
+static Class eng_metalfx_descriptor_class(void)
+{
+    static Class cls;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        if (dlopen("/System/Library/Frameworks/MetalFX.framework/MetalFX", RTLD_LAZY | RTLD_LOCAL))
+            cls = NSClassFromString(@"MTLFXSpatialScalerDescriptor");
+    }
+    return cls;
+}
+#endif
+
+/* PS3_UPSCALE=metalfx: src through a MetalFX spatial scaler into a texture of
+ * ow x oh in src's format. nil (and the frame is stretched as before) if it
+ * cannot; every failure here would repeat each frame, so it turns the option
+ * off. */
+static id<MTLTexture> eng_metalfx(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+                                  NSUInteger ow, NSUInteger oh)
+{
+#if ENG_HAVE_METALFX
+    if (@available(macOS 13.0, *)) {
+        Class desc_cls = eng_metalfx_descriptor_class();
+        if (!desc_cls) { eng_upscale_off("MetalFX not found"); return nil; }
+        const MTLPixelFormat fmt = [src pixelFormat];
+        id<MTLFXSpatialScaler> sc = s_eng_mfx_scaler;
+        if (!sc || [sc inputWidth] != [src width] || [sc inputHeight] != [src height] ||
+            [sc outputWidth] != ow || [sc outputHeight] != oh || [sc colorTextureFormat] != fmt) {
+            s_eng_mfx_scaler = nil;
+            s_eng_mfx_out = nil;
+            if (![desc_cls supportsDevice:s_dev]) {
+                eng_upscale_off("not supported on this GPU");
+                return nil;
+            }
+            MTLFXSpatialScalerDescriptor* d = [desc_cls new];
+            d.inputWidth          = [src width];
+            d.inputHeight         = [src height];
+            d.outputWidth         = ow;
+            d.outputHeight        = oh;
+            d.colorTextureFormat  = fmt;
+            d.outputTextureFormat = fmt;
+            /* The display buffer holds gamma-encoded colour. */
+            d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+            sc = [d newSpatialScalerWithDevice:s_dev];
+            if (!sc) { eng_upscale_off("no spatial scaler for this format"); return nil; }
+            MTLTextureDescriptor* td =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:ow
+                                                                  height:oh mipmapped:NO];
+            td.usage       = [sc outputTextureUsage] | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> out = [s_dev newTextureWithDescriptor:td];
+            if (!out) { eng_upscale_off("no memory for its output"); return nil; }
+            static int logged;
+            if (!logged++)
+                fprintf(stderr, "[RSX metal] MetalFX spatial upscaling %lux%lu -> %lux%lu\n",
+                        (unsigned long)[src width], (unsigned long)[src height],
+                        (unsigned long)ow, (unsigned long)oh);
+            s_eng_mfx_scaler = sc;
+            s_eng_mfx_out    = out;
+        }
+        if (([src usage] & [sc colorTextureUsage]) != [sc colorTextureUsage]) {
+            eng_upscale_off("the display buffer cannot be read by it");
+            return nil;
+        }
+        sc.colorTexture       = src;
+        sc.outputTexture      = s_eng_mfx_out;
+        sc.inputContentWidth  = [src width];
+        sc.inputContentHeight = [src height];
+        [sc encodeToCommandBuffer:cb];
+        return s_eng_mfx_out;
+    }
+#endif
+    (void)cb; (void)src; (void)ow; (void)oh;
+    eng_upscale_off("needs MetalFX, macOS 13 or later");
+    return nil;
+}
+
 /* Put a surface on the drawable. A straight blit would need matching formats
  * and sizes; a full-screen sample needs neither, and the guest's surfaces are
  * routinely a different size from the window.
  *
  * With PS3_AA=fxaa (or smaa) the surface goes through FXAA (or SMAA) first,
- * at its own size; with PS3_SHARPEN this pass sharpens it as it samples, and
- * PS3_VIBRANCE / PS3_CONTRAST adjust it before the gamma. Any one that is off
- * or fails is skipped. */
+ * at its own size; with PS3_UPSCALE=metalfx a window larger than it then gets
+ * it through MetalFX at the size it is shown; with PS3_SHARPEN this pass
+ * sharpens it as it samples, and PS3_VIBRANCE / PS3_CONTRAST adjust it before
+ * the gamma. Any one that is off or fails is skipped. */
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                 id<MTLTexture> dst)
 {
@@ -4414,6 +4534,19 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     eng_post_options();
     if (s_eng_fxaa) { id<MTLTexture> t = eng_fxaa(cb, src); if (t) src = t; }
     else if (s_eng_smaa) { id<MTLTexture> t = eng_smaa(cb, src); if (t) src = t; }
+    /* In the window the picture keeps its aspect ratio: fitted into the drawable and centred, black around it. The
+     * headless and host-surface targets are the size the title asked for and are filled as before. */
+    const double dw = (double)[dst width], dh = (double)[dst height];
+    const double sw = (double)[src width], sh = (double)[src height];
+    const int fill = s_headless || s_host;
+    const double fit = fmin(dw / sw, dh / sh);
+    const double vw = fill ? dw : floor(sw * fit + 0.5), vh = fill ? dh : floor(sh * fit + 0.5);
+    /* PS3_UPSCALE=metalfx: the picture is taken to the size it is shown at, so
+     * the pass below samples it 1:1. Its encoder has to come first. */
+    if (s_eng_upscale > 0 && !fill && vw > sw && vh > sh) {
+        id<MTLTexture> t = eng_metalfx(cb, src, (NSUInteger)vw, (NSUInteger)vh);
+        if (t) src = t;
+    }
     if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
@@ -4435,17 +4568,11 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return;
-    /* In the window the picture keeps its aspect ratio: fitted into the drawable and centred, black around it. The
-     * headless and host-surface targets are the size the title asked for and are filled as before. */
-    const double dw = (double)[dst width], dh = (double)[dst height];
-    const double sw = (double)[src width], sh = (double)[src height];
-    const int fill = s_headless || s_host;
-    const double fit = fmin(dw / sw, dh / sh);
-    const double vw = fill ? dw : floor(sw * fit + 0.5), vh = fill ? dh : floor(sh * fit + 0.5);
     [e setViewport:(MTLViewport){floor((dw - vw) * 0.5), floor((dh - vh) * 0.5), vw, vh, 0.0, 1.0}];
     [e setRenderPipelineState:s_eng_blit_pso];
     [e setFragmentTexture:src atIndex:0];
-    const int scaled = !fill && (vw != sw || vh != sh);   /* a resized window filters; 1:1 and the fixed targets stay point-sampled */
+    /* A resized window filters; 1:1 (MetalFX's output too) and the fixed targets stay point-sampled. */
+    const int scaled = !fill && (vw != (double)[src width] || vh != (double)[src height]);
     [e setFragmentSamplerState:(scaled ? s_default_sampler : s_eng_point_sampler) atIndex:0];
     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
      * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
