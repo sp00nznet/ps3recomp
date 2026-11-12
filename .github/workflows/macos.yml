@@ -168,6 +168,20 @@ jobs:
             -o /tmp/test_metal_present_post
           /tmp/test_metal_present_post
 
+      # PS3_UPSCALE=metalfx on the runner's GPU, into an offscreen "drawable":
+      # a window twice the picture's size gets MetalFX's output at that size
+      # (not black, not the bilinear frame, flat areas kept), a letterboxed
+      # one the fitted size with black around it, and a window no larger and
+      # the headless target are left alone. Unset, a larger window is still
+      # the bilinear stretch. Without MetalFX the option turns itself off and
+      # the fallback is checked instead.
+      - name: Run the Metal MetalFX upscale test
+        run: |
+          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_upscale.m \
+            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
+            -o /tmp/test_metal_upscale
+          /tmp/test_metal_upscale
+
       # Host-surface mode (tools/host_window, rsx_host_surface.h) against a
       # launcher fixture in the same process: init attaches and opens no
       # window, engine and vtable presents land in the shared IOSurfaces,
