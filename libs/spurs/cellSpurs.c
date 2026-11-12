@@ -2575,6 +2575,12 @@ static struct {
     u16 max_grab;
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
+    /* Where the chain stands between walks (see jc_thread). */
+    u32 pc, ret_pc;          /* next command; CALL return address           */
+    u64 halt_cmd;            /* the END/RET/ABORT word the last walk stopped on */
+    int halted;              /* ... and it is still at pc                     */
+    volatile long kicked;    /* a Run/Kick that no walk has taken up yet      */
+    volatile long from_entry;/* Join/Shutdown: the next walk starts at entry  */
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -2641,6 +2647,14 @@ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
             s_jobchains[i].run_count = 0;
+            /* A new chain starts at its entry. The Simpsons Arcade Game creates
+             * its chain again every frame, and each one must run from the top. */
+            s_jobchains[i].pc         = entry_ea;
+            s_jobchains[i].ret_pc     = 0;
+            s_jobchains[i].halt_cmd   = 0;
+            s_jobchains[i].halted     = 0;
+            s_jobchains[i].kicked     = 0;
+            s_jobchains[i].from_entry = 0;
             return CELL_OK;
         }
     }
@@ -3000,9 +3014,33 @@ static void jc_signal_done(u32 jc_ea, int job_index)
     }
 }
 
-static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+/* Where a walk stopped. halted: on an END/RET/ABORT word (cmd), which the next
+ * walk reads again; otherwise parked on a closed guard or an idle stretch. */
+static void jc_stop(int slot, u32 pc, u32 ret_pc, int halted, u64 cmd)
 {
-    u32 pc = entry_ea, ret_pc = 0;
+    s_jobchains[slot].pc       = pc;
+    s_jobchains[slot].ret_pc   = ret_pc;
+    s_jobchains[slot].halted   = halted;
+    s_jobchains[slot].halt_cmd = cmd;
+}
+
+/* Walk a chain's command stream from where it stands, and leave it on the
+ * command it stopped at: the job manager keeps a chain's program counter
+ * between runs, and a Run carries on from it rather than starting over.
+ *
+ * That is how a title appends work to a running chain. PlayStation All-Stars
+ * Battle Royale pads each new command list with END, links it in by
+ * overwriting the END the chain stopped on with a NEXT to it, and Runs the
+ * chain again, every frame. Starting each walk at the entry re-ran every job
+ * it had ever queued (2, 4, 6 ... 284 jobs a walk) until a walk outlasted a
+ * frame -- and then the Run for the next list was coalesced into a walk that
+ * had already read its END (see jc_thread), the list never ran, and the
+ * render thread waited for those jobs' results forever. */
+static void jc_execute(int slot)
+{
+    const u32 jc_ea = s_jobchains[slot].jc_ea, size_desc = s_jobchains[slot].size_desc;
+    u32 pc = s_jobchains[slot].pc, ret_pc = s_jobchains[slot].ret_pc;
+    u32 idle_pc = pc;    /* the first command since the last job */
     int jobs = 0;
     /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
      * SERVICE LOOP -- guard, job, sync, next, repeat -- and is meant to run for
@@ -3029,40 +3067,59 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
              * completion into one event per pass leaves it waiting for
              * completions that, from its point of view, never arrive. */
             jc_signal_done(jc_ea, idx);
-            pc += 8; continue;
+            pc += 8; idle_pc = pc; continue;
         }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
         if (op == 3) { pc = (u32)(cmd & ~7ull); continue; }   /* NEXT     */
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                /* One a walk, so every frame for an appending title: the first
+                 * few, then one in 4096. */
+                { static unsigned n_end = 0;
+                  if (++n_end <= 16 || (n_end & 4095) == 0)
+                      printf("[cellSpurs] chain 0x%08X: END after %d job(s) (#%u)\n",
+                             jc_ea, jobs, n_end); }
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
+                jc_stop(slot, pc, ret_pc, 1, cmd);
                 return;
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
-                if (!ret_pc) return;
+                if (!ret_pc) { jc_stop(slot, pc, 0, 1, cmd); return; }
                 pc = ret_pc; ret_pc = 0; continue;
             }
             if (ext == (7 | (0 << 3))) {                      /* ABORT */
                 printf("[cellSpurs] chain 0x%08X: ABORT\n", jc_ea);
+                jc_stop(slot, pc, ret_pc, 1, cmd);
                 return;
             }
         }
         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
             u32 g_ea = (u32)(cmd & ~127ull);
-            if (!jg_wait(g_ea)) return;                  /* still closed */
+            if (!jg_wait(g_ea)) {                        /* still closed */
+                jc_stop(slot, pc, ret_pc, 0, 0);         /* wait here again */
+                return;
+            }
             pc += 8; continue;
         }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
          * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
         pc += 8;
     }
+    jc_stop(slot, idle_pc, ret_pc, 0, 0);
     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
            "job(s) -- malformed?\n",
            jc_ea, jobs);
 }
 
+/* One host thread walks a chain at a time (jc_start), and it takes up every
+ * Run that lands while it walks. A Run that found the chain busy used to be
+ * dropped on the assumption that the walk in progress would see the new
+ * commands -- true until the walker has read the END it stops on: from there
+ * to clearing `running`, a list linked over that END and Run was lost. So the
+ * walker clears `kicked` before each pass and, after clearing `running`, walks
+ * again if a Run arrived meanwhile (unless that Run already started a walker of
+ * its own). A pass that finds the same END just stops again. */
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
@@ -3074,9 +3131,31 @@ static DWORD WINAPI jc_thread(LPVOID p)
      * Confirms timing-vs-never before committing to the async rewrite. */
     { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
-    jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-               s_jobchains[slot].size_desc);
-    s_jobchains[slot].running = 0;
+    for (int pass = 0;; pass++) {
+        _InterlockedExchange(&s_jobchains[slot].kicked, 0);
+        if (_InterlockedExchange(&s_jobchains[slot].from_entry, 0)) {
+            jc_stop(slot, s_jobchains[slot].entry_ea, 0, 0, 0);
+        } else if (s_jobchains[slot].halted) {
+            const int same = vm_read64(s_jobchains[slot].pc) == s_jobchains[slot].halt_cmd;
+            if (same && pass == 0) {
+                /* Run again with nothing new where the chain stopped: run it
+                 * from its entry, as every Run used to. A title that runs the
+                 * same fixed list over and over gets what it always got here;
+                 * a title that appends has replaced that END first. */
+                jc_stop(slot, s_jobchains[slot].entry_ea, 0, 0, 0);
+            } else if (!same) {
+                static int n_res = 0;
+                if (PS3_LOG_FIRST(n_res, 4))
+                    printf("[cellSpurs] chain 0x%08X: carries on at 0x%08X\n",
+                           s_jobchains[slot].jc_ea, s_jobchains[slot].pc);
+            }
+        }
+        jc_execute(slot);
+        _InterlockedExchange(&s_jobchains[slot].running, 0);
+        if (!s_jobchains[slot].kicked ||
+            _InterlockedCompareExchange(&s_jobchains[slot].running, 1, 0) != 0)
+            break;
+    }
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
     jc_signal_done(s_jobchains[slot].jc_ea, -1);
@@ -3110,7 +3189,9 @@ static s32 jc_start(u64 jc_ea, const char* who)
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
-        /* Coalesce: a chain already being walked must not start twice. */
+        /* A chain is never walked twice at once: a Run that finds it busy is
+         * taken up by the walk in progress (jc_thread), not dropped. */
+        _InterlockedExchange(&s_jobchains[i].kicked, 1);
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
@@ -3146,6 +3227,10 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea == (u32)jc_ea) {
+            /* No more passes for Runs that have not been taken up, and a later
+             * Run starts at the entry, as it did before chains kept their pc. */
+            _InterlockedExchange(&s_jobchains[i].kicked, 0);
+            _InterlockedExchange(&s_jobchains[i].from_entry, 1);
             s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
             return CELL_OK;
         }
@@ -3176,6 +3261,9 @@ s32 cellSpursJoinJobChain(u64 jc_ea)
             usleep(0);
 #endif
         }
+        /* Joined: the chain is finished, and a later Run starts it at its
+         * entry again, as every Run did before chains kept their pc. */
+        _InterlockedExchange(&s_jobchains[i].from_entry, 1);
     }
     return CELL_OK;
 }
