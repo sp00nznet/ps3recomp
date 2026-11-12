@@ -313,7 +313,10 @@ static CellGcmUserHandler    s_user_handler    = NULL;
 static CellGcmSecondVHandler s_second_v_handler = NULL;
 
 /* Flip timing */
-static u64 s_last_flip_time = 0;
+/* Guest system time (us, sys_time_get_system_time's clock) of the last flip:
+ * titles pace frames as period - (system time - this). */
+static u64 s_last_flip_time = 0;   /* set where a flip completes */
+uint64_t ps3_system_time_us(void);   /* runtime/syscalls/sys_timer.c */
 
 /* VBlank counter (incremented on each flip as approximation) */
 static u32 s_vblank_count = 0;
@@ -591,7 +594,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_vblank_handler = NULL;
     s_user_handler = NULL;
     s_second_v_handler = NULL;
-    s_last_flip_time = get_timestamp_ns();
+    s_last_flip_time = ps3_system_time_us();
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
@@ -867,7 +870,7 @@ void cellGcm_request_tick(void)
       if (need) {
           u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
           const int flip = s_fifo_getoff == put;
-          if (flip) { FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK(); }
+          if (flip) { FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; s_last_flip_time = ps3_system_time_us(); FLIP_UNLOCK(); }
           GCM_PENDING_SET(flip ? 3 : 1);
           return;
       } }
@@ -879,7 +882,7 @@ void cellGcm_request_tick(void)
      * are unaffected. The completion is stamped with the flip requested last
      * (see ppu_gcm_pump). */
     if (gcm_flip_executed_take()) {
-        FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();
+        FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; s_last_flip_time = ps3_system_time_us(); FLIP_UNLOCK();
         GCM_PENDING_SET(3);
     } else {
         GCM_PENDING_SET(1);
@@ -1027,7 +1030,7 @@ void cellGcmTickFlip(void)
      * not happened yet. */
     FLIP_LOCK();
     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
-    if (waiting) s_flip_tick_seq = s_flip_req_seq;
+    if (waiting) { s_flip_tick_seq = s_flip_req_seq; s_last_flip_time = ps3_system_time_us(); }
     FLIP_UNLOCK();
     if (waiting) GCM_PENDING_SET(2);
 }
@@ -3455,7 +3458,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
     FLIP_UNLOCK();
-    s_last_flip_time = get_timestamp_ns();
+    /* cellGcmGetLastFlipTime is stamped where the flip completes (the vblank
+     * that shows it: the ticker paths above), not here at the request. */
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
 
@@ -3563,7 +3567,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
-    s_last_flip_time = get_timestamp_ns();
+    s_last_flip_time = ps3_system_time_us();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
      * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
@@ -3629,7 +3633,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     gcm_update_handler_mask();
 }
 
-/* NID: 0x21AC3697 */
+/* NID: 0x63387071 (0x21AC3697 is cellGcmAddressToOffset) */
 u64 cellGcmGetLastFlipTime(void)
 {
     return s_last_flip_time;

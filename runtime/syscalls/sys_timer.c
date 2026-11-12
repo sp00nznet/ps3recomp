@@ -82,6 +82,28 @@ uint64_t ppu_timebase_now(void)
 #endif
 }
 
+/* Microseconds of guest system time (sys_time_get_system_time). On Windows
+ * it counts from the first read, elsewhere it is the host monotonic clock.
+ * cellGcmGetLastFlipTime stamps flips with it too: titles pace frames as
+ * period - (system time - last flip time), so the two must share clock and
+ * unit (the flip stamp used to be absolute QPC nanoseconds, which made that
+ * difference meaningless and every such limiter sleep its whole period). */
+uint64_t ps3_system_time_us(void)
+{
+#ifdef _WIN32
+    static LONGLONG t0 = 0;
+    ensure_qpc_init();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
+    uint64_t d = (uint64_t)(now.QuadPart - t0);
+    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+    return (d / q) * 1000000ull + (d % q) * 1000000ull / q;
+#else
+    return host_monotonic_ns() / 1000ull;
+#endif
+}
+
 #ifndef _WIN32
 uint64_t host_monotonic_ns(void)
 {
