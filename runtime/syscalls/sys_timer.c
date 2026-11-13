@@ -57,7 +57,7 @@ int lv2_deadline_passed(int64_t deadline)
  * PPU timebase (mftb/mftbu) -- THE guest clock.
  *
  * One global monotonic counter scaled to the PS3 timebase (79.8 MHz),
- * anchored at first use. The old lifter emission was a per-call-site
+ * counted from host boot. The old lifter emission was a per-call-site
  * static that advanced 16667 ticks PER READ -- not a clock at all: every
  * guest timing loop (media pacers, throttles, profilers) computed garbage
  * from it, and each call site had a PRIVATE counter that only moved when
@@ -67,12 +67,14 @@ int lv2_deadline_passed(int64_t deadline)
 uint64_t ppu_timebase_now(void)
 {
 #ifdef _WIN32
-    static LONGLONG t0 = 0;
+    /* Counted from HOST boot, as the PS3 timebase counts from console boot
+     * and as the POSIX path below does. A per-process anchor made every
+     * launch start at 0, so the upper word read 0 for the first ~54 s and
+     * clock-derived seeds repeated run to run. */
     ensure_qpc_init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
-    uint64_t d = (uint64_t)(now.QuadPart - t0);
+    uint64_t d = (uint64_t)now.QuadPart;
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
