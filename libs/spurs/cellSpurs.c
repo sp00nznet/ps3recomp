@@ -1150,6 +1150,207 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
 }
 
 /* =========================================================================
+ * Taskset2 / Task2 (CellSpurs2 family) -- spurs_test (D group), 2026-10-28.
+ *
+ * CellSpursTaskset2 layout (RPCS3 cellSpurs.h): identical to the v1 taskset
+ * through 0x189C, then task_exit_code[128] (16 bytes each) at 0x1980 --
+ * exit code as BE u32 at +8, byte 14 must stay 0 (non-zero reads as ESRCH),
+ * byte 15 low nibble = state (2 = exited, 4 = joined). Struct size 0x2900.
+ * All guest-memory accesses via the BE accessors per the spurs_taskset.h
+ * warning. The SPU runtime already maintains the exit records for tasksets
+ * registered with spu_taskset2_register() (spu_workload.c) once tasks run.
+ * =====================================================================*/
+enum {
+    TS2_EXITCODE      = 0x1980,   /* task_exit_code[128], 16 bytes each */
+    TS2_EXITCODE_STRIDE = 16,
+    TS2_ST_RUNNING    = 0,        /* byte15 low nibble: created, not exited */
+    TS2_ST_EXITED     = 2,
+    TS2_ST_JOINED     = 4,
+    TS2_STRUCT_END    = 0x2900,
+};
+
+/* Shared task-2 creation body (used by cellSpursCreateTask2WithBinInfo once
+ * its ABI is decoded). eaElf/context_ea/task_lsp are already resolved;
+ * task_arg is the 16-byte CellSpursTaskArgument (Task2's only channel into
+ * the SPU task's r3). Slot/bitset/TaskInfo machinery and the dispatch path
+ * are shared with cellSpursCreateTask (see its comments). */
+static s32 spurs_create_task2_impl(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
+                                   u64 context_ea, const u32 task_arg[4],
+                                   const u32 task_lsp[4])
+{
+    if (!taskset_ea || !taskId_ea)
+        return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!g_ydkj_real_taskset_ea) /* real-BE init flag (same as v1 CreateTask) */
+        return CELL_SPURS_TASK_ERROR_STAT;
+    if (!spurs_guest_range_valid((u32)taskset_ea, TS2_STRUCT_END))
+        return (s32)0x8041090Du;
+
+    u32 slot = spurs_taskset_take_slot((u32)taskset_ea, CELL_SPURS_MAX_TASK);
+    if (slot >= CELL_SPURS_MAX_TASK) {
+        fprintf(stderr, "[cellSpurs] CreateTask2: taskset 0x%08X has no free task id\n",
+                (u32)taskset_ea);
+        return CELL_SPURS_TASK_ERROR_NOMEM;
+    }
+    vm_write32((u32)taskId_ea, slot);   /* guest reads it BE */
+    { extern void spu_taskset_mark_running(uint32_t, uint32_t);
+      spu_taskset_mark_running((u32)taskset_ea, slot); }
+    { extern void spu_taskset2_set_exit(uint32_t, uint32_t, int, uint32_t);
+      spu_taskset2_set_exit((u32)taskset_ea, slot, 0, 0); }  /* fresh record */
+    spurs_taskset_add_task((u32)taskset_ea, slot, eaElf, context_ea,
+                           task_arg, task_lsp);
+    g_ydkj_real_taskset_ea = (u32)taskset_ea;  /* dispatch handoff (v1 pattern) */
+    g_ydkj_real_taskid     = slot;
+    printf("[cellSpurs] CreateTask2(id=%u taskset=0x%08X elf=0x%llX ctx=0x%llX"
+           " arg=%08X %08X %08X %08X)\n",
+           slot, (u32)taskset_ea, (unsigned long long)eaElf,
+           (unsigned long long)context_ea,
+           task_arg[0], task_arg[1], task_arg[2], task_arg[3]);
+
+    if (eaElf) {
+        const uint8_t* host_elf = GUEST_PTR((void*)(uintptr_t)eaElf, const uint8_t*);
+        size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
+        if (sz)
+            spu_workload_dispatch_async(host_elf, (uint32_t)sz, (uint32_t)context_ea);
+        else { static int _n = 0; if (PS3_LOG_FIRST(_n, 1000))
+            fprintf(stderr, "[cellSpurs] CreateTask2 id=%u taskset=0x%08X "
+                    "eaElf=0x%08llX NOT an SPU ELF (sz=0) head=%02X%02X%02X%02X "
+                    "%02X%02X%02X%02X ctx=0x%08llX\n", slot, (u32)taskset_ea,
+                    (unsigned long long)eaElf,
+                    host_elf[0], host_elf[1], host_elf[2], host_elf[3],
+                    host_elf[4], host_elf[5], host_elf[6], host_elf[7],
+                    (unsigned long long)context_ea); }
+    }
+    return CELL_OK;
+}
+
+/* cellSpursCreateTask2WithBinInfo(taskset, taskId*, binInfo, argument, eaContext)
+ * -- ABI CONFIRMED on spurs_test (2026-10-28) three ways: SPURS2_TRACE register
+ * dump (5 GPR args, a8/a9 unused), static ground truth in the guest ELF
+ * (binInfo->eaElf @0x23580 starts with the SPU ELF magic, one embedded image
+ * per ping-pong task), and RPCS3's SPU policy (spursTasksetStartTask hands the
+ * task r3 = TaskInfo.args, r4 = taskset, pc = entry).
+ * CellSpursTaskBinInfo: eaElf u64@0x00, sizeContext u32@0x08, lsPattern u64@0x10.
+ * r6 = the 16-byte CellSpursTaskArgument (each ping-pong task's event-flag
+ * bit rides in word 0), r7 = the per-task context save buffer (sizeContext).
+ * SPURS2_TRACE register/binInfo/argument dumps are gated behind the env var. */
+s32 cellSpursCreateTask2WithBinInfo(u64 taskset_ea, u64 taskId_ea, u64 binInfo_ea,
+                                    u64 argument_ea, u64 eaContext)
+{
+    static int s_traced = 0;
+    if (s_traced < 40 && getenv("SPURS2_TRACE")) {   /* 40: cover ping-pong r1+r2, MFC war r3+r4 */
+        s_traced++;
+        fprintf(stderr, "[cellSpurs] CreateTask2WithBinInfo ABI: taskset=0x%llX taskId*=0x%llX binInfo=0x%llX argument=0x%llX eaContext=0x%llX\n",
+                (unsigned long long)taskset_ea, (unsigned long long)taskId_ea,
+                (unsigned long long)binInfo_ea, (unsigned long long)argument_ea,
+                (unsigned long long)eaContext);
+        const char* nm[2] = {"binInfo", "argument"};
+        u64 av[2] = {binInfo_ea, argument_ea};
+        for (int k = 0; k < 2; k++) {
+            if (!av[k] || !spurs_guest_range_valid((u32)av[k], 64)) continue;
+            fprintf(stderr, "  %s @0x%llX:", nm[k], (unsigned long long)av[k]);
+            for (u32 o = 0; o < 64; o += 4)
+                fprintf(stderr, " %08X", vm_read32((u32)av[k] + o));
+            fprintf(stderr, "\n");
+        }
+    }
+
+    u64 eaElf = 0;
+    u32 task_lsp[4] = {0, 0, 0, 0};
+    if (binInfo_ea) {
+        if (!spurs_guest_range_valid((u32)binInfo_ea, 32)) return (s32)0x8041090Du;
+        eaElf = vm_read64((u32)binInfo_ea + 0x00);
+        for (int i = 0; i < 4; i++) task_lsp[i] = vm_read32((u32)binInfo_ea + 0x10 + i * 4);
+    }
+    u32 task_arg[4] = {0, 0, 0, 0};
+    if (argument_ea) {
+        if (!spurs_guest_range_valid((u32)argument_ea, 16)) return (s32)0x8041090Du;
+        for (int i = 0; i < 4; i++) task_arg[i] = vm_read32((u32)argument_ea + i * 4);
+    }
+    return spurs_create_task2_impl(taskset_ea, taskId_ea, eaElf, eaContext,
+                                   task_arg, task_lsp);
+}
+
+/* cellSpursJoinTask2(taskset, taskId, exitCode*): wait for the task's
+ * task_exit_code record (state 2), mark it joined (4), hand the BE exit
+ * code to the caller. Blocks like the real firmware; unblocks when the
+ * SPU task exit path (spu_taskset2_set_exit) publishes the record. */
+s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
+{
+    if (!taskset_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (taskId >= CELL_SPURS_MAX_TASK) return CELL_SPURS_TASK_ERROR_INVAL;
+    if (!spurs_guest_range_valid((u32)taskset_ea, TS2_STRUCT_END))
+        return (s32)0x8041090Du;
+    /* No ENABLED-bit precondition: the policy clears ENABLED when the task
+     * exits (RPCS3 SPURS_TASKSET_REQUEST_DESTROY_TASK), so a successfully
+     * exited task looks "disabled" here -- gating on it made every avalanche
+     * join fail with SRCH (0x80410725). The exit-code record alone decides. */
+
+    const uint32_t rec = (uint32_t)taskset_ea + TS2_EXITCODE
+                       + TS2_EXITCODE_STRIDE * taskId;
+    static int s_wait_log = 0;
+    uint32_t waited = 0;
+    for (;;) {
+        uint8_t* e = vm_base + rec;
+        uint8_t b14 = e[14];
+        uint8_t state = e[15] & 0xF;
+        if (b14) {
+            printf("[cellSpurs] JoinTask2 SRCH id=%u taskset=0x%08X "
+                   "b14=0x%02X state=%u rec=%02X%02X%02X%02X %02X%02X%02X%02X "
+                   "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                   taskId, (u32)taskset_ea, b14, state,
+                   e[0],e[1],e[2],e[3], e[4],e[5],e[6],e[7],
+                   e[8],e[9],e[10],e[11], e[12],e[13],e[14],e[15]);
+            return CELL_SPURS_TASK_ERROR_SRCH;   /* record invalidated */
+        }
+        if (state == TS2_ST_EXITED) {
+            u32 code = ((u32)e[8] << 24) | ((u32)e[9] << 16)
+                     | ((u32)e[10] << 8) | e[11];
+            { extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+              spu_lockline_lock(); e[15] = TS2_ST_JOINED; spu_lockline_unlock(); }
+            if (exitCode_ea) vm_write32((u32)exitCode_ea, code);
+            printf("[cellSpurs] JoinTask2(id=%u taskset=0x%08X exit=0x%08X)\n",
+                   taskId, (u32)taskset_ea, code);
+            return CELL_OK;
+        }
+        if (state == TS2_ST_JOINED) {
+            /* spurs_test 2026-10-28: the avalanche joins the SAME task id
+             * twice -- the id was recycled by a second task that also exited
+             * before the PPU joined (all creates precede all joins in this
+             * test). The reference run (RPCS3 TTY) shows no error for it, so a
+             * join on an already-joined record returns the cached exit code
+             * again instead of SRCH. The record stays valid until the next
+             * create of that id overwrites it (CreateTask2 writes a fresh
+             * record). */
+            u32 code = ((u32)e[8] << 24) | ((u32)e[9] << 16)
+                     | ((u32)e[10] << 8) | e[11];
+            if (exitCode_ea) vm_write32((u32)exitCode_ea, code);
+            printf("[cellSpurs] JoinTask2(id=%u taskset=0x%08X exit=0x%08X) (rejoin)\n",
+                   taskId, (u32)taskset_ea, code);
+            return CELL_OK;
+        }
+        /* still running: poll (the SPU task exit path writes the record from
+         * another host thread; nothing notifies us, so poll) */
+        if (waited == 0 || waited >= 1000) {
+            if (waited && PS3_LOG_FIRST(s_wait_log, 8))
+                printf("[cellSpurs] JoinTask2 waiting task=%u taskset=0x%08X (%us)\n",
+                       taskId, (u32)taskset_ea, waited / 1000);
+            waited = 1;
+        } else waited += 5;
+        Sleep(5);
+    }
+}
+
+/* cellSpursDestroyTaskset2(taskset): teardown after all tasks joined.
+ * Guest-visible effect is only the return code (same simplification as the
+ * v1 DestroyTaskset, which shipped with real titles). */
+s32 cellSpursDestroyTaskset2(u64 taskset_ea)
+{
+    if (!taskset_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    printf("[cellSpurs] DestroyTaskset2(ea=0x%08X)\n", (u32)taskset_ea);
+    return CELL_OK;
+}
+
+/* =========================================================================
  * Task
  * =====================================================================*/
 
