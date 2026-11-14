@@ -168,11 +168,11 @@ int main(int argc, char** argv)
     run("cellSaveDataUserAutoLoad", 0xCDC6AEFDu, 0x0001CAFEu);
     run("cellSaveDataUserAutoSave", 0x52AAC4FAu, 0x0001BEEFu);
 
-    /* The list variants: one save directory under the prefix "TEST". A title
-     * with no PARAM.SFO of its own (an empty directory) is a new save. */
+    /* The list variants: one save directory under the prefix "TEST". An empty
+     * directory (no PARAM.SFO) counts as a new save. */
     char dir[1100];
     snprintf(dir, sizeof dir, "%s/" LISTED_DIR, s_save_root);
-    if (mkdir(dir, 0700) != 0) { puts("FAIL: mkdir"); return 1; }
+    if (HOST_MKDIR(dir) != 0) { puts("FAIL: mkdir"); return 1; }
     strcpy((char*)vm_base + 0x340, "TEST");
     vm_write32(0x108, 0x340);     /* setList.prefix */
     vm_write32(0x200, 1);         /* setBuf.dirListMax */
