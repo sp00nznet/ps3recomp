@@ -97,6 +97,21 @@ static int target_invalid(int op) {
         || op == R_DFCMGT || op == R_DFTSV;
 }
 
+/* cflts/cfltu at I8 <= 14 halt the interpreter (and lifted code) on a lane with
+ * sh = be + 23 - I8 >= 264, where the console's result is not modelled (spu_cfl_unmodelled_lane in
+ * spu_helpers.h), so a trial whose operand has a lane with be >= 241 + I8 cannot be compared with
+ * RPCS3's model and is skipped. The test does not decide which of those lanes the model covers; it
+ * only keeps out of the region where a halt is possible. Every other lane at I8 <= 14, and every
+ * lane at I8 >= 15 (max sh = 263), runs and is compared. */
+static int cfl_stop_region(int op, uint32_t insn, const u128* regs) {
+    if (op != R_CFLTS && op != R_CFLTU) return 0;
+    const uint32_t i8 = (insn >> 14) & 0xFF;
+    if (i8 > 14u) return 0;
+    const u128* a = &regs[(insn >> 7) & 0x7F];
+    for (int i = 0; i < 4; i++) if (((a->_u32[i] >> 23) & 0xFFu) >= 241u + i8) return 1;
+    return 0;
+}
+
 /* ---- big-endian quadword model ---- */
 typedef struct { uint8_t b[16]; } Q;
 typedef unsigned __int128 u128b;
@@ -558,6 +573,7 @@ static char g_hand_ops[1024], g_skip_ops[1024];
 
 /* Execute one trial. Returns 1 on mismatch. */
 static int one_trial(int op, uint32_t insn, uint32_t pc, backend_fn be, void* user, OpStat* st, int* printed, const char* nm) {
+    if (cfl_stop_region(op, insn, g_orig)) return 0;
     uint32_t m = pc & 0x3FFFC; uint8_t patch[4] = { insn >> 24, insn >> 16, insn >> 8, insn }, sv[4];
     uint32_t srr0 = rnd(), evt = rnd() & 1, ch_in = int_word(), ch_cnt = int_word();
     memcpy(sv, g_ls0 + m, 4);

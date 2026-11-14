@@ -753,6 +753,29 @@ class SPULifter:
                     f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
                     f"spu_halt(ctx); return;")
 
+        # cflts/cfltu at I8 <= 14: the conversion shifts by sh = be + 23 - I8, and a
+        # lane with sh >= 264 (be >= 241 + I8, so only at these scales) leaves the
+        # console's saturating path for a result nothing models (cflts at every such
+        # lane; cfltu except negative lanes and sh == 264, which were measured;
+        # console probe, CECHC04 on FW 4.81, see spu__cfl_lane in spu_helpers.h).
+        # Which lanes reach it depends on the data, so the lifted code asks
+        # spu_cfl_unmodelled_lane(), the interpreter's check, before it writes the
+        # destination, and halts the same way when a lane does. I8 >= 15 cannot reach
+        # it (max sh = 263) and lifts to the bare helper call.
+        if mn in ("cflts", "cfltu"):
+            i8 = int(_imm(ops[2]), 0)
+            if i8 <= 14:
+                uns = 1 if mn == "cfltu" else 0
+                src = g(ra())
+                return (f"{{ int cfl_l = spu_cfl_unmodelled_lane({src}, {i8}, {uns}); "
+                        f"if (cfl_l >= 0) {{ ctx->pc = {self._pc(addr)}; "
+                        f"fprintf(stderr, \"[spu] INVALID-OP {mn}: unmodelled cflts/cfltu lane ({mn} I8={i8} lane=%d in=0x%08X) "
+                        f"(0x%08X) at LS 0x%05X img=%d\\n\", "
+                        f"cfl_l, (unsigned){src}._u32[cfl_l], 0x{insn.raw:08X}u, (unsigned)ctx->pc, ctx->image_id); "
+                        f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
+                        f"spu_halt(ctx); return; }} }} "
+                        f"{g(rt())} = spu_{mn}({src}, {i8});")
+
         # ---- integer arithmetic (register) ----
         rr_bin = {
             "a": "spu_a", "sf": "spu_sf", "ah": "spu_ah", "sfh": "spu_sfh",

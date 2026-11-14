@@ -214,8 +214,20 @@ static int spu_step(spu_context* ctx) {
     case SPU_fm: DST = spu_fm(A,B); break;
     case SPU_fcgt: DST = spu_fcgt(A,B); break;
     case SPU_fceq: DST = spu_fceq(A,B); break;
-    case SPU_cflts: DST = spu_cflts(A,I); break;
-    case SPU_cfltu: DST = spu_cfltu(A,I); break;
+    /* At I8 <= 14 a lane with sh = be + 23 - I8 >= 264 leaves the console's saturating path for
+     * a result nothing models (spu_cfl_unmodelled_lane; console probe, CECHC04 on FW 4.81, see
+     * spu__cfl_lane in spu_helpers.h). I8 >= 15 cannot reach it (max sh = 263) and costs only
+     * the I8 test. Halt at the word, like an undecodable one, instead of running on with a
+     * value the console never produced. */
+    case SPU_cflts: case SPU_cfltu: {
+        const int uns = d.op == SPU_cfltu;
+        const int lane = spu_cfl_unmodelled_lane(A, I, uns);
+        if (lane >= 0) {
+            fprintf(stderr, "[spu_interp] unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X) (0x%08X) at LS 0x%05X\n",
+                    uns ? "cfltu" : "cflts", (unsigned)I, lane, (unsigned)A._u32[lane], insn, pc);
+            ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1;
+        }
+        DST = uns ? spu_cfltu(A,I) : spu_cflts(A,I); break; }
     case SPU_csflt: DST = spu_csflt(A,I); break;
     case SPU_cuflt: DST = spu_cuflt(A,I); break;
     case SPU_frest:  DST = spu_frest(A); break;

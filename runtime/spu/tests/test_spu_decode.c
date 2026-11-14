@@ -227,6 +227,47 @@ int main(void) {
         CHECK(d.op == SPU_dfa, "dfa still decodes", i);
     }
 
+    /* cflts/cfltu at I8 <= 14 halt on a lane in the unmodelled region (sh = be + 23 - I8 >= 264,
+     * spu_cfl_unmodelled_lane in spu_helpers.h; console probe, CECHC04 on FW 4.81) and write
+     * nothing; every modelled lane runs, and I8 >= 15 never halts. Words: 0x3F800000 is 1.0
+     * (modelled at every scale), 0x7F800000 / 0xFFFFFFFF are exponent-255 words of either sign,
+     * 0x7F5BAACA / 0xFF66344D exponent 254. */
+    {
+        static const struct { uint32_t op10; uint32_t i8; uint32_t in[4]; int lane; uint32_t want[4]; } c[] = {
+            /* halts: lane named, destination untouched */
+            { 0x1D8, 14, { 0x3F800000, 0x7F800000, 0x3F800000, 0xFFFFFFFF }, 1, {0} },
+            { 0x1D8, 0,  { 0x3F800000, 0x3F800000, 0x3F800000, 0xFFABDE3D }, 3, {0} },
+            { 0x1D9, 13, { 0x3F800000, 0x7F800000, 0x7F5BAACA, 0xFFFFFFFF }, 1, {0} },
+            { 0x1D9, 0,  { 0x79607710, 0x3F800000, 0x3F800000, 0x3F800000 }, 0, {0} },
+            /* runs: sh 263 (both ops), sh 264 for cfltu (+ -> all ones, - -> 0) */
+            { 0x1D8, 14, { 0x3F800000, 0x3F800000, 0x7F5BAACA, 0xFF66344D }, -1,
+              { 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x80000000 } },
+            { 0x1D9, 14, { 0x3F800000, 0x7F800000, 0x7F5BAACA, 0xFFFFFFFF }, -1,
+              { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0 } },
+            /* I8 15 cannot reach sh 264: an exponent-255 NaN lane converts (console: sh = 263) */
+            { 0x1D8, 15, { 0x3F800000, 0x3F800000, 0x3F800000, 0xFFABDE3D }, -1,
+              { 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x80000000 } },
+        };
+        for (unsigned k = 0; k < sizeof c / sizeof c[0]; k++) {
+            const uint32_t word = ri8(c[k].op10, c[k].i8, 4, 3);
+            memset(&run_ctx, 0, sizeof run_ctx);
+            spu_context_init(&run_ctx, 0);
+            run_ctx.image_id = -1;
+            for (int l = 0; l < 4; l++) run_ctx.gpr[4]._u32[l] = c[k].in[l];
+            put_word(0x100, word);                      /* cflts/cfltu r3,r4,I8 */
+            put_word(0x104, ri16(0x081, 1, 5));         /* il r5,1: runs only if the word did */
+            put_word(0x108, 0);                         /* stop 0 */
+            (void)spu_interp_run(&run_ctx, 0x100);
+            if (c[k].lane >= 0) {
+                CHECK(run_ctx.status == SPU_STATUS_STOPPED_BY_HALT && run_ctx.pc == 0x100, "cfl halt at the word", word);
+                CHECK(run_ctx.gpr[3]._u32[0] == 0 && run_ctx.gpr[5]._u32[0] == 0, "cfl wrote nothing", word);
+            } else {
+                CHECK(run_ctx.status == SPU_STATUS_STOPPED_BY_STOP && run_ctx.gpr[5]._u32[0] == 1, "cfl ran on", word);
+                CHECK(!memcmp(run_ctx.gpr[3]._u32, c[k].want, 16), "cfl modelled lanes", word);
+            }
+        }
+    }
+
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("spu_decode1: all contract checks passed\n");
     return 0;

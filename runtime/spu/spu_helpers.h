@@ -1305,11 +1305,26 @@ static inline u128 spu_fcmgt(u128 a, u128 b) { return spu_fcmgt_ref(a, b); }
 
 /* cflts / cfltu: value * 2^(173 - i8), truncated toward zero, saturating to the integer range.
  * csflt / cuflt: integer / 2^(155 - i8) as an extended-range single (truncated). The ISA leaves
- * scales outside 0..127 undefined; these compute the same formula for them. */
+ * scales outside 0..127 undefined; these compute the same formula for them.
+ *
+ * cflts/cfltu do NOT convert an exponent-0 input (zero or denormal) to zero: its significand is 0,
+ * but the saturating conversion still saturates on the shift amount sh = be + 23 - i8, so sh >= 8
+ * gives 0x7FFFFFFF / 0x80000000 (signed, by sign) and sh >= 9 gives 0xFFFFFFFF (unsigned, sign 0;
+ * a negative input is 0 as always and sh == 8 does not saturate unsigned). Console probe, CECHC04
+ * on FW 4.81: a sweep of both ops at I8 0..16 (129024 lanes) is reproduced by this rule for every
+ * lane with sh < 264, the cfltu lanes at sh == 264 and every negative cfltu lane. With m = 0 for
+ * be == 0 it needs no separate exponent-0 branch, and for i8 >= 15 (sh <= 263) it is the formula
+ * these functions always had.
+ *
+ * sh >= 264 is reachable only for i8 <= 14 (be >= 241 + i8). There the console leaves the
+ * saturating path and the result is NOT modelled: 2899 observed lanes (cflts at sh >= 264, cfltu
+ * at sh > 264 with the sign clear, NaN-class exponents included) fit no rule, and none of them
+ * equals the saturation below. Those lanes keep it for direct callers only; the interpreter and
+ * the lifter ask spu_cfl_unmodelled_lane() and halt at the word instead of executing it. */
 static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
-    uint32_t m; int e;
-    if (!spu__sf_split(x, &m, &e)) return 0;
-    const int sh = e + scale, neg = (x >> 31) != 0;
+    const uint32_t be = (x >> 23) & 0xFFu;
+    const uint32_t m = be ? ((x & 0x7FFFFFu) | 0x800000u) : 0u;   /* exponent 0: significand 0 */
+    const int sh = (int)be - 150 + scale, neg = (x >> 31) != 0;  /* = be + 23 - i8 */
     if (is_unsigned) {
         if (neg) return 0;
         if (sh >= 9) return 0xFFFFFFFFu;                   /* >= 2^32 */
@@ -1318,6 +1333,23 @@ static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
     if (sh >= 8) return neg ? 0x80000000u : 0x7FFFFFFFu;   /* magnitude >= 2^31 */
     const uint32_t v = sh >= 0 ? m << sh : (sh <= -24 ? 0 : m >> -sh);
     return neg ? 0u - v : v;
+}
+/* The first lane (0..3) of `a` whose cflts (is_unsigned = 0) / cfltu (1) result at scale `i8` the
+ * model does not know, or -1 when every lane is modelled. A lane is unmodelled when sh >= 264,
+ * except for cfltu, where a negative lane (always 0) and the sh == 264 lane (0xFFFFFFFF) were
+ * measured. sh <= 263 for i8 >= 15, so those scales return -1 at once. The interpreter and the
+ * lifter use this to halt (fail closed) instead of guessing. */
+static inline int spu_cfl_unmodelled_lane(u128 a, int i8, int is_unsigned) {
+    i8 &= 0xFF;
+    if (i8 > 14) return -1;
+    for (int i = 0; i < 4; i++) {
+        const uint32_t x = a._u32[i];
+        const int sh = (int)((x >> 23) & 0xFFu) + 23 - i8;
+        if (sh < 264) continue;
+        if (is_unsigned && ((x >> 31) != 0 || sh == 264)) continue;
+        return i;
+    }
+    return -1;
 }
 static inline u128 spu_cflts_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
 static inline u128 spu_cfltu_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
@@ -1720,25 +1752,29 @@ SPU__XE_INLINE u128 spu_frsqest(u128 a) {
     rexp = _mm_blendv_epi8(rexp, _mm_set1_epi32(255), _mm_cmpeq_epi32(exp, _mm_setzero_si128()));
     return spu__xe_st(_mm_or_si128(_mm_slli_epi32(rexp, 23), frac));
 }
-/* cflts/cfltu: the 24-bit significand shifted by be - 150 + (173 - i8), saturated. */
+/* cflts/cfltu: the 24-bit significand shifted by be - 150 + (173 - i8), saturated. An exponent-0
+ * lane (zero/denormal) has significand 0 but still saturates on the shift amount (sh >= 8 signed,
+ * sh >= 9 unsigned; console probe, see spu__cfl_lane), which m = 0 below models without masking
+ * the result afterwards. A lane at sh >= 264 (I8 <= 14) keeps this saturation but is unmodelled
+ * unless spu_cfl_unmodelled_lane() says otherwise: the interpreter and the lifter stop on it. */
 SPU__XE_INLINE __m128i spu__xe_cfl(u128 a, int i8, int is_unsigned) {
     const __m128i x = spu__xe_ld(a);
     const __m128i be = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
-    const __m128i m = _mm_or_si128(_mm_and_si128(x, _mm_set1_epi32(0x7FFFFF)), _mm_set1_epi32(0x800000));
+    const __m128i isz = _mm_cmpeq_epi32(be, _mm_setzero_si128());
+    const __m128i m = _mm_andnot_si128(isz, _mm_or_si128(_mm_and_si128(x, _mm_set1_epi32(0x7FFFFF)), _mm_set1_epi32(0x800000)));
     const __m128i sh = _mm_add_epi32(be, _mm_set1_epi32(23 - (i8 & 0xFF)));     /* be - 150 + 173 - i8 */
     const __m128i lsh = _mm_max_epi32(sh, _mm_setzero_si128());
     const __m128i rsh = _mm_max_epi32(_mm_sub_epi32(_mm_setzero_si128(), sh), _mm_setzero_si128());
     __m128i v = _mm_blendv_epi8(_mm_srlv_epi32(m, rsh), _mm_sllv_epi32(m, lsh),
                                 _mm_cmpgt_epi32(sh, _mm_set1_epi32(-1)));       /* counts >= 32 give 0 */
-    const __m128i neg = _mm_srai_epi32(x, 31), isz = _mm_cmpeq_epi32(be, _mm_setzero_si128());
+    const __m128i neg = _mm_srai_epi32(x, 31);
     if (is_unsigned) {
         v = _mm_or_si128(v, _mm_cmpgt_epi32(sh, _mm_set1_epi32(8)));              /* >= 2^32: all ones */
-        return _mm_andnot_si128(_mm_or_si128(neg, isz), v);                       /* negative or zero: 0 */
+        return _mm_andnot_si128(neg, v);                                           /* negative: 0 */
     }
     v = _mm_sub_epi32(_mm_xor_si128(v, neg), neg);                                /* negate the negative lanes */
     const __m128i sat = _mm_xor_si128(_mm_set1_epi32(0x7FFFFFFF), neg);           /* 0x7FFFFFFF / 0x80000000 */
-    v = _mm_blendv_epi8(v, sat, _mm_cmpgt_epi32(sh, _mm_set1_epi32(7)));
-    return _mm_andnot_si128(isz, v);
+    return _mm_blendv_epi8(v, sat, _mm_cmpgt_epi32(sh, _mm_set1_epi32(7)));
 }
 SPU__XE_INLINE u128 spu_cflts(u128 a, int i8) { return spu__xe_st(spu__xe_cfl(a, i8, 0)); }
 SPU__XE_INLINE u128 spu_cfltu(u128 a, int i8) { return spu__xe_st(spu__xe_cfl(a, i8, 1)); }
