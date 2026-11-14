@@ -189,14 +189,19 @@ if(WIN32)
 endif()
 
 # sys_event_queue_destroy modes (EINVAL / EBUSY / FORCE -> ECANCELED), ports
-# disconnected from a destroyed queue, and the absolute deadline of a timed
-# receive. Links sys_event.c alone.
+# disconnected from a destroyed queue, a destroy racing a receive or a periodic
+# timer send in flight, and the absolute deadline of a timed receive. Links
+# sys_event.c, and sys_timer.c off Windows (the timer's queue admission).
 add_executable(test_event_queue_destroy
     test_event_queue_destroy.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_event.c")
+# sys_event.c calls ps3_sync_test_hook (defined by the test) at the points where
+# the test parks a call to order a destroy against it.
+target_compile_definitions(test_event_queue_destroy PRIVATE PS3_SYNC_TEST_HOOKS)
 if(NOT WIN32)
     target_sources(test_event_queue_destroy PRIVATE
-        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
+        "${RUNTIME_SYNC_DIR}/sys_timer.c")
     find_package(Threads REQUIRED)
     target_link_libraries(test_event_queue_destroy PRIVATE Threads::Threads)
 endif()
