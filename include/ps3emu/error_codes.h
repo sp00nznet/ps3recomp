@@ -138,12 +138,13 @@
 #define CELL_SYSUTIL_ERROR_SIZE             (CELL_ERROR_BASE_SYSUTIL | 0x03)
 #define CELL_SYSUTIL_ERROR_NUM              (CELL_ERROR_BASE_SYSUTIL | 0x04)
 
-/* pad errors */
+/* pad errors. libio (FW 4.93) returns 0x80121107 for a port with no connected
+ * device; 0x80121105 is its RESOURCE_ALLOCATION_FAILED. */
 #define CELL_PAD_ERROR_FATAL                (CELL_ERROR_BASE_PAD | 0x01)
 #define CELL_PAD_ERROR_INVALID_PARAMETER    (CELL_ERROR_BASE_PAD | 0x02)
 #define CELL_PAD_ERROR_ALREADY_OPENED       (CELL_ERROR_BASE_PAD | 0x03)
 #define CELL_PAD_ERROR_NOT_OPENED           (CELL_ERROR_BASE_PAD | 0x04)
-#define CELL_PAD_ERROR_NO_DEVICE            (CELL_ERROR_BASE_PAD | 0x05)
+#define CELL_PAD_ERROR_NO_DEVICE            (CELL_ERROR_BASE_PAD | 0x07)
 
 /* audio errors */
 #define CELL_AUDIO_ERROR_ALREADY_INIT       (CELL_ERROR_BASE_AUDIO | 0x01)
