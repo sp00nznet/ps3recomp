@@ -232,6 +232,37 @@ static int armed_lockstep(void)
     printf("DRAIN_LAUNCH lockstep passed=%d failed=%d\n",g_pass,g_fail);
     return g_fail?1:0;
 }
+/* A drain's resume after a call bracket resolves through the resident code spans, like indirect dispatch: the span's
+ * owner decides, not the image of the context that started the drain. LS 0xA00..0xB00 is owned by another image
+ * here, while the context's own image still has a (stale) lift at 0xA10. */
+static int resume_stale_ran, resume_owner_ran;
+static void resume_stale_fn(spu_context* c) { (void)c; ++resume_stale_ran; }
+static void resume_owner_fn(spu_context* c) { ++resume_owner_ran; spu_halt(c); }
+static void resume_entry(spu_context* c) { c->pc=0xA10; }   /* nothing queued, pc away from the return pc */
+static void resume_driver(spu_context* c)
+{
+    c->host_depth=3;   /* lifted host frames below this drain */
+    g_spu_trampoline_fn=resume_entry;spu_drain_call(c,0xB00);
+    CHECK(0); /* the drain must halt or unwind, not return */
+}
+static void resident_span_resume(void)
+{
+    /* The owner has no lift at 0xA10: the stale lift of the context's own image must not count, so the drain
+     * unwinds to the driver (host depth 0), which interprets the span's code. */
+    spu_context* c=make_context(910);
+    c->resident_code[0].lsa=0xA00;c->resident_code[0].size=0x100;c->resident_code[0].image_id=912;
+    CHECK(spu_run_with_halt(resume_driver,c)==1);
+    CHECK(resume_stale_ran==0 && resume_owner_ran==0);
+    CHECK(c->host_depth==0);
+    release_context(c);
+    /* The owner has a lift at 0xA10: the drain resumes in place, in the owner's function. */
+    c=make_context(910);
+    c->resident_code[0].lsa=0xA00;c->resident_code[0].size=0x100;c->resident_code[0].image_id=911;
+    CHECK(spu_run_with_halt(resume_driver,c)==1);
+    CHECK(resume_stale_ran==0 && resume_owner_ran==1);
+    CHECK(c->host_depth==3);
+    release_context(c);
+}
 static int small_depth;
 static void depth_probe(spu_context* c)
 {
@@ -257,7 +288,10 @@ int main(int argc,char** argv)
     spu_begin_image(904);spu_register_function(0x8000,irq_handler);
     spu_register_function(0x4104,irq_resume);spu_begin_image(905);
     spu_register_function(0x5004,reset_target);spu_begin_image(0);
-    context_history();checkpoint_paths();dynamic_irq(0);dynamic_irq(1);stack_reset();ls0_completion();
+        spu_begin_image(910);spu_register_function(0xA10,resume_stale_fn);
+    spu_begin_image(911);spu_register_function(0xA10,resume_owner_fn);spu_begin_image(0);
+context_history();checkpoint_paths();dynamic_irq(0);dynamic_irq(1);stack_reset();ls0_completion();
+    resident_span_resume();
     uint32_t before[32],after[32];unsigned n=spu_recent_pcs(before,32);
     /* Separate fresh host threads must not inherit the caller's TLS history.
      * Join each before checking so fixture accounting itself has no data race. */

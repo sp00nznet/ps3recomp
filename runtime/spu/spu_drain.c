@@ -536,6 +536,8 @@ int spu_tailret_enabled(void)
  * reaches return_pc; only a pc with no lifted code behind it is unwound. */
 typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
+/* The dispatch resolver (spu_channels.c, spu_interp.h): resident code spans first, then task, overlay, image. */
+extern spu_drain_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
@@ -608,8 +610,10 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
         {
             uint32_t pc = ctx->pc & SPU_LS_MASK;
-            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+            /* The resolver spu_indirect_branch uses: inside a resident code span
+             * the context's own image is stale (a job loaded over the policy
+             * module that started it), so its lift there must not count. */
+            spu_drain_fn fn = spu_lifted_lookup(ctx, pc);
             if (fn) {
                 { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
