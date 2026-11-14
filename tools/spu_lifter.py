@@ -737,6 +737,22 @@ class SPULifter:
             return ("ctx->stop_code = 0x3FFFu; "
                     "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
+        # dfceq, dfcmeq, dfcgt, dfcmgt, dftsv: a CBE SPU does not implement them
+        # (PowerXCell 8i additions [INFERENCE]). Console probe, CECHC04 on FW 4.81:
+        # each word run alone in its own thread group did not execute; the group
+        # ended with join cause 4 and the stopped thread's exit status read
+        # 0x8001000F (CELL_ESTAT). The interpreter decodes them as `.word` and stops
+        # at the word (tools/gen_spu_interp.py); lifted code must stop the same way
+        # instead of calling a helper and running on. This does not fall through to
+        # spu_unsupported below, which tolerates data in .text that never executes:
+        # these are opcodes the console rejects, so reaching one is a hard stop.
+        if mn in ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"):
+            return (f"ctx->pc = {self._pc(addr)}; "
+                    f"fprintf(stderr, \"[spu] INVALID-OP {mn} (0x%08X) at LS 0x%05X "
+                    f"img=%d\\n\", 0x{insn.raw:08X}u, (unsigned)ctx->pc, ctx->image_id); "
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
+                    f"spu_halt(ctx); return;")
+
         # ---- integer arithmetic (register) ----
         rr_bin = {
             "a": "spu_a", "sf": "spu_sf", "ah": "spu_ah", "sfh": "spu_sfh",
@@ -751,10 +767,8 @@ class SPULifter:
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
-            # double-precision (2 doubles/reg) + double compares
+            # double-precision (2 doubles/reg); the double compares are above (invalid)
             "dfa": "spu_dfa", "dfs": "spu_dfs", "dfm": "spu_dfm",
-            "dfceq": "spu_dfceq", "dfcmeq": "spu_dfcmeq",
-            "dfcgt": "spu_dfcgt", "dfcmgt": "spu_dfcmgt",
             "mpyhhu": "spu_mpyhhu",
             "eqv": "spu_eqv", "absdb": "spu_absdb", "avgb": "spu_avgb",
             "cg": "spu_cg", "bg": "spu_bg",
@@ -811,7 +825,6 @@ class SPULifter:
             "andhi": "spu_andhi", "andbi": "spu_andbi",
             "orhi":  "spu_orhi",  "orbi":  "spu_orbi",
             "xorhi": "spu_xorhi", "xorbi": "spu_xorbi",
-            "dftsv": "spu_dftsv",
             # RI8 float<->int conversions with scale (i8 in ops[2])
             "cflts": "spu_cflts", "cfltu": "spu_cfltu",
             "csflt": "spu_csflt", "cuflt": "spu_cuflt",

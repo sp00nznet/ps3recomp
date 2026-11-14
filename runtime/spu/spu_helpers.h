@@ -1444,9 +1444,6 @@ static inline void spu__dset(u128* r, int i, double d) {
     r->_u32[i*2] = (uint32_t)(u >> 32); r->_u32[i*2+1] = (uint32_t)u;
 }
 /* double FMA family: c = rt (accumulator, 3-register). The SPU DFMA family is FUSED (single rounding). */
-/* double compares -> per-lane 64-bit mask (RPCS3 stubs these; sane impl here). */
-static inline u128 spu_dfceq_h_(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-static inline u128 spu_dfcmeq_h_(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 /* Singles occupy preferred words 0 and 2 when converting doubleword lanes. */
 /* mpyhhu: high-16 x high-16 of each word, unsigned, full 32-bit product. */
 static inline u128 spu_mpyhhu_ref(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
@@ -1454,7 +1451,7 @@ static inline u128 spu_mpyhhu_ref(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) 
 static inline u128 spu_cgx_ref(u128 a, u128 b, u128 t){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)(t._u32[i]&1u)+a._u32[i]+b._u32[i])>>32); return r; }
 
 /* ---- remaining SPU ISA ops (RPCS3 SPUInterpreter: EQV/ABSDB/AVGB/MPYHHA/
- * MPYHHAU/DFCGT/DFCMGT/XORBI/DFTSV). Completes the lifter's opcode coverage. ---- */
+ * MPYHHAU/XORBI). Completes the lifter's opcode coverage. ---- */
 static inline u128 spu_eqv(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=~(a._u32[i]^b._u32[i]); return r; }
 static inline u128 spu_xorbi(u128 a, int32_t imm){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(a._u8[i]^(uint8_t)imm); return r; }
 static inline u128 spu_absdb_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<16;i++){ uint8_t x=a._u8[i],y=b._u8[i]; r._u8[i]=(uint8_t)(x>y?x-y:y-x); } return r; }
@@ -1462,9 +1459,6 @@ static inline u128 spu_avgb_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++
 /* mpyhha/mpyhhau: high-16 x high-16, ACCUMULATE into rt (3-register). */
 static inline u128 spu_mpyhha_ref(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=t._s32[i]+(int32_t)a._s16[2*i+1]*(int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpyhhau_ref(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=t._u32[i]+(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
-/* double compare greater (RPCS3 stubs these; sane impl) -> per-lane mask. */
-static inline u128 spu_dfcgt_h_(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
-static inline u128 spu_dfcmgt_h_(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 
 /* Double precision is IEEE round to nearest with denormals, and the double -> single of frds
  * rounds to nearest too. A thread running with SPU_FLOAT_RZ's FPCR (round toward zero,
@@ -1495,24 +1489,9 @@ static inline void spu__fpcr_put(uint64_t v) { __asm__ volatile("msr fpcr, %0" :
 SPU__DP_RN2(spu_dfa) SPU__DP_RN2(spu_dfs) SPU__DP_RN2(spu_dfm)
 SPU__DP_RN3(spu_dfma) SPU__DP_RN3(spu_dfms) SPU__DP_RN3(spu_dfnms) SPU__DP_RN3(spu_dfnma)
 SPU__DP_RN1(spu_frds)
-SPU__DP_RN2(spu_dfceq) SPU__DP_RN2(spu_dfcmeq) SPU__DP_RN2(spu_dfcgt) SPU__DP_RN2(spu_dfcmgt)
-/* dftsv rt,ra,I7: double test special value (Cell BE SPU ISA). Each
- * doubleword becomes all ones if it is in any class I7 selects:
- * 0x40 NaN, 0x20 +inf, 0x10 -inf, 0x08 +0, 0x04 -0, 0x02 +denorm, 0x01 -denorm.
- * (RPCS3 stubs it as fatal; this is the ISA definition.) */
-static inline uint64_t spu__dftsv1(uint64_t v, uint32_t i7) {
-    uint64_t e = (v >> 52) & 0x7FF, f = v & 0xFFFFFFFFFFFFFull; int neg = (int)(v >> 63);
-    int t = 0;
-    if (e == 0x7FF && f) t |= i7 & 0x40;
-    if (e == 0x7FF && !f) t |= i7 & (neg ? 0x10 : 0x20);
-    if (e == 0 && !f) t |= i7 & (neg ? 0x04 : 0x08);
-    if (e == 0 && f) t |= i7 & (neg ? 0x01 : 0x02);
-    return t ? ~0ull : 0ull;
-}
-static inline u128 spu_dftsv(u128 a, int32_t imm){ u128 r;
-    for (int i = 0; i < 2; i++) { uint64_t v = (uint64_t)a._u32[2*i] << 32 | a._u32[2*i+1];
-        uint64_t m = spu__dftsv1(v, (uint32_t)imm & 0x7F); r._u32[2*i] = (uint32_t)(m >> 32); r._u32[2*i+1] = (uint32_t)m; }
-    return r; }
+/* dfceq, dfcmeq, dfcgt, dfcmgt and dftsv have no helpers: a CBE SPU raises an
+ * invalid-instruction error for each (console probe, CECHC04 on FW 4.81), so the
+ * interpreter decodes the words as invalid and the lifter emits that stop. */
 
 /* ---- Phase 2: register-variable shifts/rotates ---- */
 static inline u128 spu_shl_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); } return r; }

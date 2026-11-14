@@ -274,11 +274,6 @@ static int spu_step(spu_context* ctx) {
     case SPU_dfms: DST = spu_dfms(A,B,DST); break;
     case SPU_dfnms:DST = spu_dfnms(A,B,DST); break;
     case SPU_dfnma:DST = spu_dfnma(A,B,DST); break;
-    case SPU_dfceq:  DST = spu_dfceq(A,B); break;
-    case SPU_dfcgt:  DST = spu_dfcgt(A,B); break;
-    case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
-    case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
-    case SPU_dftsv:  DST = spu_dftsv(A, (int32_t)(d.rb & 0x7F)); break;   /* I7 sits in the rb field */
     /* control flow */
     case SPU_br: case SPU_bra: next = d.tgt; break;
     case SPU_brsl: case SPU_brasl: DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt;
@@ -333,6 +328,12 @@ static int spu_step(spu_context* ctx) {
         if (hit) { extern void spu_trace_dump(uint32_t); spu_trace_dump(pc);
                    ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; }
         break; }
+    /* A word no table claims stops here, with the stopping pc at the word. So do
+     * dfceq, dfcmeq, dfcgt, dfcmgt and dftsv: tools/gen_spu_interp.py decodes
+     * them as SPU_word because a CBE SPU raises an invalid-instruction error for
+     * each (console probe, CECHC04 on FW 4.81: the thread group ended with join
+     * cause 4 and the stopped thread's exit status read 0x8001000F), so a guest
+     * must not run on a result the console never produced. */
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
                 d.op < SPU_OP_COUNT ? spu_op_name[d.op] : "?", insn, pc);

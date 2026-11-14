@@ -9,8 +9,10 @@
  * implementations (the exact-semantics float path: round-toward-zero, denormal flush, extended
  * range). That block is `#if 0` dead code in this RPCS3 snapshot; extract.py enables it.
  * FI is a port of the SPU LLVM recompiler's spu_fi intrinsic (the interpreter's FI is a TODO).
- * Ops RPCS3 does not implement (dfceq/dfcgt/dfcmeq/dfcmgt) fall back to the hand-written ISA
- * reference below (ref_exec); so does dftsv (RPCS3 stubs it as fatal), checked against the Cell SPU ISA.
+ * dfceq/dfcgt/dfcmeq/dfcmgt/dftsv decode as invalid on this target (console probe, CECHC04 on
+ * FW 4.81: a CBE SPU raises an invalid-instruction error for each), so the interpreter maps their
+ * prefixes to `.word` and no sweep runs them; decode_check expects SPU_word there even though
+ * RPCS3's opcode table still names them.
  * --audit compares that hand-written reference with RPCS3 itself (they agree on every integer op;
  * they differ on float/double, where the hand reference is plain IEEE).
  * Known RPCS3 precise-path quirk compensated for: CSFLT/CUFLT of a zero lane with i8 > 155 returns
@@ -84,6 +86,15 @@ static int ref_decode(uint32_t insn) {
     uint32_t p = insn >> 21; int op = R_UNK;
     for (int i = 0; i < R_NTAB; i++) if ((p >> r_tab[i].magn) == r_tab[i].val) op = r_tab[i].op;
     return op;
+}
+
+/* dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as invalid on this target: a CBE SPU raises an
+ * invalid-instruction error for each (console probe, CECHC04 on FW 4.81). RPCS3's opcode table
+ * still names them, so decode_check expects SPU_word where ref_decode names one of these, and
+ * the sweeps do not run them. */
+static int target_invalid(int op) {
+    return op == R_DFCEQ || op == R_DFCGT || op == R_DFCMEQ
+        || op == R_DFCMGT || op == R_DFTSV;
 }
 
 /* ---- big-endian quadword model ---- */
@@ -332,17 +343,6 @@ static Ref ref_exec(int op, uint32_t insn, uint32_t pc, const u128* regs, const 
     case R_DFMS: for (int d_ = 0; d_ < 2; d_++) DSET(fma(DBL(A), DBL(B), -DBL(T))); break;
     case R_DFNMS: for (int d_ = 0; d_ < 2; d_++) DSET(fma(-DBL(A), DBL(B), DBL(T))); break;
     case R_DFNMA: for (int d_ = 0; d_ < 2; d_++) DSET(-fma(DBL(A), DBL(B), DBL(T))); break;
-    case R_DFCEQ: for (int d_ = 0; d_ < 2; d_++) sd(&r, d_, DBL(A) == DBL(B) ? ~0ull : 0); break;
-    case R_DFCGT: for (int d_ = 0; d_ < 2; d_++) sd(&r, d_, DBL(A) > DBL(B) ? ~0ull : 0); break;
-    case R_DFCMEQ: for (int d_ = 0; d_ < 2; d_++) sd(&r, d_, fabs(DBL(A)) == fabs(DBL(B)) ? ~0ull : 0); break;
-    case R_DFCMGT: for (int d_ = 0; d_ < 2; d_++) sd(&r, d_, fabs(DBL(A)) > fabs(DBL(B)) ? ~0ull : 0); break;
-    case R_DFTSV: for (int d_ = 0; d_ < 2; d_++) {     /* Cell SPU ISA dftsv (no RPCS3 impl) */
-        uint64_t v = qd(&A, d_), e = (v >> 52) & 0x7FF, f = v & 0xFFFFFFFFFFFFFull; int ng = (int)(v >> 63), t = 0;
-        if (e == 0x7FF && f) t |= i7 & 0x40;
-        if (e == 0x7FF && !f) t |= i7 & (ng ? 0x10 : 0x20);
-        if (e == 0 && !f) t |= i7 & (ng ? 0x04 : 0x08);
-        if (e == 0 && f) t |= i7 & (ng ? 0x01 : 0x02);
-        sd(&r, d_, t ? ~0ull : 0); } break;
     case R_FESD: for (int d_ = 0; d_ < 2; d_++) DSET((double)f_of(qw(&A, 2*d_))); break;
     case R_FRDS: for (int d_ = 0; d_ < 2; d_++) { uint64_t u = qd(&A, d_); double dd; memcpy(&dd, &u, 8); sw(&r, 2*d_, u_of((float)dd)); } break;
     default: R.next = ~0u; return R;      /* not covered by the reference: caller skips */
@@ -698,12 +698,14 @@ static long decode_check(void) {
         if (k == 1) insn = (p << 21) | 0x1FFFFF;
         spu_decode1(insn, 0, &d); n++;
         int rop = ref_decode(insn); const char* have = d.op == SPU_word ? "?" : spu_op_name[d.op]; char nm[32]; lname(rop, nm);
-        int match = (rop == R_UNK) ? (d.op == SPU_word) : (d.op != SPU_word && !strcmp(have, nm));
+        /* target_invalid: RPCS3's table names the word, this target's decode rejects it, so
+         * SPU_word is the right answer there. */
+        int match = (rop == R_UNK || target_invalid(rop)) ? (d.op == SPU_word) : (d.op != SPU_word && !strcmp(have, nm));
         if (!match) { if (bad < 12) printf("  DECODE %08X: interp '%s' ref '%s'\n", insn, have, rop == R_UNK ? "?" : nm); bad++; }
     }
     for (long i = 0; i < 2000000; i++) { uint32_t insn = rnd() ^ (rnd() << 16); spu_decode1(insn, 0, &d); n++;
         int rop = ref_decode(insn); const char* have = d.op == SPU_word ? "?" : spu_op_name[d.op]; char nm[32]; lname(rop, nm);
-        int match = (rop == R_UNK) ? (d.op == SPU_word) : (d.op != SPU_word && !strcmp(have, nm));
+        int match = (rop == R_UNK || target_invalid(rop)) ? (d.op == SPU_word) : (d.op != SPU_word && !strcmp(have, nm));
         if (!match) { if (bad < 12) printf("  DECODE %08X: interp '%s' ref '%s'\n", insn, have, rop == R_UNK ? "?" : nm); bad++; } }
     printf("decode cross-check vs RPCS3 opcode table: %ld words, %ld mismatches\n", n, bad);
     return bad;
@@ -713,6 +715,7 @@ static long decode_check(void) {
 static void emit_cases(long scale) {
     for (int op = 1; op < R_COUNT; op++) {
         if (op_magn(op) < 0) continue;
+        if (target_invalid(op)) continue;   /* decodes as invalid on this target */
         int k = op_imm_kind(op), used[4];
         long n = k == F_NONE ? NPAT_TOTAL : 100 * scale;
         for (long c = 0; c < n; c++) {
@@ -772,6 +775,7 @@ int main(int argc, char** argv) {
         char nm[32]; lname(op, nm);
         if (only && strcmp(only, nm)) continue;
         if (op_magn(op) < 0) continue;
+        if (target_invalid(op)) continue;   /* decodes as invalid on this target */
         failing += run_op(op, scale, backend_interp, 0);
         if ((op & 7) == 0) for (int r = 0; r < 128; r++) fill_reg(r, 0);
         if (memcmp(g_ctx.ls, g_ls0, sizeof g_ls0)) { printf("LS corrupted after %s\n", nm); memcpy(g_ctx.ls, g_ls0, sizeof g_ls0); g_total_fail++; }
