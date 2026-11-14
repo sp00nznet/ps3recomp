@@ -1467,6 +1467,18 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
+/* lv2 slot 42 is the shared ENOSYS stub (FW 4.93 stock syscall table; RPCS3 at
+ * d00d8023 binds uns_func there). It must be a real handler, not the
+ * lv2_syscall_unimplemented sentinel: lv2_try_syscall filters that sentinel as
+ * "no handler", so a guest `sc 42` would fall to lv2_syscall()'s CELL_OK
+ * fallback where the firmware answers CELL_ENOSYS. */
+int64_t sys_ppu_thread_enosys_stub(ppu_context* ctx)
+{
+    const uint32_t num = (uint32_t)ctx->gpr[11];
+    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
+    return (int64_t)(int32_t)CELL_ENOSYS;
+}
+
 void sys_ppu_thread_init(lv2_syscall_table* tbl)
 {
     /* Initialize stack allocator */
@@ -1482,8 +1494,8 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     }
 #endif
 
-    lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_EXIT,                sys_ppu_thread_exit);
+    lv2_syscall_register(tbl, 42,                                 sys_ppu_thread_enosys_stub);  /* the shared ENOSYS stub */
     lv2_syscall_register(tbl, SYS_PPU_THREAD_YIELD,               sys_ppu_thread_yield);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_JOIN,                sys_ppu_thread_join);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_DETACH,              sys_ppu_thread_detach);
