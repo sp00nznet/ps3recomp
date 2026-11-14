@@ -172,6 +172,42 @@ int main(void)
     read_psf(raw, size, e);
     check_text(&e[10], "TITLE", 128, "Old T");
 
+    /* the directory listing carries each save's listParam: titles pick their saves by it. GAME0 holds "LP" (the
+     * rewritten text save), GAME1 has no PARAM.SFO, GAME2 a listParam that fills all but the NUL of its field. */
+    {
+        unsetenv("PS3_GAMEDATA_ROOT");
+        strcpy(s_save_root, root);
+        char dir1[256], dir2[256];
+        snprintf(dir1, sizeof dir1, "%s/GAME1", root);
+        snprintf(dir2, sizeof dir2, "%s/GAME2", root);
+        assert(mkdir(dir1, 0755) == 0 && mkdir(dir2, 0755) == 0);
+        CellSaveDataSystemFileParam seven;
+        memset(&seven, 0, sizeof seven);
+        strcpy(seven.title, "Seven");
+        strcpy(seven.listParam, "ABCDEFG");
+        write_param_sfo(dir2, &seven);
+
+        CellSaveDataDirList list[4];
+        memset(list, 0xAA, sizeof list);
+        assert(enumerate_save_dirs("GAME", list, 4) == 3);
+        int seen = 0;
+        for (int i = 0; i < 3; i++) {
+            const char* want = NULL;
+            if (strcmp(list[i].dirName, "GAME0") == 0) want = "LP";
+            else if (strcmp(list[i].dirName, "GAME1") == 0) want = "";
+            else if (strcmp(list[i].dirName, "GAME2") == 0) want = "ABCDEFG";
+            assert(want);
+            assert(strcmp(list[i].listParam, want) == 0);
+            assert(list[i].listParam[sizeof list[i].listParam - 1] == 0);
+            seen++;
+        }
+        assert(seen == 3);
+
+        char junk[300];
+        snprintf(junk, sizeof junk, "%s/PARAM.SFO", dir2);
+        assert(unlink(junk) == 0 && rmdir(dir2) == 0 && rmdir(dir1) == 0);
+    }
+
     /* a corrupt PSF must not make the parser run off its buffer: move the key table to the last three bytes of the
      * file, so the first key ("TIT") has no NUL inside the buffer, and place the buffer against a PROT_NONE page */
 #ifdef PS3_PSF_H
