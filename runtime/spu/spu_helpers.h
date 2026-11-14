@@ -1405,7 +1405,9 @@ static inline u128 spu_dfms_h_(u128 a, u128 b, u128 t)  { return spu__dfmx(a, b,
 static inline u128 spu_dfnms_h_(u128 a, u128 b, u128 t) { return spu__dfmx(a, b, t, 1, 1); }
 static inline u128 spu_dfnma_h_(u128 a, u128 b, u128 t) { return spu__dfmx(a, b, t, 1, 0); }
 /* fesd: the single in word 2i (IEEE format, section 9.2.1) extended to doubleword i: exact,
- * Inf stays Inf, a NaN becomes the default QNaN, a denormal becomes +0.
+ * Inf stays Inf, a NaN becomes the default QNaN, a denormal becomes a zero of its own sign
+ * (console probe, CECHC04 FW 4.81: 0x80000001..0x807FFFFF gives -0.0; every other input class
+ * of the console's full fesd sweep matched).
  * frds: doubleword i rounded (to nearest) to an IEEE single in word 2i, word 2i+1 = 0; a NaN
  * becomes the single default QNaN 0x7FC00000. */
 static inline u128 spu_fesd(u128 a) { u128 r;
@@ -1413,7 +1415,7 @@ static inline u128 spu_fesd(u128 a) { u128 r;
         const uint32_t w = a._u32[2*i], be = (w >> 23) & 0xFFu, f = w & 0x7FFFFFu;
         const uint64_t sign = (uint64_t)(w >> 31) << 63;
         uint64_t u;
-        if (be == 0)        u = f ? 0 : sign;
+        if (be == 0)        u = sign;
         else if (be == 255) u = f ? 0x7FF8000000000000ull : (sign | 0x7FF0000000000000ull);
         else                u = sign | ((uint64_t)(be - 127 + 1023) << 52) | ((uint64_t)f << 29);
         spu__dw_put(&r, i, u);

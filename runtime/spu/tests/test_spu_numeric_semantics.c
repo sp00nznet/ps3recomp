@@ -25,6 +25,10 @@ int main(void)
     a._f32[0]=1.0f; a._f32[1]=99.0f; a._f32[2]=2.0f; a._f32[3]=-99.0f;
     r=spu_fesd(a); CHECK(spu__dget(r,0)==1.0 && spu__dget(r,1)==2.0);
     r=spu_frds(r); CHECK(r._f32[0]==1.0f && r._u32[1]==0 && r._f32[2]==2.0f && r._u32[3]==0);
+    /* A denormal single extends to a zero that keeps its sign (console probe, CECHC04 FW 4.81:
+     * 0x80000001 -> -0.0), so only the sign of the zero distinguishes these two lanes. */
+    a=spu_zero(); a._u32[0]=0x80000001u; a._u32[2]=0x007FFFFFu;
+    r=spu_fesd(a); CHECK(spu__dw_get(r,0)==0x8000000000000000ull && spu__dw_get(r,1)==0);
     /* The estimate/FI pair feeds one Newton refinement in the guest code. */
     const float values[]={1.0f,2.0f,5.3311235f,-76.91874f};
     u128 one=spu_zero(); for(int i=0;i<4;++i) one._f32[i]=1.0f;
