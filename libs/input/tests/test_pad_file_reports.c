@@ -85,13 +85,28 @@ int main(int argc,char** argv)
         held_reports(40,CELL_PAD_CTRL_CROSS,0);
     }else if(!strcmp(mode,"ports-clear")){
         publish(path,"0x4000 2\n");
-        assert(cellPadGetData(7,guest)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+        /* libio (FW 4.93): a port past the 127-slot table or a NULL buffer is INVALID_PARAMETER, tested before the
+         * connection; a port at or past max_connect is treated as unconnected and answers NO_DEVICE. */
+        assert(cellPadGetData(7,guest)==(s32)CELL_PAD_ERROR_NO_DEVICE);
+        assert(cellPadGetData(CELL_MAX_PADS-1,guest)==(s32)CELL_PAD_ERROR_NO_DEVICE);
+        assert(cellPadGetData(CELL_MAX_PADS,guest)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+        assert(cellPadGetData(0xFFFFFFFFu,guest)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+        assert(cellPadGetData(7,NULL)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+        assert(cellPadGetData(CELL_MAX_PADS,NULL)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
         assert(cellPadGetData(0,NULL)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+        s_max_connect=4;   /* a port at or past max_connect is never connected */
+        assert(cellPadGetData(4,guest)==(s32)CELL_PAD_ERROR_NO_DEVICE);
+        assert(cellPadClearBuf(4)==(s32)CELL_PAD_ERROR_NO_DEVICE);
+        /* Disclosed model gap: an enabled in-range port with no connected device answers OK here; the firmware
+         * would answer NO_DEVICE (the per-port connection byte is not modelled). */
+        assert(cellPadClearBuf(3)==CELL_OK);
+        s_max_connect=7;
         s_pad_initialized=0;assert(cellPadGetData(0,guest)==(s32)CELL_PAD_ERROR_NOT_OPENED);
         s_pad_initialized=1;assert(file_size(path)>0);
         assert(read_pad(1)==0 && file_size(path)>0); /* disconnected nonzero port */
         assert(cellPadClearBuf(0)==CELL_OK);
-        assert(cellPadClearBuf(7)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+        assert(cellPadClearBuf(7)==(s32)CELL_PAD_ERROR_NO_DEVICE);
+        assert(cellPadClearBuf(CELL_MAX_PADS)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
         assert(read_pad(0)==0 && !file_size(path));
         assert(cellPadClearBuf(0)==CELL_OK);
         for(unsigned n=0;n<100;n++)assert(read_pad(1)==0);
