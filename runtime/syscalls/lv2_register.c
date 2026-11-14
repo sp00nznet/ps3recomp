@@ -2658,6 +2658,15 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
  * -----------------------------------------------------------------------*/
 lv2_syscall_table g_lv2_syscalls;
 
+/* The one default handler lv2_syscall_table_init fills empty slots with (see
+ * lv2_syscall_table.h). */
+int64_t lv2_syscall_unimplemented(ppu_context* ctx)
+{
+    uint32_t num = (uint32_t)ctx->gpr[11];
+    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
+    return (int64_t)(int32_t)CELL_ENOSYS;
+}
+
 /* Firmware imports that are ALSO lv2 syscalls.
  *
  * A title can reach these two ways: issue the raw `sc` (-> the syscall table
@@ -2692,8 +2701,8 @@ void lv2_init_syscalls(void)
 
 /* Returns 1 (and sets gpr[3] from the handler) if `num` is a registered
  * syscall; 0 if unregistered (the caller keeps its own stub behaviour). The
- * comparison against the static-inline sentinel is reliable here because this
- * TU and lv2_syscall_table_init share the same instance. */
+ * sentinel is one real function (lv2_register.c), so the pointer comparison
+ * is the same in every translation unit. */
 int lv2_try_syscall(ppu_context* ctx)
 {
     uint32_t num = (uint32_t)ctx->gpr[11];

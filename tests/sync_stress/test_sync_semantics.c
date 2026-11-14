@@ -5,8 +5,10 @@
  *              timeout past 2^40 us means "forever", it must not wrap into a
  *              deadline in the past.
  *   semaphore  destroy while a thread is blocked on it is EBUSY (the waiter was
- *              left spinning on a deleted lock); name at 0x18; huge timeout.
- *   rwlock     destroy while read- or write-held is EBUSY; unlock without a
+ *              left spinning on a deleted lock), and so is destroy while a
+ *              posted waiter is still returning; name at 0x18; huge timeout.
+ *   rwlock     destroy while read- or write-held is EBUSY, and so is destroy
+ *              while a timed acquire is between two polls; unlock without a
  *              lock is EPERM; timed rlock/wlock return ETIMEDOUT (the timeout
  *              was ignored and the call blocked for good); concurrent creates
  *              get distinct ids; name at 0x18; huge timeout.
@@ -112,6 +114,28 @@ static DWORD WINAPI hold_wlock(void* ms)
 }
 static const uint64_t k_huge[] = { 1ull << 63, ~0ull, (1ull << 40) + 1 };
 
+/* The hooks the semaphore and rwlock sources call when built with PS3_SYNC_TEST_HOOKS (see CMakeLists.txt).
+ * They park one call at a chosen point, so a destroy can be ordered against it without sleeping. */
+static HANDLE s_sem_waiting, s_sem_after_wake, s_sem_release, s_rw_poll_entered, s_rw_poll_release;
+static volatile int s_hook_sem_id, s_pause_sem_after_wake, s_pause_rw_poll;
+int ps3_sync_test_hook(const char* point, uint32_t id)
+{
+    if (strcmp(point, "sem.wait.registered") == 0 &&
+        id == (uint32_t)__atomic_load_n(&s_hook_sem_id, __ATOMIC_ACQUIRE)) {
+        SetEvent(s_sem_waiting);
+    } else if (strcmp(point, "sem.wait.after_wake") == 0 &&
+               id == (uint32_t)__atomic_load_n(&s_hook_sem_id, __ATOMIC_ACQUIRE) &&
+               __atomic_load_n(&s_pause_sem_after_wake, __ATOMIC_ACQUIRE)) {
+        SetEvent(s_sem_after_wake);
+        WaitForSingleObject(s_sem_release, 20000);
+    } else if (strcmp(point, "rw.poll") == 0 &&
+               __atomic_load_n(&s_pause_rw_poll, __ATOMIC_ACQUIRE)) {
+        SetEvent(s_rw_poll_entered);
+        WaitForSingleObject(s_rw_poll_release, 20000);
+    }
+    return 0;
+}
+
 /* ----------------------------------------------------------------- mutex */
 static void make_mutex(uint32_t recursive_flag)
 {
@@ -190,6 +214,27 @@ static void test_semaphore(void)
     CHECK_RC(call(sys_semaphore_post, 1, sid, 1, 0, 0), CELL_OK);
     bg_join(&w);
     CHECK(w.rc == CELL_OK);
+
+    /* Destroy must not retire the lock while a posted waiter is between its wake and its return from
+     * wait(): the waiter is parked there (the after-wake hook), the post has been consumed, and destroy
+     * sees no waiter left -- yet answers EBUSY because the call is in flight. */
+    CHECK_RC(call(sys_semaphore_create, 1, 0x240, A_ATTR, 0, 10), CELL_OK);
+    const uint32_t rsid = be_read(0x240);
+    __atomic_store_n(&s_hook_sem_id, (int)rsid, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pause_sem_after_wake, 1, __ATOMIC_RELEASE);
+    ResetEvent(s_sem_waiting);
+    ResetEvent(s_sem_after_wake);
+    ResetEvent(s_sem_release);
+    bg_start(&w, sys_semaphore_wait, 2, rsid, 0, 0, 0);
+    CHECK(WaitForSingleObject(s_sem_waiting, 20000) == WAIT_OBJECT_0);
+    CHECK_RC(call(sys_semaphore_post, 1, rsid, 1, 0, 0), CELL_OK);
+    CHECK(WaitForSingleObject(s_sem_after_wake, 20000) == WAIT_OBJECT_0);
+    CHECK_RC(call(sys_semaphore_destroy, 1, rsid, 0, 0, 0), CELL_EBUSY);
+    __atomic_store_n(&s_pause_sem_after_wake, 0, __ATOMIC_RELEASE);
+    SetEvent(s_sem_release);
+    bg_join(&w);
+    CHECK(w.rc == CELL_OK);
+    CHECK_RC(call(sys_semaphore_destroy, 1, rsid, 0, 0, 0), CELL_OK);
 
     /* A huge timeout waits for the post (it used to wrap to "already late"). */
     for (size_t i = 0; i < sizeof k_huge / sizeof k_huge[0]; i++) {
@@ -286,6 +331,25 @@ static void test_rwlock(void)
         if (rc == CELL_OK) call(sys_rwlock_runlock, 1, rid, 0, 0, 0);
         WaitForSingleObject(h, 5000); CloseHandle(h);
     }
+
+    /* Destroy must not retire an unlocked rwlock while a timed acquire is between two polls: the reader
+     * is parked in the gap (the poll hook), the writer lets go, and destroy -- which sees no holder and
+     * no waiter -- still answers EBUSY because the call is in flight. */
+    CHECK_RC(call(sys_rwlock_wlock, 1, rid, 0, 0, 0), CELL_OK);
+    s_rid = rid; s_timed_rc = -1;
+    ResetEvent(s_rw_poll_entered);
+    ResetEvent(s_rw_poll_release);
+    __atomic_store_n(&s_pause_rw_poll, 1, __ATOMIC_RELEASE);
+    HANDLE th2 = CreateThread(NULL, 0, timed_read_then_unlock, (void*)(uintptr_t)500000, 0, NULL);
+    CHECK(WaitForSingleObject(s_rw_poll_entered, 20000) == WAIT_OBJECT_0);
+    CHECK_RC(call(sys_rwlock_wunlock, 1, rid, 0, 0, 0), CELL_OK);
+    const int32_t destroy_rc = call(sys_rwlock_destroy, 1, rid, 0, 0, 0);
+    CHECK(destroy_rc == (int32_t)CELL_EBUSY);
+    __atomic_store_n(&s_pause_rw_poll, 0, __ATOMIC_RELEASE);
+    SetEvent(s_rw_poll_release);
+    WaitForSingleObject(th2, 5000); CloseHandle(th2);
+    if (destroy_rc != (int32_t)CELL_EBUSY) return;     /* the lock was destroyed under the reader */
+    CHECK(s_timed_rc == CELL_OK);                      /* it got the lock once the writer let go */
     CHECK_RC(call(sys_rwlock_destroy, 1, rid, 0, 0, 0), CELL_OK);
     CHECK_RC(call(sys_rwlock_destroy, 1, rid, 0, 0, 0), CELL_ESRCH);
 
@@ -354,6 +418,11 @@ int main(void)
 {
     vm_base = (uint8_t*)calloc(1, 65536);
     if (!vm_base) return 2;
+    s_sem_waiting = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_sem_after_wake = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_sem_release = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_rw_poll_entered = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_rw_poll_release = CreateEventA(NULL, TRUE, FALSE, NULL);
 #ifdef _WIN32
     timeBeginPeriod(1);      /* the runtime raises the timer resolution the same way */
 #endif
