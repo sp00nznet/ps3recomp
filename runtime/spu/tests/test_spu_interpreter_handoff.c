@@ -41,12 +41,14 @@ static void tail_entry(spu_context* c) {
 static int queued_call;
 static void nested_entry(spu_context* c) {
     c->gpr[0] = spu_link(0x204);
+    uint32_t dr = c->drain_ret_pc; c->drain_ret_pc = 0x204;   /* as the lifter's bracket */
     c->host_depth++;
     c->pc = 0x4000;
     if (queued_call) g_spu_trampoline_fn = spu_indirect_branch;
     else spu_indirect_branch(c);
     spu_drain_call(c, 0x204);
     c->host_depth--;
+    c->drain_ret_pc = dr;
     c->gpr[20]._u32[0]++;
     finish(c);
 }
@@ -59,7 +61,7 @@ int main(int argc, char** argv) {
     ctx.status = SPU_STATUS_RUNNING;
     spu_begin_image(77);
     spu_register_function(0x200, helper);
-    if (strcmp(mode, "nested-return-unlifted"))
+    if (strcmp(mode, "nested-return-unlifted") && strcmp(mode, "nested-return-direct"))
         spu_register_function(0x204, wrong_continuation);
     spu_register_function(0x240, finish);
     if (!strcmp(mode, "top-zero")) spu_register_function(0, finish);
@@ -75,7 +77,9 @@ int main(int argc, char** argv) {
     } else if (!strcmp(mode, "top")) {
         word(0x4004, 0x30004800); /* bra 0x240 */
     } else if (!strncmp(mode, "nested-return", 13)) {
-        entry = nested_entry; queued_call = 1;
+        /* -direct: the bracket calls the dispatcher itself, as a lifted
+         * bisl does, so the interpreter runs before spu_drain_call starts. */
+        entry = nested_entry; queued_call = strcmp(mode, "nested-return-direct") != 0;
         word(0x204, 0x1C004A95); /* ai $21,$21,1: must NOT be interpreted */
         word(0x208, 0x30004800); /* bra 0x240 */
         word(0x4004, 0x35000000); /* bi $0 -> 0x204 */
