@@ -52,6 +52,7 @@ static struct PmInstance {
     unsigned users, workload_users[32];   /* a CellSpurs2 has 32 workloads */
     uint32_t ea;
     struct PmSlot slots[32][6];
+    spu_context* running[6];   /* context last entered on each SPU (spu_thread_ls_peer) */
 } s_pm_instances[SPURS_PM_INSTANCES];
 static SRWLOCK s_pm_directory_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_pm_directory_wake;
@@ -110,6 +111,8 @@ int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
             struct PmSlot* slot = &pi->slots[wid][n];
             if (slot->ctx) {
                 spu_coh_unregister(slot->ctx);spu_mfc_release(slot->ctx);
+                /* spu_thread_ls_peer must not hand out the context that is freed here. */
+                if (pi->running[n] == slot->ctx) __atomic_store_n(&pi->running[n], NULL, __ATOMIC_RELEASE);
                 free(slot->ctx);slot->ctx = NULL;
             }
             slot->data = 0;slot->pm = NULL;slot->size = 0;
@@ -147,9 +150,33 @@ void spurs_policy_release_instance(uint32_t ea)
             ReleaseSRWLockExclusive(&slot->lock);
         }
         pi->used = 0; pi->retiring = 0; pi->ea = 0;
+        memset(pi->running, 0, sizeof pi->running);   /* every context above is freed */
         break;
     }
     ReleaseSRWLockExclusive(&s_pm_directory_lock);
+}
+
+/* The context whose local store SPU spu_num of self's SPURS instance holds:
+ * self when spu_num is self's own SPU, else the context that entered that SPU
+ * last (contexts are per workload and SPU; one runs on an SPU at a time). */
+spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num)
+{
+    if (spu_num >= 6) return NULL;
+    spu_context* peer = NULL;
+    AcquireSRWLockShared(&s_pm_directory_lock);
+    for (unsigned i = 0; i < SPURS_PM_INSTANCES && !peer; i++) {
+        struct PmInstance* pi = &s_pm_instances[i];
+        if (!pi->used) continue;
+        for (unsigned w = 0; w < 32 && !peer; w++)
+            for (unsigned n = 0; n < 6; n++)
+                if (pi->slots[w][n].ctx == self) {
+                    peer = n == spu_num ? (spu_context*)self
+                                        : __atomic_load_n(&pi->running[spu_num], __ATOMIC_ACQUIRE);
+                    break;
+                }
+    }
+    ReleaseSRWLockShared(&s_pm_directory_lock);
+    return peer;
 }
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
@@ -294,6 +321,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->gpr[4]._u32[2] = 0;
     ctx->gpr[4]._u32[3] = 0;
     ctx->gpr[5]._u32[0] = 0;                           /* poll status */
+
+    /* This context is now what runs on SPU spu_num: its local store is the
+     * one that SPU's mapped-LS effective addresses reach. */
+    if (resident->owner)
+        __atomic_store_n(&resident->owner->running[spu_num], ctx, __ATOMIC_RELEASE);
 
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
