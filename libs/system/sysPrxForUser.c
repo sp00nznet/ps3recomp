@@ -143,7 +143,7 @@ typedef struct {
 } HeapSlot;
 
 static HeapSlot s_heaps[MAX_HEAPS];
-static u32 s_next_heap_id = 1;
+static u32 s_next_heap_id = 1;   /* ONE id space for both create paths: no two live heaps share an id */
 
 /* ---------------------------------------------------------------------------
  * Thread management
@@ -801,6 +801,13 @@ s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond)
  * Heap management (wraps malloc)
  * -----------------------------------------------------------------------*/
 
+/* Block ownership, below: a heap's id and its live blocks. slot_lock held. */
+static int  heap_track_locked(u32 id);
+static int  heap_block_own_locked(u32 id, u32 user);
+static int  heap_release_locked(u32 id, u32** blk, u32* n);
+static void yz_heap_free(u32 user);
+static void yz_heap_free_locked(u32 user);
+
 s32 sys_heap_create_heap(sys_heap_t* heap, u32 start_addr, u32 size,
                           u32 flags, void* alloc_func, void* free_func)
 {
@@ -811,28 +818,41 @@ s32 sys_heap_create_heap(sys_heap_t* heap, u32 start_addr, u32 size,
 
     if (!heap) return CELL_EFAULT;
 
+    slot_lock();
+    int slot = -1;
     for (int i = 0; i < MAX_HEAPS; i++) {
-        if (!s_heaps[i].in_use) {
-            s_heaps[i].in_use = 1;
-            s_heaps[i].id = s_next_heap_id++;
-            vm_write32((u32)(uintptr_t)heap, s_heaps[i].id);
-            return CELL_OK;
-        }
+        if (!s_heaps[i].in_use) { slot = i; break; }
     }
-    return CELL_ENOMEM;
+    if (slot < 0) { slot_unlock(); return CELL_ENOMEM; }
+    const u32 id = s_next_heap_id++;
+    if (!heap_track_locked(id)) { slot_unlock(); return CELL_ENOMEM; }
+    s_heaps[slot].in_use = 1;
+    s_heaps[slot].id = id;
+    vm_write32((u32)(uintptr_t)heap, id);
+    slot_unlock();
+    return CELL_OK;
 }
 
 s32 sys_heap_destroy_heap(sys_heap_t heap)
 {
     printf("[sysPrxForUser] sys_heap_destroy_heap(id=%u)\n", heap);
 
+    slot_lock();
+    int found = 0;
     for (int i = 0; i < MAX_HEAPS; i++) {
         if (s_heaps[i].in_use && s_heaps[i].id == heap) {
             s_heaps[i].in_use = 0;
-            return CELL_OK;
+            found = 1;
+            break;
         }
     }
-    return CELL_ESRCH;
+    u32* blk = NULL;
+    u32 n = 0;
+    if (found) heap_release_locked(heap, &blk, &n);
+    slot_unlock();
+    for (u32 i = 0; i < n; i++) yz_heap_free(blk[i]);   /* its entry is gone: nothing to unlink */
+    free(blk);
+    return found ? CELL_OK : CELL_ESRCH;
 }
 
 /* Guest-address allocator for the _sys_heap_* API. These return a GUEST
@@ -858,6 +878,7 @@ s32 sys_heap_destroy_heap(sys_heap_t heap)
  *   user-4   offset back to the raw block start
  *   user-8   bin index
  *   user-12  magic (so free() can tell our blocks from a foreign pointer)
+ *   user-16  id of the heap that owns the block, 0 for none (see below)
  * The free-list link lives at the raw block start, which is dead space while
  * the block is free. */
 #define YZ_HEAP_BASE VM_HLE_HEAP_BASE
@@ -867,6 +888,64 @@ s32 sys_heap_destroy_heap(sys_heap_t heap)
 static u32 s_heap_bump = 0;
 static u32 s_heap_bin[YZ_BINS];          /* guest EA of each free list head */
 
+/* Which blocks each heap handed out, so that deleting the heap gives them back
+ * instead of leaving them in the window for good. A block names its heap at
+ * user-16, which every block has room for: the header in front of the address
+ * handed out is at least 16 bytes. The table lives on the host. Every access
+ * takes slot_lock -- heaps are created, allocated from and deleted on guest
+ * threads -- so the allocation and its ownership tag are one critical section
+ * and a delete cannot free a block that is only half handed out. A heap id
+ * this API never made (any id may be passed to sys_heap_malloc) leaves its
+ * blocks unowned. */
+typedef struct { u32 id; u32* blk; u32 n, cap; } HeapOwner;
+static HeapOwner* s_heap_owner;
+static u32 s_heap_nowner, s_heap_owner_cap;
+
+static HeapOwner* heap_owner_find(u32 id)    /* slot_lock held */
+{
+    for (u32 i = 0; i < s_heap_nowner; i++)
+        if (s_heap_owner[i].id == id) return &s_heap_owner[i];
+    return NULL;
+}
+
+/* Start tracking `id`; 0 when the table cannot grow. Tracking an id twice is
+ * one heap. slot_lock held. */
+static int heap_track_locked(u32 id)
+{
+    if (!heap_owner_find(id)) {
+        if (s_heap_nowner == s_heap_owner_cap) {
+            const u32 cap = s_heap_owner_cap ? s_heap_owner_cap * 2 : 8;
+            HeapOwner* grown = (HeapOwner*)realloc(s_heap_owner, cap * sizeof *grown);
+            if (!grown) return 0;
+            s_heap_owner = grown;
+            s_heap_owner_cap = cap;
+        }
+        HeapOwner* o = &s_heap_owner[s_heap_nowner++];
+        o->id = id; o->blk = NULL; o->n = o->cap = 0;
+    }
+    return 1;
+}
+
+/* Record `user` as heap `id`'s block, tag the guest header, both under
+ * slot_lock. 1: owned; 2: the id is not tracked (the block stays unowned, the
+ * pre-existing answer for ids this API never made); 0: tracked but the list
+ * cannot grow. */
+static int heap_block_own_locked(u32 id, u32 user)
+{
+    HeapOwner* o = heap_owner_find(id);
+    if (!o) return 2;
+    if (o->n == o->cap) {
+        const u32 cap = o->cap ? o->cap * 2 : 16;
+        u32* grown = (u32*)realloc(o->blk, cap * sizeof *grown);
+        if (!grown) return 0;
+        o->blk = grown;
+        o->cap = cap;
+    }
+    o->blk[o->n++] = user;
+    vm_write32(user - 16, id);
+    return 1;
+}
+
 static u32 yz_bin_for(u32 need)
 {
     u32 b = 4;                            /* 16 bytes minimum */
@@ -874,7 +953,8 @@ static u32 yz_bin_for(u32 need)
     return b;
 }
 
-static u32 yz_heap_alloc(u32 size, u32 align)
+/* slot_lock held. */
+static u32 yz_heap_alloc_locked(u32 size, u32 align)
 {
     if (align < 16) align = 16;
     /* Anything larger than the window can never fit, and letting it through
@@ -885,7 +965,6 @@ static u32 yz_heap_alloc(u32 size, u32 align)
     u32 b = yz_bin_for(need);
     u32 raw;
 
-    slot_lock();
     if (s_heap_bin[b]) {
         raw = s_heap_bin[b];
         s_heap_bin[b] = vm_read32(raw);
@@ -894,11 +973,10 @@ static u32 yz_heap_alloc(u32 size, u32 align)
         /* Check BEFORE advancing: bump-then-test left s_heap_bump past the end
          * after one failure, and a later request could wrap it back below
          * YZ_HEAP_END and hand out an address outside the window. */
-        if ((1u << b) > YZ_HEAP_END - s_heap_bump) { slot_unlock(); return 0; }
+        if ((1u << b) > YZ_HEAP_END - s_heap_bump) return 0;
         raw = s_heap_bump;
         s_heap_bump += (1u << b);
     }
-    slot_unlock();
 
     u32 user = (raw + 16 + align - 1) & ~(align - 1);
     { static int dbg = -1;
@@ -909,10 +987,37 @@ static u32 yz_heap_alloc(u32 size, u32 align)
     vm_write32(user - 4,  user - raw);
     vm_write32(user - 8,  b);
     vm_write32(user - 12, YZ_HEAP_MAGIC);
+    vm_write32(user - 16, 0);                            /* unowned until a heap claims it (heap_block_own_locked) */
     return user;                          /* guest EA; the flat VM is already backed */
 }
 
-static void yz_heap_free(u32 user)
+static u32 yz_heap_alloc(u32 size, u32 align)
+{
+    slot_lock();
+    const u32 user = yz_heap_alloc_locked(size, align);
+    slot_unlock();
+    return user;
+}
+
+/* Allocate and record ownership in one critical section: a concurrent heap
+ * delete cannot run between the allocation and the ownership tag, and a block
+ * whose ownership cannot be recorded is given back to the free lists (fail
+ * closed) rather than handed out unowned. Ids this API never made stay
+ * unowned, as before. */
+static u32 heap_owned_alloc(u32 id, u32 size, u32 align)
+{
+    slot_lock();
+    u32 user = yz_heap_alloc_locked(size, align);
+    if (user && heap_block_own_locked(id, user) == 0) {
+        yz_heap_free_locked(user);
+        user = 0;
+    }
+    slot_unlock();
+    return user;
+}
+
+/* slot_lock held. */
+static void yz_heap_free_locked(u32 user)
 {
     if (!user || user < YZ_HEAP_BASE || user >= YZ_HEAP_END) return;
     if (vm_read32(user - 12) != YZ_HEAP_MAGIC) return;   /* not one of ours */
@@ -920,44 +1025,87 @@ static void yz_heap_free(u32 user)
     u32 off = vm_read32(user - 4);
     if (b >= YZ_BINS || off > (1u << b)) return;         /* corrupt header */
     u32 raw = user - off;
+    const u32 owner = vm_read32(user - 16);              /* forget it before it can be handed out again */
+    if (owner) {
+        HeapOwner* o = heap_owner_find(owner);
+        if (o)
+            for (u32 i = 0; i < o->n; i++)
+                if (o->blk[i] == user) { o->blk[i] = o->blk[--o->n]; break; }
+    }
     { static int dbg = -1;
       if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
       if (dbg) { static int n = 0; if (PS3_LOG_FIRST(n, 400))
           fprintf(stderr, "[heap] free  0x%08X (bin %u)%c", user, b, 10); } }
     vm_write32(user - 12, 0);                            /* poison: catch double free */
-    slot_lock();
     vm_write32(raw, s_heap_bin[b]);
     s_heap_bin[b] = raw;
+}
+
+static void yz_heap_free(u32 user)
+{
+    slot_lock();
+    yz_heap_free_locked(user);
     slot_unlock();
+}
+
+/* Pop heap `id`'s owner entry (slot_lock held). 1 and the list out when the id
+ * was tracked; the caller frees the blocks and the list. */
+static int heap_release_locked(u32 id, u32** blk, u32* n)
+{
+    HeapOwner* o = heap_owner_find(id);
+    if (!o) { *blk = NULL; *n = 0; return 0; }
+    *blk = o->blk;
+    *n = o->n;
+    *o = s_heap_owner[--s_heap_nowner];
+    return 1;
+}
+
+/* Delete heap `id`: every block it still holds goes back to the free lists.
+ * 1 when `id` was a tracked heap. */
+static int heap_release(u32 id)
+{
+    slot_lock();
+    u32* blk;
+    u32 n;
+    const int found = heap_release_locked(id, &blk, &n);
+    slot_unlock();
+    for (u32 i = 0; i < n; i++) yz_heap_free(blk[i]);    /* its entry is gone: nothing to unlink */
+    free(blk);
+    return found;
 }
 
 void* sys_heap_malloc(sys_heap_t heap, u32 size)
 {
-    (void)heap;
-    return (void*)(uintptr_t)yz_heap_alloc(size, 16);
+    return (void*)(uintptr_t)heap_owned_alloc(heap, size, 16);
 }
 
 s32 sys_heap_free(sys_heap_t heap, void* ptr)
 {
-    (void)heap;
+    (void)heap;                           /* the block names its own heap */
     yz_heap_free((u32)(uintptr_t)ptr);
     return CELL_OK;
 }
 
 void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
 {
-    (void)heap;
-    return (void*)(uintptr_t)yz_heap_alloc(size, align);
+    return (void*)(uintptr_t)heap_owned_alloc(heap, size, align);
 }
 
 /* _sys_heap_create_heap (libdbgfont / dinkum ABI): RETURNS a non-zero heap id
  * in r3 (args name/type/blocksize/flags in r3..r6). Distinct from the out-param
- * sys_heap_create_heap above; _sys_heap_malloc bump-allocs regardless of id. */
+ * sys_heap_create_heap above; _sys_heap_malloc allocates from the one window
+ * whatever the id, and the id only names the blocks to give back on delete.
+ * Both create paths take their ids from the one counter, so a heap from one
+ * API can never collide with a heap from the other. 0 (no heap) when the
+ * ownership table cannot grow. */
 u32 sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags)
 {
     (void)name; (void)type; (void)blocksize; (void)flags;
-    static u32 s_hid = 0x100;
-    return s_hid++;
+    slot_lock();
+    const u32 id = s_next_heap_id++;
+    const int ok = heap_track_locked(id);
+    slot_unlock();
+    return ok ? id : 0;
 }
 
 /* The names titles actually import. Every one of these existed above under a
@@ -977,13 +1125,15 @@ u32 _sys_heap_create_heap(u32 name, u32 type, u32 blocksize, u32 flags)
 
 s32 _sys_heap_delete_heap(sys_heap_t heap)
 {
-    /* The ids _sys_heap_create_heap hands out (sys_heap_create_heap_ret) are
-     * never entered in the s_heaps table that sys_heap_destroy_heap searches, so
-     * forwarding there answered CELL_ESRCH for every heap this API ever created.
-     * Deleting one is CELL_OK; blocks are not reclaimed (the bump window has no
-     * per-heap ownership). */
-    (void)heap;
-    return CELL_OK;
+    /* A heap made by _sys_heap_create_heap (sys_heap_create_heap_ret) is not in
+     * the s_heaps table that sys_heap_destroy_heap searches, so forwarding
+     * alone answered CELL_ESRCH for every heap this API ever created. Deleting
+     * one is CELL_OK and returns its blocks to the window; a heap from
+     * sys_heap_create_heap is also released from that table; an id neither
+     * made is CELL_ESRCH, as there. */
+    const int tracked = heap_release(heap);
+    const s32 rc = sys_heap_destroy_heap(heap);
+    return tracked ? CELL_OK : rc;
 }
 
 /* The plain libc allocator sysPrxForUser exports, as opposed to the sys_heap_*
