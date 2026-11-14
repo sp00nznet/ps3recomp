@@ -620,6 +620,11 @@ static void test_mrt_set(void)
 
 /* ---- 3. the texture cache ------------------------------------------------ */
 
+#ifdef RSX_TEST_EXPECT_TEXTURE_CACHE
+_Static_assert(RSX_DRAW_ENGINE_TEXTURE_CACHE == RSX_TEST_EXPECT_TEXTURE_CACHE,
+               "the texture cache size given at build time is the one the engine uses");
+#endif
+
 static void test_texture_cache(void)
 {
     printf("-- texture cache\n");
