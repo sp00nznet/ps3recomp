@@ -51,6 +51,10 @@ static struct PmInstance {
     int used, retiring;
     unsigned users, workload_users[32];   /* a CellSpurs2 has 32 workloads */
     uint32_t ea;
+    /* SNR values posted by the PPU (sys_spu_thread_write_snr) that no resident context could take yet;
+     * applied when a context for that SPU is created. Guarded by s_pm_directory_lock. */
+    uint32_t snr_val[6][2];
+    uint8_t  snr_set[6][2];
     struct PmSlot slots[32][6];
 } s_pm_instances[SPURS_PM_INSTANCES];
 static SRWLOCK s_pm_directory_lock = SRWLOCK_INIT;
@@ -82,6 +86,54 @@ static struct PmSlot* policy_slot(uint32_t ea, uint32_t wid, uint32_t lane)
     ReleaseSRWLockExclusive(&s_pm_directory_lock);
     if (slot) AcquireSRWLockExclusive(&slot->lock);
     return slot;
+}
+
+/* Post a signal-notification value from the PPU to a virtual SPU of a SPURS instance. Every resident policy
+ * context of that SPU takes it (a policy module that never reads SNR leaves it unread); with none yet, it waits in
+ * the instance and is applied to the first context created. Returns 0, or -1 for an unknown SPU or register. */
+int spurs_policy_post_snr(uint32_t ea, uint32_t spu_num, uint32_t num, uint32_t val)
+{
+    if (spu_num >= 6 || num > 1) return -1;
+    int rc = -1;
+    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    struct PmInstance* pi = NULL;
+    for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++)
+        if (s_pm_instances[i].used && s_pm_instances[i].ea == ea) { pi = &s_pm_instances[i]; break; }
+    if (!pi)
+        for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++)
+            if (!s_pm_instances[i].used) { pi = &s_pm_instances[i]; pi->used = 1; pi->ea = ea; break; }
+    if (pi && !pi->retiring) {
+        unsigned delivered = 0;
+        /* The directory lock keeps a context from being freed under us; the channel has its own lock. */
+        for (unsigned w = 0; w < 32; w++) {
+            spu_context* ctx = pi->slots[w][spu_num].ctx;
+            if (!ctx) continue;
+            spu_channel_write(&ctx->ch_sig_notify[num], val);
+            spu_ch_wake(ctx);
+            delivered++;
+        }
+        if (!delivered) { pi->snr_val[spu_num][num] = val; pi->snr_set[spu_num][num] = 1; }
+        rc = 0;
+    }
+    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    return rc;
+}
+
+/* Make `ctx` the slot's resident context (NULL withdraws it while it is being reset); a context taking over gets the
+ * signals posted while there was none. Under the directory lock, so spurs_policy_post_snr sees either no context or
+ * an initialized one: a signal written into a context about to be zeroed would count as delivered and be lost. */
+static void policy_publish_ctx(struct PmSlot* slot, spu_context* ctx, uint32_t spu_num)
+{
+    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    slot->ctx = ctx;
+    struct PmInstance* pi = slot->owner;
+    if (ctx && pi && spu_num < 6)
+        for (unsigned num = 0; num < 2; num++)
+            if (pi->snr_set[spu_num][num]) {
+                spu_channel_write(&ctx->ch_sig_notify[num], pi->snr_val[spu_num][num]);
+                pi->snr_set[spu_num][num] = 0;
+            }
+    ReleaseSRWLockExclusive(&s_pm_directory_lock);
 }
 
 static void policy_slot_release(struct PmSlot* slot)
@@ -146,6 +198,7 @@ void spurs_policy_release_instance(uint32_t ea)
             slot->data = 0; slot->pm = NULL; slot->size = 0; slot->entry = NULL; slot->image_id = 0;
             ReleaseSRWLockExclusive(&slot->lock);
         }
+        memset(pi->snr_set, 0, sizeof pi->snr_set);   /* a signal still waiting for a context is the old instance's */
         pi->used = 0; pi->retiring = 0; pi->ea = 0;
         break;
     }
@@ -199,7 +252,6 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (!ctx) {
         ctx = (spu_context*)malloc(sizeof(spu_context));
         if (!ctx) { policy_slot_release(resident); return -1; }
-        resident->ctx = ctx;
         first = 1;
         /* SPU_CTX_LOG=1: policy-module contexts are PERSISTENT and there is one
          * per (workload, spu_num) -- a workload with readyCount 8 legitimately
@@ -213,6 +265,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                             (void*)ctx, wid, spu_num); }
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
+        policy_publish_ctx(resident, ctx, spu_num);
     } else if (s_fresh || resident->data != wkl_data ||
                resident->pm != pm_host || resident->size != pm_size ||
                resident->entry != entry || resident->image_id != image_id) {
@@ -225,10 +278,13 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                         (unsigned long long)wkl_data);
         }
         first = 1;
+        /* TODO: a reload on real hardware keeps the SPU's signal channels; this reset drops a signal still unread. */
+        policy_publish_ctx(resident, NULL, spu_num);
         spu_coh_unregister(ctx);
         spu_mfc_release(ctx);
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
+        policy_publish_ctx(resident, ctx, spu_num);
     }
     resident->data = wkl_data;
     resident->pm = pm_host; resident->size = pm_size;
