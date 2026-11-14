@@ -103,13 +103,17 @@ foreach(watch 1 2)
 endforeach()
 
 # Error returns and timeouts of the lv2 mutex, semaphore, rwlock and cond
-# (trylock EDEADLK, destroy EBUSY, timed rwlock, huge timeouts, attribute names).
+# (trylock EDEADLK, destroy EBUSY, a destroy racing a call in flight, timed
+# rwlock, huge timeouts, attribute names).
 add_executable(test_sync_semantics
     test_sync_semantics.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
     "${RUNTIME_SYNC_DIR}/sys_cond.c"
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
     "${RUNTIME_SYNC_DIR}/sys_rwlock.c")
+# The semaphore and rwlock sources call ps3_sync_test_hook (defined by the test)
+# at the points where it parks a call to order a destroy against it.
+target_compile_definitions(test_sync_semantics PRIVATE PS3_SYNC_TEST_HOOKS)
 if(NOT WIN32)
     target_sources(test_sync_semantics PRIVATE
         "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
