@@ -482,6 +482,12 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_savedata_param_sfo libs/system/tests/test_savedata_param_sfo.c
           /tmp/test_savedata_param_sfo
 
+      # cellGemGetState answers CELL_GEM_NOT_CONNECTED (a tracking result), not an error code.
+      - name: Run the cellGem state test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_gem_state libs/hardware/tests/test_gem_state.c
+          /tmp/test_gem_state
+
       # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
       # queue) on host threads. It was Windows-only until the shim grew joinable
       # handles and multi-object waits; here it is the memory-model regression
