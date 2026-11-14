@@ -292,8 +292,22 @@ Instructions the lifter accepts but does not fully model:
 - **`mfspr`** returns zero (`spu_mfspr` in `runtime/spu/spu_helpers.h`);
   **`mtspr`** emits a no-op comment.
 - **Double precision** (`dfa`, `dfs`, `dfm`, `dfma`, `dfms`, `dfnma`, `dfnms`,
-  `dfceq`, `dfcgt`, `dfcmeq`, `dfcmgt`, `dftsv`, `fesd`, `frds`) is lifted to
-  helpers in `runtime/spu/spu_helpers.h`; it is not a stub.
+  `fesd`, `frds`) is lifted to helpers in `runtime/spu/spu_helpers.h`; it is not
+  a stub.
+- **`dfceq`, `dfcmeq`, `dfcgt`, `dfcmgt`, `dftsv`** lift to a halt, not to a
+  helper. A CBE SPU raises an invalid-instruction error for each (console probe,
+  CECHC04 on FW 4.81: the thread group ends with join cause 4 and the stopped
+  thread's exit status reads `0x8001000F`), so the interpreter decodes them as
+  `.word` and the lifter emits the same halt at the word's own PC.
+- **`cflts` / `cfltu` at I8 <= 14**: the conversion shifts by
+  `sh = be + 23 - I8`, and a lane with `sh >= 264` (only reachable at these
+  scales) leaves the saturating path of a CBE SPU for a result nothing models
+  (console probe, CECHC04 on FW 4.81; `cfltu` is modelled for a negative lane
+  and for `sh == 264`). Interpreter and lifted code ask
+  `spu_cfl_unmodelled_lane()` first and halt at the word, naming the op, the
+  scale, the lane and its input word, rather than write a value the console
+  would not produce. I8 >= 15 cannot reach that region and lifts to the bare
+  helper call.
 
 ## Tracing (for §3 diff vs RPCS3)
 

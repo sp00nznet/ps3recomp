@@ -32,12 +32,25 @@ RI8 = {0x1d8: "cflts", 0x1d9: "cfltu", 0x1da: "csflt", 0x1db: "cuflt"}  # op10
 LSX = {0x1c4: "lqx", 0x144: "stqx"}
 CHANNEL = {0x00D: "rdch", 0x10D: "wrch", 0x00F: "rchcnt"}  # op11
 
+# dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as `.word` for the interpreter
+# although spu_disasm.py names them: a CBE SPU does not implement them (they
+# are PowerXCell 8i additions [INFERENCE]). Console probe, CECHC04 on FW 4.81: each word
+# run alone in its own thread group did not execute; the group ended with
+# join cause 4 and the stopped thread's exit status read 0x8001000F
+# (CELL_ESTAT). RPCS3 at d00d8023 does not implement them either. Only the
+# interpreter's decode remaps them (naming a word in a disassembly is not
+# executing it), so a guest that reaches one stops at the word's own pc, as at
+# any word no table claims, instead of computing a result the console never
+# produced.
+DECODE_AS_INVALID = {"dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"}
+
 # Every mnemonic the decoder can emit -> a stable enum. `.word` is the trap.
 all_mn = set()
 for t in (D.RRR_TABLE, D.RI18_TABLE, D.RI16_TABLE, D.RI10_TABLE, D.SPU_RR,
           RI7, RI8, LSX, CHANNEL):
     all_mn.update(t.values())
 all_mn.add(".word")
+all_mn -= DECODE_AS_INVALID
 mnems = sorted(all_mn)
 
 
@@ -121,6 +134,8 @@ def decode_prefix(p):
     for stage, bits, table in STAGES:
         mn = table.get(p >> (11 - bits))
         if mn is not None:
+            if mn in DECODE_AS_INVALID:
+                return ".word", "NONE"
             return mn, form_of(stage, mn)
     return ".word", "NONE"
 
@@ -152,7 +167,10 @@ w("")
 w("typedef struct { uint8_t op; uint8_t form; } spu_decode_ent;")
 w('_Static_assert(SPU_OP_COUNT <= 256, "spu_op must fit spu_decode_ent.op");')
 w("")
-w("/* Indexed by insn >> 21; precedence is documented in tools/gen_spu_interp.py. */")
+w("/* Indexed by insn >> 21; precedence is documented in tools/gen_spu_interp.py.")
+w(" * dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as SPU_word here: a CBE SPU raises")
+w(" * an invalid-instruction error for them (console probe, CECHC04 on FW 4.81), so")
+w(" * they take the undecodable-word stop in spu_interp.c instead of executing. */")
 w("static const spu_decode_ent spu_decode_tab[2048] = {")
 for base in range(0, 2048, 4):
     cells = []

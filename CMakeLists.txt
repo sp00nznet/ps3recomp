@@ -470,6 +470,16 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_decode COMMAND test_spu_decode)
         set_tests_properties(spu_decode PROPERTIES TIMEOUT 30)
 
+        # Numeric edge cases of the conversion, double-extension and estimate
+        # helpers (cflts/cfltu, fesd/frds, fi/frest).
+        add_executable(test_spu_numeric_semantics
+            runtime/spu/tests/test_spu_numeric_semantics.c)
+        target_include_directories(test_spu_numeric_semantics PRIVATE include runtime/spu)
+        target_compile_options(test_spu_numeric_semantics PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_numeric_semantics PRIVATE m)
+        add_test(NAME spu_numeric_semantics COMMAND test_spu_numeric_semantics)
+        set_tests_properties(spu_numeric_semantics PROPERTIES TIMEOUT 30)
+
         # fi and cflts (NEON on ARM64) against their scalar references, in the
         # default FPCR and under round-toward-zero plus flush-to-zero.
         add_executable(test_spu_fi_cflts_neon
@@ -534,6 +544,12 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_dma_repeat
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
+        add_test(NAME spu_lifter_invalid_dp
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_invalid_dp.py")
+        add_test(NAME spu_lifter_cfl_scale
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_cfl_scale.py")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
