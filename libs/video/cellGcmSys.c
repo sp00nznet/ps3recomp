@@ -11,6 +11,8 @@
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
 #include "rsx_tiling.h"
+#include "gcm_report_clock.h"
+#include "ps3emu/ps3_env_once.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -381,16 +383,28 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
  * guest memory at gcm_io2ea(offset), where the title reads it itself.
  * Killzone 3 sets 0xFEED0001 and keeps its reports in its own frame data. */
 static u32 s_report_dma = 0xFEED0000u;
-static u64 s_report_last_ts;
 
-/* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
- * walker pass must not share a time stamp or go backwards. */
+/* GET_REPORT timestamp in nanoseconds, strictly rising (gcm_report_clock.h).
+ * PS3RECOMP_GCM_REPORT_BUSY_SCALE=<0..1>: the share of the walker's drain
+ * time the stamps count, 1 by default; 0 leaves the RSX's own work out, for a
+ * title that scales its detail by GPU frame time measured with reports. Only
+ * the walker reaches these, under s_gcm_fifo_lock. */
+static gcm_report_clock s_report_clock;
+static int s_report_clock_ready;
+
+static gcm_report_clock* gcm_report_clock_get(void)
+{
+    if (!s_report_clock_ready) {
+        const char* e = ps3_env_once("PS3RECOMP_GCM_REPORT_BUSY_SCALE");
+        gcm_report_clock_init(&s_report_clock, gcm_report_clock_parse_scale(e));
+        s_report_clock_ready = 1;
+    }
+    return &s_report_clock;
+}
+
 static u64 gcm_report_timestamp(void)
 {
-    u64 t = get_timestamp_ns();
-    if (t <= s_report_last_ts) t = s_report_last_ts + 1u;
-    s_report_last_ts = t;
-    return t;
+    return gcm_report_clock_stamp(gcm_report_clock_get(), get_timestamp_ns());
 }
 
 /* Label area (256 labels, each u32). Labels live in GUEST memory so the
@@ -2179,7 +2193,10 @@ void cellGcm_rsx_process_fifo(void)
     g_gcm_drain_tid = GetCurrentThreadId();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    gcm_report_clock* rc = gcm_report_clock_get();
+    if (rc->scale < 1.0) gcm_report_clock_drain_begin(rc, get_timestamp_ns());
     gcm_rsx_process_fifo_unlocked();
+    if (rc->scale < 1.0) gcm_report_clock_drain_end(rc, get_timestamp_ns());
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
     if (ft_t0) {
         const uint64_t t1 = ps3_ft_now();

@@ -502,6 +502,8 @@ jobs:
           /tmp/test_vertex_current_color
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_color_feedback_engine
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_gcm_report_clock libs/video/tests/test_gcm_report_clock.c
+          /tmp/test_gcm_report_clock
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
           clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c

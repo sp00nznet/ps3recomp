@@ -516,6 +516,14 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
+    # The clock GET_REPORT stamps reports with, and its drain-time scale.
+    add_executable(test_gcm_report_clock libs/video/tests/test_gcm_report_clock.c)
+    target_include_directories(test_gcm_report_clock PRIVATE include libs/video)
+    if(NOT MSVC)
+        target_link_libraries(test_gcm_report_clock PRIVATE m)
+    endif()
+    add_test(NAME gcm_report_clock COMMAND test_gcm_report_clock)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
