@@ -47,7 +47,16 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
 void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
 void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
 void rsx_state_init(rsx_state* state) { (void)state; }
-int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
+/* NV4097 back-end write / texture-read semaphore releases write their label inside rsx_process_method;
+ * record where get is when the walker hands one over. */
+static u32 sema4097_get[2], sema4097_n;
+int  rsx_process_method(rsx_state* state, u32 method, u32 data)
+{
+    (void)state; (void)data;
+    if ((method == 0x1D70u || method == 0x1D74u) && sema4097_n < 2)
+        sema4097_get[sema4097_n++] = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+    return 0;
+}
 /* No microcode or constant runs here: the walker hands every word to
  * rsx_process_method instead. */
 int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
@@ -143,6 +152,12 @@ int main(int argc, char** argv)
     const u32 end_rel2 = io;
     io = put_probe(io, 2);
     io = put_probe(io, 3);
+    /* NV4097 back-end write release, then texture-read release. */
+    const u32 be_val = 0x33u, tex_val = 0x44u;
+    io = put_cmd(io, 0, 0x1D70u, 1, &be_val);
+    const u32 end_be = io;
+    io = put_cmd(io, 0, 0x1D74u, 1, &tex_val);
+    const u32 end_tex = io;
     const u32 put = io;
 
     s_fifo_getoff = 0;
@@ -161,6 +176,13 @@ int main(int argc, char** argv)
     } else {
         check(seen_get[1] == 0 && seen_get[2] == 0 && seen_get[3] == 0,
               "GCM_GET_EQ_PUT: a RELEASE publishes nothing mid-pass");
+    }
+    check(sema4097_n == 2, "the NV4097 semaphore releases reached the method handler");
+    if (!eq_put) {
+        check(sema4097_get[0] == end_be, "get is past an NV4097 back-end write release before its label");
+        check(sema4097_get[1] == end_tex, "get is past an NV4097 texture-read release before its label");
+    } else {
+        check(sema4097_get[0] == 0 && sema4097_get[1] == 0, "GCM_GET_EQ_PUT: an NV4097 release publishes nothing mid-pass");
     }
     check(vm_read32(ctrl + 4) == put, "after the pass, get is put");
 

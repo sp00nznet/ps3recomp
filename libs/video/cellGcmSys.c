@@ -2226,10 +2226,16 @@ static int gcm_word_diag(void)
 }
 
 /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
- * plus the methods whose answer the walker writes itself. */
-static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+ * plus the methods whose answer the walker writes itself. `end_off`: the IO
+ * offset just past the command the word belongs to. */
+static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live, u32 end_off)
 {
     extern u32 g_rsx_last_reference;
+    /* NV4097 back-end write / texture-read semaphore release: the label lands
+     * inside rsx_process_method, so publish `get` past the command first, as
+     * for NV406E RELEASE. */
+    if ((m == 0x1D70u || m == 0x1D74u) && !gcm_get_eq_put())
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, end_off);
     /* #466: rsx_state feeds only the legacy vtable backend. With the draw
      * engine up and no vtable registered, the state it builds is never read,
      * so only the methods with effects outside it are worth handing over.
@@ -2801,7 +2807,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     }
                     for (u32 i = 0; i < count; i++)
                         gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method,
-                                      vm_read32(dea + i * 4), legacy_state_live);
+                                      vm_read32(dea + i * 4), legacy_state_live, s_fifo_getoff + 4 + count * 4);
                     s_fifo_getoff += 4 + count * 4;
                     continue;
                 }
@@ -2954,7 +2960,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
+                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live, s_fifo_getoff + 4 + count * 4);
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
