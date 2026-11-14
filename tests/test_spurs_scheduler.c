@@ -123,6 +123,12 @@ static void* error_direct(void* arg)
     direct_rc[id]=spu_run_policy_module(id?exit_policy:error_policy,79,vm_base+0x9400,16,id+1,3,0x11000+id*0x1000,0);
     return NULL;
 }
+static atomic_uint snr_seen[2];
+static void snr_policy(spu_context* c)
+{
+    atomic_store(&snr_seen[0],c->ch_sig_notify[0].count);atomic_store(&snr_seen[1],c->ch_sig_notify[1].count);
+    finish(c);
+}
 static atomic_uint incarnation_runs,eligible_lane;
 static void incarnation_policy(spu_context* c)
 {
@@ -262,5 +268,18 @@ int main(void)
     pthread_join(a,NULL);pthread_join(b,NULL);assert(direct_rc[0]==-2 && direct_rc[1]==0);
     spurs_policy_release_instance(0x11000);spurs_policy_release_instance(0x12000);
     puts("SPURS same workload/lane across instances retains separate LS and TLS exit classification PASS");
+
+    /* A signal posted before the instance has a context goes to its first context, and only that instance's: the one
+     * still waiting when the instance is released must not reach whatever instance reuses the address. */
+    assert(spurs_policy_post_snr(0x11000,0,1,0x55)==0);
+    assert(spu_run_policy_module(snr_policy,79,vm_base+0x9400,16,1,3,0x11000,0)==0);
+    assert(atomic_load(&snr_seen[1])==1 && atomic_load(&snr_seen[0])==0);
+    spurs_policy_release_instance(0x11000);
+    assert(spurs_policy_post_snr(0x11000,0,0,0x34)==0);
+    spurs_policy_release_instance(0x11000);
+    assert(spu_run_policy_module(snr_policy,79,vm_base+0x9400,16,1,3,0x11000,0)==0);
+    assert(atomic_load(&snr_seen[0])==0 && atomic_load(&snr_seen[1])==0);
+    spurs_policy_release_instance(0x11000);
+    puts("SPURS signal waiting for a context does not survive its instance PASS");
     free(vm_base);return 0;
 }

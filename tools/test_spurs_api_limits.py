@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cellSpurs argument limits (maxContention clamp, RequestIdleSpu workload check)."""
+"""cellSpurs argument limits (maxContention clamp, RequestIdleSpu workload check, GetInfo's SPU thread ids)."""
 import os, platform, subprocess, tempfile
 from pathlib import Path
 if os.name == 'nt':

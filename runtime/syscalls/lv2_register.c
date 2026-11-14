@@ -2415,6 +2415,12 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
     }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
+        /* A SPU thread of a SPURS instance (ids from cellSpursGetInfo), which has no spu_thread_t of its own. */
+        extern int cellSpurs_post_snr(uint32_t tid, uint32_t num, uint32_t val) __attribute__((weak));
+        if (cellSpurs_post_snr && cellSpurs_post_snr(tid, num, val) == 0) {
+            ctx->gpr[3] = 0;
+            return 0;
+        }
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
         return (int64_t)ctx->gpr[3];
     }

@@ -556,6 +556,10 @@ static void wkl_count_set(u32 ea, u32 field, u32 wid, int is2, u32 v)
     else *b = (u8)((*b & 0x0F) | ((v & 0x0F) << 4));
 }
 
+/* Pseudo ids of a SPURS instance's SPU threads: instance index and SPU number under a tag byte. */
+#define SPURS_SPU_TID_BASE 0x70000000u
+#define SPURS_SPU_TID(inst, spu) (SPURS_SPU_TID_BASE | ((u32)(inst) << 4) | (u32)(spu))
+
 static struct SpursInst* spurs_inst_find(u32 ea)
 {
     for (int i = 0; i < MAX_SPURS_INST; i++)
@@ -3430,9 +3434,28 @@ s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
     if (PS3_LOG_FIRST(_n, 4)) printf("[cellSpurs] GetInfo(spurs=0x%08X info=0x%08X)\n", (u32)spurs_ea, (u32)info_ea);
     if (info_ea) {
         vm_write32((u32)info_ea, si ? si->nspus : 1);   /* nSpus */
-        for (int o = 4; o < 0x28; o += 4) vm_write32((u32)info_ea + o, 0);
+        for (int o = 4; o < 0x48; o += 4) vm_write32((u32)info_ea + o, 0);
+        /* spuThreadGroup (0x24) and spuThreads[8] (0x28): ids the game passes to sys_spu_thread_write_snr to wake the
+         * policy module of its own workload. They are pseudo ids that cellSpurs_post_snr resolves. */
+        if (si) {
+            u32 idx = (u32)(si - s_inst);
+            vm_write32((u32)info_ea + 0x24, SPURS_SPU_TID(idx, 0xF));
+            for (u32 n = 0; n < si->nspus && n < 8; n++)
+                vm_write32((u32)info_ea + 0x28 + 4 * n, SPURS_SPU_TID(idx, n));
+        }
     }
     return CELL_OK;
+}
+
+/* sys_spu_thread_write_snr on a pseudo SPU thread id of cellSpursGetInfo (see SPURS_SPU_TID). */
+int cellSpurs_post_snr(u32 tid, u32 num, u32 val)
+{
+    if ((tid & 0xFF000000u) != SPURS_SPU_TID_BASE) return -1;
+    u32 idx = (tid >> 4) & 0xF, n = tid & 0xF;
+    if (idx >= MAX_SPURS_INST) return -1;
+    u32 ea = __atomic_load_n(&s_inst[idx].ea, __ATOMIC_ACQUIRE);
+    if (!ea || n >= s_inst[idx].nspus) return -1;
+    return spurs_policy_post_snr(ea, n, num, val);
 }
 
 s32 cellSpursSetExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea)
