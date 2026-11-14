@@ -38,10 +38,15 @@ int main(void)
     assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
     assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
     assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
+    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
+    assert(vm_read64(0x208) == TROPHY_PACK_SIZE);
     assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == SCE_NP_TROPHY_ERROR_UNKNOWN);
     g_ps3_guest_caller = callback;
     assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == CELL_OK);
     assert(calls == 1 && s_contexts[1].registered);
+    /* Registration installed the set: nothing more to install. */
+    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
+    assert(vm_read64(0x208) == 0);
     cellSysutilCheckCallback(); assert(calls == 2);
     cellSysutilCheckCallback(); assert(calls == 2);
     assert(sceNpTrophyTerm() == CELL_OK);
