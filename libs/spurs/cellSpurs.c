@@ -2575,6 +2575,7 @@ static struct {
     u16 max_grab;
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
+    u8  spu_mask;     /* SPUs the priority table lets run the chain (0 = no table) */
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -2641,11 +2642,40 @@ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
             s_jobchains[i].run_count = 0;
+            s_jobchains[i].spu_mask  = 0;
             return CELL_OK;
         }
     }
     printf("[cellSpurs] %s: registry full\n", who);
     return CELL_OK;
+}
+
+/* The priority table (priorityTable[8] of cellSpursCreateJobChain and of
+ * CellSpursJobChainAttribute, one byte per SPU of the instance) is the
+ * workload's priority on each SPU; the SPURS kernel only picks a workload on
+ * an SPU where that priority is non-zero. Titles key per-SPU resources on the SPU number
+ * a job reads (cellSpursGetCurrentSpuId): Red Dead Redemption gives its Edge
+ * chain 00 06 06 06 00 00 00 00 and sets up an output ring for SPUs 1-3 only,
+ * so a job that says it is on SPU 0 finds a ring of size 0. Remember which
+ * SPUs the table allows. */
+static void jc_set_priority(u32 jc_ea, u32 prio_ea)
+{
+    if (!prio_ea || prio_ea >= 0x10000000u) return;   /* same bound as the entry dumps */
+    u8 mask = 0;
+    for (int i = 0; i < 8; i++)
+        if (*(vm_base + prio_ea + (u32)i)) mask |= (u8)(1u << i);
+    for (int i = 0; i < MAX_JOBCHAINS; i++)
+        if (s_jobchains[i].jc_ea == jc_ea) { s_jobchains[i].spu_mask = mask; return; }
+}
+
+/* The SPU number the chain's jobs see: the lowest one its priority table
+ * allows, or SPU 0 when it has no table (or an all-zero one). */
+static u32 jc_spu_for(int slot)
+{
+    const u8 mask = s_jobchains[slot].spu_mask;
+    for (u32 n = 0; n < 8; n++)
+        if (mask & (1u << n)) return n;
+    return 0;
 }
 
 s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
@@ -2674,8 +2704,10 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
            name_ea ? (const char*)(vm_base + name_ea) : "-");
 
-    return jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
-                       "CreateJobChainWithAttribute");
+    s32 rc = jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
+                         "CreateJobChainWithAttribute");
+    jc_set_priority((u32)jc_ea, (u32)attr_ea + JCATTR_PRIORITY);
+    return rc;
 }
 
 /* cellSpursCreateJobChain -- the no-attribute form, and the one the WWS job
@@ -2697,7 +2729,7 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
                             u64 prio_ea, u32 maxContention,
                             u32 autoRequestSpuCount)
 {
-    (void)spurs_ea; (void)prio_ea;
+    (void)spurs_ea;
     if (!jc_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     static int _n = 0;
@@ -2709,8 +2741,10 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
         if (entry_ea && (u32)entry_ea < 0x10000000u)
             jc_dump_commands("CreateJobChain", (u32)entry_ea, 16);
     }
-    return jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
-                       (u16)maxGrabbedJob, "CreateJobChain");
+    s32 rc = jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
+                         (u16)maxGrabbedJob, "CreateJobChain");
+    jc_set_priority((u32)jc_ea, (u32)prio_ea);
+    return rc;
 }
 
 /* ---------------------------------------------------------------------------
@@ -3074,6 +3108,9 @@ static DWORD WINAPI jc_thread(LPVOID p)
      * Confirms timing-vs-never before committing to the async rewrite. */
     { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
+    /* The walk runs the chain's jobs on this thread: they see the SPU number
+     * set here (spurs_job.c puts it at LS 0x1C8 for the job's crt). */
+    { extern void spurs_job_set_spu_num(uint32_t n); spurs_job_set_spu_num(jc_spu_for(slot)); }
     jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
                s_jobchains[slot].size_desc);
     s_jobchains[slot].running = 0;
