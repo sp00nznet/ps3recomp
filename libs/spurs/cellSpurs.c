@@ -1120,14 +1120,39 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
     return CELL_OK;
 }
 
+/* Join returns once every task of the taskset has exited: the runtime clears a
+ * task's ENABLED bit when it exits (spu_workload.c, as the real policy does),
+ * so all sixteen bytes of the bitset reading zero means the taskset is done.
+ * A guest's Shutdown, Join, Destroy, re-Create sequence relies on that. The
+ * wait is bounded; on expiry Join reports BUSY and says so, rather than
+ * hanging the caller on a task that never exits. */
+static unsigned s_taskset_join_timeout_ms = 10000;
+
+static int spurs_taskset_tasks_enabled(u32 ea)
+{
+    for (u32 off = 0; off < 16; off++)
+        if (__atomic_load_n(vm_base + ea + CSTS_ENABLED + off, __ATOMIC_ACQUIRE)) return 1;
+    return 0;
+}
+
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset)
 {
-    taskset = GUEST_PTR(taskset, CellSpursTaskset*);
-    if (!taskset)
+    const u32 ea = (u32)(uintptr_t)taskset;
+    if (!ea)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!spurs_guest_range_valid(ea, CSTS_TASKINFO))
+        return CELL_SPURS_TASK_ERROR_FAULT;
 
-    printf("[cellSpurs] JoinTaskset()\n");
-    /* In a full implementation, wait for all tasks to complete */
+    printf("[cellSpurs] JoinTaskset() ea=0x%08X\n", ea);
+    const ULONGLONG deadline = GetTickCount64() + s_taskset_join_timeout_ms;
+    while (spurs_taskset_tasks_enabled(ea)) {
+        if (GetTickCount64() >= deadline) {
+            fprintf(stderr, "[cellSpurs] JoinTaskset ea=0x%08X: tasks still enabled after %u ms; "
+                    "returning BUSY\n", ea, s_taskset_join_timeout_ms);
+            return CELL_SPURS_TASK_ERROR_BUSY;
+        }
+        Sleep(1);
+    }
     return CELL_OK;
 }
 
