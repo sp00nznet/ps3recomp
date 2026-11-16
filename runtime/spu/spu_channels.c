@@ -340,6 +340,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
         g_spu_trampoline_fn = 0;
+        /* No drain is live on the driver stack either, so no return point is.
+         * Left set, the innermost abandoned drain's return pc stops the
+         * interpreter fallback at once on a later return to that address, and
+         * the run ends with the SPU still running. A drain exit restores the
+         * enclosing drain's pc (SPU_DRAIN_POP_IRQ), so nothing else clears it. */
+        ctx->drain_ret_pc = 0;
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
         break;
