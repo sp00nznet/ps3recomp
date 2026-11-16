@@ -82,6 +82,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "rsx_present_guard.h"
 
 /* ------------------------------------------------------------------------- */
 
@@ -95,7 +96,69 @@ static int                 s_headless;
 static atomic_int          s_closed;
 #if !TARGET_OS_IPHONE
 static id                  s_window_close_observer;
+static id                  s_window_occlusion_observer;
 #endif
+/* The window's present guard (rsx_present_guard.h): an occluded or minimized
+ * window, or a compositor that stopped handing out drawables, never paces the
+ * presenting thread. nextDrawable cannot be polled, so a stall is seen by how
+ * long it took. */
+static rsx_present_guard   s_pg;
+static atomic_int          s_pg_ready;
+static uint64_t pg_now_ns(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static void pg_init(void)
+{
+    if (atomic_load(&s_pg_ready)) return;
+    rsx_present_guard_init(&s_pg, getenv("PS3RECOMP_METAL_DRAWABLE_BOUND_MS"));
+    atomic_store(&s_pg_ready, 1);
+}
+/* Whether this present asks for a drawable at all. */
+static int pg_show_window(void)
+{
+    pg_init();
+    uint64_t unused;
+    return rsx_present_guard_before(&s_pg, pg_now_ns(), &unused);
+}
+/* A frame left out of the window waits for its 60 Hz slot, as the display
+ * would have paced it: a title whose flips wait for nothing else spins. */
+static void pg_pace(void)
+{
+    const uint64_t wait = rsx_present_guard_pace_ns(&s_pg, pg_now_ns());
+    if (!wait) return;
+    const struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) };
+    nanosleep(&ts, NULL);
+}
+/* nextDrawable, timed and reported to the guard. */
+static id<CAMetalDrawable> pg_next_drawable(CAMetalLayer* layer)
+{
+    const uint64_t t0 = pg_now_ns();
+    id<CAMetalDrawable> d = [layer nextDrawable];
+    const uint64_t now = pg_now_ns();
+    const int was = __atomic_load_n(&s_pg.present_stalled, __ATOMIC_RELAXED);
+    rsx_present_guard_drawable(&s_pg, now, now - t0, d != nil);
+    const int is = __atomic_load_n(&s_pg.present_stalled, __ATOMIC_RELAXED);
+    static int logged;
+    if (is && !was && logged++ < 8)
+        fprintf(stderr, "[RSX metal] nextDrawable took %.0f ms%s; the window is shown only on a probe every 2 s until it recovers\n",
+                (double)(now - t0) / 1e6, d ? "" : " and gave none");
+    return d;
+}
+/* The frames-in-flight slot: the GPU's pace, not the window's. Bounded only
+ * to say so; it still waits, so no more frames are ever in flight. */
+static void pg_inflight_wait(dispatch_semaphore_t sem)
+{
+    pg_init();
+    if (!s_pg.bound_ns) { dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER); return; }
+    const uint64_t t0 = pg_now_ns();
+    if (!dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)s_pg.bound_ns))) return;
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    static int logged;
+    if (rsx_present_guard_slot_wait(&s_pg, pg_now_ns() - t0) && logged++ < 8)
+        fprintf(stderr, "[RSX metal] a frame slot took %.0f ms to free (GPU behind)\n", (double)(pg_now_ns() - t0) / 1e6);
+}
 /* The window's content size in device pixels, kept current by the message pump (main thread) and read
  * by the present path, which sizes the drawable to it. 0 until the first pump. */
 static volatile u32        s_win_px_w, s_win_px_h;
@@ -819,6 +882,11 @@ static void window_close_observer_stop(void)
         [[NSNotificationCenter defaultCenter] removeObserver:s_window_close_observer];
         s_window_close_observer = nil;
     }
+    if (s_window_occlusion_observer) {
+        [[NSNotificationCenter defaultCenter] removeObserver:s_window_occlusion_observer];
+        s_window_occlusion_observer = nil;
+    }
+    rsx_present_guard_set_hidden(&s_pg, 0);
 }
 
 static void window_close_observer_start(NSWindow* window)
@@ -830,6 +898,20 @@ static void window_close_observer_start(NSWindow* window)
         usingBlock:^(NSNotification* note) {
             (void)note;
             atomic_store(&s_closed, 1);
+        }];
+    /* Occluded, minimized or on a hidden space: nobody sees the window, and
+     * nextDrawable may then block for up to a second per frame. Posted on
+     * the main thread, which owns the window; presenters read only the flag. */
+    pg_init();
+    s_window_occlusion_observer = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSWindowDidChangeOcclusionStateNotification object:window queue:nil
+        usingBlock:^(NSNotification* note) {
+            NSWindow* w = (NSWindow*)note.object;
+            const int hidden = !([w occlusionState] & NSWindowOcclusionStateVisible);
+            rsx_present_guard_set_hidden(&s_pg, hidden);
+            static int logged;
+            if (logged++ < 16)
+                fprintf(stderr, "[RSX metal] window %s\n", hidden ? "occluded: presents skip it until it is visible" : "visible");
         }];
 }
 
@@ -4480,7 +4562,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         const u32 host_gen = s_host_gen;
         const int windowed_present = (present_dst && !s_headless);
         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-          if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+          if (windowed_present) pg_inflight_wait(s_inflight);
           if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
               if (w1 - w0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 2, 0, w0, w1); } }
         if (present_dst) {
@@ -4502,12 +4584,19 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                     s_layer.drawableSize = CGSizeMake((CGFloat)ww, (CGFloat)wh);
                     fprintf(stderr, "[RSX metal] drawable %ux%u (window)\n", ww, wh);
                 }
-                drawable = [s_layer nextDrawable];
-                if (!drawable) {           /* compositor is busy; skip */
-                    dispatch_semaphore_signal(s_inflight);
-                    return;
+                /* The guard may leave the window out: the frame is still
+                 * encoded and committed, into no drawable, so recorded work
+                 * never piles up, at no more than 60 frames a second. */
+                if (!pg_show_window()) {
+                    pg_pace();
+                } else {
+                    drawable = pg_next_drawable(s_layer);
+                    if (!drawable) {       /* compositor is busy; skip */
+                        dispatch_semaphore_signal(s_inflight);
+                        return;
+                    }
+                    dst = [drawable texture];
                 }
-                dst = [drawable texture];
             }
         }
 
@@ -4963,7 +5052,7 @@ void rsx_metal_backend_present(void)
      * be the display's size; a resize waits for the frames in flight first. */
     if (s_host && host_match_size(s_width, s_height) != 0) return;
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
-    if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+    if (!s_headless) pg_inflight_wait(s_inflight);
     @autoreleasepool {
         id<MTLTexture> target = nil;
         id<CAMetalDrawable> drawable = nil;
@@ -4980,8 +5069,10 @@ void rsx_metal_backend_present(void)
             }
             target = s_host_tex[host_slot];
         } else {
-            drawable = [s_layer nextDrawable];
-            if (!drawable) {            /* compositor is busy; skip this frame */
+            const int show = pg_show_window();
+            if (show) drawable = pg_next_drawable(s_layer);
+            else pg_pace();
+            if (!drawable) {            /* left out by the guard, or the compositor is busy; skip this frame */
                 dispatch_semaphore_signal(s_inflight);
                 return;
             }
