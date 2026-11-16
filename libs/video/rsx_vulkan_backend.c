@@ -50,6 +50,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "rsx_present_guard.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -65,6 +66,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------------------
  * Run-time loaded entry points (Vulkan 1.0 core only)
@@ -556,6 +558,34 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
     const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
     pthread_mutex_unlock(&s_vk.queue_mu);
     return r;
+}
+
+/* The window's present guard (rsx_present_guard.h): a window nobody can see
+ * -- hidden, minimized, on a display that is asleep -- or a compositor that
+ * stopped taking frames never paces the presenting thread. */
+static rsx_present_guard s_pg;
+static int s_pg_ready;
+static uint64_t vk_pg_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static void vk_pg_init(void)
+{
+    if (s_pg_ready) return;
+    rsx_present_guard_init(&s_pg, getenv("PS3RECOMP_VK_ACQUIRE_BOUND_MS"));
+    s_pg_ready = 1;
+    if (!s_pg.bound_ns) VK_LOG("window present guard off (PS3RECOMP_VK_ACQUIRE_BOUND_MS=0)\n");
+}
+/* A frame left out of the window waits for its 60 Hz slot, as the display
+ * would have paced it. */
+static void vk_pg_pace(void)
+{
+    const uint64_t wait = rsx_present_guard_pace_ns(&s_pg, vk_pg_now());
+    if (!wait) return;
+    const struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) };
+    nanosleep(&ts, NULL);
 }
 
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
@@ -1930,10 +1960,26 @@ static void vk_present_window(void)
         if (!s_vk.windowed || s_vk_resized) return;
     }
 
+    /* The present guard: skip a window nobody can see, and bound the acquire
+     * so a compositor that stopped taking frames does not pace the title. */
+    vk_pg_init();
+    uint64_t bound = UINT64_MAX;
+    if (!rsx_present_guard_before(&s_pg, vk_pg_now(), &bound)) { vk_pg_pace(); return; }
+
     u32 idx = 0;
-    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, bound,
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) {
+        const unsigned long long before = __atomic_load_n(&s_pg.stalls, __ATOMIC_RELAXED);
+        rsx_present_guard_acquired(&s_pg, 0);
+        if (__atomic_load_n(&s_pg.stalls, __ATOMIC_RELAXED) != before && before < 8)
+            VK_LOG("swapchain gave no image within %llu ms; frames skip the window until it does\n",
+                   (unsigned long long)(s_pg.bound_ns / 1000000ull));
+        vk_pg_pace();
+        return;
+    }
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) rsx_present_guard_acquired(&s_pg, 1);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
     }
@@ -1989,6 +2035,7 @@ static void vk_present_window(void)
         .signalSemaphoreCount = 1, .pSignalSemaphores = &s_vk.sc_done[idx],
     };
     pvkResetFences(s_vk.device, 1, &s_vk.window_fence);
+    const uint64_t t_window = vk_pg_now();   /* the blit waits on the image's release */
     if (vk_queue_submit(&si, s_vk.window_fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (window) failed\n"); return;
     }
@@ -2000,6 +2047,17 @@ static void vk_present_window(void)
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
     r = vk_queue_present(&pi);
+    {   /* The window frame's waits (the blit's wait for the image, the present
+         * call): over the bound, the window is skipped, with a probe every 2 s,
+         * until a frame gets through within it. */
+        const int was = __atomic_load_n(&s_pg.present_stalled, __ATOMIC_RELAXED);
+        const uint64_t now = vk_pg_now();
+        rsx_present_guard_presented(&s_pg, now, now - t_window);
+        static int s_logged;
+        if (!was && __atomic_load_n(&s_pg.present_stalled, __ATOMIC_RELAXED) && s_logged++ < 8)
+            VK_LOG("window presentation stalled (%.0f ms); showing frames only on a probe every 2 s until it recovers\n",
+                   (double)(now - t_window) / 1e6);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
@@ -4174,6 +4232,14 @@ int rsx_vulkan_backend_pump_messages(void)
                    (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
                     e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
             s_vk_resized = 1;
+        }
+        /* A hidden window is left out of presents by the present guard
+         * (a minimized one already is, by vk_window_hidden). */
+        if (e.type == SDL_WINDOWEVENT && s_vk.window && e.window.windowID == SDL_GetWindowID(s_vk.window)) {
+            if (e.window.event == SDL_WINDOWEVENT_HIDDEN) rsx_present_guard_set_hidden(&s_pg, 1);
+            else if (e.window.event == SDL_WINDOWEVENT_SHOWN || e.window.event == SDL_WINDOWEVENT_EXPOSED ||
+                     e.window.event == SDL_WINDOWEVENT_RESTORED)
+                rsx_present_guard_set_hidden(&s_pg, 0);
         }
     }
     return quit ? -1 : 0;

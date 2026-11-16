@@ -287,6 +287,7 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
 | `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
+| `PS3RECOMP_VK_ACQUIRE_BOUND_MS=<ms>` | With a window: the present guard (`rsx_present_guard.h`, default 100). A hidden or minimized window is left out of presents; a swapchain acquire waits at most this long, and after one times out does not wait until an image comes back; a window frame whose waits (the blit's wait for the image, the present call) take longer than this skips the window, with a probe every 2 s, until a frame gets through. Frames left out are still rendered offscreen and are held to 60 Hz. `0` restores the unbounded acquire and turns the guard off |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
 
 | `PS3RECOMP_VK_GUEST_PROGRAMS=1` | Run the guest's own vertex/fragment programs (needs the translator, below); also makes the draw engine the default path |
