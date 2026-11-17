@@ -324,7 +324,7 @@ static id<MTLLibrary> s_shader_lib;    /* built-in fixed-function shaders */
 
 /* ---- per-draw constant blocks -----------------------------------------------
  * VPConst is the 512 float4 transform constants plus the viewport epilogue's
- * posscale/posoffset (8224 bytes); PSConstants is the fragment program's
+ * posscale/posoffset and the point-size row (8240 bytes); PSConstants is the fragment program's
  * inline constants plus fp_alpha. Constants change between draws in a frame,
  * so each draw snapshots its own blocks -- the D3D12 backend keeps a per-draw
  * VP_CB_STRIDE slot for the same reason. Both blocks are past the 4 KB limit
@@ -333,7 +333,9 @@ static id<MTLLibrary> s_shader_lib;    /* built-in fixed-function shaders */
  * one buffer, exactly like the vertices.
  * --------------------------------------------------------------------------*/
 
-#define MTL_VP_CB_BYTES  ((RSX_MAX_VERTEX_CONSTANTS + 2) * 16)
+/* + vp_pointsize (rsx_vp_decompiler.h): every vertex function this backend
+ * translates writes [[point_size]] from it. */
+#define MTL_VP_CB_BYTES  ((RSX_MAX_VERTEX_CONSTANTS + 3) * 16)
 #define MTL_CB_ALIGN     256u
 #define MTL_CB_MAX       (256u << 20)
 static u8* s_cb;
@@ -1345,6 +1347,17 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
     else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+    {
+        /* vp_pointsize. This path keeps no SET_POINT_SIZE (rsx_commands.c does
+         * not track it), so a point is one pixel unless the vertex program
+         * writes o[6].x and the output mask says so. The engine path fills
+         * the guest's size. */
+        float* psz = (float*)(vp + (RSX_MAX_VERTEX_CONSTANTS + 2) * 16);
+        psz[0] = 1.0f;
+        psz[1] = (st->vertex_attrib_output_mask & RSX_VP_OUTPUT_MASK_POINT_SIZE) ? 1.0f : 0.0f;
+        psz[2] = RSX_VP_POINT_SIZE_MAX;
+        psz[3] = 0.0f;
+    }
 
     u8* fp = s_cb + fp_off;
     memset(fp, 0, fp_len);

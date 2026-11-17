@@ -22,6 +22,10 @@
  *   ATTRn         ->  [[attribute(n)]]   (vertex inputs, in declaration order)
  *   COLOR0/COLOR1/FOG/TEXCOORD0..7 -> [[user(locn0..10)]], numbered in the
  *   declaration order both decompilers share, so the stages link.
+ * The vertex stage is translated with RSX_POINT_SIZE_BUILTIN defined: the
+ * decompiled VSOutput then carries a PointSize built-in (MSL [[point_size]])
+ * and VPConst one more float4 after vp_posoffset, vp_pointsize
+ * (rsx_vp_decompiler.h). A backend binding such MSL supplies that row.
  * The MSL entry point is always `main0`.
  */
 #ifndef PS3RECOMP_RSX_SHADER_MSL_H
