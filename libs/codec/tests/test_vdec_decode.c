@@ -50,6 +50,25 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 
+/* The renderer's side of the wait (cellGcmSys.c): cellVdecGetPicture holds an
+ * ARGB / RGBA picture back until the drain has passed the next flip. Here it
+ * records the call, and whether the decoder lock was free while it waited. */
+static int s_wait_calls, s_wait_locked;
+static u32 s_wait_timeout;
+int cellGcm_wait_commands_walked(u32 timeout_ms)
+{
+    s_wait_calls++;
+    s_wait_timeout = timeout_ms;
+#ifdef _WIN32
+    if (TryAcquireSRWLockExclusive(&s_vdec_lock)) ReleaseSRWLockExclusive(&s_vdec_lock);
+    else s_wait_locked++;
+#else
+    if (pthread_mutex_trylock(&s_vdec_lock) == 0) pthread_mutex_unlock(&s_vdec_lock);
+    else s_wait_locked++;
+#endif
+    return 0;
+}
+
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
 
 /* Guest layout */
@@ -176,6 +195,18 @@ static void set_format(u32 type, u32 matrix, u8 alpha)
     vm_write32(G_FMT + 0, type);
     vm_write32(G_FMT + 4, matrix);
     vm_write8(G_FMT + 8, alpha);
+}
+
+/* The writer waited for the renderer `n` times since `since`: once for every
+ * ARGB / RGBA picture taken, outside the decoder lock, with a 40 ms bound; not
+ * at all with VDEC_WAIT_DRAIN=0. */
+static void expect_waits(int since, int n)
+{
+    const char* e = getenv("VDEC_WAIT_DRAIN");
+    const int off = e && e[0] == '0' && !e[1];
+    CHECK(s_wait_calls - since == (off ? 0 : n));
+    CHECK(s_wait_locked == 0);
+    if (!off && n) CHECK(s_wait_timeout == 40);
 }
 
 /* Pictures taken so far in this run, as GetPicItem described them. */
@@ -330,6 +361,7 @@ static int mode_decode(int argc, char** argv)
 
     for (int pass = 0; pass < 2; pass++) {       /* the second after a seq reset */
         run_sequence(h, codec, es, -1, 3);
+        CHECK(s_wait_calls == 0);   /* a YUV picture is not a texture: no wait */
         int bad = count_mismatches(ref, nref);
         printf("pass %d: %d pictures, %d differ from ffmpeg's decode\n", pass, s_npic, bad);
         CHECK(bad == 0);
@@ -397,8 +429,10 @@ static int mode_rgba(int argc, char** argv)
     CHECK(s_open_slot->ff);
 
     /* RGBA32: bytes R G B A. */
+    int waits = s_wait_calls;
     run_sequence(h, codec, es, -1, 1);
     CHECK(s_npic == nref);
+    expect_waits(waits, s_npic);
     double worst = 99;
     for (int i = 0; i < s_npic; i++) {
         const u8* p = s_frames + (size_t)i * s_frame_size;
@@ -410,7 +444,9 @@ static int mode_rgba(int argc, char** argv)
     CHECK(worst > 35.0);
 
     /* ARGB32: bytes A R G B, so shifted by one against the reference. */
+    waits = s_wait_calls;
     run_sequence(h, codec, es, -1, 0);
+    expect_waits(waits, s_npic);
     double worst_argb = 99, wrong_order = 0;
     for (int i = 0; i < s_npic; i++) {
         u8* p = s_frames + (size_t)i * s_frame_size;
@@ -426,6 +462,23 @@ static int mode_rgba(int argc, char** argv)
     }
     printf("ARGB32: worst PSNR %.2f dB; R/B swapped averages %.2f dB\n", worst_argb, wrong_order);
     CHECK(worst_argb > 35.0 && wrong_order < 25.0);
+
+    /* GetPictureExt writes the same texture: it waits too; a skip (no
+     * destination) and a YUV picture do not. */
+    CHECK(cellVdecStartSeq(h) == CELL_OK);
+    for (int i = 0; i < s_nau && s_open_slot->qCount < 2; i++)
+        CHECK(submit(h, es, i) == CELL_OK);
+    CHECK(s_open_slot->qCount >= 2);
+    vm_write32(G_FMT + 0, 0);                          /* ARGB32 */
+    vm_write8(G_FMT + 0xC, 0xFF);                      /* alpha, in the format2 layout */
+    waits = s_wait_calls;
+    CHECK(cellVdecGetPictureExt(h, (const void*)(uintptr_t)G_FMT, NULL, 0) == CELL_OK);
+    expect_waits(waits, 0);                            /* a skip */
+    CHECK(cellVdecGetPictureExt(h, (const void*)(uintptr_t)G_FMT, (void*)(uintptr_t)G_PIC, 0) == CELL_OK);
+    expect_waits(waits, 1);
+    CHECK(cellVdecEndSeq(h) == CELL_OK);
+    s_npic = 0;
+    take_pictures(h, codec, 3);                        /* the rest, as YUV */
     CHECK(cellVdecClose(h) == CELL_OK);
     printf("rgba: OK\n");
     return 0;

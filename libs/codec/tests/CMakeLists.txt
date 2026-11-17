@@ -76,9 +76,16 @@ foreach(c avc mpeg2)
         ${VDEC_MEDIA}/v.${es} ${VDEC_MEDIA}/ref_${es}.yuv 192 108 200)
     add_test(NAME vdec_idle_off_${c} COMMAND test_vdec_ffmpeg idle ${c}
         ${VDEC_MEDIA}/v.${es} ${VDEC_MEDIA}/ref_${es}.yuv 192 108 0)
+    # An ARGB / RGBA picture waits for the renderer to drain the buffer before
+    # it is written (counted by the test's stand-in for cellGcm); with
+    # VDEC_WAIT_DRAIN=0 it does not.
+    add_test(NAME vdec_rgba_nowait_${c} COMMAND test_vdec_ffmpeg rgba ${c}
+        ${VDEC_MEDIA}/v.${es} ${VDEC_MEDIA}/ref_${es}.rgba 192 108)
     set_tests_properties(vdec_decode_${c} vdec_rgba_${c} vdec_idle_${c} vdec_idle_off_${c}
         PROPERTIES ENVIRONMENT "${VDEC_LIB_ENV}" SKIP_RETURN_CODE 77)
-    set_tests_properties(vdec_decode_${c} vdec_rgba_${c} vdec_disabled_${c}
+    set_tests_properties(vdec_rgba_nowait_${c}
+        PROPERTIES ENVIRONMENT "VDEC_WAIT_DRAIN=0;${VDEC_LIB_ENV}" SKIP_RETURN_CODE 77)
+    set_tests_properties(vdec_decode_${c} vdec_rgba_${c} vdec_rgba_nowait_${c} vdec_disabled_${c}
         vdec_idle_${c} vdec_idle_off_${c}
         PROPERTIES FIXTURES_REQUIRED vdec_media)
 endforeach()
