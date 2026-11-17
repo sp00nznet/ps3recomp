@@ -713,6 +713,19 @@ static void pad_poll_sdl2(void)
 static void pad_init_backend(void)
 {
     if (!s_sdl_inited) {
+        /* Face buttons by position, as on a PlayStation pad: SDL's A is
+         * the bottom one (Cross), B the right one (Circle). By default
+         * SDL 2 maps a Nintendo controller by its printed labels, which
+         * put Cross on the right (the button marked A) and Circle at the
+         * bottom: confirm and cancel swapped against a PS3 pad, with
+         * Square and Triangle swapped too. Everything a PS3 title shows
+         * is a PS3 symbol, so the position is what counts. Xbox and
+         * PlayStation pads are the same either way. Set before the
+         * subsystem is started (or found already started), so it holds for
+         * the first controller.
+         * SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1 in the environment
+         * still wins over this. */
+        SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
         if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
             /* The game is not always the focused app: on macOS its window
              * can belong to another process (the launcher in

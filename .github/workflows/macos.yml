@@ -227,6 +227,13 @@ jobs:
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
           /tmp/test_pad_hotplug
 
+      # cellPad asks SDL for face buttons by position (not by printed label)
+      # before the controller subsystem starts.
+      - name: Run the pad face-button hint test
+        run: |
+          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_face_button_hint libs/input/tests/test_pad_face_button_hint.c $(sdl2-config --libs)
+          /tmp/test_pad_face_button_hint
+
       # cellPad keyboard fallback on port 0 (read through SDL here too, with a
       # fake keyboard and focus; the real macOS source is CGEventSourceKeyState).
       - name: Run the pad keyboard test
