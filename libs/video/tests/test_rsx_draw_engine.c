@@ -1257,6 +1257,57 @@ static void test_scissor(void)
           "a scissor larger than the surface is clipped to it (%ux%u)",
           stub.scissor[2], stub.scissor[3]);
 
+    /* A scissor the game WROTE with a zero width or height is empty and clips
+     * everything. The backend reads a zero rectangle as "no scissor", so the
+     * engine must drop the draw rather than hand it one: a game's empty gauge
+     * fill is a long quad cut down to nothing, and drawn unclipped it ran
+     * across the screen. */
+    int before = stub.n_draw;
+    m(M_SCISSOR_H, (0u << 16) | 100u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a written zero-width scissor draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (0u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a written zero-height scissor draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (10u << 16) | 300u);   /* wholly right of the 256-wide target */
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a scissor outside the target draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before + 1 && stub.scissor[2] == 64,
+          "a real scissor after an empty one draws again (%d draws, %u wide)",
+          stub.n_draw - before, stub.scissor[2]);
+    engine_down();
+
+    /* Never written is not empty: the register reads 0 and means no scissor. */
+    engine_up();
+    draw_triangle();
+    CHECK(stub.n_draw == 1 && stub.scissor[2] == 256 && stub.scissor[3] == 256,
+          "a never-written scissor still draws, over the whole surface (%d draws, %ux%u)",
+          stub.n_draw, stub.scissor[2], stub.scissor[3]);
+    engine_down();
+
+    /* One register written with a real size and the other never written: not
+     * an empty scissor, so the draw is kept (and unclipped, as before). */
+    engine_up();
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    draw_triangle();
+    CHECK(stub.n_draw == 1 && stub.scissor[2] == 256 && stub.scissor[3] == 256,
+          "only the horizontal scissor written, non-empty: still drawn (%d draws, %ux%u)",
+          stub.n_draw, stub.scissor[2], stub.scissor[3]);
     engine_down();
 }
 
@@ -2637,6 +2688,14 @@ static void test_clear_rect(void)
     m(M_CLEAR_BUFFERS, 0xF0u);
     CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
           "a scissor outside the surface clears nothing (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
+
+    /* So does one written empty, and not as a whole-surface clear. */
+    m(M_SCISSOR_H, (0u << 16) | 16u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a written zero-width scissor clears nothing (%d rect, %d whole)",
           g_rect.n_color, stub.n_clear_color);
     engine_down();
 
