@@ -2711,6 +2711,136 @@ static void test_clear_rect(void)
     engine_down();
 }
 
+/* ---- one own-target copy a pass ------------------------------------------ */
+
+/* A draw sampling the colour target it writes gets a copy of it. The copy is
+ * made once per pass (a run of draws and clears into one colour set and zeta)
+ * and shared by every such draw in it; a new pass, a frame, a clear of the
+ * target or a guest write into it makes the next one.
+ * sharing is opt-in (PS3RECOMP_ENG_FEEDBACK_PER_PASS=1); by default every
+ * draw takes its own. The suite is run both ways and `per` is what the run
+ * expects: one copy a draw by default, one a pass when opted in. */
+static int g_fb_copies;
+static rsx_draw_backend g_fb_backend;
+
+static u32 fb_snapshot(void* u, u32 surface)
+{ (void)u; (void)surface; g_fb_copies++; return stub_handle(); }
+
+static void fb_up(void)
+{
+    g_fb_backend = g_stub_backend;
+    g_fb_backend.color_snapshot = fb_snapshot;
+    engine_up_with(&g_fb_backend);
+    g_fb_copies = 0;
+    /* A8R8G8B8 pitch-linear 256x256 target at 0x40000, unit 0 sampling it. */
+    m(M_SURFACE_FORMAT, 0x148);
+    m(M_COLOR_A_PITCH, 1024);
+    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
+    m(M_TEX_UNIT + 0x18, (256u << 16) | 256u);
+    m(0x1840, 1024);                        /* the unit's pitch */
+}
+
+static void test_feedback_per_pass(void)
+{
+    const char* e = getenv("PS3RECOMP_ENG_FEEDBACK_PER_PASS");
+    const int shared = e && *e && atoi(e) != 0;
+    const int per = !shared;
+    printf("-- own-target copies%s\n", shared ? " (one a pass, opted in)" : " (one a draw, the default)");
+
+    /* Several draws in one pass share a copy. */
+    fb_up();
+    draw_triangle();
+    const u32 first = stub.bound_tex[0];
+    draw_triangle();
+    const u32 second = stub.bound_tex[0];
+    draw_triangle();
+    const u32 third = stub.bound_tex[0];
+    CHECK(stub.n_draw == 3 && g_fb_copies == (per ? 3 : 1),
+          "three own-target draws in one pass take %d copy(ies) (%d)",
+          per ? 3 : 1, g_fb_copies);
+    CHECK(per ? (first != second && second != third) : (first == second && second == third),
+          "%s", per ? "each draw samples its own copy"
+                    : "every draw in the pass samples the one copy");
+    CHECK(first && (per ? !stub.alive[first] && !stub.alive[second] : stub.alive[first]),
+          "%s", per ? "a copy the next draw replaced is released"
+                    : "the shared copy stays alive through the pass");
+    engine_down();
+    CHECK(!stub.alive[third], "shutdown releases the last copy");
+
+    /* A change of target set between them starts a second pass. */
+    fb_up();
+    draw_triangle();
+    draw_triangle();
+    m(M_COLOR_A_OFFSET, 0x90000u);          /* another target; unit 0 samples 0x40000 */
+    draw_triangle();
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 5 && g_fb_copies == (per ? 4 : 2),
+          "a target-set change in between makes a second copy (%d, want %d)",
+          g_fb_copies, per ? 4 : 2);
+    engine_down();
+
+    /* A change of zeta alone is a new pass too. */
+    fb_up();
+    draw_triangle();
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_ZETA_OFFSET, 0x200000u);
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 3 && g_fb_copies == (per ? 3 : 2),
+          "a zeta change in between makes a second copy (%d, want %d)",
+          g_fb_copies, per ? 3 : 2);
+    engine_down();
+
+    /* A presented frame ends the pass: the next one never samples the last
+     * frame's copy. */
+    fb_up();
+    draw_triangle();
+    draw_triangle();
+    rsx_draw_engine_present();
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 4 && g_fb_copies == (per ? 4 : 2),
+          "a presented frame makes a new copy (%d, want %d)", g_fb_copies, per ? 4 : 2);
+    engine_down();
+
+    /* A clear of the target retires the copy. */
+    fb_up();
+    draw_triangle();
+    draw_triangle();
+    const u32 before = stub.bound_tex[0];
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 4 && g_fb_copies == (per ? 4 : 2) && stub.bound_tex[0] != before,
+          "a clear of the target makes a new copy (%d, want %d)", g_fb_copies, per ? 4 : 2);
+    CHECK(!stub.alive[before], "the copy from before the clear was released");
+    engine_down();
+
+    /* A clear that leaves the colour alone (depth only) keeps the copy. */
+    fb_up();
+    draw_triangle();
+    m(M_CLEAR_BUFFERS, 0x01u);              /* depth only */
+    draw_triangle();
+    CHECK(stub.n_draw == 2 && g_fb_copies == (per ? 2 : 1),
+          "a depth-only clear does not retire the colour copy (%d, want %d)",
+          g_fb_copies, per ? 2 : 1);
+    engine_down();
+
+    /* A write into the target's bytes by the guest (a 2D transfer) retires it. */
+    fb_up();
+    draw_triangle();
+    draw_triangle();
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u, 1024u, 4u, 4u);
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 4 && g_fb_copies == (per ? 4 : 2),
+          "a guest write into the target makes a new copy (%d, want %d)",
+          g_fb_copies, per ? 4 : 2);
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -2759,6 +2889,7 @@ int main(void)
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
     test_clear_rect();
+    test_feedback_per_pass();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
