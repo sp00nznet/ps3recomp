@@ -13,6 +13,7 @@
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+#include "spu_coherency.h"  /* spu_coh_watch: the request-line store wake */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
@@ -482,6 +483,10 @@ static struct SpursInst {
     u8 active[SPURS_MAX_WID], idle[SPURS_MAX_WID];
     u8 is2;   /* CellSpurs2: 32 workloads */
     u32 cursor, pass_no;
+    /* PS3RECOMP_SPURS_STORE_WAKE=1: a coherence watch on the request line
+     * while the scheduler runs (spurs_request_line_written). */
+    spu_coh_watch request_watch;
+    int request_watched;
 } s_inst[MAX_SPURS_INST];
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 
@@ -514,6 +519,40 @@ static void spurs_commit_hook(uint32_t line)
 {
     ef_line_committed(line);
     spurs_line_committed(line);
+}
+/* PS3RECOMP_SPURS_STORE_WAKE=1 (default off; read before an instance's
+ * threads start). A PPU raises a ready count, signal or workload flag with a
+ * plain store or a store-conditional on the request line. Neither commits
+ * through an SPU atomic, so neither reaches spurs_line_committed: the request
+ * waits for the coordinator's next timed pass (about 1 ms) with every SPU idle.
+ * With the switch on, the scheduler keeps a coherence watch (spu_coh_watch_add)
+ * on the request line while it runs, and every real write to the line -- a PPU
+ * store or CAS, an MFC put, an SPU atomic, a host store through the coherent
+ * paths -- calls this, under the lock-line lock. It only sets the kick and
+ * wakes the coordinator, which re-reads the guest bytes as on any pass: a wake
+ * hint, no guest state. Writes the scheduler makes itself (the consumed
+ * request, the current contention) are skipped through a thread-local flag,
+ * so a dispatch doesn't schedule a second, empty pass. */
+static int s_spurs_store_wake = -1;
+static SPU_THREAD_LOCAL int t_spurs_scheduler_write;
+static void spurs_request_line_written(void* opaque)
+{
+    struct SpursInst* si = (struct SpursInst*)opaque;
+    if (t_spurs_scheduler_write) return;
+    /* A pending kick has its wake already: the coordinator either sleeps with
+     * that wake on its way or checks the kick before it sleeps again. */
+    if (!__atomic_exchange_n(&si->kick, 1, __ATOMIC_ACQ_REL))
+        WakeAllConditionVariable(&si->wake);
+}
+static void spurs_request_watch(struct SpursInst* si, int on)
+{
+    spu_lockline_lock();
+    if (on && !si->request_watched)
+        spu_coh_watch_add(&si->request_watch, si->ea, spurs_request_line_written, si);
+    else if (!on && si->request_watched)
+        spu_coh_watch_remove(&si->request_watch);
+    si->request_watched = on;
+    spu_lockline_unlock();
 }
 static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
 
@@ -2030,12 +2069,14 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
                 __atomic_fetch_add(&s_spurs_idle_worker_wakes, 1ull, __ATOMIC_RELAXED);
         }
         if (si->stopping && !slot->busy) break;
+        t_spurs_scheduler_write = 0;   /* the module's own writes are requests */
         ReleaseSRWLockExclusive(&si->lock);
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
         AcquireSRWLockExclusive(&si->lock);
+        t_spurs_scheduler_write = 1;   /* the bookkeeping below */
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;
         spu_lockline_lock();
@@ -2055,6 +2096,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
     ps3_thread_name("spurs kernel");
+    t_spurs_scheduler_write = 1;   /* every write this thread makes is bookkeeping */
     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
     unsigned kick_run = 0;
     AcquireSRWLockExclusive(&si->lock);
@@ -2157,6 +2199,11 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     }
     si->coordinator = CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     if (!si->coordinator) goto failed;
+    if (s_spurs_store_wake < 0) {
+        const char* e = getenv("PS3RECOMP_SPURS_STORE_WAKE");
+        s_spurs_store_wake = e && !strcmp(e, "1");
+    }
+    if (s_spurs_store_wake) spurs_request_watch(si, 1);
     return CELL_OK;
 failed:
     AcquireSRWLockExclusive(&si->lock);
@@ -2186,6 +2233,7 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
         HANDLE h = si->slots[sn].thread;
         if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
     }
+    spurs_request_watch(si, 0);   /* after the threads have joined */
     AcquireSRWLockExclusive(&si->lock);
     si->kernel_live = 0;
     ReleaseSRWLockExclusive(&si->lock);
