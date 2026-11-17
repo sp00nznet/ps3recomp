@@ -18,6 +18,7 @@
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
 #include "../../runtime/ps3_log.h"       /* ps3_log_verbose */
+#include "ps3emu/log_first.h"            /* PS3_LOG_FIRST */
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -606,6 +607,34 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
     return CELL_OK;
 }
 
+/* An ARGB / RGBA picture goes straight into a texture the renderer samples. The
+ * title has just released this buffer, but the draw that showed its last
+ * picture may not have been recorded by the FIFO walker yet (the walker reads
+ * guest memory when it records the draw, not when the title queues it):
+ * writing now tore every movie frame, the new picture above and the old one
+ * below. So wait, for at most 40 ms, until the walker has executed everything
+ * the title has published so far. That does not depend on a future flip, so it
+ * does not stall a caller on the thread that flips. Called outside the decoder
+ * lock, so decoding goes on meanwhile.
+ * VDEC_WAIT_DRAIN=0 turns it off. */
+extern int cellGcm_wait_commands_walked(u32 timeout_ms);
+static void vdec_wait_for_renderer(const VdecSlot* v, u32 dst, u32 type)
+{
+    static int s_wait = -1;
+    static int s_timeouts;
+    if (s_wait < 0) {
+        const char* e = getenv("VDEC_WAIT_DRAIN");
+        s_wait = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+    }
+    /* Only a picture that is written (dst), in an RGB format (0 ARGB, 1 RGBA),
+     * and only when there is one to take (the decoder thread fills the queue
+     * under the lock, so this read is atomic and may be a picture behind). */
+    if (!s_wait || !dst || type > 1 || !__atomic_load_n(&v->qCount, __ATOMIC_RELAXED))
+        return;
+    if (cellGcm_wait_commands_walked(40) < 0 && PS3_LOG_FIRST(s_timeouts, 4))
+        fprintf(stderr, "[cellVdec] the renderer did not drain the picture buffer within 40 ms\n");
+}
+
 s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
 {
     handle = VDEC_SLOT_OF(handle);
@@ -614,6 +643,7 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
         return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
     if (v->ff) {
+        vdec_wait_for_renderer(v, dst, vm_read32(fmt_ea + 0));
         VDEC_LOCK();
         s32 rc = vdec_take_picture(v, dst, vm_read32(fmt_ea + 0),
                                    vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 8));
@@ -667,6 +697,7 @@ s32 cellVdecGetPictureExt(CellVdecHandle handle, const void* format,
         return CELL_OK;
     if (!fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;
+    vdec_wait_for_renderer(&s_vdec[handle], dst, vm_read32(fmt_ea + 0));
     VDEC_LOCK();
     s32 rc = vdec_take_picture(&s_vdec[handle], dst, vm_read32(fmt_ea + 0),
                                vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 0xC));

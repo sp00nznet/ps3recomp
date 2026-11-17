@@ -105,6 +105,14 @@ u32 cellGcm_flip_request_count(void)
 {
     return s_flip_request_count;
 }
+
+/* How far the FIFO walker has got, for a host writer that fills guest memory
+ * the renderer samples as a texture (cellVdec's ARGB / RGBA pictures).
+ * `started` counts the walker's passes, each numbered as it reads `put`;
+ * `done` is the number of the newest pass that ended with get at the put it
+ * read, i.e. one that executed everything published when it began. */
+static volatile u32 s_walk_started = 0;
+static volatile u32 s_walk_done = 0;
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
 /* Display buffers */
@@ -2170,6 +2178,39 @@ static void wprof_note_walker(void)
 static void wprof_note_walker(void) {}
 #endif
 
+/* Wait until the FIFO walker has executed every command the title had
+ * published (put) when this was called, for at most timeout_ms. The renderer
+ * reads guest memory when the walker records a draw, not when the title queues
+ * it: a picture written into a buffer the title has just released, but whose
+ * draw the walker had not reached yet, was sampled half new and half old, a
+ * tear across every movie frame. It does not wait for a flip, so a caller on
+ * the thread that flips cannot be held up by its own next flip; it needs the
+ * walker to keep running on its own thread, as the host loops in templates/ and
+ * wave/ do. Commands the title has written but not yet published are not
+ * waited for. Returns the milliseconds waited, or -1 when timeout_ms passed
+ * first; 0 at once when nothing published is left to walk. */
+int cellGcm_wait_commands_walked(u32 timeout_ms)
+{
+#ifdef _WIN32
+    __declspec(dllimport) void __stdcall Sleep(unsigned long);
+#endif  /* elsewhere: runtime/platform/win32_compat.h */
+    if (!s_gcm_context_ea && !s_gcm_syscall_mode)
+        return 0;                        /* no walker */
+    /* Only a pass that begins after this point has read a put at least as new
+     * as the one read below. */
+    const u32 started = __atomic_load_n(&s_walk_started, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&s_fifo_getoff, __ATOMIC_RELAXED) == vm_read32(GCM_CONTROL_GUEST_ADDR + 0))
+        return 0;
+    for (u32 waited = 0;; waited++)
+    {
+        if ((s32)(__atomic_load_n(&s_walk_done, __ATOMIC_ACQUIRE) - started) > 0)
+            return (int)waited;
+        if (waited >= timeout_ms)
+            return -1;
+        Sleep(1);
+    }
+}
+
 /* Host thread that last walked the FIFO, for PS3_SAMPLE_DRAIN. */
 volatile unsigned long g_gcm_drain_tid;
 
@@ -2358,6 +2399,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * one flat ring (cellmark), but PSL1GHT/Tiny3D immediately JUMPs into its
      * own command ring, so everything after the jump (including the reference
      * writes its waits spin on) silently never executed. */
+    const u32 pass = __atomic_add_fetch(&s_walk_started, 1u, __ATOMIC_ACQ_REL);
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
     /* The words behind `put` were stored by another thread (the title, or the
      * recycle below) before it stored `put`. On x86 the hardware keeps loads
@@ -3145,6 +3187,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
+    if (s_fifo_getoff == put)            /* all of what was published at the start */
+        __atomic_store_n(&s_walk_done, pass, __ATOMIC_RELEASE);
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
      * a title uses to avoid overwriting commands the GPU has not read. It exists

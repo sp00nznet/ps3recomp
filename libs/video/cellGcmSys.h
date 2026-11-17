@@ -260,6 +260,11 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get);
 /* Hand the display buffers the title has registered so far to the draw
  * engine, for an engine that comes up after cellGcmSetDisplayBuffer ran. */
 void cellGcm_replay_display_buffers_to_engine(void);
+/* For a host writer of guest memory the renderer samples as a texture (cellVdec's
+ * ARGB / RGBA pictures): wait until the FIFO walker has executed every command
+ * the title had published when this was called. Returns the milliseconds waited,
+ * or -1 if timeout_ms passed first; 0 at once when nothing is left to walk. */
+int cellGcm_wait_commands_walked(u32 timeout_ms);
 
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height);
