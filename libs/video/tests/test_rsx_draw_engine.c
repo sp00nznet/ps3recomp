@@ -387,6 +387,9 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_DEPTH_TEST          0x0A74
 #define M_COLOR_C_OFFSET      0x0288
 #define M_COLOR_D_OFFSET      0x028C
+#define M_ALPHA_TEST_ENABLE   0x0304
+#define M_ALPHA_FUNC          0x0308
+#define M_ALPHA_REF           0x030C
 #define M_SCISSOR_H           0x08C0
 #define M_SCISSOR_V           0x08C4
 #define M_VTXBUF_OFFSET       0x1680
@@ -1257,6 +1260,129 @@ static void test_scissor(void)
           "a scissor larger than the surface is clipped to it (%ux%u)",
           stub.scissor[2], stub.scissor[3]);
 
+    engine_down();
+}
+
+/* ---- 7b. the objects bound to the subchannels ------------------------------ */
+
+/* The subchannel is a binding slot: SET_OBJECT (method 0) binds an object to
+ * it. Where subchannel k and subchannel 0 are both bound, k is 3D if it holds
+ * the same object and keeps its own bank if not. Otherwise k is routed as the
+ * FIFO walker routes it (cellGcmSys.c): subchannel 1 is 3D, subchannels 2..6
+ * keep their own bank. A 2D or transfer engine's methods share offsets with
+ * NV4097 state (NV3062's pitch and offsets, 0x0304-0x030C, are the 3D alpha
+ * test enable, function and reference): stripped into the 3D bank, a transfer
+ * between two draws switched the alpha test off and alpha-tested sprites drew
+ * as black boxes. Both GCM_SUBCH1_2D and GCM_SUBCH_UNBOUND_3D are read once
+ * into statics, so only the default routing is tested here. The handles are
+ * arbitrary: only whether two of them are equal matters. */
+#define OBJ_3D    0x0000A3D0u
+#define OBJ_2D    0x0000B2D0u
+
+static void alpha_on_state(void)
+{
+    m(M_ALPHA_TEST_ENABLE, 1u);
+    m(M_ALPHA_FUNC, 0x0206u);                  /* GEQUAL */
+    m(M_ALPHA_REF, 0x80u);
+}
+
+/* Methods at the NV3062 offsets on subchannel `sc`. */
+static void write_2d_state(u32 sc)
+{
+    m((sc << 13) | 0x0300, 0xBu);              /* SET_COLOR_FORMAT */
+    m((sc << 13) | 0x0304, 0xCu);              /* SET_PITCH */
+    m((sc << 13) | 0x0308, 0x00010001u);       /* SET_OFFSET_SOURCE */
+    m((sc << 13) | 0x030C, 0x00010004u);       /* SET_OFFSET_DESTIN */
+}
+
+/* With the alpha test on, subchannel `sc`'s NV3062-offset methods and its
+ * ALPHA_TEST_ENABLE = 0 must both leave the draw on the same pipeline. */
+static void check_own_bank(u32 sc, const char* what)
+{
+    alpha_on_state();
+    draw_triangle();
+    const u32 on = stub.bound_pipeline;
+    write_2d_state(sc);
+    draw_triangle();
+    CHECK(stub.bound_pipeline == on,
+          "%s: NV3062 methods on subchannel %u leave the alpha test alone", what, sc);
+    m((sc << 13) | M_ALPHA_TEST_ENABLE, 0u);
+    draw_triangle();
+    CHECK(stub.bound_pipeline == on,
+          "%s: subchannel %u's ALPHA_TEST_ENABLE does not reach NV4097", what, sc);
+}
+
+/* With the alpha test on, subchannel `sc`'s ALPHA_TEST_ENABLE = 0 must reach
+ * the 3D state. */
+static void check_3d(u32 sc, const char* what)
+{
+    alpha_on_state();
+    draw_triangle();
+    const u32 on = stub.bound_pipeline;
+    m((sc << 13) | M_ALPHA_TEST_ENABLE, 0u);
+    draw_triangle();
+    CHECK(stub.bound_pipeline != on,
+          "%s: subchannel %u's ALPHA_TEST_ENABLE reaches NV4097", what, sc);
+}
+
+static void test_2d_subchannels(void)
+{
+    printf("-- subchannels: bound objects, else the walker's split\n");
+
+    /* Subchannel 0 is the 3D object; 1..6 each have a different object.
+     * Subchannel 7 is not tested: its methods are all >= 0xE000, which take the
+     * driver-method early return before any binding logic. */
+    engine_up();
+    alpha_on_state();
+    draw_triangle();
+    CHECK(stub.pipeline_rs.alpha_test_enable == 1 && stub.pipeline_rs.alpha_func == 0x0206u &&
+          stub.pipeline_rs.alpha_ref_raw == 0x80u,
+          "the 3D alpha test is on (%u, func 0x%X, ref 0x%X)",
+          stub.pipeline_rs.alpha_test_enable, stub.pipeline_rs.alpha_func,
+          stub.pipeline_rs.alpha_ref_raw);
+    m((0u << 13) | 0x0000, OBJ_3D);
+    for (u32 sc = 1; sc <= 6; sc++) m((sc << 13) | 0x0000, OBJ_2D + sc);
+    for (u32 sc = 1; sc <= 6; sc++) check_own_bank(sc, "bound to another object");
+    check_3d(0, "subchannel 0");
+    engine_down();
+
+    /* A subchannel bound to the same object as subchannel 0 is 3D; rebound to
+     * another object it stops, and bound back it is 3D again. */
+    engine_up();
+    m((0u << 13) | 0x0000, OBJ_3D);
+    m((2u << 13) | 0x0000, OBJ_3D);
+    check_3d(2, "bound to subchannel 0's object");
+    m((2u << 13) | 0x0000, OBJ_2D);
+    check_own_bank(2, "rebound to another object");
+    m((2u << 13) | 0x0000, OBJ_3D);
+    check_3d(2, "bound back to subchannel 0's object");
+    engine_down();
+
+    /* No SET_OBJECT seen at all, which is what the HLE init gives: the walker's
+     * split. */
+    engine_up();
+    check_own_bank(2, "unbound");
+    check_own_bank(3, "unbound");
+    check_3d(1, "unbound");
+    engine_down();
+
+    /* Bound, but subchannel 0 never was: there is nothing to compare with, so
+     * the walker's split again. A title binding its 2D objects itself must not
+     * put their methods back on the 3D state. */
+    engine_up();
+    m((2u << 13) | 0x0000, OBJ_2D);
+    m((4u << 13) | 0x0000, OBJ_2D + 4u);
+    m((1u << 13) | 0x0000, OBJ_2D + 1u);
+    check_own_bank(2, "bound, subchannel 0 not bound");
+    check_own_bank(4, "bound, subchannel 0 not bound");
+    check_3d(1, "bound, subchannel 0 not bound");
+    engine_down();
+
+    /* Subchannel 0 bound, subchannel k not: the walker's split too. */
+    engine_up();
+    m((0u << 13) | 0x0000, OBJ_3D);
+    check_own_bank(3, "subchannel 0 bound, this one not");
+    check_3d(1, "subchannel 0 bound, this one not");
     engine_down();
 }
 
@@ -2735,6 +2861,7 @@ int main(void)
     test_indexed_runs();
     test_indexed_draws();
     test_scissor();
+    test_2d_subchannels();
     test_readback();
     test_custom_guest_mapping();
     test_polygon_offset();

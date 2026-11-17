@@ -216,6 +216,11 @@ static struct {
     u32 index_cap;
 
     rsx_fp_constant_block fp_constants;
+
+    /* The object a title bound to each FIFO subchannel (SET_OBJECT, method 0),
+     * and whether it has bound one: see rsx_draw_engine_method. */
+    u32 subch_object[8];
+    u8  subch_bound[8];
 } g;
 
 /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
@@ -3747,16 +3752,68 @@ void rsx_draw_engine_shutdown(void)
     g.be = be;
 }
 
+/* Does a method on this FIFO subchannel belong to the 3D object (NV4097)?
+ *
+ * The subchannel is a binding slot, not an engine selector: SET_OBJECT (method
+ * 0) binds an object to it. A 2D or transfer engine's methods share offsets
+ * with NV4097 state: NV3062's pitch and offsets (0x0304-0x030C) are the 3D
+ * alpha test enable, function and reference, so stripped into the 3D bank a
+ * transfer between two draws switched the alpha test off (Folklore's leaf
+ * cards drew as black boxes).
+ *
+ *   subchannel 0                      3D
+ *   it and subchannel 0 both bound    3D if they hold the same object, else
+ *                                     its own bank
+ *   anything else                     as the FIFO walker routes it
+ *                                     (cellGcmSys.c): subchannel 1 is 3D
+ *                                     unless GCM_SUBCH1_2D=1, subchannels
+ *                                     2..6 keep their own bank
+ *
+ * The HLE cellGcmInit never sends SET_OBJECT, so for most titles nothing is
+ * bound and the walker's split is the rule that applies. A binding is only
+ * trusted when there is a subchannel 0 binding to compare it with, so a title
+ * that binds its own 2D objects cannot put their methods back on 3D state.
+ * GCM_SUBCH_UNBOUND_3D=1 makes subchannels 2..6 3D wherever the walker's split
+ * applies, for a title that sends NV4097 methods there without both bindings.
+ * Known limits: methods on subchannel 1 under the walker's split go to the 3D
+ * bank, so a transfer object there (NV0039) writes 0x0184-0x0188 and
+ * 0x030C-0x0328 (alpha reference, blend enable, factors, colour and equation,
+ * colour mask, stencil test enable), as the walker treats it. And a title that
+ * binds NV4097 on a second subchannel under a different handle from subchannel
+ * 0's has that subchannel kept apart from the 3D state. */
+static int eng_subch_is_3d(u32 subch)
+{
+    if (subch == 0) return 1;
+    if (g.subch_bound[subch] && g.subch_bound[0])
+        return g.subch_object[subch] == g.subch_object[0];
+    static int s1_2d = -1, unbound_3d = -1;
+    if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e && atoi(e) != 0; }
+    if (unbound_3d < 0) { const char* e = getenv("GCM_SUBCH_UNBOUND_3D"); unbound_3d = e && atoi(e) != 0; }
+    if (subch == 1) return !s1_2d;
+    return unbound_3d;
+}
+
 void rsx_draw_engine_method(u32 method, u32 arg)
 {
     if (!g.ready) return;
-    /* The subchannel is a binding slot, not an engine selector, and a title
-     * whose SPU-built command lists bind NV4097 elsewhere would otherwise
-     * store its state in the wrong register bank.  Standard NV4097 methods
-     * (< 0x2000) strip the subchannel with & 0x1FFC.  Driver methods
-     * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
-     * preserve them with the wider mask. */
-    u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    const u32 subch = (method >> 13) & 7u;
+    /* Driver methods (0xE9xx, 0xEBxx) encode the subchannel bits as part of
+     * the address; preserve them with the wider mask. */
+    if (method >= 0xE000u) {
+        rsx_dispatch_method(&g.rsx, method & 0xFFFCu, arg);
+        return;
+    }
+    if ((method & 0x1FFCu) == 0u) {         /* SET_OBJECT */
+        g.subch_object[subch] = arg;
+        g.subch_bound[subch] = 1;
+    }
+    /* A 3D subchannel's methods strip the subchannel (& 0x1FFC) and land in
+     * the NV4097 bank; any other subchannel keeps its own registers: the full
+     * method, subchannel bits included, which is also how rsx_live_draw_method
+     * feeds rsx_dispatch_method. Which subchannels are 3D is eng_subch_is_3d's
+     * rule. Subchannel 7 never gets here:
+     * its methods are all >= 0xE000 and returned above as driver methods. */
+    const u32 m = eng_subch_is_3d(subch) ? (method & 0x1FFCu) : (method & 0xFFFCu);
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 
