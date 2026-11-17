@@ -674,6 +674,31 @@ if(UNIX)
                 ps3recomp_msl_translation
                 "-framework Metal" "-framework QuartzCore" "-framework AppKit")
             target_link_options(test_metal_depth_clamp PRIVATE "-Wl,-dead_strip")
+
+            # Point size (SET_POINT_SIZE, the output mask's point-size bit)
+            # through the engine and the Metal backend: one point drawn, the
+            # pixels it lit counted.
+            add_executable(test_metal_point_size
+                libs/video/tests/test_metal_point_size.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+                libs/video/rsx_tiling.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_point_size.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_point_size PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_point_size PRIVATE
+                ps3recomp_msl_translation
+                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+            target_link_options(test_metal_point_size PRIVATE "-Wl,-dead_strip")
         endif()
     endif()
 

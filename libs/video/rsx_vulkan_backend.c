@@ -3374,6 +3374,17 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.vs_bytes = 0; return; }
+    /* The engine's block ends in the Metal translator's vp_pointsize row (one
+     * float4), which this backend's shaders do not declare
+     * (RSX_POINT_SIZE_BUILTIN is not defined for them): never read, so it is
+     * dropped here. A block longer than that is still reported below. */
+    if (bytes > VK_VPCONST_BYTES) {
+        if (bytes > VK_VPCONST_BYTES + 16u && !(s_e2.warned & 2u)) {
+            VK_LOG("engine: VS constants truncated\n");
+            s_e2.warned |= 2u;
+        }
+        bytes = VK_VPCONST_BYTES;
+    }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
     memcpy(s_e2.ucpu, data, bytes);

@@ -420,6 +420,15 @@ jobs:
           ./build/test_metal_depth_bounds
           PS3RECOMP_ENG_DEPTH_BOUNDS=0 ./build/test_metal_depth_bounds
 
+      # Point size reaches the GPU: Metal leaves it undefined unless the vertex
+      # function writes it, so a point is drawn at SET_POINT_SIZE's size, at
+      # the vertex program's own when the output mask says so, and no larger
+      # than 64 pixels.
+      - name: Run the Metal point size test
+        run: |
+          test -x build/test_metal_point_size
+          ./build/test_metal_point_size
+
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's
