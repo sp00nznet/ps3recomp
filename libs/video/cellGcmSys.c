@@ -2033,6 +2033,27 @@ static void gcm_walker_wake(void)
     if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
 }
 
+/* PS3RECOMP_GCM_PPU_PUT_KICK=1 (default off; read once): a PPU store to the
+ * control register's put word wakes the FIFO walker. libgcm's flush is inlined
+ * into the title, so a plain store of put is the only sign that commands are
+ * ready; without a wake the walker sleeps out its idle wait first. The RSX
+ * sees put whoever writes it. The runtime's out-of-line vm_write32 calls this
+ * after the store has landed, for every 32-bit guest store to the word;
+ * lifted code's inline stores leave that word to it. */
+static int s_ppu_put_kick = -1;
+static _Atomic unsigned long long s_ppu_put_kicks;
+void cellGcm_put_on_store(void)
+{
+    if (s_ppu_put_kick < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_PPU_PUT_KICK");
+        s_ppu_put_kick = e && !strcmp(e, "1");
+        if (s_ppu_put_kick) fprintf(stderr, "[gcm] a PPU store of the put word wakes the FIFO walker\n");
+    }
+    if (!s_ppu_put_kick) return;
+    atomic_fetch_add_explicit(&s_ppu_put_kicks, 1ull, memory_order_relaxed);
+    gcm_walker_wake();
+}
+
 /* The present thread's idle wait. It used to be a flat Sleep(4), which meant
  * the kick above was created, signalled -- and waited on by nobody, so a
  * starved guest still paid the full tick. Waiting here instead costs nothing

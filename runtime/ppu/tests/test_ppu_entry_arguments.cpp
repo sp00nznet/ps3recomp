@@ -17,6 +17,7 @@ void spu_lockline_unlock(void) { std::abort(); }
 int spu_raw_reg_load(uint32_t, uint32_t*) { std::abort(); }
 void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
 void cellGcm_ref_on_poll(void) { std::abort(); }
+void cellGcm_put_on_store(void) { std::abort(); }
 // ppu_run buffers host stdio first (runtime/platform/ps3_stdio.c, which has its
 // own test); how this fixture's output is buffered does not matter here.
 void ps3_stdio_init(void) {}
