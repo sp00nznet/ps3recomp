@@ -44,6 +44,11 @@
 #include <string.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include "../platform/win32_compat.h"   /* SRWLOCK */
+#endif
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
@@ -122,7 +127,8 @@ enum {
  * resolve a chain handle to it. */
 static uint8_t  s_job_ls[SPU_LS_SIZE];
 static int      s_job_ls_valid;
-uint32_t        g_spurs_job_ls_handle;   /* set by the chain walker */
+uint32_t        g_spurs_job_ls_handle;   /* the chain s_job_ls belongs to */
+static SRWLOCK  s_job_ls_lock = SRWLOCK_INIT;   /* s_job_ls, its handle and valid */
 
 const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
 {
@@ -155,6 +161,23 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
  * two jobs that both think they are SPU 0 corrupt each other's ring. */
 SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
 void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
+
+/* The chain the job on this thread belongs to, set by whoever runs it (the
+ * chain walker, or a job thread under SPURS_JC_PARALLEL). Per thread, because
+ * jobs of different chains -- and of the same chain -- can finish at once; the
+ * snapshot below takes it under the same lock as the copy, so a poll never
+ * pairs one chain's handle with another job's local store. */
+static SPURS_JOB_TLS uint32_t t_job_ls_handle;
+void spurs_job_set_ls_handle(uint32_t handle) { t_job_ls_handle = handle; }
+
+static void spurs_job_keep_ls(const uint8_t* ls)
+{
+    AcquireSRWLockExclusive(&s_job_ls_lock);
+    memcpy(s_job_ls, ls, SPU_LS_SIZE);
+    g_spurs_job_ls_handle = t_job_ls_handle;
+    s_job_ls_valid = 1;
+    ReleaseSRWLockExclusive(&s_job_ls_lock);
+}
 
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
@@ -402,7 +425,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * comment here claimed they carried the title's bus counts; they do not,
      * and feeding them into the completion event turned 0x40000000 into a 1 GB
      * allocation request. Kept because the printf service needs them. */
-    memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+    spurs_job_keep_ls(ctx.ls);   /* keep the store readable */
     /* TEMP SPURS_JOB_LSWORD=<img>:<lsa>: after a job of that image, print the
      * LS word at lsa and every other LS offset holding the same value. */
     { static int img = -2; static uint32_t lsa; static int n = 0;
@@ -419,7 +442,6 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           }
           fprintf(stderr, "\n");
       } }
-    s_job_ls_valid = 1;
 
     g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
                           ? ctx.ch_out_mbox.value : 0;
