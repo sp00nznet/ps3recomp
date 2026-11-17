@@ -265,6 +265,33 @@ cmake --build build --target ps3recomp_host
 ./build/ps3recomp_host
 ```
 
+### Present thread (opt-in)
+
+By default a present runs on the thread that walks the FIFO, which then waits
+for the window system to hand out a display image; while it waits it applies
+no label, report or get/ref update the guest may be polling.
+`PS3RECOMP_RSX_PRESENT_THREAD=1` splits a draw-engine present in two
+(`libs/video/rsx_present_thread.h`). The presenting thread records and commits
+a GPU copy of the frame, present pass included, into one of a few staging
+images and returns at once. A present thread of its own then takes the oldest
+staged frame, acquires a display image, copies the frame into it and presents
+it. The presenting thread never waits for that thread or for a display
+image: with every staging slot taken, the oldest staged frame is dropped and
+counted.
+
+On Vulkan the stage blits the flipped surface into a staging image on its own
+command pool and submits it; the walker's next command buffer is ordered after
+that copy. The present thread acquires a swapchain image with a finite
+timeout, blits the staging image into the offscreen target and the window, and
+presents. Like a direct present (`PS3RECOMP_VK_DIRECT_PRESENT`), it reads
+nothing back, so `rsx_vulkan_backend_presented_center()` reports no pixel.
+
+| Environment variable | Effect |
+|---|---|
+| `PS3RECOMP_RSX_PRESENT_THREAD=1` | Turn it on (Metal or Vulkan draw engine, windowed or headless). Elsewhere -- the Metal and Vulkan vtable paths, host-surface mode, a Vulkan run with `PS3RECOMP_VK_DUMP`, D3D12, live draw -- it says once that it is unsupported and presents as before |
+| `PS3RECOMP_RSX_PRESENT_THREAD_DEPTH=<n>` | Staging slots, 2 or 3 (default 3) |
+| `PS3RECOMP_RSX_PRESENT_THREAD_REPORT_S=<sec>` | Seconds between the counter lines on stderr (default 5; 0 = only the final one at shutdown): staged, presented, dropped, failures, ring occupancy, and stage, acquire and blit times |
+
 ### The Vulkan backend (Linux, opt-in)
 
 ```bash
@@ -285,6 +312,7 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
 | `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
+| `PS3RECOMP_VK_DIRECT_PRESENT=1` | On the draw engine path, present without reading the frame back: one submission blits the flipped surface into the window, waiting for the swapchain image on the GPU, and the CPU waits for nothing (a ring of three presents stays in flight). The presents `PS3RECOMP_VK_DUMP` writes still read back. Off (the default): every present copies the frame to host memory and waits for it, then blits it to the window and waits again |
 | `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |

@@ -20,6 +20,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "rsx_present_thread.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/log_first.h"
@@ -8223,6 +8224,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
                        rsx_live_guest_ptr_fn guest_fn, void* guest_user)
 {
     if (!rsx_live_draw_enabled()) return 0;
+    /* The live renderer paces presents its own way; the shared ring has no
+     * half here. */
+    if (rsx_present_thread_requested()) rsx_present_thread_unsupported("live draw", NULL);
     if (g.ready) return 0;
     ld_present_measure_init();
 #if defined(YZ_PERF_PROFILE)
