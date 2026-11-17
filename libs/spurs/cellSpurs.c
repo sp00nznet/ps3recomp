@@ -3053,7 +3053,9 @@ static CONDITION_VARIABLE s_jcq_done = CONDITION_VARIABLE_INIT;
 static jc_work  s_jcq[JC_QUEUE];
 static unsigned s_jcq_head, s_jcq_tail;
 static int      s_jcq_started, s_jcq_threads;
-static u32      s_jc_spu_busy;   /* bit n: SPU number n is held by a running job */
+static SRWLOCK            s_jc_spu_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_jc_spu_cv   = CONDITION_VARIABLE_INIT;
+static u32      s_jc_spu_busy;   /* bit n: SPU number n is held by a running job (s_jc_spu_lock) */
 
 extern void spurs_job_set_spu_num(uint32_t n);
 extern void spurs_job_set_ls_handle(uint32_t handle);
@@ -3073,23 +3075,33 @@ static u32 jc_parallel(int slot)
     return n ? n : 1;
 }
 
+/* Claim the lowest free SPU number below nspus. When every one is held -- jobs
+ * of several chains share the instance's SPUs -- sleep until a job releases
+ * one: a job thread that spun here instead kept a host core busy for as long
+ * as the jobs holding the SPUs ran. */
 static u32 jc_claim_spu(u32 nspus)
 {
     if (!nspus || nspus > JC_POOL) nspus = JC_POOL;
+    AcquireSRWLockExclusive(&s_jc_spu_lock);
+    u32 n;
     for (;;) {
-        u32 busy = __atomic_load_n(&s_jc_spu_busy, __ATOMIC_ACQUIRE);
-        u32 n = 0;
-        while (n < nspus && (busy & (1u << n))) n++;
-        if (n == nspus) { SwitchToThread(); continue; }   /* every SPU busy */
-        if (__atomic_compare_exchange_n(&s_jc_spu_busy, &busy, busy | (1u << n),
-                                        0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            return n;
+        for (n = 0; n < nspus && (s_jc_spu_busy & (1u << n)); n++) {}
+        if (n < nspus) break;
+        SleepConditionVariableSRW(&s_jc_spu_cv, &s_jc_spu_lock, INFINITE, 0);
     }
+    s_jc_spu_busy |= 1u << n;
+    ReleaseSRWLockExclusive(&s_jc_spu_lock);
+    return n;
 }
 
+/* Wake every waiter: they may be bounded by different SPU counts, so the one
+ * a single wake picked might not be able to use n. */
 static void jc_release_spu(u32 n)
 {
-    __atomic_and_fetch(&s_jc_spu_busy, ~(1u << n), __ATOMIC_RELEASE);
+    AcquireSRWLockExclusive(&s_jc_spu_lock);
+    s_jc_spu_busy &= ~(1u << n);
+    ReleaseSRWLockExclusive(&s_jc_spu_lock);
+    WakeAllConditionVariable(&s_jc_spu_cv);
 }
 
 static DWORD WINAPI jc_worker(LPVOID p)
