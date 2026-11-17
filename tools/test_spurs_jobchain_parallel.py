@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Job chains through the real cellSpurs.c: serial by default, overlapping up to
-maxContention under SPURS_JC_PARALLEL=1 with SYNC honoured, and no lost job
-guard notify."""
+maxContention under SPURS_JC_PARALLEL=1 with SYNC honoured and SPUs claimed in
+chain order, completions announced in chain order, and no lost job guard
+notify."""
 import os
 from pathlib import Path
 import platform

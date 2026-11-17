@@ -13,10 +13,15 @@
  *   parallel  (SPURS_JC_PARALLEL=1)      jobs 0-3 overlap, never more than
  *                                        maxContention, and job 4 starts only
  *                                        after jobs 0-3 have all finished;
- *                                        a chain with maxContention 1 stays serial
+ *                                        a chain with maxContention 1 stays serial;
+ *                                        jobs claim their SPU number in chain
+ *                                        order, also when they had to wait for one
  *
- * Both modes also notify one job guard from several threads at once and check
- * that no notify is lost. */
+ * In both modes job 0 runs longest, and the completions must still be announced
+ * in chain order (data2 = 0, 1, 2, ...): on hardware each SPU takes the chain's
+ * jobs in order, and a consumer that reads data2 as "done up to here" must not
+ * hear of job 1 while job 0 is still writing. Both modes also notify one job
+ * guard from several threads at once and check that no notify is lost. */
 #include <ps3emu/ps3types.h>
 
 #include "../libs/spurs/cellSpurs.c"
@@ -32,10 +37,19 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void sys_event_queue_cancel_by_id(u32 id) { (void)id; }
 void sys_event_queue_uncancel_by_id(u32 id) { (void)id; }
-/* Job completions are pushed to the chain's event queues; none is attached here. */
+/* Job completions are pushed to the chain's event queues: one is attached in
+ * main, and every push is recorded in order (data1 = chain, data2 = job). */
+enum { MAX_PUSHES = 256 };
+static struct { u32 jc; int job; } s_push[MAX_PUSHES];
+static long s_npush;
 int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
                                uint64_t data1, uint64_t data2, uint64_t data3)
-{ (void)queue_id; (void)source; (void)data1; (void)data2; (void)data3; return 0; }
+{
+    (void)queue_id; (void)source; (void)data3;
+    const long i = __atomic_fetch_add(&s_npush, 1, __ATOMIC_ACQ_REL);
+    if (i < MAX_PUSHES) { s_push[i].jc = (u32)data1; s_push[i].job = (int)data2; }
+    return 0;
+}
 /* Referenced from spu_workload.c and spu_channels.c paths this test never takes
  * (task and policy-module dispatch); the same stubs test_spu_dispatch_miss.c uses. */
 void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
@@ -55,16 +69,24 @@ enum {
     JOBS     = 0x10000u,   /* job descriptors, 0x100 apart                   */
     CHAIN    = 0x20000u,   /* command stream                                 */
     CHAIN1   = 0x21000u,   /* second stream, for the maxContention 1 chain   */
+    CHAIN2   = 0x22000u,   /* third stream, for the claim order check        */
     JC       = 0x30000u,   /* CellSpursJobChain handles                      */
     JC1      = 0x30100u,
+    JC2      = 0x30200u,
     GUARD    = 0x31000u,
     MARK     = 0x38,       /* descriptor offset holding the job's index      */
     NJOBS    = 5,
     MAX_CONT = 4,
+    NSPUS    = CELL_SPURS_MAX_SPU,   /* SPUs of a chain created with no instance */
+    MAXJ     = NSPUS,                /* job descriptors built                    */
 };
 
+extern SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;   /* spurs_job.c */
+
 static long s_running, s_max_running, s_total;
-static double s_start[NJOBS], s_end[NJOBS];
+static double s_start[MAXJ], s_end[MAXJ];
+static unsigned s_dur_ms[MAXJ];   /* how long each job runs */
+static int s_spu[MAXJ];           /* the SPU number each job ran as */
 
 static double now_s(void)
 {
@@ -91,24 +113,31 @@ static void fake_job(spu_context* ctx)
     long m = __atomic_load_n(&s_max_running, __ATOMIC_ACQUIRE);
     while (r > m && !__atomic_compare_exchange_n(&s_max_running, &m, r, 0,
                                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
-    if (k >= 0 && k < NJOBS) s_start[k] = now_s();
-    nap_ms(40);
-    if (k >= 0 && k < NJOBS) s_end[k] = now_s();
+    if (k >= 0 && k < MAXJ) {
+        s_spu[k] = (int)g_spurs_job_spu_num;
+        s_start[k] = now_s();
+        nap_ms(s_dur_ms[k]);
+        s_end[k] = now_s();
+    }
     __atomic_sub_fetch(&s_running, 1, __ATOMIC_ACQ_REL);
     __atomic_add_fetch(&s_total, 1, __ATOMIC_ACQ_REL);
 }
 
 static void put64(u32 ea, u64 v) { vm_write32(ea, (u32)(v >> 32)); vm_write32(ea + 4, (u32)v); }
 
-static void build_chain(u32 at)
+static void build_jobs(void)
 {
-    for (int k = 0; k < NJOBS; k++) {
+    for (int k = 0; k < MAXJ; k++) {
         const u32 job = JOBS + (u32)k * 0x100u;
         memset(vm_base + job, 0, 0x100);
         put64(job + 0x00, BIN);                    /* eaBinary          */
         vm_write32(job + 0x08, 1u << 16);          /* sizeBinary = 16 B */
         vm_base[job + MARK] = (uint8_t)k;
     }
+}
+
+static void build_chain(u32 at)
+{
     u32 pc = at;
     for (int k = 0; k < 4; k++, pc += 8) put64(pc, JOBS + (u64)k * 0x100u);   /* JOB 0-3 */
     put64(pc, 2);                       pc += 8;                              /* SYNC    */
@@ -116,19 +145,83 @@ static void build_chain(u32 at)
     put64(pc, 7u | (15u << 3));                                               /* END     */
 }
 
-static void run_chain(u32 jc, u32 at, u32 max_cont)
+static void start_chain(u32 jc, u32 at, u32 max_cont)
 {
     s_running = s_max_running = s_total = 0;
     memset(s_start, 0, sizeof s_start);
     memset(s_end, 0, sizeof s_end);
-    build_chain(at);
+    for (int k = 0; k < MAXJ; k++) s_spu[k] = -1;
     assert(cellSpursCreateJobChain(0, jc, at, 0x100, 4, 0, max_cont, 0) == CELL_OK);
     assert(cellSpursRunJobChain(jc) == CELL_OK);
-    for (int i = 0; i < 2000 && __atomic_load_n(&s_total, __ATOMIC_ACQUIRE) < NJOBS; i++) nap_ms(5);
+}
+
+static void finish_chain(u32 jc, int njobs)
+{
+    for (int i = 0; i < 2000 && __atomic_load_n(&s_total, __ATOMIC_ACQUIRE) < njobs; i++) nap_ms(5);
     assert(cellSpursJoinJobChain(jc) == CELL_OK);
 }
 
+static void run_chain(u32 jc, u32 at, u32 max_cont)
+{
+    build_chain(at);
+    start_chain(jc, at, max_cont);
+    finish_chain(jc, NJOBS);
+}
+
 #define FAIL(...) do { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
+
+/* The first njobs completions pushed for chain jc name jobs 0, 1, 2, ... */
+static void check_done_order(u32 jc, int njobs)
+{
+    long n = __atomic_load_n(&s_npush, __ATOMIC_ACQUIRE);
+    if (n > MAX_PUSHES) n = MAX_PUSHES;
+    int next = 0;
+    char seen[64] = "";
+    for (long i = 0; i < n && next < njobs; i++) {
+        if (s_push[i].jc != jc) continue;
+        const size_t l = strlen(seen);
+        snprintf(seen + l, sizeof seen - l, " %d", s_push[i].job);
+        if (s_push[i].job != next)
+            FAIL("chain 0x%X: completions announced as%s..., expected job %d next",
+                 jc, seen, next);
+        next++;
+    }
+    if (next < njobs) FAIL("chain 0x%X: %d of %d completions announced", jc, next, njobs);
+}
+
+/* Every SPU number is held when the chain starts, so all of its jobs queue for
+ * one; the numbers are then released one at a time, lowest first, slower than
+ * a job claims one and faster than it finishes. Taking the chain's jobs in
+ * order, job k must get SPU k. */
+static void check_claim_order(void)
+{
+    u32 pc = CHAIN2;
+    for (int k = 0; k < NSPUS; k++, pc += 8) put64(pc, JOBS + (u64)k * 0x100u);
+    put64(pc, 7u | (15u << 3));                                               /* END */
+    for (int k = 0; k < NSPUS; k++) s_dur_ms[k] = 500;
+
+    AcquireSRWLockExclusive(&s_jc_spu_lock);
+    s_jc_spu_busy = (1u << NSPUS) - 1u;           /* hold every SPU number */
+    ReleaseSRWLockExclusive(&s_jc_spu_lock);
+    start_chain(JC2, CHAIN2, NSPUS);
+    nap_ms(100);                                  /* every job waits for an SPU */
+    for (int n = 0; n < NSPUS; n++) {
+        jc_release_spu((u32)n);
+        nap_ms(20);
+    }
+    finish_chain(JC2, NSPUS);
+    if (s_total != NSPUS) FAIL("claim order: %ld of %d jobs ran", s_total, NSPUS);
+    for (int k = 0; k < NSPUS; k++)
+        if (s_spu[k] != k) {
+            char got[64] = "";
+            for (int j = 0; j < NSPUS; j++) {
+                const size_t l = strlen(got);
+                snprintf(got + l, sizeof got - l, " %d", s_spu[j]);
+            }
+            FAIL("jobs 0-%d ran on SPUs%s: they did not claim in chain order",
+                 NSPUS - 1, got);
+        }
+}
 
 /* Several threads notify one guard at once; every notify must count. */
 enum { NOTIFIERS = 4, NOTIFIES = 20000 };
@@ -162,10 +255,16 @@ int main(int argc, char** argv)
     assert(vm_base);
     memset(vm_base + BIN, 0x40, 16);   /* any 16 bytes: the fingerprint is all that matters */
     spu_workload_register(spu_workload_fingerprint(vm_base + BIN, 16), fake_job, "fake job");
+    s_spurs_event_queue[0] = 1;                   /* attach a queue to record completions */
+    s_spurs_event_queue_n = 1;
+    build_jobs();
 
+    for (int k = 0; k < MAXJ; k++) s_dur_ms[k] = 40;
+    s_dur_ms[0] = 160;                            /* job 0 finishes after jobs 1-3 */
     run_chain(JC, CHAIN, MAX_CONT);
     const long most = s_max_running;
     if (s_total != NJOBS) FAIL("%ld of %d jobs ran", s_total, NJOBS);
+    check_done_order(JC, NJOBS);
     if (!parallel) {
         if (s_max_running != 1) FAIL("serial chain ran %ld jobs at once", s_max_running);
     } else {
@@ -178,6 +277,9 @@ int main(int argc, char** argv)
         run_chain(JC1, CHAIN1, 1);
         if (s_total != NJOBS) FAIL("maxContention 1: %ld of %d jobs ran", s_total, NJOBS);
         if (s_max_running != 1) FAIL("maxContention 1 chain ran %ld jobs at once", s_max_running);
+
+        check_claim_order();
+        check_done_order(JC2, NSPUS);
     }
 
     check_guard();

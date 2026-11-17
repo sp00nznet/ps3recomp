@@ -2576,6 +2576,8 @@ static struct {
     u32 max_cont;     /* maxContention: SPUs that may work on the chain at once */
     u32 nspus;        /* SPUs of the SPURS instance the chain was created on    */
     long inflight;    /* jobs handed to the job threads, not finished (s_jcq_lock) */
+    int claim_next;   /* next job of this walk that may claim an SPU  (s_jc_spu_lock) */
+    int done_next;    /* next job whose completion may be announced   (s_jc_spu_lock) */
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
 } s_jobchains[MAX_JOBCHAINS];
@@ -3042,6 +3044,18 @@ static void jc_signal_done(u32 jc_ea, int job_index)
  * per-SPU resources on it, see g_spurs_job_spu_num in spurs_job.c), and the
  * thread that ran it pushes its completion event, so a job's mailbox answer
  * stays paired with its own event. Unset, nothing here runs.
+ *
+ * Order. On hardware each SPU takes the chain's next JOB command in turn (the
+ * chain's grab pointer only moves forward) and runs its jobs one by one, so a
+ * job is never handed out before the jobs ahead of it, and per-SPU resources
+ * keyed on the SPU number -- an Edge output ring and its RSX label per SPU --
+ * are allocated in the order the jobs appear in the chain. Host threads that
+ * took the jobs in order can still reach jc_claim_spu out of order, so a job
+ * waits for its turn (claim_next) before it claims. Completions are announced
+ * in chain order too (done_next): data2 is the job index, and a consumer that
+ * reads it as "done up to here" must not hear of job k+1 while job k is still
+ * writing. A job releases its SPU before that wait. Both tickets go back to
+ * 0 at the start of each walk, when no job of the chain is in flight.
  * -----------------------------------------------------------------------*/
 #define JC_POOL  CELL_SPURS_MAX_SPU
 #define JC_QUEUE 256u   /* power of two, >= MAX_JOBCHAINS * JC_POOL jobs in flight */
@@ -3075,22 +3089,28 @@ static u32 jc_parallel(int slot)
     return n ? n : 1;
 }
 
-/* Claim the lowest free SPU number below nspus. When every one is held -- jobs
- * of several chains share the instance's SPUs -- sleep until a job releases
- * one: a job thread that spun here instead kept a host core busy for as long
- * as the jobs holding the SPUs ran. */
-static u32 jc_claim_spu(u32 nspus)
+/* Claim the lowest free SPU number below nspus for job idx of the chain in
+ * slot, once the jobs before it have claimed theirs. When every number is held
+ * -- jobs of several chains share the instance's SPUs -- sleep until a job
+ * releases one: a job thread that spun here instead kept a host core busy for
+ * as long as the jobs holding the SPUs ran. */
+static u32 jc_claim_spu(u32 nspus, int slot, int idx)
 {
     if (!nspus || nspus > JC_POOL) nspus = JC_POOL;
     AcquireSRWLockExclusive(&s_jc_spu_lock);
     u32 n;
     for (;;) {
-        for (n = 0; n < nspus && (s_jc_spu_busy & (1u << n)); n++) {}
-        if (n < nspus) break;
+        if (s_jobchains[slot].claim_next >= idx) {         /* this job's turn */
+            for (n = 0; n < nspus && (s_jc_spu_busy & (1u << n)); n++) {}
+            if (n < nspus) break;
+        }
         SleepConditionVariableSRW(&s_jc_spu_cv, &s_jc_spu_lock, INFINITE, 0);
     }
     s_jc_spu_busy |= 1u << n;
+    if (s_jobchains[slot].claim_next <= idx)
+        s_jobchains[slot].claim_next = idx + 1;            /* the next job's turn */
     ReleaseSRWLockExclusive(&s_jc_spu_lock);
+    WakeAllConditionVariable(&s_jc_spu_cv);
     return n;
 }
 
@@ -3104,6 +3124,29 @@ static void jc_release_spu(u32 n)
     WakeAllConditionVariable(&s_jc_spu_cv);
 }
 
+/* Announce job idx of the chain in slot once every job before it has been. */
+static void jc_signal_done_in_order(int slot, u32 jc_ea, int idx)
+{
+    AcquireSRWLockExclusive(&s_jc_spu_lock);
+    while (s_jobchains[slot].done_next < idx)
+        SleepConditionVariableSRW(&s_jc_spu_cv, &s_jc_spu_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&s_jc_spu_lock);
+    jc_signal_done(jc_ea, idx);
+    AcquireSRWLockExclusive(&s_jc_spu_lock);
+    if (s_jobchains[slot].done_next <= idx) s_jobchains[slot].done_next = idx + 1;
+    ReleaseSRWLockExclusive(&s_jc_spu_lock);
+    WakeAllConditionVariable(&s_jc_spu_cv);
+}
+
+/* A new walk of the chain in slot: its jobs count from 0 again. */
+static void jc_order_reset(int slot)
+{
+    AcquireSRWLockExclusive(&s_jc_spu_lock);
+    s_jobchains[slot].claim_next = 0;
+    s_jobchains[slot].done_next  = 0;
+    ReleaseSRWLockExclusive(&s_jc_spu_lock);
+}
+
 static DWORD WINAPI jc_worker(LPVOID p)
 {
     ps3_thread_name("spurs jcw %d", (int)(intptr_t)p);
@@ -3114,12 +3157,12 @@ static DWORD WINAPI jc_worker(LPVOID p)
         const jc_work w = s_jcq[s_jcq_head++ & (JC_QUEUE - 1u)];
         ReleaseSRWLockExclusive(&s_jcq_lock);
 
-        const u32 spu = jc_claim_spu(w.nspus);
+        const u32 spu = jc_claim_spu(w.nspus, w.slot, w.idx);
         spurs_job_set_spu_num(spu);
         spurs_job_set_ls_handle(w.jc_ea);
         jc_run_one_job(w.job_ea, w.idx, w.size_desc);
         jc_release_spu(spu);
-        jc_signal_done(w.jc_ea, w.idx);
+        jc_signal_done_in_order(w.slot, w.jc_ea, w.idx);
 
         AcquireSRWLockExclusive(&s_jcq_lock);
         s_jobchains[w.slot].inflight--;
@@ -3171,6 +3214,7 @@ static void jc_execute(int slot)
 {
     const u32 jc_ea = s_jobchains[slot].jc_ea, size_desc = s_jobchains[slot].size_desc;
     const u32 par = jc_parallel(slot);
+    if (par > 1) jc_order_reset(slot);   /* nothing of this chain is in flight */
     u32 pc = s_jobchains[slot].entry_ea, ret_pc = 0;
     int jobs = 0;
     /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
