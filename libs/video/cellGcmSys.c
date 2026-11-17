@@ -1779,7 +1779,7 @@ void gcm_forget_spu_blocks(void)
  * after the transfer has landed, so the woken walker reads the new put. */
 static int s_spu_put_kick = -1;
 static _Atomic unsigned long long s_spu_put_kicks;
-static void gcm_walker_wake(void);   /* signals the kick event, below */
+static void gcm_walker_wake(void);   /* signals the kick event, if any; below */
 static int gcm_spu_put_kick_on(void)
 {
     if (s_spu_put_kick < 0) {
@@ -2022,15 +2022,26 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * the D3D12 backend it feeds) stays on the present thread -- running it from
  * the polling game thread killed the process silently. */
 static HANDLE s_gcm_kick_ev = NULL;
+/* The wake for the put kicks, published once the kick event exists. Going
+ * through a pointer keeps SetEvent out of gcm_note_spu_put, which the SPU DMA
+ * hook makes reachable in every program that links this file: a walker
+ * fixture that never waits on the event (and links no event implementation)
+ * then needs nothing new. */
+static void gcm_walker_wake_event(void) { SetEvent(s_gcm_kick_ev); }
+static void (*s_gcm_walker_wake_fn)(void);
 void* cellGcm_fifo_kick_event(void)
 {
-    if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!s_gcm_kick_ev) {
+        s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (s_gcm_kick_ev) __atomic_store_n(&s_gcm_walker_wake_fn, gcm_walker_wake_event, __ATOMIC_RELEASE);
+    }
     return (void*)s_gcm_kick_ev;
 }
 /* Wake the walker's idle wait, if anything waits on the kick event. */
 static void gcm_walker_wake(void)
 {
-    if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+    void (*wake)(void) = __atomic_load_n(&s_gcm_walker_wake_fn, __ATOMIC_ACQUIRE);
+    if (wake) wake();
 }
 
 /* PS3RECOMP_GCM_PPU_PUT_KICK=1 (default off; read once): a PPU store to the
