@@ -13,6 +13,7 @@
 
 #include <time.h>
 #include "cellPad.h"
+#include "pad_host_state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,28 +71,6 @@ static double pad_clock(unsigned long long t0_ms)
  * -----------------------------------------------------------------------*/
 
 #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
-
-typedef struct {
-    int  connected;
-    u16  buttons;           /* CELL_PAD_CTRL_* bitmask */
-    u8   analog_lx;         /* 0-255, center=128 */
-    u8   analog_ly;
-    u8   analog_rx;
-    u8   analog_ry;
-    u8   trigger_l2;        /* 0-255 */
-    u8   trigger_r2;        /* 0-255 */
-    /* Pressure-sensitive face buttons (0-255) */
-    u8   press_right;
-    u8   press_left;
-    u8   press_up;
-    u8   press_down;
-    u8   press_triangle;
-    u8   press_circle;
-    u8   press_cross;
-    u8   press_square;
-    u8   press_l1;
-    u8   press_r1;
-} PadHostState;
 
 static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;

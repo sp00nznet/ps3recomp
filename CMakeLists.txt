@@ -601,6 +601,21 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_rsx_fence_wait PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_fence_wait COMMAND test_rsx_fence_wait)
+    # The GameController-profile -> PS3 pad mapping against the state cellPad
+    # hands the guest: pure C, no SDL and no device.
+    add_executable(test_pad_gc_map
+        libs/input/tests/test_pad_gc_map.c
+        libs/input/pad_gc_map.c)
+    target_include_directories(test_pad_gc_map PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/input")
+    if(NOT MSVC)
+        target_compile_options(test_pad_gc_map PRIVATE -UNDEBUG)
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(test_pad_gc_map PRIVATE m)
+    endif()
+    add_test(NAME pad_gc_map COMMAND test_pad_gc_map)
 
     # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
     # Without -mfma it takes the double-rounding path; with it, the builtin.
