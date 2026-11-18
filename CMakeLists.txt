@@ -638,6 +638,16 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_gcm_report_clock PRIVATE m)
     endif()
     add_test(NAME gcm_report_clock COMMAND test_gcm_report_clock)
+    if(NOT WIN32)
+        # The host audio SPSC ring: one producer and one consumer thread, so
+        # this is the memory-model net for what a real-time audio callback
+        # reads. pthreads and sched_yield(), hence POSIX only.
+        add_executable(test_audio_ring_spsc
+            libs/audio/tests/test_audio_ring_spsc.c)
+        target_link_libraries(test_audio_ring_spsc PRIVATE Threads::Threads)
+        add_test(NAME audio_ring_spsc COMMAND test_audio_ring_spsc)
+        set_tests_properties(audio_ring_spsc PROPERTIES TIMEOUT 120)
+    endif()
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
