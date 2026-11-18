@@ -21,6 +21,32 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 
+# cellFiber switches host contexts with Windows fibers on Windows and the
+# ucontext routines everywhere else. Apple arm64 has a third, opt-in option: a
+# hand-written register switch that skips swapcontext's signal-mask work, and
+# unlike ucontext it exists in every Apple process. It is Apple arm64 only
+# because host_fiber_aarch64.S implements exactly that ABI.
+set(_ps3_fiber_arm64 OFF)
+if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+   (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
+    set(_ps3_fiber_arm64 ON)
+endif()
+set(PS3RECOMP_FIBER_BACKEND "ucontext" CACHE STRING
+    "cellFiber host context switch: ucontext (default) or aarch64 (Apple arm64)")
+set_property(CACHE PS3RECOMP_FIBER_BACKEND PROPERTY STRINGS ucontext aarch64)
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    if(NOT _ps3_fiber_arm64)
+        message(FATAL_ERROR
+            "PS3RECOMP_FIBER_BACKEND=aarch64 requires a single-arch Apple arm64 build "
+            "(-DCMAKE_OSX_ARCHITECTURES=arm64): host_fiber_aarch64.S is that ABI only, "
+            "and a universal binary would need a second one.")
+    endif()
+    enable_language(ASM)
+elseif(NOT PS3RECOMP_FIBER_BACKEND STREQUAL "ucontext")
+    message(FATAL_ERROR "Unknown PS3RECOMP_FIBER_BACKEND: ${PS3RECOMP_FIBER_BACKEND} "
+        "(expected ucontext or aarch64)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Collect source files
 # ---------------------------------------------------------------------------
@@ -43,6 +69,14 @@ file(GLOB_RECURSE HLE_SOURCES
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+
+# The AArch64 switch is two files that only make sense together: the assembly
+# implements the ABI, the C file maps stacks and states onto it.
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    list(APPEND HLE_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/host_fiber_aarch64.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/host_fiber_aarch64.S")
+endif()
 
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
@@ -105,6 +139,9 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    call leaks one resolver frame per guest loop iteration. A port adds it to
 #    its own target; see templates/project/CMakeLists.txt.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
+# Selected as a pair with its assembly above, never globbed: the .c alone has
+# no ps3_host_ctx_switch to link against.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/host_fiber_aarch64\\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -113,6 +150,10 @@ add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
 )
+# cellFiber picks its host context path on this; nothing else reads it.
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FIBER_HOST_AARCH64=1)
+endif()
 
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -415,6 +456,13 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    # The AArch64 switch as a standalone unit: a two-sided ABI probe, the
+    # guard-page layout, thread pinning and the fail-closed invariants. It
+    # compiles the backend itself, so it runs whether or not the runtime
+    # selects it -- Apple arm64 is the only host its assembly implements.
+    if(_ps3_fiber_arm64)
+        add_subdirectory(tests/host_fiber)
+    endif()
     # Syscall 14's address/flags classification as a plain unit test: the
     # check is pure, so the test links one runtime translation unit
     # (lv2_lock_line.c) and nothing else.

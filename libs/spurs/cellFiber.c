@@ -30,6 +30,9 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#if PS3RECOMP_FIBER_HOST_AARCH64
+#include "../../runtime/platform/host_fiber.h"
+#else
 #include <ucontext.h>
 
 #if defined(__APPLE__)
@@ -41,6 +44,7 @@
 _Static_assert(sizeof(ucontext_t) > 64,
                "ucontext_t has no embedded machine state: _XOPEN_SOURCE was "
                "defined too late and getcontext will write past the struct");
+#endif
 #endif
 #endif
 
@@ -86,6 +90,8 @@ struct Fiber {
     s32     status;
 #ifdef _WIN32
     void*   host_fiber;
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+    ps3_host_fiber host;
 #else
     ucontext_t uc;
     void*   host_stack;
@@ -99,6 +105,8 @@ struct Sched {
     int     running;             /* a thread is inside RunFibers */
 #ifdef _WIN32
     void*   back;                /* RunFibers' fiber while it runs one */
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+    ps3_host_runner back;        /* RunFibers' saved context while it runs one */
 #else
     ucontext_t back;             /* RunFibers' context while it runs one */
 #endif
@@ -164,8 +172,10 @@ static int all_done(const Sched* s)
 }
 
 /* ---------------------------------------------------------------------------
- * Host context switching: ucontext on POSIX, fibers on Windows. RunFibers' own context is the "back" one every fiber
- * returns to when it blocks, yields or ends.
+ * Host context switching: fibers on Windows, ucontext on the other hosts, or
+ * the explicit Apple AArch64 switch (PS3RECOMP_FIBER_BACKEND=aarch64).
+ * RunFibers' own context is the "back" one every fiber returns to when it
+ * blocks, yields or ends.
  * -----------------------------------------------------------------------*/
 
 static void fiber_body(Fiber* f);
@@ -200,6 +210,32 @@ static void host_resume(Sched* s, Fiber* f)
 static void host_yield(Fiber* f)
 {
     SwitchToFiber(f->sched->back);
+}
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+static void fiber_entry(void* p)
+{
+    fiber_body((Fiber*)p);
+}
+
+static int host_create(Fiber* f)
+{
+    return ps3_host_fiber_create(&f->host, FIBER_HOST_STACK, fiber_entry, f, f->ea) == 0;
+}
+
+/* Releases the guarded host stack. The fiber must not be the one running, nor be resumed again. */
+static void host_destroy(Fiber* f)
+{
+    ps3_host_fiber_destroy(&f->host);
+}
+
+static void host_resume(Sched* s, Fiber* f)
+{
+    ps3_host_fiber_resume(&s->back, &f->host);
+}
+
+static void host_yield(Fiber* f)
+{
+    ps3_host_fiber_yield(&f->host);
 }
 #else
 static void fiber_entry(unsigned hi, unsigned lo)
@@ -252,6 +288,8 @@ static void fiber_leave(Fiber* f)
 {
 #ifdef _WIN32
     SwitchToFiber(f->sched->back);
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+    ps3_host_fiber_exit(&f->host);
 #else
     setcontext(&f->sched->back);
 #endif
