@@ -516,6 +516,11 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
+    # cellAudio's mixer pacing decision (libs/audio/audio_pace.h) against a
+    # simulated clock and device queue: pure, so no runtime and no host audio.
+    add_executable(test_audio_pace libs/audio/tests/test_audio_pace.c)
+    add_test(NAME audio_pace COMMAND test_audio_pace)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
