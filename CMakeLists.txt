@@ -516,6 +516,17 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
+    if(NOT WIN32)
+        # The host audio SPSC ring: one producer and one consumer thread, so
+        # this is the memory-model net for what a real-time audio callback
+        # reads. pthreads and sched_yield(), hence POSIX only.
+        add_executable(test_audio_ring_spsc
+            libs/audio/tests/test_audio_ring_spsc.c)
+        target_link_libraries(test_audio_ring_spsc PRIVATE Threads::Threads)
+        add_test(NAME audio_ring_spsc COMMAND test_audio_ring_spsc)
+        set_tests_properties(audio_ring_spsc PROPERTIES TIMEOUT 120)
+    endif()
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
