@@ -2573,6 +2573,8 @@ enum {
 static struct {
     u32 jc_ea;        /* CellSpursJobChain EA (0 = free) */
     u32 entry_ea;     /* first command word EA */
+    u32 pc;           /* next command: CellSpursJobChain.pc, kept across Run/Kick */
+    u32 ret_pc;       /* CALL/RET link, kept with it */
     u16 size_desc;
     u16 max_grab;
     int run_count;
@@ -2641,6 +2643,8 @@ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
             s_jobchains[i].jc_ea     = jc_ea;
             s_jobchains[i].entry_ea  = entry_ea;
+            s_jobchains[i].pc        = entry_ea;
+            s_jobchains[i].ret_pc    = 0;
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
             s_jobchains[i].run_count = 0;
@@ -3003,9 +3007,21 @@ static void jc_signal_done(u32 jc_ea, int job_index)
     }
 }
 
-static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+/* The walk resumes where it stopped. CellSpursJobChain.pc is set when the
+ * chain is created and Run/Kick never touch it (as in RPCS3). A title can
+ * keep one chain as a growing list: it overwrites the tail END with a new
+ * JOB, writes a fresh END after it and calls Run again. Restarting at the
+ * entry then re-runs every finished command against descriptors the title
+ * has already recycled (Red Dead Redemption, BLUS30418). The walker stops
+ * AT the END, so the slot the title overwrites is read again next time.
+ * SPURS_JC_RESTART=1 restores restarting jobchain walks from entry_ea instead of persistent pc */
+static void jc_execute(int slot)
 {
-    u32 pc = entry_ea, ret_pc = 0;
+    static int s_restart = -1;
+    if (s_restart < 0) s_restart = getenv("SPURS_JC_RESTART") ? 1 : 0;
+    const u32 jc_ea = s_jobchains[slot].jc_ea, size_desc = s_jobchains[slot].size_desc;
+    u32 pc = s_restart ? s_jobchains[slot].entry_ea : s_jobchains[slot].pc;
+    u32 ret_pc = s_restart ? 0 : s_jobchains[slot].ret_pc;
     int jobs = 0;
     /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
      * SERVICE LOOP -- guard, job, sync, next, repeat -- and is meant to run for
@@ -3043,20 +3059,20 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
                 if (PS3_LOG_FIRST(_n_end, 8))
                     printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
-                return;
+                goto park;              /* pc stays on the END */
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
-                if (!ret_pc) return;
+                if (!ret_pc) goto park;
                 pc = ret_pc; ret_pc = 0; continue;
             }
             if (ext == (7 | (0 << 3))) {                      /* ABORT */
                 printf("[cellSpurs] chain 0x%08X: ABORT\n", jc_ea);
-                return;
+                goto park;
             }
         }
         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
             u32 g_ea = (u32)(cmd & ~127ull);
-            if (!jg_wait(g_ea)) return;                  /* still closed */
+            if (!jg_wait(g_ea)) goto park;               /* still closed: retried next Run */
             pc += 8; continue;
         }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
@@ -3070,6 +3086,9 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
                    "job(s) -- malformed?\n",
                    jc_ea, jobs);
     }
+park:
+    s_jobchains[slot].pc = pc;
+    s_jobchains[slot].ret_pc = ret_pc;
 }
 
 static DWORD WINAPI jc_thread(LPVOID p)
@@ -3085,8 +3104,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
       if (d && *d) Sleep((unsigned)atoi(d)); }
     for (;;) {
         _InterlockedExchange(&s_jobchains[slot].rerun, 0);
-        jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-                   s_jobchains[slot].size_desc);
+        jc_execute(slot);
         if (!s_jobchains[slot].rerun) {
             _InterlockedExchange(&s_jobchains[slot].running, 0);
             if (!s_jobchains[slot].rerun ||
