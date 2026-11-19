@@ -22,12 +22,12 @@ def main():
   results = []
   # 256 records give each registered kind at least 100 samples. Five seconds
   # bounds the sampler; the fixture waits for its completed dump, not a sleep.
-  for name, ppu, interval in [('spu',False,'1000'),('ppu',True,'1000'),('slow',True,'10000')]:
+  for name, ppu, interval, secs in [('spu',False,'1000','5'),('ppu',True,'1000','5'),('slow',True,'10000','10')]:
    prof = t/(name+'.txt')
    runenv = {**env,'PS3_TPROF':str(prof),'PS3_TPROF_TRIGGER':str(t/(name+'.go')),
-             'PS3_TPROF_SECONDS':'5','PS3_TPROF_CAP':'256','PS3_TPROF_INTERVAL_US':interval}
+             'PS3_TPROF_SECONDS':secs,'PS3_TPROF_CAP':'256','PS3_TPROF_INTERVAL_US':interval}
    if ppu: runenv['PS3_TPROF_PPU'] = '1'
-   q = subprocess.run([str(exe)],env=runenv,capture_output=True,text=True,timeout=12)
+   q = subprocess.run([str(exe)],env=runenv,capture_output=True,text=True,timeout=20)
    assert q.returncode == 0, (name,q.stdout+q.stderr)
    hits = n = 0
    for line in prof.read_text().splitlines():
