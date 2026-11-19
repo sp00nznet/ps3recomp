@@ -2308,6 +2308,8 @@ static u32 dr_unnorm_units(const D3D12DrawRecord* dr, u32 dim[16][3])
     return mask;
 }
 
+extern int cellGcmOffsetIsDisplay(u32 offset);
+
 /* Sparse sample across a guest texture buffer to detect whether any texel is
  * non-zero before substituting a captured render target (SCREEN_AS_TEX /
  * SUBVP). Sampling only the first 128 KB misses bottom-aligned UI/intro art,
@@ -4948,11 +4950,13 @@ static void render_frame(void)
                     continue;
                 }
             }
-            /* Display-sized sampler source -> the rendered frame (only when
-             * guest RAM contains no actual pixel data for this texture). */
+            /* Display-sized sampler source -> the rendered frame (always for
+             * registered display buffers; or for other guest textures only
+             * when guest RAM contains no actual pixel data). */
             if (dr->tex[_u].set && s_screen_copy &&
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height &&
-                !guest_tex_nonzero(dr->tex[_u].off, dr->tex[_u].w, dr->tex[_u].h)) {
+                (cellGcmOffsetIsDisplay(dr->tex[_u].off) ||
+                 !guest_tex_nonzero(dr->tex[_u].off, dr->tex[_u].w, dr->tex[_u].h))) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
                 if (en) {
