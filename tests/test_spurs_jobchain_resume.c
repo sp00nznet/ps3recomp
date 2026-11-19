@@ -201,9 +201,28 @@ int main(void)
     quiet();
     expect(8, 3, "Run after Join"); expect(9, 1, "Run after Join");
 
+    /* Shutdown of a service-loop chain (job, NEXT back to it: no END ever).
+     * Join must wait for the job in flight, and the walk must then stop. */
+    vm_write64(LIST(9), JOBEA(10)); job(10);
+    vm_write64(LIST(9) + 8, NEXT(LIST(9)));
+    assert(cellSpursCreateJobChain(SPURS, CHAIN, LIST(9), 256, 16, 0, 1, 0) == CELL_OK);
+    hold_next();                              /* job 10 done, its event in flight */
+    assert(cellSpursRunJobChain(CHAIN) == CELL_OK);
+    wait_held();
+    assert(cellSpursShutdownJobChain(CHAIN) == CELL_OK);
+    if (!s_jobchains[chain_slot()].running) {
+        fprintf(stderr, "FAIL: Shutdown let Join through while a job was in flight\n");
+        failed = 1;
+    }
+    unhold();
+    quiet();                                  /* fails if the loop never stops */
+    assert(cellSpursJoinJobChain(CHAIN) == CELL_OK);
+    expect(10, 1, "looping chain after Shutdown");
+
     if (failed) return 1;
     free(vm_base);
     puts("PASS: job chain resumes at the END it stopped on; no Run lost while a walk finishes; "
-         "re-create, re-run of a fixed list and Join start at the entry");
+         "re-create, re-run of a fixed list and Join start at the entry; "
+         "Shutdown stops a looping chain after its job in flight");
     return 0;
 }
