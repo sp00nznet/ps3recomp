@@ -780,9 +780,13 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
 
 s32 cellGameDeleteGameData(const char* dirName)
 {
-    printf("[cellGame] DeleteGameData(dir='%s')\n", dirName ? dirName : "<null>");
+    uintptr_t raw = (uintptr_t)dirName;
+    const char* host_dir = (raw && raw < 0x100000000ull && vm_base)
+        ? (const char*)(vm_base + (uint32_t)raw)
+        : dirName;
+    printf("[cellGame] DeleteGameData(dir='%s')\n", host_dir ? host_dir : "<null>");
 
-    if (!dirName)
+    if (!raw)
         return CELL_GAME_ERROR_PARAM;
 
     /* We won't recursively delete host directories for safety.
