@@ -2574,7 +2574,8 @@ static struct {
     u16 size_desc;
     u16 max_grab;
     int run_count;
-    volatile long running;   /* 1 while a host thread walks this chain */
+    volatile long running;      /* 1 while a host thread walks this chain */
+    volatile long shutdown_req; /* 1 when ShutdownJobChain requested stop */
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -3111,6 +3112,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
         /* Coalesce: a chain already being walked must not start twice. */
+        s_jobchains[i].shutdown_req = 0;
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
@@ -3146,7 +3148,10 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea == (u32)jc_ea) {
-            s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
+            /* Signal shutdown without clearing `running`: jc_thread clears
+             * `running = 0` once jc_execute finishes so JoinJobChain waits
+             * for in-flight SPU jobs to drain. */
+            s_jobchains[i].shutdown_req = 1;
             return CELL_OK;
         }
     }
