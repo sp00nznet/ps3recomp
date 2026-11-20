@@ -552,10 +552,17 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
 
+<<<<<<< HEAD
     add_executable(test_rsx_gpu_wait tests/test_rsx_gpu_wait.c)
     target_include_directories(test_rsx_gpu_wait PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_gpu_wait COMMAND test_rsx_gpu_wait)
+=======
+    add_executable(test_rsx_fence_wait tests/test_rsx_fence_wait.c)
+    target_include_directories(test_rsx_fence_wait PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME rsx_fence_wait COMMAND test_rsx_fence_wait)
+>>>>>>> pr/713
 
     # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
     # Without -mfma it takes the double-rounding path; with it, the builtin.
