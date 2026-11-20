@@ -413,6 +413,27 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if ((uint64_t)lsa + (uint64_t)size > (uint64_t)SPU_LS_SIZE)
         return -1;
 
+    /* SPU thread local stores are mapped into the effective-address space at
+     * 0xF0000000 + spu_num * 0x100000 (lv2 SYS_SPU_THREAD_BASE_LOW and
+     * SYS_SPU_THREAD_OFFSET); a transfer there moves data between local
+     * stores. Resistance 3's collision job gathers 16-byte records out of SPU
+     * 0's local store this way (GETs from 0xF0007400); reading guest memory
+     * there instead handed it zeros, and no query ever hit the level.
+     * TODO: only SPURS policy contexts are registered (spu_thread_ls_peer);
+     * plain SPU thread groups and the problem-state area above 0x40000 are
+     * not mapped. */
+    if ((uint32_t)ea >= SPU_THREAD_EA_BASE &&
+        (uint32_t)ea < SPU_THREAD_EA_BASE + SPU_THREAD_LS_MAX * SPU_THREAD_EA_STRIDE &&
+        (mfc_is_get(cmd) || mfc_is_put(cmd))) {
+        uint32_t off = ((uint32_t)ea - SPU_THREAD_EA_BASE) % SPU_THREAD_EA_STRIDE;
+        spu_context* peer = spu_thread_ls_peer(spu, ((uint32_t)ea - SPU_THREAD_EA_BASE) / SPU_THREAD_EA_STRIDE);
+        if (peer && off + size <= SPU_LS_SIZE) {
+            if (mfc_is_get(cmd)) memmove(&spu->ls[lsa], &peer->ls[off], size);
+            else                 memmove(&peer->ls[off], &spu->ls[lsa], size);
+            return 0;
+        }
+    }
+
     /* Reject transfers whose main-memory range is not committed guest memory,
      * so a garbage EA (e.g. from an incomplete SPURS context) is a failed DMA
      * rather than a host segfault. */
