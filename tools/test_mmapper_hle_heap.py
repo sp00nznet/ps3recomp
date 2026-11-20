@@ -10,9 +10,16 @@ def main():
         print('SKIP: standalone mapper/HLE-heap fixture needs a POSIX toolchain')
         return 0
     source = (ROOT / 'libs/system/sysPrxForUser.c').read_text()
-    begin = source.index('#define YZ_HEAP_BASE')
-    end = source.index('/* The plain libc allocator sysPrxForUser exports', begin)
-    body = source[begin:end]
+    # Two layout-independent slices: the heap table decls (wherever they sit)
+    # and the heap-management section, so the fixture also builds on master
+    # for the fail-before runs.
+    t_begin = source.index('#define MAX_HEAPS')
+    t_mark = 'static u32 s_next_heap_id = 1;'
+    t_end = source.index(t_mark) + len(t_mark)
+    h_mark = source.index('Heap management (wraps malloc)')
+    h_begin = source.rindex('/*', 0, h_mark)   # the banner comment opener, not its text
+    h_end = source.index('/* The plain libc allocator sysPrxForUser exports', h_begin)
+    body = source[t_begin:t_end] + '\n' + source[h_begin:h_end]
     with tempfile.TemporaryDirectory(prefix='ps3-mmapper-hle-heap-') as tmp:
         temp = Path(tmp)
         (temp / 'heap-under-test.inc').write_text(body)
