@@ -574,10 +574,20 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
+<<<<<<< HEAD
     # cellAudio's mixer pacing decision (libs/audio/audio_pace.h) against a
     # simulated clock and device queue: pure, so no runtime and no host audio.
     add_executable(test_audio_pace libs/audio/tests/test_audio_pace.c)
     add_test(NAME audio_pace COMMAND test_audio_pace)
+=======
+    # The clock GET_REPORT stamps reports with, and its drain-time scale.
+    add_executable(test_gcm_report_clock libs/video/tests/test_gcm_report_clock.c)
+    target_include_directories(test_gcm_report_clock PRIVATE include libs/video)
+    if(NOT MSVC)
+        target_link_libraries(test_gcm_report_clock PRIVATE m)
+    endif()
+    add_test(NAME gcm_report_clock COMMAND test_gcm_report_clock)
+>>>>>>> pr/753
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
