@@ -39,6 +39,7 @@
 #include <time.h>
 #include <ps3emu/ps3types.h>
 #include "../libs/spurs/cellSpurs.c"
+void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c (#729) */
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 16u << 20;

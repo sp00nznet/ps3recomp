@@ -2951,6 +2951,8 @@ static void test_feedback_per_pass(void)
           "a guest write into the target makes a new copy (%d, want %d)",
           g_fb_copies, per ? 4 : 2);
     engine_down();
+}
+
 /* Runs `body` with stderr captured into `out` (NUL-terminated, truncated). */
 static void capture_stderr(void (*body)(void), char* out, size_t cap)
 {

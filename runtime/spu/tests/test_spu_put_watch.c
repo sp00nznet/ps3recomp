@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../spu_dma.h"
+spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num) { (void)self; (void)spu_num; return 0; }   /* #800 */
 
 static uint8_t memory[0x40000];
 uint8_t* vm_base = memory;

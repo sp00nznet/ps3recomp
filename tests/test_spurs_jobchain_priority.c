@@ -17,6 +17,7 @@
 #include "../libs/spurs/cellSpurs.c"
 #include <assert.h>
 #include <time.h>
+void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c (#729) */
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x100000;

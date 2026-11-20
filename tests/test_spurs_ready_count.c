@@ -9,6 +9,7 @@
 #undef spu_workload_dispatch_async
 #include <assert.h>
 #include <stdatomic.h>
+void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c (#729) */
 
 void spu_indirect_branch(spu_context*);
 uint8_t* vm_base;

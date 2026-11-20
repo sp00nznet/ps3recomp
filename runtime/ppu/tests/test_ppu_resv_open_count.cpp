@@ -29,6 +29,7 @@
 #include <thread>
 #include <vector>
 #include "win32_compat.h"
+extern "C" void cellGcm_put_on_store(void) {}   /* cellGcmSys.c (#817) */
 
 extern "C" {
 uint8_t* vm_base;
