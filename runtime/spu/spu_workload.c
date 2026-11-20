@@ -49,8 +49,15 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
 
 /* ---- registry ---------------------------------------------------------- */
 
+/* LOCAL PATCH (spurs_test 2026-10-28): default 256 -> 4096. The SPU Test
+ * benchmark patches a task counter into each of its 1024 per-task image
+ * copies, so the title registers 1024 fingerprints for ONE lifted image plus
+ * the normal set. 256 silently dropped the rest (registry reports "full").
+ * Setting the define from the port's CMakeLists does not work: source-file
+ * properties are directory-scoped and the runtime target lives in the SDK
+ * subdirectory, so the default here is the only reliable knob. */
 #ifndef SPU_WORKLOAD_MAX
-#define SPU_WORKLOAD_MAX 256
+#define SPU_WORKLOAD_MAX 4096
 #endif
 
 typedef struct {
