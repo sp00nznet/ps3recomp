@@ -2205,6 +2205,12 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
 #endif
     { uint32_t _v = v;
       v = __builtin_bswap32(v); VM_WRITE_COH(a, &v, 4);
+      /* The gcm put word, after the store has landed: GCM may wake the FIFO
+       * walker (PS3RECOMP_GCM_PPU_PUT_KICK). The store side of the ref-poll
+       * word's hook in vm_read32; inline stores leave this word to us. */
+      if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2000u)) {
+          extern void cellGcm_put_on_store(void);
+          cellGcm_put_on_store(); }
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */

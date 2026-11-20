@@ -1,7 +1,9 @@
 /* PS3RECOMP_GCM_SPU_PUT_KICK=1 (cellGcmSys.c): an SPU transfer that writes the
  * control register's put word wakes the FIFO walker's idle wait. Transfers
  * that miss the word, and every transfer with the switch off, wake nothing.
- * Synthetic: no SPU program, no graphics backend.
+ * PS3RECOMP_GCM_PPU_PUT_KICK=1: a PPU store of the put word
+ * (cellGcm_put_on_store, which the runtime's vm_write32 calls) does the same.
+ * Synthetic: no SPU or PPU program, no graphics backend.
  *
  * python3 tools/test_gcm_spu_put_kick.py
  */
@@ -69,18 +71,28 @@ static void* spu_writes_put(void* arg)
     gcm_note_spu_put(GCM_CONTROL_GUEST_ADDR, 4);
     return NULL;
 }
-/* How long the walker's idle wait (timeout ms) takes when an SPU writes put
+/* The PPU side: a store of put, as the runtime's vm_write32 reports it. */
+static void* ppu_stores_put(void* arg)
+{
+    (void)arg;
+    struct timespec d = { 0, 20 * 1000000L };
+    nanosleep(&d, NULL);
+    cellGcm_put_on_store();
+    return NULL;
+}
+/* How long the walker's idle wait (timeout ms) takes when a writer stores put
  * 20 ms into it. */
-static double idle_wait_ms(unsigned timeout)
+static double idle_wait_ms_with(unsigned timeout, void* (*writer)(void*))
 {
     pthread_t t;
     const double t0 = now_ms();
-    pthread_create(&t, NULL, spu_writes_put, NULL);
+    pthread_create(&t, NULL, writer, NULL);
     cellGcm_fifo_kick_wait(timeout);
     const double took = now_ms() - t0;
     pthread_join(t, NULL);
     return took;
 }
+static double idle_wait_ms(unsigned timeout) { return idle_wait_ms_with(timeout, spu_writes_put); }
 
 int main(void)
 {
@@ -106,6 +118,19 @@ int main(void)
         const double took = idle_wait_ms(400);
         printf("    idle wait with an SPU put write 20 ms in: %.1f ms (timeout 400 ms)\n", took);
         if (on) check(took < 200.0, "on: the idle wait ends at the SPU's put write");
+        else    check(took >= 390.0, "off: the idle wait runs to its timeout");
+    }
+    for (int on = 0; on <= 1; on++) {
+        s_ppu_put_kick = -1;
+        if (on) setenv("PS3RECOMP_GCM_PPU_PUT_KICK", "1", 1); else unsetenv("PS3RECOMP_GCM_PPU_PUT_KICK");
+        const unsigned long long k0 = atomic_load(&s_ppu_put_kicks);
+        cellGcm_put_on_store();
+        check(atomic_load(&s_ppu_put_kicks) == k0 + (on ? 1u : 0u),
+              on ? "on: a PPU store of put wakes the walker" : "off: a PPU store of put wakes nothing");
+        cellGcm_fifo_kick_wait(0);
+        const double took = idle_wait_ms_with(400, ppu_stores_put);
+        printf("    idle wait with a PPU put store 20 ms in: %.1f ms (timeout 400 ms)\n", took);
+        if (on) check(took < 200.0, "on: the idle wait ends at the PPU's put store");
         else    check(took >= 390.0, "off: the idle wait runs to its timeout");
     }
     printf("[gcm_spu_put_kick] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
