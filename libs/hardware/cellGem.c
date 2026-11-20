@@ -55,7 +55,10 @@ s32 cellGemGetState(u32 gemNum, u32 flag, u64 timestamp, CellGemState* state)
     (void)gemNum; (void)flag; (void)timestamp;
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
     if (!state) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
-    return (s32)CELL_GEM_ERROR_NOT_CONNECTED;
+    /* Not an error code: a title keeps the result as the controller's status.
+     * Resistance 3 reads anything but CELL_GEM_NOT_CONNECTED as "a Move needs
+     * calibrating" and opens its PlayStation Eye dialog, which nothing closes. */
+    return CELL_GEM_NOT_CONNECTED;
 }
 
 s32 cellGemIsTrackableHue(u32 hue)
