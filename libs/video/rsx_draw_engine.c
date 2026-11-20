@@ -67,7 +67,9 @@ extern u32 ppu_vm_size;
 #define M_BLEND_ENABLE        0x0310
 #define M_BLEND_SFACTOR       0x0314
 #define M_BLEND_DFACTOR       0x0318
+#define M_BLEND_COLOR         0x031C
 #define M_BLEND_EQUATION      0x0320
+#define M_BLEND_COLOR2        0x037C
 #define M_COLOR_MASK          0x0324
 #define M_STENCIL_TEST_ENABLE 0x0328
 #define M_STENCIL_MASK        0x032C
@@ -3464,6 +3466,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
         memcpy(&fmin, &lo, sizeof fmin);
         memcpy(&fmax, &hi, sizeof fmax);
         g.be->set_depth_bounds(g.be->user, fmin, fmax);
+    }
+    /* And the blend constant, which the CONSTANT_COLOR / CONSTANT_ALPHA
+     * factors multiply by: A8R8G8B8 in SET_BLEND_COLOR, or on a half-float
+     * target 16 bits a channel, R and G there and B and A in _COLOR2. A title
+     * fades decals and weights its bloom passes with it. */
+    if (g.be->set_blend_color) {
+        const u32 c  = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR);
+        const u32 c2 = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR2);
+        float k[4];
+        if (rs.rt_fp16) {
+            k[0] = (float)(c & 0xFFFFu) / 65535.0f;  k[1] = (float)(c >> 16) / 65535.0f;
+            k[2] = (float)(c2 & 0xFFFFu) / 65535.0f; k[3] = (float)(c2 >> 16) / 65535.0f;
+        } else {
+            k[0] = (float)((c >> 16) & 0xFFu) / 255.0f; k[1] = (float)((c >> 8) & 0xFFu) / 255.0f;
+            k[2] = (float)(c & 0xFFu) / 255.0f;         k[3] = (float)(c >> 24) / 255.0f;
+        }
+        g.be->set_blend_color(g.be->user, k);
     }
 
     /* Polygon offset: dynamic state, like the stencil reference. The
