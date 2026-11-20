@@ -14,6 +14,7 @@
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
+#include "audio_pace.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
@@ -100,6 +101,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #include <pthread.h>
   #include <unistd.h>
   #include <time.h>
+  #include <errno.h>   /* EINTR from clock_nanosleep */
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
   #define mutex_init(m)    pthread_mutex_init(m, NULL)
@@ -683,8 +685,50 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    /* One block per guest audio period on the monotonic clock, the device's
+     * queue only guarding against the drift between its clock and ours
+     * (audio_pace.h). A fixed sleep after each block left the rate to the
+     * sleep's overshoot (197 blocks/s on Linux against the PS3's 187.5);
+     * pacing on the queue alone turned the guest's events into pairs on a
+     * device that pulls two blocks at once. */
+    const uint64_t ns_per_second = 1000000000ull;
+    struct timespec clock;
+    clock_gettime(CLOCK_MONOTONIC, &clock);
+    uint64_t now_ns = (uint64_t)clock.tv_sec * ns_per_second + (uint64_t)clock.tv_nsec;
+
+    audio_pace_state pacer;
+    audio_pace_init(&pacer, now_ns);
+
     unsigned long blocks = 0; float peak = 0.0f;
     while (s_mix_thread_running) {
+        clock_gettime(CLOCK_MONOTONIC, &clock);
+        now_ns = (uint64_t)clock.tv_sec * ns_per_second + (uint64_t)clock.tv_nsec;
+
+        /* room() answers -1 while no device is open; the queue only guards the
+         * drift of a device that is. */
+        const int has_device = audio_backend_room() >= 0;
+        const u32 queued_blocks = has_device
+            ? audio_backend_queued_samples() / CELL_AUDIO_BLOCK_SAMPLES : 0;
+
+        const audio_pace_decision dec = audio_pace_decide(&pacer, now_ns, queued_blocks, has_device != 0);
+
+        if (dec.action == AUDIO_PACE_ACTION_SLEEP) {
+#if defined(__linux__)
+            const struct timespec deadline = { (time_t)(dec.deadline_ns / ns_per_second),
+                                               (long)(dec.deadline_ns % ns_per_second) };
+            while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL) == EINTR) {}
+#else
+            /* macOS has no clock_nanosleep and coalesces its timers, so this
+             * sleeps the remaining time; the cadence is held by the deadline
+             * arithmetic, not by the sleep's precision. */
+            const struct timespec remain = { (time_t)(dec.sleep_ns / ns_per_second),
+                                             (long)(dec.sleep_ns % ns_per_second) };
+            nanosleep(&remain, NULL);
+#endif
+            continue;
+        }
+        if (dec.action == AUDIO_PACE_ACTION_SKIP) continue;   /* the queue is at HI */
+
         audio_mix_one_block();
         audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
@@ -695,13 +739,6 @@ static void* audio_mix_thread_func(void* arg)
               const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
               if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
           } }
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
