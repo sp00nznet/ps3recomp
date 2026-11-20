@@ -474,47 +474,25 @@ static void timer_send_event(sys_timer_info* t)
     if (t->event_queue_id <= 0 || t->event_queue_id > SYS_EVENT_QUEUE_MAX)
         return;
 
-    sys_event_queue_info* q = &g_sys_event_queues[t->event_queue_id - 1];
-    if (!q->active)
-        return;
-
-    sys_event_t evt;
-    evt.source = t->source;
     /* lv2 (and RPCS3) deliver the connect's data1/data2 and, in data3, the
      * EXPIRATION TIME -- which advances every period. It was 0 here, so a
      * consumer that paces itself by the delta between ticks saw no time pass:
      * Twisted Metal's BoomRangBuss audio driver wakes on this timer, derives
      * how many blocks to service from data3, and serviced none, ever -- so
-     * brb_StartSession timed out and every later BRB request hung. */
-    evt.data1  = t->data1;
-    evt.data2  = t->data2;
-    evt.data3  = t->next_expire;
-    t->next_expire += t->period_usec;
-
-    /* Push event (ignore if queue full) */
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-#endif
-
-    if (q->count < q->capacity) {
-        q->buffer[q->tail] = evt;
-        q->tail = (q->tail + 1) % q->capacity;
-        q->count++;
-#ifdef _WIN32
-        WakeConditionVariable(&q->not_empty);
-#else
-        pthread_cond_signal(&q->not_empty);
-#endif
-    }
-
-#ifdef _WIN32
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_unlock(&q->lock);
-#endif
+     * brb_StartSession timed out and every later BRB request hung.
+     *
+     * The queue is pinned for the send (and a full queue drops the event):
+     * a destroy racing this callback must not reuse the queue's native lock. */
+    (void)sys_event_queue_push_periodic_by_id((uint32_t)t->event_queue_id, t->source,
+                                               t->data1, t->data2, &t->next_expire,
+                                               t->period_usec);
 }
+#ifdef PS3_SYNC_TEST_HOOKS
+void sys_timer_test_send_event(sys_timer_info* t)
+{
+    timer_send_event(t);
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * sys_timer_create

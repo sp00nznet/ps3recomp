@@ -130,9 +130,10 @@ extern unsigned int cellGcm_flip_request_count(void);
 #define SMOKE_FRAMES        3
 
 /* lv2 syscall numbers (runtime/syscalls/lv2_syscall_table.h). Spelled out
- * because a title has no header of ours: it puts the number in r11. */
-#define SC_PPU_THREAD_CREATE  41
-#define SC_PPU_THREAD_EXIT    42
+ * because a title has no header of ours: it puts the number in r11. Thread
+ * creation is not a table entry: lv2's 52/53 have another ABI, and a title
+ * reaches sys_ppu_thread_create by its sysPrxForUser import NID. */
+#define SC_PPU_THREAD_EXIT    41
 #define SC_PPU_THREAD_JOIN    44
 #define SC_TIMER_USLEEP      141
 #define SC_TTY_WRITE         403
@@ -147,6 +148,7 @@ extern unsigned int cellGcm_flip_request_count(void);
 #define NID_cellGcmGetFlipStatus      0x72A577CEu
 #define NID_cellGcmSetVBlankHandler   0xA91B0402u
 #define NID_sys_process_exit          0xE6F2C1E7u
+#define NID_sys_ppu_thread_create     0x24A1EA07u
 
 /* cellGcmSys.h's flip states. */
 #define SMOKE_FLIP_DONE     0
@@ -490,9 +492,9 @@ void func_00010000(ppu_context* ctx)
                 "the GCM context does not begin at the IO address");
     smoke_mark(ctx, SMOKE_STEP_HLE);
 
-    /* A guest thread. The entry is an OPD address, which the runtime's thread
+    /* A guest thread, through the sysPrxForUser import NID as a lifted title
+     * does it. The entry is an OPD address, which the runtime's thread
      * trampoline resolves the same way ppu_run resolved ours. */
-    ctx->gpr[11] = SC_PPU_THREAD_CREATE;
     ctx->gpr[3]  = SMOKE_SC_TID;          /* u64* thread id (out) */
     ctx->gpr[4]  = SMOKE_OPD_THREAD;      /* entry OPD           */
     ctx->gpr[5]  = SMOKE_THREAD_ARG;      /* the new thread's r3 */
@@ -500,7 +502,7 @@ void func_00010000(ppu_context* ctx)
     ctx->gpr[7]  = 0x10000;               /* stack size          */
     ctx->gpr[8]  = 1;                     /* flags: JOINABLE (joined below) */
     ctx->gpr[9]  = SMOKE_THREAD_NAME;
-    lv2_syscall(ctx);
+    ps3_hle_call(NID_sys_ppu_thread_create, ctx); DRAIN_TRAMPOLINE(ctx);
     smoke_check((int32_t)ctx->gpr[3] == 0, "sys_ppu_thread_create failed");
     tid = vm_read64(SMOKE_SC_TID);
     smoke_check(tid != 0, "sys_ppu_thread_create returned thread id 0");

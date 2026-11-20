@@ -171,6 +171,13 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
 /* Resolve an event queue by its ipc_key; returns queue_id (1-based) or 0. */
 uint32_t sys_event_find_queue_by_key(uint64_t key);
 
+/* The periodic timer's send: pushes {source, data1, data2, *next_expire} and
+ * advances *next_expire by period_usec, unless the queue is gone (returns 0,
+ * *next_expire untouched). */
+int sys_event_queue_push_periodic_by_id(uint32_t queue_id, uint64_t source,
+                                        uint64_t data1, uint64_t data2,
+                                        uint64_t* next_expire, uint64_t period_usec);
+
 /* Create a queue without a guest context (for HLE libs that must hand the
  * game a queue id, e.g. cellAudioCreateNotifyEventQueue). 0 = table full. */
 uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
