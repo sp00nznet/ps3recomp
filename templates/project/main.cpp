@@ -113,6 +113,7 @@ void     cellGcmTickVBlank(void);
 void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
+void     cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
 unsigned cellGcm_flip_request_count(void);
 }
 
@@ -213,7 +214,11 @@ static DWORD WINAPI frame_clock(LPVOID)
     ULONGLONG next_tick = GetTickCount64();
 
     for (;;) {
-        Sleep(4);
+        /* Wait on the FIFO kick event, not a flat Sleep(4): the runtime
+         * signals it when the guest needs the walker now (a dry fence queue,
+         * a ring recycle, and, opted in, an SPU write of put). Nothing kicks:
+         * the same 4 ms. GCM_FIFO_KICK=0 restores the plain sleep. */
+        cellGcm_fifo_kick_wait(4);
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;

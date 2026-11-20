@@ -1829,8 +1829,33 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+/* PS3RECOMP_GCM_SPU_PUT_KICK=1 (default off; read once): an SPU transfer that
+ * writes the control register's put word wakes the FIFO walker. A title whose
+ * SPU jobs advance put by DMA (an SPU-built command stream, rather than
+ * libgcm's PPU-side flush) otherwise leaves the walker asleep until its idle
+ * wait times out, with new commands already in the buffer. The RSX sees put
+ * whoever writes it, so waking on it is what the hardware does. This hook runs
+ * after the transfer has landed, so the woken walker reads the new put. */
+static int s_spu_put_kick = -1;
+static _Atomic unsigned long long s_spu_put_kicks;
+static void gcm_walker_wake(void);   /* signals the kick event, if any; below */
+static int gcm_spu_put_kick_on(void)
+{
+    if (s_spu_put_kick < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_SPU_PUT_KICK");
+        s_spu_put_kick = e && !strcmp(e, "1");
+        if (s_spu_put_kick) fprintf(stderr, "[gcm] an SPU DMA over the put word wakes the FIFO walker\n");
+    }
+    return s_spu_put_kick;
+}
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    /* [ea, ea + size) covers the put word (unsigned: a transfer below it wraps). */
+    if (size && GCM_CONTROL_GUEST_ADDR - ea < size && gcm_spu_put_kick_on()) {
+        atomic_fetch_add_explicit(&s_spu_put_kicks, 1ull, memory_order_relaxed);
+        gcm_walker_wake();
+    }
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -2056,10 +2081,26 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * the D3D12 backend it feeds) stays on the present thread -- running it from
  * the polling game thread killed the process silently. */
 static HANDLE s_gcm_kick_ev = NULL;
+/* The wake for the put kicks, published once the kick event exists. Going
+ * through a pointer keeps SetEvent out of gcm_note_spu_put, which the SPU DMA
+ * hook makes reachable in every program that links this file: a walker
+ * fixture that never waits on the event (and links no event implementation)
+ * then needs nothing new. */
+static void gcm_walker_wake_event(void) { SetEvent(s_gcm_kick_ev); }
+static void (*s_gcm_walker_wake_fn)(void);
 void* cellGcm_fifo_kick_event(void)
 {
-    if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!s_gcm_kick_ev) {
+        s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (s_gcm_kick_ev) __atomic_store_n(&s_gcm_walker_wake_fn, gcm_walker_wake_event, __ATOMIC_RELEASE);
+    }
     return (void*)s_gcm_kick_ev;
+}
+/* Wake the walker's idle wait, if anything waits on the kick event. */
+static void gcm_walker_wake(void)
+{
+    void (*wake)(void) = __atomic_load_n(&s_gcm_walker_wake_fn, __ATOMIC_ACQUIRE);
+    if (wake) wake();
 }
 
 /* The present thread's idle wait. It used to be a flat Sleep(4), which meant
