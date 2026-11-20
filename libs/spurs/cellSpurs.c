@@ -3252,22 +3252,17 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
      * queue to reason about. */
     uint32_t q = (uint32_t)queue_ea;
     for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
-    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
-     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
-     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
-     * the queue look permanently empty no matter what a producer wrote. */
+    /* Official PS3 SDK CellSpursQueue 128-byte BE layout (verified from
+     * SPU cellSpursQueueTryPushBegin / PushEnd):
+     *   +0x00 s32 pop       +0x04 s32 push
+     *   +0x08 u32 size      +0x0C u32 depth
+     *   +0x10 u64 buffer    +0x18 u32 eventPort (0xFFFFFFFF = none)
+     *   +0x1C u32 direction (+0x70 u64 eaTaskset) */
+    vm_write32(q + 0x08, size);
     vm_write32(q + 0x0C, depth);
-    vm_write32(q + 0x10, size);
-    vm_write32(q + 0x14, depth);
-    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);
-    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
-     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
-     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
-     * write there marching through it one byte per dequeue --
-     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
-     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
-     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
-     * Whatever holds direction/init, it is not these offsets. */
+    vm_write64(q + 0x10, (u64)(uint32_t)buffer_ea);
+    vm_write32(q + 0x18, 0xFFFFFFFFu);
+    vm_write32(q + 0x1C, direction);
     vm_write64(q + 0x70, (u64)(uint32_t)taskset_ea);
     memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
 
@@ -3349,9 +3344,9 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
     if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     uint32_t q   = (uint32_t)queue_ea;
-    uint32_t sz  = vm_read32(q + 0x10);
-    uint32_t dep = vm_read32(q + 0x14);
-    uint32_t buf = (uint32_t)vm_read64(q + 0x18);
+    uint32_t sz  = vm_read32(q + 0x08);
+    uint32_t dep = vm_read32(q + 0x0C);
+    uint32_t buf = (uint32_t)vm_read64(q + 0x10);
     uint32_t tsp = (uint32_t)vm_read64(q + 0x70);      /* eaSignal: taskset */
     if (!sz || !dep || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
 
@@ -3420,6 +3415,53 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
         printf("[cellSpurs] QueuePush#%d q=0x%08X slot=%u (cur=%u->%u) buf=0x%08X+0x%X "
                "size=%u depth=%u waiters=%u woke=%d sync=%d/%d tail=%d->%d taskset=0x%08X\n",
                _n, q, slot, cur, nxt, buf, slot * sz, sz, dep, waiters, woke, sync, nsync, tail, ntail, tsp);
+    return CELL_OK;
+}
+
+/* SDK ABI: cellSpursQueuePopBody(CellSpursQueue* queue, void* buffer,
+ *                                unsigned int isPeek, unsigned int isBlocking)
+ * NID 0x91066667. Counterpart to SPU cellSpursQueueTryPushBegin / PushEnd. */
+s32 cellSpursQueuePopBody(u64 queue_ea, u64 data_ea, u32 isPeek, u32 isBlocking)
+{
+    if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (queue_ea & 0x7Fu)      return CELL_SPURS_TASK_ERROR_ALIGN;
+
+    const uint32_t q   = (uint32_t)queue_ea;
+    const uint32_t sz  = vm_read32(q + 0x08);
+    const int32_t  mod = (int32_t)vm_read32(q + 0x0C);
+    const uint32_t buf = (uint32_t)vm_read64(q + 0x10);
+    if (!sz || mod <= 0 || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
+
+    int32_t pop = 0;
+    for (;;) {
+        const int32_t w0   = (int32_t)vm_read32(q + 0x00);
+        const int32_t w1   = (int32_t)vm_read32(q + 0x04);
+        const int32_t npop = (w0 < 0) ? ~w0 : w0;
+        const int32_t npsh = (w1 < 0) ? ~w1 : w1;
+        const int32_t occ  = (npop > npsh) ? (npsh - npop + 2 * mod) : (npsh - npop);
+        if (w0 >= 0 && occ > 0) {
+            pop = npop;
+            break;
+        }
+        if (!isBlocking) return CELL_SPURS_TASK_ERROR_BUSY;
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(200);
+#endif
+    }
+
+    const uint32_t slot = (uint32_t)(pop % mod);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    memcpy(vm_base + (uint32_t)data_ea, vm_base + buf + (size_t)slot * sz, sz);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    const int32_t nxt = isPeek ? pop : ((pop + 1) % (2 * mod));
+    if (!isPeek) vm_write32(q + 0x00, (uint32_t)nxt);
+
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 16))
+        printf("[cellSpurs] QueuePop#%d q=0x%08X slot=%u (%d->%d) size=%u depth=%d peek=%u blk=%u\n",
+               _n, q, slot, pop, nxt, sz, mod, isPeek, isBlocking);
     return CELL_OK;
 }
 
