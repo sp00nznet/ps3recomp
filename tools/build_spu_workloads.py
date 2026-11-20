@@ -131,6 +131,10 @@ def main():
                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks from one "
                          "call target to the next becomes one C function, so branches "
                          "inside it are gotos instead of trampoline round trips")
+    ap.add_argument("--return-entries", action="append", default=[], metavar="IMAGE",
+                    help="Pass --return-entries --merge-chunks to spu_lifter.py for IMAGE "
+                         "(discovered content name or 'ALL') -- needed for FMOD mixers "
+                         "whose overlay plugins return into the middle of mixer functions")
     ap.add_argument("--handled", metavar="JSON",
                     help="With --input: {sha256: reason} for discovered programs another path "
                          "already provides (an existing registration, an interpreter route). They "
