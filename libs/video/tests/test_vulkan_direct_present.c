@@ -138,8 +138,17 @@ int main(int argc, char** argv)
         CHECK(st.staged == frames && !st.stage_failed && !st.show_failed, "every frame staged, every show done");
         CHECK(st.presented + st.dropped == frames && st.presented >= 1, "every frame shown or dropped");
         CHECK(s_vk.presented == st.presented, "every show counted");
-        CHECK(s_vk.present_direct == 0 && s_vk.present_readback_count == 0, "no present on the presenting thread");
-        CHECK(rsx_vulkan_backend_presented_center() == 0, "the present thread keeps no centre pixel");
+        CHECK(s_vk.present_direct == 0, "no direct present on the presenting thread");
+        if (s_vk.dump_path) {
+            /* PS3RECOMP_VK_DUMP: every dump_every-th staged frame is read back
+             * from its staging image and written; the centre pixel follows. */
+            CHECK(s_vk.present_readback_count == frames / s_vk.dump_every, "every dump_every-th frame dumped");
+            if (frames % s_vk.dump_every == 0)
+                CHECK(rsx_vulkan_backend_presented_center() == (0xFF000000u | centre), "the last dump is the final frame");
+        } else {
+            CHECK(s_vk.present_readback_count == 0, "no read-back on the presenting thread");
+            CHECK(rsx_vulkan_backend_presented_center() == 0, "the present thread keeps no centre pixel");
+        }
         /* What the show thread blitted into the offscreen target last. */
         int shown_ok = 0;
         if (!vk_begin()) {

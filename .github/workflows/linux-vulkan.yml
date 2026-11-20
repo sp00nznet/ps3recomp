@@ -102,6 +102,20 @@ jobs:
             done
             cmp "frame-$batch-0.bin" "frame-$batch-1.bin" || { echo "::error::batch=$batch: direct and read-back frames differ"; fail=1; }
             cmp "frame-$batch-0.bin" "frame-$batch-thread.bin" || { echo "::error::batch=$batch: threaded and read-back frames differ"; fail=1; }
+            # A periodic frame dump keeps the present thread: every 4th frame
+            # is dumped from its staging image, and the last dump (the final
+            # frame) must equal the read-back present's.
+            for mode in readback thread; do
+              rc=0; thread=0; [ "$mode" = thread ] && thread=1
+              VK_DRAW_BATCH=$batch PS3RECOMP_RSX_PRESENT_THREAD=$thread \
+                PS3RECOMP_VK_DUMP="dump-$batch-$mode.ppm" PS3RECOMP_VK_DUMP_EVERY=4 \
+                ./build/test_vulkan_direct_present "dump$batch" "dframe-$batch-$mode.bin" > run.log 2>&1 || rc=$?
+              echo "::group::batch=$batch dump mode=$mode -> exit $rc"; cat run.log; echo "::endgroup::"
+              [ "$rc" -eq 0 ] || { echo "::error::batch=$batch dump mode=$mode: exit $rc"; fail=1; }
+              if grep -qE "VUID|SYNC-HAZARD" run.log; then echo "::error::batch=$batch dump mode=$mode: validation messages"; fail=1; fi
+              if grep -q "unsupported" run.log; then echo "::error::batch=$batch dump mode=$mode: present thread refused"; fail=1; fi
+            done
+            cmp "dump-$batch-readback.ppm" "dump-$batch-thread.ppm" || { echo "::error::batch=$batch: threaded and read-back dumps differ"; fail=1; }
           done
           exit $fail
 

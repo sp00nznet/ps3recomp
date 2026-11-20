@@ -2878,9 +2878,11 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
  * Opt-in present thread (PS3RECOMP_RSX_PRESENT_THREAD=1)
  *
  * rsx_present_thread.h owns the ring, the show thread and the counters; these
- * are the Vulkan halves, on the register-file engine path. A present that
- * has to read the frame back (PS3RECOMP_VK_DUMP) and the vtable path keep the
- * ordinary present, with a one-time message.
+ * are the Vulkan halves, on the register-file engine path. The vtable path
+ * keeps the ordinary present, with a one-time message. A periodic frame dump
+ * (PS3RECOMP_VK_DUMP, every PS3RECOMP_VK_DUMP_EVERY-th frame) is copied from
+ * the staging image of each dumped frame and written by the presenting
+ * thread; the show thread and the window are untouched.
  *
  * Stage (the presenting thread, under present_mu like vk_eng_present): after
  * a full dependency on everything submitted before, blit the flipped surface
@@ -2910,6 +2912,7 @@ static struct {
     VkFence stage_fences[VK_PT_STAGE_CMDS];
     int stage_busy[VK_PT_STAGE_CMDS];               /* atomic: submitted, not yet waited */
     u32 stage_next;
+    unsigned long long staged;                      /* presenting thread: frames staged */
     vk_image img[RSX_PRESENT_THREAD_MAX_DEPTH];     /* the staging images */
     u32 img_w[RSX_PRESENT_THREAD_MAX_DEPTH], img_h[RSX_PRESENT_THREAD_MAX_DEPTH];
     int img_fresh[RSX_PRESENT_THREAD_MAX_DEPTH];    /* still UNDEFINED */
@@ -2986,6 +2989,28 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
     pvkCmdBlitImage(cb, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vpt.img[slot].img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                     (o->w == s_vk.width && o->h == s_vk.height) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    /* PS3RECOMP_VK_DUMP: every dump_every-th staged frame is also copied from
+     * its staging image into `readback` (which only a read-back present uses,
+     * and there is none in this mode) and written out once the stage has run,
+     * on this thread, as the read-back present does. */
+    const int dump = s_vk.dump_path && s_vk.readback.buf && (++s_vpt.staged % s_vk.dump_every) == 0;
+    if (dump) {
+        vk_barrier_image_on(cb, s_vpt.img[slot].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkBufferImageCopy region = {
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageExtent = { s_vk.width, s_vk.height, 1 },
+        };
+        pvkCmdCopyImageToBuffer(cb, s_vpt.img[slot].img, VK_IMAGE_LAYOUT_GENERAL,
+                                s_vk.readback.buf, 1, &region);
+        VkBufferMemoryBarrier host = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = s_vk.readback.buf, .offset = 0, .size = VK_WHOLE_SIZE,
+        };
+        pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                              0, 0, NULL, 1, &host, 0, NULL);
+    }
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &cb };
     pvkResetFences(s_vk.device, 1, &s_vpt.stage_fences[c]);
@@ -2998,6 +3023,18 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
     s_vpt.img_fresh[slot] = 0;
     s_vk.present_order = 1;                 /* later writes wait for this copy */
     pthread_mutex_unlock(&s_vk.present_mu);
+    if (dump) {
+        /* Outside present_mu, so a held stage can leave its hold. Only this
+         * thread stages, so `readback` is not reused meanwhile. A dumped
+         * frame waits for its copy, as a read-back present does. */
+        pvkWaitForFences(s_vk.device, 1, &s_vpt.stage_fences[c], VK_TRUE, UINT64_MAX);
+        vk_invalidate(&s_vk.readback);
+        const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
+        const size_t centre = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
+        s_vk.last_center = ((u32)px[centre] << 16) | ((u32)px[centre + 1] << 8) | (u32)px[centre + 2];
+        s_vk.present_readback_count++;
+        vk_dump_ppm(px);
+    }
     return 1;
 }
 
@@ -3112,10 +3149,6 @@ static void vk_pt_stop(void)
 static void vk_pt_start(void)
 {
     if (s_vpt.pt || !s_vk.device) return;
-    if (s_vk.dump_path) {
-        rsx_present_thread_unsupported("vulkan", "PS3RECOMP_VK_DUMP reads presents back");
-        return;
-    }
     memset(&s_vpt, 0, sizeof s_vpt);
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
