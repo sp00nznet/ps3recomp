@@ -899,7 +899,17 @@ extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) 
 #define PPU_RESV_MAX 128
 #define PPU_RESV_INVALID 0x100000000ull   /* out of (uint32_t) ea range */
 static ppu_context* g_resv_ctxs[PPU_RESV_MAX];
+/* One entry per distinct context. A ppu_thread_info slot (and its ctx) is
+ * reused by every thread that later starts in it, so registration must be
+ * idempotent: counting every start filled the 128 entries after ~127 thread
+ * starts, and a context first registered after that was never scanned -- a
+ * store by another thread no longer broke its reservation. Registrations
+ * serialize on g_resv_reg_lock; the count is published with a release store
+ * after the entry is written, and readers load it with acquire, so every entry
+ * below the count they see is initialized. Bound: PPU_THREAD_MAX (64) table
+ * slots + the main thread = 65 distinct contexts, well under PPU_RESV_MAX. */
 static volatile LONG g_resv_ctx_n = 0;
+static volatile LONG g_resv_reg_lock = 0;
 /* Sharded by address: a single global lock convoyed all stwcx (workers spinning
  * on a descheduled holder -> loader too slow to finish jobs). Shard by the
  * 16-byte-block of ea so unrelated structures never serialize; same-structure
@@ -916,8 +926,21 @@ extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
 extern "C" void ppu_resv_register(ppu_context* c)
 {
     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
-    long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
-    if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
+    while (_InterlockedExchange(&g_resv_reg_lock, 1)) { while (g_resv_reg_lock) YieldProcessor(); }
+    const long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_RELAXED);   /* only writers change it */
+    for (long i = 0; i < n; i++)
+        if (g_resv_ctxs[i] == c) { _InterlockedExchange(&g_resv_reg_lock, 0); return; }
+    if (n == PPU_RESV_MAX) {
+        /* A context left out would silently lose cross-thread reservation
+         * breaks (lost updates in the guest's lock-free code): stop instead. */
+        fprintf(stderr, "[ppu] FATAL: reservation registry exhausted: capacity=%d distinct contexts\n",
+                PPU_RESV_MAX);
+        fflush(stderr);
+        abort();
+    }
+    g_resv_ctxs[n] = c;
+    __atomic_store_n(&g_resv_ctx_n, (LONG)(n + 1), __ATOMIC_RELEASE);
+    _InterlockedExchange(&g_resv_reg_lock, 0);
 }
 /* Where every guest thread is, as a GUEST address.
  *
@@ -944,7 +967,7 @@ extern "C" void ppu_resv_register(ppu_context* c)
  * last DIRECT call site and nothing more. */
 extern "C" void ppu_report_guest_lrs(void)
 {
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (!c) continue;
@@ -969,7 +992,7 @@ extern "C" void ppu_report_guest_lrs(void)
 extern "C" void ppu_resv_break_store(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea & ~3u;
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & ~3u) == a)
@@ -987,7 +1010,7 @@ extern "C" void ppu_resv_break_line(uint32_t ea)
 {
     const uint32_t line = ea & ~127u;
     ppu_context* self = g_active_ctx;
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (c && c != self && c->reserve_addr < PPU_RESV_INVALID &&
@@ -1001,7 +1024,7 @@ static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
 static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 {
     uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (c && c->reserve_addr == a) c->reserve_addr = PPU_RESV_INVALID;
@@ -1013,13 +1036,13 @@ static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 static inline int resv_diag() { static int v = -1; if (v < 0) v = getenv("RESV_DIAG") ? 1 : 0; return v; }
 static void resv_check_reg(ppu_context* self)
 {
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) if (g_resv_ctxs[i] == self) return;
     static ppu_context* seen[64]; static long sn = 0;
     for (long i = 0; i < sn; i++) if (seen[i] == self) return;
     if (sn < 64) seen[sn++] = self;
     fprintf(stderr, "[RESV-UNREG] stwcx/stdcx by UNREGISTERED ctx=%p tid=%llu (n_reg=%ld)\n",
-            (void*)self, (unsigned long long)self->thread_id, g_resv_ctx_n);
+            (void*)self, (unsigned long long)self->thread_id, n);
     fflush(stderr);
 }
 
