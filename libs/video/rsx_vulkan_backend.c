@@ -59,7 +59,11 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+<<<<<<< HEAD
 #include "metal_frame_rate.h"   /* portable bounded present-rate statistics */
+=======
+#include "rsx_present_thread.h"
+>>>>>>> pr/741
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -4463,6 +4467,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
+    /* PS3RECOMP_RSX_PRESENT_THREAD has no Vulkan half yet: say so once and
+     * present as always. */
+    if (rsx_present_thread_requested()) rsx_present_thread_unsupported("vulkan", NULL);
     memset(&s_vk, 0, sizeof s_vk);
     if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();
