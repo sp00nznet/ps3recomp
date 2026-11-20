@@ -184,20 +184,20 @@ static long dp_under_rz(long n)
             if (it & 1) { a._u32[k & ~1] &= 0x800FFFFFu; }   /* denormal doubles */
             if (it & 2) { b._u32[k & ~1] = (b._u32[k & ~1] & 0x800FFFFFu) | 0x3FF00000u; }
         }
-        u128 want[12], got[12];
+        /* The double compares are not here: a CBE SPU raises an invalid-instruction error for
+         * them (console probe, CECHC04 on FW 4.81), so no helper exists to keep FPCR-clean. */
+        u128 want[8], got[8];
         want[0] = spu_dfa(a, b); want[1] = spu_dfs(a, b); want[2] = spu_dfm(a, b);
         want[3] = spu_dfma(a, b, c); want[4] = spu_dfms(a, b, c); want[5] = spu_dfnms(a, b, c);
-        want[6] = spu_dfnma(a, b, c); want[7] = spu_frds(a); want[8] = spu_dfceq(a, b);
-        want[9] = spu_dfcmeq(a, b); want[10] = spu_dfcgt(a, b); want[11] = spu_dfcmgt(a, b);
+        want[6] = spu_dfnma(a, b, c); want[7] = spu_frds(a);
         fpcr_set(SPU_FPCR_RZFZ);
         got[0] = spu_dfa(a, b); got[1] = spu_dfs(a, b); got[2] = spu_dfm(a, b);
         got[3] = spu_dfma(a, b, c); got[4] = spu_dfms(a, b, c); got[5] = spu_dfnms(a, b, c);
-        got[6] = spu_dfnma(a, b, c); got[7] = spu_frds(a); got[8] = spu_dfceq(a, b);
-        got[9] = spu_dfcmeq(a, b); got[10] = spu_dfcgt(a, b); got[11] = spu_dfcmgt(a, b);
+        got[6] = spu_dfnma(a, b, c); got[7] = spu_frds(a);
         const uint64_t after = fpcr_get();
         fpcr_set(0);
         if (after != SPU_FPCR_RZFZ) bad++;
-        for (int k = 0; k < 12; k++) bad += memcmp(&want[k], &got[k], 16) != 0;
+        for (int k = 0; k < 8; k++) bad += memcmp(&want[k], &got[k], 16) != 0;
     }
     return bad;
 }
