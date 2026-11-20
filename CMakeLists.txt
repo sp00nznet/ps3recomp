@@ -605,6 +605,7 @@ if(PS3RECOMP_BUILD_TESTS)
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
 <<<<<<< HEAD
+<<<<<<< HEAD
         add_test(NAME ppu_hle_toc
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_hle_toc.py")
@@ -613,6 +614,14 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_function_splice.py")
 >>>>>>> pr/730
+=======
+        add_test(NAME check_public_tree
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_public_tree.py")
+        add_test(NAME fetch_sdk_pins
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_fetch_sdk_pins.py")
+>>>>>>> pr/726
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
