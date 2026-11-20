@@ -948,9 +948,33 @@ static void test_file_attributes(void)
     CHECK(GetFileAttributesA(NULL) == INVALID_FILE_ATTRIBUTES);
 }
 
+/* A large static TLS block (a per-thread cache, say) must not
+ * stop a small-stack CreateThread from starting, and the caller's stack size
+ * stays usable: glibc carves TLS out of the requested stack. */
+static _Thread_local unsigned char g_big_tls[3u << 20];
+static DWORD WINAPI big_tls_thread(LPVOID arg)
+{
+    volatile unsigned char frame[768u << 10];   /* most of the 1 MB asked for */
+    frame[0] = 1; frame[sizeof frame - 1] = 2;
+    g_big_tls[0] = 3; g_big_tls[sizeof g_big_tls - 1] = 4;
+    *(int*)arg = frame[0] + frame[sizeof frame - 1] + g_big_tls[0] + g_big_tls[sizeof g_big_tls - 1];
+    return 0;
+}
+static void test_large_static_tls_thread(void)
+{
+    CHECK(ps3_host_thread_stack_size(0) == 0);
+    CHECK(ps3_host_thread_stack_size(1u << 20) >= (1u << 20));
+    int sum = 0;
+    HANDLE h = CreateThread(NULL, 1u << 20, big_tls_thread, &sum, 0, NULL);
+    CHECK(h != NULL);
+    if (h) { CHECK(WaitForSingleObject(h, 5000) == WAIT_OBJECT_0); CloseHandle(h); }
+    CHECK(sum == 10);
+}
+
 int main(void)
 {
     test_interlocked();
+    test_large_static_tls_thread();
     test_file_attributes();
     test_threads_and_cs();
     test_thread_lifecycle();

@@ -36,6 +36,7 @@
 
 #include "win32_compat.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
@@ -527,6 +528,41 @@ static int thread_arm(ps3_obj* t)
     return 1;
 }
 
+/* glibc carves each thread's static TLS (and guard) out of the stack size it is
+ * given, and refuses with EINVAL when that size cannot hold them. Once a
+ * program (the runtime, a port or its lifted code) carries more static TLS
+ * than a CreateThread stack -- a per-thread cache of a few MB is enough -- a
+ * 1 MB CreateThread cannot even start on Linux, and what does start has less
+ * stack than it asked for. Add what glibc itself reports beyond its minimum,
+ * keeping the caller's size usable. Darwin and other libcs allocate TLS
+ * separately and need nothing. */
+static size_t host_stack_overhead(void)
+{
+#if defined(__linux__) && defined(__GLIBC__)
+    static size_t overhead = (size_t)-1;
+    size_t known = __atomic_load_n(&overhead, __ATOMIC_ACQUIRE);
+    if (known != (size_t)-1) return known;
+    size_t (*minstack)(const pthread_attr_t*) =
+        (size_t (*)(const pthread_attr_t*))dlsym(RTLD_DEFAULT, "__pthread_get_minstack");
+    size_t extra = 0;
+    pthread_attr_t probe;
+    if (minstack && pthread_attr_init(&probe) == 0) {
+        size_t need = minstack(&probe);
+        pthread_attr_destroy(&probe);
+        if (need > (size_t)PTHREAD_STACK_MIN) extra = need - (size_t)PTHREAD_STACK_MIN;
+    }
+    __atomic_store_n(&overhead, extra, __ATOMIC_RELEASE);
+    return extra;
+#else
+    return 0;
+#endif
+}
+
+size_t ps3_host_thread_stack_size(size_t usable)
+{
+    return usable ? usable + host_stack_overhead() : 0;
+}
+
 static HANDLE create_thread(SIZE_T stack, PS3_THREAD_FN fn, unsigned (*fn_crt)(void*),
                             LPVOID arg, DWORD flags, DWORD* out_tid)
 {
@@ -552,7 +588,7 @@ static HANDLE create_thread(SIZE_T stack, PS3_THREAD_FN fn, unsigned (*fn_crt)(v
          * under the minimum. */
         size_t page = (size_t)sysconf(_SC_PAGESIZE);
         if (page == 0) page = 4096;
-        size_t sz = (stack + page - 1) & ~(page - 1);
+        size_t sz = (ps3_host_thread_stack_size(stack) + page - 1) & ~(page - 1);
         if (sz < (size_t)PTHREAD_STACK_MIN) sz = ((size_t)PTHREAD_STACK_MIN + page - 1) & ~(page - 1);
         pthread_attr_setstacksize(&attr, sz);
     }

@@ -790,6 +790,9 @@ BOOL   CancelWaitableTimer(HANDLE h);
 
 HANDLE CreateThread(void* sa, SIZE_T stack, PS3_THREAD_FN fn, LPVOID arg,
                     DWORD flags, DWORD* out_tid);
+/* Host stack size to request for `usable` bytes of stack: glibc takes static
+ * TLS and the guard out of the requested size, other libcs do not. 0 stays 0. */
+size_t ps3_host_thread_stack_size(size_t usable);
 uintptr_t _beginthreadex(void* sa, unsigned stack, unsigned (*fn)(void*),
                          void* arg, unsigned flags, unsigned* out_tid);
 void   ExitThread(DWORD code);
