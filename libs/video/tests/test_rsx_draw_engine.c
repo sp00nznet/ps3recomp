@@ -3011,7 +3011,6 @@ static void test_target_churn(void)
           "both size transitions are reported\n%s", log);
 }
 
-int main(void)
 /* ---- PS3RECOMP_RSX_SINGLE_PRESENT: one present per flip ----------------- */
 
 /* Runs in its own process (main's "single" mode): the switch is read once. */

@@ -1524,6 +1524,32 @@ SPU__DP_RN1(spu_frds)
 /* dfceq, dfcmeq, dfcgt, dfcmgt and dftsv have no helpers: a CBE SPU raises an
  * invalid-instruction error for each (console probe, CECHC04 on FW 4.81), so the
  * interpreter decodes the words as invalid and the lifter emits that stop. */
+/* Compatibility only: SPU sources lifted before #793 still call these, and a
+ * port should not stop building because its lift is older than the toolkit.
+ * The lifter no longer emits them; relift to get the console behaviour. */
+static inline u128 spu_dfceq_h_(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)==spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+static inline u128 spu_dfcmeq_h_(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x==y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+ * MPYHHAU/DFCGT/DFCMGT/XORBI/DFTSV). Completes the lifter's opcode coverage. ---- */
+static inline u128 spu_dfcgt_h_(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+static inline u128 spu_dfcmgt_h_(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
+SPU__DP_RN2(spu_dfceq) SPU__DP_RN2(spu_dfcmeq) SPU__DP_RN2(spu_dfcgt) SPU__DP_RN2(spu_dfcmgt)
+/* dftsv rt,ra,I7: double test special value (Cell BE SPU ISA). Each
+ * doubleword becomes all ones if it is in any class I7 selects:
+ * 0x40 NaN, 0x20 +inf, 0x10 -inf, 0x08 +0, 0x04 -0, 0x02 +denorm, 0x01 -denorm.
+ * (RPCS3 stubs it as fatal; this is the ISA definition.) */
+static inline uint64_t spu__dftsv1(uint64_t v, uint32_t i7) {
+    uint64_t e = (v >> 52) & 0x7FF, f = v & 0xFFFFFFFFFFFFFull; int neg = (int)(v >> 63);
+    int t = 0;
+    if (e == 0x7FF && f) t |= i7 & 0x40;
+    if (e == 0x7FF && !f) t |= i7 & (neg ? 0x10 : 0x20);
+    if (e == 0 && !f) t |= i7 & (neg ? 0x04 : 0x08);
+    if (e == 0 && f) t |= i7 & (neg ? 0x01 : 0x02);
+    return t ? ~0ull : 0ull;
+}
+static inline u128 spu_dftsv(u128 a, int32_t imm){ u128 r;
+    for (int i = 0; i < 2; i++) { uint64_t v = (uint64_t)a._u32[2*i] << 32 | a._u32[2*i+1];
+        uint64_t m = spu__dftsv1(v, (uint32_t)imm & 0x7F); r._u32[2*i] = (uint32_t)(m >> 32); r._u32[2*i+1] = (uint32_t)m; }
+    return r; }
 
 /* ---- Phase 2: register-variable shifts/rotates ---- */
 static inline u128 spu_shl_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); } return r; }
