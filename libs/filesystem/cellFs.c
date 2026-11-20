@@ -15,6 +15,7 @@
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "ps3emu/fs_write_check.h"
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -562,16 +563,20 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
         return CELL_EFAULT;
 
     u64 bytes_written = 0;
+    int write_failed = 0;
 
     if (s_files[fd].host_fp) {
+        clearerr(s_files[fd].host_fp);   /* ferror() is sticky */
         bytes_written = (u64)fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
-        fflush(s_files[fd].host_fp);
+        write_failed = ps3_fs_write_failed((size_t)bytes_written, nbytes,
+                                           fflush(s_files[fd].host_fp) != 0 ||
+                                           ferror(s_files[fd].host_fp));
     }
 
     if (nwrite)
         *(u64*)gptr(nwrite) = ps3_bswap64(bytes_written);
 
-    return CELL_OK;
+    return write_failed ? (s32)CELL_EIO : CELL_OK;
 }
 
 /* NID: 0xA397D042 */
