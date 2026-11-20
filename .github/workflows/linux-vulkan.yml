@@ -78,6 +78,15 @@ jobs:
           done
           exit $fail
 
+      - name: Present-rate report (PS3RECOMP_VK_FPS)
+        run: |
+          ./build/ps3recomp_host --draw --frames=30 > off.log 2>&1
+          if grep -q '\[RSX FPS\]' off.log; then echo "::error::report printed while off"; exit 1; fi
+          PS3RECOMP_VK_FPS=1 ./build/ps3recomp_host --draw --frames=30 > on.log 2>&1
+          grep '\[RSX FPS\]' on.log || { cat on.log; echo "::error::no present-rate report"; exit 1; }
+          grep '\[RSX FPS\]' on.log | tail -1 | grep -Eo 'guest=[0-9.]+' | cut -d= -f2 | awk '{ exit !($1 > 0) }' \
+            || { echo "::error::no guest presents counted"; exit 1; }
+
       - name: Draw engine with guest programs, under the validation layer
         env:
           PS3RECOMP_VK_GUEST_PROGRAMS: "1"
