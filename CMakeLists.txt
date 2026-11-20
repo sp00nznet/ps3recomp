@@ -626,8 +626,11 @@ if(PS3RECOMP_BUILD_TESTS)
 
     # cellAudio's mixer pacing decision (libs/audio/audio_pace.h) against a
     # simulated clock and device queue: pure, so no runtime and no host audio.
-    add_executable(test_audio_pace libs/audio/tests/test_audio_pace.c)
-    add_test(NAME audio_pace COMMAND test_audio_pace)
+    # The pacing is POSIX-only (WASAPI is untouched) and so is the test's clock.
+    if(NOT WIN32)
+        add_executable(test_audio_pace libs/audio/tests/test_audio_pace.c)
+        add_test(NAME audio_pace COMMAND test_audio_pace)
+    endif()
     # The clock GET_REPORT stamps reports with, and its drain-time scale.
     add_executable(test_gcm_report_clock libs/video/tests/test_gcm_report_clock.c)
     target_include_directories(test_gcm_report_clock PRIVATE include libs/video)
