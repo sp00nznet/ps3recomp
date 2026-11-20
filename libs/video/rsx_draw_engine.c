@@ -3213,9 +3213,16 @@ static void pd_present(u32 presented)
 
 /* The guest scissor intersected with a w x h target, as out[x, y, w, h] in
  * the target's sample grid. The nv40 reset is a full 4096x4096 window and a
- * never-written register reads 0 here, which the w == 0 test treats as no
- * scissor, so only a real game scissor narrows anything
- * (rsx_live_draw.c:6180-6197). */
+ * never-written register reads 0 here, which is no scissor: only a real game
+ * scissor narrows anything (the scissor intersection in rsx_live_draw.c's
+ * sink_end_impl). A register the game WROTE with a zero width or height is a
+ * different thing, an empty scissor, and comes back as a zero-sized rectangle:
+ * the draw is dropped (sink_end) and a clear does nothing. A game's empty
+ * gauge fill (a long quad cut down to the gauge's value) is exactly that, and
+ * drawn unclipped it ran to the edge of the screen. The D3D12 path takes the
+ * scissor as written when either register was; here only a register written
+ * with a zero dimension makes it empty, so a title that writes one register
+ * and never the other keeps drawing as before. */
 static void eng_scissor_rect(const rsx_dsp_surface* sf, u32 w, u32 h, u32 out[4])
 {
     u32 sx = 0, sy = 0, sw = w, sh = h;
@@ -3224,7 +3231,12 @@ static void eng_scissor_rect(const rsx_dsp_surface* sf, u32 w, u32 h, u32 out[4]
     /* The scissor is in pixels: scale it to the sample grid. */
     const u32 gx = (hr & 0xFFFFu) * sf->aa_sx, gw = (hr >> 16) * sf->aa_sx;
     const u32 gy = (vr & 0xFFFFu) * sf->aa_sy, gh = (vr >> 16) * sf->aa_sy;
-    if (gw > 0 && gh > 0) {
+    const int written_empty =
+        (gw == 0 && g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2]) ||
+        (gh == 0 && g.rsx.seen[M_SCISSOR_VERTICAL >> 2]);
+    if (written_empty) {
+        sw = sh = 0;
+    } else if (gw > 0 && gh > 0) {
         u32 right = sx + sw, bottom = sy + sh;
         if (gx > sx) sx = gx;
         if (gy > sy) sy = gy;
@@ -3302,6 +3314,25 @@ static void sink_end(void* user, const rsx_dispatch* r)
         if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
     }
 
+    u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+    const u32 n_targets = eng_current_target_set(targets);
+    if (!n_targets) return;
+    const u32 target = targets[0];
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+
+    /* An empty scissor (eng_scissor_rect: a written zero width or height, or
+     * one wholly outside the target) draws nothing. The backend reads a zero
+     * rectangle as "no scissor", so the draw is dropped here, before the
+     * vertices are fetched or any texture is bound (a draw that samples its own
+     * target would copy the whole target first). Not counted in guest_draws:
+     * it drew nothing. */
+    {
+        u32 sc[4];
+        eng_scissor_rect(&sf, g.surfaces[target].w, g.surfaces[target].h, sc);
+        if (!sc[2] || !sc[3]) return;
+    }
+
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
     dc_fetch(&layout, rebuild);
@@ -3321,14 +3352,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
-    u32 targets[RSX_BE_MAX_COLOR_TARGETS];
-    const u32 n_targets = eng_current_target_set(targets);
-    if (!n_targets) return;
-    const u32 target = targets[0];
-
-    rsx_dsp_surface sf;
     rsx_dsp_viewport vp;
-    rsx_dsp_get_surface(&g.rsx, &sf);
     rsx_dsp_get_viewport(&g.rsx, &vp);
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);
