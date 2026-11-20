@@ -4807,9 +4807,6 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
-    /* PS3RECOMP_RSX_PRESENT_THREAD has no Vulkan half yet: say so once and
-     * present as always. */
-    if (rsx_present_thread_requested()) rsx_present_thread_unsupported("vulkan", NULL);
     memset(&s_vk, 0, sizeof s_vk);
     if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();

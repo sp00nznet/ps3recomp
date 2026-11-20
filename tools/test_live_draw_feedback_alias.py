@@ -11,10 +11,12 @@ def main():
     if os.name != 'nt':
         print('SKIP: Windows D3D12 fixture'); return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--runtime-library', type=Path, required=True)
+    parser.add_argument('--runtime-library', type=Path)
     parser.add_argument('--scenario', choices=('all', 'large-first', 'small-first', 'no-alias', 'half', 'other-size', 'other-pitch', 'other-format', 'other-remap', 'newer-covering'), default='all')
     parser.add_argument('--renderer-source', type=Path, help='Optional unchanged renderer source for red/green comparison')
     args = parser.parse_args()
+    if args.runtime_library is None:   # the CI glob runs every tools/test_*.py bare
+        print('SKIP: needs --runtime-library (a built /MT ps3recomp_runtime.lib)'); return 0
     root = Path(__file__).resolve().parents[1]
     compiler = shutil.which(os.environ.get('CC', 'clang-cl'))
     if not compiler or not args.runtime_library.is_file(): parser.error('Native compiler and /MT runtime library required')
