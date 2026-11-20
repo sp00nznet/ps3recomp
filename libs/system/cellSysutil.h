@@ -130,6 +130,10 @@ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
  * games use slot 0. */
 void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 
+/* Installs a pump that cellSysutilCheckCallback runs before delivering queued
+ * events (the native OSK host's lifecycle). NULL removes it. */
+void cellSysutil_set_osk_pump(void (*pump)(void));
+
 /* Quit the game from the host (the window closed, Cmd+Q, a host menu):
  * sends REQUEST_EXITGAME to every registered callback, then ends the process
  * with status 0 if the title has not within PS3_QUIT_GRACE_MS (default
