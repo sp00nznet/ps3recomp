@@ -63,6 +63,11 @@ jobs:
       # The HLSL -> SPIR-V translation cache: a repeat is served from memory,
       # PS3RECOMP_SPIRV_CACHE's files serve the next run, a damaged file is a
       # miss. Needs glslang, which configure has already checked for.
+      - name: Backend bring-up smoke test
+        run: |
+          cmake --build build --target test_vulkan_backend_smoke
+          ./build/test_vulkan_backend_smoke
+
       - name: SPIR-V translation cache test
         run: |
           cmake --build build --target test_shader_spirv
