@@ -21,6 +21,7 @@
 #include "ps3emu/log_first.h"
 #include "rsx_d3d12_backend.h"
 #include "rsx_present_policy.h"
+#include "rsx_gpu_wait.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
@@ -1405,6 +1406,32 @@ static int init_d3d12(u32 width, u32 height)
  * Frame sync helpers
  * -----------------------------------------------------------------------*/
 
+typedef struct { const char* what; u64 want; } D3DFenceWaitCtx;
+static int d3d_fw_wait_2s(void* c) {
+    (void)c;
+    return WaitForSingleObject(s_d3d.fence_event, 2000) != WAIT_TIMEOUT;
+}
+static int d3d_fw_removed(void* c) {
+    (void)c;
+    return s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device) != 0 /* != S_OK */;
+}
+static void d3d_fw_timeout(void* c, unsigned timeouts, int removed) {
+    D3DFenceWaitCtx* w = (D3DFenceWaitCtx*)c;
+    printf("[D3D12] %s STUCK %us: want %llu got %llu removed=0x%08lX%s\n", w->what, 2 * timeouts,
+           (unsigned long long)w->want,
+           (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
+           (long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device),
+           removed ? " (device removed, giving up)" : "");
+    fflush(stdout);
+}
+/* The fence event is already armed for `want`. Returns 1 when reached, 0 for a removed device. */
+static int fence_wait_alive(const char* what, u64 want)
+{
+    D3DFenceWaitCtx w = { what, want };
+    RsxGpuWaitOps ops = { d3d_fw_wait_2s, d3d_fw_removed, d3d_fw_timeout };
+    return rsx_gpu_wait_alive(&ops, &w);
+}
+
 static void wait_for_gpu(void)
 {
     u32 fi = s_d3d.frame_index;
@@ -1414,28 +1441,15 @@ static void wait_for_gpu(void)
     if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[fi]) {
         s_d3d.fence->lpVtbl->SetEventOnCompletion(
             s_d3d.fence, s_d3d.fence_values[fi], s_d3d.fence_event);
-        /* NEVER wait unbounded here: this runs on the vblank ticker, which also
-         * drives the guest's vblank handlers, the FIFO drain, and the fence
-         * publication. A device removal (TDR) leaves the D3D12 fence unsignaled
-         * forever and an INFINITE wait silently froze the ENTIRE emulation --
-         * observed on LBP as a boot that died the moment the 2048x2048
-         * offscreen RT was created (last log line), every guest thread parked.
-         * Degrade loudly instead: bounded waits + the removal reason, then
-         * carry on (subsequent D3D calls fail visibly but the game keeps
-         * running headless). */
-        for (int tries = 0; tries < 3; tries++) {
-            if (WaitForSingleObject(s_d3d.fence_event, 2000) != WAIT_TIMEOUT)
-                return;
-            HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
-            printf("[D3D12] wait_for_gpu STUCK %ds: want %llu got %llu removed=0x%08lX\n",
-                   2 * (tries + 1),
-                   (unsigned long long)s_d3d.fence_values[fi],
-                   (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
-                   (long)rr);
-            fflush(stdout);
-            if (rr != 0 /* S_OK: device still alive, keep waiting a bit */)
-                break;
-        }
+        /* Wait for as long as the device is alive. Callers reset the command allocator, rewrite the upload rings and
+         * release evicted objects once this returns, so giving up on a GPU that is only slow (loaded, shared, a first
+         * use cache flush) corrupts the command stream under a batch that is still running. The one wait that must be
+         * given up on is a removed device (TDR): its fence never signals, and an INFINITE wait froze the whole
+         * emulation (observed on LBP as a boot that died when the 2048x2048 offscreen RT was created, every guest
+         * thread parked, because this runs on the vblank ticker that also drives the guest's vblank handlers, the
+         * FIFO drain and the fence publication). A removed device is logged and carried on headless; every 2 s on a
+         * live device a STUCK line says what is being waited for. */
+        fence_wait_alive("wait_for_gpu", s_d3d.fence_values[fi]);
     }
 }
 
@@ -1449,13 +1463,8 @@ static void move_to_next_frame(void)
     if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[s_d3d.frame_index]) {
         s_d3d.fence->lpVtbl->SetEventOnCompletion(
             s_d3d.fence, s_d3d.fence_values[s_d3d.frame_index], s_d3d.fence_event);
-        if (WaitForSingleObject(s_d3d.fence_event, 2000) == WAIT_TIMEOUT) {
-            HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
-            printf("[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
-                   (unsigned long long)s_d3d.fence_values[s_d3d.frame_index],
-                   (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
-                   (long)rr);
-        }
+        /* This frame's allocator and rings are reset next: wait while the device is alive (see wait_for_gpu). */
+        fence_wait_alive("move_to_next_frame", s_d3d.fence_values[s_d3d.frame_index]);
     }
 
     s_d3d.fence_values[s_d3d.frame_index] = current_fence + 1;
