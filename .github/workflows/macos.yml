@@ -168,6 +168,21 @@ jobs:
             -o /tmp/test_metal_present_post
           /tmp/test_metal_present_post
 
+      # The engine's record cap: a full record array is submitted mid-frame,
+      # with the bound constants staged again, instead of dropping the rest
+      # of the frame. Again with a cap a title defines at build time.
+      - name: Run the Metal record cap test
+        run: |
+          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_record_cap.m \
+            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
+            -o /tmp/test_metal_record_cap
+          /tmp/test_metal_record_cap
+          clang -fobjc-arc -DENG_MAX_RECORDS=16384 -DRSX_TEST_EXPECT_MAX_RECORDS=16384 \
+            -I include -I libs/video libs/video/tests/test_metal_record_cap.m \
+            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
+            -o /tmp/test_metal_record_cap_16k
+          /tmp/test_metal_record_cap_16k
+
       # Host-surface mode (tools/host_window, rsx_host_surface.h) against a
       # launcher fixture in the same process: init attaches and opens no
       # window, engine and vtable presents land in the shared IOSurfaces,
