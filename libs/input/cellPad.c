@@ -874,8 +874,15 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= s_max_connect || !data_guest)
+    /* libio (FW 4.93) cellPadGetData: port_no > 126 (unsigned) or data == NULL
+     * is INVALID_PARAMETER; a port whose connection byte is not set is
+     * NO_DEVICE. libio has no comparison with max_connect, the byte is simply
+     * never set for a port the connect handler refused, and a port at or past
+     * max_connect is such a port. RPCS3 cellPad.cpp agrees. */
+    if (port_no >= CELL_MAX_PADS || !data_guest)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (port_no >= s_max_connect)
+        return CELL_PAD_ERROR_NO_DEVICE;
 
     /* Build in a local host struct, then copy to guest memory big-endian. */
     CellPadData _d; CellPadData* data = &_d;
@@ -1509,8 +1516,12 @@ s32 cellPadClearBuf(u32 port_no)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+    /* libio (FW 4.93) cellPadClearBuf: port_no > 126 -> INVALID_PARAMETER, a
+     * port that is not connected -> NO_DEVICE, as for cellPadGetData. */
+    if (port_no >= CELL_MAX_PADS)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (port_no >= s_max_connect)
+        return CELL_PAD_ERROR_NO_DEVICE;
 
     /* Nothing to clear in our implementation -- state is polled fresh */
     return CELL_OK;

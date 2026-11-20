@@ -350,10 +350,23 @@ const char* cellGame_get_hdd_title_id(void)
 }
 
 /* Whether the title was started as a game patch (CATEGORY GP over a disc
- * game). The port boots the title itself, never a patch. */
+ * game). The port boots the title itself, never a patch.
+ *
+ * libsysutil_game (FW 4.93) cellGamePatchCheck(size, reserved): a non-NULL
+ * `reserved` is PARAM (0x8002CB07), tested before anything else. `size` is not
+ * tested up front: the firmware looks at it only once the title is known to be
+ * a patch, to decide whether to write the sizes, so a NULL `size` changes
+ * nothing on a non-patch boot. RPCS3 does not test `reserved`. The non-patch
+ * answer stays the local NOTPATCH: the firmware's static non-patch literal
+ * (0x8002CB06, its INTERNAL value) was only proven on a successful lookup and
+ * the live boot value is unobserved, so that mapping awaits a console probe. */
 s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved)
 {
-    (void)size; (void)reserved;
+    (void)size;
+    if (reserved) {
+        printf("[cellGame] PatchCheck(reserved=0x%X) -> PARAM\n", reserved);
+        return CELL_GAME_ERROR_PARAM;
+    }
     printf("[cellGame] PatchCheck() -> not a patch\n");
     return CELL_GAME_ERROR_NOTPATCH;
 }
