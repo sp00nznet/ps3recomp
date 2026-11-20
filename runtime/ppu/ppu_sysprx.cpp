@@ -71,10 +71,17 @@ static void sys_initialize_tls(ppu_context* ctx)
 static void sys_time_get_system_time(ppu_context* ctx)
 {
 #ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
+    /* Time since HOST boot, like the PS3 (time since console boot) and like
+     * the POSIX path below (CLOCK_MONOTONIC). Anchoring at the first call made
+     * every launch read the same small values, so a game seeding its RNG
+     * from the clock at boot got the same seed every run. Also the epoch of
+     * the lv2 timers (sys_timer.c timer_now_us), which guests feed these
+     * values to. Split so the multiply cannot overflow. */
+    static LARGE_INTEGER s_freq;
+    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
+    const uint64_t q = (uint64_t)s_freq.QuadPart, n = (uint64_t)now.QuadPart;
+    ctx->gpr[3] = (n / q) * 1000000ull + (n % q) * 1000000ull / q;
 #else
     /* The same host clock as the timebase (sys_timer.h), so guest code that
      * mixes mftb and this stays consistent. */
