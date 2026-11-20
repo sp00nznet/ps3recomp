@@ -1055,6 +1055,49 @@ s32 sys_prx_exitspawn_with_level(void)
     return CELL_OK;
 }
 
+s32 sys_prx_get_module_list(u64 flags, void* info)
+{
+    (void)flags;
+    /* info is a GUEST effective address of sys_prx_get_module_list_t:
+     *   +0x00 u64 size
+     *   +0x08 u32 max
+     *   +0x0C u32 count
+     *   +0x10 u32 idlist (guest EA)
+     *
+     * The runtime has no PRX module table to enumerate yet, so report an
+     * empty list. This is the truthful answer here -- the title's own
+     * executable is not a loadable PRX -- and, critically, it writes count
+     * back. Leaving the out-param untouched (the old unresolved-NID fake
+     * CELL_OK behaviour) leaves the CALLER's initialization in count, so it
+     * walks a list of garbage ids; Uncharted 2 then calls
+     * sys_prx_get_module_info 39 times with stack addresses as ids. */
+    u32 ea = (u32)(uintptr_t)info;
+    if (!ea) return CELL_EFAULT;
+
+    u64 size = vm_read64(ea);
+    if (size < 0x14) return CELL_EINVAL;
+
+    vm_write32(ea + 0x0C, 0);
+    printf("[sysPrxForUser] sys_prx_get_module_list(flags=0x%llx) -> count=0\n",
+           (unsigned long long)flags);
+    return CELL_OK;
+}
+
+s32 sys_prx_get_module_info(u32 id, u64 flags, void* info)
+{
+    (void)flags;
+    /* info is a GUEST effective address of sys_prx_module_info_t; size is
+     * the first field. Nothing is loaded under any id while get_module_list
+     * reports an empty table, so every id is unknown. Match the lookup-miss
+     * code sys_prx_get_module_id_by_name already returns rather than fake
+     * success with an all-zero module descriptor. */
+    u32 ea = (u32)(uintptr_t)info;
+    if (!ea) return CELL_EFAULT;
+
+    printf("[sysPrxForUser] sys_prx_get_module_info(id=0x%X) -> unknown module\n", id);
+    return (s32)0x8001112E;   /* CELL_PRX_ERROR_UNKNOWN_MODULE */
+}
+
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 {
     (void)flags;

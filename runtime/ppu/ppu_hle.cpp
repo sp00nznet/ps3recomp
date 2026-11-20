@@ -281,8 +281,24 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
-    if (const hle_fast_fn f = hle_fast(nid))
-        if (f(ctx)) return;
+    if (const hle_fast_fn f = hle_fast(nid)) {
+        /* Fast handlers return before the _TocGuard below, but the guest caller
+         * still expects the ELFv1 TOC spill at [r1+0x28] that the import stub
+         * would have performed. Without it, `ld r2,40(r1)` after the call loads
+         * whatever happened to be in that slot -- often 0 -- and every later
+         * TOC-relative global read is garbage. Uncharted 2 hits this on
+         * sys_lwmutex_lock during CRT init: the chain then runs with r2=0 and
+         * the module-list table read at 0xADFD5C comes back empty. Spill and
+         * restore exactly like the full dispatcher. */
+        const uint64_t _toc = ctx->gpr[2];
+        const uint64_t _sp  = ctx->gpr[1];
+        if (f(ctx)) {
+            ctx->gpr[2] = _toc;
+            vm_write64(_sp + 0x28, _toc);
+            return;
+        }
+        ctx->gpr[2] = _toc;
+    }
 
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
