@@ -35,6 +35,7 @@
 #endif
 
 #include "win32_compat.h"
+#include "../memory/vm_watch_hooks.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -1507,6 +1508,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect)
     }
     if (type & MEM_COMMIT) {
         if (!address) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+        vm_watch_forget_host((const void*)a0, sz, (prot & PROT_WRITE) != 0);
         if (mprotect((void*)a0, sz, prot) != 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
         return (LPVOID)a0;
     }
@@ -1522,6 +1524,7 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD type)
         pthread_mutex_lock(&s_lock);
         for (int i = 0; i < VA_REGIONS; i++) {
             if (s_regions[i].base == address && s_regions[i].base) {
+                vm_watch_forget_host(s_regions[i].base, s_regions[i].size, 0);
                 munmap(s_regions[i].base, s_regions[i].size);
                 s_regions[i].base = NULL; s_regions[i].size = 0; s_regions[i].protect = 0;
                 ok = TRUE;
@@ -1535,6 +1538,7 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD type)
     if (type & MEM_DECOMMIT) {
         uintptr_t a0 = (uintptr_t)address & ~(pg - 1);
         size_t    sz = (((uintptr_t)address + size + pg - 1) & ~(pg - 1)) - a0;
+        vm_watch_forget_host((const void*)a0, sz, 0);
         if (mprotect((void*)a0, sz, PROT_NONE) != 0) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
         madvise((void*)a0, sz, MADV_DONTNEED);
         return TRUE;
@@ -1549,6 +1553,7 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, DWORD* old)
     uintptr_t a0 = (uintptr_t)address & ~(pg - 1);
     size_t    sz = (((uintptr_t)address + size + pg - 1) & ~(pg - 1)) - a0;
     if (old) *old = PAGE_READWRITE;
+    vm_watch_forget_host((const void*)a0, sz, (prot_of(protect) & PROT_WRITE) != 0);
     if (mprotect((void*)a0, sz, prot_of(protect)) != 0) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     return TRUE;
 }
