@@ -471,6 +471,9 @@ struct SpursPmSlot {
     const uint8_t* pm;
     u64 data;
     HANDLE thread;
+    /* PS3RECOMP_SPURS_WORKER_WAKE=1: this worker's own wake, so a dispatch
+     * wakes only the slot it filled (spurs_worker_cv). */
+    CONDITION_VARIABLE wake;
 };
 static struct SpursInst {
     u32 ea, nspus;
@@ -2066,6 +2069,33 @@ static u32 spurs_idle_max(void)
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
  * never runs under that lock, and only a genuine return releases contention. */
+/* PS3RECOMP_SPURS_WORKER_WAKE=1 (default off; read before an instance's
+ * threads start): each policy-module worker sleeps on its own condition
+ * variable and a dispatch wakes only the worker it filled. Off, the
+ * coordinator and every worker share the instance's variable, and each
+ * dispatch, module return and request-line commit wakes all of them: the idle
+ * workers then queue for the instance lock in front of the one worker that was
+ * given work, find nothing, and sleep again. The instance's variable keeps
+ * waking the coordinator either way. Admission is unchanged. */
+static int s_spurs_worker_wake = -1;
+static unsigned long long s_spurs_idle_worker_wakes;   /* atomic: woke with nothing to run */
+static void spurs_worker_wake_option_read(void)
+{
+    if (s_spurs_worker_wake >= 0) return;
+    const char* e = getenv("PS3RECOMP_SPURS_WORKER_WAKE");
+    s_spurs_worker_wake = e && !strcmp(e, "1");
+}
+static CONDITION_VARIABLE* spurs_worker_cv(struct SpursInst* si, struct SpursPmSlot* slot)
+{
+    return s_spurs_worker_wake > 0 ? &slot->wake : &si->wake;
+}
+/* Stop, or a start that failed: every worker and the coordinator. */
+static void spurs_wake_all(struct SpursInst* si)
+{
+    WakeAllConditionVariable(&si->wake);
+    for (u32 sn = 0; sn < si->nspus && sn < 6u; sn++) WakeAllConditionVariable(&si->slots[sn].wake);
+}
+
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
@@ -2077,8 +2107,11 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
-        while (!slot->busy && !si->stopping)
-            SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+        while (!slot->busy && !si->stopping) {
+            SleepConditionVariableSRW(spurs_worker_cv(si, slot), &si->lock, INFINITE, 0);
+            if (!slot->busy && !si->stopping)
+                __atomic_fetch_add(&s_spurs_idle_worker_wakes, 1ull, __ATOMIC_RELAXED);
+        }
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
@@ -2094,7 +2127,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         if (polls) si->idle[wid] = 0;
         else if (si->idle[wid] < spurs_idle_max()) si->idle[wid]++;
         slot->busy = 0;
-        WakeAllConditionVariable(&si->wake);
+        WakeAllConditionVariable(&si->wake);   /* the coordinator: contention changed */
     }
     ReleaseSRWLockExclusive(&si->lock);
     ps3_tprof_thread_exit();
@@ -2178,7 +2211,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 wkl_count_set(ea, SPURS_WKL_CURCONT, wid, si->is2, si->active[wid]);
                 ef_line_end(ea);
                 slot->busy = 1;
-                WakeAllConditionVariable(&si->wake);
+                if (s_spurs_worker_wake > 0) WakeConditionVariable(&slot->wake);
+                else                         WakeAllConditionVariable(&si->wake);
                 break;
             }
         }
@@ -2197,9 +2231,12 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
       g_rsx_main_release_hook = spurs_line_committed; }
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
+    spurs_worker_wake_option_read();
     for (u32 sn = 0; sn < si->nspus; sn++) {
         struct SpursPmSlot* slot = &si->slots[sn];
+        const CONDITION_VARIABLE wake = slot->wake;   /* kept across restarts */
         memset(slot, 0, sizeof(*slot));
+        slot->wake = wake;
         slot->instance = si; slot->spu_num = sn;
         slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
         if (!slot->thread) goto failed;
@@ -2209,7 +2246,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     return CELL_OK;
 failed:
     AcquireSRWLockExclusive(&si->lock);
-    si->stopping = 1; WakeAllConditionVariable(&si->wake);
+    si->stopping = 1; spurs_wake_all(si);
     ReleaseSRWLockExclusive(&si->lock);
     for (u32 sn = 0; sn < si->nspus; sn++) {
         HANDLE h = si->slots[sn].thread;
@@ -2228,7 +2265,7 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
     if (si->stopping || si->starting) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     for (u32 wid = 0; wid < SPURS_MAX_WID; wid++)
         if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
-    si->stopping = 1; WakeAllConditionVariable(&si->wake);
+    si->stopping = 1; spurs_wake_all(si);
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
     for (u32 sn = 0; sn < si->nspus; sn++) {
