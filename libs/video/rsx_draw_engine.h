@@ -118,8 +118,13 @@ typedef struct rsx_be_render_state {
 
 /* How many distinct guest textures the engine keeps before it evicts the
  * least recently used one. Public so the eviction test can be exact about
- * where the boundary is rather than assuming a number. */
+ * where the boundary is rather than assuming a number. A title whose frame
+ * binds more defines a larger cache at build time
+ * (-DRSX_DRAW_ENGINE_TEXTURE_CACHE=N): past the cap every frame evicts and
+ * re-decodes the textures it is about to bind again. */
+#ifndef RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+#endif
 
 /* ---- the backend interface ---------------------------------------------- */
 
