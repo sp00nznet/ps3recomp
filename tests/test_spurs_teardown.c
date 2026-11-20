@@ -77,7 +77,7 @@ static DWORD WINAPI wait_thread(void* p)
 
 int main(void)
 {
-    setenv("SPURS_SHUTDOWN_MS", "150", 1);
+    setenv("SPURS_SHUTDOWN_MS", "1000", 1);   /* room for macOS timer coalescing over the 50 ms sleep */
     vm_base = calloc(1, ppu_vm_size); assert(vm_base);
     memset(vm_base + 0x9000, 0x22, 16);
     memset(vm_base + 0x9100, 0x33, 16);

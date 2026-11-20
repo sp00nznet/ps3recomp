@@ -9,7 +9,8 @@ from pathlib import Path
 def main():
     if os.name!='nt':print('SKIP: Windows D3D12 fixture');return 0
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--runtime-library',type=Path,required=True);args=parser.parse_args()
+    parser.add_argument('--runtime-library',type=Path);args=parser.parse_args()
+    if args.runtime_library is None:print('SKIP: needs --runtime-library (a built /MT ps3recomp_runtime.lib)');return 0
     library=args.runtime_library.resolve();root=Path(__file__).resolve().parents[1]
     compiler=shutil.which(os.environ.get('CC','clang-cl'))
     if not compiler or not library.is_file():parser.error('C compiler and runtime library required')
