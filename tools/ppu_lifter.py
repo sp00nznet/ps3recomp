@@ -1043,6 +1043,10 @@ class PPULifter:
         # {addr -> (original word, replacement word, guard symbol)}. See
         # _patched_translate.
         self.insn_patches: dict[int, tuple[int, int, str]] = {}
+        # --resv-open-count: lwarx/ldarx report themselves to the runtime's
+        # opt-in open-reservation counts (PS3RECOMP_PPU_RESV_OPEN_COUNT) before
+        # reading. Off by default; the output is then unchanged.
+        self.resv_open_count: bool = False
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -2719,7 +2723,9 @@ class PPULifter:
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
+            note = ("if (g_resv_open_active) ppu_resv_open_note(ctx, (uint32_t)ea); "
+                    if self.resv_open_count else "")
+            return (f"{{ uint64_t ea = {ea}; {note}"
                     f"ctx->gpr[{rd}] = vm_read32(ea); "
                     f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
@@ -2739,7 +2745,9 @@ class PPULifter:
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
+            note = ("if (g_resv_open_active) ppu_resv_open_note(ctx, (uint32_t)ea); "
+                    if self.resv_open_count else "")
+            return (f"{{ uint64_t ea = {ea}; {note}"
                     f"ctx->gpr[{rd}] = vm_read64(ea); "
                     f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
@@ -3993,6 +4001,12 @@ class PPULifter:
                                             self.prefix + "function_table")
                     if self.prefix else HEADER_PREAMBLE)
         lines = [preamble]
+        if self.resv_open_count:
+            lines.append('#ifdef __cplusplus\nextern "C" {\n#endif\n'
+                         '/* --resv-open-count: see ppu_resv_open_note in the runtime. */\n'
+                         'extern int g_resv_open_active;\n'
+                         'void ppu_resv_open_note(ppu_context* ctx, uint32_t ea);\n'
+                         '#ifdef __cplusplus\n}\n#endif')
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
@@ -4905,7 +4919,7 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, insn_patches=None):
+                 toc_base=0, insn_patches=None, resv_open_count=False):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4921,6 +4935,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
     _WORKER_STATE["insn_patches"] = insn_patches or {}
+    _WORKER_STATE["resv_open_count"] = resv_open_count
 
 
 def _worker_lift(task):
@@ -4937,6 +4952,7 @@ def _worker_lift(task):
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
+    lifter.resv_open_count = _WORKER_STATE.get("resv_open_count", False)
     results = []
     for start, end in bounds:
         blob = b""
@@ -4972,7 +4988,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             lifter.insn_patches))
+                             lifter.insn_patches, lifter.resv_open_count))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -5048,6 +5064,12 @@ def main() -> None:
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
                              "links alongside the main title without collisions")
+    parser.add_argument("--resv-open-count", action="store_true",
+                        help="Have lwarx/ldarx report themselves to the "
+                             "runtime's opt-in open-reservation counts, so "
+                             "PS3RECOMP_PPU_RESV_OPEN_COUNT=1 can skip "
+                             "reservation-break scans. Output is unchanged "
+                             "without it")
     parser.add_argument("--weak", action="store_true",
                         help="Emit lifted function definitions as weak symbols "
                              "so a port's idiomatic overrides (strong symbols "
@@ -5561,6 +5583,7 @@ def main() -> None:
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
+    lifter.resv_open_count = args.resv_open_count
     if args.insn_patches:
         lifter.insn_patches = load_insn_patches(args.insn_patches)
         print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
