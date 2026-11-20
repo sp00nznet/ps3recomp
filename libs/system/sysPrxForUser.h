@@ -168,6 +168,8 @@ s32   _sys_heap_free(sys_heap_t heap, void* ptr);
  * -----------------------------------------------------------------------*/
 
 s32 sys_prx_exitspawn_with_level(void);
+s32 sys_prx_get_module_list(u64 flags, void* info);
+s32 sys_prx_get_module_info(u32 id, u64 flags, void* info);
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
 
 /* ---------------------------------------------------------------------------

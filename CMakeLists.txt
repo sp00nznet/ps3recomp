@@ -422,6 +422,37 @@ if(PS3RECOMP_BUILD_TESTS)
     # cellVdec through its guest API: the callback-only decoder always, and
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)
+
+    # sys_prx_get_module_list must write count = 0 back to the caller; leaving
+    # the out-param untouched makes a title walk a garbage module-id list.
+    # Function/data sections let the linker drop the rest of sysPrxForUser.c
+    # (threads, lwmutex, heap) so this stays a small unit test.
+    add_executable(test_prx_module_list
+        libs/system/tests/test_prx_module_list.c
+        libs/system/sysPrxForUser.c)
+    target_include_directories(test_prx_module_list PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/memory"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")
+    if(MSVC)
+        target_compile_options(test_prx_module_list PRIVATE /Gy)
+        target_link_options(test_prx_module_list PRIVATE /OPT:REF)
+    else()
+        target_compile_options(test_prx_module_list PRIVATE
+            -ffunction-sections -fdata-sections -UNDEBUG)
+        if(APPLE)
+            target_link_options(test_prx_module_list PRIVATE -Wl,-dead_strip)
+        else()
+            target_link_options(test_prx_module_list PRIVATE -Wl,--gc-sections)
+        endif()
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(test_prx_module_list PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME prx_module_list COMMAND test_prx_module_list)
     # cellGcm's FIFO walker without a backend: where GET_REPORT writes for
     # each report DMA context. Links the runtime like the POSIX host below.
     if(UNIX)
@@ -764,6 +795,27 @@ if(UNIX)
         )
         target_link_libraries(ps3recomp_boot_smoke PRIVATE ps3recomp_runtime)
         set_target_properties(ps3recomp_boot_smoke PROPERTIES LINKER_LANGUAGE CXX)
+
+        # Fast HLE handlers return before the full dispatcher's _TocGuard. They
+        # still have to spill the caller's TOC to [r1+0x28], or the caller's
+        # `ld r2,40(r1)` restores stale/zero data. This test exercises both
+        # fast exits (handled and declined) against the real ppu_hle.cpp.
+        if(PS3RECOMP_BUILD_TESTS)
+            add_executable(test_hle_fast_toc
+                runtime/ppu/tests/test_hle_fast_toc.cpp
+                runtime/ppu/tests/test_hle_stubs.cpp
+                runtime/ppu/ppu_hle.cpp
+                "${SMOKE_GEN}/ppu_recomp.h")
+            target_include_directories(test_hle_fast_toc PRIVATE
+                "${SMOKE_GEN}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/memory"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
+            set_target_properties(test_hle_fast_toc PROPERTIES LINKER_LANGUAGE CXX)
+            add_test(NAME hle_fast_toc COMMAND test_hle_fast_toc)
+        endif()
 
         # Where the runnable image lands, so CI and a developer both say
         #   ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
