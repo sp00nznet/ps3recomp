@@ -838,6 +838,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
                     ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
     ctx->gpr[3] = r;   /* PPC return value */
+    { unsigned t = (unsigned)ctx->thread_id;
+      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
     /* PS3_HLE_PTRCHECK: the guest stores HLE return values as guest pointers, so
      * an HLE returning a value outside guest RAM (>= 0x10000000) that is not a
      * CELL_ERROR code (0x8001xxxx / 0x8002xxxx) is leaking a truncated HOST
