@@ -400,3 +400,28 @@ swapcontext(&current, &ctx);
 ```
 
 **Note:** `ucontext` is deprecated on macOS but still works. For production macOS builds, consider using `setjmp`/`longjmp` with manual stack management, or platform-specific alternatives.
+
+### Apple AArch64 (opt-in)
+
+`-DPS3RECOMP_FIBER_BACKEND=aarch64` switches cellFiber's host stacks with the
+hand-written register switch in `runtime/platform/host_fiber_aarch64.S`
+instead of `swapcontext` (the default stays `ucontext`, and the option is a
+configure error anywhere but single-arch Apple arm64). It saves x19-x29, SP
+and the low 64 bits of v8-v15, never touches Apple's reserved x18, and writes
+only the context record, so both red zones survive.
+
+Every host stack has an inaccessible guard page below it. A stack mapping --
+or the `mprotect` that splits off the guard -- that fails with `ENOMEM` makes
+`cellFiberPpuCreateFiber` return `CELL_FIBER_ERROR_NOMEM` with the record
+untouched; other failures and broken lifecycle invariants print one
+`[host_fiber] backend=aarch64 op=... reason=... ea=... error=...` line to
+stderr and abort. A fiber belongs to the thread that first resumed it, yield
+and exit must run on the fiber's own stack, and one runner serves one resume
+at a time (nesting through a second runner is fine). Signal masks,
+FPCR/FPSR, arm64e pointer authentication, SME and tagged stacks are not
+switched.
+
+`tests/host_fiber` exercises the switch directly in either configuration: a
+two-sided assembly ABI probe, lifecycle, guard-page faults, and each abort in
+a child process. The optional `bench_host_fiber` target compares raw switch
+pairs, resume/yield pairs and `swapcontext` pairs on the same machine.
