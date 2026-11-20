@@ -214,7 +214,6 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
-    q->active   = 1;
     q->key      = key;
     q->capacity = size;
     q->type     = SYS_PPU_QUEUE;
@@ -225,6 +224,8 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
      * null internal pointer -- which is exactly how YDKJ's FMOD audio thread
      * died the moment it was finally given a real queue to block on. */
     event_queue_native_init(q, slot);
+    /* Publish last (#804): a reader that sees active also sees an initialised lock. */
+    __atomic_store_n(&q->active, 1, __ATOMIC_RELEASE);
 
     evt_table_unlock();
 
@@ -256,7 +257,6 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
-    q->active   = 1;
     q->key      = key;
     q->capacity = size;
     q->head     = 0;
@@ -288,6 +288,8 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     }
 
     event_queue_native_init(q, slot);
+    /* Publish last (#804): a reader that sees active also sees an initialised lock. */
+    __atomic_store_n(&q->active, 1, __ATOMIC_RELEASE);
 
     uint32_t queue_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
