@@ -33,10 +33,11 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <errno.h>
 #endif
 
-/* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
- * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
- * down; keep the two in step so a stack-depth bug reproduces on both. */
-#define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
+/* Host stack reserved per guest thread, on both branches below, so a
+ * stack-depth bug reproduces on both. guest_host_thread.h holds the size, so
+ * a runtime thread that calls into the guest gets the same one. */
+#include "ps3emu/guest_host_thread.h"
+#define PPU_HOST_STACK_BYTES  PS3_GUEST_HOST_STACK_BYTES
 
 #ifdef _WIN32
 #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
@@ -189,7 +190,7 @@ static void* ppu_host_thread_proc(void* param)
      * without the guarantee the handler faults while reporting -- the process
      * then dies silently with an access violation INSIDE the handler and the
      * backtrace that would name the recursing function is lost. */
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    { ULONG g = PS3_GUEST_HOST_STACK_GUARANTEE; SetThreadStackGuarantee(&g); }
 #endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation
@@ -574,7 +575,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
     int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
     if (_gate_this) _initflag |= CREATE_SUSPENDED;
-    t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
+    t->host_thread = (HANDLE)_beginthreadex(NULL, PPU_HOST_STACK_BYTES,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
