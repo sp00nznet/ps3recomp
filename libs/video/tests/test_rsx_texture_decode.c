@@ -206,7 +206,7 @@ int main(int argc, char** argv)
     /* The existing suite initializes authored guest vertex data and executes
      * content, aliases, programs/constants, render state and lifecycle tests. */
     if (argc == 1) {
-        int result = engine_regressions_main();
+        int result = engine_regressions_main(1, (char*[]){"test", NULL});
         if (result) return result;
     }
     vm_base = calloc(1, GUEST_BYTES); ppu_vm_size = GUEST_BYTES;
