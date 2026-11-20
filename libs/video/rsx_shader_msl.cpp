@@ -76,7 +76,11 @@ bool hlsl_to_spirv(const char* hlsl, EShLanguage lang, std::vector<unsigned int>
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
     /* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
      * decompiler's _rsx_inv_w helper which one it gets. */
-    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n");
+    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n"
+                       /* Metal-only vertex point size: the decompilers' VSOutput
+                        * gains a PointSize built-in and VPConst a vp_pointsize
+                        * row behind this macro (rsx_vp_decompiler.h). */
+                       "#define RSX_POINT_SIZE_BUILTIN 1\n");
     shader.setEntryPoint("main");
     shader.setAutoMapBindings(true);
     shader.setAutoMapLocations(true);
@@ -160,6 +164,9 @@ bool spirv_to_msl(const std::vector<unsigned int>& spirv, bool vertex, char* out
     spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_VERSION, 20100u);
     spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_MACOS);
     spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ENABLE_DECORATION_BINDING, SPVC_TRUE);
+    /* A vertex function's PointSize built-in is emitted as [[point_size]] only
+     * with this on; Metal's point size is undefined unless one is written. */
+    spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ENABLE_POINT_SIZE_BUILTIN, SPVC_TRUE);
     if (spvc_compiler_install_compiler_options(comp, opt) != SPVC_SUCCESS) {
         put_log(log, log_size, "MSL options install", spvc_context_get_last_error_string(ctx));
         goto done;

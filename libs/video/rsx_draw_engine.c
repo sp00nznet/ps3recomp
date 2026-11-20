@@ -58,7 +58,9 @@ extern u32 ppu_vm_size;
  * target rather than destroying a live one. */
 #define ENG_MAX_SURFACE_DIM 8192u
 
-#define ENG_VP_CB_BYTES    ((RSX_DSP_NUM_CONSTANTS + 2) * 16u)
+/* VPConst: the transform constants, vp_posscale, vp_posoffset, and the Metal
+ * translator's vp_pointsize row (rsx_vp_decompiler.h). */
+#define ENG_VP_CB_BYTES    ((RSX_DSP_NUM_CONSTANTS + 3) * 16u)
 #define ENG_FP_MAX_BYTES   0x10000u
 
 #define M_ALPHA_TEST_ENABLE   0x0304
@@ -99,6 +101,13 @@ extern u32 ppu_vm_size;
 #define M_POLY_OFFSET_FACTOR  0x0A78
 #define M_POLY_OFFSET_BIAS    0x0A7C
 #define M_ZMIN_MAX_CONTROL    0x1D78
+/* Point state. NV4097_SET_POINT_SIZE 0x1EE0 is an f32 in pixels;
+ * NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK 0x1FF4 (the NV40 VP_RESULT_EN) has a
+ * bit per vertex-program output, and RSX_VP_OUTPUT_MASK_POINT_SIZE is the
+ * point-size output's. Sources are listed at the vp_pointsize row,
+ * rsx_vp_decompiler.h. */
+#define M_POINT_SIZE            0x1EE0
+#define M_VERTEX_OUTPUT_MASK    0x1FF4
 
 /* ---- module state -------------------------------------------------------- */
 
@@ -1946,12 +1955,15 @@ static const char* const kEngFixedVS =
 "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
 "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
 "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
+RSX_VP_HLSL_PSIZE_MEMBER
 "};\n"
 "cbuffer VPConst : register(b0) {\n"
 "    float4 vp_c[512];\n"
 "    float4 vp_posscale;\n"
 "    float4 vp_posoffset;\n"
+RSX_VP_HLSL_PSIZE_ROW
 "};\n"
+RSX_VP_HLSL_PSIZE_FUNC
 "VSOutput main(VSInput input) {\n"
 "    float4 _p = float4(dot(vp_c[0], input.a0), dot(vp_c[1], input.a0),\n"
 "                       dot(vp_c[2], input.a0), dot(vp_c[3], input.a0));\n"
@@ -1964,6 +1976,9 @@ static const char* const kEngFixedVS =
 "    Out.t0 = input.a8; Out.t1 = (float4)0; Out.t2 = (float4)0; Out.t3 = (float4)0;\n"
 "    Out.t4 = (float4)0; Out.t5 = (float4)0; Out.t6 = (float4)0; Out.t7 = (float4)0;\n"
 "    Out.t8 = (float4)0; Out.t9 = (float4)0;\n"
+/* No vertex program, so no o[6]: always the guest's register, whatever the
+ * output mask a previous program left says. */
+RSX_VP_HLSL_PSIZE_STORE("vp_pointsize.x")
 "    return Out;\n"
 "}\n";
 
@@ -3286,6 +3301,18 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                 what, rc[0], rc[1], rc[2], rc[3], w, h);
 }
 
+/* The vp_pointsize row for the draw being recorded; see rsx_vp_decompiler.h. */
+static void eng_point_row(float row[RSX_VP_POINT_SIZE_ROW_FLOATS])
+{
+    const u32 bits = rsx_dsp_reg(&g.rsx, M_POINT_SIZE);
+    float size;
+    memcpy(&size, &bits, sizeof size);
+    row[0] = size;
+    row[1] = (rsx_dsp_reg(&g.rsx, M_VERTEX_OUTPUT_MASK) & RSX_VP_OUTPUT_MASK_POINT_SIZE) ? 1.0f : 0.0f;
+    row[2] = RSX_VP_POINT_SIZE_MAX;
+    row[3] = 0.0f;
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -3424,6 +3451,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
     memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    {
+        float ps[RSX_VP_POINT_SIZE_ROW_FLOATS];
+        eng_point_row(ps);
+        memcpy(g.vp_cb + (RSX_DSP_NUM_CONSTANTS + 2) * 16u, ps, sizeof ps);
+    }
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
