@@ -73,6 +73,12 @@ int main(void) {
     assert(s_io_address_table[0x44e]==0xffff && s_io_address_table[0x44f]==0xffff);
     assert(s_ea_address_table[0xe0]==0xffff && s_ea_address_table[0xe1]==0xffff);
     assert(cellGcmMapEaIoAddressWithFlags(0x44e00000,0x0e000000,2*page,strict)==CELL_OK);
+    /* A size short of a whole page still maps its last page; unmapping clears
+     * it. cellGcmInit's ioSize and sys_rsx's iomap reach these with such a size. */
+    populate_offset_table(0x46000000,0x03000000,page+0x80000);
+    assert(s_io_address_table[0x461]==0x31);
+    clear_offset_table(0x46000000,0x03000000,page+0x80000);
+    assert(s_io_address_table[0x461]==0xffff && s_ea_address_table[0x31]==0xffff);
     reset_maps();
     for(unsigned i=0;i<CELL_GCM_MAX_IO_MAPPINGS;i++)
         assert(cellGcmMapEaIoAddress(0x10000000+i*page,i*page,page)==CELL_OK);
