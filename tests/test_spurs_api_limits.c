@@ -62,6 +62,22 @@ int main(void)
     assert(vm_read8(0x1000+SPURS_WKL_IDLE2)==2);
     puts("SPURS RequestIdleSpu rejects a workload slot that is not in use PASS");
 
+    /* cellSpursGetInfo hands out the SPU thread ids a title passes to sys_spu_thread_write_snr; cellSpurs_post_snr,
+     * which the syscall falls back to for an id with no thread of its own, takes those and nothing else. */
+    memset(vm_base+0xA000,0xEE,0x60);
+    assert(cellSpursGetInfo(0x1000,0xA000)==0);
+    assert(vm_read32(0xA000)==2);                                  /* nSpus */
+    u32 group=vm_read32(0xA024),t0=vm_read32(0xA028),t1=vm_read32(0xA02C);
+    assert(group && t0 && t1 && t0!=t1 && group!=t0);
+    assert(vm_read32(0xA030)==0 && vm_read32(0xA044)==0);          /* the slots of SPUs this instance lacks */
+    assert(vm_read32(0xA048)==0xEEEEEEEEu);                        /* and nothing written past the struct */
+    assert(cellSpurs_post_snr(t0,0,0x11)==0 && cellSpurs_post_snr(t1,1,0x22)==0);
+    assert(cellSpurs_post_snr(t0,2,1)==-1);                        /* SNR 2 does not exist */
+    assert(cellSpurs_post_snr((t0&~0xFu)|2,0,1)==-1);              /* nor does SPU 2 of a 2-SPU instance */
+    assert(cellSpurs_post_snr(group,0,1)==-1);                     /* the group id is no SPU thread */
+    assert(cellSpurs_post_snr(0x1000,0,1)==-1);                    /* an id of another kind */
+    puts("SPURS GetInfo SPU thread ids take sys_spu_thread_write_snr PASS");
+
     atomic_store(&gate,1);
     finalize(0x1000);
     free(vm_base);return 0;
