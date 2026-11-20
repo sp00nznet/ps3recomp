@@ -427,6 +427,7 @@ jobs:
           /tmp/test_rsx_draw_engine
           PS3RECOMP_ENG_FEEDBACK_PER_PASS=1 /tmp/test_rsx_draw_engine
           /tmp/test_rsx_draw_engine single
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_rsx_texture_decode.py
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c

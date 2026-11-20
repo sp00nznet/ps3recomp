@@ -196,6 +196,8 @@ static struct {
     u32 width, height;
 
     rsx_dispatch rsx;
+    rsx_dsp_texture decoded_textures[RSX_DSP_NUM_TEXTURES];
+    u32 decoded_textures_valid;
 
     eng_surface surfaces[ENG_MAX_SURFACES];
     u32 n_surfaces;
@@ -1916,6 +1918,57 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
     if (out->max_lod < out->min_lod) out->max_lod = out->min_lod;
 }
 
+/* Test-only accounting for the pure register decode, with an uncached oracle.
+ * This seam is absent from normal builds. */
+#ifdef RSX_DRAW_ENGINE_TEXTURE_DECODE_TEST
+static int s_texture_decode_bypass;
+static u64 s_texture_decodes;
+void rsx_draw_engine_test_texture_decode_bypass(int bypass)
+{ s_texture_decode_bypass = bypass; s_texture_decodes = 0; }
+u64 rsx_draw_engine_test_texture_decodes(void) { return s_texture_decodes; }
+#endif
+
+/* A texture descriptor depends only on its eight-word register block and
+ * SIZE1 word. Keep this pure decode across draws; guest content, aliases,
+ * uploads and bindings are still checked at every normal consumption point.
+ * All writes to these registers enter through rsx_draw_engine_method. */
+static void eng_texture_decode_invalidate(u32 method, u32 arg)
+{
+    u32 unit;
+    if (method >= 0x1A00u && method < 0x1C00u)
+        unit = (method - 0x1A00u) >> 5;
+    else if (method >= 0x1840u && method < 0x1880u)
+        unit = (method - 0x1840u) >> 2;
+    else
+        return;
+    if (rsx_dsp_reg(&g.rsx, method) != arg)
+        g.decoded_textures_valid &= ~(1u << unit);
+}
+
+static void eng_get_texture(u32 unit, rsx_dsp_texture* out)
+{
+#ifdef RSX_DRAW_ENGINE_TEXTURE_DECODE_TEST
+    if (s_texture_decode_bypass == 1) {
+        s_texture_decodes++;
+        rsx_dsp_get_texture(&g.rsx, unit, out);
+        return;
+    }
+#endif
+    if (!(g.decoded_textures_valid & (1u << unit))) {
+#ifdef RSX_DRAW_ENGINE_TEXTURE_DECODE_TEST
+        s_texture_decodes++;
+#endif
+        rsx_dsp_get_texture(&g.rsx, unit, &g.decoded_textures[unit]);
+        g.decoded_textures_valid |= 1u << unit;
+    }
+    *out = g.decoded_textures[unit];
+}
+
+#ifdef RSX_DRAW_ENGINE_TEXTURE_DECODE_TEST
+void rsx_draw_engine_test_get_texture(u32 unit, rsx_dsp_texture* out)
+{ eng_get_texture(unit, out); }
+#endif
+
 /* ---- pipelines ----------------------------------------------------------- */
 
 static u32 eng_vtex_mask(void)
@@ -1938,7 +1991,7 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        eng_get_texture(u, &t);
         dim[u][0] = dim[u][1] = dim[u][2] = 0;
         if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || !t.width || !t.height)
             continue;
@@ -1960,7 +2013,7 @@ static u32 eng_volume_mask(void)
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        eng_get_texture(u, &t);
         if (t.enabled && !t.cubemap && t.dimension == 3 && t.depth > 1 && t.width && t.height)
             mask |= 1u << u;
     }
@@ -1972,7 +2025,7 @@ static u32 eng_cube_mask(void)
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        eng_get_texture(u, &t);
         /* A cube face is square by construction, so a non-square image
          * cannot be one; the fragment program is compiled against this mask
          * and a texturecube slot filled with a 2D texture is a validation
@@ -2311,14 +2364,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        eng_get_texture(u, &t);
         rsx_fp_shadow_desc_from_texture(&shadow[u], t.format, t.dimension,
             t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
         if (shadow[u].enabled) shadow_mask |= 1u << u;
     }
     u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        rsx_dsp_texture t; eng_get_texture(u, &t);
         if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
     }
     const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
@@ -2329,7 +2382,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * gamma: only units the program samples count. */
     u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        rsx_dsp_texture t; eng_get_texture(u, &t);
         if (t.enabled) expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
     }
     const u32 expand_units = fixed ? 0 : rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks);
@@ -2907,7 +2960,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     eng_pass_note(target_slots, n_targets);
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        eng_get_texture(u, &t);
         /* A unit left enabled by an earlier draw but not sampled by this
          * program is skipped: resolving it would cost a cache check, and an
          * aliased surface a store to guest memory, for nothing. */
@@ -3322,7 +3375,7 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
             if (!(tex_mask & (1u << u))) continue;
             rsx_dsp_texture t;
-            rsx_dsp_get_texture(&g.rsx, u, &t);
+            eng_get_texture(u, &t);
             fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
                     t.format & 0xFFu, t.width, t.height);
         }
@@ -3345,7 +3398,7 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES && at < sizeof s_pd.first; u++) {
         if (!(tex_mask & (1u << u))) continue;
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        eng_get_texture(u, &t);
         /* S<n> a colour surface, Z<n> a depth target, each with the serial
          * of its last write: the newer one is what the binding sampled. */
         char src[48] = "G";
@@ -3483,6 +3536,11 @@ static void eng_point_row(float row[RSX_VP_POINT_SIZE_ROW_FLOATS])
 
 static void sink_end(void* user, const rsx_dispatch* r)
 {
+#ifdef RSX_DRAW_ENGINE_TEXTURE_DECODE_TEST
+    /* Reproduce the measured fork's existing within-draw-only memo as a
+     * second baseline, without changing normal builds. */
+    if (s_texture_decode_bypass == 2) g.decoded_textures_valid = 0;
+#endif
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
     eng_arena_reset();
@@ -3980,6 +4038,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.immediate_vertex = sink_immediate_vertex;
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
+    g.decoded_textures_valid = 0;
     g.ready = 1;
     /* Display buffers the title registered before the backend came up. */
     cellGcm_replay_display_buffers_to_engine();
@@ -4030,6 +4089,7 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    eng_texture_decode_invalidate(m, arg);
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 
