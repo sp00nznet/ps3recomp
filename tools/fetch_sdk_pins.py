@@ -47,7 +47,7 @@ def load_pins(document):
         if not isinstance(pin.get('path'), str) or not pin['path']:
             raise ValueError(f'{role}: path is required')
         path = Path(pin['path'])
-        if path.is_absolute() or '..' in path.parts:
+        if path.is_absolute() or path.anchor or '..' in path.parts:
             raise ValueError(f'{role}: path must stay inside the port root')
         if 'tag' in pin and not (isinstance(pin['tag'], str) and pin['tag']):
             raise ValueError(f'{role}: tag must be a non-empty string')
