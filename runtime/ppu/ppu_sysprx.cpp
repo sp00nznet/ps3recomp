@@ -21,10 +21,8 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
-#ifndef _WIN32
 /* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
-extern "C" uint64_t host_monotonic_ns(void);
-#endif
+extern "C" uint64_t ps3_system_time_us(void);
 #include "ps3emu/log_first.h"
 
 extern "C" uint8_t* vm_base;
@@ -67,19 +65,11 @@ static void sys_initialize_tls(ppu_context* ctx)
  * wall-time. LBP's Bink movie clock (sysGetSystemTime import 0x8461E528
  * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
  * the audio preload threshold took forever to fill (movie stayed silent),
- * and every frontend animation timed off it crawled. */
+ * and every frontend animation timed off it crawled. The clock is
+ * ps3_system_time_us (sys_timer.c), shared with cellGcmGetLastFlipTime. */
 static void sys_time_get_system_time(ppu_context* ctx)
 {
-#ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
-#else
-    /* The same host clock as the timebase (sys_timer.h), so guest code that
-     * mixes mftb and this stays consistent. */
-    ctx->gpr[3] = host_monotonic_ns() / 1000ull;
-#endif
+    ctx->gpr[3] = ps3_system_time_us();
 }
 
 /* sys_process_is_stack(u32 addr) -> 1 if addr is in the stack region. We model

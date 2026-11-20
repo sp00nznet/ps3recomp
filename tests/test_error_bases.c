@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include "ps3emu/error_codes.h"
 #include "../libs/spurs/cellSpurs.h"
+#include "../libs/input/cellPad.h"
 
 static int fails;
 #define EXPECT(name, value) do { if ((uint32_t)(name) != (uint32_t)(value)) { \
@@ -21,6 +22,8 @@ int main(void)
     EXPECT(CELL_SPURS_TASK_ERROR_NULL_POINTER, 0x80410911u);
     EXPECT(CELL_AUDIO_ERROR_ALREADY_INIT,    0x80310701u);
     EXPECT(CELL_PAD_ERROR_FATAL,             0x80121101u);
+    EXPECT(CELL_PAD_ERROR_NO_DEVICE,         0x80121107u);   /* 0x80121105 is RESOURCE_ALLOCATION_FAILED */
+    EXPECT(CELL_MAX_PADS,                    127u);
     if (fails) return 1;
     puts("PASS: GCM, SPURS core and task, audio and pad error bases");
     return 0;

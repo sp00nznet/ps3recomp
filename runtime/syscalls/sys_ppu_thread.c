@@ -33,10 +33,11 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <errno.h>
 #endif
 
-/* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
- * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
- * down; keep the two in step so a stack-depth bug reproduces on both. */
-#define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
+/* Host stack reserved per guest thread, on both branches below, so a
+ * stack-depth bug reproduces on both. guest_host_thread.h holds the size, so
+ * a runtime thread that calls into the guest gets the same one. */
+#include "ps3emu/guest_host_thread.h"
+#define PPU_HOST_STACK_BYTES  PS3_GUEST_HOST_STACK_BYTES
 
 #ifdef _WIN32
 #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
@@ -189,7 +190,7 @@ static void* ppu_host_thread_proc(void* param)
      * without the guarantee the handler faults while reporting -- the process
      * then dies silently with an access violation INSIDE the handler and the
      * backtrace that would name the recursing function is lost. */
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    { ULONG g = PS3_GUEST_HOST_STACK_GUARANTEE; SetThreadStackGuarantee(&g); }
 #endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation
@@ -574,7 +575,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
     int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
     if (_gate_this) _initflag |= CREATE_SUSPENDED;
-    t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
+    t->host_thread = (HANDLE)_beginthreadex(NULL, PPU_HOST_STACK_BYTES,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
@@ -830,7 +831,19 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         t->host_thread  = NULL;
         t->finish_event = NULL;
 #else
-        pthread_detach(t->host_thread);
+        /* The same on POSIX: freeing at once let the epilogue put the freed
+         * slot back to FINISHED, where it stayed, and signal through the
+         * mutex and condition variable destroyed here. pthread_join reaps
+         * the thread as pthread_detach did. */
+        const pthread_t h = t->host_thread;
+        t->joining = 1;                 /* nobody joins it meanwhile */
+        table_unlock();
+        pthread_join(h, NULL);
+        table_lock();
+        if (t->state != PPU_THREAD_STATE_FINISHED || !pthread_equal(t->host_thread, h)) {
+            table_unlock();             /* freed or reused in the meantime */
+            return CELL_OK;
+        }
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
 #endif
@@ -1467,6 +1480,18 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
+/* lv2 slot 42 is the shared ENOSYS stub (FW 4.93 stock syscall table; RPCS3 at
+ * d00d8023 binds uns_func there). It must be a real handler, not the
+ * lv2_syscall_unimplemented sentinel: lv2_try_syscall filters that sentinel as
+ * "no handler", so a guest `sc 42` would fall to lv2_syscall()'s CELL_OK
+ * fallback where the firmware answers CELL_ENOSYS. */
+int64_t sys_ppu_thread_enosys_stub(ppu_context* ctx)
+{
+    const uint32_t num = (uint32_t)ctx->gpr[11];
+    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
+    return (int64_t)(int32_t)CELL_ENOSYS;
+}
+
 void sys_ppu_thread_init(lv2_syscall_table* tbl)
 {
     /* Initialize stack allocator */
@@ -1482,8 +1507,8 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     }
 #endif
 
-    lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_EXIT,                sys_ppu_thread_exit);
+    lv2_syscall_register(tbl, 42,                                 sys_ppu_thread_enosys_stub);  /* the shared ENOSYS stub */
     lv2_syscall_register(tbl, SYS_PPU_THREAD_YIELD,               sys_ppu_thread_yield);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_JOIN,                sys_ppu_thread_join);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_DETACH,              sys_ppu_thread_detach);

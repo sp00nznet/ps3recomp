@@ -596,7 +596,7 @@ Syscall handlers extract arguments from the PPU context:
 
 ```c
 // Register a single syscall
-LV2_REGISTER_SYSCALL(SYS_PPU_THREAD_CREATE, sys_ppu_thread_create);
+LV2_REGISTER_SYSCALL(SYS_PPU_THREAD_EXIT, sys_ppu_thread_exit);
 
 // Or use the bulk registration function
 lv2_register_all_syscalls(&g_lv2_syscalls);

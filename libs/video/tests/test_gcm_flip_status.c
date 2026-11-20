@@ -14,6 +14,7 @@
 #include "../rsx_tiling.c"
 #include <assert.h>
 uint8_t* vm_base;
+uint64_t ps3_system_time_us(void) { return 0; }   /* sys_timer.c */
 uint32_t ppu_vm_size;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
@@ -24,6 +25,8 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 ps3_guest_caller_fn g_ps3_guest_caller;
+int rsx_draw_engine_enabled(void) { return 0; }
+void rsx_draw_engine_note_flip(u32 id) { (void)id; }
 /* What the drain does when it reaches a flip queued in the command stream. */
 static void flip_executed(void) { s_fifo_flips_reached++; }
 static unsigned flips;
@@ -75,6 +78,12 @@ int main(void)
     cellGcmTickFlip();
     ppu_gcm_pump();
     assert(flips == 4 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+
+    /* cellGcmSetPrepareFlip answers with the buffer id, which a title keeps
+     * for cellGcmSetFlipImmediate. */
+    s_display_buffer_set[1] = 1;
+    assert(cellGcmSetPrepareFlip(NULL, 1) == 1);
+    assert(cellGcmSetPrepareFlip(NULL, 2) == (s32)CELL_GCM_ERROR_INVALID_VALUE);
 
     puts("GCM flip status checks passed");
 }

@@ -19,7 +19,7 @@ def ri10(op8, i10, ra, rt): return w(((op8 & 0xFF) << 24) | ((i10 & 0x3FF) << 14
 def rr(op11, rb, ra, rt): return w(((op11 & 0x7FF) << 21) | ((rb & 0x7F) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F))
 def ch(op11, channel, rt): return w(((op11 & 0x7FF) << 21) | ((channel & 0x1F) << 7) | (rt & 0x7F))
 
-IL, STQD, WRCH, STOP = 0x81, 0x24, 0x10D, 0x000
+IL, ILHU, STQD, WRCH, STOP = 0x81, 0x82, 0x24, 0x10D, 0x000
 MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID, MFC_Cmd = 16, 17, 18, 19, 20, 21
 WrOutIntrMbox = 30
 MFC_PUT = 0x20
@@ -32,7 +32,7 @@ b += ri10(STQD, 0x10,  9, 11)     # stqd r11, 0x100(r9)
 # --- DMA PUT: LS+0x100 -> main memory EA 0 ---
 b += ri16(IL, 0x100,    3)        # il   r3, 0x100   (LSA)
 b += ri16(IL, 0,        4)        # il   r4, 0       (EAH)
-b += ri16(IL, 0,        5)        # il   r5, 0       (EAL)
+b += ri16(ILHU, 1,      5)        # ilhu r5, 1          (EAL = 0x10000; PUTs below 64 KB are rejected as null-page writes)
 b += ri16(IL, 16,       6)        # il   r6, 16      (Size)
 b += ri16(IL, 0,        7)        # il   r7, 0       (TagID)
 b += ri16(IL, MFC_PUT,  8)        # il   r8, 0x20    (PUT)

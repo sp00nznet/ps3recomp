@@ -195,7 +195,11 @@ def build_programs(args, registry_writer):
                            '--report', str(outdir / 'lift.json'), '--output', str(outdir)]
                 if extra.get(name):
                     command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
-                if getattr(args, 'merge_chunks', False):
+                ret_entries = set(getattr(args, 'return_entries', []) or [])
+                want_ret = ('ALL' in ret_entries) or (name in ret_entries)
+                if want_ret:
+                    command += ['--return-entries', '--merge-chunks']
+                elif getattr(args, 'merge_chunks', False):
                     command += ['--merge-chunks']
                 result = subprocess.run(command, capture_output=True, text=True)
                 (outdir / 'lift.log').write_text(result.stdout + result.stderr)

@@ -14,10 +14,14 @@
  * through vm_base in big-endian.
  */
 #define PPU_NO_INLINE_STORES   /* declares its own out-of-line vm_write32/64 below */
+#include "../memory/vm_watch_hooks.h"
+#include <errno.h>
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
+#include "ps3emu/error_codes.h"
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
+#include "ps3emu/fs_write_check.h"
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +40,13 @@ extern "C" void ydkj_host_bt(const char* tag);
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>          /* open/close on MinGW */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>     /* SetEndOfFile: cellFsAllocateFileAreaWithoutZeroFill */
 #else
 #include <unistd.h>
 #endif
@@ -139,6 +150,15 @@ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
  * prefixes are stripped; the rest is appended to the root. */
 static void host_path(char* out, size_t cap, const char* guest)
 {
+    if (guest && (strcmp(guest, "/dev/null") == 0 || strcmp(guest, "dev/null") == 0)) {
+#ifdef _WIN32
+        snprintf(out, cap, "NUL");
+#else
+        snprintf(out, cap, "/dev/null");
+#endif
+        return;
+    }
+
     const char* rel = guest;
     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
@@ -241,11 +261,27 @@ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir 
  * claim the same slot, and every handler reads its slot once (fd_file/fd_dir)
  * rather than re-reading a pointer another thread's close may have cleared. */
 static std::mutex g_fd_lock;
+/* runtime/syscalls/sys_fs.c keeps its own descriptor table, but on hardware
+ * cellFs and the raw sys_fs_* calls share ONE kernel fd space. Never hand out
+ * a number the other table already owns; the bridge in sys_fs.c reads an fd
+ * this table owns (MLB's Bink SDK does sys_fs_read on a cellFs fd). */
+#ifdef _MSC_VER
+extern "C" int sys_fs_fd_active_absent(int fd) { (void)fd; return 0; }
+extern "C" int sys_fs_fd_active(int fd);
+#  ifdef _M_IX86
+#    pragma comment(linker, "/alternatename:_sys_fs_fd_active=_sys_fs_fd_active_absent")
+#  else
+#    pragma comment(linker, "/alternatename:sys_fs_fd_active=sys_fs_fd_active_absent")
+#  endif
+#else
+extern "C" __attribute__((weak)) int sys_fs_fd_active(int fd) { (void)fd; return 0; }
+#endif
+static bool sys_fs_owns_fd(int fd) { return sys_fs_fd_active(fd) != 0; }
 static int fd_alloc_file(FILE* f)
 {
     std::lock_guard<std::mutex> hold(g_fd_lock);
     for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i]) {
+        if (!g_files[i] && !g_dirs[i] && !sys_fs_owns_fd(i)) {
             g_fd_dir[i] = 0;
             __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
             return i;
@@ -256,7 +292,10 @@ static int fd_alloc_dir(DIR* d)
 {
     std::lock_guard<std::mutex> hold(g_fd_lock);
     for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
+        if (!g_files[i] && !g_dirs[i] && !sys_fs_owns_fd(i)) {
+            __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE);
+            return i;
+        }
     return -1;
 }
 static FILE* fd_file(int fd)
@@ -266,6 +305,13 @@ static FILE* fd_file(int fd)
 static DIR* fd_dir(int fd)
 {
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
+}
+/* Bridged fd accessor for runtime/syscalls/sys_fs.c. One kernel fd space on
+ * hardware: MLB's Bink SDK opens the .BIK with cellFs and then reads it with
+ * sys_fs_read, which used to hit the empty sys_fs table and return EBADF. */
+extern "C" FILE* ppu_cellfs_file_for_fd(int fd)
+{
+    return fd_file(fd);
 }
 
 /* ---- handlers ---- */
@@ -493,7 +539,9 @@ static void cellFsRead(ppu_context* ctx)
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     fs_set_dir(fd, f, 1);
+    vm_note_write(buf, (size_t)nbytes);   /* kernel write into guest memory */
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
+    vm_note_write_check(n < (size_t)nbytes && ferror(f) && errno == EFAULT, "cellFsRead");
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -562,7 +610,11 @@ static void cellFsWrite(ppu_context* ctx)
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     fs_set_dir(fd, f, 2);
+    clearerr(f);    /* ferror() is sticky: an old failure would look like this write's */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+    /* Flush here: a small write only reaches the kernel at the flush, so an
+     * unflushed one always looks like it worked. */
+    const int write_failed = ps3_fs_write_failed(n, nbytes, fflush(f) != 0 || ferror(f));
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (ps3_env_once("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -585,7 +637,7 @@ static void cellFsWrite(ppu_context* ctx)
         }
     }
     if (nwr_ptr) vm_write64(nwr_ptr, n);
-    ctx->gpr[3] = CELL_OK;
+    ctx->gpr[3] = write_failed ? (uint64_t)(int64_t)CELL_FS_EIO : CELL_OK;
 }
 
 /* cellFsFGetBlockSize(int fd, u64* sector_size, u64* block_size)
@@ -891,7 +943,35 @@ static void cellFsMkdir(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
 }
 static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
-static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+static void cellFsUnlink(ppu_context* ctx)
+{
+    const uint32_t address = (uint32_t)ctx->gpr[3];
+    if (!address) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EINVAL; return; }
+    if (ppu_vm_size && address >= ppu_vm_size) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT; return;
+    }
+    char guest[1024], host[1100];
+    guest_strcpy(guest, address, sizeof guest);
+    host_path(host, sizeof host, guest);
+#ifdef _WIN32
+    const int result = _unlink(host);
+#else
+    const int result = unlink(host);
+#endif
+    uint32_t error = CELL_OK;
+    if (result != 0) {
+        switch (errno) {
+        case ENOENT:  error = CELL_ENOENT; break;
+        case ENOTDIR: error = CELL_ENOTDIR; break;
+        case EACCES:  error = CELL_EACCES; break;
+        case EPERM:   error = CELL_EPERM; break;
+        case EBUSY:   error = CELL_EBUSY; break;
+        case EISDIR:  error = CELL_EISDIR; break;
+        default:      error = CELL_EIO; break;
+        }
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)error;
+}
 static void cellFsFsync(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
@@ -914,9 +994,57 @@ static void cellFsFtruncate(ppu_context* ctx)
                                      (int)(uint32_t)ctx->gpr[3], (unsigned long long)ctx->gpr[4], rc);
     ctx->gpr[3] = rc == 0 ? CELL_OK : (uint64_t)(int64_t)CELL_FS_EIO;
 }
-/* File-area preallocation (LBP cache warm-up spams this): host filesystems
- * grow files on write, so accepting is correct -- no preallocation needed. */
-static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+/* Grow an existing host file to `size` bytes without writing the new space.
+ * SetEndOfFile (Windows) and truncate (POSIX) move the end of file, and the
+ * filesystem reads the gap back as zeroes. The CRT's _chsize_s writes those
+ * zeroes itself: about 5 s for a 1.75 GB file, which is what one title asks
+ * for. Returns 0 when the file is now at least `size` long (a longer file is
+ * left alone), 1 when there is no such file, -1 when it cannot be grown. */
+static int host_grow_file(const char* path, uint64_t size)
+{
+    fs_stat64_t st;
+    if (FS_STAT64(path, &st) != 0) return 1;
+    if ((uint64_t)st.st_size >= size) return 0;
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    LARGE_INTEGER end;
+    end.QuadPart = (LONGLONG)size;
+    const BOOL ok = SetFilePointerEx(h, end, NULL, FILE_BEGIN) && SetEndOfFile(h);
+    CloseHandle(h);
+    return ok ? 0 : -1;
+#else
+    return truncate(path, (off_t)size) == 0 ? 0 : -1;
+#endif
+}
+
+/* cellFsAllocateFileAreaWithoutZeroFill(path, u64 size): reserve `size` bytes
+ * for the file without clearing them, so that afterwards the file is that long.
+ *
+ * Accepting the call and doing nothing left the file at whatever length its
+ * writes had reached, and a title that checks the length when it next opens
+ * the file finds it short. Red Dead Redemption sizes its disk cache this way
+ * (cache.dat under /dev_hdd1, 0x6FE02000 bytes), reads the size back on the
+ * next boot, and rebuilt the whole cache on every boot ("Cache file is wrong
+ * size").
+ *
+ * This allocates; it never shrinks, and a file already long enough costs one
+ * stat (LBP calls it repeatedly while it warms its cache). A missing file keeps
+ * the previous answer, CELL_OK with nothing created. */
+static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx)
+{
+    char gpath[1024], hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    host_path(hpath, sizeof hpath, gpath);
+    const uint64_t size = ctx->gpr[4];
+    const int rc = host_grow_file(hpath, size);
+    if (ps3_env_once("PS3_FSLOG"))
+        fprintf(stderr, "[fs] AllocateFileAreaWithoutZeroFill '%s' -> '%s' size=0x%llX (%s)\n",
+                gpath, hpath, (unsigned long long)size,
+                rc == 0 ? "OK" : rc > 0 ? "no such file" : "FAIL");
+    ctx->gpr[3] = rc < 0 ? (uint64_t)(int64_t)CELL_FS_EIO : CELL_OK;
+}
 
 /* Free space for (path, u32* block_size, u64* free_block_count). Unregistered,
  * the call took the unresolved-NID path: CELL_OK with both out-params left as
@@ -987,7 +1115,12 @@ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
  * done", which is exactly true here. */
 static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 
-static void cellFsAioRead(ppu_context* ctx)
+/* One id space for reads and writes: the completion callback and
+ * cellFsAioCancel tell requests apart by id alone, and with a counter each a
+ * read and a write in flight together could both be id 1. */
+static std::atomic<int32_t> s_aio_next_id{1};
+
+static void fs_aio_submit(ppu_context* ctx, bool write)
 {
     uint32_t aio    = (uint32_t)ctx->gpr[3];
     uint32_t id_ptr = (uint32_t)ctx->gpr[4];
@@ -998,81 +1131,91 @@ static void cellFsAioRead(ppu_context* ctx)
     uint32_t buf    = guest_be32(aio + 0x10);
     uint64_t size   = guest_be64(aio + 0x18);
 
-    static std::atomic<int32_t> s_next_id{1};
-    int32_t id = s_next_id++;
+    int32_t id = s_aio_next_id++;
     if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
 
     size_t n = 0;
     int32_t err = CELL_FS_ENOENT;
     if (FILE* f = fd_file(fd)) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
-        fs_prefault(buf, size);
-        /* AIO reads are absolute: they must not move the fd's own position,
-         * and the guest issues them from several threads at once (FIOS media
-         * threads, audio streamers) on the same fd as its plain reads. A bare
-         * seek + read on the shared FILE* did both: another thread's seek
-         * could land between the two, and the next cellFsRead continued from
-         * wherever the AIO stopped. Hold the stream lock across seek, read
-         * and the seek back (stdio's own calls take the same lock). */
+        fs_prefault(buf, size);   /* a read fills it, a write makes the kernel read it: both trap on reserved pages */
+        /* AIO transfers are absolute: they must not move the fd's own
+         * position, and the guest issues them from several threads at once
+         * (FIOS media threads, audio streamers) on the same fd as its plain
+         * reads. A bare seek + read on the shared FILE* did both: another
+         * thread's seek could land between the two, and the next cellFsRead
+         * continued from wherever the AIO stopped. Hold the stream lock across
+         * seek, transfer and the seek back (stdio's own calls take the same
+         * lock). */
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
-        if (HOST_FSEEK64(f, offset) == 0)
-            n = fread(vm_base + buf, 1, (size_t)size, f);
+        if (HOST_FSEEK64(f, offset) == 0) {
+            if (!write) vm_note_write(buf, (size_t)size);   /* kernel write into guest memory */
+            n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
+                      : fread(vm_base + buf, 1, (size_t)size, f);
+            if (!write) vm_note_write_check(n < (size_t)size && ferror(f) && errno == EFAULT, "cellFs aio read");
+        }
+        if (write) fflush(f);
         if (pos >= 0) HOST_FSEEK64(f, pos);
         HOST_UNLOCKFILE(f);
-        err = CELL_OK;
+        err = (!write || n == size) ? CELL_OK : CELL_FS_EIO;
     }
     if (ps3_env_once("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
+        fprintf(stderr, "[fs] aio %s id=%d fd=%d off=%llu size=%llu -> %zu\n", write ? "write" : "read",
                 id, fd, (unsigned long long)offset, (unsigned long long)size, n);
 
     ctx->gpr[3] = CELL_OK;
     if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
+
+static void cellFsAioRead(ppu_context* ctx) { fs_aio_submit(ctx, false); }
 
 /* MLB The Show 16 copies files into its /dev_hdd1 cache in 64 KB chunks, each
  * written with cellFsAioWrite, and polls a status word its completion callback
  * sets. With the NID unresolved the submit "succeeded", nothing was written, the
  * callback never ran, and the boot parked on the first screen. Same contract and
  * the same synchronous-completion shortcut as cellFsAioRead above. */
-static void cellFsAioWrite(ppu_context* ctx)
+static void cellFsAioWrite(ppu_context* ctx) { fs_aio_submit(ctx, true); }
+
+/* cellFsReadWithOffset(fd, u64 offset, void* buf, u64 size, u64* nread) and
+ * cellFsWriteWithOffset(fd, u64 offset, const void* buf, u64 size, u64* nwrite):
+ * the synchronous form of the AIO pair above, I/O at an absolute offset.
+ *
+ * Unregistered, both took the unresolved-NID path: CELL_OK with nothing read or
+ * written and the count left unwritten. Red Dead Redemption reads its RPF
+ * archives with the first -- the header came back empty and the title stopped
+ * at "Cannot load archive" -- and writes its disk cache with the second, which
+ * stayed at 0 bytes. Like the AIO pair they leave the fd's own position where it
+ * was, under the stream lock, since a title issues them from several threads on
+ * one fd alongside its plain reads. */
+static void fs_io_with_offset(ppu_context* ctx, int write)
 {
-    uint32_t aio    = (uint32_t)ctx->gpr[3];
-    uint32_t id_ptr = (uint32_t)ctx->gpr[4];
-    uint32_t cb_opd = (uint32_t)ctx->gpr[5];
-
-    int      fd     = (int)guest_be32(aio + 0x00);
-    uint64_t offset = guest_be64(aio + 0x08);
-    uint32_t buf    = guest_be32(aio + 0x10);
-    uint64_t size   = guest_be64(aio + 0x18);
-
-    static std::atomic<int32_t> s_next_id{1};
-    int32_t id = s_next_id++;
-    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
-
+    int      fd     = (int)(uint32_t)ctx->gpr[3];
+    uint64_t offset = ctx->gpr[4];
+    uint32_t buf    = (uint32_t)ctx->gpr[5];
+    uint64_t size   = ctx->gpr[6];
+    uint32_t n_ptr  = (uint32_t)ctx->gpr[7];
+    FILE* f = fd_file(fd);
+    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+    fs_prefault(buf, size);   /* written by a read, read by a write: same reserved-page trap */
     size_t n = 0;
-    int32_t err = CELL_FS_ENOENT;
-    if (FILE* f = fd_file(fd)) {
-        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
-        /* Absolute, like the read: leave the fd's own position where it was. */
-        HOST_LOCKFILE(f);
-        const int64_t pos = (int64_t)HOST_FTELL64(f);
-        if (HOST_FSEEK64(f, offset) == 0)
-            n = fwrite(vm_base + buf, 1, (size_t)size, f);
-        fflush(f);
-        if (pos >= 0) HOST_FSEEK64(f, pos);
-        HOST_UNLOCKFILE(f);
-        err = (n == size) ? CELL_OK : CELL_FS_EIO;
-    }
+    HOST_LOCKFILE(f);
+    const int64_t pos = (int64_t)HOST_FTELL64(f);
+    if (HOST_FSEEK64(f, offset) == 0)
+        n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
+                  : fread(vm_base + buf, 1, (size_t)size, f);
+    if (pos >= 0) HOST_FSEEK64(f, pos);
+    HOST_UNLOCKFILE(f);
     if (ps3_env_once("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio write id=%d fd=%d off=%llu size=%llu -> %zu\n",
-                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
-
+        fprintf(stderr, "[fs] %s@ fd=%d off=%llu size=%llu -> %zu\n", write ? "write" : "read",
+                fd, (unsigned long long)offset, (unsigned long long)size, n);
+    if (n_ptr) vm_write64(n_ptr, n);
     ctx->gpr[3] = CELL_OK;
-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
+static void cellFsReadWithOffset(ppu_context* ctx)  { fs_io_with_offset(ctx, 0); }
+static void cellFsWriteWithOffset(ppu_context* ctx) { fs_io_with_offset(ctx, 1); }
 
 extern "C" void ppu_fs_register(void)
 {
@@ -1084,6 +1227,8 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClose"),    "cellFsClose",    cellFsClose);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsReadWithOffset"),  "cellFsReadWithOffset",  cellFsReadWithOffset);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsWriteWithOffset"), "cellFsWriteWithOffset", cellFsWriteWithOffset);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);

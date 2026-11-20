@@ -175,6 +175,7 @@ endif()
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
+    port_extension.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}
@@ -290,6 +291,12 @@ else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
 endif()
+
+# ---------------------------------------------------------------------------
+# Build extensions (optional; see cmake/PortExtensions.cmake)
+# ---------------------------------------------------------------------------
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PortExtensions.cmake")
+port_apply_extensions(${PROJECT_NAME})
 
 # ---------------------------------------------------------------------------
 # Install

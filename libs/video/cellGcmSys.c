@@ -11,6 +11,8 @@
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
 #include "rsx_tiling.h"
+#include "gcm_report_clock.h"
+#include "ps3emu/ps3_env_once.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -18,6 +20,7 @@
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+#include "../../include/ps3emu/guest_host_thread.h" /* the GCM interrupt thread's host stack */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
@@ -144,6 +147,8 @@ static int gcm_flip_executed_take(void)
     if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
     return 0;
 }
+static int s_flip_pacing = -1;              /* PS3RECOMP_GCM_FLIP_PACING: -1 unread, 0 fixed, 1 adaptive */
+static void gcm_flip_adaptive_poll(void);   /* below */
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -313,7 +318,10 @@ static CellGcmUserHandler    s_user_handler    = NULL;
 static CellGcmSecondVHandler s_second_v_handler = NULL;
 
 /* Flip timing */
-static u64 s_last_flip_time = 0;
+/* Guest system time (us, sys_time_get_system_time's clock) of the last flip:
+ * titles pace frames as period - (system time - this). */
+static u64 s_last_flip_time = 0;   /* set where a flip completes */
+uint64_t ps3_system_time_us(void);   /* runtime/syscalls/sys_timer.c */
 
 /* VBlank counter (incremented on each flip as approximation) */
 static u32 s_vblank_count = 0;
@@ -381,16 +389,28 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
  * guest memory at gcm_io2ea(offset), where the title reads it itself.
  * Killzone 3 sets 0xFEED0001 and keeps its reports in its own frame data. */
 static u32 s_report_dma = 0xFEED0000u;
-static u64 s_report_last_ts;
 
-/* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
- * walker pass must not share a time stamp or go backwards. */
+/* GET_REPORT timestamp in nanoseconds, strictly rising (gcm_report_clock.h).
+ * PS3RECOMP_GCM_REPORT_BUSY_SCALE=<0..1>: the share of the walker's drain
+ * time the stamps count, 1 by default; 0 leaves the RSX's own work out, for a
+ * title that scales its detail by GPU frame time measured with reports. Only
+ * the walker reaches these, under s_gcm_fifo_lock. */
+static gcm_report_clock s_report_clock;
+static int s_report_clock_ready;
+
+static gcm_report_clock* gcm_report_clock_get(void)
+{
+    if (!s_report_clock_ready) {
+        const char* e = ps3_env_once("PS3RECOMP_GCM_REPORT_BUSY_SCALE");
+        gcm_report_clock_init(&s_report_clock, gcm_report_clock_parse_scale(e));
+        s_report_clock_ready = 1;
+    }
+    return &s_report_clock;
+}
+
 static u64 gcm_report_timestamp(void)
 {
-    u64 t = get_timestamp_ns();
-    if (t <= s_report_last_ts) t = s_report_last_ts + 1u;
-    s_report_last_ts = t;
-    return t;
+    return gcm_report_clock_stamp(gcm_report_clock_get(), get_timestamp_ns());
 }
 
 /* Label area (256 labels, each u32). Labels live in GUEST memory so the
@@ -482,7 +502,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
 /* Clear offset table entries for an IO mapping */
 static void clear_offset_table(u32 ea, u32 io, u32 size)
 {
-    u32 pages = size >> 20;
+    u32 pages = (size + 0xFFFFFu) >> 20;  /* rounded up, as populate_offset_table mapped them */
     u32 ea_page = ea >> 20;
     u32 io_page = io >> 20;
 
@@ -591,7 +611,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_vblank_handler = NULL;
     s_user_handler = NULL;
     s_second_v_handler = NULL;
-    s_last_flip_time = get_timestamp_ns();
+    s_last_flip_time = ps3_system_time_us();
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
@@ -766,8 +786,10 @@ void cellGcmSetWaitFlip(void)
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++) {
+        if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
         Sleep(1);
+    }
     /* A flip still WAITING after the bound is left to the tick. Forcing DONE
      * here skipped its completion: the tick only completes WAITING flips, so
      * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
@@ -808,6 +830,7 @@ u32 cellGcmGetFlipStatus(void)
       if (fd && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
+    if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
     return s_flip_status;
 }
 
@@ -845,6 +868,50 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
+/* PS3RECOMP_GCM_FLIP_PACING=adaptive (opt-in; unset keeps the fixed beat).
+ *
+ * By default a flip the drain has executed completes on the next 60 Hz beat
+ * (cellGcm_request_tick / cellGcmTickFlip), so a frame that misses a beat
+ * waits for the one after, and everything the title orders behind its flip
+ * waits with it. Adaptive pacing completes an executed flip as soon as one
+ * display period has passed since the previous completion: at
+ * max(execution, last completion + 1/60 s). It still completes only flips
+ * the drain has executed, through the same pending-completion and delivery
+ * path as the beat (status, handler, and the late-delivery and newer-request
+ * rules in ppu_gcm_pump), and never more than one per period. The vblank
+ * count, vblank interrupt and handler stay on the ticker. Completions are
+ * polled wherever one may have become possible: after each drain, on the
+ * beat, and while the guest waits on or polls the flip status. */
+#define GCM_FLIP_PERIOD_NS 16666667ull
+static int s_flip_done_any;
+static u64 s_flip_done_ns;
+static unsigned long long s_flip_adaptive_completions;
+static u64 (*s_flip_clock)(void) = get_timestamp_ns;   /* tests substitute it */
+static int gcm_flip_adaptive(void)
+{
+    if (s_flip_pacing < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_FLIP_PACING");
+        s_flip_pacing = e && !strcmp(e, "adaptive");
+        if (s_flip_pacing)
+            fprintf(stderr, "[flip pacing] adaptive: an executed flip completes one period after the last\n");
+    }
+    return s_flip_pacing;
+}
+static void gcm_flip_adaptive_poll(void)
+{
+    if (!gcm_flip_adaptive()) return;
+    const u64 now = s_flip_clock();
+    FLIP_LOCK();
+    const int due = !s_flip_done_any || now - s_flip_done_ns >= GCM_FLIP_PERIOD_NS;
+    const int complete = due && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
+    if (complete) { s_flip_tick_seq = s_flip_req_seq; s_flip_done_ns = now; s_flip_done_any = 1; }
+    FLIP_UNLOCK();
+    if (!complete) return;
+    GCM_PENDING_SET(2);
+    if (++s_flip_adaptive_completions % 600ull == 0)
+        fprintf(stderr, "[flip pacing] adaptive completions=%llu\n", s_flip_adaptive_completions);
+}
+
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
@@ -852,6 +919,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 void cellGcm_request_tick(void)
 {
     s_vblank_count++;
+    if (gcm_flip_adaptive()) { GCM_PENDING_SET(1); gcm_flip_adaptive_poll(); return; }
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -867,7 +935,7 @@ void cellGcm_request_tick(void)
       if (need) {
           u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
           const int flip = s_fifo_getoff == put;
-          if (flip) { FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK(); }
+          if (flip) { FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; s_last_flip_time = ps3_system_time_us(); FLIP_UNLOCK(); }
           GCM_PENDING_SET(flip ? 3 : 1);
           return;
       } }
@@ -879,7 +947,7 @@ void cellGcm_request_tick(void)
      * are unaffected. The completion is stamped with the flip requested last
      * (see ppu_gcm_pump). */
     if (gcm_flip_executed_take()) {
-        FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();
+        FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; s_last_flip_time = ps3_system_time_us(); FLIP_UNLOCK();
         GCM_PENDING_SET(3);
     } else {
         GCM_PENDING_SET(1);
@@ -928,10 +996,9 @@ static int gcm_handler_thread_on(void)
     if (v < 0) { const char* e = getenv("GCM_HANDLER_THREAD"); v = (e && *e && *e != '0') ? 1 : 0; }
     return v;
 }
-#ifndef _WIN32
-#include <pthread.h>
-#endif
-static DWORD WINAPI gcm_intr_main(LPVOID unused)
+/* The handlers run guest code, so the thread gets the host stack a guest PPU
+ * thread does (guest_host_thread.h): their call chains are as deep. */
+static void gcm_intr_main(void* unused)
 {
     (void)unused;
     s_gcm_intr_tid = (unsigned long)GetCurrentThreadId();
@@ -940,12 +1007,7 @@ static DWORD WINAPI gcm_intr_main(LPVOID unused)
 #else
     for (;;) { ppu_gcm_pump(); usleep(250); }
 #endif
-    return 0;
 }
-
-#ifndef _WIN32
-static void* gcm_intr_posix(void* a) { gcm_intr_main(a); return NULL; }
-#endif
 
 void ppu_gcm_pump(void)
 {
@@ -959,11 +1021,7 @@ void ppu_gcm_pump(void)
     if (gcm_handler_thread_on() && (unsigned long)GetCurrentThreadId() != s_gcm_intr_tid) {
         static volatile long started = 0;
         if (!started && InterlockedCompareExchange(&started, 1, 0) == 0)
-#ifdef _WIN32
-            CreateThread(NULL, 1u << 20, gcm_intr_main, NULL, 0, NULL);
-#else
-        { pthread_t t; if (pthread_create(&t, NULL, gcm_intr_posix, NULL) == 0) pthread_detach(t); }
-#endif
+            ps3_guest_host_thread_start(gcm_intr_main, NULL);
         return;   /* only the interrupt thread delivers */
     }
     if (!GCM_PUMP_TRY_ENTER()) return;
@@ -1023,11 +1081,12 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
+    if (gcm_flip_adaptive()) { gcm_flip_adaptive_poll(); return; }
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
      * not happened yet. */
     FLIP_LOCK();
     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
-    if (waiting) s_flip_tick_seq = s_flip_req_seq;
+    if (waiting) { s_flip_tick_seq = s_flip_req_seq; s_last_flip_time = ps3_system_time_us(); }
     FLIP_UNLOCK();
     if (waiting) GCM_PENDING_SET(2);
 }
@@ -1770,8 +1829,33 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+/* PS3RECOMP_GCM_SPU_PUT_KICK=1 (default off; read once): an SPU transfer that
+ * writes the control register's put word wakes the FIFO walker. A title whose
+ * SPU jobs advance put by DMA (an SPU-built command stream, rather than
+ * libgcm's PPU-side flush) otherwise leaves the walker asleep until its idle
+ * wait times out, with new commands already in the buffer. The RSX sees put
+ * whoever writes it, so waking on it is what the hardware does. This hook runs
+ * after the transfer has landed, so the woken walker reads the new put. */
+static int s_spu_put_kick = -1;
+static _Atomic unsigned long long s_spu_put_kicks;
+static void gcm_walker_wake(void);   /* signals the kick event, if any; below */
+static int gcm_spu_put_kick_on(void)
+{
+    if (s_spu_put_kick < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_SPU_PUT_KICK");
+        s_spu_put_kick = e && !strcmp(e, "1");
+        if (s_spu_put_kick) fprintf(stderr, "[gcm] an SPU DMA over the put word wakes the FIFO walker\n");
+    }
+    return s_spu_put_kick;
+}
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    /* [ea, ea + size) covers the put word (unsigned: a transfer below it wraps). */
+    if (size && GCM_CONTROL_GUEST_ADDR - ea < size && gcm_spu_put_kick_on()) {
+        atomic_fetch_add_explicit(&s_spu_put_kicks, 1ull, memory_order_relaxed);
+        gcm_walker_wake();
+    }
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -1997,10 +2081,47 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * the D3D12 backend it feeds) stays on the present thread -- running it from
  * the polling game thread killed the process silently. */
 static HANDLE s_gcm_kick_ev = NULL;
+/* The wake for the put kicks, published once the kick event exists. Going
+ * through a pointer keeps SetEvent out of gcm_note_spu_put, which the SPU DMA
+ * hook makes reachable in every program that links this file: a walker
+ * fixture that never waits on the event (and links no event implementation)
+ * then needs nothing new. */
+static void gcm_walker_wake_event(void) { SetEvent(s_gcm_kick_ev); }
+static void (*s_gcm_walker_wake_fn)(void);
 void* cellGcm_fifo_kick_event(void)
 {
-    if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!s_gcm_kick_ev) {
+        s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (s_gcm_kick_ev) __atomic_store_n(&s_gcm_walker_wake_fn, gcm_walker_wake_event, __ATOMIC_RELEASE);
+    }
     return (void*)s_gcm_kick_ev;
+}
+/* Wake the walker's idle wait, if anything waits on the kick event. */
+static void gcm_walker_wake(void)
+{
+    void (*wake)(void) = __atomic_load_n(&s_gcm_walker_wake_fn, __ATOMIC_ACQUIRE);
+    if (wake) wake();
+}
+
+/* PS3RECOMP_GCM_PPU_PUT_KICK=1 (default off; read once): a PPU store to the
+ * control register's put word wakes the FIFO walker. libgcm's flush is inlined
+ * into the title, so a plain store of put is the only sign that commands are
+ * ready; without a wake the walker sleeps out its idle wait first. The RSX
+ * sees put whoever writes it. The runtime's out-of-line vm_write32 calls this
+ * after the store has landed, for every 32-bit guest store to the word;
+ * lifted code's inline stores leave that word to it. */
+static int s_ppu_put_kick = -1;
+static _Atomic unsigned long long s_ppu_put_kicks;
+void cellGcm_put_on_store(void)
+{
+    if (s_ppu_put_kick < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_PPU_PUT_KICK");
+        s_ppu_put_kick = e && !strcmp(e, "1");
+        if (s_ppu_put_kick) fprintf(stderr, "[gcm] a PPU store of the put word wakes the FIFO walker\n");
+    }
+    if (!s_ppu_put_kick) return;
+    atomic_fetch_add_explicit(&s_ppu_put_kicks, 1ull, memory_order_relaxed);
+    gcm_walker_wake();
 }
 
 /* The present thread's idle wait. It used to be a flat Sleep(4), which meant
@@ -2179,13 +2300,17 @@ void cellGcm_rsx_process_fifo(void)
     g_gcm_drain_tid = GetCurrentThreadId();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    gcm_report_clock* rc = gcm_report_clock_get();
+    if (rc->scale < 1.0) gcm_report_clock_drain_begin(rc, get_timestamp_ns());
     gcm_rsx_process_fifo_unlocked();
+    if (rc->scale < 1.0) gcm_report_clock_drain_end(rc, get_timestamp_ns());
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
     if (ft_t0) {
         const uint64_t t1 = ps3_ft_now();
         if (t1 - ft_t0 >= ps3_ft_min_ns())
             ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
     }
+    if (s_flip_pacing != 0) gcm_flip_adaptive_poll();
 }
 
 /* The methods rsx_process_method acts on beyond its own rsx_state: the notify
@@ -2226,10 +2351,16 @@ static int gcm_word_diag(void)
 }
 
 /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
- * plus the methods whose answer the walker writes itself. */
-static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+ * plus the methods whose answer the walker writes itself. `end_off`: the IO
+ * offset just past the command the word belongs to. */
+static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live, u32 end_off)
 {
     extern u32 g_rsx_last_reference;
+    /* NV4097 back-end write / texture-read semaphore release: the label lands
+     * inside rsx_process_method, so publish `get` past the command first, as
+     * for NV406E RELEASE. */
+    if ((m == 0x1D70u || m == 0x1D74u) && !gcm_get_eq_put())
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, end_off);
     /* #466: rsx_state feeds only the legacy vtable backend. With the draw
      * engine up and no vtable registered, the state it builds is never read,
      * so only the methods with effects outside it are worth handing over.
@@ -2801,7 +2932,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     }
                     for (u32 i = 0; i < count; i++)
                         gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method,
-                                      vm_read32(dea + i * 4), legacy_state_live);
+                                      vm_read32(dea + i * 4), legacy_state_live, s_fifo_getoff + 4 + count * 4);
                     s_fifo_getoff += 4 + count * 4;
                     continue;
                 }
@@ -2954,7 +3085,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
+                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live, s_fifo_getoff + 4 + count * 4);
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
@@ -3455,7 +3586,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
     FLIP_UNLOCK();
-    s_last_flip_time = get_timestamp_ns();
+    /* cellGcmGetLastFlipTime is stamped where the flip completes (the vblank
+     * that shows it: the ticker paths above), not here at the request. */
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
 
@@ -3563,7 +3695,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
-    s_last_flip_time = get_timestamp_ns();
+    s_last_flip_time = ps3_system_time_us();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
      * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
@@ -3572,7 +3704,11 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
 
-    return CELL_OK;
+    /* The buffer id, not CELL_OK: a title can keep this and later pass it to
+     * cellGcmSetFlipImmediate. MLB The Show 16 does, so with 0 here every
+     * flip named buffer 0 while it rendered into 0 and 1 in turn, and the
+     * picture stepped back to the older buffer. */
+    return (s32)bufferId;
 }
 
 /* NID: 0x1BFAB6EE */
@@ -3629,7 +3765,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     gcm_update_handler_mask();
 }
 
-/* NID: 0x21AC3697 */
+/* NID: 0x63387071 (0x21AC3697 is cellGcmAddressToOffset) */
 u64 cellGcmGetLastFlipTime(void)
 {
     return s_last_flip_time;

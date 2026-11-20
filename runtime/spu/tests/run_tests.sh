@@ -16,6 +16,14 @@ TOOLS="$REPO/tools"
 RUNTIME_SPU="$REPO/runtime/spu"
 
 GCC="${1:-${GCC:-gcc}}"
+PY="${PYTHON:-$(command -v python3 || command -v python)}"
+
+# Runtime units every test links. The generated spu_recomp.h and spu_dma.h
+# call into coherency, page-map and drain helpers; test_runtime_stubs.c covers
+# hooks from spu_channels.c that these tests cannot link (they define their own
+# spu_rdch/spu_wrch).
+SUPPORT="$HERE/test_runtime_stubs.c $RUNTIME_SPU/spu_coherency.c $RUNTIME_SPU/spu_vm_pagemap.c
+ $RUNTIME_SPU/spu_drain.c $REPO/runtime/platform/win32_compat.c $REPO/runtime/host/host_stubs.c"
 
 pass=0
 fail=0
@@ -34,8 +42,8 @@ for gen in "$HERE"/gen_test_*.py; do
     exe="$HERE/test_${name}.exe"
 
     rm -rf "$gen_out"
-    python "$gen" > /dev/null
-    python "$TOOLS/spu_lifter.py" --auto-functions "$elf" \
+    "$PY" "$gen" > /dev/null
+    "$PY" "$TOOLS/spu_lifter.py" --auto-functions "$elf" \
         --output "$gen_out" > /dev/null
 
     # Optional per-test extra build args (extra sources / -I dirs). A
@@ -44,8 +52,9 @@ for gen in "$HERE"/gen_test_*.py; do
     EXTRA=""
     [ -f "$HERE/test_${name}.deps" ] && . "$HERE/test_${name}.deps"
 
-    if "$GCC" -std=c11 -O2 -I "$gen_out" -I "$RUNTIME_SPU" \
-        "$gen_out/spu_recomp.c" "$main" $EXTRA -o "$exe" \
+    if "$GCC" -std=gnu17 -O2 -I "$gen_out" -I "$RUNTIME_SPU" \
+        -I "$REPO/include" -I "$REPO/runtime/platform" \
+        "$gen_out/spu_recomp.c" "$main" $SUPPORT $EXTRA -pthread -lm -o "$exe" \
         2> "$HERE/build_${name}.log"; then
         out=$("$exe" 2>&1) && rc=$? || rc=$?
         if [ "$rc" -eq 0 ]; then

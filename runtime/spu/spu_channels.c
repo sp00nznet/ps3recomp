@@ -340,6 +340,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
         g_spu_trampoline_fn = 0;
+        /* No drain is live on the driver stack either, so no return point is.
+         * Left set, the innermost abandoned drain's return pc stops the
+         * interpreter fallback at once on a later return to that address, and
+         * the run ends with the SPU still running. A drain exit restores the
+         * enclosing drain's pc (SPU_DRAIN_POP_IRQ), so nothing else clears it. */
+        ctx->drain_ret_pc = 0;
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
         break;
@@ -932,6 +938,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
+        spu_coh_live_end(ctx);
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
@@ -952,6 +959,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        spu_coh_live_end(ctx);
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>            /* dup/dup2: capture the churn report */
 
 static int g_failures;
 
@@ -170,8 +171,18 @@ static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
 static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
 
+/* Set by a test: the backend keeps one snapshot texture per depth target and
+ * hands the same handle back, refilled, while it is alive (as the Vulkan
+ * backend does). Otherwise every request returns a new texture. */
+static int g_snapshot_in_place;
+static u32 g_snapshot_kept;
 static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
-{ (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++; return stub_handle(); }
+{
+    (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++;
+    if (g_snapshot_in_place && g_snapshot_kept && stub.alive[g_snapshot_kept]) return g_snapshot_kept;
+    g_snapshot_kept = stub_handle();
+    return g_snapshot_kept;
+}
 
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
@@ -619,6 +630,11 @@ static void test_mrt_set(void)
 }
 
 /* ---- 3. the texture cache ------------------------------------------------ */
+
+#ifdef RSX_TEST_EXPECT_TEXTURE_CACHE
+_Static_assert(RSX_DRAW_ENGINE_TEXTURE_CACHE == RSX_TEST_EXPECT_TEXTURE_CACHE,
+               "the texture cache size given at build time is the one the engine uses");
+#endif
 
 static void test_texture_cache(void)
 {
@@ -1257,6 +1273,57 @@ static void test_scissor(void)
           "a scissor larger than the surface is clipped to it (%ux%u)",
           stub.scissor[2], stub.scissor[3]);
 
+    /* A scissor the game WROTE with a zero width or height is empty and clips
+     * everything. The backend reads a zero rectangle as "no scissor", so the
+     * engine must drop the draw rather than hand it one: a game's empty gauge
+     * fill is a long quad cut down to nothing, and drawn unclipped it ran
+     * across the screen. */
+    int before = stub.n_draw;
+    m(M_SCISSOR_H, (0u << 16) | 100u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a written zero-width scissor draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (0u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a written zero-height scissor draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (10u << 16) | 300u);   /* wholly right of the 256-wide target */
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a scissor outside the target draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before + 1 && stub.scissor[2] == 64,
+          "a real scissor after an empty one draws again (%d draws, %u wide)",
+          stub.n_draw - before, stub.scissor[2]);
+    engine_down();
+
+    /* Never written is not empty: the register reads 0 and means no scissor. */
+    engine_up();
+    draw_triangle();
+    CHECK(stub.n_draw == 1 && stub.scissor[2] == 256 && stub.scissor[3] == 256,
+          "a never-written scissor still draws, over the whole surface (%d draws, %ux%u)",
+          stub.n_draw, stub.scissor[2], stub.scissor[3]);
+    engine_down();
+
+    /* One register written with a real size and the other never written: not
+     * an empty scissor, so the draw is kept (and unclipped, as before). */
+    engine_up();
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    draw_triangle();
+    CHECK(stub.n_draw == 1 && stub.scissor[2] == 256 && stub.scissor[3] == 256,
+          "only the horizontal scissor written, non-empty: still drawn (%d draws, %ux%u)",
+          stub.n_draw, stub.scissor[2], stub.scissor[3]);
     engine_down();
 }
 
@@ -2072,6 +2139,43 @@ static void test_depth_snapshot_release(void)
     engine_down();
 }
 
+/* The same clear, depth pass and read, against a backend that refills one
+ * texture per depth target in place: the handle it returns again is the one
+ * the engine already holds, and it has to stay alive for the draw that
+ * samples it. Releasing the previous snapshot without comparing handles
+ * releases the one just returned, so every second pass samples a released
+ * texture and the next request makes a new one. */
+static void test_depth_snapshot_refilled_in_place(void)
+{
+    printf("-- depth snapshot refilled in place stays alive\n");
+    engine_up();
+    g_snapshot_in_place = 1; g_snapshot_kept = 0;
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+
+    int taken = 0, dead = 0;
+    u32 first = 0;
+    for (int pass = 0; pass < 4; pass++) {
+        depth_pass();
+        const int before = stub.n_depth_snapshot;
+        const u32 snap = sample_depth();
+        if (stub.n_depth_snapshot != before + 1) continue;
+        taken++;
+        if (!first) first = snap;
+        if (!snap || snap != g_snapshot_kept || !stub.alive[snap]) dead++;
+    }
+    CHECK(taken == 4, "each pass after a clear asks for a snapshot (%d of 4)", taken);
+    CHECK(dead == 0, "every pass samples the live refilled snapshot (%d sampled a released one)",
+          dead);
+    CHECK(first && g_snapshot_kept == first && stub.n_released[first] == 0,
+          "one texture serves every pass and is never released (%u, %u, %d release calls)",
+          first, g_snapshot_kept, first ? stub.n_released[first] : -1);
+    g_snapshot_in_place = 0; g_snapshot_kept = 0;
+    engine_down();
+}
+
 /* depth_as_color: the zeta's bytes made on the GPU, no store to guest memory. */
 static int g_argb_calls, g_argb_fail;
 static u32 g_argb_w, g_argb_h, g_argb_fmt;
@@ -2638,6 +2742,14 @@ static void test_clear_rect(void)
     CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
           "a scissor outside the surface clears nothing (%d rect, %d whole)",
           g_rect.n_color, stub.n_clear_color);
+
+    /* So does one written empty, and not as a whole-surface clear. */
+    m(M_SCISSOR_H, (0u << 16) | 16u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a written zero-width scissor clears nothing (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
     engine_down();
 
     /* The co-op frame: player 1's view under a left-half scissor, then
@@ -2711,7 +2823,218 @@ static void test_clear_rect(void)
     engine_down();
 }
 
-int main(void)
+/* ---- one own-target copy a pass ------------------------------------------ */
+
+/* A draw sampling the colour target it writes gets a copy of it. The copy is
+ * made once per pass (a run of draws and clears into one colour set and zeta)
+ * and shared by every such draw in it; a new pass, a frame, a clear of the
+ * target or a guest write into it makes the next one.
+ * sharing is opt-in (PS3RECOMP_ENG_FEEDBACK_PER_PASS=1); by default every
+ * draw takes its own. The suite is run both ways and `per` is what the run
+ * expects: one copy a draw by default, one a pass when opted in. */
+static int g_fb_copies;
+static rsx_draw_backend g_fb_backend;
+
+static u32 fb_snapshot(void* u, u32 surface)
+{ (void)u; (void)surface; g_fb_copies++; return stub_handle(); }
+
+static void fb_up(void)
+{
+    g_fb_backend = g_stub_backend;
+    g_fb_backend.color_snapshot = fb_snapshot;
+    engine_up_with(&g_fb_backend);
+    g_fb_copies = 0;
+    /* A8R8G8B8 pitch-linear 256x256 target at 0x40000, unit 0 sampling it. */
+    m(M_SURFACE_FORMAT, 0x148);
+    m(M_COLOR_A_PITCH, 1024);
+    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
+    m(M_TEX_UNIT + 0x18, (256u << 16) | 256u);
+    m(0x1840, 1024);                        /* the unit's pitch */
+}
+
+static void test_feedback_per_pass(void)
+{
+    const char* e = getenv("PS3RECOMP_ENG_FEEDBACK_PER_PASS");
+    const int shared = e && *e && atoi(e) != 0;
+    const int per = !shared;
+    printf("-- own-target copies%s\n", shared ? " (one a pass, opted in)" : " (one a draw, the default)");
+
+    /* Several draws in one pass share a copy. */
+    fb_up();
+    draw_triangle();
+    const u32 first = stub.bound_tex[0];
+    draw_triangle();
+    const u32 second = stub.bound_tex[0];
+    draw_triangle();
+    const u32 third = stub.bound_tex[0];
+    CHECK(stub.n_draw == 3 && g_fb_copies == (per ? 3 : 1),
+          "three own-target draws in one pass take %d copy(ies) (%d)",
+          per ? 3 : 1, g_fb_copies);
+    CHECK(per ? (first != second && second != third) : (first == second && second == third),
+          "%s", per ? "each draw samples its own copy"
+                    : "every draw in the pass samples the one copy");
+    CHECK(first && (per ? !stub.alive[first] && !stub.alive[second] : stub.alive[first]),
+          "%s", per ? "a copy the next draw replaced is released"
+                    : "the shared copy stays alive through the pass");
+    engine_down();
+    CHECK(!stub.alive[third], "shutdown releases the last copy");
+
+    /* A change of target set between them starts a second pass. */
+    fb_up();
+    draw_triangle();
+    draw_triangle();
+    m(M_COLOR_A_OFFSET, 0x90000u);          /* another target; unit 0 samples 0x40000 */
+    draw_triangle();
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 5 && g_fb_copies == (per ? 4 : 2),
+          "a target-set change in between makes a second copy (%d, want %d)",
+          g_fb_copies, per ? 4 : 2);
+    engine_down();
+
+    /* A change of zeta alone is a new pass too. */
+    fb_up();
+    draw_triangle();
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_ZETA_OFFSET, 0x200000u);
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 3 && g_fb_copies == (per ? 3 : 2),
+          "a zeta change in between makes a second copy (%d, want %d)",
+          g_fb_copies, per ? 3 : 2);
+    engine_down();
+
+    /* A presented frame ends the pass: the next one never samples the last
+     * frame's copy. */
+    fb_up();
+    draw_triangle();
+    draw_triangle();
+    rsx_draw_engine_present();
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 4 && g_fb_copies == (per ? 4 : 2),
+          "a presented frame makes a new copy (%d, want %d)", g_fb_copies, per ? 4 : 2);
+    engine_down();
+
+    /* A clear of the target retires the copy. */
+    fb_up();
+    draw_triangle();
+    draw_triangle();
+    const u32 before = stub.bound_tex[0];
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 4 && g_fb_copies == (per ? 4 : 2) && stub.bound_tex[0] != before,
+          "a clear of the target makes a new copy (%d, want %d)", g_fb_copies, per ? 4 : 2);
+    CHECK(!stub.alive[before], "the copy from before the clear was released");
+    engine_down();
+
+    /* A clear that leaves the colour alone (depth only) keeps the copy. */
+    fb_up();
+    draw_triangle();
+    m(M_CLEAR_BUFFERS, 0x01u);              /* depth only */
+    draw_triangle();
+    CHECK(stub.n_draw == 2 && g_fb_copies == (per ? 2 : 1),
+          "a depth-only clear does not retire the colour copy (%d, want %d)",
+          g_fb_copies, per ? 2 : 1);
+    engine_down();
+
+    /* A write into the target's bytes by the guest (a 2D transfer) retires it. */
+    fb_up();
+    draw_triangle();
+    draw_triangle();
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u, 1024u, 4u, 4u);
+    draw_triangle();
+    draw_triangle();
+    CHECK(stub.n_draw == 4 && g_fb_copies == (per ? 4 : 2),
+          "a guest write into the target makes a new copy (%d, want %d)",
+          g_fb_copies, per ? 4 : 2);
+    engine_down();
+}
+
+/* Runs `body` with stderr captured into `out` (NUL-terminated, truncated). */
+static void capture_stderr(void (*body)(void), char* out, size_t cap)
+{
+    fflush(stderr);
+    FILE* tmp = tmpfile();
+    const int saved = dup(2);
+    if (!tmp || saved < 0) { out[0] = 0; body(); return; }
+    dup2(fileno(tmp), 2);
+    body();
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    rewind(tmp);
+    const size_t n = fread(out, 1, cap - 1, tmp);
+    out[n] = 0;
+    fclose(tmp);
+}
+
+static void churn_body(void)
+{
+    engine_up();
+    m(M_CLEAR_BUFFERS, 0xF0u);                 /* first colour target: new */
+    for (int i = 0; i < 3; i++) {              /* size flips back and forth */
+        m(M_SURFACE_CLIP_H, 512u << 16);
+        m(M_SURFACE_CLIP_V, 512u << 16);
+        m(M_CLEAR_BUFFERS, 0xF0u);
+        m(M_SURFACE_CLIP_H, 256u << 16);
+        m(M_SURFACE_CLIP_V, 256u << 16);
+        m(M_CLEAR_BUFFERS, 0xF0u);
+    }
+    engine_down();                             /* the final report */
+}
+
+static void test_target_churn(void)
+{
+    printf("-- render-target churn counter\n");
+    static char log[16384];
+
+    unsetenv("PS3RECOMP_RSX_TARGET_CHURN");
+    capture_stderr(churn_body, log, sizeof log);
+    CHECK(!strstr(log, "[target churn]"), "off by default: no churn report");
+    const int creates_off = stub.n_color_create;
+
+    setenv("PS3RECOMP_RSX_TARGET_CHURN", "1", 1);
+    capture_stderr(churn_body, log, sizeof log);
+    unsetenv("PS3RECOMP_RSX_TARGET_CHURN");
+    CHECK(stub.n_color_create == creates_off,
+          "counting changes no engine behaviour (%d vs %d creates)",
+          stub.n_color_create, creates_off);
+    char want[64];
+    snprintf(want, sizeof want, "creates=%d ", stub.n_color_create);
+    CHECK(strstr(log, want) != NULL, "the summary counts every creation (%s)\n%s", want, log);
+    CHECK(strstr(log, "color 0:0x00040000 new -> ") != NULL,
+          "the first target at the address is reported as new\n%s", log);
+    CHECK(strstr(log, "256x256 -> fmt") && strstr(log, "512x512 -> fmt"),
+          "both size transitions are reported\n%s", log);
+}
+
+/* ---- PS3RECOMP_RSX_SINGLE_PRESENT: one present per flip ----------------- */
+
+/* Runs in its own process (main's "single" mode): the switch is read once. */
+static void test_single_present(void)
+{
+    printf("-- single present\n");
+    engine_up();
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    const int before = stub.n_present;
+    m(0xE944u, 0);                          /* the FIFO reaches a flip: the engine presents it */
+    CHECK(stub.n_present == before + 1, "the flip method presents once");
+    rsx_draw_engine_present();              /* the host frame clock presents the same flip */
+    CHECK(stub.n_present == before + 1, "a host present right after the engine's is skipped");
+    rsx_draw_engine_present();              /* no newer flip: a host present still presents */
+    CHECK(stub.n_present == before + 2, "a host present with no engine flip before it presents");
+    m(0xE944u, 1);
+    m(0xE944u, 0);                          /* two flips between host presents */
+    CHECK(stub.n_present == before + 4, "each flip method presents");
+    rsx_draw_engine_present();
+    CHECK(stub.n_present == before + 4, "one host present after them is skipped");
+    engine_down();
+}
+
+int main(int argc, char** argv)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
     if (!vm_base) { printf("[FAIL] guest memory\n"); return 1; }
@@ -2723,6 +3046,12 @@ int main(void)
         p[0] = 0x3F; p[1] = 0x80; p[2] = 0; p[3] = 0;    /* 1.0f big-endian */
     }
 
+    if (argc > 1 && !strcmp(argv[1], "single")) {
+        setenv("PS3RECOMP_RSX_SINGLE_PRESENT", "1", 1);
+        test_single_present();
+        printf("%s\n", g_failures ? "FAIL" : "PASS single present");
+        return g_failures ? 1 : 0;
+    }
     test_surface_set();
     test_surface_aliasing();
     test_mrt_set();
@@ -2751,6 +3080,7 @@ int main(void)
     test_antialiased_wpos();
     test_depth_read_as_color();
     test_depth_snapshot_release();
+    test_depth_snapshot_refilled_in_place();
     test_depth_read_as_argb_on_gpu();
     test_z16_read_as_depth16_on_gpu();
     test_full_tables_evict_the_oldest();
@@ -2759,6 +3089,8 @@ int main(void)
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
     test_clear_rect();
+    test_feedback_per_pass();
+    test_target_churn();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

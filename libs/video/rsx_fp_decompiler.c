@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_env_once.h"
 
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
@@ -912,7 +913,7 @@ static int rsx_fp_decompile_internal(
         }
 
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
-            (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            (opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
             static u32 reported;
             if (PS3_LOG_FIRST(reported, 32))
                 fprintf(stderr, "[RSX fp] gamma fetch opcode %u unsupported on unit %u\n", opcode, tex_unit);
@@ -949,7 +950,13 @@ static int rsx_fp_decompile_internal(
          * an unhandled op the destination kept 0 and every glyph bloated. */
         case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
         case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
-        case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
+        case OP_RCP:
+            /* RSX_FP_SAFE_DIV=1: guard OP_RCP, OP_DIV, and _rsx_inv_w against zero-division NaNs. */
+            if (ps3_env_once("RSX_FP_SAFE_DIV"))
+                snprintf(rhs, sizeof(rhs), "((%s).x != 0.0 ? 1.0 / (%s).x : 0.0)", a, a);
+            else
+                snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a);
+            break;
         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
          * builtins): the packed word is a scalar that replicates. */
         case OP_PK4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(%s))", a); break;
@@ -975,7 +982,12 @@ static int rsx_fp_decompile_internal(
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
         case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
-        case OP_DIV: snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
+        case OP_DIV:
+            if (ps3_env_once("RSX_FP_SAFE_DIV"))
+                snprintf(rhs, sizeof(rhs), "((%s).x != 0.0 ? (%s) / (%s).x : (float4)0.0)", b, a, b);
+            else
+                snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b);
+            break;
         /* Real RSX DIVSQ shares RSQ's sign-ignoring sqrt on the denominator
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp's _builtin_sqrt macro,
          * reused by _builtin_divsq) AND forces the result to exactly 0,
@@ -1023,6 +1035,23 @@ static int rsx_fp_decompile_internal(
             else
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+            break;
+        /* Explicit-derivative fetch: SRC0 is the coordinate, SRC1 and SRC2 its
+         * partial derivatives along window x and y. A depth comparison on this
+         * opcode stops above, as for TXB and TXL. */
+        case OP_TXD:
+            if ((tex_sep_mask >> tex_unit) & 1u)
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.SampleGrad(rsx_samp[%u], (%s).xyz, (%s).xyz, (%s).xyz)",
+                         tex_unit, tex_unit, a, b, c);
+            else if (tex_sep_mask)
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.SampleGrad(rsx_samp[%u], (%s).xy, (%s).xy, (%s).xy)",
+                         tex_unit, tex_unit, a, b, c);
+            else
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex[%u].SampleGrad(rsx_samp[%u], (%s).xy, (%s).xy, (%s).xy)",
+                         tex_unit, tex_unit, a, b, c);
             break;
         case OP_TXP:
             if (shadow && shadow[tex_unit].enabled) {
@@ -1093,7 +1122,8 @@ static int rsx_fp_decompile_internal(
         }
 
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL ||
+             opcode == OP_TXD)) {
             char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
             const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_input(%s, %uu)",
                                         sample, gamma_masks[tex_unit] & 15u);
@@ -1108,7 +1138,8 @@ static int rsx_fp_decompile_internal(
          * A comparison fetch has nothing to expand. */
         if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
             !(shadow && shadow[tex_unit].enabled) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL ||
+             opcode == OP_TXD)) {
             const int bx2 = (w0 & (1u << 21)) != 0;
             u32 mask = bx2 ? 15u : (expand_masks[tex_unit] & 0x1Fu);
             if (!bx2 && gamma_masks) mask &= ~(gamma_masks[tex_unit] & 15u);
@@ -1119,7 +1150,7 @@ static int rsx_fp_decompile_internal(
                 if (length < 0 || (size_t)length >= sizeof rhs) return -1;
             }
         } else if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
-                   (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+                   (opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
             static u32 reported;
             if (PS3_LOG_FIRST(reported, 32))
                 fprintf(stderr, "[RSX fp] sign-expand fetch opcode %u unsupported on unit %u (read unexpanded)\n",
@@ -1313,13 +1344,23 @@ static int rsx_fp_decompile_internal(
      * SPIR-V FragCoord (Vulkan, and Metal's [[position]] is (x, y, z, 1/w));
      * the glslang paths define RSX_FRAGCOORD_W_IS_RCP. Emitted only where the
      * body uses it, so every other program stays byte-identical. */
-    if (strstr(o.p, "_rsx_inv_w("))
-        out_puts(&p,
-            "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
-            "#define _rsx_inv_w(p) ((p).w)\n"
-            "#else\n"
-            "#define _rsx_inv_w(p) (1.0 / (p).w)\n"
-            "#endif\n");
+    if (strstr(o.p, "_rsx_inv_w(")) {
+        if (ps3_env_once("RSX_FP_SAFE_DIV")) {
+            out_puts(&p,
+                "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
+                "#define _rsx_inv_w(p) ((p).w)\n"
+                "#else\n"
+                "#define _rsx_inv_w(p) ((p).w != 0.0 ? (1.0 / (p).w) : 0.0)\n"
+                "#endif\n");
+        } else {
+            out_puts(&p,
+                "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
+                "#define _rsx_inv_w(p) ((p).w)\n"
+                "#else\n"
+                "#define _rsx_inv_w(p) (1.0 / (p).w)\n"
+                "#endif\n");
+        }
+    }
     /* WPOS in the RSX window convention. The host position has its origin at the
      * top left; with SET_SHADER_WINDOW origin BOTTOM the RSX counts y up from the
      * bottom edge. A full-screen pass that builds its UV from it, e.g.

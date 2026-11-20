@@ -713,6 +713,19 @@ static void pad_poll_sdl2(void)
 static void pad_init_backend(void)
 {
     if (!s_sdl_inited) {
+        /* Face buttons by position, as on a PlayStation pad: SDL's A is
+         * the bottom one (Cross), B the right one (Circle). By default
+         * SDL 2 maps a Nintendo controller by its printed labels, which
+         * put Cross on the right (the button marked A) and Circle at the
+         * bottom: confirm and cancel swapped against a PS3 pad, with
+         * Square and Triangle swapped too. Everything a PS3 title shows
+         * is a PS3 symbol, so the position is what counts. Xbox and
+         * PlayStation pads are the same either way. Set before the
+         * subsystem is started (or found already started), so it holds for
+         * the first controller.
+         * SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1 in the environment
+         * still wins over this. */
+        SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
         if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
             /* The game is not always the focused app: on macOS its window
              * can belong to another process (the launcher in
@@ -874,8 +887,15 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= s_max_connect || !data_guest)
+    /* libio (FW 4.93) cellPadGetData: port_no > 126 (unsigned) or data == NULL
+     * is INVALID_PARAMETER; a port whose connection byte is not set is
+     * NO_DEVICE. libio has no comparison with max_connect, the byte is simply
+     * never set for a port the connect handler refused, and a port at or past
+     * max_connect is such a port. RPCS3 cellPad.cpp agrees. */
+    if (port_no >= CELL_MAX_PADS || !data_guest)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (port_no >= s_max_connect)
+        return CELL_PAD_ERROR_NO_DEVICE;
 
     /* Build in a local host struct, then copy to guest memory big-endian. */
     CellPadData _d; CellPadData* data = &_d;
@@ -1509,8 +1529,12 @@ s32 cellPadClearBuf(u32 port_no)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+    /* libio (FW 4.93) cellPadClearBuf: port_no > 126 -> INVALID_PARAMETER, a
+     * port that is not connected -> NO_DEVICE, as for cellPadGetData. */
+    if (port_no >= CELL_MAX_PADS)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (port_no >= s_max_connect)
+        return CELL_PAD_ERROR_NO_DEVICE;
 
     /* Nothing to clear in our implementation -- state is polled fresh */
     return CELL_OK;

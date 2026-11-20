@@ -433,6 +433,12 @@ typedef struct spu_context {
      * spu_coh_reserve_fast). Written under that lock, read by the context's
      * own thread. */
     int coh_listed;
+
+    /* PS3RECOMP_SPU_LIVE_HOLDERS (spu_coherency.c): the line this context is
+     * counted on in the live-holder table, from its GETLLAR until its
+     * reservation ends on this thread. Owner thread only. */
+    uint32_t coh_live_line;
+    int coh_live_counted;
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own
@@ -479,6 +485,14 @@ typedef struct spu_context {
  * the context. Pair with spu_coh_unregister before a reset or destruction. */
 void spu_mfc_release(spu_context* ctx);
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
+
+/* Effective-address window of the SPU thread group's local stores. */
+#define SPU_THREAD_EA_BASE   0xF0000000u
+#define SPU_THREAD_EA_STRIDE 0x00100000u
+#define SPU_THREAD_LS_MAX    6u
+/* The context whose local store SPU spu_num of self's thread group holds, or
+ * NULL (spurs_policy.c). */
+spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num);
 
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {

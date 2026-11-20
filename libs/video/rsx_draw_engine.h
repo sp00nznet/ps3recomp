@@ -118,8 +118,13 @@ typedef struct rsx_be_render_state {
 
 /* How many distinct guest textures the engine keeps before it evicts the
  * least recently used one. Public so the eviction test can be exact about
- * where the boundary is rather than assuming a number. */
+ * where the boundary is rather than assuming a number. A title whose frame
+ * binds more defines a larger cache at build time
+ * (-DRSX_DRAW_ENGINE_TEXTURE_CACHE=N): past the cap every frame evicts and
+ * re-decodes the textures it is about to bind again. */
+#ifndef RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+#endif
 
 /* ---- the backend interface ---------------------------------------------- */
 
@@ -168,7 +173,11 @@ typedef struct rsx_draw_backend {
     u32  (*depth_target_create)(void* user, u32 w, u32 h);
     void (*depth_target_release)(void* user, u32 depth);
     /* Resolve a depth target into a sampleable texture and return it; 0 when
-     * the backend cannot. The engine only asks after a depth-writing draw. */
+     * the backend cannot. The engine only asks after a depth-writing draw. The
+     * engine owns the result and releases it with texture_release once it has
+     * a newer snapshot of the same target. A backend may keep one texture per
+     * depth target and return that same handle again, refilled: the engine
+     * then keeps it and releases nothing. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
@@ -213,6 +222,12 @@ typedef struct rsx_draw_backend {
      * (rsx_be_render_state.depth_bounds_test); a backend that leaves this
      * NULL draws as if the test were off. */
     void (*set_depth_bounds)(void* user, float min, float max);
+    /* Optional: the blend constant (SET_BLEND_COLOR, and _COLOR2 on a
+     * half-float target) as r, g, b, a in 0..1, called before every draw.
+     * It is what the CONSTANT_COLOR / CONSTANT_ALPHA blend factors
+     * (0x8001..0x8004) multiply by; a backend that leaves this NULL must not
+     * map those factors. */
+    void (*set_blend_color)(void* user, const float rgba[4]);
     /* Optional. The NV4097 polygon offset for the next draw, called before
      * every draw like the stencil reference (SET_POLY_OFFSET_{POINT,LINE,
      * FILL}_ENABLE 0x0A60/0x0A64/0x0A68, SCALE_FACTOR 0x0A78, BIAS 0x0A7C).
@@ -300,6 +315,13 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional. depth_snapshot into `dst`, a texture an earlier depth_snapshot
+     * of the same size returned, instead of a new one: the engine re-takes a
+     * depth-bounds copy with it rather than allocating one per snapshot.
+     * Ordered after every draw already handed over that samples `dst`.
+     * Returns dst, or 0 when the backend cannot (the engine then takes a new
+     * snapshot). */
+    u32  (*depth_snapshot_into)(void* user, u32 depth, u32 dst);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

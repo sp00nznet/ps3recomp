@@ -18,6 +18,9 @@ int g_resv_store_active;
 uint32_t g_ww_lo,g_ww_hi,g_barrier_sync_watch;
 uint32_t g_spu_image_src_ea,g_spu_image_ls_start,g_spu_image_span;
 void ppu_resv_break_store(uint64_t ea) {(void)ea;}
+int g_resv_open_active = 0;
+void ppu_resv_open_note(ppu_context* ctx, uint32_t ea) { (void)ctx; (void)ea; }
+void ppu_resv_open_done(ppu_context* ctx) { (void)ctx; }
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
 unsigned long long ps3_ms_now(void)
 {

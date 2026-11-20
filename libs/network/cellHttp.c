@@ -6,6 +6,7 @@
  * responses with header parsing and body streaming.
  */
 
+#include "../../runtime/memory/vm_watch_hooks.h"
 #include "cellHttp.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -716,6 +717,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         /* buf is a guest address (the overflow copy above already translates
          * it); recv() into the raw value wrote to the host address of the same
          * number whenever a body outgrew the header read. */
+        vm_note_host_write(GUEST_PTR(buf, char*) + filled, want);   /* kernel write into guest memory */
         int n = recv(t->sock, GUEST_PTR(buf, char*) + filled, (int)want, 0);
         if (n < 0) {
             /* Error - if we already have some data, return it */

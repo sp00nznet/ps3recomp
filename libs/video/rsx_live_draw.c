@@ -20,6 +20,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "rsx_present_thread.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/log_first.h"
@@ -105,6 +106,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <d3dcompiler.h>
 #include "rsx_vertex_formats.h"
 #include "rsx_d3d12_device.h"
+#include "rsx_fence_wait.h"
 #include <sys/stat.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -210,6 +212,7 @@ typedef struct {
     /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
     struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
     u32 swin_wgen;            /* bumped by every write into the surface; a window older than it is recopied */
+    u64 last_write_serial;    /* production ordering across same-address views */
 #if !defined(YZ_PERF_CLEAN)
     u32 resource_serial;
     u32 last_write_generation;
@@ -302,6 +305,7 @@ typedef struct {
 
     surface_t                  surfaces[MAX_SURFACES];
     u32                        n_surfaces;
+    u64                        surface_write_serial;
     display_buffer_t           display_buffers[8];
 
     ID3D12DescriptorHeap*      dsv_heap;
@@ -487,6 +491,7 @@ static void ld_surface_note_write(u32 target, u32 kind)
     if (target >= MAX_SURFACES)
         return;
     surface_t* surface = &g.surfaces[target];
+    surface->last_write_serial = ++g.surface_write_serial;
     const u32 generation = ++g_ld_surface_generation;
     surface->swin_wgen++;
     surface->last_write_generation = generation;
@@ -517,7 +522,10 @@ static void ld_surface_note_write(u32 target, u32 kind)
 }
 #else
 #define ld_surface_note_write(target, kind) \
-    do { if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; } while (0)
+    do { if ((target) < MAX_SURFACES) { \
+        g.surfaces[(target)].last_write_serial = ++g.surface_write_serial; \
+        g.surfaces[(target)].swin_wgen++; \
+    } } while (0)
 #endif
 
 #define LD_LAYOUT_CACHE_CAP 256u
@@ -1750,13 +1758,28 @@ static void ld_flush(ld_flush_reason reason)
         g.ready = 0;
         return;
     }
-    if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+    const u64 completed = g.fence->lpVtbl->GetCompletedValue(g.fence);
+    if (completed == UINT64_MAX) {
+        fprintf(stderr,
+                "[d3d-fail] device removed before fence wait frame=%u\n",
+                g_ld_frames);
+        ld_dump_dred("GetCompletedValue", DXGI_ERROR_DEVICE_REMOVED);
+        g.ready = 0;
+        return;
+    }
+    if (!rsx_fence_ready(1, completed, v)) {
+        HRESULT event_hr;
+        DWORD wait_result;
+        DWORD wait_error;
+        u64 after;
+        HRESULT wait_hr;
 #if defined(YZ_PERF_PROFILE)
-        const LONGLONG wait_begin = ld_profile_qpc();
+        LONGLONG wait_begin;
+        u64 wait_ticks;
+        wait_begin = ld_profile_qpc();
 #endif
-        const HRESULT event_hr =
-            g.fence->lpVtbl->SetEventOnCompletion(
-                g.fence, v, g.fence_event);
+        event_hr = g.fence->lpVtbl->SetEventOnCompletion(
+            g.fence, v, g.fence_event);
         if (FAILED(event_hr)) {
             fprintf(stderr,
                     "[d3d-fail] fence SetEventOnCompletion "
@@ -1766,12 +1789,35 @@ static void ld_flush(ld_flush_reason reason)
             g.ready = 0;
             return;
         }
-        WaitForSingleObject(g.fence_event, INFINITE);
+        wait_result = WaitForSingleObject(g.fence_event, INFINITE);
+        wait_error =
+            wait_result == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
 #if defined(YZ_PERF_PROFILE)
-        const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
+        wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
         g_ld_profile.total.fence_wait_qpc += wait_ticks;
         g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
 #endif
+        after = g.fence->lpVtbl->GetCompletedValue(g.fence);
+        if (!rsx_fence_ready(
+                wait_result == WAIT_OBJECT_0, after, v)) {
+            fprintf(stderr,
+                    "[d3d-fail] fence wait result=0x%08lX "
+                    "error=%lu completed=%llu required=%llu frame=%u\n",
+                    (unsigned long)wait_result,
+                    (unsigned long)wait_error,
+                    (unsigned long long)after,
+                    (unsigned long long)v,
+                    g_ld_frames);
+            wait_hr = E_FAIL;
+            if (wait_result == WAIT_FAILED &&
+                wait_error != ERROR_SUCCESS)
+                wait_hr = HRESULT_FROM_WIN32(wait_error);
+            else if (after == UINT64_MAX)
+                wait_hr = DXGI_ERROR_DEVICE_REMOVED;
+            ld_dump_dred("FenceWait", wait_hr);
+            g.ready = 0;
+            return;
+        }
     }
     ld_drain_info_queue("flush");
     /* Dynamic guest textures can replace a cached D3D resource while an
@@ -2947,6 +2993,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->resource_serial = ++g_ld_surface_resource_serial;
 #endif
     ld_surface_note_write(slot, LD_SURFACE_WRITE_CREATE);
+    s->last_write_serial = 0;  /* allocation is not a write of usable content */
     /* RTVs for surfaces live above the swap-chain backbuffer RTVs */
     g.dev->lpVtbl->CreateRenderTargetView(g.dev, s->tex,
         NULL, rtv_handle(LD_SWAP_BUFFERS + slot));
@@ -3082,6 +3129,54 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
             fprintf(stderr, "[swin] copies=%llu frame=%u\n", (unsigned long long)g_ld_swin_copies, g_ld_frames);
     }
     return (int)(SRV_SURF_WIN_BASE + si * LD_SWIN_PER + k);
+}
+
+static u32 ld_surface_texel_bytes(DXGI_FORMAT format)
+{
+    if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) return 16u;
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) return 8u;
+    return 4u;
+}
+
+/* Exact physical-layout reads of the current target need its ordered
+ * snapshot, even if a stale resource of another size shares its address.
+ * Keep existing remap/reinterpretation/subrectangle routes, and let a newer
+ * covering write through the same guest rows remain the sampled source. */
+static int surface_feedback_matches(const surface_t* s, const rsx_dsp_texture* t,
+                                    const rsx_dsp_surface* sf)
+{
+    const u32 base = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    u32 color = 0;
+    if (s->fmt == DXGI_FORMAT_R8G8B8A8_UNORM && base == RSX_TEX_FMT_A8R8G8B8)
+        color = 8;
+    else if (s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT && base == RSX_TEX_FMT_W16Z16Y16X16_FLOAT)
+        color = 11;
+    else if (s->fmt == DXGI_FORMAT_R32G32B32A32_FLOAT && base == RSX_TEX_FMT_W32Z32Y32X32_FLOAT)
+        color = 12;
+    if (!color || (t->remap & 0xffffu) != 0xaae4u ||
+        sf->color_format != color || sf->raster_type != 1 ||
+        s->location != t->location || s->offset != t->offset ||
+        !(t->format & TEX_FMT_LINEAR) || t->dimension != 2 ||
+        t->cubemap || t->mipmaps > 1 || t->depth > 1 ||
+        t->width != s->w || t->height != s->h)
+        return 0;
+    const u64 row = (u64)s->w * ld_surface_texel_bytes(s->fmt);
+    const u64 sp = s->pitch ? s->pitch : row;
+    const u64 tp = t->pitch ? t->pitch : row;
+    if (!row || sp < row || tp != sp) return 0;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const surface_t* other = &g.surfaces[i];
+        if (other == s || !other->tex || other->location != s->location ||
+            other->offset != s->offset || other->fmt != s->fmt ||
+            other->w < t->width || other->h < t->height ||
+            other->last_write_serial <= s->last_write_serial)
+            continue;
+        const u64 other_row = (u64)other->w * ld_surface_texel_bytes(other->fmt);
+        const u64 other_pitch = other->pitch ? other->pitch : other_row;
+        if (other_pitch == sp && other_pitch >= other_row)
+            return 0;
+    }
+    return 1;
 }
 
 /* A draw that samples its own render target. RSX reads and writes the same
@@ -5082,6 +5177,7 @@ typedef struct {
     batch_t idx[256]; u32 n_idx;
     u32     n_packets;
     vtx_t*  verts; u32 n_verts, cap_verts;
+    u32     n_immediate;
     rsx_vertex_ref* refs; u32 n_refs, cap_refs;
     u32     n_source_refs;
     int     refs_remapped;
@@ -5103,6 +5199,7 @@ static draw_ctx dc;
 static void dc_reset(void)
 {
     dc.n_arr = dc.n_idx = dc.n_verts = dc.n_refs = 0;
+    dc.n_immediate = 0;
     dc.n_source_refs = 0;
     dc.refs_remapped = 0;
     dc.n_packets = 0;
@@ -5471,6 +5568,8 @@ static const float* dc_vertex_attr(
         return (const float*)(
             dc.compact_verts + (u64)vertex * dc.layout.stride +
             (u32)slot * 16u);
+    if (dc.n_immediate && vertex < dc.n_verts)
+        return dc.verts[vertex].a[attr];
     memcpy(fallback, dc.fetch_plan.attr[attr].default_value, 16);
     return fallback;
 }
@@ -5483,7 +5582,7 @@ static const float* dc_vertex_attr(
 static const float* dc_vertex_attr_canonical(
     u32 vertex, u32 attr, float fallback[4])
 {
-    if (!ld_vertex_compact_payload())
+    if (dc.n_immediate || !ld_vertex_compact_payload())
         return dc.verts[vertex].a[attr];
     const s8 slot = dc.layout.slot_by_attr[attr];
     if (slot >= 0 && vertex < dc.n_verts)
@@ -6305,6 +6404,26 @@ static void ld_movie_capture_overlay(void)
 }
 
 static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
+/* Immediate positions latch the current attribute values at that point in the
+ * stream. Their payload is independent of array formats and guest addresses.
+ * Keep a bounded complete group; never draw a truncated allocation prefix. */
+static void sink_immediate_vertex(void* user,const rsx_dispatch* r)
+{
+    (void)user;g_ld_stats.packets_seen++;
+    if(g_ld_movie_mode && !ld_movie_composite_ui_enabled()) {g_ld_stats.packets_movie++;return;}
+    dc.n_packets++;
+    if(!dc.fetch_ok)return;
+    if(dc.n_immediate>=4096u) {dc.fetch_ok=0;return;}
+    vtx_t vertex;
+    for(u32 attr=0;attr<16;attr++) {
+        rsx_dsp_vertex_default(r,attr,vertex.a[attr]);
+        const u32 base=(0x1C00u+attr*16u)>>2;
+        if(r->seen[base] || r->seen[base+1] || r->seen[base+2] || r->seen[base+3])
+            memcpy(vertex.a[attr],r->regs+base,16);
+    }
+    push_vert(&vertex);
+    if(dc.fetch_ok) {dc.n_immediate++;g_ld_stats.packets_queued++;}
+}
 static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)u; (void)r; g_ld_stats.packets_seen++;
@@ -6331,6 +6450,8 @@ static void sink_inline_array(void* u, const rsx_dispatch* r,
         g_ld_stats.packets_movie++;
         return;
     }
+
+    if(dc.n_immediate) {dc.n_packets++;dc.fetch_ok=0;return;}
 
     const u32 stride = rsx_vertex_inline_layout(&g.rsx, dc.inl_off);
     if (!stride || bytes < stride) { g_ld_stats.packets_queue_full++; return; }
@@ -7123,7 +7244,18 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_profile.total_used_attribute_max = used_layout.count;
     const LONGLONG fetch_pack_begin = ld_profile_qpc();
 #endif
-    if (ld_vertex_compact_payload()) {
+    if (dc.n_immediate) {
+        if(dc.n_arr || dc.n_idx || dc.inl)dc.fetch_ok=0;
+        dc.layout=used_layout;
+        dc.n_source_refs=dc.n_immediate;
+        if(dc.fetch_ok && ld_vertex_compact_payload()) {
+            if(!reserve_compact_vertices((u64)dc.n_immediate*used_layout.stride))dc.fetch_ok=0;
+            if(dc.fetch_ok)for(u32 vertex=0;vertex<dc.n_immediate;vertex++)
+                for(u32 slot=0;slot<used_layout.count;slot++)
+                    memcpy(dc.compact_verts+(u64)vertex*used_layout.stride+slot*16u,
+                           dc.verts[vertex].a[used_layout.attrs[slot]],16u);
+        }
+    } else if (ld_vertex_compact_payload()) {
         fetch_batches_hoisted(&used_layout, 1);
     } else if (ld_vertex_hoist_fetch()) {
         rsx_vertex_layout_plan legacy_layout;
@@ -7470,7 +7602,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                     zeta_pref = 1;
                     break;
                 }
-        if (!zeta_pref) { u32 best_gen = 0;
+        const int current_feedback = !zeta_pref &&
+            surface_feedback_matches(&g.surfaces[target], &t, &sf);
+        if (!zeta_pref && !current_feedback) { u32 best_gen = 0;
           for (u32 i = 0; i < g.n_surfaces; i++) {
               const surface_t* sf_i = &g.surfaces[i];
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
@@ -8223,6 +8357,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
                        rsx_live_guest_ptr_fn guest_fn, void* guest_user)
 {
     if (!rsx_live_draw_enabled()) return 0;
+    /* The live renderer paces presents its own way; the shared ring has no
+     * half here. */
+    if (rsx_present_thread_requested()) rsx_present_thread_unsupported("live draw", NULL);
     if (g.ready) return 0;
     ld_present_measure_init();
 #if defined(YZ_PERF_PROFILE)
@@ -8506,6 +8643,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     sink.inline_array = sink_inline_array;
     sink.draw_index_array = sink_draw_index;
     sink.flip = sink_flip;
+    sink.immediate_vertex = sink_immediate_vertex;
     rsx_dispatch_init(&g.rsx, &sink);
 
     g.ready = 1;

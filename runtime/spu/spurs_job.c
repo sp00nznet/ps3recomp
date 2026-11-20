@@ -375,7 +375,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * cacheBuffer[0] (Twisted Metal's Edge jobs read their viewport there and
      * got width = height = 0). Leave the caller's 32-byte frame inside the
      * stack. */
-    ctx.gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
+    uint32_t sp = (stack_top - 32u) & ~15u;
+    uint32_t stk_base = s_ls + size_scr;
+    ctx.gpr[1]._u32[0] = sp;
+    /* SPU ABI: word 1 of $sp holds available stack bytes for -mstack-check
+     * guards (ai $sp,$sp,-N; xswd $t,$sp; heqi $t,-1). Leaving it 0 causes
+     * jobs compiled with stack checks to HALT-ASSERT on their first frame. */
+    ctx.gpr[1]._u32[1] = (sp > stk_base) ? (sp - stk_base) : 0u;
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
