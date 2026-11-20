@@ -15,6 +15,7 @@ void ppu_resv_break_store(uint64_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
 void sys_event_queue_cancel_by_id(u32 id) {(void)id;}
 void sys_event_queue_uncancel_by_id(u32 id) {(void)id;}
+void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c */
 void ydkj_wake_all_event_flags(void) {}
 uint64_t spurs_pm_build_context(uint8_t* ls,uint32_t a,uint32_t b,uint32_t c,uint32_t d){(void)ls;(void)a;(void)b;(void)c;(void)d;return 0;}
 void spu_thread_publish_ctx(uint32_t tid,void* ctx){(void)tid;(void)ctx;}
