@@ -119,6 +119,7 @@ typedef struct {
     rsx_be_format fmt;
     u32 handle;
     u32 feedback;          /* last immutable own-target copy, engine-owned */
+    u64 feedback_pass;     /* g.pass_serial that copy may still be shared in, or 0 */
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
     u32 last_use;           /* g.frames when last bound, sampled or presented */
@@ -216,6 +217,12 @@ static struct {
     u32 last_present_surface;
     u32 last_flip_buffer;
     u64 write_serial;       /* orders colour and depth writes to one address */
+    /* The pass the engine is in: a run of draws and clears into one unchanged
+     * colour target set and zeta (eng_pass_note). pass_serial is bumped when
+     * that set changes; an own-target feedback copy is shared inside one. */
+    u64 pass_serial;
+    u32 pass_n, pass_targets[RSX_BE_MAX_COLOR_TARGETS];
+    u32 pass_zloc, pass_zoff;
 
     /* staging: decoded texture levels, the constant blocks, the index list */
     u8* tex_staging;
@@ -829,6 +836,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
 
     eng_surface* s = &g.surfaces[slot];
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
+    s->feedback_pass = 0;
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
@@ -1063,6 +1071,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h, 4u));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+    g.surfaces[slot].feedback_pass = 0;   /* a shared own-target copy no longer shows the target */
 }
 
 static u32 eng_current_surface(void)
@@ -2732,6 +2741,59 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
     return ENG_INVALID;
 }
 
+/* PS3RECOMP_ENG_FEEDBACK_PER_PASS=1 (off by default): own-target samples in
+ * one pass share a snapshot (eng_feedback_shared). Without it every such
+ * sample takes its own. */
+static int eng_feedback_per_pass(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_FEEDBACK_PER_PASS"); on = e && *e && atoi(e) != 0; }
+    return on;
+}
+
+/* Note the colour target set and zeta a draw or clear goes to: a change from
+ * the last one starts a new pass (g.pass_serial). The zeta is told apart by
+ * its location and offset registers, which is all a clear has to hand without
+ * creating the target; a change of the zeta's format alone does not start a
+ * pass. */
+static void eng_pass_note(const u32* targets, u32 n_targets)
+{
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    int same = g.pass_serial && g.pass_n == n_targets &&
+               g.pass_zloc == sf.zeta_location && g.pass_zoff == sf.zeta_offset;
+    for (u32 k = 0; same && k < n_targets; k++) same = g.pass_targets[k] == targets[k];
+    if (same) return;
+    g.pass_serial++;
+    g.pass_n = n_targets;
+    memcpy(g.pass_targets, targets, n_targets * sizeof(u32));
+    g.pass_zloc = sf.zeta_location;
+    g.pass_zoff = sf.zeta_offset;
+}
+
+/* Whether surface `s`'s own-target copy may serve another sample. Only with
+ * PS3RECOMP_ENG_FEEDBACK_PER_PASS=1; by default it never does.
+ *
+ * A host pass cannot sample a colour attachment it is writing (Metal), so a
+ * draw that samples the target it draws into reads a copy of it, and the copy
+ * used to be taken again for every such draw. A frame that draws a few
+ * hundred sprites into a full-size scene target, with two fragment programs
+ * sampling that target, then copies the whole target a few hundred times.
+ *
+ * Opted in, the copy is made once per pass and shared by every own-target
+ * sample in it, so it shows the target as it was at the pass's first such
+ * draw, not as the draws before it in the same pass left it. A new pass (the
+ * colour set or zeta changed, or a frame was presented), a clear of the
+ * target and a guest write into it each retire the copy. The copy is
+ * released only when replaced or with its surface, never while a queued draw
+ * could still name it: a backend retires a released handle only after the
+ * draws recorded against it are encoded. */
+static int eng_feedback_shared(const eng_surface* s)
+{
+    return eng_feedback_per_pass() && s->feedback && s->feedback_pass &&
+           s->feedback_pass == g.pass_serial;
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot, u32 tex_used,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -2739,6 +2801,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
 {
     u32 mask = 0;
     u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
+    eng_pass_note(target_slots, n_targets);
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
@@ -2814,11 +2877,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             u32 k = 0;
             while (k < n_targets && target_slots[k] != (u32)surface_at) k++;
             if (k == n_targets) return eng_color_feedback_failure(u, s, &t);
+            if (!feedback[k] && eng_feedback_shared(s)) feedback[k] = s->feedback;
             if (!feedback[k]) {
                 const u32 copy = g.be->color_snapshot(g.be->user, s->handle);
                 if (!copy) return eng_color_feedback_failure(u, s, &t);
                 if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
                 s->feedback = feedback[k] = copy;
+                s->feedback_pass = g.pass_serial;
             }
             if (g.be->surface_view) {
                 textures[u] = g.be->surface_view(g.be->user, feedback[k],
@@ -3583,6 +3648,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
     if (!n_targets) return;
+    eng_pass_note(targets, n_targets);
     if (pd_capturing()) {
         rsx_dsp_surface zs;
         rsx_dsp_get_surface(&g.rsx, &zs);
@@ -3619,6 +3685,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             } else
                 g.be->clear_color(g.be->user, s->handle, rgba);
             wrote = 1;
+            g.surfaces[targets[i]].feedback_pass = 0;   /* its content was replaced */
         }
         if (wrote) eng_surfaces_wrote(targets, n_targets);
     }
@@ -3716,6 +3783,7 @@ static void eng_present(u32 buffer_id)
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
+    g.pass_serial++;    /* a frame ends every pass: no copy is shared into the next */
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
 }
