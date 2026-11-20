@@ -446,6 +446,23 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
     return result;
 }
 
+static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
+
+/* One dirList entry: the directory name and the listParam its PARAM.SFO
+ * carries (SAVEDATA_LIST_PARAM). Titles tell their saves apart by listParam, so
+ * an entry without it looks like nothing the title is looking for. */
+static void fill_dir_entry(CellSaveDataDirList* entry, const char* name)
+{
+    char path[1024];
+    CellSaveDataSystemFileParam param;
+
+    memset(entry, 0, sizeof(*entry));
+    strncpy(entry->dirName, name, CELL_SAVEDATA_DIRNAME_SIZE - 1);
+    build_save_path(path, sizeof(path), name);
+    read_param_sfo(path, &param);
+    memcpy(entry->listParam, param.listParam, sizeof(entry->listParam));
+}
+
 /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
 static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList, u32 max)
 {
@@ -474,11 +491,8 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 continue;
             if (prefix && prefix[0] && strncmp(fd.cFileName, prefix, strlen(prefix)) != 0)
                 continue;
-            if (count < max && dirList) {
-                memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
-                strncpy(dirList[count].dirName, fd.cFileName,
-                        CELL_SAVEDATA_DIRNAME_SIZE - 1);
-            }
+            if (count < max && dirList)
+                fill_dir_entry(&dirList[count], fd.cFileName);
             count++;
         } while (FindNextFileA(hFind, &fd));
 
@@ -501,11 +515,8 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 continue;
             if (prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0)
                 continue;
-            if (count < max && dirList) {
-                memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
-                strncpy(dirList[count].dirName, de->d_name,
-                        CELL_SAVEDATA_DIRNAME_SIZE - 1);
-            }
+            if (count < max && dirList)
+                fill_dir_entry(&dirList[count], de->d_name);
             count++;
         }
         closedir(dp);
