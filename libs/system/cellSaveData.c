@@ -1239,6 +1239,21 @@ s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
+/* ListAutoLoad and ListAutoSave differ only in direction: funcFixed picks the
+ * directory, then the usual stat/file callbacks run on it. */
+static s32 savedata_list_auto(int is_save, u32 version, u32 errDialog,
+                              CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                              CellSaveDataFixedCallback funcFixed,
+                              CellSaveDataStatCallback funcStat,
+                              CellSaveDataFileCallback funcFile,
+                              u32 container, void* userdata)
+{
+    (void)container;
+    if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
+    printf("[cellSaveData] ListAuto%s(version=%u)\n", is_save ? "Save" : "Load", version);
+    return savedata_fixed(is_save, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+}
+
 s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
                             CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
                             CellSaveDataFixedCallback funcFixed,
@@ -1246,10 +1261,8 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
                             CellSaveDataFileCallback funcFile,
                             u32 container, void* userdata)
 {
-    (void)container;
-    if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
-    printf("[cellSaveData] ListAutoLoad(version=%u)\n", version);
-    return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+    return savedata_list_auto(0, version, errDialog, setList, setBuf, funcFixed,
+                              funcStat, funcFile, container, userdata);
 }
 
 s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
@@ -1507,14 +1520,20 @@ extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_
  * parameter save area shadowing r3.. one doubleword each -> arg9 at SP+112. */
 #define SAVEDATA_ARG9_SP_OFF 112u
 
-static uint32_t savedata_arg9(ppu_context* ctx)
+static int savedata_arg9_off(void)
 {
-    uint32_t sp = (uint32_t)ctx->gpr[1];
     static int off = -1;
     if (off < 0) {
         const char* e = getenv("PS3_SAVEDATA_ARG9_OFF");
         off = e ? (int)strtol(e, NULL, 0) : (int)SAVEDATA_ARG9_SP_OFF;
     }
+    return off;
+}
+
+static uint32_t savedata_arg9(ppu_context* ctx)
+{
+    uint32_t sp = (uint32_t)ctx->gpr[1];
+    int off = savedata_arg9_off();
     { static int dumped = 0;
       if (!dumped) { dumped = 1;
         printf("[cellSaveData] caller SP=0x%08X param-save-area window:\n", sp);
@@ -1587,6 +1606,40 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
         (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
 }
 
+/* UserListAutoLoad and UserListAutoSave are ListAutoLoad and ListAutoSave with
+ * userId inserted after version, which makes them ten-argument entries:
+ * errDialog is in r5, setList..funcFile in r6..r10, container and userdata in
+ * the ninth and tenth slots of the caller's parameter save area. */
+static void savedata_user_list_auto(ppu_context* ctx, int is_save)
+{
+    u32 userId = (u32)ctx->gpr[4];
+    uint32_t container = savedata_arg9(ctx);
+    /* The tenth argument is the next doubleword of the save area. */
+    uint32_t userdata = (uint32_t)vm_read64((uint32_t)ctx->gpr[1] +
+                                            (uint32_t)savedata_arg9_off() + 8u);
+
+    printf("[cellSaveData] UserListAuto%s(user=%u, userdata=0x%08X)\n",
+           is_save ? "Save" : "Load", userId, userdata);
+    ctx->gpr[3] = (uint64_t)(int64_t)savedata_list_auto(
+        is_save, (u32)ctx->gpr[3], (u32)ctx->gpr[5],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[10],
+        container, (void*)(uintptr_t)userdata);
+}
+
+static void hle_cellSaveDataUserListAutoLoad(ppu_context* ctx)
+{
+    savedata_user_list_auto(ctx, 0);
+}
+
+static void hle_cellSaveDataUserListAutoSave(ppu_context* ctx)
+{
+    savedata_user_list_auto(ctx, 1);
+}
+
 void cellSaveData_register_ctx_handlers(void)
 {
     /* Overrides the generated 8-arg registration: ctx handlers are dispatched
@@ -1595,6 +1648,10 @@ void cellSaveData_register_ctx_handlers(void)
                          hle_cellSaveDataUserAutoLoad);
     ps3_hle_register_ctx(0x52AAC4FAu, "cellSaveDataUserAutoSave",
                          hle_cellSaveDataUserAutoSave);
+    ps3_hle_register_ctx(0x248BD1D8u, "cellSaveDataUserListAutoLoad",
+                         hle_cellSaveDataUserListAutoLoad);
+    ps3_hle_register_ctx(0x0E091C36u, "cellSaveDataUserListAutoSave",
+                         hle_cellSaveDataUserListAutoSave);
 }
 
 s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
