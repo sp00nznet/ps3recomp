@@ -2776,8 +2776,6 @@ static void test_clear_rect(void)
     engine_down();
 }
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 /* ---- one own-target copy a pass ------------------------------------------ */
 
 /* A draw sampling the colour target it writes gets a copy of it. The copy is
@@ -2906,7 +2904,6 @@ static void test_feedback_per_pass(void)
           "a guest write into the target makes a new copy (%d, want %d)",
           g_fb_copies, per ? 4 : 2);
     engine_down();
-=======
 /* Runs `body` with stderr captured into `out` (NUL-terminated, truncated). */
 static void capture_stderr(void (*body)(void), char* out, size_t cap)
 {
@@ -2963,11 +2960,9 @@ static void test_target_churn(void)
           "the first target at the address is reported as new\n%s", log);
     CHECK(strstr(log, "256x256 -> fmt") && strstr(log, "512x512 -> fmt"),
           "both size transitions are reported\n%s", log);
->>>>>>> pr/737
 }
 
 int main(void)
-=======
 /* ---- PS3RECOMP_RSX_SINGLE_PRESENT: one present per flip ----------------- */
 
 /* Runs in its own process (main's "single" mode): the switch is read once. */
@@ -2992,7 +2987,6 @@ static void test_single_present(void)
 }
 
 int main(int argc, char** argv)
->>>>>>> pr/721
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
     if (!vm_base) { printf("[FAIL] guest memory\n"); return 1; }
@@ -3046,11 +3040,8 @@ int main(int argc, char** argv)
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
     test_clear_rect();
-<<<<<<< HEAD
     test_feedback_per_pass();
-=======
     test_target_churn();
->>>>>>> pr/737
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

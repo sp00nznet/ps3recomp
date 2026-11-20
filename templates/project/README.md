@@ -108,7 +108,6 @@ requires complete coverage. `--extra-funcs` accepts the discovered `spu_<sha256>
 name for explicit entry overrides. The existing `--images` interface is still
 available for manually extracted programs.
 
-<<<<<<< HEAD
 ## Build extensions
 
 Code a port keeps outside its main tree (an experiment, a diagnostic, a capture
@@ -142,7 +141,6 @@ static int registered = [] {
 With `PORT_EXTENSIONS` empty (the default) nothing is included, every slot is
 null, and the build behaves as before. `python3 tools/test_port_extension.py`
 checks the registry and the CMake inclusion.
-=======
 ## Keeping the port's repository publishable
 
 A port's repository should hold only its own source. Never commit the game's
@@ -180,4 +178,3 @@ example `sdk-pins.json`:
 updates each pinned checkout, detaches it at the commit, and refuses a tag that
 names a different commit or a checkout with local changes. Point
 `-DPS3RECOMP_DIR` at that checkout.
->>>>>>> pr/726

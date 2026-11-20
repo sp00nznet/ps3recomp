@@ -562,17 +562,14 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
 
-<<<<<<< HEAD
     add_executable(test_rsx_gpu_wait tests/test_rsx_gpu_wait.c)
     target_include_directories(test_rsx_gpu_wait PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_gpu_wait COMMAND test_rsx_gpu_wait)
-=======
     add_executable(test_rsx_fence_wait tests/test_rsx_fence_wait.c)
     target_include_directories(test_rsx_fence_wait PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_fence_wait COMMAND test_rsx_fence_wait)
->>>>>>> pr/713
 
     # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
     # Without -mfma it takes the double-rounding path; with it, the builtin.
@@ -596,12 +593,10 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
-<<<<<<< HEAD
     # cellAudio's mixer pacing decision (libs/audio/audio_pace.h) against a
     # simulated clock and device queue: pure, so no runtime and no host audio.
     add_executable(test_audio_pace libs/audio/tests/test_audio_pace.c)
     add_test(NAME audio_pace COMMAND test_audio_pace)
-=======
     # The clock GET_REPORT stamps reports with, and its drain-time scale.
     add_executable(test_gcm_report_clock libs/video/tests/test_gcm_report_clock.c)
     target_include_directories(test_gcm_report_clock PRIVATE include libs/video)
@@ -609,29 +604,22 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_gcm_report_clock PRIVATE m)
     endif()
     add_test(NAME gcm_report_clock COMMAND test_gcm_report_clock)
->>>>>>> pr/753
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-<<<<<<< HEAD
-<<<<<<< HEAD
         add_test(NAME ppu_hle_toc
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_hle_toc.py")
-=======
         add_test(NAME ppu_function_splice
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_function_splice.py")
->>>>>>> pr/730
-=======
         add_test(NAME check_public_tree
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_public_tree.py")
         add_test(NAME fetch_sdk_pins
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_fetch_sdk_pins.py")
->>>>>>> pr/726
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
@@ -647,18 +635,15 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_dma_repeat
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
-<<<<<<< HEAD
         add_test(NAME ppu_thread_syscall_slots
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_syscall_slots.py")
-=======
         add_test(NAME spu_lifter_invalid_dp
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_invalid_dp.py")
         add_test(NAME spu_lifter_cfl_scale
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_cfl_scale.py")
->>>>>>> pr/793
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

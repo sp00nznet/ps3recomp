@@ -59,11 +59,8 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
-<<<<<<< HEAD
 #include "metal_frame_rate.h"   /* portable bounded present-rate statistics */
-=======
 #include "rsx_present_thread.h"
->>>>>>> pr/741
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
