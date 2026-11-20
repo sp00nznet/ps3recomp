@@ -7,9 +7,8 @@
 # its public headers, and the Python pipeline -- so a port can be attempted with
 # nothing but a tag download.
 #
-# Only Windows and macOS are built, because those are the only two platforms
-# with CI proving they compile. Shipping an untested Linux binary would repeat
-# the mistake of documenting macOS support the tree did not have.
+# Windows, macOS arm64 and Linux are built. Each has a dedicated CI workflow
+# proving the same source revision before a tagged bundle is published.
 name: Release
 
 on:
@@ -124,11 +123,15 @@ jobs:
           # bundle layout cannot drift from what a local `cmake --install` gives.
           cmake --install build --prefix "${STAGE}"
 
-          # The static library alone cannot recompile anything; the pipeline that
-          # turns an EBOOT into C is these scripts.
-          cp -r tools "${STAGE}/tools"
-          find "${STAGE}/tools" -name __pycache__ -type d -prune -exec rm -rf {} +   # test-run leftovers
-          cp README.md LICENSE CONTRIBUTORS.md "${STAGE}/"
+          # Keep the bundle source-layout compatible with PS3RECOMP_DIR. A port
+          # needs more than the installed archive: the project template compiles
+          # the per-title PPU scaffold, gen_hle_nids.py scans libs/, and SPU
+          # projects include cmake/PS3RecompSPU.cmake. Shipping those together
+          # makes the downloaded SDK usable without a second source checkout.
+          cp CMakeLists.txt requirements.txt "${STAGE}/"
+          cp -R cmake libs runtime templates third_party tools "${STAGE}/"
+          find "${STAGE}" -name __pycache__ -type d -prune -exec rm -rf {} +   # test-run leftovers
+          cp README.md CHANGELOG.md CONTRIBUTING.md CONTRIBUTORS.md LICENSE CITATION.cff "${STAGE}/"
           mkdir -p "${STAGE}/docs" && cp docs/*.md "${STAGE}/docs/"
 
           # What this bundle can actually do, per platform. Someone who
@@ -136,8 +139,8 @@ jobs:
           # here rather than after building one.
           case "${{ matrix.platform }}" in
             win-x64)    CAN="renders and runs recompiled titles (D3D12)" ;;
-            mac-arm64)  CAN="renders through Metal; cannot yet load a title -- the PPU boot scaffold does not run on POSIX" ;;
-            linux-x64)  CAN="toolkit and runtime library only -- no renderer in this bundle (the Vulkan backend is opt-in, build from source with -DPS3RECOMP_RSX_VULKAN=ON), and the PPU boot scaffold does not run on POSIX" ;;
+            mac-arm64)  CAN="renders through Metal; the bundled project template boots the synthetic PPU smoke title, but no retail title has been validated in this tree" ;;
+            linux-x64)  CAN="the bundled project template boots the synthetic PPU smoke title through the headless null backend; Vulkan is opt-in (-DPS3RECOMP_RSX_VULKAN=ON), and no retail title has been validated in this tree" ;;
             *)          CAN="unknown" ;;
           esac
 
@@ -147,6 +150,23 @@ jobs:
             echo "run:      ${{ github.run_id }}"
             echo
             echo "status:   ${CAN}"; } > "${STAGE}/VERSION.txt"
+
+          # Exercise the staged POSIX SDK, not the checkout. This catches a
+          # missing template/support file before the archive is published and
+          # proves that PS3RECOMP_DIR may point at the extracted bundle.
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            BUNDLE_ROOT="$PWD/${STAGE}"
+            test -f build/smoke/lift/ppu_recomp.h
+            cmake -S "${BUNDLE_ROOT}/templates/project" -B build-bundle-template -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DPS3RECOMP_DIR="${BUNDLE_ROOT}" \
+              -DRECOMP_DIR="$PWD/build/smoke/lift"
+            cmake --build build-bundle-template
+            PS3RECOMP_METAL_HEADLESS=1 ./build-bundle-template/MyGameRecomp \
+              build/smoke/smoke.elf > bundle-template.log 2>&1
+            grep -q "\[smoke\] OK: all 11 markers, in order" bundle-template.log
+            grep -q "\[smoke\] PASS" bundle-template.log
+          fi
 
           # cmake -E tar rather than zip/Compress-Archive: CMake is already a
           # hard requirement on both runners, so this is one code path instead of
