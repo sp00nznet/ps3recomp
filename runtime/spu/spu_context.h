@@ -570,6 +570,15 @@ static inline __m128i spu_ls_bswap_words(__m128i x) {
 }
 #endif
 
+/* SPU_LS_PROBES=0 compiles the diagnostics gate out of spu_ls_read128 and
+ * spu_ls_write128 in the translation unit (a build option for the lifted SPU
+ * sources): no SPU_LS_LOWREAD, SPU_LS_WATCH, SPU_SMC_WATCH or SPU_WWS_PROBE on
+ * those accesses, and no gate word to reload after every store. Default 1: the
+ * env-driven diagnostics stay available at one load and one branch per access. */
+#ifndef SPU_LS_PROBES
+#define SPU_LS_PROBES 1
+#endif
+
 /* Debug probes of spu_ls_read128/write128, out of line: inlined they kept
  * every LS load a real call (~10% of GH3's FMOD mixer task).
  *
@@ -658,8 +667,10 @@ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t 
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+#if SPU_LS_PROBES
     if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
         spu_ls_read_diag(ctx, lsa);
+#endif
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
 #if defined(__ARM_NEON)
@@ -779,8 +790,12 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
+#if SPU_LS_PROBES
     if (__builtin_expect(g_spu_ls_wdiag != 0, 0))
         spu_ls_write_diag(ctx, lsa, val);
+#else
+    (void)val;
+#endif
 }
 
 /* ---------------------------------------------------------------------------
