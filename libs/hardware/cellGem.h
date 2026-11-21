@@ -31,6 +31,10 @@ extern "C" {
 #define CELL_GEM_STATUS_READY          1
 #define CELL_GEM_STATUS_CALIBRATING    2
 
+/* Tracking results: cellGemGetState answers one of these, a small positive
+ * value, not an error code (CELL_GEM_ERROR_*). */
+#define CELL_GEM_NOT_CONNECTED         1
+
 /* Types. Layouts verified against the DWARF in the Gears of War 3 / og-LBP debug
  * builds (dwarf_abi.py) -- the previous definitions were wrong on every one:
  * CellGemState was 58 bytes vs the real 192, CellGemInfo.port was u16 not u32,

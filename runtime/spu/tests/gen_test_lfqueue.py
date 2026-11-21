@@ -15,14 +15,17 @@ from wrap_spu_elf import wrap
 
 def w(v): return struct.pack(">I", v & 0xFFFFFFFF)
 def ri16(op9, i16, rt): return w(((op9 & 0x1FF) << 23) | ((i16 & 0xFFFF) << 7) | (rt & 0x7F))
+def ri18(op7, i18, rt): return w(((op7 & 0x7F) << 25) | ((i18 & 0x3FFFF) << 7) | (rt & 0x7F))
 def rr(op11, rb, ra, rt): return w(((op11 & 0x7FF) << 21) | ((rb & 0x7F) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F))
 def ch(op11, channel, rt): return w(((op11 & 0x7FF) << 21) | ((channel & 0x1F) << 7) | (rt & 0x7F))
 
-IL, WRCH, STOP = 0x81, 0x10D, 0x000
+IL, ILA, WRCH, STOP = 0x81, 0x21, 0x10D, 0x000
 MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID, MFC_Cmd = 16, 17, 18, 19, 20, 21
 WrOutIntrMbox = 30
 MFC_GET, MFC_PUT = 0x40, 0x20
-WORK_EA, RESULT_EA, LS_SCRATCH = 0x100, 0x140, 0x200   # queue buffer slot 0 / result / LS
+# queue buffer slot 0 / result / LS. The result sits above 64 KB: the DMA engine
+# rejects PUTs into the null page.
+WORK_EA, RESULT_EA, LS_SCRATCH = 0x100, 0x10140, 0x200
 
 b = b""
 # --- DMA GET: queued work item (main mem WORK_EA) -> LS_SCRATCH ---
@@ -35,7 +38,7 @@ b += ri16(IL, MFC_GET,    8)      # il r8, GET
 b += ch(WRCH, MFC_LSA, 3) + ch(WRCH, MFC_EAH, 4) + ch(WRCH, MFC_EAL, 5)
 b += ch(WRCH, MFC_Size, 6) + ch(WRCH, MFC_TagID, 7) + ch(WRCH, MFC_Cmd, 8)   # issue GET
 # --- DMA PUT: LS_SCRATCH -> result slot (main mem RESULT_EA) ---
-b += ri16(IL, RESULT_EA,  5)      # il r5, EAL = result slot
+b += ri18(ILA, RESULT_EA, 5)      # ila r5, EAL = result slot
 b += ri16(IL, MFC_PUT,    8)      # il r8, PUT
 b += ch(WRCH, MFC_LSA, 3) + ch(WRCH, MFC_EAH, 4) + ch(WRCH, MFC_EAL, 5)
 b += ch(WRCH, MFC_Size, 6) + ch(WRCH, MFC_TagID, 7) + ch(WRCH, MFC_Cmd, 8)   # issue PUT

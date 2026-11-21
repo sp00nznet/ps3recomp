@@ -5,6 +5,8 @@
  * to host filesystem paths and performs real I/O.
  */
 
+#include "../../runtime/memory/vm_watch_hooks.h"
+#include <errno.h>
 #include "cellFs.h"
 #include "../../runtime/platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/endian.h"
@@ -15,6 +17,7 @@
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "ps3emu/fs_write_check.h"
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -527,7 +530,10 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
          * which made this look handled -- but the file contents were being read
          * to a raw guest address interpreted as a host one, so nothing the
          * title loaded ever landed in guest memory. */
+        vm_note_host_write(gptr(buf), (size_t)nbytes);   /* kernel write into guest memory */
         bytes_read = (u64)fread(gptr(buf), 1, (size_t)nbytes, s_files[fd].host_fp);
+        vm_note_write_check(bytes_read < nbytes && ferror(s_files[fd].host_fp) && errno == EFAULT,
+                            "cellFsRead (libs)");
     }
 
     { static int _n = 0;
@@ -562,16 +568,20 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
         return CELL_EFAULT;
 
     u64 bytes_written = 0;
+    int write_failed = 0;
 
     if (s_files[fd].host_fp) {
+        clearerr(s_files[fd].host_fp);   /* ferror() is sticky */
         bytes_written = (u64)fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
-        fflush(s_files[fd].host_fp);
+        write_failed = ps3_fs_write_failed((size_t)bytes_written, nbytes,
+                                           fflush(s_files[fd].host_fp) != 0 ||
+                                           ferror(s_files[fd].host_fp));
     }
 
     if (nwrite)
         *(u64*)gptr(nwrite) = ps3_bswap64(bytes_written);
 
-    return CELL_OK;
+    return write_failed ? (s32)CELL_EIO : CELL_OK;
 }
 
 /* NID: 0xA397D042 */

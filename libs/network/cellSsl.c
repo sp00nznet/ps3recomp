@@ -5,6 +5,7 @@
  * return empty data, and RNG uses host OS entropy.
  */
 
+#include "../../runtime/memory/vm_watch_hooks.h"
 #include "cellSsl.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 -- out-params are guest EAs */
 #include <stdio.h>
@@ -126,6 +127,7 @@ s32 cellSslGetRandomNumber(u8* buf, u32 size)
 #else
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) {
+        vm_note_host_write(buf, size);   /* a guest buffer: kernel write */
         read(fd, buf, size);
         close(fd);
     } else {

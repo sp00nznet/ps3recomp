@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""cellFsAioRead on an fd shared with plain reads and other threads.
+"""cellFsAioRead / cellFsAioWrite on an fd shared with plain reads and other threads.
 
 An AIO read names its own offset. runtime/ppu/ppu_fs.cpp did a bare seek and
 read on the fd's FILE*, so the next cellFsRead continued from wherever the
 AIO stopped, and a seek from another thread could land between the two.
 This builds runtime/ppu/tests/test_fs_aio.cpp (which includes ppu_fs.cpp)
 against a ppu_recomp.h made from the lifter's own HEADER_PREAMBLE and runs
-it: the fd's position after an AIO read, and AIO reads racing from four
-threads.
+it: the fd's position after an AIO read, AIO reads racing from four
+threads, an AIO write read back, and reads and writes drawing distinct ids
+(cellFsAioWrite had a counter of its own, so the two could share one).
 
 It needs a host C++ compiler (under CI=1 a missing one fails instead of
 skipping).

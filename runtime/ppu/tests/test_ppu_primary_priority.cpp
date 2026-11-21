@@ -17,6 +17,7 @@ void spu_lockline_unlock(void) { std::abort(); }
 int spu_raw_reg_load(uint32_t, uint32_t*) { std::abort(); }
 void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
 void cellGcm_ref_on_poll(void) { std::abort(); }
+void cellGcm_put_on_store(void) { std::abort(); }
 uint32_t g_gcm_consumer_put_wake_ea = 0;
 void cellGcm_fifo_kick_notify(void) { std::abort(); }
 void sys_memory_set_image_query(uint64_t (*)(uint64_t, uint64_t)) {}

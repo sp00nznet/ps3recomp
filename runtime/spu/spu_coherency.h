@@ -61,6 +61,16 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea);
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
 
+/* PS3RECOMP_SPU_LIVE_HOLDERS=1 (default off): count, per line, the contexts
+ * that may hold a reservation on it, so a write to a line no SPU holds now
+ * skips the walk over every registered context. spu_coh_reserve and
+ * spu_coh_reserve_fast count the caller; the caller ends the count with
+ * spu_coh_live_end on its own thread once its reservation is consumed (PUTLLC
+ * either way, PUTLLUC). Off, all three are no-ops. */
+int  spu_coh_live_enabled(void);
+void spu_coh_live_end(spu_context* ctx);
+extern unsigned long g_spu_coh_live_skips;   /* notifies that skipped the walk */
+
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host
  * thread in case it is parked in `rdch SPU_RdEventStat`.

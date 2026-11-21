@@ -1,2 +1,5 @@
-# Extra sources for the workload-dispatch test: the dispatch layer itself.
-EXTRA="$RUNTIME_SPU/spu_workload.c"
+# Extra sources for the workload-dispatch test: the dispatch layer itself and
+# the policy/job units it calls into (the weak stubs in test_runtime_stubs.c
+# yield to these).
+EXTRA="$RUNTIME_SPU/spu_workload.c $RUNTIME_SPU/spurs_job.c $RUNTIME_SPU/spurs_policy.c
+ $RUNTIME_SPU/spu_tsp_weak.c $RUNTIME_SPU/spurs_policy_blob_weak.c $RUNTIME_SPU/spu_lockstep.c"

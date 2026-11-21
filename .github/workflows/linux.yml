@@ -275,6 +275,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -lm
           /tmp/test_pad_hotplug
 
+      # cellPad asks SDL for face buttons by position (not by printed label)
+      # before the controller subsystem starts.
+      - name: Run the pad face-button hint test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_face_button_hint libs/input/tests/test_pad_face_button_hint.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_face_button_hint
+
       # cellPad keyboard fallback on port 0 (SDL source, fake keyboard and focus).
       - name: Run the pad keyboard test
         run: |
@@ -418,6 +425,9 @@ jobs:
           # is where those get checked at all.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_rsx_draw_engine
+          PS3RECOMP_ENG_FEEDBACK_PER_PASS=1 /tmp/test_rsx_draw_engine
+          /tmp/test_rsx_draw_engine single
+          CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} python3 tools/test_rsx_texture_decode.py
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
@@ -428,6 +438,8 @@ jobs:
           /tmp/test_vertex_current_color
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_color_feedback_engine
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_gcm_report_clock libs/video/tests/test_gcm_report_clock.c -lm
+          /tmp/test_gcm_report_clock
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
@@ -482,6 +494,12 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_savedata_param_sfo libs/system/tests/test_savedata_param_sfo.c
           /tmp/test_savedata_param_sfo
 
+      # cellGemGetState answers CELL_GEM_NOT_CONNECTED (a tracking result), not an error code.
+      - name: Run the cellGem state test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_gem_state libs/hardware/tests/test_gem_state.c
+          /tmp/test_gem_state
+
       # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
       # queue) on host threads. It was Windows-only until the shim grew joinable
       # handles and multi-object waits; here it is the memory-model regression
@@ -526,6 +544,7 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
+          PS3RECOMP_SPU_LIVE_HOLDERS=1 /tmp/test_spu_lockline_peer
 
       # A task parked in WAIT_SIGNAL, signalled by another SPU. libspurs does
       # that with PUTLLC on the taskset line, which never woke the parked
@@ -642,3 +661,20 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_job_stack
+
+      # MFC transfers to the SPU thread local-store window (0xF0000000 +
+      # spu_num * 0x100000) move data between local stores: a GET reads the
+      # peer SPU's local store and a PUT writes it, never guest memory.
+      - name: Run the SPU thread local-store DMA test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_thread_ls_dma \
+            runtime/spu/tests/test_spu_thread_ls_dma.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spu_thread_ls_dma

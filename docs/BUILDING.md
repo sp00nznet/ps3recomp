@@ -133,7 +133,7 @@ cmake --install build --prefix /usr/local
 | CMake Option | Default | Description |
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
-| `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
+| `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux, and opt-in on Windows: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
 | `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded-opt-in) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
@@ -248,6 +248,7 @@ which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
 | Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
 | Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
+| Windows (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Built beside D3D12 with `-DPS3RECOMP_RSX_VULKAN=ON`; D3D12 stays the default and a port selects Vulkan by calling `rsx_vulkan_backend_init`. `vulkan-1.dll` is loaded at run time and the optional window is a plain Win32 one. |
 | Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
 
 So on Windows a plain `cmake --build` already gives you the working renderer --
@@ -265,6 +266,36 @@ cmake --build build --target ps3recomp_host
 ./build/ps3recomp_host
 ```
 
+### Present thread (opt-in)
+
+By default a present runs on the thread that walks the FIFO, which then waits
+for the window system to hand out a display image; while it waits it applies
+no label, report or get/ref update the guest may be polling.
+`PS3RECOMP_RSX_PRESENT_THREAD=1` splits a draw-engine present in two
+(`libs/video/rsx_present_thread.h`). The presenting thread records and commits
+a GPU copy of the frame, present pass included, into one of a few staging
+images and returns at once. A present thread of its own then takes the oldest
+staged frame, acquires a display image, copies the frame into it and presents
+it. The presenting thread never waits for that thread or for a display
+image: with every staging slot taken, the oldest staged frame is dropped and
+counted.
+
+| Environment variable | Effect |
+|---|---|
+| `PS3RECOMP_RSX_PRESENT_THREAD=1` | Turn it on (Metal draw engine, windowed or headless). Elsewhere -- the Metal vtable path, host-surface mode, Vulkan, D3D12, live draw -- it says once that it is unsupported and presents as before |
+On Vulkan the stage blits the flipped surface into a staging image on its own
+command pool and submits it; the walker's next command buffer is ordered after
+that copy. The present thread acquires a swapchain image with a finite
+timeout, blits the staging image into the offscreen target and the window, and
+presents. Like a direct present (`PS3RECOMP_VK_DIRECT_PRESENT`), it reads
+nothing back, so `rsx_vulkan_backend_presented_center()` reports no pixel.
+
+| Environment variable | Effect |
+|---|---|
+| `PS3RECOMP_RSX_PRESENT_THREAD=1` | Turn it on (Metal or Vulkan draw engine, windowed or headless). Elsewhere -- the Metal and Vulkan vtable paths, host-surface mode, a Vulkan run with `PS3RECOMP_VK_DUMP`, D3D12, live draw -- it says once that it is unsupported and presents as before |
+| `PS3RECOMP_RSX_PRESENT_THREAD_DEPTH=<n>` | Staging slots, 2 or 3 (default 3) |
+| `PS3RECOMP_RSX_PRESENT_THREAD_REPORT_S=<sec>` | Seconds between the counter lines on stderr (default 5; 0 = only the final one at shutdown): staged, presented, dropped, failures, ring occupancy, and stage, acquire and blit times |
+
 ### The Vulkan backend (Linux, opt-in)
 
 ```bash
@@ -280,12 +311,28 @@ also keeps cross-compiling for aarch64 simple (point
 Vulkan 1.0 entry points are used; it has been run on Mesa's lavapipe and on
 NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 
+On Windows the same option builds the backend beside D3D12 (clang-cl, with
+the Vulkan SDK's headers on the include path or
+`-DPS3RECOMP_VULKAN_INCLUDE_DIR=<sdk>/Include`). `ps3recomp_host` is
+POSIX-only, so `test_vulkan_backend_smoke` covers the Windows platform layer:
+it loads `vulkan-1.dll`, presents a few frames headless (or in the Win32 window
+with `PS3RECOMP_VK_WINDOW=1`), shuts down and comes up again.
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPS3RECOMP_RSX_VULKAN=ON
+cmake --build build --target test_vulkan_backend_smoke
+build\test_vulkan_backend_smoke.exe
+```
+
 | Environment variable | Effect |
 |---|---|
 | `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
 | `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
+| `PS3RECOMP_VK_DIRECT_PRESENT=1` | On the draw engine path, present without reading the frame back: one submission blits the flipped surface into the window, waiting for the swapchain image on the GPU, and the CPU waits for nothing (a ring of three presents stays in flight). The presents `PS3RECOMP_VK_DUMP` writes still read back. Off (the default): every present copies the frame to host memory and waits for it, then blits it to the window and waits again |
 | `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
+| `PS3RECOMP_VK_FPS=1` | Once a second, log `[RSX FPS] display=… guest=…`: completed guest presents and accepted window presents, with interval average/p95/max. Window times are host clock readings when `vkQueuePresentKHR` returns, not compositor presentation timestamps (`clock=host_present_call`) |
+| `PS3RECOMP_VK_WINDOW=1` | Also show frames in a window (SDL2; Win32 on Windows), resizable, with F11 or Alt+Enter for borderless full screen; if it cannot, the run continues headless and says why |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
 

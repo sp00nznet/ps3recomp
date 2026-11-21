@@ -38,13 +38,16 @@
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
 
+#include "port_extension.h"   /* optional build extensions (PORT_EXTENSIONS) */
+
+#include <atomic>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifndef _WIN32
-#include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
+#include "guest_arena.h"   /* the 4 GB aligned guest arena, see alloc_guest_vm */
 #endif
 
 #if defined(__APPLE__)
@@ -110,6 +113,7 @@ void     cellGcmTickVBlank(void);
 void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
+void     cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
 unsigned cellGcm_flip_request_count(void);
 }
 
@@ -210,7 +214,11 @@ static DWORD WINAPI frame_clock(LPVOID)
     ULONGLONG next_tick = GetTickCount64();
 
     for (;;) {
-        Sleep(4);
+        /* Wait on the FIFO kick event, not a flat Sleep(4): the runtime
+         * signals it when the guest needs the walker now (a dry fence queue,
+         * a ring recycle, and, opted in, an SPU write of put). Nothing kicks:
+         * the same 4 ms. GCM_FIFO_KICK=0 restores the plain sleep. */
+        cellGcm_fifo_kick_wait(4);
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;
@@ -234,6 +242,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             fired++;
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
+        if (auto poll = port_extension()->frame_poll) poll();
 
         /* Drain at the outer cadence too, not only on the 16 ms tick: titles
          * fence every render pass on a label the drain writes, and one wave of
@@ -334,11 +343,17 @@ static bool alloc_guest_vm(void)
      * takes page-aligned addresses only. glibc serves an allocation this big
      * from its own mmap chunk and returns a pointer 16 bytes past the page
      * start, so every commit failed with EINVAL and sys_memory_allocate
-     * answered ENOMEM to every call. mmap's base is page-aligned and zeroed. */
-    void* p = mmap(NULL, VM_SIZE, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    vm_base = (p == MAP_FAILED) ? nullptr : (uint8_t*)p;
+     * answered ENOMEM to every call. And 4 GB aligned, not merely page
+     * aligned: the HLE recovers guest addresses by truncating host pointers
+     * to 32 bits, as vm_init() guarantees for the toolkit's own arena (see
+     * guest_arena.h). */
+    vm_base = guest_arena_map(VM_SIZE);
     ppu_vm_size = 0;              /* the whole space is backed; no OOB guard needed */
+    if (vm_base && ((uintptr_t)vm_base & 0xFFFFFFFFu)) {
+        fprintf(stderr, "guest arena at %p is not 4 GB aligned\n", (void*)vm_base);
+        guest_arena_unmap(vm_base, VM_SIZE);
+        vm_base = nullptr;
+    }
 #endif
     return vm_base != nullptr;
 }
@@ -402,6 +417,15 @@ static int run_guest(uint32_t entry, uint32_t stack_top)
 static int run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry, stack_top); }
 #endif
 
+/* Registered with atexit when an extension has a stop callback; the flag keeps
+ * it to one call even if exit is reached twice. */
+static void port_extension_stop_once(void)
+{
+    static std::atomic<bool> stopped{false};
+    if (stopped.exchange(true)) return;
+    if (auto stop = port_extension()->stop) stop();
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -419,6 +443,9 @@ int main(int argc, char** argv)
 #endif
 
     printf("=== ps3recomp game runner ===\n");
+
+    /* Build extensions (port_extension.h): null unless one is registered. */
+    if (auto prepare = port_extension()->prepare) prepare(argv[1]);
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
@@ -444,6 +471,9 @@ int main(int argc, char** argv)
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */
     g_ps3_guest_caller = harness_guest_caller;
+    if (auto start = port_extension()->start) start(argv[1]);
+    /* stop runs once at process exit, whichever path ends the run. */
+    if (port_extension()->stop) std::atexit(port_extension_stop_once);
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",

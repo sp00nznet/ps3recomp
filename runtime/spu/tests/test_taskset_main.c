@@ -31,14 +31,17 @@ static int evq_receive(ev_queue* q, ev_t* o) {
     *o = q->buf[q->head]; q->head = (q->head + 1) % 16; q->count--; return 0;
 }
 
-static uint8_t  g_mem[2048];
+static uint8_t  g_mem[0x10800];
 uint8_t*        vm_base = g_mem;
 static mfc_engine g_mfc;
 static ev_queue g_taskset_evq;     /* taskset completion event queue */
 
 #define WORK_EA   0x180            /* SPU task input slot  */
-#define RESULT_EA 0x1C0            /* SPU task output slot */
+#define RESULT_EA 0x101C0           /* SPU task output slot */
 #define QUEUE_BUF 0x100            /* LFQueue data buffer  */
+/* cellSync takes guest effective addresses (vm_base + ea), not host pointers. */
+#define QUEUE_EA  0x400
+#define ITEM_EA   0x500
 #define EV_SOURCE_SPU_GROUP 0x7ULL
 
 u128 spu_rdch(spu_context* ctx, uint32_t ch) { (void)ctx; (void)ch; return spu_zero(); }
@@ -60,11 +63,11 @@ static void wbe32(uint8_t* p, uint32_t v) { p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p
 typedef struct { CellSyncLFQueue* work_q; ev_queue* evq; int done; } spurs_taskset;
 
 static void taskset_run(spurs_taskset* ts) {
-    uint8_t item[16];
+    uint8_t* item = &g_mem[ITEM_EA];
     /* non-blocking drain: cellSyncLFQueuePop BLOCKS when empty (it's the
      * blocking variant); TryPop returns an error so the taskset stops when the
      * workload queue is exhausted. */
-    while (cellSyncLFQueueTryPop(ts->work_q, item) == CELL_OK) {
+    while (cellSyncLFQueueTryPop(ts->work_q, (void*)(uintptr_t)ITEM_EA) == CELL_OK) {
         memcpy(&g_mem[WORK_EA], item, 16);                 /* deliver workload to the SPU task input */
         spu_context ctx; spu_context_init(&ctx, 0);
         mfc_engine_init(&g_mfc);
@@ -84,19 +87,19 @@ int main(void) {
     memset(&g_taskset_evq, 0, sizeof(g_taskset_evq)); g_taskset_evq.active = 1;
 
     /* PPU: a real cellSync LFQueue feeding the taskset, buffer in shared memory. */
-    CellSyncLFQueue q;
-    cellSyncLFQueueInitialize(&q, &g_mem[QUEUE_BUF], 16, 8, 0, 0);
+    CellSyncLFQueue* q = (CellSyncLFQueue*)(uintptr_t)QUEUE_EA;
+    cellSyncLFQueueInitialize(q, (void*)(uintptr_t)QUEUE_BUF, 16, 8, 0, 0);
 
     /* PPU enqueues 3 workloads. */
     const uint32_t kWork[3] = { 0x1111AAAA, 0x2222BBBB, 0x3333CCCC };
     int pushed = 0;
     for (int i = 0; i < 3; i++) {
-        uint8_t item[16] = {0}; wbe32(item, kWork[i]);
-        if (cellSyncLFQueuePush(&q, item) == CELL_OK) pushed++;
+        uint8_t* item = &g_mem[ITEM_EA + 0x20]; memset(item, 0, 16); wbe32(item, kWork[i]);
+        if (cellSyncLFQueuePush(q, (void*)(uintptr_t)(ITEM_EA + 0x20)) == CELL_OK) pushed++;
     }
 
     /* Run the taskset: it drains the queue, invoking the lifted SPU task per item. */
-    spurs_taskset ts = { &q, &g_taskset_evq, 0 };
+    spurs_taskset ts = { q, &g_taskset_evq, 0 };
     taskset_run(&ts);
 
     /* Verify: 3 workloads processed, 3 completion events, each result == its input. */

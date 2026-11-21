@@ -210,6 +210,21 @@ class LiftedFunction:
 _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
 
 
+# A call bracket publishes its return pc (ctx->drain_ret_pc) for the whole
+# call, not only once spu_drain_call starts: the interpreter stops there when
+# the callee's return lands mid-function. Set only by the drain loop, it was
+# stale while the callee ran from the call itself -- Resistance 3's
+# igjob_00DC0200 calls an unlifted handler through `bisl`, the interpreter ran
+# on through the caller's loop back into the same call, and every iteration
+# nested another host frame until the depth guard halted the SPU.
+# `ret` is the C expression of the return pc (SPULifter._pc: --reloc moves it).
+def _drain_ret_open(ret: str) -> str:
+    return f"uint32_t _dr = ctx->drain_ret_pc; ctx->drain_ret_pc = {ret}; "
+
+
+_DRAIN_RET_CLOSE = "ctx->drain_ret_pc = _dr; "
+
+
 # Mnemonics that do NOT write the rt register (so we skip the post-trace).
 # Everything else writes rt = ops[0] (= insn.raw & 0x7F).
 _NO_RT_WRITE = {
@@ -737,6 +752,45 @@ class SPULifter:
             return ("ctx->stop_code = 0x3FFFu; "
                     "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
+        # dfceq, dfcmeq, dfcgt, dfcmgt, dftsv: a CBE SPU does not implement them
+        # (PowerXCell 8i additions [INFERENCE]). Console probe, CECHC04 on FW 4.81:
+        # each word run alone in its own thread group did not execute; the group
+        # ended with join cause 4 and the stopped thread's exit status read
+        # 0x8001000F (CELL_ESTAT). The interpreter decodes them as `.word` and stops
+        # at the word (tools/gen_spu_interp.py); lifted code must stop the same way
+        # instead of calling a helper and running on. This does not fall through to
+        # spu_unsupported below, which tolerates data in .text that never executes:
+        # these are opcodes the console rejects, so reaching one is a hard stop.
+        if mn in ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"):
+            return (f"ctx->pc = {self._pc(addr)}; "
+                    f"fprintf(stderr, \"[spu] INVALID-OP {mn} (0x%08X) at LS 0x%05X "
+                    f"img=%d\\n\", 0x{insn.raw:08X}u, (unsigned)ctx->pc, ctx->image_id); "
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
+                    f"spu_halt(ctx); return;")
+
+        # cflts/cfltu at I8 <= 14: the conversion shifts by sh = be + 23 - I8, and a
+        # lane with sh >= 264 (be >= 241 + I8, so only at these scales) leaves the
+        # console's saturating path for a result nothing models (cflts at every such
+        # lane; cfltu except negative lanes and sh == 264, which were measured;
+        # console probe, CECHC04 on FW 4.81, see spu__cfl_lane in spu_helpers.h).
+        # Which lanes reach it depends on the data, so the lifted code asks
+        # spu_cfl_unmodelled_lane(), the interpreter's check, before it writes the
+        # destination, and halts the same way when a lane does. I8 >= 15 cannot reach
+        # it (max sh = 263) and lifts to the bare helper call.
+        if mn in ("cflts", "cfltu"):
+            i8 = int(_imm(ops[2]), 0)
+            if i8 <= 14:
+                uns = 1 if mn == "cfltu" else 0
+                src = g(ra())
+                return (f"{{ int cfl_l = spu_cfl_unmodelled_lane({src}, {i8}, {uns}); "
+                        f"if (cfl_l >= 0) {{ ctx->pc = {self._pc(addr)}; "
+                        f"fprintf(stderr, \"[spu] INVALID-OP {mn}: unmodelled cflts/cfltu lane ({mn} I8={i8} lane=%d in=0x%08X) "
+                        f"(0x%08X) at LS 0x%05X img=%d\\n\", "
+                        f"cfl_l, (unsigned){src}._u32[cfl_l], 0x{insn.raw:08X}u, (unsigned)ctx->pc, ctx->image_id); "
+                        f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
+                        f"spu_halt(ctx); return; }} }} "
+                        f"{g(rt())} = spu_{mn}({src}, {i8});")
+
         # ---- integer arithmetic (register) ----
         rr_bin = {
             "a": "spu_a", "sf": "spu_sf", "ah": "spu_ah", "sfh": "spu_sfh",
@@ -751,10 +805,8 @@ class SPULifter:
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
-            # double-precision (2 doubles/reg) + double compares
+            # double-precision (2 doubles/reg); the double compares are above (invalid)
             "dfa": "spu_dfa", "dfs": "spu_dfs", "dfm": "spu_dfm",
-            "dfceq": "spu_dfceq", "dfcmeq": "spu_dfcmeq",
-            "dfcgt": "spu_dfcgt", "dfcmgt": "spu_dfcmgt",
             "mpyhhu": "spu_mpyhhu",
             "eqv": "spu_eqv", "absdb": "spu_absdb", "avgb": "spu_avgb",
             "cg": "spu_cg", "bg": "spu_bg",
@@ -811,7 +863,6 @@ class SPULifter:
             "andhi": "spu_andhi", "andbi": "spu_andbi",
             "orhi":  "spu_orhi",  "orbi":  "spu_orbi",
             "xorhi": "spu_xorhi", "xorbi": "spu_xorbi",
-            "dftsv": "spu_dftsv",
             # RI8 float<->int conversions with scale (i8 in ops[2])
             "cflts": "spu_cflts", "cfltu": "spu_cfltu",
             "csflt": "spu_csflt", "cuflt": "spu_cuflt",
@@ -942,13 +993,17 @@ class SPULifter:
                 # Nested host call bracketed by host_depth (so the callee's
                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
                 # callee's own tail-chains so they don't grow the caller frame)
-                # + image save/restore (adopt-on-serve cannot leak upward).
+                # + image save/restore (adopt-on-serve cannot leak upward)
+                # + the bracket's return pc published for the whole call (see
+                # _drain_ret_open).
                 # --reloc: the callee's drain may dispatch into other placed code, which sets
                 # ctx->reloc_delta for itself; put this placement's back on return.
                 rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
+                        f"{_drain_ret_open(self._pc((addr + 4) & 0x3FFFC))}"
                         f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
+                        f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; "
+                        f"{_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si);{rr} }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -1013,9 +1068,10 @@ class SPULifter:
             rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
                     f"int32_t _si = (int32_t)ctx->image_id; {rs}"
+                    f"{_drain_ret_open(self._pc((addr + 4) & 0x3FFFC))}"
                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._pc(addr + 4)}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
+                    f"ctx->host_depth--; {_DRAIN_RET_CLOSE}spu_img_restore(ctx, _si);{rr} }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link

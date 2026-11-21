@@ -87,8 +87,9 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
 }
 
 /* Leaf imports that can finish without the dispatcher: no guest code, no
- * change to r2, no blocking. The module that implements one registers a fast
- * form beside the full handler. ps3_hle_call tries it first, and the fast form
+ * change to r2, no blocking (ps3_hle_call still stores the caller's TOC slot,
+ * as the full path's guard does). The module that implements one registers a
+ * fast form beside the full handler. ps3_hle_call tries it first, and the fast form
  * returns 0 to take the full call instead (a contended lock that has to wait,
  * say). God of War HD takes an lwmutex about 640,000 times in one frame (its
  * allocator, when a wave spawns), and the dispatcher's guard and bookkeeping
@@ -228,12 +229,50 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
     if (i == n_seen && n_seen < 512) { seen[n_seen] = nid; hits[n_seen] = 0; n_seen++; }
     uint32_t count = (i < 512) ? ++hits[i] : 0;
     (void)count;
-    if (count == 1)
+    if (count == 1) {
         fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> faking %s "
                         "(unregistered import%s)\n",
                 nid, s_fake ? "CELL_OK" : "CELL_ERROR_ERROR",
                 s_fake ? "; PS3_HLE_UNRESOLVED=fail to find load-bearing ones"
                        : "");
+        /* The caller's signature, observed black-box: r3..r10 are arguments
+         * 1..8, and the PPC64 ELFv1 parameter save area at SP+112 carries
+         * arg9 onward -- the same ABI libs/network/sceNpScore.c documents for
+         * its ctx handlers. First hit only: one dump per distinct NID, the
+         * same visibility contract as the report above. This is what lets
+         * whoever implements the missing handler write it from an observed
+         * call rather than from anyone else's source. */
+        const uint64_t* g = ctx->gpr;
+        uint32_t sp = (uint32_t)g[1];
+        fprintf(stderr,
+                "[hle]   0x%08X tid=%-3u r3 =%016llX r4 =%016llX "
+                "r5 =%016llX r6 =%016llX\n"
+                "[hle]   0x%08X          r7 =%016llX r8 =%016llX "
+                "r9 =%016llX r10=%016llX\n"
+                "[hle]   0x%08X          sp =%016llX lr =%016llX\n",
+                nid, (unsigned)ctx->thread_id,
+                (unsigned long long)g[3], (unsigned long long)g[4],
+                (unsigned long long)g[5], (unsigned long long)g[6],
+                nid,
+                (unsigned long long)g[7], (unsigned long long)g[8],
+                (unsigned long long)g[9], (unsigned long long)g[10],
+                nid, (unsigned long long)g[1], (unsigned long long)ctx->lr);
+        if (sp) {   /* sp==0 means a synthetic context; skip the guest read */
+            fprintf(stderr,
+                    "[hle]   0x%08X          arg9=%016llX arg10=%016llX "
+                    "arg11=%016llX arg12=%016llX  @SP+112 "
+                    "(0 = unreadable)\n",
+                    nid,
+                    (unsigned long long)(((uint64_t)vm_read32((uint64_t)sp + 112) << 32) |
+                                          vm_read32((uint64_t)sp + 116)),
+                    (unsigned long long)(((uint64_t)vm_read32((uint64_t)sp + 120) << 32) |
+                                          vm_read32((uint64_t)sp + 124)),
+                    (unsigned long long)(((uint64_t)vm_read32((uint64_t)sp + 128) << 32) |
+                                          vm_read32((uint64_t)sp + 132)),
+                    (unsigned long long)(((uint64_t)vm_read32((uint64_t)sp + 136) << 32) |
+                                          vm_read32((uint64_t)sp + 140)));
+        }
+    }
 
     ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
 }
@@ -281,8 +320,15 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
-    if (const hle_fast_fn f = hle_fast(nid))
-        if (f(ctx)) return;
+    if (const hle_fast_fn f = hle_fast(nid)) {
+        /* The lifted import stub does not save r2, but its caller still runs
+         * ld r2,0x28(r1) after the call. The full path's _TocGuard writes the
+         * caller's TOC to that slot; a fast call has to as well, or a caller
+         * on a fresh stack reloads r2 = 0 and reads every TOC-relative global
+         * from the null page. */
+        const uint64_t toc = ctx->gpr[2], sp = ctx->gpr[1];
+        if (f(ctx)) { ctx->gpr[2] = toc; vm_write64(sp + 0x28, toc); return; }
+    }
 
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
@@ -768,8 +814,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */
@@ -816,7 +860,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
               return;
           } } }
-        ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
+        /* The generic fallback: distinct-once report, first-hit signature
+         * dump, and PS3_HLE_UNRESOLVED (ok|fail) honored -- i.e. the function
+         * below, which existed but was never called, so `=fail` was a no-op
+         * and the first-40 cap above hid every import past the 40th unique
+         * one (exactly what its comment says not to do). */
+        ps3_hle_unresolved(nid, ctx);
         return;
     }
     g_last_hle_name = e->name;
@@ -838,6 +887,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
                     ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
     ctx->gpr[3] = r;   /* PPC return value */
+    { unsigned t = (unsigned)ctx->thread_id;
+      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
     /* PS3_HLE_PTRCHECK: the guest stores HLE return values as guest pointers, so
      * an HLE returning a value outside guest RAM (>= 0x10000000) that is not a
      * CELL_ERROR code (0x8001xxxx / 0x8002xxxx) is leaking a truncated HOST

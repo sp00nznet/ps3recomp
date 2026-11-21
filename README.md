@@ -285,8 +285,10 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 **Downloads:** each [release](https://github.com/sp00nznet/ps3recomp/releases/latest)
 includes a prebuilt SDK bundle per platform (`ps3recomp-<version>-win-x64.zip`,
 `-mac-arm64.zip`, `-linux-x64.zip`) plus `SHA256SUMS.txt`. A bundle contains the
-runtime library, its headers and the Python pipeline. `VERSION.txt` inside it
-says what that platform can and cannot do yet.
+runtime library, its headers, the Python dependency manifest and pipeline, and
+the project template with the support sources it builds. Point `PS3RECOMP_DIR`
+at the extracted bundle just as you would at a source checkout. `VERSION.txt`
+inside it says what that platform can and cannot do yet.
 
 > **Prerequisites (building from source)**: Python 3.10+ (CI uses 3.12), CMake
 > 3.20+, Ninja, and a C17/C++20 compiler: clang-cl with Visual Studio 2022 on
@@ -432,6 +434,158 @@ licence requires.
 
 
 ## Changelog
+
+### v0.20.0 — *"One Hundred Eleven"* (November 2026)
+
+*111 pull requests from sixteen contributors, merged in #839. Five of them are
+here for the first time. Most of the batch is opt-in: new behaviour sits
+behind an environment switch or a build option and is off by default. The
+changes that are on by default are marked below.*
+
+**Default-behaviour changes**
+- **Pad face buttons map by position** (*[@djrobson5](https://github.com/djrobson5)*,
+  new, #810). On a Nintendo-layout pad the bottom button is now Cross, not the
+  button printed A. Xbox and PlayStation pads are unchanged. Set
+  `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1` for the old mapping.
+- **lwmutex unlock hands the lock to the oldest waiter**, as lv2 does
+  (*[@zeropaulsy](https://github.com/zeropaulsy)*, new, #822). A thread that
+  dropped and retook the lock in a loop always won before.
+- **The POSIX cellAudio mixer is paced on the clock**, 187.5 blocks a second,
+  with the device queue as a guard (*[@mmkzer0](https://github.com/mmkzer0)*,
+  #826). It had run about 5% fast, so music drifted behind the picture.
+- **lv2 syscall slots 41/42** (*@mmkzer0*, #794): `sys_ppu_thread_exit` is
+  41, and 42 answers `ENOSYS`, per the stock firmware table.
+- **On Windows the timebase and system time count from host boot**, not from
+  the process's first call (*[@CapTiveEel20](https://github.com/CapTiveEel20)*,
+  new, #788). Titles that seed an RNG from the clock no longer get the same
+  seed every launch.
+- **A draw under a scissor written empty is dropped** (*@djrobson5*, #811),
+  not drawn unclipped.
+- **Metal writes `[[point_size]]`** (*@djrobson5*, #813), so guest points draw
+  at the size the RSX set.
+
+**RSX and graphics**
+- **Presenting** (*[@tekulvw](https://github.com/tekulvw)*): one host present
+  per executed flip (`PS3RECOMP_RSX_SINGLE_PRESENT=1`, #721), adaptive flip
+  pacing (`PS3RECOMP_GCM_FLIP_PACING=adaptive`, #724), direct Vulkan engine
+  presents (`PS3RECOMP_VK_DIRECT_PRESENT=1`, #738), and a present thread for
+  Metal and Vulkan (`PS3RECOMP_RSX_PRESENT_THREAD=1`, #741, #752) that keeps
+  periodic frame dumps (#818). MetalFX spatial upscaling with
+  `PS3_UPSCALE=metalfx` (*[@erikomis](https://github.com/erikomis)*, #785).
+- **Vulkan**: the backend builds on Windows (*@tekulvw*, #746); unbound engine
+  units read as transparent black (#754); the guest's polygon offset is
+  applied (*[@MatRanc](https://github.com/MatRanc)*, #702;
+  `PS3RECOMP_ENG_POLY_OFFSET=0` turns it off); blend constant factors and
+  `SET_BLEND_COLOR` (*[@MaChInEgUn3](https://github.com/MaChInEgUn3)*, #782).
+- **D3D12** (*[@DriifterSelf](https://github.com/DriifterSelf)*): the
+  fallback projection fires only on an all-zero matrix (#771), slotted-VS FP
+  PSO entries survive `vp_gen` bumps (#774), and the offscreen target and
+  shader/PSO caches are larger (#780). Immediate vertices render in the live
+  backend (*@tekulvw*, #662), fence waits are validated
+  (*[@Tzeentchnet](https://github.com/Tzeentchnet)*, #713), and GPU waits give
+  up only on a removed device (*[@undecuple](https://github.com/undecuple)*,
+  #764).
+- **Metal** (*[@n0madic](https://github.com/n0madic)*): a full record array is
+  submitted mid-frame instead of dropping the rest, and the cap and the draw
+  engine's texture cache size can be set at build time (#719, #798).
+- **Draw engine and decompilers**: `RSX_FP_SAFE_DIV=1` guards `DIV`, `RCP` and
+  `_rsx_inv_w` against zero-division NaNs (*@DriifterSelf*, #601); `TXD`
+  (*@MatRanc*, #701) and the `Y16_X16_FLOAT` remap (#836); CMP (11-11-10)
+  vertex components (*@DriifterSelf*, #775). Current-target feedback across
+  size aliases (#665), depth-bounds snapshots in one texture with a per-pass
+  `PS3RECOMP_ENG_DEPTH_BOUNDS=2` (#755), reused texture register decodes
+  (#762) (all *@tekulvw*), and one own-target copy shared across a pass with
+  `PS3RECOMP_ENG_FEEDBACK_PER_PASS=1` (*@djrobson5*, #814).
+- **GCM**: the interrupt thread gets a guest thread's host stack,
+  `cellGcmSetPrepareFlip` returns the buffer id, and an unmap clears a partial
+  last page (*@MatRanc*, #698, #703, #704). Get is published before an NV4097
+  semaphore release, and `PS3RECOMP_GCM_REPORT_BUSY_SCALE` scales the walker's
+  drain time out of report time stamps (*@n0madic*, #797, #753).
+  `cellGcmGetLastFlipTime` returns the last completed flip's time
+  (*@undecuple*, #783). The FIFO walker can wake on an SPU write of put
+  (`PS3RECOMP_GCM_SPU_PUT_KICK=1`, #816) or a PPU store of it
+  (`PS3RECOMP_GCM_PPU_PUT_KICK=1`, #817) (*@tekulvw*).
+- **Diagnostics** (*@tekulvw*): `PS3RECOMP_VK_FPS=1` (#736),
+  `PS3RECOMP_RSX_TARGET_CHURN=1` (#737), `D3D12_DROP_STATS_EVERY` (#747).
+
+**SPU and SPURS**
+- **SPURS**: workload `maxContention` from the guest stack (*@MatRanc*, #646),
+  the task attribute descriptor form auto-detected (#708), real workload
+  shutdown bounded by `SPURS_SHUTDOWN_MS` (#711), `CellSpursQueue` at its SDK
+  layout with `cellSpursQueuePopBody` (#832), and job `$sp` word 1 (#829). A
+  job chain resumes where it stopped and a Run on a busy chain is kept
+  (*[@ohkora](https://github.com/ohkora)*, #784); a chain's jobs see an SPU
+  number its priority table allows
+  (*[@pedrowallybandeira](https://github.com/pedrowallybandeira)*, new, #803);
+  `cellSpursGetJobChainId` (*@DriifterSelf*, #777).
+  `SPURS_IDLE_PROBE=0` admits as the real kernel does (*@n0madic*, #756), and
+  `sys_spu_thread_write_snr` reaches a SPURS instance's policy contexts (#802).
+  The default workload registry holds 4096 entries
+  (*[@xuxinsss](https://github.com/xuxinsss)*, #787).
+- **SPU**: semantics measured on a console — `fesd` sign, invalid DP words,
+  `cflts`/`cfltu` small scales (*@mmkzer0*, #793). The drain resume resolves
+  through resident code spans (*@n0madic*, #799), the SPU thread LS window at
+  `0xF0000000 + spu_num * 0x100000` is mapped for DMA (#800), and a call
+  bracket publishes its return pc for the whole call (#801). A depth-0 restart
+  leaves no drain return point (*@tekulvw*, #806).
+- **Opt-in wake-ups and counters** (*@tekulvw*): `PS3RECOMP_SPURS_WORKER_WAKE=1`
+  (#819), `PS3RECOMP_SPURS_STORE_WAKE=1` (#820),
+  `PS3RECOMP_RSX_RELEASE_LINE_WAKE=1` (#729), `PS3RECOMP_SPU_LIVE_HOLDERS=1`
+  (#731), `PS3RECOMP_SPU_TASK_POOL=1` (#733), `PS3RECOMP_SPU_PUT_WATCH` (#744).
+
+**lv2, PPU and HLE**
+- **lv2**: semaphore and rwlock calls pin their slot, and a destroyed event
+  queue waits for calls inside it (*@mmkzer0*, #794); event queues are
+  published only once initialised (*@tekulvw*, #804); `sys_gpio_set`/`get`
+  and a watchdog guest stack unwind (*@DriifterSelf*, #767); memory containers
+  reserve from the default pool (*@MatRanc*, #699); a heap delete frees its
+  blocks (*@mmkzer0*, #796).
+- **PPU**: the HLE fast path writes the caller's TOC slot (*@tekulvw*, #805);
+  reservation contexts register once (*@undecuple*, #758);
+  `PS3RECOMP_PPU_RESV_OPEN_COUNT=1` (*@tekulvw*, #732); the HLE in-flight slot
+  clears on return (*@DriifterSelf*, #776); `ps3_hle_unresolved` is wired in
+  with a first-hit call dump, default unchanged
+  (*[@Lincoln16yyy](https://github.com/Lincoln16yyy)*, new, #697). Hardware
+  `fmaf()` for VMX on arm64 (*@MatRanc*, #834).
+- **Timers**: `PS3_USLEEP_WAIT_US` (*@MaChInEgUn3*, #628) and
+  `PS3RECOMP_USLEEP_SPIN_US` (*@tekulvw*, #725) for short sleeps.
+- **System**: firmware answers for pad `NO_DEVICE`, the port bound and
+  `cellGamePatchCheck` (*@mmkzer0*, #795); `cellGemGetState` answers
+  `CELL_GEM_NOT_CONNECTED` and sceNpTrophy reports no disk space needed once
+  installed (*@n0madic*, #792, #791); Sail keeps its Start/Stop tokens
+  (*@tekulvw*, #663); a native OSK lifecycle with `PS3RECOMP_NATIVE_OSK`
+  (#739); `-DPS3RECOMP_FIBER_BACKEND=aarch64` for cellFiber (*@mmkzer0*, #827).
+
+**Filesystem and saves**
+- cellFs shares one AIO path and id space (*@MatRanc*, #700), reports failed
+  and short writes (#705), and shares one fd space with `sys_fs` (#707);
+  `cellGameDeleteGameData` translates its `dirName` (#830).
+  `cellFsAllocateFileAreaWithoutZeroFill`, `cellFsReadWithOffset` and
+  `cellFsWriteWithOffset` (*@pedrowallybandeira*, #714, #715); `cellFsUnlink`
+  deletes (*@tekulvw*, #661). The transient retry skips directories and
+  `EINVAL`, and `/dev/null` maps to `NUL` on Windows (*@DriifterSelf*, #768,
+  #770).
+- `cellSaveDataUserListAutoLoad`/`AutoSave`, and `listParam` in the directory
+  list (*@n0madic*, #789, #790).
+- `PS3RECOMP_VM_WRITE_WATCH=1` lets host caches prove guest pages unchanged,
+  with preservation sessions (*@tekulvw*, #727, #728).
+
+**Tooling, templates and CI**
+- Release archives are a self-contained SDK that `PS3RECOMP_DIR` can point at
+  (*@Tzeentchnet*, #655).
+- For ports (*@tekulvw*): `check_public_tree.py` and `fetch_sdk_pins.py`
+  (#726), `ppu_function_splice.py` (#730), `lift_hooks.py` (#743), template
+  build extensions and lifecycle callbacks (#742), a 4 GB-aligned POSIX arena
+  (#723), glibc static-TLS in thread stack sizes (#720), and regression
+  fixtures (#722).
+- `PS3RECOMP_SPU_RETURN_ENTRIES` in CMake (*@MatRanc*, #831); SPU
+  `run_tests.sh` 11/11 (#709) and a wider `test_ps3_tprof` window for macOS
+  (#837); macOS links two syscall tests (*@n0madic*, #717); Windows CI on a
+  pinned LLVM 22 clang-cl (*@mmkzer0*, #828).
+
+**Held for the next round**: #718, #745, #807 and #808 need a rebase onto this
+batch; #757, #809, #812, #815, #734, #773 and #772 change default behaviour and
+wait for a gate A/B.
 
 ### v0.19.0 — *"Eighty-One"* (November 2026)
 

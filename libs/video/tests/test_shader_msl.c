@@ -275,6 +275,44 @@ int main(int argc, char** argv)
             check("VP MSL", g_msl, getenv("PS3RECOMP_MSL_INVARIANT") ? "[[position" : "[[position, invariant]]");
             check("VP MSL", g_msl, "[[user(locn0)]]");    /* COLOR0 */
             check("VP MSL", g_msl, "[[user(locn10)]]");   /* TEXCOORD7 */
+            /* Metal's point size is undefined unless written: the vertex
+             * function writes [[point_size]] from the vp_pointsize row of
+             * VPConst, after vp_posoffset (rsx_vp_decompiler.h), as
+             * clamp(size, 1, max). The MSL is the one thing the D3D12 text
+             * does not carry, so the plain decompile has none. */
+            check("VP MSL point size", g_msl, "[[point_size]]");
+            check("VP MSL point size", g_msl, "float4 vp_pointsize;");
+            check("VP MSL point size", g_msl, "vp_pointsize.z");
+            {
+                const char* po = strstr(g_msl, "float4 vp_posoffset;");
+                const char* pp = strstr(g_msl, "float4 vp_pointsize;");
+                check_true("VP MSL point size: the row follows vp_posoffset", po && pp && pp > po);
+            }
+            /* The program's own size is o[6].x (output mask bit 5), taken
+             * only when vp_pointsize.y says so; the translated text keeps
+             * both sources. */
+            check("VP MSL point size", g_msl, "vp_pointsize.y");
+            check("VP MSL point size", g_msl, "vp_pointsize.x");
+        }
+        /* The text the other backends compile is the macro's guard, nothing
+         * more: undefined there, the member, row and store do not exist. */
+        check("VP HLSL point size", g_hlsl, "#ifdef RSX_POINT_SIZE_BUILTIN");
+        check("VP HLSL point size", g_hlsl, "[[vk::builtin(\"PointSize\")]] float psz:PSIZE;");
+        check("VP HLSL point size", g_hlsl, "Out.psz = vp_point_size(o[6].x);");
+    }
+
+    /* ---- vertex program: MOV o6, v3 -- the program writes the point size ---- */
+    {
+        u8 vp[32];
+        rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0 */
+        rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 6, 1);   /* MOV o6, v3, END */
+        check_count("VP point size", rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 2);
+        check("VP point size HLSL", g_hlsl, "o[6].xyzw = _v.xyzw;");
+        if (translate("VP point size", RSX_SHADER_STAGE_VERTEX) == 0) {
+            check("VP point size MSL", g_msl, "[[point_size]]");
+            check("VP point size MSL", g_msl, "vp_pointsize");
+            /* TEX9 still comes out of the same register. */
+            check("VP point size MSL", g_msl, "[[user(locn");
         }
     }
 

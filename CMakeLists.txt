@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # 2026 while the project shipped 0.6.x through 0.8.0, so every build printed
 # "ps3recomp runtime v0.3.0" and was believed. v0.9.0 is the first TAGGED one.
 project(ps3recomp_runtime
-    VERSION 0.19.0
+    VERSION 0.20.0
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
@@ -20,6 +20,32 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
+
+# cellFiber switches host contexts with Windows fibers on Windows and the
+# ucontext routines everywhere else. Apple arm64 has a third, opt-in option: a
+# hand-written register switch that skips swapcontext's signal-mask work, and
+# unlike ucontext it exists in every Apple process. It is Apple arm64 only
+# because host_fiber_aarch64.S implements exactly that ABI.
+set(_ps3_fiber_arm64 OFF)
+if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+   (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
+    set(_ps3_fiber_arm64 ON)
+endif()
+set(PS3RECOMP_FIBER_BACKEND "ucontext" CACHE STRING
+    "cellFiber host context switch: ucontext (default) or aarch64 (Apple arm64)")
+set_property(CACHE PS3RECOMP_FIBER_BACKEND PROPERTY STRINGS ucontext aarch64)
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    if(NOT _ps3_fiber_arm64)
+        message(FATAL_ERROR
+            "PS3RECOMP_FIBER_BACKEND=aarch64 requires a single-arch Apple arm64 build "
+            "(-DCMAKE_OSX_ARCHITECTURES=arm64): host_fiber_aarch64.S is that ABI only, "
+            "and a universal binary would need a second one.")
+    endif()
+    enable_language(ASM)
+elseif(NOT PS3RECOMP_FIBER_BACKEND STREQUAL "ucontext")
+    message(FATAL_ERROR "Unknown PS3RECOMP_FIBER_BACKEND: ${PS3RECOMP_FIBER_BACKEND} "
+        "(expected ucontext or aarch64)")
+endif()
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -44,16 +70,29 @@ file(GLOB_RECURSE HLE_SOURCES
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 
+# The AArch64 switch is two files that only make sense together: the assembly
+# implements the ABI, the C file maps stacks and states onto it.
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    list(APPEND HLE_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/host_fiber_aarch64.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/host_fiber_aarch64.S")
+endif()
+
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux; opt-in on Windows)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    # Windows: a Win32 window and vulkan-1.dll loaded at run time. The D3D12
+    # backend is still built and stays the Windows default; a port selects
+    # Vulkan by calling rsx_vulkan_backend_init.
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is not available on macOS")
     endif()
-    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+    # VULKAN_SDK: the LunarG SDK on Windows sets it (Include/vulkan/vulkan.h).
+    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h
+        HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{VULKAN_SDK}/include")
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
         message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
             "libvulkan-dev, Fedora: vulkan-headers -- or pass "
@@ -105,6 +144,9 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    call leaks one resolver frame per guest loop iteration. A port adds it to
 #    its own target; see templates/project/CMakeLists.txt.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
+# Selected as a pair with its assembly above, never globbed: the .c alone has
+# no ps3_host_ctx_switch to link against.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/host_fiber_aarch64\\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -113,6 +155,10 @@ add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
 )
+# cellFiber picks its host context path on this; nothing else reads it.
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FIBER_HOST_AARCH64=1)
+endif()
 
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -208,6 +254,18 @@ if(PS3RECOMP_FFMPEG_RUNTIME)
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
     message(STATUS "  FFmpeg:       run-time loaded (headers in ${PS3RECOMP_FFMPEG_INCLUDE_DIR})")
+endif()
+
+# Native on-screen keyboard hosts for cellOskDialog (libs/misc/osk_native.h).
+# All are off by default; without one the legacy cellOskDialog stub is used.
+if(NOT WIN32 AND NOT APPLE)
+    # No toolkit dialog: a dialog opens with its initial text and is confirmed
+    # only through OSK_NATIVE_CONTROL_FILE (libs/misc/osk_headless.c).
+    option(PS3RECOMP_NATIVE_OSK_HEADLESS "Build the headless native OSK host (mailbox-confirmed)" OFF)
+    if(PS3RECOMP_NATIVE_OSK_HEADLESS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NATIVE_OSK_HEADLESS=1)
+        message(STATUS "  OSK:          headless native host")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -313,6 +371,11 @@ endif()
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
+    # The lookup above is POSIX-only (it also serves the Metal translation);
+    # the opt-in Windows Vulkan backend looks glslang up on its own.
+    if(WIN32 AND NOT glslang_FOUND)
+        find_package(glslang CONFIG QUIET)
+    endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
@@ -415,6 +478,13 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    # The AArch64 switch as a standalone unit: a two-sided ABI probe, the
+    # guard-page layout, thread pinning and the fail-closed invariants. It
+    # compiles the backend itself, so it runs whether or not the runtime
+    # selects it -- Apple arm64 is the only host its assembly implements.
+    if(_ps3_fiber_arm64)
+        add_subdirectory(tests/host_fiber)
+    endif()
     # Syscall 14's address/flags classification as a plain unit test: the
     # check is pure, so the test links one runtime translation unit
     # (lv2_lock_line.c) and nothing else.
@@ -431,6 +501,25 @@ if(PS3RECOMP_BUILD_TESTS)
         # The same walker's JUMP decode: the old and the new form.
         add_subdirectory(tests/gcm_fifo_jump)
     endif()
+    # The guest write watch (default off) on synthetic guest memory.
+    add_executable(test_vm_write_watch tests/test_vm_write_watch.c runtime/memory/vm_watch.c)
+    target_include_directories(test_vm_write_watch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(NOT WIN32)
+        target_link_libraries(test_vm_write_watch PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME vm_write_watch COMMAND test_vm_write_watch)
+    add_test(NAME vm_write_watch_off COMMAND test_vm_write_watch off)
+    add_test(NAME vm_write_watch_strict COMMAND test_vm_write_watch strict)
+    set_tests_properties(vm_write_watch vm_write_watch_off vm_write_watch_strict PROPERTIES TIMEOUT 60)
+    set_tests_properties(vm_write_watch_strict PROPERTIES WILL_FAIL TRUE)
+    # Preservation sessions (copy on first write) of the write watch.
+    add_executable(test_vm_preserve tests/test_vm_preserve.c runtime/memory/vm_watch.c)
+    target_include_directories(test_vm_preserve PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(NOT WIN32)
+        target_link_libraries(test_vm_preserve PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME vm_preserve COMMAND test_vm_preserve)
+    set_tests_properties(vm_preserve PROPERTIES TIMEOUT 60)
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -470,6 +559,16 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_decode COMMAND test_spu_decode)
         set_tests_properties(spu_decode PROPERTIES TIMEOUT 30)
 
+        # Numeric edge cases of the conversion, double-extension and estimate
+        # helpers (cflts/cfltu, fesd/frds, fi/frest).
+        add_executable(test_spu_numeric_semantics
+            runtime/spu/tests/test_spu_numeric_semantics.c)
+        target_include_directories(test_spu_numeric_semantics PRIVATE include runtime/spu)
+        target_compile_options(test_spu_numeric_semantics PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_numeric_semantics PRIVATE m)
+        add_test(NAME spu_numeric_semantics COMMAND test_spu_numeric_semantics)
+        set_tests_properties(spu_numeric_semantics PROPERTIES TIMEOUT 30)
+
         # fi and cflts (NEON on ARM64) against their scalar references, in the
         # default FPCR and under round-toward-zero plus flush-to-zero.
         add_executable(test_spu_fi_cflts_neon
@@ -494,6 +593,15 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
 
+    add_executable(test_rsx_gpu_wait tests/test_rsx_gpu_wait.c)
+    target_include_directories(test_rsx_gpu_wait PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME rsx_gpu_wait COMMAND test_rsx_gpu_wait)
+    add_executable(test_rsx_fence_wait tests/test_rsx_fence_wait.c)
+    target_include_directories(test_rsx_fence_wait PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME rsx_fence_wait COMMAND test_rsx_fence_wait)
+
     # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
     # Without -mfma it takes the double-rounding path; with it, the builtin.
     add_executable(test_vmx_fmaf tests/test_vmx_fmaf.c)
@@ -516,9 +624,36 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
+    # cellAudio's mixer pacing decision (libs/audio/audio_pace.h) against a
+    # simulated clock and device queue: pure, so no runtime and no host audio.
+    # The pacing is POSIX-only (WASAPI is untouched) and so is the test's clock.
+    if(NOT WIN32)
+        add_executable(test_audio_pace libs/audio/tests/test_audio_pace.c)
+        add_test(NAME audio_pace COMMAND test_audio_pace)
+    endif()
+    # The clock GET_REPORT stamps reports with, and its drain-time scale.
+    add_executable(test_gcm_report_clock libs/video/tests/test_gcm_report_clock.c)
+    target_include_directories(test_gcm_report_clock PRIVATE include libs/video)
+    if(NOT MSVC)
+        target_link_libraries(test_gcm_report_clock PRIVATE m)
+    endif()
+    add_test(NAME gcm_report_clock COMMAND test_gcm_report_clock)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME ppu_hle_toc
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_hle_toc.py")
+        add_test(NAME ppu_function_splice
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_function_splice.py")
+        add_test(NAME check_public_tree
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_public_tree.py")
+        add_test(NAME fetch_sdk_pins
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_fetch_sdk_pins.py")
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
@@ -534,10 +669,34 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_dma_repeat
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
+        add_test(NAME ppu_thread_syscall_slots
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_syscall_slots.py")
+        add_test(NAME spu_lifter_invalid_dp
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_invalid_dp.py")
+        add_test(NAME spu_lifter_cfl_scale
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_cfl_scale.py")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
+            add_test(NAME spu_interpreter_mpyui
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_mpyui.py")
+            add_test(NAME spu_interpreter_double_arithmetic
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_double_arithmetic.py")
+            add_test(NAME spu_interpreter_rothmi
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_rothmi.py")
+            add_test(NAME spu_interpreter_xorbi
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_xorbi.py")
+            add_test(NAME ppu_ctr64
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_ctr64.py")
             add_test(NAME spu_fnms_zero_extended
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
@@ -558,6 +717,25 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
     endif()
+endif()
+
+# Vulkan backend bring-up smoke test (Linux and Windows): loader, optional
+# window, pump, present and shutdown, twice, with no command stream.
+if(PS3RECOMP_RSX_VULKAN)
+    add_executable(test_vulkan_backend_smoke
+        libs/video/tests/test_vulkan_backend_smoke.c
+        runtime/host/host_stubs.c
+    )
+    target_link_libraries(test_vulkan_backend_smoke PRIVATE ps3recomp_runtime)
+    if(NOT WIN32)
+        target_link_libraries(test_vulkan_backend_smoke PRIVATE m)
+    endif()
+    target_include_directories(test_vulkan_backend_smoke PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${PS3RECOMP_VULKAN_INCLUDE_DIR}"
+    )
+    set_target_properties(test_vulkan_backend_smoke PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -674,6 +852,31 @@ if(UNIX)
                 ps3recomp_msl_translation
                 "-framework Metal" "-framework QuartzCore" "-framework AppKit")
             target_link_options(test_metal_depth_clamp PRIVATE "-Wl,-dead_strip")
+
+            # Point size (SET_POINT_SIZE, the output mask's point-size bit)
+            # through the engine and the Metal backend: one point drawn, the
+            # pixels it lit counted.
+            add_executable(test_metal_point_size
+                libs/video/tests/test_metal_point_size.m
+                libs/video/rsx_shader_msl.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+                libs/video/rsx_tiling.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_point_size.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            target_include_directories(test_metal_point_size PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            target_link_libraries(test_metal_point_size PRIVATE
+                ps3recomp_msl_translation
+                "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+            target_link_options(test_metal_point_size PRIVATE "-Wl,-dead_strip")
         endif()
     endif()
 
@@ -694,6 +897,44 @@ if(UNIX)
                 glslang::glslang-default-resource-limits)
         endif()
         set_target_properties(test_shader_spirv PROPERTIES LINKER_LANGUAGE CXX)
+
+        # Direct and read-back engine presents leave the same frame
+        # (PS3RECOMP_VK_DIRECT_PRESENT). Needs a Vulkan device (lavapipe in
+        # CI); skips without one.
+        if(SDL2_FOUND)
+            add_executable(test_vulkan_direct_present
+                libs/video/tests/test_vulkan_direct_present.c
+                libs/video/rsx_shader_spirv.cpp
+                libs/video/rsx_draw_engine.c
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_vertex_fetch.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+                libs/video/rsx_tiling.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_vulkan_direct_present.c"
+                PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_RSX_VULKAN=1)
+            target_include_directories(test_vulkan_direct_present PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            if(TARGET SDL2::SDL2)
+                target_link_libraries(test_vulkan_direct_present PRIVATE SDL2::SDL2)
+            else()
+                target_include_directories(test_vulkan_direct_present PRIVATE ${SDL2_INCLUDE_DIRS})
+                target_link_libraries(test_vulkan_direct_present PRIVATE ${SDL2_LIBRARIES})
+            endif()
+            target_link_libraries(test_vulkan_direct_present PRIVATE
+                glslang::glslang glslang::SPIRV ${CMAKE_DL_LIBS} Threads::Threads m)
+            if(TARGET glslang::glslang-default-resource-limits)
+                target_link_libraries(test_vulkan_direct_present PRIVATE
+                    glslang::glslang-default-resource-limits)
+            endif()
+            set_target_properties(test_vulkan_direct_present PROPERTIES LINKER_LANGUAGE CXX)
+        endif()
     endif()
 endif()
 

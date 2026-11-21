@@ -7,10 +7,15 @@ runtime called cellSaveData_register_ctx_handlers(), so both went through
 the generic eight-argument binding and the title's callbacks saw
 cbResult->userdata == 0.
 
+cellSaveDataUserListAutoLoad and UserListAutoSave take ten: userId follows
+version, and container and userdata are the ninth and tenth, on the stack.
+They had no implementation at all (NIDs 0x248BD1D8 and 0x0E091C36).
+
 Two checks:
   1. libs/system/tests/test_savedata_user_autosave.c registers cellSaveData's
-     context handlers and calls both handlers; each must hand the stack
-     userdata to the stat callback.
+     context handlers and calls all four handlers; each must hand the stack
+     userdata to the stat callback (the list variants to funcFixed as well,
+     and with the right direction: only the save writes PARAM.SFO).
   2. ppu_sysprx_register() (runtime/ppu/ppu_sysprx.cpp) calls
      cellSaveData_register_ctx_handlers(), so a project cannot forget it.
 

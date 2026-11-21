@@ -53,8 +53,13 @@ extern "C" {
 extern uint32_t g_ps3_sdk_version;
 
 
-#define SYS_PPU_THREAD_CREATE           41
-#define SYS_PPU_THREAD_EXIT             42
+/* 41 is _sys_ppu_thread_exit and 42 is the shared ENOSYS stub: the FW 4.93 stock
+ * syscall table has a handler at 41 and the stub at 42, the 4.81 dump agrees,
+ * and RPCS3 at pin d00d8023 (lv2.cpp) binds _sys_ppu_thread_exit at 41 and
+ * uns_func at 42. Thread creation is two syscalls, _sys_ppu_thread_create (52)
+ * and sys_ppu_thread_start (53), whose ABI is not the sysPrxForUser-shaped
+ * sys_ppu_thread_create; that one is reached by NID, so neither is tabled here. */
+#define SYS_PPU_THREAD_EXIT             41
 #define SYS_PPU_THREAD_YIELD            43
 #define SYS_PPU_THREAD_JOIN             44
 #define SYS_PPU_THREAD_DETACH           45
@@ -268,13 +273,12 @@ typedef struct lv2_syscall_table {
 
 extern lv2_syscall_table g_lv2_syscalls;
 
-/* Default handler for unimplemented syscalls — logs the call for debugging */
-static inline int64_t lv2_syscall_unimplemented(ppu_context* ctx)
-{
-    uint32_t num = (uint32_t)ctx->gpr[11];
-    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
-    return (int64_t)(int32_t)CELL_ENOSYS;
-}
+/* Default handler for unimplemented syscalls -- logs the call for debugging.
+ * One real function, not a static inline: lv2_try_syscall tells a registered
+ * handler from "no handler" by comparing against it, and a static inline
+ * would give every translation unit its own address, so the comparison could
+ * fail across units. Defined in lv2_register.c. */
+int64_t lv2_syscall_unimplemented(ppu_context* ctx);
 
 static inline void lv2_syscall_table_init(lv2_syscall_table* tbl)
 {
@@ -342,6 +346,12 @@ static inline void lv2_syscall_dispatch(lv2_syscall_table* tbl, ppu_context* ctx
  * ppu_thread, mutex, cond, semaphore, rwlock, event, timer, memory, fs.
  * -----------------------------------------------------------------------*/
 void lv2_register_all_syscalls(lv2_syscall_table* tbl);
+
+/* The dispatch half of the guest `sc` path (lv2_syscall() in ppu_loader.cpp
+ * consults this and, for a genuinely unregistered number, writes its own
+ * fallback). Returns 1 and stores the handler's answer in gpr[3] for a
+ * registered number; 0 when the slot is empty (the filtered sentinel). */
+int lv2_try_syscall(ppu_context* ctx);
 
 #ifdef __cplusplus
 } /* extern "C" */

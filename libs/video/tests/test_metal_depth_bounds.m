@@ -8,8 +8,12 @@
  *   - [0.5, 1.0]: only the right half turns green;
  *   - [0.0, 0.5]: only the left half;
  *   - [0.0, 1.0] (no bound) or the test off: both halves;
- *   - PS3RECOMP_ENG_DEPTH_BOUNDS=0 (macos.yml's second run): both halves in
- *     every case, as before the test was emulated.
+ *   - mode 0 (PS3RECOMP_ENG_DEPTH_BOUNDS=0, macos.yml's second run): both
+ *     halves in every case, as before the test was emulated;
+ *   - modes 1 (exact, the default when the variable is unset) and 2 (per
+ *     pass) bound as above, and differ only when a pass writes depth between
+ *     bounded draws (alternating()).
+ * Every mode runs in one process, the environment's first.
  *
  * Built by CMake (build/test_metal_depth_bounds) only where glslang and
  * spirv-cross were found, like test_metal_poly_offset.
@@ -56,8 +60,9 @@ static void rect(float x0, float x1, float z, float r, float gr, float b)
     method(0x1808, RSX_PRIMITIVE_TRIANGLES); method(0x1814, 5u << 24); method(0x1808, 0);
 }
 
-/* The green draw's result: bit 0 = left half green, bit 1 = right half. */
-static int bounded(int enable, float mn, float mx)
+/* A 64x64 target and a Z24S8 zeta holding depth 0.25 on the left half and
+ * 0.75 on the right (both halves red), depth writes off afterwards. */
+static int setup(void)
 {
     if (rsx_draw_engine_init(64, 64) != 0) { CHECK(0, "engine init"); return -1; }
     method(0x0194, 0xFEED0000);                 /* CONTEXT_DMA_COLOR_A: local */
@@ -91,11 +96,20 @@ static int bounded(int enable, float mn, float mx)
     rect(-1.0f, 0.0f, 0.25f, 1, 0, 0);
     rect( 0.0f, 1.0f, 0.75f, 1, 0, 0);
     method(0x0A70, 0);                          /* DEPTH_MASK off */
+    return 0;
+}
+
+static void bounds(int enable, float mn, float mx)
+{
     method(0x0380, enable ? 1u : 0u);           /* DEPTH_BOUNDS_TEST_ENABLE */
     method(0x0384, fbits(mn));
     method(0x0388, fbits(mx));
-    rect(-1.0f, 1.0f, 0.5f, 0, 1, 0);
+}
 
+/* Reads the target back, shuts the engine down. Bit 0 = left half green,
+ * bit 1 = right half. */
+static int result(void)
+{
     s_engine_backend.submit_and_wait(NULL, 0);
     static u8 px[64 * 64 * 4];
     memset(px, 0, sizeof px);
@@ -110,6 +124,76 @@ static int bounded(int enable, float mn, float mx)
     return lg | (rg << 1);
 }
 
+/* Command order across a re-taken snapshot. A bounded [0.5, 1] blue draw
+ * colours the right half (depth 0.75) only; then, colour writes off, the two
+ * halves' depths are swapped; then a bounded green draw. The second snapshot
+ * goes into the first one's texture (depth_snapshot_into), so the blue draw
+ * must still read the depth from before the swap: the right half stays blue.
+ * Had it read the swapped depth, the right half would be red and the left
+ * blue then green. Returns 1 when the right half is blue, 0 when it is not,
+ * -1 when the engine would not start. */
+static int ordered(void)
+{
+    if (setup() < 0) return -1;
+    bounds(1, 0.5f, 1.0f);
+    rect(-1.0f, 1.0f, 0.5f, 0, 0, 1);
+    bounds(0, 0.0f, 1.0f);
+    method(0x0324, 0);                          /* COLOR_MASK: none */
+    method(0x0A70, 1);                          /* DEPTH_MASK on */
+    rect(-1.0f, 0.0f, 0.75f, 0, 0, 0);
+    rect( 0.0f, 1.0f, 0.25f, 0, 0, 0);
+    method(0x0A70, 0);
+    method(0x0324, 0x01010101);                 /* COLOR_MASK: all */
+    bounds(1, 0.5f, 1.0f);
+    rect(-1.0f, 1.0f, 0.5f, 0, 1, 0);
+    s_engine_backend.submit_and_wait(NULL, 0);
+    static u8 px[64 * 64 * 4];
+    memset(px, 0, sizeof px);
+    s_engine_backend.readback(NULL, g.surfaces[0].handle, 0, 0, 64, 64, px, 64 * 4);
+    const u8* r = px + (32 * 64 + 48) * 4;
+    const u8* l = px + (32 * 64 + 16) * 4;
+    rsx_draw_engine_shutdown();
+    const int right_blue = r[2] > 200 && r[0] < 50 && r[1] < 50;
+    const int left_green = l[1] > 200 && l[0] < 50;
+    return right_blue && left_green;
+}
+
+/* The green draw's result over the two halves, bounded or not. */
+static int bounded(int enable, float mn, float mx)
+{
+    if (setup() < 0) return -1;
+    bounds(enable, mn, mx);
+    rect(-1.0f, 1.0f, 0.5f, 0, 1, 0);
+    return result();
+}
+
+/* One pass that writes depth between two bounded draws: [0.5, 1] lets only
+ * the right half through, then the left half's depth is rewritten to 0.75
+ * (red again) with the test off, then the same bounded draw again. Exact
+ * (mode 1): the second draw sees the new depth, both halves green, and its
+ * snapshot reuses the first one's texture (depth_snapshot_into). Per pass
+ * (mode 2): it still sees the snapshot from the pass's first bounded draw,
+ * where the left half was 0.25, so the left half stays red -- the divergence
+ * mode 2 accepts. Bit 2 of the result: the second snapshot reused the first
+ * texture. */
+static int alternating(void)
+{
+    if (setup() < 0) return -1;
+    bounds(1, 0.5f, 1.0f);
+    rect(-1.0f, 1.0f, 0.5f, 0, 1, 0);
+    const u32 first = g.zdepths[0].dbz_copy;
+    bounds(0, 0.0f, 1.0f);
+    method(0x0A70, 1);                          /* DEPTH_MASK on */
+    rect(-1.0f, 0.0f, 0.75f, 1, 0, 0);
+    method(0x0A70, 0);
+    bounds(1, 0.5f, 1.0f);
+    rect(-1.0f, 1.0f, 0.5f, 0, 1, 0);
+    const u32 second = g.zdepths[0].dbz_copy;
+    const int reused = first && first == second;
+    const int r = result();
+    return r < 0 ? r : r | (reused << 2);
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -120,20 +204,42 @@ int main(void)
         vm_base = calloc(1, 1u << 20); ppu_vm_size = 1u << 20;
         rsx_draw_engine_set_backend(&s_engine_backend);
 
+        /* Every mode in one process (s_dbz_mode is the engine's cached
+         * switch): 0 off, 1 exact (the default), 2 per pass. The
+         * environment's value runs first, so the default is also covered. */
         const char* e = getenv("PS3RECOMP_ENG_DEPTH_BOUNDS");
-        const int on = !(e && *e && atoi(e) == 0);
-        const int far_half  = bounded(1, 0.5f, 1.0f);
-        const int near_half = bounded(1, 0.0f, 0.5f);
-        const int unbound   = bounded(1, 0.0f, 1.0f);
-        const int off       = bounded(0, 0.5f, 1.0f);
-        CHECK(far_half == (on ? 2 : 3), "bounds [0.5, 1]: green halves 0x%X, want 0x%X", far_half, on ? 2 : 3);
-        CHECK(near_half == (on ? 1 : 3), "bounds [0, 0.5]: green halves 0x%X, want 0x%X", near_half, on ? 1 : 3);
-        CHECK(unbound == 3, "bounds [0, 1]: green halves 0x%X, want 0x3", unbound);
-        CHECK(off == 3, "test off: green halves 0x%X, want 0x3", off);
+        const int env_mode = !(e && *e) ? 1 : atoi(e) == 0 || atoi(e) == 2 ? atoi(e) : 1;
+        const int modes[4] = { env_mode, 0, 1, 2 };
+        for (int k = 0; k < 4; k++) {
+            const int mode = modes[k];
+            s_dbz_mode = mode;
+            const int on = mode != 0;
+            const int far_half  = bounded(1, 0.5f, 1.0f);
+            const int near_half = bounded(1, 0.0f, 0.5f);
+            const int unbound   = bounded(1, 0.0f, 1.0f);
+            const int off       = bounded(0, 0.5f, 1.0f);
+            CHECK(far_half == (on ? 2 : 3), "mode %d bounds [0.5, 1]: green halves 0x%X, want 0x%X", mode, far_half, on ? 2 : 3);
+            CHECK(near_half == (on ? 1 : 3), "mode %d bounds [0, 0.5]: green halves 0x%X, want 0x%X", mode, near_half, on ? 1 : 3);
+            CHECK(unbound == 3, "mode %d bounds [0, 1]: green halves 0x%X, want 0x3", mode, unbound);
+            CHECK(off == 3, "mode %d test off: green halves 0x%X, want 0x3", mode, off);
+            /* Depth written between two bounded draws of one pass. */
+            const int alt = alternating();
+            const int halves = alt & 3, reused = (alt >> 2) & 1;
+            const int want = mode == 2 ? 2 : 3;   /* mode 2 keeps the pass's first snapshot */
+            CHECK(alt >= 0 && halves == want, "mode %d depth rewritten mid-pass: green halves 0x%X, want 0x%X",
+                  mode, halves, want);
+            if (mode == 1) {
+                CHECK(reused, "mode 1 re-snapshot reuses the first snapshot's texture");
+                /* The reused texture is rewritten only after the draws queued
+                 * before the rewrite have read it. */
+                CHECK(ordered() == 1, "mode 1 draws queued before a re-taken snapshot read the old depth");
+            }
+        }
+        s_dbz_mode = -1;
 
         rsx_draw_engine_set_backend(NULL);
         free(vm_base);
     }
-    printf("%u checks, %u failed (depth bounds %s)\n", checks, failures, getenv("PS3RECOMP_ENG_DEPTH_BOUNDS") ? "off" : "on");
+    printf("%u checks, %u failed (depth bounds modes 0, 1, 2)\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -69,17 +69,12 @@ typedef enum {
     SPU_cwd,
     SPU_cwx,
     SPU_dfa,
-    SPU_dfceq,
-    SPU_dfcgt,
-    SPU_dfcmeq,
-    SPU_dfcmgt,
     SPU_dfm,
     SPU_dfma,
     SPU_dfms,
     SPU_dfnma,
     SPU_dfnms,
     SPU_dfs,
-    SPU_dftsv,
     SPU_dsync,
     SPU_eqv,
     SPU_fa,
@@ -273,17 +268,12 @@ static const char* const spu_op_name[SPU_OP_COUNT] = {
     [SPU_cwd] = "cwd",
     [SPU_cwx] = "cwx",
     [SPU_dfa] = "dfa",
-    [SPU_dfceq] = "dfceq",
-    [SPU_dfcgt] = "dfcgt",
-    [SPU_dfcmeq] = "dfcmeq",
-    [SPU_dfcmgt] = "dfcmgt",
     [SPU_dfm] = "dfm",
     [SPU_dfma] = "dfma",
     [SPU_dfms] = "dfms",
     [SPU_dfnma] = "dfnma",
     [SPU_dfnms] = "dfnms",
     [SPU_dfs] = "dfs",
-    [SPU_dftsv] = "dftsv",
     [SPU_dsync] = "dsync",
     [SPU_eqv] = "eqv",
     [SPU_fa] = "fa",
@@ -432,7 +422,10 @@ typedef enum {
 typedef struct { uint8_t op; uint8_t form; } spu_decode_ent;
 _Static_assert(SPU_OP_COUNT <= 256, "spu_op must fit spu_decode_ent.op");
 
-/* Indexed by insn >> 21; precedence is documented in tools/gen_spu_interp.py. */
+/* Indexed by insn >> 21; precedence is documented in tools/gen_spu_interp.py.
+ * dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as SPU_word here: a CBE SPU raises
+ * an invalid-instruction error for them (console probe, CECHC04 on FW 4.81), so
+ * they take the undecodable-word stop in spu_interp.c instead of executing. */
 static const spu_decode_ent spu_decode_tab[2048] = {
     /*000*/ {SPU_stop, SPU_F_STOP}, {SPU_lnop, SPU_F_NONE}, {SPU_sync, SPU_F_NONE}, {SPU_dsync, SPU_F_NONE},
     /*004*/ {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
@@ -610,9 +603,9 @@ static const spu_decode_ent spu_decode_tab[2048] = {
     /*2B4*/ {SPU_cntb, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_xsbh, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*2B8*/ {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*2BC*/ {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
-    /*2C0*/ {SPU_clgt, SPU_F_NONE}, {SPU_andc, SPU_F_NONE}, {SPU_fcgt, SPU_F_NONE}, {SPU_dfcgt, SPU_F_NONE},
+    /*2C0*/ {SPU_clgt, SPU_F_NONE}, {SPU_andc, SPU_F_NONE}, {SPU_fcgt, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*2C4*/ {SPU_fa, SPU_F_NONE}, {SPU_fs, SPU_F_NONE}, {SPU_fm, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
-    /*2C8*/ {SPU_clgth, SPU_F_NONE}, {SPU_orc, SPU_F_NONE}, {SPU_fcmgt, SPU_F_NONE}, {SPU_dfcmgt, SPU_F_NONE},
+    /*2C8*/ {SPU_clgth, SPU_F_NONE}, {SPU_orc, SPU_F_NONE}, {SPU_fcmgt, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*2CC*/ {SPU_dfa, SPU_F_NONE}, {SPU_dfs, SPU_F_NONE}, {SPU_dfm, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*2D0*/ {SPU_clgtb, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*2D4*/ {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
@@ -673,10 +666,10 @@ static const spu_decode_ent spu_decode_tab[2048] = {
     /*3B0*/ {SPU_cflts, SPU_F_I8}, {SPU_cflts, SPU_F_I8}, {SPU_cfltu, SPU_F_I8}, {SPU_cfltu, SPU_F_I8},
     /*3B4*/ {SPU_csflt, SPU_F_I8}, {SPU_csflt, SPU_F_I8}, {SPU_cuflt, SPU_F_I8}, {SPU_cuflt, SPU_F_I8},
     /*3B8*/ {SPU_fesd, SPU_F_NONE}, {SPU_frds, SPU_F_NONE}, {SPU_fscrwr, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
-    /*3BC*/ {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_dftsv, SPU_F_NONE},
-    /*3C0*/ {SPU_ceq, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_fceq, SPU_F_NONE}, {SPU_dfceq, SPU_F_NONE},
+    /*3BC*/ {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
+    /*3C0*/ {SPU_ceq, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_fceq, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*3C4*/ {SPU_mpy, SPU_F_NONE}, {SPU_mpyh, SPU_F_NONE}, {SPU_mpyhh, SPU_F_NONE}, {SPU_mpys, SPU_F_NONE},
-    /*3C8*/ {SPU_ceqh, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_fcmeq, SPU_F_NONE}, {SPU_dfcmeq, SPU_F_NONE},
+    /*3C8*/ {SPU_ceqh, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_fcmeq, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*3CC*/ {SPU_mpyu, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_mpyhhu, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*3D0*/ {SPU_ceqb, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE},
     /*3D4*/ {SPU_fi, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE}, {SPU_word, SPU_F_NONE},

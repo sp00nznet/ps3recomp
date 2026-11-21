@@ -37,12 +37,33 @@ jobs:
         with:
           arch: x64
 
+      # The runner image's MSVC STL decides which clang it accepts: STL 14.52
+      # (image 20261111 onwards) stops with "STL1000: Unexpected compiler
+      # version, expected Clang 22 or newer", and the image's own LLVM is
+      # 20.1.8. A pinned, hash-checked LLVM keeps the build independent of
+      # which image a job lands on. It goes first on PATH, so every clang-cl
+      # below (CMake and the direct test compiles) is this one.
+      - name: Install LLVM 22 (clang-cl)
+        shell: pwsh
+        run: |
+          $ver = '22.1.8'
+          $sha = '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+          $exe = "$env:RUNNER_TEMP\LLVM-$ver-win64.exe"
+          Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-win64.exe" -OutFile $exe
+          $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $sha) { throw "LLVM installer sha256 $got, expected $sha" }
+          $dir = "$env:RUNNER_TEMP\llvm-$ver"
+          Start-Process -FilePath $exe -ArgumentList '/S', "/D=$dir" -Wait
+          if (-not (Test-Path "$dir\bin\clang-cl.exe")) { throw "clang-cl.exe missing after install" }
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Install Ninja
         run: choco install ninja -y --no-progress
 
       - name: Show toolchain
         run: |
           clang-cl --version
+          if (-not ((clang-cl --version) -match 'clang version 22\.')) { throw "clang-cl on PATH is not LLVM 22" }
           ninja --version
           cmake --version
 

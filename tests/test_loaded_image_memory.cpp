@@ -16,6 +16,7 @@ void spu_coh_notify_write(uint32_t) { std::abort(); }
 void spu_lockline_lock(void) { std::abort(); }
 void spu_lockline_unlock(void) { std::abort(); }
 void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
+void cellGcm_put_on_store(void) { std::abort(); }
 HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
 BOOL CloseHandle(HANDLE) { std::abort(); }
 DWORD GetFileAttributesA(const char*) { std::abort(); }

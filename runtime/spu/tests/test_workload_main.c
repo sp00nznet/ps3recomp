@@ -21,7 +21,8 @@
 #include <string.h>
 
 /* SPU "main memory" view (DMA dereferences vm_base + ea). */
-static uint8_t g_mem[1024];
+static uint8_t g_mem[0x10100];
+#define OUT_EA 0x10000u        /* the job's PUT target (above the 64 KB null page) */
 uint8_t* vm_base = g_mem;
 static mfc_engine g_mfc;
 
@@ -45,8 +46,6 @@ static uint32_t be32(const uint8_t* p) {
            ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
 }
 
-/* diagnostics externs referenced from spu_dma.h in the full runtime */
-int g_cri_video_dma = 0;
 /* stop/halt hooks required by current lifter output */
 void spu_stop(spu_context* ctx) { (void)ctx; }
 void spu_halt(spu_context* ctx) { (void)ctx; }
@@ -80,8 +79,8 @@ int main(void) {
     memset(g_mem, 0, sizeof(g_mem));
     int hit = spu_workload_dispatch(kWorkloadElf, kWorkloadElfSize, kArg);
 
-    uint32_t got_arg    = be32(&g_mem[0]);    /* LS[0x100] word0 = r3 (task arg)  */
-    uint32_t got_marker = be32(&g_mem[16]);   /* LS[0x110] word0 = baked-in marker */
+    uint32_t got_arg    = be32(&g_mem[OUT_EA]);    /* LS[0x100] word0 = r3 (task arg)  */
+    uint32_t got_marker = be32(&g_mem[OUT_EA + 16]);   /* LS[0x110] word0 = baked-in marker */
     int hit_ok    = (hit == 1);
     int arg_ok    = (got_arg == kArg);
     int marker_ok = (got_marker == kWorkloadMarker);

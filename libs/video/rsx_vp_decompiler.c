@@ -617,6 +617,7 @@ static int rsx_vp_decompile_impl(
         "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
         "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
+        RSX_VP_HLSL_PSIZE_MEMBER
         "};\n"
         /* b0: 512 vec4 transform constants + the RSX viewport transform,
          * pre-mapped by the harness to D3D clip space:
@@ -625,7 +626,9 @@ static int rsx_vp_decompile_impl(
         "    float4 vp_c[512];\n"
         "    float4 vp_posscale;\n"
         "    float4 vp_posoffset;\n"
+        RSX_VP_HLSL_PSIZE_ROW
         "};\n"
+        RSX_VP_HLSL_PSIZE_FUNC
         /* NV vertex programs multiply by the legacy rule: 0 times anything,
          * INF and NaN included, is 0. IEEE gives NaN, and one RCP of a zero
          * distance then poisons a whole lighting sum -- Tornado Outbreak's UI
@@ -693,6 +696,9 @@ static int rsx_vp_decompile_impl(
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
         "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"
         "    Out.t8=o[15]; Out.t9=o[6];\n"
+        /* o6.x is also the point size when output mask bit 5 is set
+         * (vp_pointsize.y; see rsx_vp_decompiler.h). */
+        RSX_VP_HLSL_PSIZE_STORE("o[6].x")
         "    return Out;\n"
         "}\n");
 

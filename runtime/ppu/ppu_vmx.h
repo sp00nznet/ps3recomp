@@ -285,8 +285,8 @@ VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
  * ASSUMPTION: the host rounding mode is round-to-nearest (nothing in the
  * runtime changes MXCSR). */
 VMX_INL float vmx_fmaf(float x, float z, float y) {
-#if defined(__FMA__)
-    return fmaf(x, z, y);   /* one instruction with -mfma */
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+    return fmaf(x, z, y);   /* one instruction with -mfma / arm64 fmadd */
 #else
     const double s = (double)x * (double)z + (double)y;
     uint64_t u; memcpy(&u, &s, sizeof u);

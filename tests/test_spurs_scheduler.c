@@ -27,6 +27,7 @@ void ydkj_wake_all_event_flags(void){}
 static atomic_uint canceled_queues;
 void sys_event_queue_cancel_by_id(u32 id) { assert(id==3 || id==4);atomic_fetch_or(&canceled_queues,1u<<id); }
 void sys_event_queue_uncancel_by_id(u32 id) {(void)id;}
+void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c */
 /* Observe the legacy bypass without substituting any policy completion. */
 static atomic_uint unbounded_dispatches;
 int fixture_unbounded_dispatch(const uint8_t* pm,uint32_t size,uint32_t data)
@@ -123,6 +124,12 @@ static void* error_direct(void* arg)
     direct_rc[id]=spu_run_policy_module(id?exit_policy:error_policy,79,vm_base+0x9400,16,id+1,3,0x11000+id*0x1000,0);
     return NULL;
 }
+static atomic_uint snr_seen[2];
+static void snr_policy(spu_context* c)
+{
+    atomic_store(&snr_seen[0],c->ch_sig_notify[0].count);atomic_store(&snr_seen[1],c->ch_sig_notify[1].count);
+    finish(c);
+}
 static atomic_uint incarnation_runs,eligible_lane;
 static void incarnation_policy(spu_context* c)
 {
@@ -171,7 +178,7 @@ int main(void)
     }
     for(unsigned i=0;i<3;i++)wait_for(&held[i],1,"configured capacity");
     Sleep(20);assert(atomic_load(&peak_count)==3 && atomic_load(&lane_mask)==7);
-    assert((u32)cellSpursRemoveWorkload((CellSpurs*)0x1000,0)==CELL_SPURS_CORE_ERROR_BUSY);
+    assert((u32)cellSpursRemoveWorkload((CellSpurs*)0x1000,0)==CELL_SPURS_POLICY_MODULE_ERROR_BUSY);
     assert(cellSpursSetMaxContention((CellSpurs*)0x1000,0,0)==0);
     assert(vm_read8(0x1000+SPURS_WKL_MAXCONT)==0);
     assert(!atomic_load(&held[3]));
@@ -199,7 +206,7 @@ int main(void)
         wait_for(&incarnation_runs,incarnation+1,"same policy/data workload incarnation");
         for(unsigned i=0;;i++) {
             s32 rc=cellSpursRemoveWorkload((CellSpurs*)0x1000,0);
-            if(!rc)break;assert((u32)rc==CELL_SPURS_CORE_ERROR_BUSY && i<3000);Sleep(1);
+            if(!rc)break;assert((u32)rc==CELL_SPURS_POLICY_MODULE_ERROR_BUSY && i<3000);Sleep(1);
         }
     }
     finalize(0x1000);puts("SPURS removal retires resident LS even with unchanged policy/data PASS");
@@ -262,5 +269,18 @@ int main(void)
     pthread_join(a,NULL);pthread_join(b,NULL);assert(direct_rc[0]==-2 && direct_rc[1]==0);
     spurs_policy_release_instance(0x11000);spurs_policy_release_instance(0x12000);
     puts("SPURS same workload/lane across instances retains separate LS and TLS exit classification PASS");
+
+    /* A signal posted before the instance has a context goes to its first context, and only that instance's: the one
+     * still waiting when the instance is released must not reach whatever instance reuses the address. */
+    assert(spurs_policy_post_snr(0x11000,0,1,0x55)==0);
+    assert(spu_run_policy_module(snr_policy,79,vm_base+0x9400,16,1,3,0x11000,0)==0);
+    assert(atomic_load(&snr_seen[1])==1 && atomic_load(&snr_seen[0])==0);
+    spurs_policy_release_instance(0x11000);
+    assert(spurs_policy_post_snr(0x11000,0,0,0x34)==0);
+    spurs_policy_release_instance(0x11000);
+    assert(spu_run_policy_module(snr_policy,79,vm_base+0x9400,16,1,3,0x11000,0)==0);
+    assert(atomic_load(&snr_seen[0])==0 && atomic_load(&snr_seen[1])==0);
+    spurs_policy_release_instance(0x11000);
+    puts("SPURS signal waiting for a context does not survive its instance PASS");
     free(vm_base);return 0;
 }

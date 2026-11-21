@@ -47,6 +47,10 @@
  *         runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
  *         runtime/platform/win32_compat.c -lpthread -lm
  *
+ * Run it twice: as built, and with PS3RECOMP_SPU_LIVE_HOLDERS=1, which
+ * switches on the live holder counts (the tests near the end follow the
+ * switch; every other test must pass either way).
+ *
  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
  */
 
@@ -444,6 +448,223 @@ static void test_racing_write_ends_lockfree_reservation(void)
 }
 
 /* ===========================================================================
+ * Live holder counts (PS3RECOMP_SPU_LIVE_HOLDERS)
+ *
+ * The binary runs once with the option off (the default) and once with it on;
+ * the expectations below follow spu_coh_live_enabled(). Off, every notify of a
+ * marked line walks the holders and nothing is ever skipped. On, a notify skips
+ * the walk exactly when no context is counted on the line, and everything that
+ * is not the walk -- the PPU reservation break, the watches -- still happens.
+ * These use lines no earlier test touched: reset_ctx() re-initialises a
+ * context without ending its count, which only leaves an older line counted.
+ * ===========================================================================*/
+#define LINE_E   0x00030000u
+#define LINE_F   0x00030080u
+#define LINE_G   0x00030100u
+
+static unsigned long g_ppu_line_breaks;
+void ppu_resv_break_line(uint32_t ea) { (void)ea; g_ppu_line_breaks++; }
+
+static int g_watch_wakes;
+static void live_watch_wake(void* opaque) { (void)opaque; g_watch_wakes++; }
+
+/* A coherent guest store to a line, as the PPU store path makes it. */
+static void host_write(uint32_t ea, uint8_t v)
+{
+    spu_lockline_lock();
+    g_guest_mem[ea + 16] = v;
+    spu_coh_notify_write(ea);
+    spu_lockline_unlock();
+}
+
+static void test_live_holder_counts(void)
+{
+    const int on = spu_coh_live_enabled();
+    printf("  live holder counts: %s\n", on ? "on" : "off");
+    reset_pair();
+    unsigned long skips = g_spu_coh_live_skips, raised = g_spu_lr_raise;
+
+    TEST("a write to a line whose holder committed skips the walk only when on");
+    spu_atomic(&g_a, LSA_A, LINE_E, MFC_GETLLAR_CMD);
+    stage(&g_a, LSA_A, 0xA0, 128);
+    spu_atomic(&g_a, LSA_A, LINE_E, MFC_PUTLLC_CMD);
+    CHECK_EQ_U32(g_a.atomic_stat, 0);
+    unsigned long breaks = g_ppu_line_breaks;
+    host_write(LINE_E, 1);
+    CHECK(g_spu_coh_live_skips == skips + (on ? 1u : 0u));
+    CHECK(g_spu_lr_raise == raised);
+    TEST("...and still breaks PPU reservations on the line");
+    CHECK(g_ppu_line_breaks == breaks + 1);
+
+    TEST("a holder that re-reserves the line (lock-free GETLLAR) loses it to a write");
+    skips = g_spu_coh_live_skips;
+    spu_atomic(&g_a, LSA_A, LINE_E, MFC_GETLLAR_CMD);
+    CHECK(g_a.resv_valid == 1);
+    g_a.event_status = 0;
+    host_write(LINE_E, 2);
+    CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_a.resv_valid == 0);
+    CHECK(g_spu_lr_raise == raised + 1);
+    CHECK(g_spu_coh_live_skips == skips);
+
+    TEST("a reservation taken away stays counted until its owner ends it");
+    host_write(LINE_E, 3);
+    CHECK(g_spu_coh_live_skips == skips);
+    CHECK(g_spu_lr_raise == raised + 1);
+    spu_atomic(&g_a, LSA_A, LINE_E, MFC_PUTLLC_CMD);   /* fails: no reservation */
+    CHECK_EQ_U32(g_a.atomic_stat, 1);
+    host_write(LINE_E, 4);
+    CHECK(g_spu_coh_live_skips == skips + (on ? 1u : 0u));
+
+    TEST("a GETLLAR of another line moves the count with it");
+    skips = g_spu_coh_live_skips;
+    spu_atomic(&g_a, LSA_A, LINE_E, MFC_GETLLAR_CMD);
+    spu_atomic(&g_a, LSA_A, LINE_F, MFC_GETLLAR_CMD);
+    g_a.event_status = 0;
+    host_write(LINE_E, 5);
+    CHECK(g_spu_coh_live_skips == skips + (on ? 1u : 0u));
+    CHECK_EQ_U32(g_a.event_status, 0);
+    host_write(LINE_F, 6);
+    CHECK(g_spu_coh_live_skips == skips + (on ? 1u : 0u));
+    CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+
+    TEST("a peer's PUTLLUC ends its own count, and a holder still sees it");
+    skips = g_spu_coh_live_skips;
+    spu_atomic(&g_a, LSA_A, LINE_F, MFC_GETLLAR_CMD);
+    spu_atomic(&g_b, LSA_B, LINE_F, MFC_GETLLAR_CMD);
+    g_a.event_status = 0;
+    stage(&g_b, LSA_B, 0xB0, 128);
+    spu_atomic(&g_b, LSA_B, LINE_F, MFC_PUTLLUC_CMD);
+    CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    host_write(LINE_F, 7);                 /* g_a's reservation ended, still counted */
+    CHECK(g_spu_coh_live_skips == skips);
+    spu_atomic(&g_a, LSA_A, LINE_F, MFC_PUTLLC_CMD);
+    host_write(LINE_F, 8);                 /* nobody counted now */
+    CHECK(g_spu_coh_live_skips == skips + (on ? 1u : 0u));
+
+    TEST("unregistering a context ends its count");
+    skips = g_spu_coh_live_skips;
+    spu_atomic(&g_a, LSA_A, LINE_F, MFC_GETLLAR_CMD);
+    spu_coh_unregister(&g_a);
+    host_write(LINE_F, 9);
+    CHECK(g_spu_coh_live_skips == skips + (on ? 1u : 0u));
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);  /* re-register */
+    CHECK(g_a.coh_listed == 1);
+
+    TEST("a watch on a line nobody holds is still woken");
+    skips = g_spu_coh_live_skips;
+    spu_coh_watch watch;
+    spu_lockline_lock();
+    spu_coh_watch_add(&watch, LINE_G, live_watch_wake, NULL);
+    spu_lockline_unlock();
+    g_watch_wakes = 0;
+    host_write(LINE_G, 10);
+    CHECK(g_watch_wakes == 1);
+    CHECK(g_spu_coh_live_skips == skips + (on ? 1u : 0u));
+    spu_lockline_lock();
+    spu_coh_watch_remove(&watch);
+    spu_lockline_unlock();
+
+    if (!on) {
+        TEST("off, nothing is ever skipped");
+        CHECK(g_spu_coh_live_skips == 0);
+    }
+}
+
+/* The race the counts add: the holder ends its reservation before each round,
+ * so its line's count is zero when its lock-free GETLLAR and a write start
+ * together. Either the write's notify sees the new count and ends the
+ * reservation, or the GETLLAR's copy holds the write -- never neither. */
+static atomic_int g_live_race_ready, g_live_race_checked;
+
+static void* live_race_reader(void* arg)
+{
+    (void)arg;
+    for (int k = 1; k <= RACE_ROUNDS; k++) {
+        while (atomic_load(&g_live_race_checked) != k - 1) { }
+        spu_atomic(&g_a, LSA_A, LINE_E, MFC_PUTLLC_CMD);   /* ends the count */
+        atomic_store(&g_live_race_ready, k);
+        while (atomic_load(&g_race_go) != k) { }
+        race_delay((unsigned)(k * 7) & 31u);
+        spu_atomic(&g_a, LSA_A, LINE_E, MFC_GETLLAR_CMD);
+        atomic_store(&g_race_reader_done, k);
+    }
+    return NULL;
+}
+
+static void* live_race_writer(void* arg)
+{
+    (void)arg;
+    for (int k = 1; k <= RACE_ROUNDS; k++) {
+        while (atomic_load(&g_race_go) != k) { }
+        race_delay((unsigned)(k * 13) & 31u);
+        spu_lockline_lock();
+        memset(g_guest_mem + LINE_E, (uint8_t)(k % 255 + 1), 128);
+        spu_coh_notify_write(LINE_E);
+        spu_lockline_unlock();
+        atomic_store(&g_race_writer_done, k);
+    }
+    return NULL;
+}
+
+static void test_live_count_race(void)
+{
+    reset_pair();
+    spu_atomic(&g_a, LSA_A, LINE_E, MFC_GETLLAR_CMD);   /* registers */
+    atomic_store(&g_race_go, 0);
+    atomic_store(&g_race_reader_done, 0);
+    atomic_store(&g_race_writer_done, 0);
+    atomic_store(&g_live_race_ready, 0);
+    atomic_store(&g_live_race_checked, 0);
+    const unsigned long skips = g_spu_coh_live_skips;
+
+    pthread_t r, w;
+    if (pthread_create(&r, NULL, live_race_reader, NULL) != 0) {
+        TEST("race threads start"); CHECK(0); return;
+    }
+    if (pthread_create(&w, NULL, live_race_writer, NULL) != 0) {
+        atomic_store(&g_race_go, -1);
+        TEST("race threads start"); CHECK(0); return;
+    }
+
+    unsigned long saw_write = 0, lost = 0, stale_kept = 0, lost_no_event = 0;
+    for (int k = 1; k <= RACE_ROUNDS; k++) {
+        while (atomic_load(&g_live_race_ready) != k) { }
+        g_a.event_status = 0;
+        atomic_store(&g_race_go, k);
+        while (atomic_load(&g_race_reader_done) != k ||
+               atomic_load(&g_race_writer_done) != k) { }
+        const uint8_t v = (uint8_t)(k % 255 + 1);
+        int whole = 1;
+        for (int i = 0; i < 128; i++)
+            if (g_a.ls[LSA_A + i] != v || g_a.resv_line[i] != v) { whole = 0; break; }
+        if (g_a.resv_valid) {
+            if (whole) saw_write++; else stale_kept++;
+        } else {
+            lost++;
+            if (!(g_a.event_status & SPU_EVENT_LR)) lost_no_event++;
+        }
+        atomic_store(&g_live_race_checked, k);
+    }
+    pthread_join(r, NULL);
+    pthread_join(w, NULL);
+
+    printf("  count-zero GETLLAR race: %lu saw the write, %lu lost the reservation,"
+           " %lu walks skipped\n", saw_write, lost, g_spu_coh_live_skips - skips);
+    TEST("a write racing a GETLLAR from a zero count is in its copy or ends it");
+    CHECK(stale_kept == 0);
+    TEST("...and a reservation it ends raises SPU_EVENT_LR");
+    CHECK(lost_no_event == 0);
+    TEST("...and the race exercised both outcomes");
+    CHECK(saw_write > 0);
+    CHECK(lost > 0);
+    if (spu_coh_live_enabled()) {
+        TEST("...and, on, some writes found the count at zero");
+        CHECK(g_spu_coh_live_skips > skips);
+    }
+}
+
+/* ===========================================================================
  * A peer's plain DMA PUT
  * ===========================================================================*/
 static void test_plain_put_breaks_peer(void)
@@ -692,6 +913,8 @@ int main(void)
     test_ack_keeps_a_concurrent_raise();
     test_producer_keeps_peer_event(2);
     test_producer_keeps_peer_event(1);
+    test_live_holder_counts();
+    test_live_count_race();
 
     printf("\nSPU-to-SPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);

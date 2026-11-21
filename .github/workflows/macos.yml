@@ -168,6 +168,34 @@ jobs:
             -o /tmp/test_metal_present_post
           /tmp/test_metal_present_post
 
+      # The engine's record cap: a full record array is submitted mid-frame,
+      # with the bound constants staged again, instead of dropping the rest
+      # of the frame. Again with a cap a title defines at build time.
+      - name: Run the Metal record cap test
+        run: |
+          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_record_cap.m \
+            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
+            -o /tmp/test_metal_record_cap
+          /tmp/test_metal_record_cap
+          clang -fobjc-arc -DENG_MAX_RECORDS=16384 -DRSX_TEST_EXPECT_MAX_RECORDS=16384 \
+            -I include -I libs/video libs/video/tests/test_metal_record_cap.m \
+            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
+            -o /tmp/test_metal_record_cap_16k
+          /tmp/test_metal_record_cap_16k
+      # PS3_UPSCALE=metalfx on the runner's GPU, into an offscreen "drawable":
+      # a window twice the picture's size gets MetalFX's output at that size
+      # (not black, not the bilinear frame, flat areas kept), a letterboxed
+      # one the fitted size with black around it, and a window no larger and
+      # the headless target are left alone. Unset, a larger window is still
+      # the bilinear stretch. Without MetalFX the option turns itself off and
+      # the fallback is checked instead.
+      - name: Run the Metal MetalFX upscale test
+        run: |
+          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_upscale.m \
+            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
+            -o /tmp/test_metal_upscale
+          /tmp/test_metal_upscale
+
       # Host-surface mode (tools/host_window, rsx_host_surface.h) against a
       # launcher fixture in the same process: init attaches and opens no
       # window, engine and vtable presents land in the shared IOSurfaces,
@@ -226,6 +254,13 @@ jobs:
         run: |
           clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
           /tmp/test_pad_hotplug
+
+      # cellPad asks SDL for face buttons by position (not by printed label)
+      # before the controller subsystem starts.
+      - name: Run the pad face-button hint test
+        run: |
+          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_face_button_hint libs/input/tests/test_pad_face_button_hint.c $(sdl2-config --libs)
+          /tmp/test_pad_face_button_hint
 
       # cellPad keyboard fallback on port 0 (read through SDL here too, with a
       # fake keyboard and focus; the real macOS source is CGEventSourceKeyState).
@@ -296,6 +331,10 @@ jobs:
             echo "--border passed with the border colour ignored; the check is not checking"
             exit 1
           fi
+          # A fragment program sampling a texture unit that is switched off
+          # reads transparent black, blended over the clear: the clear colour
+          # must come through, the texture behind the unit must not.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --unbound
           # Render-to-texture: a red triangle drawn into a colour surface of
           # the guest's own, then sampled by a full-screen quad through the
           # guest programs. The guest bytes behind that surface are green, so
@@ -420,6 +459,15 @@ jobs:
           ./build/test_metal_depth_bounds
           PS3RECOMP_ENG_DEPTH_BOUNDS=0 ./build/test_metal_depth_bounds
 
+      # Point size reaches the GPU: Metal leaves it undefined unless the vertex
+      # function writes it, so a point is drawn at SET_POINT_SIZE's size, at
+      # the vertex program's own when the output mask says so, and no larger
+      # than 64 pixels.
+      - name: Run the Metal point size test
+        run: |
+          test -x build/test_metal_point_size
+          ./build/test_metal_point_size
+
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's
@@ -492,6 +540,9 @@ jobs:
           # restart cuts bounding topology expansion. Runs on Linux too.
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_rsx_draw_engine
+          PS3RECOMP_ENG_FEEDBACK_PER_PASS=1 /tmp/test_rsx_draw_engine
+          /tmp/test_rsx_draw_engine single
+          CC=clang python3 tools/test_rsx_texture_decode.py
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without.
           clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
@@ -502,6 +553,8 @@ jobs:
           /tmp/test_vertex_current_color
           clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_color_feedback_engine
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_gcm_report_clock libs/video/tests/test_gcm_report_clock.c
+          /tmp/test_gcm_report_clock
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
           clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
@@ -595,6 +648,7 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
+          PS3RECOMP_SPU_LIVE_HOLDERS=1 /tmp/test_spu_lockline_peer
 
       # A task parked in WAIT_SIGNAL, signalled by another SPU. libspurs does
       # that with PUTLLC on the taskset line, which never woke the parked
@@ -711,3 +765,20 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_job_stack
+
+      # MFC transfers to the SPU thread local-store window (0xF0000000 +
+      # spu_num * 0x100000) move data between local stores: a GET reads the
+      # peer SPU's local store and a PUT writes it, never guest memory.
+      - name: Run the SPU thread local-store DMA test
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_thread_ls_dma \
+            runtime/spu/tests/test_spu_thread_ls_dma.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spu_thread_ls_dma

@@ -93,7 +93,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 ## PPU Thread Management
 
 **File:** `runtime/syscalls/sys_ppu_thread.c`
-**Syscall numbers:** 41–49, 56
+**Syscall numbers:** 41, 43–49, 56 (thread creation is 52/53 on lv2 and reached by NID; see below)
 
 ### Implementation Strategy
 
@@ -101,9 +101,9 @@ PS3 PPU threads map 1:1 to host OS threads. Each thread gets its own `ppu_contex
 
 ### Syscalls
 
-#### `sys_ppu_thread_create` (41)
+#### `sys_ppu_thread_create` (by NID, not a syscall-table slot)
 
-Creates a new PPU thread with its own register context and stack.
+Creates a new PPU thread with its own register context and stack. lv2 creates threads with two syscalls, `_sys_ppu_thread_create` (52) and `sys_ppu_thread_start` (53), whose calling convention is not this function's; this handler is the sysPrxForUser-shaped one a title reaches through its import NID.
 
 **Arguments:**
 - `r3`: Pointer to store thread ID (`sys_ppu_thread_t*`)
@@ -126,9 +126,9 @@ Creates a new PPU thread with its own register context and stack.
 
 **Returns:** `CELL_OK` on success, `CELL_EAGAIN` if thread limit reached, `CELL_ENOMEM` if stack allocation fails.
 
-#### `sys_ppu_thread_exit` (42)
+#### `sys_ppu_thread_exit` (41)
 
-Terminates the calling thread. The exit code is in `r3`.
+Terminates the calling thread. The exit code is in `r3`; the call never returns. Slot 42 is the stock kernel's ENOSYS stub, which answers `CELL_ENOSYS` and leaves the thread running.
 
 #### `sys_ppu_thread_yield` (43)
 
@@ -384,7 +384,7 @@ PS3 time is measured in **timebase ticks** at 79,800,000 Hz (79.8 MHz). This is 
 | 74 | `sys_timer_stop` | Stop timer. |
 | 75 | `sys_timer_connect_event_queue` | Connect timer to an event queue. |
 | 76 | `sys_timer_disconnect_event_queue` | Disconnect timer from queue. |
-| 141 | `sys_timer_usleep` | Sleep for N microseconds. |
+| 141 | `sys_timer_usleep` | Sleep for N microseconds. Windows spins sub-millisecond sleeps to a QPC deadline; on POSIX, `PS3RECOMP_USLEEP_SPIN_US=<n>` (off by default) makes sleeps shorter than n microseconds yield to a monotonic deadline instead of calling nanosleep. |
 | 142 | `sys_timer_sleep` | Sleep for N seconds. |
 | 145 | `sys_time_get_current_time` | Get current time (seconds + nanoseconds since epoch). |
 | 147 | `sys_time_get_timebase_frequency` | Returns 79,800,000. |
