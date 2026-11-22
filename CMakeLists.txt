@@ -645,6 +645,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME ppu_hle_toc
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_hle_toc.py")
+        add_test(NAME ppu_hle_prx_stack_args
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_hle_prx_stack_args.py")
         add_test(NAME ppu_function_splice
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_function_splice.py")
