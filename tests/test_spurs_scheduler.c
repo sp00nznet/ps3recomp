@@ -106,6 +106,8 @@ static void resident_policy(spu_context* c)
     assert(spu_ls_read32(c,0x4000)==0x12340000u+id);
     atomic_fetch_add(&direct_leave,1);finish(c);
 }
+static atomic_uint wkl_addr_seen;
+static void wkl_addr_policy(spu_context* c) { atomic_store(&wkl_addr_seen,spu_ls_read32(c,0x1D4));finish(c); }
 static void exit_policy(spu_context* c) { atomic_store(&direct_exit,1);finish(c); }
 static void error_policy(spu_context* c)
 {
@@ -282,5 +284,15 @@ int main(void)
     assert(atomic_load(&snr_seen[0])==0 && atomic_load(&snr_seen[1])==0);
     spurs_policy_release_instance(0x11000);
     puts("SPURS signal waiting for a context does not survive its instance PASS");
+    /* wklCurrentAddr (kernel context 0x1D4) is the module's EA (#664), and the LS base for a module the runtime
+     * holds in host memory. */
+    static uint8_t host_pm[16];
+    assert(spu_run_policy_module(wkl_addr_policy,79,vm_base+0x9400,16,1,3,0x11000,0)==0);
+    assert(atomic_load(&wkl_addr_seen)==0x9400u);
+    spurs_policy_release_instance(0x11000);
+    assert(spu_run_policy_module(wkl_addr_policy,79,host_pm,16,1,3,0x11000,0)==0);
+    assert(atomic_load(&wkl_addr_seen)==0xA00u);
+    spurs_policy_release_instance(0x11000);
+    puts("SPURS wklCurrentAddr is the policy module's EA PASS");
     free(vm_base);return 0;
 }
