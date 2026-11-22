@@ -1374,8 +1374,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 if (sz)
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
+                    spu_workload_dispatch_task(host_elf, (uint32_t)sz,
+                                               (uint32_t)(uintptr_t)context, taskset_ea, i);
             }
             return CELL_OK;
         }

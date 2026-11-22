@@ -644,8 +644,9 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     for (int i = 0; i < n_start; i++) {
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
-        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
-        spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
+        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];   /* legacy readers */
+        spu_workload_dispatch_task(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i],
+                                   taskset_ea, start_t[i]);
     }
     s_ts_held = 0; ts_unlock();
 }
@@ -1603,8 +1604,35 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     return 0;
 }
 
+static int spu_workload_dispatch_async_as(const uint8_t* image, uint32_t image_size,
+                                          uint32_t args_ea, uint32_t taskset_ea,
+                                          uint32_t taskid);
+
+/* The taskset and task id travel as arguments: the one-slot globals
+ * g_ydkj_real_taskset_ea/g_ydkj_real_taskid are written by cellSpursCreateTask
+ * on a PPU thread and by spu_taskset_task_exited on whichever SPU thread just
+ * finished a task, each some time before it dispatches. With both at once (Havok
+ * creates its per-step tasks from the PPU while its SPU tasks exit and start the
+ * next) one of them dispatched the other's task id: the wrong slot was marked
+ * running and later cleared, a task never ran, and the physics step waited on
+ * its semaphore forever. */
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
+{
+    return spu_workload_dispatch_async_as(image, image_size, args_ea, taskset_ea, taskid);
+}
+
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea)
+{
+    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+    return spu_workload_dispatch_async_as(image, image_size, args_ea,
+                                          g_ydkj_real_taskset_ea, g_ydkj_real_taskid);
+}
+
+static int spu_workload_dispatch_async_as(const uint8_t* image, uint32_t image_size,
+                                          uint32_t args_ea, uint32_t taskset_ea,
+                                          uint32_t taskid)
 {
     if (!image || image_size == 0) return 0;
 
@@ -1645,12 +1673,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
-    /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
-     * set the globals for THIS task). Reading them later in the async thread races
-     * the next CreateTask overwriting the single-slot globals -- with two audio
+    /* Capture the taskset+taskid NOW, not in the async thread: reading the
+     * single-slot globals later raced the next CreateTask -- with two audio
      * tasks that made both run task 1's descriptor. */
-    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+    j->taskset_ea = taskset_ea; j->taskid = taskid;
     /* Mark the task running NOW, not when its thread starts: in that gap another
      * task's exit saw it ready-but-not-running and started it a second time
      * (Twisted Metal's level-load inflate tasks each ran twice, concurrently). */
