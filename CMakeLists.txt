@@ -697,6 +697,9 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME ppu_ctr64
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_ctr64.py")
+            add_test(NAME ppu_float_823
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_float_823.py")
             add_test(NAME spu_fnms_zero_extended
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
