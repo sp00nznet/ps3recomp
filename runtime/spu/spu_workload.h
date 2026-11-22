@@ -152,6 +152,12 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 
+/* Same as spu_workload_dispatch_async for a SPURS task: the taskset and task id
+ * it runs as are passed in, not read from the g_ydkj_real_* globals, which two
+ * threads starting tasks at once overwrite under each other. */
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 
