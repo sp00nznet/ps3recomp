@@ -723,6 +723,15 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * Opt out with YDKJ_NO_REENTRY_ISO=1. */
             { static int _ri=-1; if(_ri<0){ const char* e=getenv("YDKJ_NO_REENTRY_ISO"); _ri = (e && e[0]=='1') ? 0 : 1; }
               if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
+                /* Arguments past the eighth are NOT in registers: the callee reads
+                 * them from the parameter save area at its entry r1 + 0x30 (+0x70
+                 * for the ninth). Carry the caller's area into the new frame, or a
+                 * 9+-argument export reads an empty frame (#664:
+                 * _cellSpursCreateJobQueue got a NULL priority table).
+                 * shortcut: 0x100 bytes = 32 doublewords, i.e. up to 24 stack
+                 * arguments; widen if an export ever takes more. */
+                { extern uint8_t* vm_base;
+                  memmove(vm_base + (uint32_t)ctx->gpr[1] + 0x30, vm_base + (uint32_t)_sr1 + 0x30, 0x100); }
                 ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
             /* A real PRX serving this import is a different implementation of it,
