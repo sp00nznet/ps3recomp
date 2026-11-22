@@ -599,7 +599,12 @@ static void samp_report(void)
                 s_t2_id[k], (unsigned long long)s_t2_guest[k],
                 (unsigned long long)s_t2_ntdll[k], (unsigned long long)s_t2_other[k]);
     }
-    for (int rank = 0; rank < 25; rank++) {
+    /* PS3_SAMPLE_RANKS=<n>: RVA buckets printed per report (default 25).
+     * Lifted code spreads over thousands of 16-byte buckets, and the default
+     * leaves most of its samples out of the report. */
+    static int s_ranks = -1;
+    if (s_ranks < 0) { const char* e = getenv("PS3_SAMPLE_RANKS"); s_ranks = e ? atoi(e) : 25; }
+    for (int rank = 0; rank < s_ranks; rank++) {
         uint64_t best = 0; int bi = -1;
         for (int k = 0; k < SAMP_RVAS; k++)
             if (s_rva_ct[k] > best) { best = s_rva_ct[k]; bi = k; }
@@ -700,6 +705,16 @@ static DWORD WINAPI samp_thread(LPVOID p)
     HANDLE main_h = (s_samp_main > 0)
         ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, s_samp_boot_tid) : NULL;
     DWORD one_tid = s_samp_main > 0 ? s_samp_boot_tid : 0;
+    /* All-threads mode: the thread list is a system-wide snapshot, and taking
+     * it every period took most of a round (one round per ~430 ms with ~45
+     * threads, against a 2 ms period). Keep the handles and take the snapshot
+     * every 2 s: a thread that exits in between fails SuspendThread and is
+     * skipped, one that starts is picked up at the next refresh. */
+    enum { SAMP_MAXT = 256 };
+    static HANDLE s_th[SAMP_MAXT];
+    static DWORD s_th_id[SAMP_MAXT];
+    unsigned n_th = 0;
+    unsigned long long next_list = 0;
     for (;;) {
         if (s_samp_drain > 0 && g_gcm_drain_tid && g_gcm_drain_tid != one_tid) {
             if (main_h) CloseHandle(main_h);
@@ -733,38 +748,53 @@ static DWORD WINAPI samp_thread(LPVOID p)
             }
             continue;
         }
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap != INVALID_HANDLE_VALUE) {
-            THREADENTRY32 te; te.dwSize = sizeof te;
-            if (Thread32First(snap, &te)) do {
-                if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-                if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
-                /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
-                 * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
-                 * histogram is the drain's own cost, not the spin loops of
-                 * every SPU thread. */
-                if (s_samp_drain > 0 && te.th32ThreadID != g_gcm_drain_tid) continue;
-                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
-                                      FALSE, te.th32ThreadID);
-                if (!h) continue;
-                if (SuspendThread(h) != (DWORD)-1) {
-                    CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
-                    if (GetThreadContext(h, &c)) {
-                        s_samp_total++;
-                        samp_rva_record((uintptr_t)c.Rip);
-                        uint32_t g = samp_lookup((uintptr_t)c.Rip);
-                        if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
-                        if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
-                                 samp_tid2(te.th32ThreadID, 1, 0); }
-                        else { int nt = samp_mod_hit((uintptr_t)c.Rip);
-                               if (!nt) samp_rva_hit((uintptr_t)c.Rip);
-                               samp_tid2(te.th32ThreadID, 0, nt); }
-                    }
-                    ResumeThread(h);
+        if (GetTickCount64() >= next_list) {
+            for (unsigned i = 0; i < n_th; i++) CloseHandle(s_th[i]);
+            n_th = 0;
+            unsigned over = 0;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te; te.dwSize = sizeof te;
+                if (Thread32First(snap, &te)) do {
+                    if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+                    if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
+                    if (n_th >= SAMP_MAXT) { over++; continue; }
+                    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                          FALSE, te.th32ThreadID);
+                    if (h) { s_th[n_th] = h; s_th_id[n_th] = te.th32ThreadID; n_th++; }
+                } while (Thread32Next(snap, &te));
+                CloseHandle(snap);
+            }
+            if (over) {   /* say so, a few times: those threads are missing from every report */
+                static int s_said = 0;
+                if (s_said < 4) { s_said++;
+                    fprintf(stderr, "[samp] %u thread(s) beyond SAMP_MAXT=%d are not sampled\n", over, (int)SAMP_MAXT); }
+            }
+            next_list = GetTickCount64() + 2000;
+        }
+        for (unsigned ti = 0; ti < n_th; ti++) {
+            const DWORD tid = s_th_id[ti];
+            /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
+             * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
+             * histogram is the drain's own cost, not the spin loops of
+             * every SPU thread. */
+            if (s_samp_drain > 0 && tid != g_gcm_drain_tid) continue;
+            HANDLE h = s_th[ti];
+            if (SuspendThread(h) != (DWORD)-1) {
+                CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(h, &c)) {
+                    s_samp_total++;
+                    samp_rva_record((uintptr_t)c.Rip);
+                    uint32_t g = samp_lookup((uintptr_t)c.Rip);
+                    if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
+                    if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(tid);
+                             samp_tid2(tid, 1, 0); }
+                    else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                           if (!nt) samp_rva_hit((uintptr_t)c.Rip);
+                           samp_tid2(tid, 0, nt); }
                 }
-                CloseHandle(h);
-            } while (Thread32Next(snap, &te));
-            CloseHandle(snap);
+                ResumeThread(h);
+            }
         }
         Sleep(period);
         if (GetTickCount64() >= next_report) {
