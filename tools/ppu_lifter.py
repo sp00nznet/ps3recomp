@@ -459,6 +459,81 @@ static inline double ppu_frsp(double b)
     }
     return (double)(float)b;
 }
+/* Exact a + b = s + *e (Knuth's TwoSum; needs -ffp-contract=off, set for lifted code). */
+static inline double ppu_two_sum(double a, double b, double* e)
+{
+    double s = a + b, bb = s - a;
+    *e = (a - (s - bb)) + (b - bb);
+    return s;
+}
+/* Sign (-1, 0, 1) of the exact a*c + b - r. a*c = p + pe exactly (fma), and
+ * the four terms are summed into an exact expansion (Shewchuk's
+ * grow-expansion): its largest component carries the sign. */
+static inline int ppu_fma_residual_sign(double a, double c, double b, double r)
+{
+    double p = a * c;
+    if (fabs(p) < 0x1p-900) {
+        /* pe would underflow. The product is then far below an ulp of r, so it
+         * only decides the sign when b == r exactly. */
+        if (b != r) return b > r ? 1 : -1;
+        if (a == 0 || c == 0) return 0;
+        return (signbit(a) != signbit(c)) ? -1 : 1;
+    }
+    if (!isfinite(p)) return 0;   /* shortcut: |a*c| > DBL_MAX yet a finite result; not seen in practice */
+    double t[4] = { p, fma(a, c, -p), b, -r }, e[4];
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        double q = t[i], lo;
+        int m = 0;
+        for (int j = 0; j < n; j++) {
+            q = ppu_two_sum(q, e[j], &lo);
+            if (lo != 0) e[m++] = lo;
+        }
+        if (q != 0) e[m++] = q;
+        n = m;
+    }
+    return n ? (e[n - 1] > 0 ? 1 : -1) : 0;
+}
+/* fmadds and friends: ONE rounding of the exact result to single. Rounding the
+ * double fma result again is wrong only when that result is exactly halfway
+ * between two singles (#823: 1.5 * 20000.6f + FLT_MIN gave 46EA61CC, the
+ * console 46EA61CD); then the sign of the residual picks the side. */
+static inline double ppu_fmadds(double a, double c, double b, int neg_b, int neg_res)
+{
+    const double r = ppu_fmadd_core(a, c, b, neg_b, neg_res);
+    uint64_t u; memcpy(&u, &r, 8);
+    /* A midpoint has <= 25 significant bits: almost every result leaves here. */
+    if ((u & 0x0FFFFFFFull) || (u & 0x7FF0000000000000ull) == 0x7FF0000000000000ull)
+        return ppu_fp_single(r);
+    const float f = (float)r;
+    /* An infinite single stands for 2^128 here, so FLT_MAX..inf has a midpoint. */
+    const double fd = isinf(f) ? copysign(0x1p128, r) : (double)f;
+    if (fd == r) return (double)f;
+    const int up = r > fd;
+    const float g = nextafterf(f, up ? INFINITY : -INFINITY);
+    const double gd = isinf(g) ? copysign(0x1p128, r) : (double)g;
+    if (r != (fd + gd) * 0.5) return (double)f;                       /* not a tie: one rounding already */
+    int s = ppu_fma_residual_sign(a, c, neg_b ? -b : b, neg_res ? -r : r);
+    if (neg_res) s = -s;
+    if (s == 0) return (double)f;                                     /* a true tie: (float) rounded it to even */
+    const float hi = up ? g : f, lo = up ? f : g;
+    return (double)(s > 0 ? hi : lo);
+}
+/* stfs (Book I 4.6.3): the console stores bits, it does not round. Normal
+ * singles take FRS[0:1] || FRS[5:34]; values in the single denormal range are
+ * shifted right with the implicit 1. (#823: stfs of 3F80123456789ABC stores
+ * 3C0091A2, host conversion 3C0091A3.) */
+static inline uint32_t ppu_stfs_bits(double d)
+{
+    uint64_t u; memcpy(&u, &d, 8);
+    const uint32_t exp = (uint32_t)(u >> 52) & 0x7FF;
+    if (exp > 896 || (u << 1) == 0)
+        return (uint32_t)((u >> 32) & 0xC0000000u) | (uint32_t)((u >> 29) & 0x3FFFFFFFu);
+    /* exp below 874 is undefined in the ISA; shifting further gives a signed zero. */
+    const uint64_t frac = (u & 0x000FFFFFFFFFFFFFull) | 0x0010000000000000ull;   /* 1.f, 53 bits */
+    const int shift = 29 + (897 - (int)exp);                                     /* to frac[1:23] */
+    return (uint32_t)((u >> 32) & 0x80000000u) | (shift < 64 ? (uint32_t)(frac >> shift) & 0x7FFFFFu : 0);
+}
 /* FPSCR (Book I 4.2.2), big-endian bit n = 1u << (31 - n). FEX (1) and VX (2)
  * are summaries and never written directly: VX = OR of the VX* bits (7-12,
  * 21-23), FEX = OR of each exception bit ANDed with its enable (VX/VE, OX/OE,
@@ -2001,14 +2076,14 @@ class PPULifter:
             # stfdx also contains 's' -- match single explicitly [fork eb5451b3]
             single = mn in ("stfsx", "stfsux")
             if mn.endswith("ux") and ra_i != "0":
-                body = (f"float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32(ea, tmp);"
+                body = (f"vm_write32(ea, ppu_stfs_bits(ctx->fpr[{frs}]));"
                         if single else
                         f"uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64(ea, tmp);")
                 return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
                         f"{body} ctx->gpr[{ra_i}] = ea; }}")
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             if single:
-                return f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32({ea}, tmp); }}"
+                return f"{{ vm_write32({ea}, ppu_stfs_bits(ctx->fpr[{frs}])); }}"
             else:
                 return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64({ea}, tmp); }}"
 
@@ -2386,8 +2461,7 @@ class PPULifter:
                 # store, corrupting the double (breaks fctidz+stfd+ld float->GPR
                 # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
                 if mn in ("stfs", "stfsu"):
-                    line = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
-                            f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
+                    line = f"{{ vm_write32(ctx->gpr[{base}] + {disp}, ppu_stfs_bits(ctx->fpr[{frs}])); }}"
                 else:
                     line = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
                             f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
@@ -2452,7 +2526,8 @@ class PPULifter:
             expr = (f"ppu_fmadd_core(ctx->fpr[{fra}], ctx->fpr[{frc}], "
                     f"ctx->fpr[{frb}], {neg_b}, {neg_res})")
             if mn_base.endswith("s"):
-                expr = f"ppu_fp_single({expr})"
+                expr = (f"ppu_fmadds(ctx->fpr[{fra}], ctx->fpr[{frc}], "
+                        f"ctx->fpr[{frb}], {neg_b}, {neg_res})")
             return f"ctx->fpr[{frd}] = {expr};"
 
         if mn_base in ("frsp",):
@@ -2494,15 +2569,15 @@ class PPULifter:
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)sqrt(ctx->fpr[{frb}]);"
-            return f"ctx->fpr[{frd}] = sqrt(ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_fp_single(ppu_fp_bin(ctx->fpr[{frb}], ctx->fpr[{frb}], sqrt(ctx->fpr[{frb}])));"
+            return f"ctx->fpr[{frd}] = ppu_fp_bin(ctx->fpr[{frb}], ctx->fpr[{frb}], sqrt(ctx->fpr[{frb}]));"
 
         if mn_base in ("frsqrte", "frsqrtes"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base == "frsqrtes":
-                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / sqrt(ctx->fpr[{frb}]));"
-            return f"ctx->fpr[{frd}] = 1.0 / sqrt(ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_fp_single(ppu_fp_bin(ctx->fpr[{frb}], ctx->fpr[{frb}], 1.0 / sqrt(ctx->fpr[{frb}])));"
+            return f"ctx->fpr[{frd}] = ppu_fp_bin(ctx->fpr[{frb}], ctx->fpr[{frb}], 1.0 / sqrt(ctx->fpr[{frb}]));"
 
         if mn_base in ("fre", "fres"):
             frd = _reg_idx(ops[0])
