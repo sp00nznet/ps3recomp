@@ -350,7 +350,14 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     KBE32(0x1C8, spu_num);              /* spuNum (virtual SPU / lane row) */
     KBE32(0x1CC, 8);                    /* dmaTagId (kernel's tag)  */
     KBE32(0x1D0, 0);                    /* wklCurrentAddr hi32 (u64 ptr) */
-    KBE32(0x1D4, 0xA00);                /* wklCurrentAddr lo32 = PM load base */
+    { extern uint8_t* vm_base; extern uint32_t ppu_vm_size;
+      /* wklCurrentAddr is the module's EA, as RPCS3's spursKernelDispatchWorkload
+       * sets it (wklInfo->addr): a module larger than what is loaded DMAs the
+       * rest of itself from there (#664: libspurs_jq reads wklCurrentAddr +
+       * 0x4000). A built-in module in host memory has no EA; it keeps the LS base. */
+      const uint32_t pm_ea = (pm_host >= vm_base && pm_host < vm_base + ppu_vm_size)
+                           ? (uint32_t)(pm_host - vm_base) : 0xA00u;
+      KBE32(0x1D4, pm_ea); }             /* wklCurrentAddr lo32 */
     KBE32(0x1D8, wid);                  /* wklCurrentUniqueId       */
     KBE32(0x1DC, wid);                  /* wklCurrentId             */
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
