@@ -2752,6 +2752,7 @@ static struct {
     int halted;              /* ... and it is still at pc                     */
     volatile long kicked;    /* a Run/Kick that no walk has taken up yet      */
     volatile long from_entry;/* Join/Shutdown: the next walk starts at entry  */
+    volatile long shutdown_req;/* Shutdown: the walk stops before its next command */
     u8  spu_mask;     /* SPUs the priority table lets run the chain (0 = no table) */
 } s_jobchains[MAX_JOBCHAINS];
 
@@ -3257,6 +3258,13 @@ static void jc_execute(int slot)
     int idle = 0;
     for (;; idle++) {
         if (idle > 4096) break;
+        /* Shutdown lets the job in flight finish, then stops the walk. A
+         * service-loop chain never reaches an END, so without this Join waits
+         * forever. */
+        if (s_jobchains[slot].shutdown_req) {
+            jc_stop(slot, pc, ret_pc, 0, 0);
+            return;
+        }
         u64 cmd = vm_read64(pc);
         u32 op  = (u32)(cmd & 7);
         u32 ext = (u32)(cmd & 127);
@@ -3398,7 +3406,9 @@ static s32 jc_start(u64 jc_ea, const char* who)
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
         /* A chain is never walked twice at once: a Run that finds it busy is
-         * taken up by the walk in progress (jc_thread), not dropped. */
+         * taken up by the walk in progress (jc_thread), not dropped. A Run
+         * after a Shutdown starts the chain again. */
+        _InterlockedExchange(&s_jobchains[i].shutdown_req, 0);
         _InterlockedExchange(&s_jobchains[i].kicked, 1);
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
@@ -3424,8 +3434,11 @@ s32 cellSpursRunJobChain(u64 jc_ea)
  * r3, so the caller reads a garbage result for "did the shutdown take?" and a
  * title that checks it can decide the subsystem failed and tear itself down.
  *
- * Clearing `running` is what makes the pair honest: the host walker stops
- * grabbing new work, and the Join that follows has something true to observe.
+ * Shutdown asks the walker to stop before its next command; the walker clears
+ * `running` once the job in flight is done, so the Join that follows returns
+ * only when no job is still writing its results. Clearing `running` here let
+ * Join return mid-job: Deus Ex: Human Revolution then read half-decompressed
+ * allocation sizes and failed with out-of-memory at boot.
  * Found in Tokyo Jungle, whose sound engine shuts its chain down during init
  * and then reports "failed to recv data from SPU" when the handshake does not
  * complete. */
@@ -3437,9 +3450,9 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
         if (s_jobchains[i].jc_ea == (u32)jc_ea) {
             /* No more passes for Runs that have not been taken up, and a later
              * Run starts at the entry, as it did before chains kept their pc. */
+            _InterlockedExchange(&s_jobchains[i].shutdown_req, 1);
             _InterlockedExchange(&s_jobchains[i].kicked, 0);
             _InterlockedExchange(&s_jobchains[i].from_entry, 1);
-            s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
             return CELL_OK;
         }
     }
