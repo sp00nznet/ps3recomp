@@ -8,6 +8,7 @@ at configure time; without one nothing changes.
 | CMake option | Platforms | Host |
 |---|---|---|
 | `PS3RECOMP_NATIVE_OSK_HEADLESS` | POSIX other than macOS | No window: the dialog opens with its initial text and is confirmed only through the control mailbox (below). |
+| `PS3RECOMP_NATIVE_OSK_MACOS` | macOS | An AppKit sheet on the Metal backend's game window (below). |
 
 ## Lifecycle
 
@@ -42,6 +43,24 @@ user interface.
   Every file found is consumed, valid or not; commands written before the
   dialog opened, for another token, or repeated are ignored.
 
+## macOS host
+
+With `PS3RECOMP_NATIVE_OSK_MACOS=ON` the Metal backend registers its game
+window, and a request shows as a sheet on it: the prompt, a text field with the
+initial text (a secure field for password panels), OK and Cancel. All AppKit
+work happens on the main thread; the guest side only sees the copied result
+through the normal lifecycle. Closing the game window cancels an open sheet
+and makes the host unavailable.
+
+While a sheet is open it owns the keyboard: the backend's event pump hands key
+events to AppKit (it otherwise drops them), and the keyboard pad fallback in
+`cellPad` reports nothing; a key still held when the sheet closes (the Return
+that pressed OK) is ignored until it is released. After OK or Cancel the game
+window gets keyboard focus back on the next main-queue turn, unless something
+else took it meanwhile: the user picked another window or application, another
+sheet is up, a newer dialog opened, or the dialog was aborted or the window
+replaced. The host never activates the application.
+
 ## Tests
 
 - `python3 tools/test_native_osk.py` builds the real `cellOskDialog.c`,
@@ -50,3 +69,9 @@ user interface.
   the initial-text override and the mailbox.
 - `python3 tools/test_native_osk_headless.py` runs the headless host end to end.
 - `python3 tools/test_native_osk_control.py` checks the confirm helper.
+- `python3 tools/test_native_osk_macos.py` (macOS, interactive graphical
+  session; it takes keyboard focus for a few seconds and skips under `CI`)
+  launches a real AppKit fixture as an app bundle: Unicode OK, secure Cancel,
+  typed keys reaching the sheet and not the game view, the control mailbox,
+  the focus hand-back guards (another window, a follow-up sheet, a replaced
+  window, another application, abort) and parent close.

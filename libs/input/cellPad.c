@@ -20,6 +20,10 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#if defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_MACOS) && !defined(PS3RECOMP_DISABLE_NATIVE_OSK)
+#include "../misc/osk_native.h"                   /* the OSK sheet owns the keyboard */
+#define PAD_OSK_OWNS_KEYBOARD() osk_native_macos_input_active()
+#endif
 
 /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
  * wall-clock seconds. A loaded machine runs a title at a third of its usual
@@ -308,6 +312,20 @@ static void pad_poll_keyboard(void)
     if (off) return;
 
     PadHostState* hs = &s_host_state[0];
+#ifdef PAD_OSK_OWNS_KEYBOARD
+    /* Typing into an open native OSK must not also drive the pad, and a key
+     * that closed it (Return on OK) is ignored until it is released. */
+    static int s_osk_was_open;
+    static u16 s_held_from_osk;
+    if (PAD_OSK_OWNS_KEYBOARD()) {
+        s_osk_was_open = 1;
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = 128;
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->connected = 1;
+        return;
+    }
+#endif
     if (!pad_host_window_focused()) {
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */
@@ -331,6 +349,11 @@ static void pad_poll_keyboard(void)
     u16 btns = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
         if (pad_key_down(map[i].vk)) btns |= map[i].btn;
+#ifdef PAD_OSK_OWNS_KEYBOARD
+    if (s_osk_was_open) { s_held_from_osk = btns; s_osk_was_open = 0; }
+    s_held_from_osk &= btns;
+    btns &= (u16)~s_held_from_osk;
+#endif
 
     hs->buttons   = btns;
     hs->connected = 1;
