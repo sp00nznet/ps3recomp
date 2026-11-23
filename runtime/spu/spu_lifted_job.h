@@ -16,6 +16,7 @@
 #include "spu_context.h"
 #include "spu_interp.h"
 #include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
+#include "../../include/ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: interpreted runs */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,7 +84,9 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     } else {
         ctx.gpr[3]._u32[0] = args_ea;
     }
-    spu_interp_run(&ctx, entry_pc);
+    { const uint64_t tr_t0 = ps3_trace_begin();
+      spu_interp_run(&ctx, entry_pc);
+      ps3_trace_end(tr_t0, PS3_TR_SPU_INTERP, entry_pc, args_ea); }
     /* Completion signal, exactly ONCE per run. Real hardware raises a PPU event
      * only from WrOutIntrMbox; the plain mailbox is PPU-polled. But a sim SPU
      * that finishes by writing only the PLAIN mailbox (Rubber Ducky's
