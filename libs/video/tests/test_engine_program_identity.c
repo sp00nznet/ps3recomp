@@ -11,6 +11,7 @@
 #undef main
 #include "rsx_test_programs.h"
 #include "rsx_fp_decompiler.h"
+#include "rsx_vp_decompiler.h"
 
 #define N_PROGRAMS 256u
 
@@ -80,6 +81,37 @@ int main(void)
     draw_triangle();
     CHECK(stub.n_pipeline_create == (int)N_PROGRAMS + 1 && stub.bound_pipeline == handle[5],
           "and restoring it finds the old pipeline again");
+
+    /* SET_TRANSFORM_BRANCH_BITS is not program identity: a program with BRB
+     * reads the bits per draw from vp_posoffset.w. Keyed on them, a title
+     * that flips its optional paths between draws compiled one program per
+     * combination (Resistance 3: 70 of one 543-slot program).
+     *   0 MOV o0, v0   1 BRB b5 -> 3   2 MOV o1, v1   3 MOV o2, v2 (END) */
+    {
+        u8 bp[4 * 16];
+        rsx_test_vp_mov_out(bp + 0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+        rsx_test_vp_branch(bp + 16, 0x11, 3, 5, 1);
+        rsx_test_vp_mov_out(bp + 32, 1, RSX_TEST_VP_SWZ_IDENT, 1, 0);
+        rsx_test_vp_mov_out(bp + 48, 2, RSX_TEST_VP_SWZ_IDENT, 2, 1);
+        m(0x1E9C, 0);
+        for (u32 i = 0; i < 16; i++) { u32 w; memcpy(&w, bp + i * 4, 4); m(0xB80 + i * 4, w); }
+        m(0x1EA0, 0);
+        static const u32 bits[3] = { 0x00000020u, 0x80000001u, 0x00000020u };
+        const int before = stub.n_pipeline_create;
+        u32 first = 0, lane_ok = 1, same_pipeline = 1;
+        for (u32 k = 0; k < 3; k++) {
+            m(0x1FF8, bits[k]);
+            draw_triangle();
+            if (!k) first = stub.bound_pipeline;
+            else if (stub.bound_pipeline != first) same_pipeline = 0;
+            u32 lane; memcpy(&lane, &stub.vp_xf[RSX_VP_BRANCH_BITS_LANE], 4);
+            if (lane != bits[k]) lane_ok = 0;
+        }
+        CHECK(stub.n_pipeline_create == before + 1 && same_pipeline,
+              "a BRB program is one pipeline whatever the branch bits (%d)",
+              stub.n_pipeline_create - before);
+        CHECK(lane_ok, "and each draw hands its bits over in vp_posoffset.w");
+    }
     engine_down();
 
     /* Only the slots a program has are written. */

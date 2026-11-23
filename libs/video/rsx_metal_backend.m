@@ -1366,6 +1366,7 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
         psz[2] = RSX_VP_POINT_SIZE_MAX;
         psz[3] = 0.0f;
     }
+    rsx_vp_set_epilogue_branch_bits(vpx, st->transform_branch_bits);
 
     u8* fp = s_cb + fp_off;
     memset(fp, 0, fp_len);
