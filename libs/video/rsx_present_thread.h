@@ -100,6 +100,20 @@ static inline void rsx_present_thread_unsupported(const char *backend, const cha
 
 #if defined(_WIN32)
 
+#include <windows.h>
+
+/* The clock the present timing is taken on (CLOCK_MONOTONIC's counterpart below). The backends stamp their show
+ * and acquire times with it whether or not the present thread itself is supported, so it exists here too. The
+ * counter is split in seconds and remainder so a fast counter cannot overflow the nanosecond product. */
+static inline uint64_t rsx_present_thread_now(void)
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    const uint64_t freq = (uint64_t)f.QuadPart, ticks = (uint64_t)c.QuadPart;
+    return (ticks / freq) * 1000000000ull + (ticks % freq) * 1000000000ull / freq;
+}
+
 typedef struct rsx_present_thread rsx_present_thread;
 static inline rsx_present_thread *rsx_present_thread_create(const rsx_present_hooks *hooks, uint32_t depth)
 { (void)hooks; (void)depth; rsx_present_thread_unsupported("windows", "no POSIX threads"); return NULL; }
