@@ -501,6 +501,8 @@ cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
 ```
 
+**Window present guard** (`rsx_present_guard.h`): an occluded or minimized window (`NSWindowDidChangeOcclusionStateNotification`) is left out of presents, and a `nextDrawable` that takes longer than `PS3RECOMP_METAL_DRAWABLE_BOUND_MS` (default 100) skips the window, with a probe every 2 s, until a drawable comes back within it. Frames left out are still encoded and committed, at no more than 60 a second. The frames-in-flight wait still waits (it is the GPU's pace) and only says when it overran. `PS3RECOMP_METAL_DRAWABLE_BOUND_MS=0` turns the guard off.
+
 The same workflow boots a synthetic PPU ELF twice: once through
 `ps3recomp_boot_smoke`, and once through the unmodified project template. Those
 runs cover the loader, HLE dispatch, guest threads, frame clock and Metal
