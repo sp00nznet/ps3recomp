@@ -12,6 +12,9 @@
  *   PS3RECOMP_NATIVE_OSK_HEADLESS  POSIX without a toolkit dialog; a dialog is
  *                                  confirmed only through the control mailbox
  *                                  (osk_headless.c).
+ *   PS3RECOMP_NATIVE_OSK_WINDOWS   Windows: a small owned Win32 dialog run on
+ *                                  the thread that pumps the game window
+ *                                  (osk_win32.c).
  * PS3RECOMP_DISABLE_NATIVE_OSK forces the legacy stub. PS3RECOMP_TEST_NATIVE_OSK
  * builds the lifecycle for a test that supplies its own host.
  */
@@ -19,9 +22,14 @@
 #define PS3RECOMP_OSK_NATIVE_H
 #include <stdint.h>
 
-#if (!defined(_WIN32) && !defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_HEADLESS) && \
+#if (((!defined(_WIN32) && !defined(__APPLE__) && defined(PS3RECOMP_NATIVE_OSK_HEADLESS)) || \
+      (defined(_WIN32) && defined(PS3RECOMP_NATIVE_OSK_WINDOWS))) && \
      !defined(PS3RECOMP_DISABLE_NATIVE_OSK)) || defined(PS3RECOMP_TEST_NATIVE_OSK)
 #define PS3RECOMP_NATIVE_OSK 1
+#endif
+#if defined(_WIN32) && defined(PS3RECOMP_NATIVE_OSK_WINDOWS) && \
+    !defined(PS3RECOMP_DISABLE_NATIVE_OSK) && !defined(PS3RECOMP_TEST_NATIVE_OSK)
+#define OSK_NATIVE_HAS_WIN32_HOST 1
 #endif
 
 #ifdef __cplusplus
@@ -60,6 +68,18 @@ int32_t osk_native_get_text(uint32_t result);
 int32_t osk_native_abort(void);
 /* Delivers pending lifecycle events; run from cellSysutilCheckCallback. */
 void cellOskDialog_tick(void);
+
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+/* Windows host. set_window, pump and handle_message run on the thread that
+ * owns the game window and pumps its messages; set_window(NULL) retires any
+ * dialog before the window goes away. handle_message returns nonzero when the
+ * message belonged to the dialog (the caller then skips it). */
+void osk_native_win32_set_window(void* hwnd);
+void osk_native_win32_pump(void);
+int  osk_native_win32_handle_message(void* msg);
+/* Any thread: a dialog is queued or open and owns the keyboard. */
+int  osk_native_win32_input_active(void);
+#endif
 
 #ifdef __cplusplus
 }

@@ -7,6 +7,7 @@
  */
 
 #include "rsx_null_backend.h"
+#include "../misc/osk_native.h"
 #include <stdio.h>
 #include <string.h>
 #include "../../runtime/ps3_log.h"
@@ -265,6 +266,9 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     }
 
     s_state.hdc = GetDC(s_state.hwnd);
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_set_window(s_state.hwnd);
+#endif
     s_state.last_fps_time = GetTickCount64();
     snprintf(s_state.title, sizeof(s_state.title), "%s", title ? title : "ps3recomp");
     s_state.title_time = s_state.last_fps_time;
@@ -284,6 +288,9 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_null_backend_shutdown(void)
 {
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    osk_native_win32_set_window(NULL);
+#endif
     if (s_state.hwnd) {
         ReleaseDC(s_state.hwnd, s_state.hdc);
         DestroyWindow(s_state.hwnd);
@@ -296,6 +303,19 @@ void rsx_null_backend_shutdown(void)
 
 int rsx_null_backend_pump_messages(void)
 {
+#ifdef OSK_NATIVE_HAS_WIN32_HOST
+    /* The native OSK dialog lives on this thread: open, close or confirm what
+     * other threads queued, and route its keyboard messages (Unicode). */
+    osk_native_win32_pump();
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT)
+            return -1;
+        if (osk_native_win32_handle_message(&msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+#else
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT)
@@ -303,6 +323,7 @@ int rsx_null_backend_pump_messages(void)
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+#endif
     /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
      * live-draw frame, window size. Here on the window's own thread, so the
      * WM_SETTEXT never blocks the renderer. */
