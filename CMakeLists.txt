@@ -638,6 +638,10 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_gcm_report_clock PRIVATE m)
     endif()
     add_test(NAME gcm_report_clock COMMAND test_gcm_report_clock)
+    # The present thread's clock, which the backends use on every platform.
+    add_executable(test_present_thread_now libs/video/tests/test_present_thread_now.c)
+    target_include_directories(test_present_thread_now PRIVATE include libs/video)
+    add_test(NAME present_thread_now COMMAND test_present_thread_now)
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
