@@ -678,6 +678,9 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_lifter_cfl_scale
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_cfl_scale.py")
+        add_test(NAME ppu_fp_estimates
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_fp_estimates.py")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
