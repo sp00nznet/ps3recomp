@@ -459,6 +459,84 @@ static inline double ppu_frsp(double b)
     }
     return (double)(float)b;
 }
+/* fres and frsqrte as the Cell PPU computes them (#823): table estimates,
+ * not exact maths. Measured on a PS3 (FW 4.93) over every single-precision
+ * mantissa of [1,2) and, for frsqrte, [2,4); 15 more exponents near both
+ * ends and the single denormals, sampled. fres indexes a 128-entry table
+ * with the top 7 fraction bits of FRB; frsqrte one of two 8-entry tables,
+ * chosen by the parity of the exponent, with the top 3. Both rescale by the
+ * exponent and copy the sign. An entry is the high word of the result for
+ * an input in [1,2) (fres, frsqrte even) or [2,4) (frsqrte odd); the low
+ * word is always zero.
+ * Measured: fres(+-0) = +-inf, fres(+-inf) = +-0, and a fres result above
+ * FLT_MAX is +-inf; frsqrte(+-0) = +-inf, frsqrte(+inf) = +0, and a negative
+ * input gives the default QNaN; a NaN input comes back quieted. Double
+ * inputs outside the single range follow the same rule but are unmeasured. */
+static const uint32_t ppu_fres_tab[128] = {
+    0x3FEFE000u, 0x3FEFA100u, 0x3FEF6300u, 0x3FEF2600u, 0x3FEEEA00u, 0x3FEEAE00u, 0x3FEE7400u, 0x3FEE3C00u,
+    0x3FEE0000u, 0x3FEDC800u, 0x3FED9400u, 0x3FED5C00u, 0x3FED2800u, 0x3FECF000u, 0x3FECC000u, 0x3FEC8C00u,
+    0x3FEC5800u, 0x3FEC2800u, 0x3FEBF800u, 0x3FEBC800u, 0x3FEB9800u, 0x3FEB6800u, 0x3FEB3800u, 0x3FEB0800u,
+    0x3FEAE000u, 0x3FEAB000u, 0x3FEA8000u, 0x3FEA5800u, 0x3FEA3000u, 0x3FEA0000u, 0x3FE9D800u, 0x3FE9B000u,
+    0x3FE98000u, 0x3FE96000u, 0x3FE93000u, 0x3FE91000u, 0x3FE8E800u, 0x3FE8C000u, 0x3FE89800u, 0x3FE87000u,
+    0x3FE85000u, 0x3FE83000u, 0x3FE80000u, 0x3FE7E000u, 0x3FE7C000u, 0x3FE7A000u, 0x3FE77800u, 0x3FE75800u,
+    0x3FE73000u, 0x3FE71000u, 0x3FE6F000u, 0x3FE6D000u, 0x3FE6B000u, 0x3FE69000u, 0x3FE67000u, 0x3FE65000u,
+    0x3FE63000u, 0x3FE61000u, 0x3FE5F000u, 0x3FE5D800u, 0x3FE5C000u, 0x3FE5A000u, 0x3FE58000u, 0x3FE56000u,
+    0x3FE54000u, 0x3FE53000u, 0x3FE51000u, 0x3FE4F000u, 0x3FE4D800u, 0x3FE4C000u, 0x3FE4A000u, 0x3FE48800u,
+    0x3FE47000u, 0x3FE45000u, 0x3FE44000u, 0x3FE42000u, 0x3FE40000u, 0x3FE3F000u, 0x3FE3D000u, 0x3FE3C000u,
+    0x3FE3A000u, 0x3FE39000u, 0x3FE37000u, 0x3FE36000u, 0x3FE34000u, 0x3FE33000u, 0x3FE32000u, 0x3FE30000u,
+    0x3FE2F000u, 0x3FE2D000u, 0x3FE2C000u, 0x3FE2B000u, 0x3FE29000u, 0x3FE28000u, 0x3FE27000u, 0x3FE25000u,
+    0x3FE24000u, 0x3FE23000u, 0x3FE21000u, 0x3FE20000u, 0x3FE1F000u, 0x3FE1E000u, 0x3FE1C000u, 0x3FE1B000u,
+    0x3FE1A000u, 0x3FE19000u, 0x3FE17000u, 0x3FE16000u, 0x3FE15000u, 0x3FE14000u, 0x3FE13000u, 0x3FE12000u,
+    0x3FE10000u, 0x3FE0F000u, 0x3FE0E000u, 0x3FE0D000u, 0x3FE0C000u, 0x3FE0B000u, 0x3FE0A000u, 0x3FE09000u,
+    0x3FE08000u, 0x3FE07000u, 0x3FE06000u, 0x3FE05000u, 0x3FE04000u, 0x3FE03000u, 0x3FE02000u, 0x3FE00000u,
+};
+static const uint32_t ppu_frsqrte_tab[2][8] = {
+    { 0x3FEF1000u, 0x3FED8000u, 0x3FEC0000u, 0x3FEA8000u, 0x3FE98000u, 0x3FE88000u, 0x3FE80000u, 0x3FE70000u },
+    { 0x3FE60000u, 0x3FE4C000u, 0x3FE3C000u, 0x3FE30000u, 0x3FE20000u, 0x3FE18000u, 0x3FE10000u, 0x3FE08000u },
+};
+/* Unbiased exponent and 52-bit fraction of a finite non-zero double; a
+ * double denormal is normalised first. */
+static inline int ppu_fp_est_split(double b, uint64_t* frac)
+{
+    uint64_t u; memcpy(&u, &b, 8);
+    int e = (int)((u >> 52) & 0x7FF) - 1023;
+    uint64_t f = u & 0x000FFFFFFFFFFFFFull;
+    if (e == -1023) {
+        e = -1022;
+        while (!(f & 0x0010000000000000ull)) { f <<= 1; e--; }
+        f &= 0x000FFFFFFFFFFFFFull;
+    }
+    *frac = f;
+    return e;
+}
+static inline double ppu_fp_est_entry(uint32_t hi)
+{
+    uint64_t u = (uint64_t)hi << 32; double d;
+    memcpy(&d, &u, 8);
+    return d;
+}
+static inline double ppu_fres(double b)
+{
+    if (b != b) return ppu_fp_quiet(b);
+    if (b == 0.0) return copysign(INFINITY, b);
+    if (isinf(b)) return copysign(0.0, b);
+    uint64_t frac;
+    const int e = ppu_fp_est_split(b, &frac);
+    double r = ldexp(ppu_fp_est_entry(ppu_fres_tab[frac >> 45]), -e);
+    if (r > 3.4028234663852886e38) r = INFINITY;
+    return copysign((double)(float)r, b);
+}
+static inline double ppu_frsqrte(double b)
+{
+    if (b != b) return ppu_fp_quiet(b);
+    if (b == 0.0) return copysign(INFINITY, b);
+    if (b < 0.0) return ppu_fp_default_qnan();
+    if (isinf(b)) return 0.0;
+    uint64_t frac;
+    const int e = ppu_fp_est_split(b, &frac);
+    const int odd = e & 1;
+    return ldexp(ppu_fp_est_entry(ppu_frsqrte_tab[odd][frac >> 49]), -((e - odd) / 2));
+}
 /* FPSCR (Book I 4.2.2), big-endian bit n = 1u << (31 - n). FEX (1) and VX (2)
  * are summaries and never written directly: VX = OR of the VX* bits (7-12,
  * 21-23), FEX = OR of each exception bit ANDed with its enable (VX/VE, OX/OE,
@@ -2500,15 +2578,18 @@ class PPULifter:
         if mn_base in ("frsqrte", "frsqrtes"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
+            # The console's table estimate (ppu_frsqrte in the preamble, #823).
+            # frsqrtes is not a Cell instruction; it keeps the same estimate.
             if mn_base == "frsqrtes":
-                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / sqrt(ctx->fpr[{frb}]));"
-            return f"ctx->fpr[{frd}] = 1.0 / sqrt(ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_fp_single(ppu_frsqrte(ctx->fpr[{frb}]));"
+            return f"ctx->fpr[{frd}] = ppu_frsqrte(ctx->fpr[{frb}]);"
 
         if mn_base in ("fre", "fres"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base == "fres":
-                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_fres(ctx->fpr[{frb}]);"
+            # fre (double) is not a Cell instruction and was not measured.
             return f"ctx->fpr[{frd}] = 1.0 / ctx->fpr[{frb}];"
 
         if mn_base == "fsel":
