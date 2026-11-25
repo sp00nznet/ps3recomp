@@ -2313,6 +2313,17 @@ class PPULifter:
                 if mn == "mfspr":
                     return f"ctx->gpr[{g}] = ctx->vrsave;"
                 return f"ctx->vrsave = (uint32_t)ctx->gpr[{g}];"
+            # The time base read through mfspr: TBL is SPR 268 and TBU 269, the
+            # same registers mftb/mftbu read (Book II lists mfspr 268/269 as
+            # their preferred form). Left as a no-op, the destination GPR kept
+            # whatever it held, so a title that times its frame this way saw
+            # the clock stand still: Heavenly Sword reads TBL with
+            # `mfspr r10,268` in its game clock, its frame delta came out 0
+            # every frame, and its boot logos never faded in.
+            if mn == "mfspr" and s in ("TBL", "268"):
+                return f"ctx->gpr[{g}] = ppu_timebase_now();"
+            if mn == "mfspr" and s in ("TBU", "269"):
+                return f"ctx->gpr[{g}] = (ppu_timebase_now() >> 32);"
             if spr_field is None:
                 return f"/* {mn} {insn.operands}: unsupported SPR -- no-op */;"
             if mn == "mfspr":
