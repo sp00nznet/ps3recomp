@@ -3388,8 +3388,13 @@ extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 /* GPIO device pin state (sys_gpio_set / sys_gpio_get). */
 static uint64_t s_gpio_dev[8] = { 0 };
 
+#include "ppu_calltrace.h"
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
+    /* PS3_CALLTRACE (ppu_calltrace.h): first, so it closes after every other
+     * exit guard and records the final r3. */
+    ps3_ct_scope _ct(PS3_CT_SYSCALL, (uint32_t)ctx->gpr[11], ctx);
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
      * waiting for a store watch to fire. Armed here because lv2_syscall runs
      * early and unconditionally; used to measure how far a guest block clear

@@ -318,8 +318,331 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
     for (int j = 0; j < ht_used; j++) ht_n[j] = 0;
 }
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+/* ---- PS3_CALLTRACE: firmware call trace (JSONL) ----------------------------
+ * See ppu_calltrace.h and docs/HLE_TRACE_DIFF.md. One line per call, written
+ * when the call returns (so a nested call -- an HLE call that runs a guest
+ * callback that makes another -- is written before the call around it; the
+ * per-thread "seq" is taken at entry and gives the call order). */
+#include "ppu_calltrace.h"
+#include <mutex>
+#include <vector>
+extern "C" int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name);   /* sys_ppu_thread.c */
+extern "C" uint32_t cellGcm_flip_request_count(void);   /* cellGcmSys.c: guest flips requested so far */
+#include <atomic>
+#include <string>
+#include <stdarg.h>
+#include <string.h>
+
+extern "C" uint8_t* vm_base;   /* guest arena (the host defines it, in C) */
+extern "C" int g_ps3_calltrace = -1;
+namespace {
+FILE*        s_ct_file = nullptr;
+std::mutex   s_ct_mu;
+uint32_t     s_ct_win = 256;
+uint64_t     s_ct_max = 0;
+std::atomic<uint64_t> s_ct_count{0};
+uint64_t     s_ct_t0_us = 0;
+uint64_t     s_ct_last_flush_us = 0;
+struct CtRule { int exclude; int kind; uint32_t nid; int sc; std::string name; int prefix; };
+std::vector<CtRule> s_ct_rules;
+int          s_ct_has_include = 0;
+/* Filter verdict per NID / syscall: 0 unknown, 1 trace, 2 skip. Read without
+ * the lock; a lost store only repeats the rule walk. */
+uint8_t      s_ct_sc_ok[1024];
+uint32_t     s_ct_nid_key[4096];
+uint8_t      s_ct_nid_ok[4096];
+enum { CT_MAX_DEPTH = 16 };
+struct CtThread { uint64_t seq = 0; int depth = 0; uint8_t* pool = nullptr; unsigned tid = ~0u; };
+thread_local CtThread tl_ct;
+std::atomic<uint32_t> s_ct_next_tid{1};
+
+uint64_t ct_now_us()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* Name and handler lookups over the two registration tables above. */
+int ct_ctx_find(uint32_t nid)
+{
+    for (uint32_t i = 0; i < g_ctx_count; i++)
+        if (g_ctx[i].nid == nid) return (int)i;
+    return -1;
+}
+
+ps3_nid_entry* ct_nid_find(uint32_t nid)
+{
+    return g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+}
+
+const char* ct_hle_name(uint32_t nid)
+{
+    const int i = ct_ctx_find(nid);
+    if (i >= 0) return g_ctx[i].name;
+    ps3_nid_entry* e = ct_nid_find(nid);
+    return (e && e->name) ? e->name : nullptr;
+}
+
+/* Which implementation serves the call: a loaded system PRX (the real
+ * firmware code, lifted), one of our HLE handlers, or nothing. */
+const char* ct_impl(uint32_t nid)
+{
+    if (prx_resolve_export(nid)) return "prx";
+    if (ct_ctx_find(nid) >= 0) return "hle";
+    ps3_nid_entry* e = ct_nid_find(nid);
+    return (e && e->handler) ? "hle" : "unresolved";
+}
+
+int ct_rule_match(const CtRule& r, int kind, uint32_t id, const char* name)
+{
+    if (r.kind == PS3_CT_SYSCALL) return kind == PS3_CT_SYSCALL && (r.sc < 0 || (uint32_t)r.sc == id);
+    if (kind != PS3_CT_HLE) return 0;
+    if (r.nid) return r.nid == id;
+    if (!name) return 0;
+    return r.prefix ? strncmp(name, r.name.c_str(), r.name.size()) == 0 : r.name == name;
+}
+
+int ct_wanted(int kind, uint32_t id)
+{
+    if (s_ct_rules.empty()) return 1;
+    uint8_t* slot = nullptr;
+    if (kind == PS3_CT_SYSCALL) { if (id < 1024) slot = &s_ct_sc_ok[id]; }
+    else {
+        uint32_t h = (id * 2654435761u) >> 20;
+        for (uint32_t k = 0; k < 4096; k++, h = (h + 1) & 4095) {
+            if (s_ct_nid_key[h] == id && s_ct_nid_ok[h]) { slot = &s_ct_nid_ok[h]; break; }
+            if (!s_ct_nid_ok[h]) { s_ct_nid_key[h] = id; slot = &s_ct_nid_ok[h]; break; }
+        }
+    }
+    if (slot && *slot) return *slot == 1;
+    const char* name = kind == PS3_CT_HLE ? ct_hle_name(id) : nullptr;
+    int ok = !s_ct_has_include;   /* only excludes given: everything else is in */
+    for (const CtRule& r : s_ct_rules)
+        if (ct_rule_match(r, kind, id, name)) ok = !r.exclude;   /* last match wins */
+    if (slot) *slot = ok ? 1 : 2;
+    return ok;
+}
+
+/* Is [ea, ea+len) backed? The guest arena is reserved and committed on first
+ * touch (a vectored handler on Windows), so a read of an untouched page would
+ * commit it -- a side effect the trace must not have. */
+uint32_t ct_readable(uint32_t ea, uint32_t len)
+{
+    if (!vm_base || ea < 0x10000u || ea >= 0xE0000000u) return 0;
+    if ((uint64_t)ea + len > 0xE0000000ull) len = 0xE0000000u - ea;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(vm_base + ea, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+    const uint64_t end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    const uint64_t want = (uint64_t)(uintptr_t)(vm_base + ea) + len;
+    if (want > end) len = (uint32_t)(end - (uint64_t)(uintptr_t)(vm_base + ea));
+#endif
+    return len;
+}
+
+uint64_t ct_fnv(const uint8_t* p, size_t n)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001B3ull; }
+    return h;
+}
+
+void ct_put(std::string& o, const char* fmt, ...)
+{
+    char b[256];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    if (n > 0) o.append(b, (size_t)(n < (int)sizeof b ? n : (int)sizeof b - 1));
+}
+
+void ct_json_str(std::string& o, const char* s)
+{
+    o += '"';
+    for (; s && *s; s++) {
+        const unsigned char ch = (unsigned char)*s;
+        if (ch == '"' || ch == '\\') { o += '\\'; o += (char)ch; }
+        else if (ch < 0x20 || ch >= 0x7F) ct_put(o, "\\u%04x", ch);
+        else o += (char)ch;
+    }
+    o += '"';
+}
+
+void ct_write(const std::string& line)
+{
+    std::lock_guard<std::mutex> lk(s_ct_mu);
+    if (!s_ct_file) return;
+    fwrite(line.data(), 1, line.size(), s_ct_file);
+    /* Flushed at least every 250 ms: a run is usually ended by killing the
+     * process, and the tail is the part being looked at. */
+    const uint64_t now = ct_now_us();
+    if (now - s_ct_last_flush_us > 250000) { fflush(s_ct_file); s_ct_last_flush_us = now; }
+}
+
+void ct_atexit() { std::lock_guard<std::mutex> lk(s_ct_mu); if (s_ct_file) fflush(s_ct_file); }
+} // namespace
+
+extern "C" int ps3_calltrace_init(void)
+{
+    static std::mutex init_mu;
+    std::lock_guard<std::mutex> lk(init_mu);
+    if (g_ps3_calltrace >= 0) return g_ps3_calltrace;
+    const char* path = getenv("PS3_CALLTRACE");
+    if (!path || !*path) { g_ps3_calltrace = 0; return 0; }
+    s_ct_file = fopen(path, "wb");
+    if (!s_ct_file) {
+        fprintf(stderr, "[calltrace] cannot open %s; tracing off\n", path);
+        g_ps3_calltrace = 0; return 0;
+    }
+    setvbuf(s_ct_file, nullptr, _IOFBF, 1 << 20);
+    if (const char* w = getenv("PS3_CALLTRACE_WIN")) s_ct_win = (uint32_t)strtoul(w, 0, 0);
+    if (s_ct_win > 4096) s_ct_win = 4096;
+    if (const char* m = getenv("PS3_CALLTRACE_MAX")) s_ct_max = strtoull(m, 0, 0);
+    if (const char* f = getenv("PS3_CALLTRACE_FILTER")) {
+        std::string all(f);
+        size_t p = 0;
+        while (p <= all.size()) {
+            size_t q = all.find(',', p);
+            if (q == std::string::npos) q = all.size();
+            std::string t = all.substr(p, q - p);
+            p = q + 1;
+            while (!t.empty() && t[0] == ' ') t.erase(0, 1);
+            while (!t.empty() && t.back() == ' ') t.pop_back();
+            if (t.empty()) continue;
+            CtRule r{0, PS3_CT_HLE, 0, -1, std::string(), 0};
+            if (t[0] == '-') { r.exclude = 1; t.erase(0, 1); }
+            if (t == "sc") r.kind = PS3_CT_SYSCALL;
+            else if (t.compare(0, 3, "sc:") == 0) { r.kind = PS3_CT_SYSCALL; r.sc = atoi(t.c_str() + 3); }
+            else if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X'))
+                r.nid = (uint32_t)strtoul(t.c_str(), 0, 16);
+            else {
+                if (t.back() == '*') { r.prefix = 1; t.pop_back(); }
+                r.name = t;
+            }
+            if (!r.exclude) s_ct_has_include = 1;
+            s_ct_rules.push_back(r);
+            if (q == all.size()) break;
+        }
+    }
+    s_ct_t0_us = ct_now_us();
+    std::string hdr;
+    ct_put(hdr, "{\"type\":\"header\",\"schema\":\"ps3-calltrace/1\",\"side\":\"ps3recomp\",\"win\":%u,", s_ct_win);
+    hdr += "\"filter\":"; ct_json_str(hdr, getenv("PS3_CALLTRACE_FILTER") ? getenv("PS3_CALLTRACE_FILTER") : "");
+    hdr += "}\n";
+    fwrite(hdr.data(), 1, hdr.size(), s_ct_file);
+    atexit(ct_atexit);
+    fprintf(stderr, "[calltrace] writing %s (window %u bytes)\n", path, s_ct_win);
+    g_ps3_calltrace = 1;
+    return 1;
+}
+
+extern "C" void ps3_ct_enter(ps3_ct_call* c, int kind, uint32_t id, ppu_context* ctx)
+{
+    CtThread& t = tl_ct;
+    if (!ct_wanted(kind, id)) { t.seq++; return; }   /* still counted: seq stays a call index */
+    if (s_ct_max && s_ct_count.load(std::memory_order_relaxed) >= s_ct_max) return;
+    c->on = 1; c->kind = kind; c->id = id;
+    c->depth = t.depth++;
+    c->seq = t.seq++;
+    c->t0_us = ct_now_us() - s_ct_t0_us;
+    c->lr = (uint32_t)ctx->lr;
+    c->frame = cellGcm_flip_request_count();
+    for (int i = 0; i < 8; i++) c->args[i] = ctx->gpr[3 + i];
+    c->snap = nullptr;
+    if (s_ct_win && c->depth < CT_MAX_DEPTH) {
+        if (!t.pool) t.pool = (uint8_t*)calloc((size_t)CT_MAX_DEPTH * 8, s_ct_win);
+        if (t.pool) {
+            c->snap = t.pool + (size_t)c->depth * 8 * s_ct_win;
+            for (int i = 0; i < 8; i++) {
+                const uint32_t ea = (uint32_t)c->args[i];
+                const uint32_t n = (c->args[i] >> 32) ? 0 : ct_readable(ea, s_ct_win);
+                if (n) memcpy(c->snap + (size_t)i * s_ct_win, vm_base + ea, n);
+            }
+        }
+    }
+}
+
+extern "C" void ps3_ct_leave(ps3_ct_call* c, ppu_context* ctx)
+{
+    CtThread& t = tl_ct;
+    t.depth = c->depth;
+    const unsigned slot = (unsigned)ctx->thread_id;
+    std::string o;
+    o.reserve(512);
+    /* First record from this OS thread: assign a unique monotonic calltrace
+     * tid and emit its name. Using a monotonic tid instead of ctx->thread_id
+     * avoids merging records when a thread slot is recycled after exit. */
+    if (t.tid == ~0u) {
+        t.tid = s_ct_next_tid.fetch_add(1, std::memory_order_relaxed);
+        unsigned t2 = 0, cia = 0; const char* tn = nullptr;
+        if (slot >= 1) ppu_prof_snapshot((int)slot - 1, &t2, &cia, &tn);
+        ct_put(o, "{\"type\":\"thread\",\"tid\":%u,\"name\":", t.tid);
+        ct_json_str(o, tn ? tn : (slot == 1 ? "main" : ""));
+        o += "}\n";
+    }
+    const unsigned tid = t.tid;
+    ct_put(o, "{\"type\":\"call\",\"tid\":%u,\"seq\":%llu,\"depth\":%d,\"t_us\":%llu,\"frame\":%u,",
+           tid, (unsigned long long)c->seq, c->depth, (unsigned long long)c->t0_us, c->frame);
+    if (c->kind == PS3_CT_HLE) {
+        ct_put(o, "\"kind\":\"hle\",\"nid\":\"0x%08X\",\"name\":", c->id);
+        const char* nm = ct_hle_name(c->id);
+        ct_json_str(o, nm ? nm : "");
+        ct_put(o, ",\"impl\":\"%s\",", ct_impl(c->id));
+    } else {
+        ct_put(o, "\"kind\":\"sc\",\"sc\":%u,", c->id);
+    }
+    ct_put(o, "\"lr\":\"0x%08X\",\"args\":[", c->lr);
+    for (int i = 0; i < 8; i++) ct_put(o, "%s\"0x%llX\"", i ? "," : "", (unsigned long long)c->args[i]);
+    ct_put(o, "],\"ret\":\"0x%llX\",\"wr\":[", (unsigned long long)ctx->gpr[3]);
+    /* Written memory: per pointer argument, the runs of 4-byte words whose
+     * bytes changed across the call inside its window, as [arg, offset,
+     * length, data] with data in hex up to 32 bytes and "#<fnv1a64>" beyond.
+     * Word-aligning runs keeps 32-bit ids/handles/addresses intact even when
+     * only some bytes differed from zero. Runs closer than 8 bytes are merged. */
+    int nw = 0;
+    if (c->snap) {
+        for (int i = 0; i < 8; i++) {
+            const uint32_t ea = (uint32_t)c->args[i];
+            const uint32_t n = (c->args[i] >> 32) ? 0 : ct_readable(ea, s_ct_win);
+            if (!n) continue;
+            const uint8_t* pre = c->snap + (size_t)i * s_ct_win;
+            const uint8_t* post = vm_base + ea;
+            auto word_diff = [&](uint32_t w) {
+                uint32_t lim = (w + 4 < n) ? (w + 4) : n;
+                for (uint32_t b = w; b < lim; b++) if (pre[b] != post[b]) return 1;
+                return 0;
+            };
+            uint32_t k = 0;
+            while (k < n) {
+                if (!word_diff(k)) { k += 4; continue; }
+                uint32_t s = k, e = (k + 4 < n) ? (k + 4) : n, gap = 0;
+                for (uint32_t j = e; j < n; j += 4) {
+                    uint32_t je = (j + 4 < n) ? (j + 4) : n;
+                    if (word_diff(j)) { e = je; gap = 0; }
+                    else { gap += (je - j); if (gap >= 8) break; }
+                }
+                ct_put(o, "%s[%d,%u,%u,\"", nw++ ? "," : "", i, s, e - s);
+                if (e - s <= 32) for (uint32_t j = s; j < e; j++) ct_put(o, "%02x", post[j]);
+                else ct_put(o, "#%016llx", (unsigned long long)ct_fnv(post + s, e - s));
+                o += "\"]";
+                k = e;
+            }
+        }
+    }
+    o += "]}\n";
+    ct_write(o);
+    if (s_ct_max && s_ct_count.fetch_add(1, std::memory_order_relaxed) + 1 == s_ct_max) {
+        std::lock_guard<std::mutex> lk(s_ct_mu);
+        if (s_ct_file) fflush(s_ct_file);
+        fprintf(stderr, "[calltrace] %llu records written; stopped\n", (unsigned long long)s_ct_max);
+    }
+}
+
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    ps3_ct_scope _ct(PS3_CT_HLE, nid, ctx);   /* PS3_CALLTRACE; first, so it closes last */
     if (const hle_fast_fn f = hle_fast(nid)) {
         /* The lifted import stub does not save r2, but its caller still runs
          * ld r2,0x28(r1) after the call. The full path's _TocGuard writes the
