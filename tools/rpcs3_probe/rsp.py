@@ -10,6 +10,7 @@ register/stack slot).
 
 This is title-agnostic: nothing here knows about any specific game.
 """
+import collections
 import socket
 import time
 import xml.etree.ElementTree as ET
@@ -53,6 +54,8 @@ class RSPClient:
         self.no_ack = False
         self.reg_layout = []   # ordered list of (name, byte_offset, byte_size)
         self.reg_by_name = {}  # name -> (byte_offset, byte_size)
+        # the last packets each way, for diagnosing a stub that stops answering
+        self.history = collections.deque(maxlen=64)
 
     # ---- connection ---------------------------------------------------------
     def connect(self, retries=40, delay=0.5):
@@ -60,7 +63,8 @@ class RSPClient:
         for _ in range(retries):
             try:
                 s = socket.create_connection((self.host, self.port), timeout=self.timeout)
-                s.settimeout(self.timeout)
+                # short reads: the callers' deadlines (not the socket) bound each wait
+                s.settimeout(min(self.timeout, 0.25))
                 self.sock = s
                 return True
             except OSError as e:
@@ -89,16 +93,16 @@ class RSPClient:
         body = payload.encode("latin-1")
         pkt = b"$" + body + b"#" + f"{_checksum(body):02x}".encode()
         self.sock.sendall(pkt)
+        self.history.append((time.time(), ">", payload[:80]))
         if not self.no_ack:
             self._wait_ack()
 
     def _wait_ack(self, deadline=None):
         deadline = deadline or (time.time() + self.timeout)
         while time.time() < deadline:
-            while not self.buf:
+            if not self.buf:
                 self.buf += self._read_raw()
-                if not self.buf:
-                    continue
+                continue
             ch = self.buf[:1]
             self.buf = self.buf[1:]
             if ch == b"+":
@@ -132,6 +136,7 @@ class RSPClient:
             self.buf += self._read_raw()
         payload = self.buf[1:hi]
         self.buf = self.buf[hi + 3:]
+        self.history.append((time.time(), "<", payload[:80].decode("latin-1")))
         if not self.no_ack:
             self.sock.sendall(b"+")
         return _unescape(payload)
@@ -139,6 +144,7 @@ class RSPClient:
     def interrupt(self):
         """Async interrupt (Ctrl-C) to halt a running target."""
         self.sock.sendall(b"\x03")
+        self.history.append((time.time(), ">", "^C"))
 
     # ---- handshake / capabilities ------------------------------------------
     def handshake(self):
@@ -218,13 +224,16 @@ class RSPClient:
         return regs
 
     def _fallback_registers(self):
+        """GDB's powerpc-64 layout: r0-r31 and f0-f31 64-bit, pc and msr 64-bit,
+        cr 32-bit, lr and ctr 64-bit, xer and fpscr 32-bit (1112 hex digits per
+        `g` reply). RPCS3 answers `g` this way and serves no target.xml."""
         off = 0
-        names = [f"r{i}" for i in range(32)] + [f"f{i}" for i in range(32)] + \
-                ["pc", "msr", "cr", "lr", "ctr", "xer", "fpscr"]
-        for name in names:
-            self.reg_layout.append((name, off, 8))
-            self.reg_by_name[name] = (off, 8)
-            off += 8
+        names = [(f"r{i}", 8) for i in range(32)] + [(f"f{i}", 8) for i in range(32)] + \
+                [("pc", 8), ("msr", 8), ("cr", 4), ("lr", 8), ("ctr", 8), ("xer", 4), ("fpscr", 4)]
+        for name, size in names:
+            self.reg_layout.append((name, off, size))
+            self.reg_by_name[name] = (off, size)
+            off += size
 
     # ---- state access -------------------------------------------------------
     def read_registers(self) -> dict:

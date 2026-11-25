@@ -20,6 +20,9 @@ int cellfs_translate_path(const char*,char*,size_t) { return -1; }
 int32_t cellPamfReaderInitialize(void*,void*,uint64_t,uint32_t) { std::abort(); }
 int32_t cellPamfReaderGetStreamIndex(void*) { std::abort(); }
 uint32_t prx_resolve_export(uint32_t) { return 0; }
+/* PS3_CALLTRACE (ppu_calltrace.h) names threads and stamps frames through these. */
+extern "C" int ppu_prof_snapshot(int, unsigned*, unsigned*, const char**) { return 0; }
+extern "C" uint32_t cellGcm_flip_request_count(void) { return 0; }
 void ps3_indirect_call(ppu_context*) { std::abort(); }
 uint64_t ppu_guest_call(uint32_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) { std::abort(); }
 void ppu_prof_stamp(void*,unsigned) {}
