@@ -145,12 +145,16 @@ static void gifdec_free_source(GifDecSubState* sub)
  * -----------------------------------------------------------------------*/
 
 /* ---------------------------------------------------------------------------
- * Guest struct access
+ * Guest struct access (verified live against Sony firmware 4.93 libgifdec.sprx)
  *
- * Neither CellGifDecSrc nor CellGifDecInfo holds a pointer, so the guest lays
- * them out exactly as we do -- same scalar sizes, same alignment -- and
- * offsetof() on the host struct is a valid guest offset. What does not carry
- * over is byte order: every field in guest memory is big-endian.
+ * CellGifDecSrc guest layout (32 bytes, big-endian, matches CellPngDecSrc):
+ *   +0x00 u32 srcSelect        (0 = FILE, 1 = BUFFER)
+ *   +0x04 u32 fileName         (guest const char* EA)
+ *   +0x08 u64 fileOffset
+ *   +0x10 u32 fileSize
+ *   +0x14 u32 streamPtr        (guest void* EA)
+ *   +0x18 u32 streamSize
+ *   +0x1C u32 spuThreadEnable
  * -----------------------------------------------------------------------*/
 #define GIF_EA(p) ((u32)(uintptr_t)(p))
 
@@ -160,26 +164,35 @@ static void gifdec_src_load(CellGifDecSrc* h, const CellGifDecSrc* guest_ea)
     memset(h, 0, sizeof(*h));
     if (!ea)
         return;
-    h->srcSelect       = vm_read32(ea + (u32)offsetof(CellGifDecSrc, srcSelect));
-    h->fileOffset      = vm_read64(ea + (u32)offsetof(CellGifDecSrc, fileOffset));
-    h->fileSize        = vm_read32(ea + (u32)offsetof(CellGifDecSrc, fileSize));
-    h->streamPtr       = vm_read64(ea + (u32)offsetof(CellGifDecSrc, streamPtr));
-    h->streamSize      = vm_read32(ea + (u32)offsetof(CellGifDecSrc, streamSize));
-    h->spuThreadEnable = vm_read32(ea + (u32)offsetof(CellGifDecSrc, spuThreadEnable));
-    /* fileName is bytes, so it comes across as-is. */
-    memcpy(h->fileName, vm_base + ea + offsetof(CellGifDecSrc, fileName),
-           sizeof(h->fileName));
-    h->fileName[sizeof(h->fileName) - 1] = '\0';
+    h->srcSelect       = vm_read32(ea + 0x00u);
+    h->fileOffset      = vm_read64(ea + 0x08u);
+    h->fileSize        = vm_read32(ea + 0x10u);
+    h->streamPtr       = (u64)vm_read32(ea + 0x14u);
+    h->streamSize      = vm_read32(ea + 0x18u);
+    h->spuThreadEnable = vm_read32(ea + 0x1Cu);
+    if (h->srcSelect == CELL_GIFDEC_FILE) {
+        u32 name_ea = vm_read32(ea + 0x04u);
+        if (name_ea && vm_base) {
+            const char* src_str = (const char*)(vm_base + name_ea);
+            strncpy(h->fileName, src_str, sizeof(h->fileName) - 1);
+            h->fileName[sizeof(h->fileName) - 1] = '\0';
+        }
+    }
 }
 
-/* CellGifDecInfo is eight consecutive u32. */
+/* CellGifDecInfo is eight consecutive BE u32s (32 bytes). */
 static void gifdec_info_store(u32 ea, const CellGifDecInfo* h)
 {
     if (!ea)
         return;
-    const u32* w = (const u32*)h;
-    for (u32 i = 0; i < sizeof(*h) / 4; i++)
-        vm_write32(ea + i * 4, w[i]);
+    vm_write32(ea + 0x00u, h->SWidth);
+    vm_write32(ea + 0x04u, h->SHeight);
+    vm_write32(ea + 0x08u, h->SGlobalColorTableFlag);
+    vm_write32(ea + 0x0Cu, h->SColorResolution);
+    vm_write32(ea + 0x10u, h->SSortFlag);
+    vm_write32(ea + 0x14u, h->SSizeOfGlobalColorTable);
+    vm_write32(ea + 0x18u, h->SBackGroundColor);
+    vm_write32(ea + 0x1Cu, h->SPixelAspectRatio);
 }
 
 s32 cellGifDecCreate(CellGifDecMainHandle* mainHandle,
@@ -269,10 +282,10 @@ s32 cellGifDecReadHeader(CellGifDecMainHandle mainHandle,
         return CELL_GIFDEC_ERROR_SEQ;
     if (!info) return CELL_GIFDEC_ERROR_ARG;
 
-    /* Fill a host copy and publish it big-endian on the way out. */
+    /* Fill a host copy and publish it big-endian to guest memory. */
     u32 info_ea = GIF_EA(info);
-    CellGifDecInfo host_info;
-    info = &host_info;
+    CellGifDecInfo parsed;
+    memset(&parsed, 0, sizeof(parsed));
 
     GifDecSubState* sub = &s_gif_sub[subHandle];
     if (gifdec_load_source(sub) < 0)
@@ -291,27 +304,26 @@ s32 cellGifDecReadHeader(CellGifDecMainHandle mainHandle,
         sub->image_width  = (u32)w;
         sub->image_height = (u32)h;
 
-        memset(info, 0, sizeof(CellGifDecInfo));
-        info->SWidth  = (u32)w;
-        info->SHeight = (u32)h;
+        parsed.SWidth  = (u32)w;
+        parsed.SHeight = (u32)h;
 
         /* Also parse GIF LSD for the extra fields if we have enough data */
         if (sub->src_size >= 13 && memcmp(sub->src_data, "GIF", 3) == 0) {
             const u8* lsd = sub->src_data + 6;
             u8 packed = lsd[4];
-            info->SGlobalColorTableFlag   = (packed >> 7) & 1;
-            info->SColorResolution        = ((packed >> 4) & 0x07) + 1;
-            info->SSortFlag               = (packed >> 3) & 1;
-            info->SSizeOfGlobalColorTable = 1u << ((packed & 0x07) + 1);
-            info->SBackGroundColor        = lsd[5];
-            info->SPixelAspectRatio       = lsd[6];
+            parsed.SGlobalColorTableFlag   = (packed >> 7) & 1;
+            parsed.SColorResolution        = ((packed >> 4) & 0x07) + 1;
+            parsed.SSortFlag               = (packed >> 3) & 1;
+            parsed.SSizeOfGlobalColorTable = (packed & 0x07) + 1;
+            parsed.SBackGroundColor        = lsd[5];
+            parsed.SPixelAspectRatio       = lsd[6];
         }
 
         printf("[cellGifDec]   %ux%u\n", (u32)w, (u32)h);
 
-        sub->info = *info;
+        sub->info = parsed;
         sub->header_read = 1;
-        gifdec_info_store(info_ea, info);
+        gifdec_info_store(info_ea, &parsed);
         return CELL_OK;
     }
 manual_parse:
@@ -331,21 +343,21 @@ manual_parse:
     sub->image_width  = w;
     sub->image_height = h;
 
-    memset(info, 0, sizeof(CellGifDecInfo));
-    info->SWidth  = w;
-    info->SHeight = h;
-    info->SGlobalColorTableFlag    = (packed >> 7) & 1;
-    info->SColorResolution         = ((packed >> 4) & 0x07) + 1;
-    info->SSortFlag                = (packed >> 3) & 1;
-    info->SSizeOfGlobalColorTable  = 1u << ((packed & 0x07) + 1);
-    info->SBackGroundColor         = lsd[5];
-    info->SPixelAspectRatio        = lsd[6];
+    memset(&parsed, 0, sizeof(parsed));
+    parsed.SWidth  = w;
+    parsed.SHeight = h;
+    parsed.SGlobalColorTableFlag    = (packed >> 7) & 1;
+    parsed.SColorResolution         = ((packed >> 4) & 0x07) + 1;
+    parsed.SSortFlag                = (packed >> 3) & 1;
+    parsed.SSizeOfGlobalColorTable  = (packed & 0x07) + 1;
+    parsed.SBackGroundColor         = lsd[5];
+    parsed.SPixelAspectRatio        = lsd[6];
 
     printf("[cellGifDec]   %ux%u (header parse)\n", w, h);
 
-    sub->info = *info;
+    sub->info = parsed;
     sub->header_read = 1;
-    gifdec_info_store(info_ea, info);
+    gifdec_info_store(info_ea, &parsed);
     return CELL_OK;
 }
 
@@ -362,27 +374,27 @@ s32 cellGifDecSetParameter(CellGifDecMainHandle mainHandle,
     GifDecSubState* sub = &s_gif_sub[subHandle];
     if (!sub->header_read) return CELL_GIFDEC_ERROR_SEQ;
 
-    /* CellGifDecInParam is three u32; CellGifDecOutParam leads with a u64,
-     * so it is published field by field -- a word-at-a-time copy would put
-     * the two halves of outputWidthByte the wrong way round. */
+    /* CellGifDecInParam is three BE u32s; CellGifDecOutParam is 32 bytes
+     * (verified against Sony firmware 4.93 libgifdec.sprx: +0x00 u64 outputWidthByte,
+     * +0x08 width, +0x0C height, +0x10 components, +0x14 bitDepth=8,
+     * +0x18 colorSpace, +0x1C useMemorySpace). */
     CellGifDecInParam host_in;
     guest_struct_load(&host_in, GUEST_EA(inParam), (u32)sizeof(host_in));
-    inParam = &host_in;
 
-    sub->in_param = *inParam;
+    sub->in_param = host_in;
     sub->param_set = 1;
 
     u32 out_comp = 4; /* GIF always decoded to 4-component (RGBA or ARGB) */
     u64 width_byte = (u64)(sub->image_width * out_comp);
     u32 out_ea = GUEST_EA(outParam);
-    vm_write64(out_ea + (u32)offsetof(CellGifDecOutParam, outputWidthByte),  width_byte);
-    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputWidth),      sub->image_width);
-    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputHeight),     sub->image_height);
-    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputComponents), out_comp);
-    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputColorSpace),
-               inParam->outputColorSpace ? inParam->outputColorSpace : CELL_GIFDEC_RGBA);
-    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, useMemorySpace),
-               (u32)(width_byte * sub->image_height));
+    vm_write64(out_ea + 0x00u, width_byte);
+    vm_write32(out_ea + 0x08u, sub->image_width);
+    vm_write32(out_ea + 0x0Cu, sub->image_height);
+    vm_write32(out_ea + 0x10u, out_comp);
+    vm_write32(out_ea + 0x14u, 8u); /* outputBitDepth */
+    vm_write32(out_ea + 0x18u,
+               host_in.outputColorSpace ? host_in.outputColorSpace : CELL_GIFDEC_RGBA);
+    vm_write32(out_ea + 0x1Cu, (u32)(width_byte * sub->image_height));
 
     return CELL_OK;
 }
