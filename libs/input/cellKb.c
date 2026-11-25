@@ -155,6 +155,15 @@ s32 cellKbEnd(void)
 
 /* Guest CellKbData layout (big-endian): +0x00 led u32, +0x04 mkey u32,
  * +0x08 len s32, +0x0C keycode[62] u16. */
+s32 cellKbGetData(u32 port_no, CellKbData* data);
+
+/* cellKbRead (0xFF0A21B7): the SDK's older name for cellKbGetData, same data
+ * (RPCS3 cellKb.cpp). Some titles poll it every frame. */
+s32 cellKbRead(u32 port_no, CellKbData* data)
+{
+    return cellKbGetData(port_no, data);
+}
+
 s32 cellKbGetData(u32 port_no, CellKbData* data)
 {
     unsigned long long ea = (unsigned int)(uintptr_t)data;
@@ -167,12 +176,8 @@ s32 cellKbGetData(u32 port_no, CellKbData* data)
 
     KbPortState* kb = &s_kb_ports[port_no];
 
-    if (!kb->connected) {
-        vm_write32(ea + 0x00, 0);
-        vm_write32(ea + 0x04, 0);
-        vm_write32(ea + 0x08, 0);
+    if (!kb->connected)
         return CELL_KB_ERROR_NO_DEVICE;
-    }
 
     vm_write32(ea + 0x00, kb->led);
     vm_write32(ea + 0x04, kb->mkey);

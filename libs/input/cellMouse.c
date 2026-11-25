@@ -152,10 +152,11 @@ s32 cellMouseEnd(void)
     return CELL_OK;
 }
 
-/* Guest CellMouseData layout (big-endian, 8 bytes): +0 update u8, +1 buttons
- * u8, +2 x_axis s8, +3 y_axis s8, +4 wheel s8, +5 tilt s8, +6..7 pad. The
- * arg is a GUEST EA -- write via vm accessors (see cellMouseGetInfo below);
- * dereferencing it as a host pointer is an instant AV. */
+/* Guest CellMouseData layout (6 bytes, SDK cell/mouse/mouse_codes.h):
+ * +0 update u8, +1 buttons u8, +2 x_axis s8, +3 y_axis s8, +4 wheel s8,
+ * +5 tilt s8. Do NOT write bytes +6..+7: sizeof(CellMouseData) == 6
+ * (verified against RPCS3 GDB trace where bytes +6..+7 remain untouched)
+ * and CellMouseDataList packs CellMouseData[8] at stride 6. */
 static void mouse_write_data(unsigned long long ea, u8 update, u8 buttons,
                              s8 x, s8 y, s8 wheel)
 {
@@ -165,8 +166,6 @@ static void mouse_write_data(unsigned long long ea, u8 update, u8 buttons,
     vm_write8(ea + 3, (u8)y);
     vm_write8(ea + 4, (u8)wheel);
     vm_write8(ea + 5, 0);           /* tilt */
-    vm_write8(ea + 6, 0);
-    vm_write8(ea + 7, 0);
 }
 
 s32 cellMouseGetData(u32 port_no, CellMouseData* data)
@@ -181,10 +180,8 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
 
     MousePortState* ms = &s_mouse_ports[port_no];
 
-    if (!ms->connected) {
-        mouse_write_data(ea, 0, 0, 0, 0, 0);
+    if (!ms->connected)
         return CELL_MOUSE_ERROR_NO_DEVICE;
-    }
 
     /* Clamp accumulated deltas to s8 range */
     s32 dx = ms->acc_dx;
@@ -219,10 +216,8 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
 
     MousePortState* ms = &s_mouse_ports[port_no];
 
-    if (!ms->connected) {
-        vm_write32(ea + 0x00, 0);
+    if (!ms->connected)
         return CELL_MOUSE_ERROR_NO_DEVICE;
-    }
 
     /* Push current state into ring if there's pending data */
     if (ms->updated) {
@@ -241,7 +236,7 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
     for (u32 i = 0; i < ms->ring_count; i++) {
         u32 idx = (start + i) % CELL_MOUSE_MAX_DATA_LIST_NUM;
         CellMouseData* d = &ms->ring[idx];
-        mouse_write_data(ea + 0x04 + i * 8, d->update, d->buttons,
+        mouse_write_data(ea + 0x04 + i * 6, d->update, d->buttons,
                          d->x_axis, d->y_axis, d->wheel);
     }
 
