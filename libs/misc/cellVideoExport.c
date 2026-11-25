@@ -5,6 +5,7 @@
  */
 
 #include "cellVideoExport.h"
+#include "../system/cellSysutil.h"
 #include <stdio.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
@@ -38,9 +39,12 @@ s32 cellVideoExportStart(const CellVideoExportParam* param,
     if (!s_initialized)
         return (s32)CELL_VIDEO_EXPORT_ERROR_NOT_INITIALIZED;
 
-    /* Immediately call back with NOT_SUPPORTED */
-    if (callback)
-        callback((s32)CELL_VIDEO_EXPORT_ERROR_NOT_SUPPORTED, userdata);
+    /* callback is a guest OPD address; queue via sysutil instead of calling directly. */
+    if (callback) {
+        const u64 ev[8] = {(u64)(s64)(s32)CELL_VIDEO_EXPORT_ERROR_NOT_SUPPORTED,
+                           (u64)(uintptr_t)userdata, 0, 0, 0, 0, 0, 0};
+        cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, ev);
+    }
 
     return (s32)CELL_VIDEO_EXPORT_ERROR_NOT_SUPPORTED;
 }

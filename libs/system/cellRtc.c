@@ -159,6 +159,31 @@ static void rtc_dt_read(const CellRtcDateTime* p, CellRtcDateTime* v)
     }
 }
 
+static void rtc_tick_to_dt_host(u64 tick, CellRtcDateTime* out)
+{
+    u32 usec = (u32)(tick % USEC_PER_SEC);
+    s64 unix_time = tick_to_time_t(tick);
+    time_t t = (time_t)unix_time;
+    struct tm tm_val;
+#ifdef _WIN32
+    gmtime_s(&tm_val, &t);
+#else
+    gmtime_r(&t, &tm_val);
+#endif
+    tm_to_datetime(&tm_val, usec, out);
+}
+
+static u64 rtc_dt_to_tick_host(const CellRtcDateTime* dt)
+{
+    struct tm t = datetime_to_tm(dt);
+#ifdef _WIN32
+    time_t tt = _mkgmtime(&t);
+#else
+    time_t tt = timegm(&t);
+#endif
+    return time_t_to_tick((s64)tt) + dt->microsecond;
+}
+
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -269,16 +294,16 @@ s32 cellRtcTickAddYears(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
-    /* Convert tick to datetime, add years, convert back */
+    /* Convert tick to datetime, add years, convert back via host helpers */
     CellRtcDateTime dt;
-    cellRtcSetTick(&dt, pTick1);
+    rtc_tick_to_dt_host(rtc_tick_read(pTick1), &dt);
     dt.year = (u16)((s32)dt.year + iAdd);
 
     /* Clamp Feb 29 -> Feb 28 if not leap year */
     if (dt.month == 2 && dt.day == 29 && !is_leap_year(dt.year))
         dt.day = 28;
 
-    cellRtcGetTick(&dt, pTick0);
+    rtc_tick_write(pTick0, rtc_dt_to_tick_host(&dt));
     return CELL_OK;
 }
 
@@ -288,7 +313,7 @@ s32 cellRtcTickAddMonths(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAd
         return CELL_EINVAL;
 
     CellRtcDateTime dt;
-    cellRtcSetTick(&dt, pTick1);
+    rtc_tick_to_dt_host(rtc_tick_read(pTick1), &dt);
 
     s32 total_months = (s32)(dt.year - 1) * 12 + (s32)(dt.month - 1) + iAdd;
     if (total_months < 0) total_months = 0;
@@ -301,7 +326,7 @@ s32 cellRtcTickAddMonths(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAd
     if (dt.day > (u16)max_day)
         dt.day = (u16)max_day;
 
-    cellRtcGetTick(&dt, pTick0);
+    rtc_tick_write(pTick0, rtc_dt_to_tick_host(&dt));
     return CELL_OK;
 }
 
@@ -497,23 +522,9 @@ s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
     if (!pDateTime || !pTick)
         return CELL_EINVAL;
 
-    u64 tick = rtc_tick_read(pTick);
-    u32 usec = (u32)(tick % USEC_PER_SEC);
-    s64 unix_time = tick_to_time_t(tick);
-
-    time_t t = (time_t)unix_time;
-    struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
-    gmtime_r(&t, &tm_val);
-#endif
-
-    {
-        CellRtcDateTime dt_s;
-        tm_to_datetime(&tm_val, usec, &dt_s);
-        rtc_dt_write(pDateTime, &dt_s);
-    }
+    CellRtcDateTime dt_s;
+    rtc_tick_to_dt_host(rtc_tick_read(pTick), &dt_s);
+    rtc_dt_write(pDateTime, &dt_s);
     return CELL_OK;
 }
 
@@ -524,13 +535,6 @@ s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)
 
     CellRtcDateTime dt_g;
     rtc_dt_read(pDateTime, &dt_g);
-    struct tm t = datetime_to_tm(&dt_g);
-#ifdef _WIN32
-    time_t tt = _mkgmtime(&t);
-#else
-    time_t tt = timegm(&t);
-#endif
-
-    rtc_tick_write(pTick, time_t_to_tick((s64)tt) + dt_g.microsecond);
+    rtc_tick_write(pTick, rtc_dt_to_tick_host(&dt_g));
     return CELL_OK;
 }
