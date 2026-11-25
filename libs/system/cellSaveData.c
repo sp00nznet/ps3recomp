@@ -238,6 +238,7 @@ static s32 marshal_cbresult_read_result(uint32_t addr)
  */
 #define SAVEDATA_STATGET_SIZE   1704u
 #define SAVEDATA_STATSET_SIZE   16u    /* setParam ptr + reCreateMode + indicator ptr */
+#define SAVEDATA_LISTSET_SIZE   24u    /* focusPos + focusDir + fixedNum + fixedList + newData + reserved */
 #define SAVEDATA_CBRESULT_SIZE  20u    /* s32 + u32 + s32 + char* + void* */
 
 /* CellSaveDataFileGet is 0x44 (excSize + reserved[64]); CellSaveDataFileSet is
@@ -397,7 +398,7 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
  * listed the new-save name wins -- headless, there is no user to pick. */
 static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* dirList,
                                 uint32_t dirCount, uint32_t setBuf_ea, int is_save,
-                                uint32_t userdata_ea, const char* who, char selected[64])
+                                uint32_t* userdata_ea, const char* who, char selected[64])
 {
     selected[0] = '\0';
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
@@ -405,19 +406,20 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
     scratch_reset();
     uint32_t cb_ea  = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
     uint32_t get_ea = scratch_alloc(SAVEDATA_STATGET_SIZE);
-    uint32_t set_ea = scratch_alloc(SAVEDATA_STATSET_SIZE);
+    uint32_t set_ea = scratch_alloc(SAVEDATA_LISTSET_SIZE);
     if (!cb_ea || !get_ea || !set_ea) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
-    for (uint32_t i = 0; i < 24; i += 4) vm_write32(set_ea + i, 0);
+    for (uint32_t i = 0; i < SAVEDATA_LISTSET_SIZE; i += 4) vm_write32(set_ea + i, 0);
 
     uint32_t buf_ea = setBuf_ea ? vm_read32(setBuf_ea + 36) : 0;
     uint32_t cap = setBuf_ea ? vm_read32(setBuf_ea + 32) / 48u : 0;
     if (setBuf_ea && vm_read32(setBuf_ea + 0) < cap) cap = vm_read32(setBuf_ea + 0);
     uint32_t listed = buf_ea ? (dirCount < cap ? dirCount : cap) : 0;
+    if (listed) vm_commit(buf_ea, listed * 48u);
     for (uint32_t i = 0; i < listed; i++)
         for (uint32_t k = 0; k < 48; k++)
             vm_write8(buf_ea + i * 48 + k, (uint8_t)((const char*)&dirList[i])[k]);
 
-    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea);
+    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea ? *userdata_ea : 0);
     vm_write32(get_ea + 0, dirCount);        /* dirNum     */
     vm_write32(get_ea + 4, listed);          /* dirListNum */
     vm_write32(get_ea + 8, listed ? buf_ea : 0);
@@ -426,6 +428,7 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
            who, func_opd, dirCount, listed, 10);
     g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
 
+    if (userdata_ea) *userdata_ea = vm_read32(cb_ea + 16);
     s32 result = marshal_cbresult_read_result(cb_ea);
     const uint32_t fixed_n = vm_read32(set_ea + 8), fixed = vm_read32(set_ea + 12);
     const uint32_t newd = vm_read32(set_ea + 16), focus = vm_read32(set_ea + 4);
@@ -1039,13 +1042,15 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
      * host string. The host structs put dirNamePrefix at +8 as an 8-byte
      * pointer, so a cast would have read half of it plus padding. */
     u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
+    if (dir_max > CELL_SAVEDATA_DIRLIST_MAX)
+        return CELL_SAVEDATA_ERROR_PARAM;
     if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
     CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
+    if (!dirList) return CELL_SAVEDATA_ERROR_INTERNAL;
 
-    u32 dirCount = enumerate_save_dirs(
-        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
-            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
-        dirList, dir_max);
+    u32 prefix_ea = vm_read32((u32)(uintptr_t)setList + 8);
+    const char* prefix_h = prefix_ea ? (const char*)(vm_base + prefix_ea) : "";
+    u32 dirCount = enumerate_save_dirs(prefix_h, dirList, dir_max);
 
     /* Call list callback */
     CellSaveDataCBResult cbResult;
@@ -1061,11 +1066,17 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
     memset(&listSet, 0, sizeof(listSet));
 
     char selectedDir[64];
+    uint32_t cb_userdata = (uint32_t)(uintptr_t)userdata;
     cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
                                           listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 1,
-                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+                                          &cb_userdata, "funcList", selectedDir);
     (void)listSet;
 
+    if (cbResult.result == CELL_SAVEDATA_CBRESULT_OK_LAST ||
+        cbResult.result == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM) {
+        free(dirList);
+        return CELL_OK;
+    }
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
@@ -1077,7 +1088,8 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
         return CELL_SAVEDATA_ERROR_NODATA;
     }
 
-    s32 result = savedata_execute(selectedDir, 1, setBuf, funcStat, funcFile, userdata);
+    s32 result = savedata_execute(selectedDir, 1, setBuf, funcStat, funcFile,
+                                  (void*)(uintptr_t)cb_userdata);
     free(dirList);
     return result;
 }
@@ -1100,13 +1112,15 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
      * host string. The host structs put dirNamePrefix at +8 as an 8-byte
      * pointer, so a cast would have read half of it plus padding. */
     u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
+    if (dir_max > CELL_SAVEDATA_DIRLIST_MAX)
+        return CELL_SAVEDATA_ERROR_PARAM;
     if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
     CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
+    if (!dirList) return CELL_SAVEDATA_ERROR_INTERNAL;
 
-    u32 dirCount = enumerate_save_dirs(
-        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
-            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
-        dirList, dir_max);
+    u32 prefix_ea = vm_read32((u32)(uintptr_t)setList + 8);
+    const char* prefix_h = prefix_ea ? (const char*)(vm_base + prefix_ea) : "";
+    u32 dirCount = enumerate_save_dirs(prefix_h, dirList, dir_max);
 
     CellSaveDataCBResult cbResult;
     memset(&cbResult, 0, sizeof(cbResult));
@@ -1121,11 +1135,17 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
     memset(&listSet, 0, sizeof(listSet));
 
     char selectedDir[64];
+    uint32_t cb_userdata = (uint32_t)(uintptr_t)userdata;
     cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
                                           listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 0,
-                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+                                          &cb_userdata, "funcList", selectedDir);
     (void)listSet;
 
+    if (cbResult.result == CELL_SAVEDATA_CBRESULT_OK_LAST ||
+        cbResult.result == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM) {
+        free(dirList);
+        return CELL_OK;
+    }
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
@@ -1137,7 +1157,8 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
         return CELL_SAVEDATA_ERROR_NODATA;
     }
 
-    s32 result = savedata_execute(selectedDir, 0, setBuf, funcStat, funcFile, userdata);
+    s32 result = savedata_execute(selectedDir, 0, setBuf, funcStat, funcFile,
+                                  (void*)(uintptr_t)cb_userdata);
     free(dirList);
     return result;
 }
@@ -1285,23 +1306,13 @@ s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata)
 {
-    dirName = savedata_host_str(dirName);
+    const char* dirName_h = savedata_host_str(dirName);
     printf("[cellSaveData] AutoSave2(version=%u, dir='%s')\n",
-           version, dirName ? dirName : "<null>");
+           version, dirName_h ? dirName_h : "<null>");
 
-    /* Delegate to the non-_2 entry, which marshals. This used to call
-     * savedata_execute(), which invokes funcStat as a HOST function pointer
-     * with HOST struct addresses -- but funcStat is a guest OPD and the structs
-     * must live in guest memory, so the callback wrote nothing the caller could
-     * read and the first dereference faulted. The Simpsons Arcade Game crashed
-     * exactly here on its first boot, creating its profile right after
-     * AutoLoad2 had correctly reported ERR_NODATA. The two entries take
-     * identical arguments; _2 is just the newer SDK name.
-     *
-     * savedata_execute() is still behind the List* and Fixed* entries and
-     * carries the same defect for each of them. Fixing those needs list/file
-     * marshalling that dispatch_func_stat does not do yet, so they are left
-     * alone until a title actually reaches one. */
+    /* Delegate to the non-_2 entry: identical arguments, _2 is the newer SDK
+     * export name. savedata_execute() marshals both funcStat and funcFile
+     * through g_ps3_guest_caller in guest big-endian memory. */
     return cellSaveDataAutoSave(version, dirName, errDialog, setBuf,
                                 funcStat, funcFile, container, userdata);
 }
@@ -1595,9 +1606,7 @@ static void hle_cellSaveDataUserAutoSave(ppu_context* ctx)
     uint32_t userdata = savedata_arg9(ctx);
 
     printf("[cellSaveData] UserAutoSave(user=%u, userdata=0x%08X)\n", userId, userdata);
-    /* cellSaveDataAutoSave, not AutoSave2: AutoSave2 maps dirName to a host
-     * pointer and passes it on to AutoSave, which maps it again; a host
-     * address below 4 GiB would then be read as a guest one. */
+    /* Forward raw guest EA `dir` directly to cellSaveDataAutoSave. */
     ctx->gpr[3] = (uint64_t)(int64_t)(s32)
         cellSaveDataAutoSave(version, dir, errDialog,
                              (CellSaveDataSetBuf*)setBuf,
@@ -1617,6 +1626,21 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
         (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[8],
         (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[9],
         (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
+}
+
+static int s_savedata_overlay_enabled = 0;
+
+void cellSaveDataEnableOverlay(s32 enable)
+{
+    s_savedata_overlay_enabled = enable ? 1 : 0;
+    printf("[cellSaveData] EnableOverlay(%d)\n", s_savedata_overlay_enabled);
+}
+
+static void hle_cellSaveDataEnableOverlay(ppu_context* ctx)
+{
+    /* void cellSaveDataEnableOverlay(int enable) — leave r3 untouched as
+     * PS3/RPCS3 do for void HLE calls. */
+    cellSaveDataEnableOverlay((s32)ctx->gpr[3]);
 }
 
 /* UserListAutoLoad and UserListAutoSave are ListAutoLoad and ListAutoSave with
@@ -1661,6 +1685,8 @@ void cellSaveData_register_ctx_handlers(void)
                          hle_cellSaveDataUserAutoLoad);
     ps3_hle_register_ctx(0x52AAC4FAu, "cellSaveDataUserAutoSave",
                          hle_cellSaveDataUserAutoSave);
+    ps3_hle_register_ctx(0xE7FA820Bu, "cellSaveDataEnableOverlay",
+                         hle_cellSaveDataEnableOverlay);
     ps3_hle_register_ctx(0x248BD1D8u, "cellSaveDataUserListAutoLoad",
                          hle_cellSaveDataUserListAutoLoad);
     ps3_hle_register_ctx(0x0E091C36u, "cellSaveDataUserListAutoSave",

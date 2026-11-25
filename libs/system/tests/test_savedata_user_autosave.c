@@ -42,9 +42,11 @@ static void (*find(uint32_t nid))(ppu_context*)
 
 #define FIXED_OPD 0x800u
 #define STAT_OPD 0x900u
+#define LIST_OK_LAST_OPD 0x910u
+#define LIST_NEXT_OPD 0x920u
 #define PARAM_EA 0x1000u     /* a CellSaveDataSystemFileParam the stat callback hands back */
 #define LISTED_DIR "TEST00001"
-static int s_stat_calls, s_fixed_calls;
+static int s_stat_calls, s_fixed_calls, s_list_calls;
 static uint32_t s_seen_userdata, s_fixed_userdata, s_fixed_dir_num;
 static int s_stat_sets_param;
 static void guest_callback(u32 opd, u64 cb, u64 get, u64 set,
@@ -58,6 +60,22 @@ static void guest_callback(u32 opd, u64 cb, u64 get, u64 set,
         vm_write32((u32)set, vm_read32((u32)get + 8));  /* dirName: the first entry of the list */
         vm_write32((u32)set + 8, 0);                    /* option */
         return;                                         /* result stays OK_NEXT */
+    }
+    if (opd == LIST_OK_LAST_OPD) {
+        s_list_calls++;
+        s_seen_userdata = vm_read32((u32)cb + 16);
+        vm_write32((u32)cb, CELL_SAVEDATA_CBRESULT_OK_LAST);
+        return;
+    }
+    if (opd == LIST_NEXT_OPD) {
+        s_list_calls++;
+        /* Verify all 24 bytes of CellSaveDataListSet are zeroed & writable,
+         * mutate cb->userdata, and supply newData->dirName at set+16. */
+        vm_write32((u32)cb + 16, 0x0002CAFEu);
+        vm_write32((u32)set + 16, 0x380u); /* newData* */
+        vm_write32((u32)set + 20, 0u);     /* reserved* */
+        vm_write32((u32)cb, CELL_SAVEDATA_CBRESULT_OK_NEXT);
+        return;
     }
     if (opd != STAT_OPD) { vm_write32((u32)cb, (u32)-1); return; }
     s_stat_calls++;
@@ -180,6 +198,44 @@ int main(int argc, char** argv)
     strcpy((char*)vm_base + PARAM_EA, "Test save");
     run10("cellSaveDataUserListAutoLoad", 0x248BD1D8u, 0, 0x0002CAFEu);
     run10("cellSaveDataUserListAutoSave", 0x0E091C36u, 1, 0x0002BEEFu);
+
+    s_stat_sets_param = 0;
+    /* ListSave2 / ListLoad2: OK_LAST short-circuits to CELL_OK, updated userdata
+     * flows from funcList -> funcStat, and oversized dirListMax returns PARAM. */
+    vm_write32(0x280u + 8, 0x340u); /* setList->dirNamePrefix */
+    strcpy((char*)vm_base + 0x340, "TEST");
+    vm_write32(0x200u + 0, 8u);     /* setBuf->dirListMax */
+    vm_write32(0x200u + 4, 8u);     /* setBuf->fileListMax */
+    vm_write32(0x200u + 32, 48u * 8u);
+    vm_write32(0x200u + 36, 0x500u);
+    vm_write32(0x380u + 4, 0x300u); /* newData->dirName = "TEST00001" */
+
+    s_list_calls = 0; s_stat_calls = 0; s_seen_userdata = 0;
+    s32 lrc = cellSaveDataListLoad2(0, (CellSaveDataSetList*)(uintptr_t)0x280u,
+                                    (CellSaveDataSetBuf*)(uintptr_t)0x200u,
+                                    (CellSaveDataListCallback)(uintptr_t)LIST_OK_LAST_OPD,
+                                    (CellSaveDataStatCallback)(uintptr_t)STAT_OPD,
+                                    NULL, 0, (void*)(uintptr_t)0x0001AAAAu);
+    check(lrc == CELL_OK && s_list_calls == 1 && s_stat_calls == 0 && s_seen_userdata == 0x0001AAAAu,
+          "cellSaveDataListLoad2 OK_LAST returns CELL_OK without invoking funcStat");
+
+    s_list_calls = 0; s_stat_calls = 0; s_seen_userdata = 0;
+    s32 src = cellSaveDataListSave2(0, (CellSaveDataSetList*)(uintptr_t)0x280u,
+                                    (CellSaveDataSetBuf*)(uintptr_t)0x200u,
+                                    (CellSaveDataListCallback)(uintptr_t)LIST_NEXT_OPD,
+                                    (CellSaveDataStatCallback)(uintptr_t)STAT_OPD,
+                                    NULL, 0, (void*)(uintptr_t)0x0001BBBBu);
+    check(src == CELL_OK && s_list_calls == 1 && s_stat_calls == 1 && s_seen_userdata == 0x0002CAFEu,
+          "cellSaveDataListSave2 propagates mutated userdata from funcList to funcStat");
+
+    vm_write32(0x200u + 0, CELL_SAVEDATA_DIRLIST_MAX + 1u);
+    s32 prc = cellSaveDataListSave2(0, (CellSaveDataSetList*)(uintptr_t)0x280u,
+                                    (CellSaveDataSetBuf*)(uintptr_t)0x200u,
+                                    (CellSaveDataListCallback)(uintptr_t)LIST_OK_LAST_OPD,
+                                    (CellSaveDataStatCallback)(uintptr_t)STAT_OPD,
+                                    NULL, 0, NULL);
+    check(prc == CELL_SAVEDATA_ERROR_PARAM,
+          "cellSaveDataListSave2 rejects dirListMax > CELL_SAVEDATA_DIRLIST_MAX");
 
     free(vm_base);
     if (s_failed) { printf("FAIL (%d failed)\n", s_failed); return 1; }

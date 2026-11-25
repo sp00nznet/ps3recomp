@@ -353,6 +353,7 @@ s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
                              u32 errDialog, CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile, u32 container);
+void cellSaveDataEnableOverlay(s32 enable);
 
 #ifdef __cplusplus
 }
