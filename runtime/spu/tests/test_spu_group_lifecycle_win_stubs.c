@@ -16,6 +16,7 @@ char g_ps3_sdk_version[64];
 char g_spu_interp_last_pc[64];
 char g_spu_interp_steps[64];
 char g_spu_out_mbox_hook[64];
+char g_spu_receive_event_hook[64];
 char g_spu_user_event_hook[64];
 char g_spurs_kernel_hook[64];
 char g_ydkj_spurs_ctx_ea[64];

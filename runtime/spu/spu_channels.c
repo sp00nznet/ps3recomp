@@ -169,6 +169,14 @@ void spu_restart_dispatch(spu_context* ctx)
 int (*g_spu_user_event_hook)(spu_context*, uint32_t) = NULL;
 void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
                             int is_intr, uint32_t value) = 0;
+/* sys_spu_thread_receive_event (stop 0x110). lv2_register.c installs a handler
+ * that looks up the event queue bound to spuq_num for this SPU thread
+ * (sys_spu_thread_bind_queue) and waits on it. It returns 1 with the four
+ * inbound-mailbox reply words {status, data1, data2, data3}, 0 when no queue
+ * is bound (the stop is left as before), or -1 when the thread was asked to
+ * stop while it waited (sys_spu_thread_group_terminate). NULL until
+ * installed. */
+int (*g_spu_receive_event_hook)(spu_context* ctx, uint32_t spuq_num, uint32_t reply[4]) = NULL;
 
 /* Every MFC PUT an SPU completes, if anyone is listening. Installed by the GCM
  * layer (libs/video/cellGcmSys.c), which needs it to find the RSX pushbuffer:
@@ -234,6 +242,32 @@ void spu_stop(spu_context* ctx)
     static int s_halt = -1;
     if (s_halt < 0) s_halt = getenv("YDKJ_STOP_HALT") ? 1 : 0;
     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+    /* stop 0x110 = sys_spu_thread_receive_event. The SPU has written the
+     * spuq number to its outbound mailbox; lv2 blocks the thread on the queue
+     * bound to that number (sys_spu_thread_bind_queue) and answers with four
+     * inbound-mailbox words {status, data1, data2, data3}, after which the SPU
+     * runs on past the stop. With no service a lifted thread just spun on the
+     * call: FMOD Ex's SPU mixer (Heavenly Sword) did, at boot, while the PPU
+     * side held FMOD's mutex. The wait itself is lv2's (g_spu_receive_event_hook,
+     * installed by lv2_register.c); a thread asked to stop while it waits halts
+     * here, as lv2 stops a thread a group terminate finds blocked. */
+    if (ctx->stop_code == 0x110u && ctx->ch_out_mbox.count && ctx->rcv_evt_n == 0 &&
+        g_spu_receive_event_hook) {
+        uint32_t reply[4] = {0, 0, 0, 0};
+        const int r = g_spu_receive_event_hook(ctx, ctx->ch_out_mbox.value, reply);
+        if (r != 0) {
+            ctx->ch_out_mbox.count = 0;
+            if (r < 0) {
+                ctx->status = SPU_STATUS_STOPPED;
+                spu_halt(ctx);
+            }
+            for (int i = 0; i < 4; i++) ctx->rcv_evt[i] = reply[i];
+            ctx->rcv_evt_i = 0;
+            ctx->rcv_evt_n = 4;
+            ctx->status = SPU_STATUS_RUNNING;
+            return;
+        }
+    }
     if (s_halt) spu_halt(ctx);
 }
 

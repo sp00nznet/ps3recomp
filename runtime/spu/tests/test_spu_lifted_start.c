@@ -1272,6 +1272,9 @@ void sys_fs_init(lv2_syscall_table* t)         { (void)t; }
 const char* np_psnr_identity(void)            { return NULL; }
 /* cellSpurs.c: sys_spu_thread_write_snr on a SPURS pseudo SPU thread id. */
 int cellSpurs_post_snr(uint32_t tid, uint32_t num, uint32_t val) { (void)tid; (void)num; (void)val; return -1; }
+/* lv2_register.c's sys_spu_thread_receive_event service waits here; no thread
+ * in this test binds a queue, so it is never reached. */
+int64_t sys_event_queue_receive(ppu_context* ctx) { (void)ctx; return (int64_t)(int32_t)CELL_ESRCH; }
 
 int sys_event_queue_push_by_id(uint32_t q, uint64_t d0, uint64_t d1,
                                uint64_t d2, uint64_t d3)

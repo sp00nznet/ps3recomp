@@ -1420,12 +1420,49 @@ static int64_t sys_spu_thread_group_terminate_handler(ppu_context* ctx)
     uint32_t id     = (uint32_t)ctx->gpr[3];
     int32_t  status = (int32_t)ctx->gpr[4];
     spu_group_t* g = spu_find_group(id);
+    int left = 0;
     if (g) {
         g->state = SPU_GROUP_STATE_STOPPED;
         g->cause = SPU_GROUP_CAUSE_TERMINATED;
         g->exit_status = status;
+        /* lv2 stops every thread of the group before this returns. Only
+         * marking the group stopped left a lifted worker running on its host
+         * thread -- the FMOD mixer, idle in sys_spu_thread_receive_event --
+         * so the destroy that follows refused with EBUSY and the middleware
+         * restarted on top of a group that never went away. Ask each live
+         * lifted context to stop (it halts at its next channel operation or
+         * receive slice) and wait for the host threads to leave. A thread
+         * running its own image keeps its context in sctx (group_start's
+         * LIFTED path; the FMOD mixer runs there), a registry worker publishes
+         * a stack context as live_ctx. Fallback handlers with neither are left
+         * as they were. */
+        extern void spu_ch_wake(spu_context* ctx);
+        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+            uint32_t idx = g->thread_indices[i];
+            if (idx >= MAX_SPU_THREADS) continue;
+            spu_thread_t* t = &s_spu_threads[idx];
+            spu_context* lc = t->live_ctx ? (spu_context*)t->live_ctx : t->sctx;
+            if (t->in_use && t->running && lc) {
+                lc->stop_request = 1;
+                spu_ch_wake(lc);
+            }
+        }
+        const uint64_t t0 = GetTickCount64();
+        for (;;) {
+            left = 0;
+            for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+                uint32_t idx = g->thread_indices[i];
+                if (idx < MAX_SPU_THREADS && s_spu_threads[idx].in_use &&
+                    *(volatile int*)&s_spu_threads[idx].running &&
+                    (s_spu_threads[idx].live_ctx || s_spu_threads[idx].sctx))
+                    left++;
+            }
+            if (!left || GetTickCount64() - t0 >= 1000) break;
+            Sleep(1);
+        }
     }
-    fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d\n", id, status);
+    fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d%s\n", id, status,
+            left ? " (a thread did not stop)" : "");
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -2501,6 +2538,80 @@ static int64_t sys_spu_thread_stub(ppu_context* ctx)
     return 0;
 }
 
+/* sys_spu_thread_bind_queue(id, spuq, spuq_num) / _unbind_queue(id, spuq_num):
+ * the queue an SPU thread receives from with sys_spu_thread_receive_event
+ * (stop 0x110, spuq_num written to its outbound mailbox). They used to be
+ * stubs, so a lifted thread's receive had nothing to wait on: FMOD Ex's raw
+ * SPU mixer (Heavenly Sword) spun on receive_event at boot while its PPU
+ * side held FMOD's mutex, and the title's main thread blocked behind it.
+ * spu_receive_event_wait() below looks the queue up here. */
+#define SPU_BIND_MAX 64
+static struct { uint32_t tid, num, queue; } s_spu_bind[SPU_BIND_MAX];
+static int s_spu_bind_n;
+uint32_t spu_thread_bound_queue(uint32_t tid, uint32_t num)
+{
+    for (int i = 0; i < s_spu_bind_n; i++)
+        if (s_spu_bind[i].tid == tid && s_spu_bind[i].num == num) return s_spu_bind[i].queue;
+    return 0;
+}
+/* g_spu_receive_event_hook (spu_channels.c): the lv2 half of
+ * sys_spu_thread_receive_event for a lifted thread. Wait on the queue bound to
+ * spuq_num and hand back {status, data1, data2, data3}. The wait goes in 20 ms
+ * slices, not forever: lv2 stops a thread a group terminate finds blocked here,
+ * and FMOD's mixer sits on this call whenever it is idle. Returns 1 with the
+ * reply, 0 when nothing is bound (the caller leaves the stop as before), -1
+ * when the thread was asked to stop. SPU_RECEIVE_EVENT=0 leaves the call
+ * unserviced. */
+static int spu_receive_event_wait(spu_context* sc, uint32_t num, uint32_t reply[4])
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("SPU_RECEIVE_EVENT"); s_on = !(e && e[0] == '0'); }
+    if (!s_on) return 0;
+    const uint32_t q = spu_thread_bound_queue(sc->spu_id, num);
+    if (!q) return 0;
+    ppu_context c;
+    int64_t rc;
+    for (;;) {
+        memset(&c, 0, sizeof c);
+        c.gpr[3] = q;        /* queue id */
+        c.gpr[4] = 0;        /* no event structure: the reply is in r4-r7 */
+        c.gpr[5] = 20000;    /* timeout, us */
+        c.thread_id = 0x7F000000u | (sc->spu_id & 0xFFFFu);
+        rc = sys_event_queue_receive(&c);
+        if ((uint32_t)rc != (uint32_t)CELL_ETIMEDOUT) break;
+        if (sc->stop_request) return -1;
+    }
+    /* The handler's return value is the status; c.gpr[3] still holds the
+     * queue id. data1..data3 come back in r5..r7. */
+    reply[0] = (uint32_t)rc;
+    reply[1] = (uint32_t)c.gpr[5];
+    reply[2] = (uint32_t)c.gpr[6];
+    reply[3] = (uint32_t)c.gpr[7];
+    return 1;
+}
+static int64_t sys_spu_thread_bind_queue_handler(ppu_context* ctx)
+{
+    const uint32_t tid = (uint32_t)ctx->gpr[3], q = (uint32_t)ctx->gpr[4], num = (uint32_t)ctx->gpr[5];
+    int i = 0;
+    for (; i < s_spu_bind_n; i++) if (s_spu_bind[i].tid == tid && s_spu_bind[i].num == num) break;
+    if (i == s_spu_bind_n) {
+        if (s_spu_bind_n >= SPU_BIND_MAX) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004; return 0; } /* EAGAIN */
+        s_spu_bind_n++;
+    }
+    s_spu_bind[i].tid = tid; s_spu_bind[i].num = num; s_spu_bind[i].queue = q;
+    fprintf(stderr, "[SPU] bind_queue tid=0x%X queue=0x%X spuq_num=0x%X\n", tid, q, num);
+    ctx->gpr[3] = 0;
+    return 0;
+}
+static int64_t sys_spu_thread_unbind_queue_handler(ppu_context* ctx)
+{
+    const uint32_t tid = (uint32_t)ctx->gpr[3], num = (uint32_t)ctx->gpr[4];
+    for (int i = 0; i < s_spu_bind_n; i++)
+        if (s_spu_bind[i].tid == tid && s_spu_bind[i].num == num) { s_spu_bind[i] = s_spu_bind[--s_spu_bind_n]; break; }
+    ctx->gpr[3] = 0;
+    return 0;
+}
+
 
 
 /* sys_usbd_receive_event (540) -- a BLOCKING receive, not a poll.
@@ -2639,6 +2750,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
       g_spu_out_mbox_hook = ydkj_spu_out_mbox_deliver; }
     { extern int (*g_spu_user_event_hook)(spu_context*, uint32_t);
       g_spu_user_event_hook = spu_deliver_user_event; }
+    { extern int (*g_spu_receive_event_hook)(spu_context*, uint32_t, uint32_t[4]);
+      g_spu_receive_event_hook = spu_receive_event_wait; }
     lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_group_connect_event_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_group_disconnect_event_handler);
@@ -2648,8 +2761,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_SPU_CFG,    sys_spu_thread_set_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_SPU_CFG,    sys_spu_thread_get_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SPU_MB,  sys_spu_thread_write_spu_mb_handler);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_bind_queue_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_unbind_queue_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
 }
 

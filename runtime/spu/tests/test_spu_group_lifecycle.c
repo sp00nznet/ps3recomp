@@ -33,6 +33,48 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail) { (void)image;
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
 
+/* sys_event_queue_receive, as the receive_event service sees it: time out
+ * fake_timeouts times, then deliver one event in r4-r7 and answer CELL_OK.
+ * Records the queue and the timeout it was asked for. */
+static int fake_timeouts, fake_calls;
+static uint32_t fake_queue; static uint64_t fake_timeout;
+static spu_context* fake_stop_on_timeout;   /* ask this context to stop at the first timeout */
+int64_t sys_event_queue_receive(ppu_context* c)
+{
+    fake_calls++;
+    fake_queue = (uint32_t)c->gpr[3];
+    fake_timeout = c->gpr[5];
+    if (fake_timeouts > 0) {
+        fake_timeouts--;
+        if (fake_stop_on_timeout) fake_stop_on_timeout->stop_request = 1;
+        return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    }
+    c->gpr[4] = 0x1234; c->gpr[5] = 0xA1; c->gpr[6] = 0xB2; c->gpr[7] = 0xC3;
+    return 0;
+}
+
+/* A lifted thread on its host thread: runs until its context is asked to
+ * stop, then leaves the way spu_exec_thread_proc does. */
+#ifdef _WIN32
+static DWORD WINAPI fake_worker(LPVOID arg)
+#else
+#include <pthread.h>
+#include <unistd.h>
+static void* fake_worker(void* arg)
+#endif
+{
+    spu_thread_t* t = (spu_thread_t*)arg;
+    while (!((spu_context*)t->sctx)->stop_request) {
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(200);
+#endif
+    }
+    __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
+    return 0;
+}
+
 static uint32_t rd32(uint32_t a) { const uint8_t* p = vm_base + a; return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
 /* Run a handler as lv2_try_syscall does: r3 receives the return value. */
@@ -118,6 +160,76 @@ int main(void)
     t->running = 0;
     CHECK(sc(sys_spu_thread_group_destroy_handler, g->id, 0, 0, 0) == 0, "group_destroy of a stopped group succeeds");
     CHECK(!t->in_use && !g->in_use && !t->local_store && !t->sctx, "and releases the thread and the group");
+
+    /* group_terminate stops a thread that is still running, as lv2 does: it asks
+     * the thread's context to stop and waits for the host thread to leave, so the
+     * destroy that follows goes through instead of answering EBUSY. Only marking
+     * the group stopped left FMOD's mixer running, its destroy refused and its
+     * restart rebuilt on a half torn-down state. */
+    {
+        spu_group_t* g2 = NULL;
+        spu_thread_t* t2 = make_thread(&g2);
+        t2->running = 1;
+#ifdef _WIN32
+        HANDLE th = CreateThread(NULL, 0, fake_worker, t2, 0, NULL);
+        CHECK(th != NULL, "worker thread starts");
+#else
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, fake_worker, t2) == 0, "worker thread starts");
+#endif
+        CHECK(sc(sys_spu_thread_group_terminate_handler, g2->id, 7, 0, 0) == 0, "group_terminate succeeds");
+        CHECK(((spu_context*)t2->sctx)->stop_request == 1, "and asks the running thread's context to stop");
+        CHECK(!__atomic_load_n(&t2->running, __ATOMIC_ACQUIRE), "and returns once the thread has left");
+        CHECK(g2->cause == SPU_GROUP_CAUSE_TERMINATED && g2->exit_status == 7,
+              "the group reports TERMINATED with the status it was given");
+        ((spu_context*)t2->sctx)->stop_request = 1;   /* a handler that did not ask must not hang the test */
+#ifdef _WIN32
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+#else
+        pthread_join(th, NULL);
+#endif
+        CHECK(sc(sys_spu_thread_group_destroy_handler, g2->id, 0, 0, 0) == 0,
+              "group_destroy after group_terminate succeeds");
+    }
+
+    /* sys_spu_thread_bind_queue / unbind_queue: the queue a thread's
+     * sys_spu_thread_receive_event (stop 0x110) waits on, by spuq number. */
+    CHECK(sc(sys_spu_thread_bind_queue_handler, 0x2100, 5, 0x63, 0) == 0, "bind_queue succeeds");
+    CHECK(spu_thread_bound_queue(0x2100, 0x63) == 5, "the spuq number maps to the bound queue");
+    CHECK(spu_thread_bound_queue(0x2100, 0x64) == 0 && spu_thread_bound_queue(0x2101, 0x63) == 0,
+          "another number or another thread maps to nothing");
+    CHECK(sc(sys_spu_thread_bind_queue_handler, 0x2100, 6, 0x63, 0) == 0 &&
+          spu_thread_bound_queue(0x2100, 0x63) == 6, "binding the number again replaces the queue");
+
+    /* The receive_event service: wait on the bound queue and hand back
+     * {status, data1, data2, data3}. */
+    {
+        spu_context* sc2 = (spu_context*)calloc(1, sizeof(spu_context)); assert(sc2);
+        sc2->spu_id = 0x2100;
+        uint32_t reply[4] = {0, 0, 0, 0};
+        fake_calls = 0; fake_timeouts = 2; fake_stop_on_timeout = NULL;
+        CHECK(spu_receive_event_wait(sc2, 0x63, reply) == 1, "receive_event on a bound queue is served");
+        CHECK(fake_queue == 6 && fake_calls == 3, "it waits on the bound queue through its timeouts (queue %u, %d calls)",
+              fake_queue, fake_calls);
+        CHECK(fake_timeout > 0, "in bounded slices, not forever");
+        CHECK(reply[0] == 0 && reply[1] == 0xA1 && reply[2] == 0xB2 && reply[3] == 0xC3,
+              "the reply is {status, data1, data2, data3} (%08X %08X %08X %08X)", reply[0], reply[1], reply[2], reply[3]);
+
+        fake_calls = 0;
+        CHECK(spu_receive_event_wait(sc2, 0x64, reply) == 0 && fake_calls == 0,
+              "a number with no queue is left unserviced");
+
+        /* Asked to stop while it waits (a group terminate): it gives up. */
+        fake_timeouts = 1000; fake_stop_on_timeout = sc2;
+        CHECK(spu_receive_event_wait(sc2, 0x63, reply) == -1, "a thread asked to stop leaves the wait");
+        fake_timeouts = 0; fake_stop_on_timeout = NULL;
+
+        CHECK(sc(sys_spu_thread_unbind_queue_handler, 0x2100, 0x63, 0, 0) == 0 &&
+              spu_thread_bound_queue(0x2100, 0x63) == 0, "unbind_queue removes the binding");
+        CHECK(spu_receive_event_wait(sc2, 0x63, reply) == 0, "and the number is unserviced again");
+        free(sc2);
+    }
 
     printf("[spu_group_lifecycle] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);
