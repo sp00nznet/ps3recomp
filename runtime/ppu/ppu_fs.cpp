@@ -526,6 +526,17 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
     p[len - 1] = p[len - 1];
 }
 
+/* A read or write buffer below the first mapped guest page (main memory starts
+ * at 0x00010000). LV2 answers CELL_EFAULT and transfers nothing. The host has
+ * that page mapped, so without this check the transfer simply happens: a title
+ * that reads a file into the result of an allocation it did not check fills
+ * guest address 0, and every later read through a null pointer returns file
+ * contents instead of zeros. */
+static inline bool fs_buf_faults(uint32_t buf, uint64_t nbytes)
+{
+    return nbytes && buf < 0x00010000u;
+}
+
 static void cellFsRead(ppu_context* ctx)
 {
     int fd          = (int)(uint32_t)ctx->gpr[3];
@@ -534,6 +545,15 @@ static void cellFsRead(ppu_context* ctx)
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    if (fs_buf_faults(buf, nbytes)) {
+        static int s_n = 0;
+        if (PS3_LOG_FIRST(s_n, 16))
+            fprintf(stderr, "[fs] read fd=%d buf=0x%08X nbytes=%llu -> CELL_EFAULT (null page)\n",
+                    fd, buf, (unsigned long long)nbytes);
+        if (nread_ptr) vm_write64(nread_ptr, 0);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
+        return;
+    }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(f);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
@@ -608,6 +628,15 @@ static void cellFsWrite(ppu_context* ctx)
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    if (fs_buf_faults(buf, nbytes)) {
+        static int s_n = 0;
+        if (PS3_LOG_FIRST(s_n, 16))
+            fprintf(stderr, "[fs] write fd=%d buf=0x%08X nbytes=%llu -> CELL_EFAULT (null page)\n",
+                    fd, buf, (unsigned long long)nbytes);
+        if (nwr_ptr) vm_write64(nwr_ptr, 0);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
+        return;
+    }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     fs_set_dir(fd, f, 2);
     clearerr(f);    /* ferror() is sticky: an old failure would look like this write's */
