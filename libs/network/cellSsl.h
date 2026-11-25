@@ -16,14 +16,14 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
+ * Error codes (PS3 cell/ssl.h, base 0x80740000; verified against RPCS3)
  * -----------------------------------------------------------------------*/
-#define CELL_SSL_ERROR_NOT_INITIALIZED       0x80720101
-#define CELL_SSL_ERROR_ALREADY_INITIALIZED   0x80720102
-#define CELL_SSL_ERROR_INVALID_ARG           0x80720103
-#define CELL_SSL_ERROR_NO_MEMORY             0x80720104
-#define CELL_SSL_ERROR_HANDSHAKE_FAILED      0x80720105
-#define CELL_SSL_ERROR_NOT_CONNECTED         0x80720106
+#define CELL_SSL_ERROR_NOT_INITIALIZED       (CELL_ERROR_BASE_SSL | 0x01) /* 0x80740001 */
+#define CELL_SSL_ERROR_ALREADY_INITIALIZED   (CELL_ERROR_BASE_SSL | 0x02) /* 0x80740002 */
+#define CELL_SSL_ERROR_NO_MEMORY             (CELL_ERROR_BASE_SSL | 0x03) /* 0x80740003 */
+#define CELL_SSL_ERROR_INVALID_ARG           (CELL_ERROR_BASE_SSL | 0x04) /* 0x80740004 */
+#define CELL_SSL_ERROR_HANDSHAKE_FAILED      (CELL_ERROR_BASE_SSL | 0x05)
+#define CELL_SSL_ERROR_NOT_CONNECTED         (CELL_ERROR_BASE_SSL | 0x06)
 
 /* ---------------------------------------------------------------------------
  * Types

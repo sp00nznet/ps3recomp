@@ -18,7 +18,7 @@ extern "C" {
  * Error codes (GIF shares base with PNG/JPG range)
  * -----------------------------------------------------------------------*/
 
-#define CELL_GIFDEC_ERROR_BASE          0x80611400
+#define CELL_GIFDEC_ERROR_BASE          CELL_ERROR_BASE_GIF /* 0x80611300 */
 #define CELL_GIFDEC_ERROR_HEADER        (CELL_GIFDEC_ERROR_BASE | 0x01)
 #define CELL_GIFDEC_ERROR_STREAM_FORMAT (CELL_GIFDEC_ERROR_BASE | 0x02)
 #define CELL_GIFDEC_ERROR_ARG           (CELL_GIFDEC_ERROR_BASE | 0x03)
