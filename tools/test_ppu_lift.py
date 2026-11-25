@@ -737,8 +737,13 @@ def check_decode_and_lift():
           operand_substr="VRSAVE", code_substr="ctx->gpr[3] = ctx->vrsave")
     check("mtspr VRSAVE", spr_form(467, 3, 256), "mtspr",
           operand_substr="VRSAVE", code_substr="ctx->vrsave = (uint32_t)ctx->gpr[3]")
+    # The time base read through mfspr reads the same clock as mftb/mftbu.
+    check("mfspr TBL", spr_form(339, 10, 268), "mfspr",
+          operand_substr="TBL", code_substr="ctx->gpr[10] = ppu_timebase_now();")
+    check("mfspr TBU", spr_form(339, 10, 269), "mfspr",
+          operand_substr="TBU", code_substr="ctx->gpr[10] = (ppu_timebase_now() >> 32);")
 
-    n_ok = 5 - fails[0]
+    n_ok = 7 - fails[0]
     print(f"[fpscr/vrsave] {n_ok} checks passed, {fails[0]} FAILED")
     return fails[0] == 0
 
