@@ -41,10 +41,15 @@ typedef struct CellSync2Mutex {
     u8 _opaque[CELL_SYNC2_MUTEX_SIZE];
 } CellSync2Mutex;
 
+/* Real 128-byte PS3 libsync2.sprx layouts (verified live against stock RPCS3). */
 typedef struct CellSync2MutexAttribute {
-    u32 maxWaiters;
-    u8  recursive;
-    u8  padding[3];
+    u32  sdkVersion;    /* +0x00 */
+    u16  threadTypes;   /* +0x04 */
+    u16  maxWaiters;    /* +0x06 */
+    u8   recursive;     /* +0x08 */
+    u8   padding;       /* +0x09 */
+    char name[32];      /* +0x0A */
+    u8   reserved[86];  /* +0x2A..+0x7F */
 } CellSync2MutexAttribute;
 
 s32 cellSync2MutexAttributeInitialize(CellSync2MutexAttribute* attr);
@@ -64,7 +69,10 @@ typedef struct CellSync2Cond {
 } CellSync2Cond;
 
 typedef struct CellSync2CondAttribute {
-    u32 maxWaiters;
+    u32  sdkVersion;    /* +0x00 */
+    u16  maxWaiters;    /* +0x04 */
+    char name[32];      /* +0x06 */
+    u8   reserved[90];  /* +0x26..+0x7F */
 } CellSync2CondAttribute;
 
 s32 cellSync2CondAttributeInitialize(CellSync2CondAttribute* attr);
@@ -85,8 +93,11 @@ typedef struct CellSync2Semaphore {
 } CellSync2Semaphore;
 
 typedef struct CellSync2SemaphoreAttribute {
-    u32 maxWaiters;
-    s32 maxValue;
+    u32  sdkVersion;    /* +0x00 */
+    u16  threadTypes;   /* +0x04 */
+    u16  maxWaiters;    /* +0x06 */
+    char name[32];      /* +0x08 */
+    u8   reserved[88];  /* +0x28..+0x7F */
 } CellSync2SemaphoreAttribute;
 
 s32 cellSync2SemaphoreAttributeInitialize(CellSync2SemaphoreAttribute* attr);
