@@ -16,6 +16,7 @@
 #include "cellAudio.h"
 #include "audio_pace.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
+#include "../../runtime/ppu/ppu_context.h"  /* cellAudioAdd*Data: the volume is in f1 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -127,6 +128,7 @@ typedef struct {
     u32                  buf_size;       /* buffer size in bytes */
     u64                  read_index;     /* current read position (block index) */
     u64                  write_index;    /* where the game is writing */
+    u64                  add_block;      /* cellAudioAdd*Data: next block to fill */
     /* For address reporting to guest */
     u64                  port_addr;      /* guest-visible buffer address */
     u64                  read_idx_addr;  /* guest-visible read index address */
@@ -905,6 +907,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->param.nChannel = nch;
     port->param.nBlock   = nblk;
     port->read_index  = 0;
+    port->add_block   = 0;
     port->write_index = 0;
 
     /* Allocate the audio buffer in GUEST memory so portAddr/readIndexAddr are
@@ -1121,6 +1124,18 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
 
     mutex_lock(&s_audio_mutex);
 
+    /* cellAudioCreateNotifyEventQueue has already registered its own key, and
+     * the SDK pattern is Create then Set with that key: a second slot for the
+     * same key posted two events per mixed block, and a title that writes one
+     * block per event (a cellSail movie player) ran at twice the mixer's rate
+     * -- half its blocks dropped, the rest played double speed. */
+    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+        if (s_notify_queues[i].in_use && s_notify_queues[i].key == key) {
+            mutex_unlock(&s_audio_mutex);
+            return CELL_OK;
+        }
+    }
+
     for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
         if (!s_notify_queues[i].in_use) {
             s_notify_queues[i].in_use = 1;
@@ -1236,4 +1251,80 @@ s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream)
     (void)iPersonalStream;
     printf("[cellAudio] UnsetPersonalDevice(stream=%d) - stub\n", iPersonalStream);
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * cellAudioAddData / cellAudioAdd2chData / cellAudioAdd6chData
+ *
+ * The firmware's own mixing into a port: the caller hands over one block of
+ * float PCM (guest memory, big-endian) and a volume, and the firmware adds it
+ * into the port's ring instead of the title writing the ring itself. cellSail
+ * movie players use them, calling Add2chData each audio period on a port of
+ * their own.
+ *
+ * Which block: the next one the mixer has not consumed, kept as a per-port
+ * cursor so blocks added in a burst (the mixer can run two periods back to
+ * back, and the title then wakes twice) fill consecutive blocks instead of
+ * the same one. The cursor stays at least one block ahead of the mixer, so an
+ * add racing the mix lands in the following period, and never more than the
+ * ring ahead of it (an add that would overrun is dropped).
+ *
+ * The volume is a float in f1, so these are context handlers.
+ * -----------------------------------------------------------------------*/
+static s32 audio_add(u32 portNum, u32 src_ea, u32 samples, u32 src_ch, float volume)
+{
+    if (!s_audio_initialized) return CELL_AUDIO_ERROR_NOT_INIT;
+    if (portNum >= CELL_AUDIO_PORT_MAX || !src_ea) return CELL_AUDIO_ERROR_PARAM;
+    if (samples != CELL_AUDIO_BLOCK_SAMPLES) return CELL_AUDIO_ERROR_PARAM;
+    mutex_lock(&s_audio_mutex);
+    AudioPortSlot* port = &s_ports[portNum];
+    if (!port->in_use || !port->buffer) { mutex_unlock(&s_audio_mutex); return CELL_AUDIO_ERROR_PORT_NOT_OPEN; }
+    const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+    if (port->add_block < port->read_index + 1) port->add_block = port->read_index + 1;
+    if (port->add_block >= port->read_index + nblock) {     /* ring full: drop */
+        static unsigned long long dropped;
+        if ((dropped++ % 256) == 0)
+            fprintf(stderr, "[cellAudio] Add*Data: port %u ring full, block dropped (%llu)\n",
+                    portNum, dropped);
+        mutex_unlock(&s_audio_mutex);
+        return CELL_OK;
+    }
+    float* dst = port->buffer + (u32)(port->add_block % nblock) * CELL_AUDIO_BLOCK_SAMPLES * nch;
+    const float* src = (const float*)(vm_base + src_ea);
+    const u32 n = src_ch < nch ? src_ch : nch;
+    for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++)
+        for (u32 c = 0; c < n; c++) {
+            float v = ld_be_f32(&dst[s * nch + c]) + ld_be_f32(&src[s * src_ch + c]) * volume;
+            u32 w; memcpy(&w, &v, 4);
+            w = (w >> 24) | ((w >> 8) & 0xFF00u) | ((w << 8) & 0xFF0000u) | (w << 24);
+            memcpy(&dst[s * nch + c], &w, 4);
+        }
+    port->add_block++;
+    mutex_unlock(&s_audio_mutex);
+    return CELL_OK;
+}
+
+s32 cellAudioAddData(u32 portNum, u32 src, u32 samples, float volume)
+{
+    if (portNum >= CELL_AUDIO_PORT_MAX) return CELL_AUDIO_ERROR_PARAM;
+    return audio_add(portNum, src, samples, (u32)s_ports[portNum].param.nChannel, volume);
+}
+s32 cellAudioAdd2chData(u32 portNum, u32 src, u32 samples, float volume)
+{ return audio_add(portNum, src, samples, 2, volume); }
+s32 cellAudioAdd6chData(u32 portNum, u32 src, float volume)
+{ return audio_add(portNum, src, CELL_AUDIO_BLOCK_SAMPLES, 6, volume); }
+
+static void hle_audio_add_data(ppu_context* ctx)
+{ ctx->gpr[3] = (u64)(s64)cellAudioAddData((u32)ctx->gpr[3], (u32)ctx->gpr[4], (u32)ctx->gpr[5], (float)ctx->fpr[1]); }
+static void hle_audio_add_2ch(ppu_context* ctx)
+{ ctx->gpr[3] = (u64)(s64)cellAudioAdd2chData((u32)ctx->gpr[3], (u32)ctx->gpr[4], (u32)ctx->gpr[5], (float)ctx->fpr[1]); }
+static void hle_audio_add_6ch(ppu_context* ctx)
+{ ctx->gpr[3] = (u64)(s64)cellAudioAdd6chData((u32)ctx->gpr[3], (u32)ctx->gpr[4], (float)ctx->fpr[1]); }
+
+void audio_register_ctx(void)
+{
+    extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+    ps3_hle_register_ctx(0xDAB029AAu, "cellAudioAddData",    hle_audio_add_data);
+    ps3_hle_register_ctx(0x9E4B1DB8u, "cellAudioAdd2chData", hle_audio_add_2ch);
+    ps3_hle_register_ctx(0x832DF17Eu, "cellAudioAdd6chData", hle_audio_add_6ch);
 }
