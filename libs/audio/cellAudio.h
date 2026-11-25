@@ -112,6 +112,13 @@ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp);
 s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
 s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 
+/* The firmware mixes one block (256 samples of big-endian float at src) into
+ * the port; registered as context handlers (the volume is in f1). */
+s32 cellAudioAddData(u32 portNum, u32 src, u32 samples, float volume);
+s32 cellAudioAdd2chData(u32 portNum, u32 src, u32 samples, float volume);
+s32 cellAudioAdd6chData(u32 portNum, u32 src, float volume);
+void audio_register_ctx(void);
+
 /* NID: 0x28BC1409 */
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
