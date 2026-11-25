@@ -14,16 +14,16 @@
 /* Internal state */
 
 typedef struct {
-    void* ptr;
+    u32 ea;
     u32 size;
 } SheapBlock;
 
 typedef struct {
     int in_use;
-    u8* base;
+    u32 base_ea;
     u32 totalSize;
     u32 align;
-    u32 offset;     /* bump pointer offset from base */
+    u32 offset;     /* bump pointer offset from base_ea */
     SheapBlock blocks[CELL_SHEAP_BLOCK_MAX];
     int blockCount;
 } SheapState;
@@ -61,7 +61,7 @@ s32 cellSheapInitialize(const CellSheapAttr* attr, CellSheapHandle* handle)
         if (!s_heaps[i].in_use) {
             memset(&s_heaps[i], 0, sizeof(SheapState));
             s_heaps[i].in_use = 1;
-            s_heaps[i].base = vm_base + heap_base;
+            s_heaps[i].base_ea = heap_base;
             s_heaps[i].totalSize = heap_size;
             s_heaps[i].align = alignment;
             s_heaps[i].offset = 0;
@@ -96,24 +96,25 @@ void* cellSheapAllocate(CellSheapHandle handle, u32 size)
     if (h->blockCount >= CELL_SHEAP_BLOCK_MAX)
         return NULL;
 
-    void* ptr = h->base + aligned_offset;
-    h->blocks[h->blockCount].ptr = ptr;
+    u32 block_ea = h->base_ea + aligned_offset;
+    h->blocks[h->blockCount].ea = block_ea;
     h->blocks[h->blockCount].size = aligned_size;
     h->blockCount++;
     h->offset = aligned_offset + aligned_size;
 
-    return ptr;
+    return (void*)(uintptr_t)block_ea;
 }
 
 s32 cellSheapFree(CellSheapHandle handle, void* ptr)
 {
     if (handle >= CELL_SHEAP_MAX || !s_heaps[handle].in_use)
         return (s32)CELL_SHEAP_ERROR_INVAL;
-    if (!ptr) return (s32)CELL_SHEAP_ERROR_INVAL;
+    u32 ptr_ea = (u32)(uintptr_t)ptr;
+    if (!ptr_ea) return (s32)CELL_SHEAP_ERROR_INVAL;
 
     SheapState* h = &s_heaps[handle];
     for (int i = 0; i < h->blockCount; i++) {
-        if (h->blocks[i].ptr == ptr) {
+        if (h->blocks[i].ea == ptr_ea) {
             /* Remove by shifting */
             for (int j = i; j < h->blockCount - 1; j++)
                 h->blocks[j] = h->blocks[j + 1];
