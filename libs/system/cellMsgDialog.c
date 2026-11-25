@@ -296,13 +296,23 @@ s32 cellMsgDialogAbort(void)
     return CELL_OK;
 }
 
+static u32 msgdialog_progress_bars(void)
+{
+    if (s_type & CELL_MSGDIALOG_TYPE_PROGRESSBAR_DOUBLE) return 2;
+    if (s_type & CELL_MSGDIALOG_TYPE_PROGRESSBAR_SINGLE) return 1;
+    return 0;
+}
+
 s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString)
 {
-    if (progressBarIndex >= MAX_PROGRESS_BARS)
-        return CELL_MSGDIALOG_ERROR_PARAM;
-
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+
+    u32 bars = msgdialog_progress_bars();
+    if (bars == 0)
+        return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+    if (progressBarIndex >= bars)
+        return CELL_MSGDIALOG_ERROR_PARAM;
 
     if (msgString) {
         strncpy(s_progress[progressBarIndex].message, GUEST_PTR(msgString, const char*),
@@ -316,11 +326,14 @@ s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString)
 
 s32 cellMsgDialogProgressBarReset(u32 progressBarIndex)
 {
-    if (progressBarIndex >= MAX_PROGRESS_BARS)
-        return CELL_MSGDIALOG_ERROR_PARAM;
-
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+
+    u32 bars = msgdialog_progress_bars();
+    if (bars == 0)
+        return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+    if (progressBarIndex >= bars)
+        return CELL_MSGDIALOG_ERROR_PARAM;
 
     s_progress[progressBarIndex].value = 0;
     printf("[cellMsgDialog] ProgressBar[%u] reset to 0%%\n", progressBarIndex);
@@ -330,11 +343,14 @@ s32 cellMsgDialogProgressBarReset(u32 progressBarIndex)
 
 s32 cellMsgDialogProgressBarInc(u32 progressBarIndex, u32 delta)
 {
-    if (progressBarIndex >= MAX_PROGRESS_BARS)
-        return CELL_MSGDIALOG_ERROR_PARAM;
-
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+
+    u32 bars = msgdialog_progress_bars();
+    if (bars == 0)
+        return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+    if (progressBarIndex >= bars)
+        return CELL_MSGDIALOG_ERROR_PARAM;
 
     s_progress[progressBarIndex].value += delta;
     if (s_progress[progressBarIndex].value > 100)
