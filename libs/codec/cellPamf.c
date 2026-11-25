@@ -7,6 +7,7 @@
  */
 
 #include "cellPamf.h"
+#include "ps3emu/endian.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
@@ -250,7 +251,7 @@ s32 cellPamfReaderGetNumberOfStreams(CellPamfReader* reader)
 /* Get pointer to raw stream descriptor bytes by absolute index */
 static const u8* get_stream_desc_raw(CellPamfReader* reader, u32 index)
 {
-    if (!reader || index >= reader->numStreams)
+    if (!reader || !reader->pamfAddr || index >= reader->numStreams)
         return NULL;
 
     const u8* base = (const u8*)reader->pamfAddr;
@@ -384,9 +385,6 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
     info = GUEST_PTR(info, void*);
-    /* ponytail: the CellPamf*Info structs below are filled host-endian.
-     * Their u8 fields are already right; the u16/u32 ones (horizontalSize,
-     * samplingFreq, ...) still need a swap if a title ever reads them. */
     const u8* desc = get_stream_desc_raw(reader, reader->currentStream);
     if (!desc)
         return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
@@ -397,6 +395,10 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
     case CELL_PAMF_STREAM_TYPE_AVC:
         if (infoSize >= sizeof(CellPamfAvcInfo)) {
             CellPamfAvcInfo* avc = (CellPamfAvcInfo*)info;
+            u16 sarW = be16(desc + 6);
+            u16 sarH = be16(desc + 8);
+            u16 hSize = be16(desc + 14);
+            u16 vSize = be16(desc + 16);
             memset(avc, 0, sizeof(*avc));
             avc->profileIdc            = desc[2];
             avc->levelIdc              = desc[3];
@@ -404,10 +406,10 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
             avc->videoSignalInfoFlag   = (desc[4] >> 6) & 1;
             avc->frameRateCode         = (desc[5] >> 4) & 0x0F;
             avc->aspectRatioIdc        = desc[5] & 0x0F;
-            avc->sarWidth              = be16(desc + 6);
-            avc->sarHeight             = be16(desc + 8);
-            avc->horizontalSize        = be16(desc + 14);
-            avc->verticalSize          = be16(desc + 16);
+            avc->sarWidth              = ps3_bswap16(sarW);
+            avc->sarHeight             = ps3_bswap16(sarH);
+            avc->horizontalSize        = ps3_bswap16(hSize);
+            avc->verticalSize          = ps3_bswap16(vSize);
             avc->frameCropLeftOffset   = desc[18];
             avc->frameCropRightOffset  = desc[19];
             avc->frameCropTopOffset    = desc[20];
@@ -416,7 +418,7 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
             printf("[cellPamf] AVC info: profile=%u level=%u %ux%u "
                    "frameRate=%u aspect=%u\n",
                    avc->profileIdc, avc->levelIdc,
-                   avc->horizontalSize, avc->verticalSize,
+                   hSize, vSize,
                    avc->frameRateCode, avc->aspectRatioIdc);
         }
         break;
@@ -424,25 +426,27 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
     case CELL_PAMF_STREAM_TYPE_ATRAC3PLUS:
         if (infoSize >= sizeof(CellPamfAtrac3plusInfo)) {
             CellPamfAtrac3plusInfo* at3 = (CellPamfAtrac3plusInfo*)info;
+            u32 sr = audio_sample_rate(desc[12]);
             memset(at3, 0, sizeof(*at3));
             at3->numberOfChannels  = audio_channels(desc[10]);
-            at3->samplingFrequency = audio_sample_rate(desc[12]);
+            at3->samplingFrequency = ps3_bswap32(sr);
 
             printf("[cellPamf] ATRAC3+ info: %u ch, %u Hz\n",
-                   at3->numberOfChannels, at3->samplingFrequency);
+                   at3->numberOfChannels, sr);
         }
         break;
 
     case CELL_PAMF_STREAM_TYPE_PAMF_LPCM:
         if (infoSize >= sizeof(CellPamfLpcmInfo)) {
             CellPamfLpcmInfo* lpcm = (CellPamfLpcmInfo*)info;
+            u32 sr = audio_sample_rate(desc[12]);
             memset(lpcm, 0, sizeof(*lpcm));
             lpcm->numberOfChannels  = audio_channels(desc[10]);
             lpcm->bitsPerSample     = lpcm_bits(desc[11]);
-            lpcm->samplingFrequency = audio_sample_rate(desc[12]);
+            lpcm->samplingFrequency = ps3_bswap32(sr);
 
             printf("[cellPamf] LPCM info: %u ch, %u Hz, %u bits\n",
-                   lpcm->numberOfChannels, lpcm->samplingFrequency,
+                   lpcm->numberOfChannels, sr,
                    lpcm->bitsPerSample);
         }
         break;
@@ -450,12 +454,13 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
     case CELL_PAMF_STREAM_TYPE_AC3:
         if (infoSize >= sizeof(CellPamfAc3Info)) {
             CellPamfAc3Info* ac3 = (CellPamfAc3Info*)info;
+            u32 sr = audio_sample_rate(desc[12]);
             memset(ac3, 0, sizeof(*ac3));
             ac3->numberOfChannels  = audio_channels(desc[10]);
-            ac3->samplingFrequency = audio_sample_rate(desc[12]);
+            ac3->samplingFrequency = ps3_bswap32(sr);
 
             printf("[cellPamf] AC3 info: %u ch, %u Hz\n",
-                   ac3->numberOfChannels, ac3->samplingFrequency);
+                   ac3->numberOfChannels, sr);
         }
         break;
 
@@ -478,12 +483,11 @@ s32 cellPamfReaderGetStreamIndex(CellPamfReader* reader)
 s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
                                      void* esFilterId)
 {
-    (void)streamType; (void)streamIndex;
     if (!esFilterId)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
-    /* Set filter ID bytes (type + index) */
-    u8* id = (u8*)esFilterId;
+    /* Set filter ID bytes (type + index) in guest memory */
+    u8* id = GUEST_PTR(esFilterId, u8*);
     id[0] = streamType;
     id[1] = streamIndex;
     return CELL_OK;
