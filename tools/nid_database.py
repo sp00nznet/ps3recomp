@@ -63,6 +63,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     # ---- cellSysutil ----
     ("cellSysutil", "cellSysutilRegisterCallback"),
     ("cellSysutil", "cellSysutilUnregisterCallback"),
+    ("cellSysutil", "cellSaveDataEnableOverlay"),
     ("cellSysutil", "cellSysutilCheckCallback"),
     ("cellSysutil", "cellSysutilGetSystemParamInt"),
     ("cellSysutil", "cellSysutilGetSystemParamString"),
