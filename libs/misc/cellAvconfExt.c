@@ -6,6 +6,7 @@
  */
 
 #include "cellAvconfExt.h"
+#include "ps3emu/endian.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
 #include "../../runtime/ppu/ppu_context.h"  /* the float argument of SetGamma is in f1 */
 #include <stdlib.h>
@@ -27,6 +28,16 @@ extern u8* vm_base;
  * -----------------------------------------------------------------------*/
 
 static float s_gamma = 1.0f;
+static u8    s_audio_channel   = CELL_AUDIO_OUT_CHNUM_2;
+static u8    s_audio_encoder   = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+static u32   s_audio_downmixer = CELL_AUDIO_OUT_DOWNMIXER_NONE;
+
+static u32 audio_layout_for_channels(u8 ch)
+{
+    if (ch >= CELL_AUDIO_OUT_CHNUM_8) return CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy;
+    if (ch >= CELL_AUDIO_OUT_CHNUM_6) return CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr;
+    return CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH;
+}
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -91,17 +102,21 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
      * Advertising a single stereo mode here while GetSoundAvailability reports 5.1/7.1 is
      * self-inconsistent, and middleware (FMOD) validates these against each other. */
     info->portType = 0; /* HDMI */
-    info->state = 2;    /* connected */
+    info->state = 1;    /* CELL_AUDIO_OUT_DEVICE_STATE_AVAILABLE (verified against RPCS3) */
+    info->latency = ps3_bswap16(13);
     info->availableModeCount = 3;
     info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
     info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[0].layout  = ps3_bswap32(CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH);
     info->availableModes[1].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[1].channel = CELL_AUDIO_OUT_CHNUM_6;
     info->availableModes[1].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[1].layout  = ps3_bswap32(CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr);
     info->availableModes[2].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[2].channel = CELL_AUDIO_OUT_CHNUM_8;
     info->availableModes[2].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[2].layout  = ps3_bswap32(CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy);
 
     return CELL_OK;
 }
@@ -118,11 +133,11 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
 
     if (!config)
         return CELL_EINVAL;
-    config = GUEST_PTR(config, CellAudioOutConfiguration*);
-
-    memset(config, 0, sizeof(CellAudioOutConfiguration));
-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
-    config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+    uint32_t cfg_ea = (uint32_t)(uintptr_t)config;
+    memset(vm_base + cfg_ea, 0, sizeof(CellAudioOutConfiguration));
+    vm_write8(cfg_ea + 0, s_audio_channel);
+    vm_write8(cfg_ea + 1, s_audio_encoder);
+    vm_write32(cfg_ea + 12, s_audio_downmixer);
 
     return CELL_OK;
 }
@@ -133,9 +148,17 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
  * the whole title. The device is always present and enabled here: there is no
  * "no audio device" case a recompiled port can be in.
  *
- * CellAudioOutState { u8 state; u8 encoder; u8 reserved[2]; u32 downMixer;
- *                     CellAudioOutSoundMode soundMode; } -- written big-endian
- * a byte at a time, which needs no struct definition to get right. */
+ * PS3 CellAudioOutState (20 bytes, big-endian; verified against RPCS3 GDB trace):
+ *   +0x00 u8  state        (0 = ENABLED)
+ *   +0x01 u8  encoder      (0 = LPCM)
+ *   +0x02 u8  reserved[6]  (6 bytes, NOT 2)
+ *   +0x08 u32 downMixer    (0 = NONE, 1 = TYPE_A, 2 = TYPE_B)
+ *   +0x0C CellAudioOutSoundMode soundMode:
+ *         +0x0C u8  type
+ *         +0x0D u8  channel
+ *         +0x0E u8  fs
+ *         +0x0F u8  reserved
+ *         +0x10 u32 layout (1 = 2CH, 3 = 6CH, 7 = 8CH) */
 s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
 {
     (void)deviceIndex;
@@ -145,15 +168,14 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
         return CELL_EINVAL;
 
     vm_write8(ea + 0, 0);                                   /* ENABLED        */
-    vm_write8(ea + 1, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
-    vm_write8(ea + 2, 0);
-    vm_write8(ea + 3, 0);
-    vm_write32(ea + 4, 0);                                  /* no down-mixer  */
-    vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
-    vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
-    vm_write8(ea + 11, 0);
-    vm_write32(ea + 12, 0);
+    vm_write8(ea + 1, s_audio_encoder);
+    for (uint32_t i = 2; i < 8; i++) vm_write8(ea + i, 0);  /* reserved[6]    */
+    vm_write32(ea + 8, s_audio_downmixer);                  /* downMixer      */
+    vm_write8(ea + 12, s_audio_encoder);                    /* soundMode.type */
+    vm_write8(ea + 13, s_audio_channel);                    /* soundMode.ch   */
+    vm_write8(ea + 14, CELL_AUDIO_OUT_FS_48KHZ);            /* soundMode.fs   */
+    vm_write8(ea + 15, 0);                                  /* soundMode.res  */
+    vm_write32(ea + 16, audio_layout_for_channels(s_audio_channel));
     return CELL_OK;
 }
 
@@ -218,7 +240,16 @@ float cellAvconfExt_display_gamma(void)
  * the title queries availability separately. NID 0x4692AB35. */
 s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
 {
-    (void)config; (void)option; (void)waitForEvent;
-    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+    (void)option; (void)waitForEvent;
+    uint32_t cfg_ea = (uint32_t)(uintptr_t)config;
+    if (cfg_ea) {
+        u8 ch = vm_read8(cfg_ea + 0);
+        if (ch == CELL_AUDIO_OUT_CHNUM_2 || ch == CELL_AUDIO_OUT_CHNUM_6 || ch == CELL_AUDIO_OUT_CHNUM_8)
+            s_audio_channel = ch;
+        s_audio_encoder   = vm_read8(cfg_ea + 1);
+        s_audio_downmixer = vm_read32(cfg_ea + 12);
+    }
+    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u, ch=%u, enc=%u, dm=%u) -> ok\n",
+           audioOut, s_audio_channel, s_audio_encoder, s_audio_downmixer);
     return 0;
 }

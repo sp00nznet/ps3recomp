@@ -40,6 +40,16 @@ extern "C" {
 #define CELL_AUDIO_OUT_FS_176KHZ           0x20
 #define CELL_AUDIO_OUT_FS_192KHZ           0x40
 
+/* Downmixer modes */
+#define CELL_AUDIO_OUT_DOWNMIXER_NONE      0
+#define CELL_AUDIO_OUT_DOWNMIXER_TYPE_A    1
+#define CELL_AUDIO_OUT_DOWNMIXER_TYPE_B    2
+
+/* Speaker layouts */
+#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH          0x0001
+#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr   0x0003
+#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy 0x0007
+
 /* ---------------------------------------------------------------------------
  * Types
  * -----------------------------------------------------------------------*/
@@ -49,15 +59,17 @@ typedef struct CellAudioOutSoundMode {
     u8  channel;
     u8  fs;
     u8  reserved;
-} CellAudioOutSoundMode;
+    u32 layout;                 /* big-endian in guest memory */
+} CellAudioOutSoundMode;        /* 8 bytes */
 
 typedef struct CellAudioOutDeviceInfo {
     u8  portType;
     u8  availableModeCount;
     u8  state;
     u8  reserved[3];
-    CellAudioOutSoundMode availableModes[16];
-} CellAudioOutDeviceInfo;
+    u16 latency;                /* +0x06, big-endian in guest memory */
+    CellAudioOutSoundMode availableModes[16]; /* +0x08..+0x87 (128 bytes) */
+} CellAudioOutDeviceInfo;       /* 136 bytes (0x88) */
 
 typedef struct CellAudioOutConfiguration {
     u8  channel;
@@ -78,6 +90,7 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
 s32 cellAudioOutGetConfiguration(u32 audioOut,
                                   CellAudioOutConfiguration* config,
                                   void* option, u32 optionSize);
+s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent);
 s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state);
 s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control);
 

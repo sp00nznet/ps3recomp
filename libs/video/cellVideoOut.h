@@ -40,8 +40,17 @@ extern "C" {
 #define CELL_VIDEO_OUT_ASPECT_4_3    1
 #define CELL_VIDEO_OUT_ASPECT_16_9   2
 
-/* Output type */
-#define CELL_VIDEO_OUT_OUTPUT_HDMI   5
+/* Output type (PS3 CELL_VIDEO_OUT_PORT_HDMI = 1; verified against RPCS3) */
+#define CELL_VIDEO_OUT_OUTPUT_HDMI   1
+
+/* Device state (CellVideoOutDeviceInfo.state) */
+#define CELL_VIDEO_OUT_DEVICE_STATE_UNAVAILABLE 0
+#define CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE   1
+
+/* Refresh rate bitmask (CellVideoOutDisplayMode.refreshRates) */
+#define CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ  0x0001
+#define CELL_VIDEO_OUT_REFRESH_RATE_50HZ     0x0004
+#define CELL_VIDEO_OUT_REFRESH_RATE_60HZ     0x0008
 
 /* Color space */
 #define CELL_VIDEO_OUT_COLOR_SPACE_RGB   0x01
@@ -117,16 +126,29 @@ typedef struct CellVideoOutDisplayMode {
     u16 refreshRates;
 } CellVideoOutDisplayMode;
 
+typedef struct CellVideoOutColorInfo {
+    u16 redX;
+    u16 redY;
+    u16 greenX;
+    u16 greenY;
+    u16 blueX;
+    u16 blueY;
+    u16 whiteX;
+    u16 whiteY;
+    u32 gamma;
+} CellVideoOutColorInfo; /* 20 bytes, all fields big-endian in guest memory */
+
 typedef struct CellVideoOutDeviceInfo {
     u8  portType;
     u8  colorSpace;
-    u16 latency;
+    u16 latency;                /* big-endian in guest memory */
     u8  availableModeCount;
     u8  state;
     u8  rgbOutputRange;
     u8  reserved[5];
-    CellVideoOutDisplayMode availableModes[32];
-} CellVideoOutDeviceInfo;
+    CellVideoOutColorInfo   colorInfo;           /* +0x0C..+0x1F (20 bytes) */
+    CellVideoOutDisplayMode availableModes[32];  /* +0x20..+0x11F (256 bytes) */
+} CellVideoOutDeviceInfo; /* 288 bytes (0x120) */
 
 /* ---------------------------------------------------------------------------
  * Configuration

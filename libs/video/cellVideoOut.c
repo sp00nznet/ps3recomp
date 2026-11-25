@@ -101,7 +101,7 @@ s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state
         state->displayMode.aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
         state->displayMode.refreshRates = ps3_bswap16(0x0001); /* 59.94Hz flag */
     } else {
-        state->state = 0; /* disabled */
+        state->state = 1; /* CELL_VIDEO_OUT_OUTPUT_STATE_DISABLED */
     }
 
     return CELL_OK;
@@ -196,9 +196,23 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
 
     info->portType       = CELL_VIDEO_OUT_OUTPUT_HDMI;
     info->colorSpace     = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
-    info->latency        = 0;
-    info->state          = 2; /* connected */
+    info->latency        = ps3_bswap16(100);
+    info->state          = CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE;
     info->rgbOutputRange = 1;
+
+    /* Color info (0x0C..0x1F): chromaticities default to 0xFFFF, gamma = 100 (BE) */
+    info->colorInfo.redX   = 0xFFFFu;
+    info->colorInfo.redY   = 0xFFFFu;
+    info->colorInfo.greenX = 0xFFFFu;
+    info->colorInfo.greenY = 0xFFFFu;
+    info->colorInfo.blueX  = 0xFFFFu;
+    info->colorInfo.blueY  = 0xFFFFu;
+    info->colorInfo.whiteX = 0xFFFFu;
+    info->colorInfo.whiteY = 0xFFFFu;
+    info->colorInfo.gamma  = ps3_bswap32(100u);
+
+    const u16 rates_be = ps3_bswap16(CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ |
+                                     CELL_VIDEO_OUT_REFRESH_RATE_50HZ);
 
     /* Report supported modes */
     int idx = 0;
@@ -207,24 +221,28 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
     info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_480;
     info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    info->availableModes[idx].refreshRates = rates_be;
     idx++;
 
     /* 576p */
     info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_576;
     info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    info->availableModes[idx].refreshRates = rates_be;
     idx++;
 
     /* 720p */
     info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_720;
     info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    info->availableModes[idx].refreshRates = rates_be;
     idx++;
 
     /* 1080p */
     info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_1080;
     info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
     info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    info->availableModes[idx].refreshRates = rates_be;
     idx++;
 
     info->availableModeCount = (u8)idx;
