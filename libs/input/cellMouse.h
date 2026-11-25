@@ -28,7 +28,7 @@ extern "C" {
  * Constants
  * -----------------------------------------------------------------------*/
 
-#define CELL_MOUSE_MAX_MICE             2
+#define CELL_MOUSE_MAX_MICE             127
 #define CELL_MOUSE_MAX_DATA_LIST_NUM    8
 
 /* Button flags */
