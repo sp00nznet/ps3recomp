@@ -1136,6 +1136,21 @@ static int s_report_hold_pass = 0;    /* this drain stopped on a held GET_REPORT
  * since when it has stood with that put: the jump-park grace in the walker. */
 static u32 park_off, park_put;
 static unsigned long long park_since;
+/* A title whose SPU jobs fill command-buffer holes (Edge geometry reserves a
+ * hole as a self-JUMP until the job writes its CALL) sets this hook. While it
+ * returns non-zero the walker keeps waiting on the park, as the RSX does,
+ * instead of following `put` and dropping the holes still to be filled -- their
+ * ring-segment releases with them, after which every geometry job of the frame
+ * polled a label nobody would write again. GCM_PARK_HOLD_MAX_MS caps the wait
+ * (default 10 s) so a park nobody patches still resyncs. */
+int (*g_gcm_park_hold_hook)(u32 park_io, u32 put) = NULL;
+static unsigned long long park_first;   /* when this park was first seen */
+static unsigned long long gcm_park_hold_max_ms(void)
+{
+    static long long ms = -1;
+    if (ms < 0) { const char* e = getenv("GCM_PARK_HOLD_MAX_MS"); ms = e ? atoll(e) : 10000; }
+    return (unsigned long long)ms;
+}
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
@@ -2767,7 +2782,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       extern unsigned long long ps3_ms_now(void);
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
+                          if (park_off != s_fifo_getoff) park_first = now;
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
+                      } else if (now - park_since >= gcm_park_grace_ms() &&
+                                 g_gcm_park_hold_hook &&
+                                 now - park_first < gcm_park_hold_max_ms() &&
+                                 g_gcm_park_hold_hook(s_fifo_getoff, put)) {
+                          park_since = now;   /* a job can still fill this hole: keep waiting */
                       } else if (now - park_since >= gcm_park_grace_ms() &&
                                  /* Read the park again before giving up on it.
                                   * An SPU job that fills a command-buffer hole
