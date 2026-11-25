@@ -15,11 +15,12 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_SHEAP_ERROR_INVAL       0x80410401
-#define CELL_SHEAP_ERROR_NOMEM       0x80410402
-#define CELL_SHEAP_ERROR_ALIGN       0x80410403
-#define CELL_SHEAP_ERROR_NOSYS       0x80410404
+/* Error codes (PS3 cellSheap, base 0x80410300; verified against Sony LLE libsre.sprx on RPCS3) */
+#define CELL_SHEAP_ERROR_INVAL        (CELL_ERROR_BASE_SHEAP | 0x02) /* 0x80410302 */
+#define CELL_SHEAP_ERROR_NOSYS        (CELL_ERROR_BASE_SHEAP | 0x03) /* 0x80410303 */
+#define CELL_SHEAP_ERROR_NOMEM        (CELL_ERROR_BASE_SHEAP | 0x04) /* 0x80410304 */
+#define CELL_SHEAP_ERROR_ALIGN        (CELL_ERROR_BASE_SHEAP | 0x10) /* 0x80410310 */
+#define CELL_SHEAP_ERROR_NULL_POINTER (CELL_ERROR_BASE_SHEAP | 0x11) /* 0x80410311 */
 
 /* Constants */
 #define CELL_SHEAP_MAX   8

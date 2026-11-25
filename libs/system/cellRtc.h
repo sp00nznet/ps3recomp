@@ -25,6 +25,19 @@ extern "C" {
  */
 #define CELL_RTC_UNIX_EPOCH_OFFSET  62135596800ULL
 
+/* Error codes (PS3 libsysutil/cellRtc, base 0x80010600; verified against RPCS3) */
+#define CELL_RTC_ERROR_NOT_INITIALIZED      (CELL_ERROR_BASE_RTC | 0x01) /* 0x80010601 */
+#define CELL_RTC_ERROR_INVALID_POINTER      (CELL_ERROR_BASE_RTC | 0x02) /* 0x80010602 */
+#define CELL_RTC_ERROR_INVALID_VALUE        (CELL_ERROR_BASE_RTC | 0x03) /* 0x80010603 */
+#define CELL_RTC_ERROR_INVALID_ARG          (CELL_ERROR_BASE_RTC | 0x04) /* 0x80010604 */
+#define CELL_RTC_ERROR_INVALID_YEAR         (CELL_ERROR_BASE_RTC | 0x21) /* 0x80010621 */
+#define CELL_RTC_ERROR_INVALID_MONTH        (CELL_ERROR_BASE_RTC | 0x22) /* 0x80010622 */
+#define CELL_RTC_ERROR_INVALID_DAY          (CELL_ERROR_BASE_RTC | 0x23) /* 0x80010623 */
+#define CELL_RTC_ERROR_INVALID_HOUR         (CELL_ERROR_BASE_RTC | 0x24) /* 0x80010624 */
+#define CELL_RTC_ERROR_INVALID_MINUTE       (CELL_ERROR_BASE_RTC | 0x25) /* 0x80010625 */
+#define CELL_RTC_ERROR_INVALID_SECOND       (CELL_ERROR_BASE_RTC | 0x26) /* 0x80010626 */
+#define CELL_RTC_ERROR_INVALID_MICROSECOND  (CELL_ERROR_BASE_RTC | 0x27) /* 0x80010627 */
+
 /* ---------------------------------------------------------------------------
  * Structures
  * -----------------------------------------------------------------------*/

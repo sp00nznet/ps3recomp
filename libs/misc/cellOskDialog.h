@@ -15,15 +15,15 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
+ * Error codes (PS3 sysutil_oskdialog.h, base 0x8002B500; verified against RPCS3)
  * -----------------------------------------------------------------------*/
-#define CELL_OSK_ERROR_NOT_INITIALIZED          0x8002B301
-#define CELL_OSK_ERROR_ALREADY_INITIALIZED      0x8002B302
-#define CELL_OSK_ERROR_INVALID_PARAMETER        0x8002B303
-#define CELL_OSK_ERROR_DIALOG_NOT_LOADED        0x8002B304
-#define CELL_OSK_ERROR_DIALOG_ALREADY_LOADED    0x8002B305
-#define CELL_OSK_ERROR_ABORT                    0x8002B306
-#define CELL_OSK_ERROR_UNKNOWN                  0x8002B3FF
+#define CELL_OSK_ERROR_NOT_INITIALIZED          (CELL_ERROR_BASE_SYSUTIL_OSK | 0x01)
+#define CELL_OSK_ERROR_ALREADY_INITIALIZED      (CELL_ERROR_BASE_SYSUTIL_OSK | 0x02)
+#define CELL_OSK_ERROR_DIALOG_NOT_LOADED        (CELL_ERROR_BASE_SYSUTIL_OSK | 0x03)
+#define CELL_OSK_ERROR_INVALID_PARAMETER        (CELL_ERROR_BASE_SYSUTIL_OSK | 0x04) /* 0x8002B504 */
+#define CELL_OSK_ERROR_DIALOG_ALREADY_LOADED    (CELL_ERROR_BASE_SYSUTIL_OSK | 0x05)
+#define CELL_OSK_ERROR_ABORT                    (CELL_ERROR_BASE_SYSUTIL_OSK | 0x06)
+#define CELL_OSK_ERROR_UNKNOWN                  (CELL_ERROR_BASE_SYSUTIL_OSK | 0xFF)
 
 /* ---------------------------------------------------------------------------
  * Dialog result codes

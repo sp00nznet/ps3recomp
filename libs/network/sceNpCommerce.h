@@ -18,11 +18,12 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED     0x80024301
-#define SCE_NP_COMMERCE2_ERROR_ALREADY_INITIALIZED 0x80024302
-#define SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT    0x80024303
-#define SCE_NP_COMMERCE2_ERROR_NOT_CONNECTED       0x80024304
-#define SCE_NP_COMMERCE2_ERROR_INSUFFICIENT        0x80024305
+/* Error codes (PS3 sceNpCommerce2, base 0x80023000; verified against RPCS3) */
+#define SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED     (CELL_ERROR_BASE_NP_COMMERCE2 | 0x01) /* 0x80023001 */
+#define SCE_NP_COMMERCE2_ERROR_ALREADY_INITIALIZED (CELL_ERROR_BASE_NP_COMMERCE2 | 0x02) /* 0x80023002 */
+#define SCE_NP_COMMERCE2_ERROR_INVALID_ARGUMENT    (CELL_ERROR_BASE_NP_COMMERCE2 | 0x03) /* 0x80023003 */
+#define SCE_NP_COMMERCE2_ERROR_NOT_CONNECTED       (CELL_ERROR_BASE_NP_COMMERCE2 | 0x04) /* 0x80023004 */
+#define SCE_NP_COMMERCE2_ERROR_INSUFFICIENT        (CELL_ERROR_BASE_NP_COMMERCE2 | 0x05) /* 0x80023005 */
 
 /* ---------------------------------------------------------------------------
  * Types

@@ -16,16 +16,17 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
+ * Error codes (PS3 np/basic.h, base 0x8002A660; verified against RPCS3)
  * -----------------------------------------------------------------------*/
-#define SCE_NP_BASIC_ERROR_NOT_INITIALIZED         0x8002AA01
-#define SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED     0x8002AA02
-#define SCE_NP_BASIC_ERROR_INVALID_ARGUMENT        0x8002AA03
-#define SCE_NP_BASIC_ERROR_NOT_SUPPORTED           0x8002AA04
-#define SCE_NP_BASIC_ERROR_OUT_OF_MEMORY           0x8002AA05
-#define SCE_NP_BASIC_ERROR_EXCEEDS_MAX             0x8002AA06
-#define SCE_NP_BASIC_ERROR_NOT_CONNECTED           0x8002AA07
-#define SCE_NP_BASIC_ERROR_DATA_NOT_FOUND          0x8002AA08
+#define SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED     0x8002A661
+#define SCE_NP_BASIC_ERROR_NOT_INITIALIZED         0x8002A662
+#define SCE_NP_BASIC_ERROR_INVALID_ARGUMENT        0x8002A663
+#define SCE_NP_BASIC_ERROR_OUT_OF_MEMORY           0x8002A664
+#define SCE_NP_BASIC_ERROR_EXCEEDS_MAX             0x8002A665
+#define SCE_NP_BASIC_ERROR_NOT_CONNECTED           0x8002A666
+#define SCE_NP_BASIC_ERROR_DATA_NOT_FOUND          0x8002A667
+#define SCE_NP_BASIC_ERROR_NOT_SUPPORTED           0x8002A668
+#define SCE_NP_BASIC_ERROR_NO_EVENT                0x8002A66A
 
 /* ---------------------------------------------------------------------------
  * Constants

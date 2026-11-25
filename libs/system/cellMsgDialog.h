@@ -45,9 +45,9 @@ extern "C" {
 #define CELL_MSGDIALOG_BUTTON_NO       2
 #define CELL_MSGDIALOG_BUTTON_ESCAPE   3
 
-/* Error codes */
-#define CELL_MSGDIALOG_ERROR_PARAM         (s32)(CELL_ERROR_BASE_SYSUTIL | 0x01)
-#define CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (s32)(CELL_ERROR_BASE_SYSUTIL | 0x10)
+/* Error codes (PS3 SDK: 0x8002B300 base for msgdialog) */
+#define CELL_MSGDIALOG_ERROR_PARAM             (s32)(CELL_ERROR_BASE_SYSUTIL_MSGDIALOG | 0x01)
+#define CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED (s32)(CELL_ERROR_BASE_SYSUTIL_MSGDIALOG | 0x02)
 
 /* ---------------------------------------------------------------------------
  * Types
