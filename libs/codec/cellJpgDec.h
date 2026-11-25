@@ -84,12 +84,18 @@ typedef struct CellJpgDecInfo {
     u32 colorSpace;
 } CellJpgDecInfo;
 
+/* Input parameters for decode (24 bytes BE: commandPtr, downScale, method,
+ * outputMode, outputColorSpace, then u8 outputColorAlpha + 3 reserved bytes).
+ * Sony firmware 4.93 libjpgdec.sprx accepted this layout and echoed
+ * downScale/outputMode/outputColorSpace into CellJpgDecOutParam. */
 typedef struct CellJpgDecInParam {
     u32 commandPtr;
+    u32 downScale;
+    u32 method;
     u32 outputMode;
     u32 outputColorSpace;
-    u32 downScale;
-    u32 outputBitDepth; /* not in PS3 SDK but useful */
+    u8  outputColorAlpha;
+    u8  reserved[3];
 } CellJpgDecInParam;
 
 typedef struct CellJpgDecOutParam {

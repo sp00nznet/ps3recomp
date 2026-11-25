@@ -144,12 +144,25 @@ static void jpgdec_free_source(JpgDecSubState* sub)
  * -----------------------------------------------------------------------*/
 
 /* ---------------------------------------------------------------------------
- * Guest struct access
+ * Guest struct access (CellJpgDecInfo/OutParam verified live against Sony
+ * firmware 4.93 libjpgdec.sprx)
  *
- * Same as cellGifDec: none of these structs holds a pointer, so the guest lays
- * them out as we do and offsetof() gives a usable guest offset. Only the
- * address and the byte order differ. CellJpgDecOutParam leads with a u64, so it
- * is written field by field rather than word by word.
+ * CellJpgDecSrc guest layout (32 bytes, big-endian, matches CellPngDecSrc):
+ *   +0x00 u32 srcSelect        (0 = FILE, 1 = BUFFER)
+ *   +0x04 u32 fileName         (guest const char* EA)
+ *   +0x08 u64 fileOffset
+ *   +0x10 u32 fileSize
+ *   +0x14 u32 streamPtr        (guest void* EA)
+ *   +0x18 u32 streamSize
+ *   +0x1C u32 spuThreadEnable
+ *
+ * CellJpgDecInParam guest layout (24 bytes, big-endian):
+ *   +0x00 u32 commandPtr
+ *   +0x04 u32 downScale
+ *   +0x08 u32 method
+ *   +0x0C u32 outputMode
+ *   +0x10 u32 outputColorSpace
+ *   +0x14 u8  outputColorAlpha (+3 reserved)
  * -----------------------------------------------------------------------*/
 #define JPG_EA(p) ((u32)(uintptr_t)(p))
 
@@ -159,15 +172,20 @@ static void jpgdec_src_load(CellJpgDecSrc* h, const CellJpgDecSrc* guest_ea)
     memset(h, 0, sizeof(*h));
     if (!ea)
         return;
-    h->srcSelect       = vm_read32(ea + (u32)offsetof(CellJpgDecSrc, srcSelect));
-    h->fileOffset      = vm_read64(ea + (u32)offsetof(CellJpgDecSrc, fileOffset));
-    h->fileSize        = vm_read32(ea + (u32)offsetof(CellJpgDecSrc, fileSize));
-    h->streamPtr       = vm_read64(ea + (u32)offsetof(CellJpgDecSrc, streamPtr));
-    h->streamSize      = vm_read32(ea + (u32)offsetof(CellJpgDecSrc, streamSize));
-    h->spuThreadEnable = vm_read32(ea + (u32)offsetof(CellJpgDecSrc, spuThreadEnable));
-    memcpy(h->fileName, vm_base + ea + offsetof(CellJpgDecSrc, fileName),
-           sizeof(h->fileName));
-    h->fileName[sizeof(h->fileName) - 1] = '\0';
+    h->srcSelect       = vm_read32(ea + 0x00u);
+    h->fileOffset      = vm_read64(ea + 0x08u);
+    h->fileSize        = vm_read32(ea + 0x10u);
+    h->streamPtr       = (u64)vm_read32(ea + 0x14u);
+    h->streamSize      = vm_read32(ea + 0x18u);
+    h->spuThreadEnable = vm_read32(ea + 0x1Cu);
+    if (h->srcSelect == CELL_JPGDEC_FILE) {
+        u32 name_ea = vm_read32(ea + 0x04u);
+        if (name_ea && vm_base) {
+            const char* src_str = (const char*)(vm_base + name_ea);
+            strncpy(h->fileName, src_str, sizeof(h->fileName) - 1);
+            h->fileName[sizeof(h->fileName) - 1] = '\0';
+        }
+    }
 }
 
 static void jpgdec_in_param_load(CellJpgDecInParam* h,
@@ -177,34 +195,37 @@ static void jpgdec_in_param_load(CellJpgDecInParam* h,
     memset(h, 0, sizeof(*h));
     if (!ea)
         return;
-    const u32 n = (u32)(sizeof(*h) / 4);   /* all u32 */
-    u32* w = (u32*)h;
-    for (u32 i = 0; i < n; i++)
-        w[i] = vm_read32(ea + i * 4);
+    h->commandPtr       = vm_read32(ea + 0x00u);
+    h->downScale        = vm_read32(ea + 0x04u);
+    h->method           = vm_read32(ea + 0x08u);
+    h->outputMode       = vm_read32(ea + 0x0Cu);
+    h->outputColorSpace = vm_read32(ea + 0x10u);
+    h->outputColorAlpha = vm_read8(ea + 0x14u);
 }
 
-/* CellJpgDecInfo is four consecutive u32. */
+/* CellJpgDecInfo is four consecutive BE u32s (16 bytes). */
 static void jpgdec_info_store(u32 ea, const CellJpgDecInfo* h)
 {
     if (!ea)
         return;
-    const u32* w = (const u32*)h;
-    for (u32 i = 0; i < sizeof(*h) / 4; i++)
-        vm_write32(ea + i * 4, w[i]);
+    vm_write32(ea + 0x00u, h->imageWidth);
+    vm_write32(ea + 0x04u, h->imageHeight);
+    vm_write32(ea + 0x08u, h->numComponents);
+    vm_write32(ea + 0x0Cu, h->colorSpace);
 }
 
 static void jpgdec_out_param_store(u32 ea, const CellJpgDecOutParam* h)
 {
     if (!ea)
         return;
-    vm_write64(ea + (u32)offsetof(CellJpgDecOutParam, outputWidthByte),  h->outputWidthByte);
-    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputWidth),      h->outputWidth);
-    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputHeight),     h->outputHeight);
-    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputComponents), h->outputComponents);
-    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputMode),       h->outputMode);
-    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputColorSpace), h->outputColorSpace);
-    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, downScale),        h->downScale);
-    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, useMemorySpace),   h->useMemorySpace);
+    vm_write64(ea + 0x00u, h->outputWidthByte);
+    vm_write32(ea + 0x08u, h->outputWidth);
+    vm_write32(ea + 0x0Cu, h->outputHeight);
+    vm_write32(ea + 0x10u, h->outputComponents);
+    vm_write32(ea + 0x14u, h->outputMode);
+    vm_write32(ea + 0x18u, h->outputColorSpace);
+    vm_write32(ea + 0x1Cu, h->downScale);
+    vm_write32(ea + 0x20u, h->useMemorySpace);
 }
 
 s32 cellJpgDecCreate(CellJpgDecMainHandle* mainHandle,
@@ -388,18 +409,16 @@ s32 cellJpgDecSetParameter(CellJpgDecMainHandle mainHandle,
 
     CellJpgDecInParam host_in;
     jpgdec_in_param_load(&host_in, inParam);
-    inParam = &host_in;
 
     u32 out_ea = JPG_EA(outParam);
     CellJpgDecOutParam host_out;
     memset(&host_out, 0, sizeof(host_out));
-    outParam = &host_out;
 
-    sub->in_param = *inParam;
+    sub->in_param = host_in;
     sub->param_set = 1;
 
     u32 out_comp;
-    u32 out_cs = inParam->outputColorSpace;
+    u32 out_cs = host_in.outputColorSpace;
     switch (out_cs) {
         case CELL_JPGDEC_GRAYSCALE: out_comp = 1; break;
         case CELL_JPGDEC_RGB:       out_comp = 3; break;
@@ -408,21 +427,21 @@ s32 cellJpgDecSetParameter(CellJpgDecMainHandle mainHandle,
         default:                     out_comp = 3; out_cs = CELL_JPGDEC_RGB; break;
     }
 
-    u32 ds = (inParam->downScale > 0) ? inParam->downScale : 1;
+    u32 ds = (host_in.downScale > 0) ? host_in.downScale : 1;
     u32 out_w = sub->info.imageWidth / ds;
     u32 out_h = sub->info.imageHeight / ds;
     if (out_w == 0) out_w = 1;
     if (out_h == 0) out_h = 1;
 
-    outParam->outputWidth      = out_w;
-    outParam->outputHeight     = out_h;
-    outParam->outputComponents = out_comp;
-    outParam->outputColorSpace = out_cs;
-    outParam->outputWidthByte  = (u64)(out_w * out_comp);
-    outParam->outputMode       = 0;
-    outParam->downScale        = ds;
-    outParam->useMemorySpace   = (u32)(outParam->outputWidthByte * out_h);
-    jpgdec_out_param_store(out_ea, outParam);
+    host_out.outputWidth      = out_w;
+    host_out.outputHeight     = out_h;
+    host_out.outputComponents = out_comp;
+    host_out.outputColorSpace = out_cs;
+    host_out.outputWidthByte  = (u64)(out_w * out_comp);
+    host_out.outputMode       = host_in.outputMode;
+    host_out.downScale        = ds;
+    host_out.useMemorySpace   = (u32)(host_out.outputWidthByte * out_h);
+    jpgdec_out_param_store(out_ea, &host_out);
 
     return CELL_OK;
 }

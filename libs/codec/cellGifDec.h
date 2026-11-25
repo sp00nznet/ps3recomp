@@ -97,6 +97,7 @@ typedef struct CellGifDecOutParam {
     u32 outputWidth;
     u32 outputHeight;
     u32 outputComponents;
+    u32 outputBitDepth;
     u32 outputColorSpace;
     u32 useMemorySpace;
 } CellGifDecOutParam;
