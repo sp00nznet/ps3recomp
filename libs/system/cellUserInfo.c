@@ -5,17 +5,12 @@
  */
 
 #include "cellUserInfo.h"
+#include "cellSysutil.h"
+#include "ps3emu/endian.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
-/* HLE args arrive as guest effective addresses; translate before deref. */
-#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
-/* The guest is big-endian; u32 fields we write into guest structs must be stored
- * byte-swapped or the guest reads them mangled (e.g. a count of 1 read as
- * 0x01000000 = 16.7M, blowing up the caller's enumeration loop). */
-#define BE32(v) ( (((uint32_t)(v) & 0x000000FFu) << 24) | (((uint32_t)(v) & 0x0000FF00u) << 8) | \
-                  (((uint32_t)(v) & 0x00FF0000u) >> 8) | (((uint32_t)(v) & 0xFF000000u) >> 24) )
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, GUEST_PTR (guest mem) */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -44,7 +39,7 @@ s32 cellUserInfoGetStat(u32 id, CellUserInfoUserStat* stat)
     /* NOTE: write ONLY the real 68-byte struct (id+name). Anything more
      * overflows the guest's stack buffer (see header comment). */
     memset(stat, 0, sizeof(CellUserInfoUserStat));
-    stat->id = BE32(EMU_USER_ID);
+    stat->id = ps3_bswap32(EMU_USER_ID);
     strncpy(stat->name, EMU_USER_NAME, CELL_USERINFO_USERNAME_SIZE - 1);
 
     return CELL_OK;
@@ -58,15 +53,15 @@ s32 cellUserInfoGetList(u32* listNum, CellUserInfoUserList* list, u32* currentUs
     u32* currentUser_h = GUEST_PTR(currentUser, u32*);
 
     if (listNum_h)
-        *listNum_h = BE32(1);
+        *listNum_h = ps3_bswap32(1);
 
     if (list_h) {
         memset(list_h, 0, sizeof(CellUserInfoUserList));
-        list_h->userId[0] = BE32(EMU_USER_ID);
+        list_h->userId[0] = ps3_bswap32(EMU_USER_ID);
     }
 
     if (currentUser_h)
-        *currentUser_h = BE32(EMU_USER_ID);
+        *currentUser_h = ps3_bswap32(EMU_USER_ID);
 
     return CELL_OK;
 }
@@ -83,9 +78,13 @@ s32 cellUserInfoSelectUser_ListSet(u32 listType,
     /* Auto-select the default user */
     s_selected_user = EMU_USER_ID;
 
-    /* Invoke callback immediately (synchronous selection) */
-    if (callback)
-        callback(CELL_OK, EMU_USER_ID, userdata);
+    /* Queue completion callback via sysutil (callback is a guest OPD address;
+     * never invoke it directly as a host C function pointer). */
+    if (callback) {
+        const u64 ev[8] = {(u64)(int64_t)CELL_OK, (u64)EMU_USER_ID,
+                           (u64)(uintptr_t)userdata, 0, 0, 0, 0, 0};
+        cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, ev);
+    }
 
     return CELL_OK;
 }
@@ -98,7 +97,7 @@ s32 cellUserInfoSelectUser_ListGet(u32* selectedUser)
         return CELL_USERINFO_ERROR_PARAM;
     selectedUser = GUEST_PTR(selectedUser, u32*);
 
-    *selectedUser = BE32(s_selected_user);
+    *selectedUser = ps3_bswap32(s_selected_user);
     return CELL_OK;
 }
 
