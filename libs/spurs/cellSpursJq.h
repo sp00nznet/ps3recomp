@@ -98,7 +98,7 @@ s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
 s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
                              u32 tag, CellSpursJobId* id);
 
-s32 cellSpursJobQueuePort2Create(CellSpursJobQueue* jq, CellSpursJobQueuePort* port);
+s32 cellSpursJobQueuePort2Create(CellSpursJobQueuePort* port, CellSpursJobQueue* jq);
 s32 cellSpursJobQueuePort2Destroy(CellSpursJobQueuePort* port);
 s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
                                    const void* job, u32 jobSize,
@@ -110,6 +110,22 @@ s32 cellSpursJobQueueTryWait(CellSpursJobQueue* jq, CellSpursJobId id);
 
 s32 cellSpursJobQueueGetCount(CellSpursJobQueue* jq, u32* count);
 s32 cellSpursJobQueueSemaphoreTryAcquire(CellSpursJobQueue* jq);
+
+/* Jobs that RUN (guest EAs, see cellSpursJq.c). Pushed jobs execute
+ * synchronously on the pushing thread through the jobchain job runner
+ * (lifted image if registered, SPU interpreter otherwise). */
+s32 _cellSpursCreateJobQueueWithJobDescriptorPool(u32 jqRevision, u32 sdkRevision,
+                                                  u32 spurs, u32 jq, u32 attr,
+                                                  u32 pool, u32 descPool, u32 name);
+s32 _cellSpursCreateJobQueue(u32 jqRevision, u32 sdkRevision, u32 spurs, u32 jq,
+                             u32 attr, u32 pool, u32 name);
+s32 cellSpursShutdownJobQueue(u32 jq);
+s32 cellSpursJoinJobQueue(u32 jq, u32 exitCode);
+s32 _cellSpursJobQueuePort2PushJobBody(u32 port, u32 job, u32 sizeJobDesc,
+                                       u32 tag, u32 isSync);
+s32 _cellSpursJobQueuePort2CopyPushJobBody(u32 port, u32 job, u32 sizeJobDesc,
+                                           u32 sizeCopy, u32 tag, u32 isSync);
+s32 cellSpursJobQueuePort2Sync(u32 port, u32 flag);
 
 #ifdef __cplusplus
 }
