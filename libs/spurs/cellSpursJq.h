@@ -16,17 +16,21 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_SPURS_JQ_ERROR_NOT_INITIALIZED     0x80410A01
-#define CELL_SPURS_JQ_ERROR_ALREADY_INITIALIZED 0x80410A02
-#define CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT    0x80410A03
-#define CELL_SPURS_JQ_ERROR_OUT_OF_MEMORY       0x80410A04
-#define CELL_SPURS_JQ_ERROR_BUSY                0x80410A05
-#define CELL_SPURS_JQ_ERROR_JOB_NOT_FOUND       0x80410A06
-#define CELL_SPURS_JQ_ERROR_QUEUE_FULL          0x80410A07
-#define CELL_SPURS_JQ_ERROR_QUEUE_EMPTY         0x80410A08
-#define CELL_SPURS_JQ_ERROR_AGAIN               0x80410A09
-#define CELL_SPURS_JQ_ERROR_ABORT               0x80410A0A
+/* Error codes (PS3 libspurs_jq, base 0x80410A00 | SPURS_ERRNO; verified against RPCS3) */
+#define CELL_SPURS_JQ_ERROR_AGAIN               (CELL_ERROR_BASE_SPURS_JQ | 0x01) /* 0x80410A01 */
+#define CELL_SPURS_JQ_ERROR_INVAL               (CELL_ERROR_BASE_SPURS_JQ | 0x02) /* 0x80410A02 */
+#define CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT    CELL_SPURS_JQ_ERROR_INVAL
+#define CELL_SPURS_JQ_ERROR_OUT_OF_MEMORY       (CELL_ERROR_BASE_SPURS_JQ | 0x04) /* 0x80410A04 */
+#define CELL_SPURS_JQ_ERROR_JOB_NOT_FOUND       (CELL_ERROR_BASE_SPURS_JQ | 0x06) /* 0x80410A06 */
+#define CELL_SPURS_JQ_ERROR_BUSY                (CELL_ERROR_BASE_SPURS_JQ | 0x0A) /* 0x80410A0A */
+#define CELL_SPURS_JQ_ERROR_ABORT               (CELL_ERROR_BASE_SPURS_JQ | 0x0C) /* 0x80410A0C */
+#define CELL_SPURS_JQ_ERROR_STAT                (CELL_ERROR_BASE_SPURS_JQ | 0x0F) /* 0x80410A0F */
+#define CELL_SPURS_JQ_ERROR_NOT_INITIALIZED     CELL_SPURS_JQ_ERROR_STAT
+#define CELL_SPURS_JQ_ERROR_ALIGN               (CELL_ERROR_BASE_SPURS_JQ | 0x10) /* 0x80410A10 */
+#define CELL_SPURS_JQ_ERROR_NULL_POINTER        (CELL_ERROR_BASE_SPURS_JQ | 0x11) /* 0x80410A11 */
+#define CELL_SPURS_JQ_ERROR_QUEUE_FULL          (CELL_ERROR_BASE_SPURS_JQ | 0x12) /* 0x80410A12 */
+#define CELL_SPURS_JQ_ERROR_QUEUE_EMPTY         (CELL_ERROR_BASE_SPURS_JQ | 0x13) /* 0x80410A13 */
+#define CELL_SPURS_JQ_ERROR_ALREADY_INITIALIZED (CELL_ERROR_BASE_SPURS_JQ | 0x14) /* 0x80410A14 */
 
 /* Job types */
 #define CELL_SPURS_JQ_JOB_TYPE_DEFAULT  0
@@ -94,7 +98,7 @@ s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
 s32 cellSpursJobQueuePushJob(CellSpursJobQueue* jq, const CellSpursJob256* job,
                              u32 tag, CellSpursJobId* id);
 
-s32 cellSpursJobQueuePort2Create(CellSpursJobQueue* jq, CellSpursJobQueuePort* port);
+s32 cellSpursJobQueuePort2Create(CellSpursJobQueuePort* port, CellSpursJobQueue* jq);
 s32 cellSpursJobQueuePort2Destroy(CellSpursJobQueuePort* port);
 s32 cellSpursJobQueuePort2PushSync(CellSpursJobQueuePort* port,
                                    const void* job, u32 jobSize,
@@ -106,6 +110,22 @@ s32 cellSpursJobQueueTryWait(CellSpursJobQueue* jq, CellSpursJobId id);
 
 s32 cellSpursJobQueueGetCount(CellSpursJobQueue* jq, u32* count);
 s32 cellSpursJobQueueSemaphoreTryAcquire(CellSpursJobQueue* jq);
+
+/* Jobs that RUN (guest EAs, see cellSpursJq.c). Pushed jobs execute
+ * synchronously on the pushing thread through the jobchain job runner
+ * (lifted image if registered, SPU interpreter otherwise). */
+s32 _cellSpursCreateJobQueueWithJobDescriptorPool(u32 jqRevision, u32 sdkRevision,
+                                                  u32 spurs, u32 jq, u32 attr,
+                                                  u32 pool, u32 descPool, u32 name);
+s32 _cellSpursCreateJobQueue(u32 jqRevision, u32 sdkRevision, u32 spurs, u32 jq,
+                             u32 attr, u32 pool, u32 name);
+s32 cellSpursShutdownJobQueue(u32 jq);
+s32 cellSpursJoinJobQueue(u32 jq, u32 exitCode);
+s32 _cellSpursJobQueuePort2PushJobBody(u32 port, u32 job, u32 sizeJobDesc,
+                                       u32 tag, u32 isSync);
+s32 _cellSpursJobQueuePort2CopyPushJobBody(u32 port, u32 job, u32 sizeJobDesc,
+                                           u32 sizeCopy, u32 tag, u32 isSync);
+s32 cellSpursJobQueuePort2Sync(u32 port, u32 flag);
 
 #ifdef __cplusplus
 }

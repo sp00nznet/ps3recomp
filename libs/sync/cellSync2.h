@@ -19,16 +19,17 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes (shared base with cellSync)
  * -----------------------------------------------------------------------*/
-#define CELL_SYNC2_ERROR_AGAIN                  (CELL_ERROR_BASE_SYNC | 0x41)
-#define CELL_SYNC2_ERROR_INVAL                  (CELL_ERROR_BASE_SYNC | 0x42)
-#define CELL_SYNC2_ERROR_NOMEM                  (CELL_ERROR_BASE_SYNC | 0x44)
-#define CELL_SYNC2_ERROR_BUSY                   (CELL_ERROR_BASE_SYNC | 0x4A)
-#define CELL_SYNC2_ERROR_STAT                   (CELL_ERROR_BASE_SYNC | 0x4F)
-#define CELL_SYNC2_ERROR_NULL_POINTER           (CELL_ERROR_BASE_SYNC | 0x51)
-#define CELL_SYNC2_ERROR_TIMEDOUT               (CELL_ERROR_BASE_SYNC | 0x52)
-#define CELL_SYNC2_ERROR_NOT_INITIALIZED        (CELL_ERROR_BASE_SYNC | 0x53)
-#define CELL_SYNC2_ERROR_OVERFLOW               (CELL_ERROR_BASE_SYNC | 0x54)
-#define CELL_SYNC2_ERROR_EMPTY                  (CELL_ERROR_BASE_SYNC | 0x55)
+#define CELL_SYNC2_ERROR_AGAIN                  (CELL_ERROR_BASE_SYNC2 | 0x01) /* 0x80410C01 */
+#define CELL_SYNC2_ERROR_INVAL                  (CELL_ERROR_BASE_SYNC2 | 0x02) /* 0x80410C02 */
+#define CELL_SYNC2_ERROR_NOMEM                  (CELL_ERROR_BASE_SYNC2 | 0x04) /* 0x80410C04 */
+#define CELL_SYNC2_ERROR_BUSY                   (CELL_ERROR_BASE_SYNC2 | 0x0A) /* 0x80410C0A */
+#define CELL_SYNC2_ERROR_TIMEDOUT               (CELL_ERROR_BASE_SYNC2 | 0x0B) /* 0x80410C0B */
+#define CELL_SYNC2_ERROR_STAT                   (CELL_ERROR_BASE_SYNC2 | 0x0F) /* 0x80410C0F */
+#define CELL_SYNC2_ERROR_NOT_INITIALIZED        CELL_SYNC2_ERROR_STAT
+#define CELL_SYNC2_ERROR_ALIGN                  (CELL_ERROR_BASE_SYNC2 | 0x10) /* 0x80410C10 */
+#define CELL_SYNC2_ERROR_NULL_POINTER           (CELL_ERROR_BASE_SYNC2 | 0x11) /* 0x80410C11 */
+#define CELL_SYNC2_ERROR_OVERFLOW               (CELL_ERROR_BASE_SYNC2 | 0x12) /* 0x80410C12 */
+#define CELL_SYNC2_ERROR_EMPTY                  (CELL_ERROR_BASE_SYNC2 | 0x13) /* 0x80410C13 */
 
 /* ---------------------------------------------------------------------------
  * CellSync2Mutex

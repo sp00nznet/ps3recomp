@@ -18,13 +18,14 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define SCE_NP_TUS_ERROR_NOT_INITIALIZED       0x80022E01
-#define SCE_NP_TUS_ERROR_ALREADY_INITIALIZED   0x80022E02
-#define SCE_NP_TUS_ERROR_INVALID_ARGUMENT      0x80022E03
-#define SCE_NP_TUS_ERROR_OUT_OF_MEMORY         0x80022E04
-#define SCE_NP_TUS_ERROR_NOT_CONNECTED         0x80022E05
-#define SCE_NP_TUS_ERROR_DATA_NOT_FOUND        0x80022E06
-#define SCE_NP_TUS_ERROR_TIMEOUT               0x80022E07
+/* Error codes (PS3 sceNpTus shares NP Community base 0x8002A100; verified against RPCS3) */
+#define SCE_NP_TUS_ERROR_ALREADY_INITIALIZED   (CELL_ERROR_BASE_NP_COMMUNITY | 0x01) /* 0x8002A101 */
+#define SCE_NP_TUS_ERROR_NOT_INITIALIZED       (CELL_ERROR_BASE_NP_COMMUNITY | 0x02) /* 0x8002A102 */
+#define SCE_NP_TUS_ERROR_OUT_OF_MEMORY         (CELL_ERROR_BASE_NP_COMMUNITY | 0x04) /* 0x8002A104 */
+#define SCE_NP_TUS_ERROR_INVALID_ARGUMENT      (CELL_ERROR_BASE_NP_COMMUNITY | 0x05) /* 0x8002A105 */
+#define SCE_NP_TUS_ERROR_NOT_CONNECTED         (CELL_ERROR_BASE_NP_COMMUNITY | 0x06) /* 0x8002A106 */
+#define SCE_NP_TUS_ERROR_DATA_NOT_FOUND        (CELL_ERROR_BASE_NP_COMMUNITY | 0x07) /* 0x8002A107 */
+#define SCE_NP_TUS_ERROR_TIMEOUT               (CELL_ERROR_BASE_NP_COMMUNITY | 0x08) /* 0x8002A108 */
 
 /* ---------------------------------------------------------------------------
  * Constants

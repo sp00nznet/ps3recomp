@@ -16,14 +16,14 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
+ * Error codes (PS3 cell/resc.h, base 0x80210300; verified against RPCS3)
  * -----------------------------------------------------------------------*/
-#define CELL_RESC_ERROR_NOT_INITIALIZED    0x80210301
-#define CELL_RESC_ERROR_REINITIALIZED      0x80210302
-#define CELL_RESC_ERROR_BAD_ARGUMENT       0x80210303
-#define CELL_RESC_ERROR_BAD_COMBINATION    0x80210304
-#define CELL_RESC_ERROR_BAD_ALIGNMENT      0x80210305
-#define CELL_RESC_ERROR_INSUFFICIENT_BUFFER 0x80210306
+#define CELL_RESC_ERROR_NOT_INITIALIZED     (CELL_ERROR_BASE_RESC | 0x01) /* 0x80210301 */
+#define CELL_RESC_ERROR_REINITIALIZED       (CELL_ERROR_BASE_RESC | 0x02) /* 0x80210302 */
+#define CELL_RESC_ERROR_BAD_ALIGNMENT       (CELL_ERROR_BASE_RESC | 0x03) /* 0x80210303 */
+#define CELL_RESC_ERROR_BAD_ARGUMENT        (CELL_ERROR_BASE_RESC | 0x04) /* 0x80210304 */
+#define CELL_RESC_ERROR_INSUFFICIENT_BUFFER (CELL_ERROR_BASE_RESC | 0x05) /* 0x80210305 */
+#define CELL_RESC_ERROR_BAD_COMBINATION     (CELL_ERROR_BASE_RESC | 0x07) /* 0x80210307 */
 
 /* ---------------------------------------------------------------------------
  * Display buffer modes

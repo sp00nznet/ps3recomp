@@ -15,13 +15,21 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_GEM_ERROR_NOT_INITIALIZED     0x80121801
-#define CELL_GEM_ERROR_ALREADY_INITIALIZED 0x80121802
-#define CELL_GEM_ERROR_INVALID_ARGUMENT    0x80121803
-#define CELL_GEM_ERROR_NOT_CONNECTED       0x80121804
-#define CELL_GEM_ERROR_NOT_CALIBRATED      0x80121805
-#define CELL_GEM_ERROR_NO_VIDEO            0x80121806
+/* Error codes (cell/gem.h; base 0x80121800 verified against Sony firmware 4.93
+ * libgem.sprx: cellGemUpdateStart(0,0) -> 0x80121803 NOT_INITIALIZED,
+ * cellGemInit(0) -> 0x80121804 INVALID_PARAMETER) */
+#define CELL_GEM_ERROR_RESOURCE_ALLOCATION_FAILED (CELL_ERROR_BASE_GEM | 0x01) /* 0x80121801 */
+#define CELL_GEM_ERROR_ALREADY_INITIALIZED        (CELL_ERROR_BASE_GEM | 0x02) /* 0x80121802 */
+#define CELL_GEM_ERROR_NOT_INITIALIZED            (CELL_ERROR_BASE_GEM | 0x03) /* 0x80121803 */
+#define CELL_GEM_ERROR_INVALID_PARAMETER          (CELL_ERROR_BASE_GEM | 0x04) /* 0x80121804 */
+#define CELL_GEM_ERROR_INVALID_ARGUMENT           CELL_GEM_ERROR_INVALID_PARAMETER
+#define CELL_GEM_ERROR_INVALID_ALIGNMENT          (CELL_ERROR_BASE_GEM | 0x05) /* 0x80121805 */
+#define CELL_GEM_ERROR_UPDATE_NOT_FINISHED        (CELL_ERROR_BASE_GEM | 0x06) /* 0x80121806 */
+/* The three below are HLE-local placeholders (not measured on firmware): the
+ * SDK reports these states through positive status returns, not errors. */
+#define CELL_GEM_ERROR_NOT_CONNECTED              (CELL_ERROR_BASE_GEM | 0x0B) /* 0x8012180B */
+#define CELL_GEM_ERROR_NOT_CALIBRATED             (CELL_ERROR_BASE_GEM | 0x0C) /* 0x8012180C */
+#define CELL_GEM_ERROR_NO_VIDEO                   (CELL_ERROR_BASE_GEM | 0x0D) /* 0x8012180D */
 
 /* Constants */
 #define CELL_GEM_MAX_NUM   4

@@ -15,25 +15,22 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
+ * Error codes (PS3 cell/http.h, base 0x80710000; verified against RPCS3)
  * -----------------------------------------------------------------------*/
-#define CELL_HTTP_ERROR_NOT_INITIALIZED         0x80710101
-#define CELL_HTTP_ERROR_ALREADY_INITIALIZED     0x80710102
-#define CELL_HTTP_ERROR_NO_MEMORY               0x80710103
-#define CELL_HTTP_ERROR_NOT_FOUND               0x80710104
-#define CELL_HTTP_ERROR_INVALID_PARAMETER       0x80710105
-#define CELL_HTTP_ERROR_NO_BUFFER               0x80710106
-#define CELL_HTTP_ERROR_CONNECTION_FAILED       0x80710107
-#define CELL_HTTP_ERROR_SEND_FAILED             0x80710108
-#define CELL_HTTP_ERROR_RECV_FAILED             0x80710109
-#define CELL_HTTP_ERROR_TIMEOUT                 0x8071010A
-#define CELL_HTTP_ERROR_INVALID_URL             0x8071010B
-#define CELL_HTTP_ERROR_ABORTED                 0x8071010C
-#define CELL_HTTP_ERROR_UNKNOWN                 0x807101FF
-/* "No Content-Length" from cellHttpResponseGetContentLength. The value is the
- * one titles compare the result with before reading the body to the end; the
- * SDK's own name for it is not confirmed here. */
-#define CELL_HTTP_ERROR_NO_CONTENT_LENGTH       0x80710017
+#define CELL_HTTP_ERROR_NOT_INITIALIZED         (CELL_ERROR_BASE_HTTP | 0x02) /* 0x80710002 */
+#define CELL_HTTP_ERROR_ALREADY_INITIALIZED     (CELL_ERROR_BASE_HTTP | 0x01) /* 0x80710001 */
+#define CELL_HTTP_ERROR_NO_MEMORY               (CELL_ERROR_BASE_HTTP | 0x03)
+#define CELL_HTTP_ERROR_NOT_FOUND               (CELL_ERROR_BASE_HTTP | 0x04)
+#define CELL_HTTP_ERROR_INVALID_PARAMETER       (CELL_ERROR_BASE_HTTP | 0x05)
+#define CELL_HTTP_ERROR_NO_BUFFER               (CELL_ERROR_BASE_HTTP | 0x06)
+#define CELL_HTTP_ERROR_CONNECTION_FAILED       (CELL_ERROR_BASE_HTTP | 0x07)
+#define CELL_HTTP_ERROR_SEND_FAILED             (CELL_ERROR_BASE_HTTP | 0x08)
+#define CELL_HTTP_ERROR_RECV_FAILED             (CELL_ERROR_BASE_HTTP | 0x09)
+#define CELL_HTTP_ERROR_TIMEOUT                 (CELL_ERROR_BASE_HTTP | 0x0A)
+#define CELL_HTTP_ERROR_INVALID_URL             (CELL_ERROR_BASE_HTTP | 0x0B)
+#define CELL_HTTP_ERROR_ABORTED                 (CELL_ERROR_BASE_HTTP | 0x0C)
+#define CELL_HTTP_ERROR_UNKNOWN                 (CELL_ERROR_BASE_HTTP | 0xFF)
+#define CELL_HTTP_ERROR_NO_CONTENT_LENGTH       (CELL_ERROR_BASE_HTTP | 0x17) /* 0x80710017 */
 
 /* ---------------------------------------------------------------------------
  * HTTP methods

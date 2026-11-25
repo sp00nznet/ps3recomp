@@ -18,11 +18,12 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define CELL_K2C_ERROR_FATAL               0x80121601
-#define CELL_K2C_ERROR_INVALID_HANDLE      0x80121602
-#define CELL_K2C_ERROR_INVALID_PARAMETER   0x80121603
-#define CELL_K2C_ERROR_ALREADY_INITIALIZED 0x80121604
-#define CELL_K2C_ERROR_UNINITIALIZED       0x80121605
+/* Error codes (PS3 cellKey2char, base 0x80121300; verified against RPCS3) */
+#define CELL_K2C_ERROR_FATAL               (CELL_ERROR_BASE_KEY2CHAR | 0x01) /* 0x80121301 */
+#define CELL_K2C_ERROR_INVALID_HANDLE      (CELL_ERROR_BASE_KEY2CHAR | 0x02) /* 0x80121302 */
+#define CELL_K2C_ERROR_INVALID_PARAMETER   (CELL_ERROR_BASE_KEY2CHAR | 0x03) /* 0x80121303 */
+#define CELL_K2C_ERROR_ALREADY_INITIALIZED (CELL_ERROR_BASE_KEY2CHAR | 0x04) /* 0x80121304 */
+#define CELL_K2C_ERROR_UNINITIALIZED       (CELL_ERROR_BASE_KEY2CHAR | 0x05) /* 0x80121305 */
 
 /* ---------------------------------------------------------------------------
  * Keyboard arrangements

@@ -18,11 +18,14 @@ extern "C" {
  * Error codes
  * -----------------------------------------------------------------------*/
 
-#define CELL_KB_ERROR_FATAL                 (CELL_ERROR_BASE_KB | 0x01)
-#define CELL_KB_ERROR_INVALID_PARAMETER     (CELL_ERROR_BASE_KB | 0x02)
-#define CELL_KB_ERROR_ALREADY_INITIALIZED   (CELL_ERROR_BASE_KB | 0x03)
-#define CELL_KB_ERROR_UNINITIALIZED         (CELL_ERROR_BASE_KB | 0x04)
-#define CELL_KB_ERROR_NO_DEVICE             (CELL_ERROR_BASE_KB | 0x05)
+#define CELL_KB_ERROR_FATAL                         (CELL_ERROR_BASE_KB | 0x01)
+#define CELL_KB_ERROR_INVALID_PARAMETER             (CELL_ERROR_BASE_KB | 0x02)
+#define CELL_KB_ERROR_ALREADY_INITIALIZED           (CELL_ERROR_BASE_KB | 0x03)
+#define CELL_KB_ERROR_UNINITIALIZED                 (CELL_ERROR_BASE_KB | 0x04)
+#define CELL_KB_ERROR_RESOURCE_ALLOCATION_FAILED    (CELL_ERROR_BASE_KB | 0x05)
+#define CELL_KB_ERROR_READ_FAILED                   (CELL_ERROR_BASE_KB | 0x06)
+#define CELL_KB_ERROR_NO_DEVICE                     (CELL_ERROR_BASE_KB | 0x07)
+#define CELL_KB_ERROR_SYS_SETTING_FAILED            (CELL_ERROR_BASE_KB | 0x08)
 
 /* ---------------------------------------------------------------------------
  * Constants

@@ -18,11 +18,12 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define SCE_NP_UTIL_ERROR_NOT_INITIALIZED      0x80022501
-#define SCE_NP_UTIL_ERROR_INVALID_ARGUMENT     0x80022502
-#define SCE_NP_UTIL_ERROR_OUT_OF_MEMORY        0x80022503
-#define SCE_NP_UTIL_ERROR_INVALID_NP_ENV       0x80022504
-#define SCE_NP_UTIL_ERROR_INVALID_ONLINE_ID    0x80022505
+/* Error codes (PS3 sceNpUtil shares NP base 0x8002AA00; verified against RPCS3) */
+#define SCE_NP_UTIL_ERROR_NOT_INITIALIZED      (CELL_ERROR_BASE_NP | 0x01) /* 0x8002AA01 */
+#define SCE_NP_UTIL_ERROR_INVALID_ARGUMENT     (CELL_ERROR_BASE_NP | 0x03) /* 0x8002AA03 */
+#define SCE_NP_UTIL_ERROR_OUT_OF_MEMORY        (CELL_ERROR_BASE_NP | 0x04) /* 0x8002AA04 */
+#define SCE_NP_UTIL_ERROR_INVALID_NP_ENV       (CELL_ERROR_BASE_NP | 0x05) /* 0x8002AA05 */
+#define SCE_NP_UTIL_ERROR_INVALID_ONLINE_ID    (CELL_ERROR_BASE_NP | 0x06) /* 0x8002AA06 */
 
 /* ---------------------------------------------------------------------------
  * NP Environment

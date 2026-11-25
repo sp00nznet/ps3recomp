@@ -17,13 +17,17 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
+ * Error codes (PS3 cell/pamf.h, base 0x80610500; verified against RPCS3)
  * -----------------------------------------------------------------------*/
-#define CELL_PAMF_ERROR_INVALID_ARG          0x80610301
-#define CELL_PAMF_ERROR_INVALID_HEADER       0x80610302
-#define CELL_PAMF_ERROR_STREAM_NOT_FOUND     0x80610303
-#define CELL_PAMF_ERROR_EP_NOT_FOUND         0x80610304
-#define CELL_PAMF_ERROR_NOT_AVAILABLE        0x80610305
+#define CELL_PAMF_ERROR_STREAM_NOT_FOUND     (CELL_ERROR_BASE_PAMF | 0x01) /* 0x80610501 */
+#define CELL_PAMF_ERROR_INVALID_PAMF         (CELL_ERROR_BASE_PAMF | 0x02) /* 0x80610502 */
+#define CELL_PAMF_ERROR_INVALID_HEADER       CELL_PAMF_ERROR_INVALID_PAMF
+#define CELL_PAMF_ERROR_INVALID_ARG          (CELL_ERROR_BASE_PAMF | 0x03) /* 0x80610503 */
+#define CELL_PAMF_ERROR_UNKNOWN_TYPE         (CELL_ERROR_BASE_PAMF | 0x04) /* 0x80610504 */
+#define CELL_PAMF_ERROR_UNKNOWN_STREAM       (CELL_ERROR_BASE_PAMF | 0x05) /* 0x80610505 */
+#define CELL_PAMF_ERROR_UNSUPPORTED_VERSION  (CELL_ERROR_BASE_PAMF | 0x06) /* 0x80610506 */
+#define CELL_PAMF_ERROR_EP_NOT_FOUND         (CELL_ERROR_BASE_PAMF | 0x07) /* 0x80610507 */
+#define CELL_PAMF_ERROR_NOT_AVAILABLE        (CELL_ERROR_BASE_PAMF | 0x08) /* 0x80610508 */
 
 /* ---------------------------------------------------------------------------
  * Stream types

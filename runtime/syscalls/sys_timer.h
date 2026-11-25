@@ -32,9 +32,10 @@ extern "C" {
  * to the PS3 timebase. Called from every lifted mftb site (ppu_lifter.py). */
 uint64_t ppu_timebase_now(void);
 
-/* The guest's system time in microseconds: what sys_time_get_system_time
- * returns. Every guest-visible time stamp that a title subtracts from it
- * (cellGcmGetLastFlipTime) must come from this same clock. */
+/* Shared boot-anchored guest system time in microseconds (system_time_t).
+ * Used by sys_time_get_system_time(), cellGcmGetLastFlipTime(), and
+ * cellAudioGetPortTimestamp() so all PS3 microsecond timestamps share one
+ * monotonic clock domain (pauses with ps3_guest_clock_pause). */
 uint64_t ps3_system_time_us(void);
 
 #ifndef _WIN32

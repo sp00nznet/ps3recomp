@@ -5,6 +5,61 @@
 #include <stdlib.h>
 #include "ps3emu/error_codes.h"
 #include "../libs/spurs/cellSpurs.h"
+#include "../libs/spurs/cellSpursJq.h"
+#include "../libs/spurs/cellFiber.h"
+#include "../libs/sync/cellSync2.h"
+#include "../libs/input/cellKb.h"
+#include "../libs/input/cellMouse.h"
+#include "../libs/video/cellVideoOut.h"
+#include "../libs/video/cellResc.h"
+#include "../libs/audio/cellMic.h"
+#include "../libs/audio/cellVoice.h"
+#include "../libs/codec/cellAdec.h"
+#include "../libs/codec/cellDmux.h"
+#include "../libs/codec/cellVpost.h"
+#include "../libs/codec/cellPamf.h"
+#include "../libs/codec/cellJpgDec.h"
+#include "../libs/codec/cellJpgEnc.h"
+#include "../libs/codec/cellPngDec.h"
+#include "../libs/codec/cellPngEnc.h"
+#include "../libs/codec/cellGifDec.h"
+#include "../libs/font/cellFont.h"
+#include "../libs/system/cellMsgDialog.h"
+#include "../libs/system/cellRtc.h"
+#include "../libs/system/cellSaveData.h"
+#include "../libs/system/cellUserInfo.h"
+#include "../libs/misc/cellGameRecording.h"
+#include "../libs/misc/cellKey2char.h"
+#include "../libs/misc/cellMusicExport.h"
+#include "../libs/misc/cellOskDialog.h"
+#include "../libs/misc/cellPhotoImport.h"
+#include "../libs/misc/cellSheap.h"
+#include "../libs/misc/cellSubdisplay.h"
+#include "../libs/misc/cellVideoExport.h"
+#include "../libs/misc/cellBGDL.h"
+#include "../libs/misc/cellImeJp.h"
+#include "../libs/misc/cellMusicDecode.h"
+#include "../libs/misc/cellMusicDecode2.h"
+#include "../libs/misc/cellPhotoExport.h"
+#include "../libs/misc/cellPrint.h"
+#include "../libs/misc/cellVideoUpload.h"
+#include "../libs/hardware/cellGem.h"
+#include "../libs/network/cellHttps.h"
+#include "../libs/font/cellFontFT.h"
+#include "../libs/sync/cellSync.h"
+#include "../libs/hardware/cellCamera.h"
+#include "../libs/hardware/cellUsbd.h"
+#include "../libs/network/cellHttp.h"
+#include "../libs/network/cellHttpUtil.h"
+#include "../libs/network/cellSsl.h"
+#include "../libs/network/sceNpBasic.h"
+#include "../libs/network/sceNpClans.h"
+#include "../libs/network/sceNpCommerce2.h"
+#include "../libs/network/sceNpMatching2.h"
+#include "../libs/network/sceNpSignaling.h"
+#include "../libs/network/sceNpSns.h"
+#include "../libs/network/sceNpTus.h"
+#include "../libs/network/sceNpUtil.h"
 #include "../libs/input/cellPad.h"
 
 static int fails;
@@ -16,15 +71,109 @@ int main(void)
     EXPECT(CELL_GCM_ERROR_NO_IO_PAGE_TABLE,  0x80210001u);
     EXPECT(CELL_GCM_ERROR_INVALID_ALIGNMENT, 0x80210004u);
     EXPECT(CELL_GCM_ERROR_FAILURE,           0x802100FFu);
+    EXPECT(CELL_RESC_ERROR_NOT_INITIALIZED,  0x80210301u);
+    EXPECT(CELL_RESC_ERROR_BAD_ARGUMENT,     0x80210304u);
     EXPECT(CELL_SPURS_CORE_ERROR_AGAIN,      0x80410701u);
     EXPECT(CELL_SPURS_TASK_ERROR_AGAIN,      0x80410901u);
     EXPECT(CELL_SPURS_TASK_ERROR_NOENT,      0x80410906u);
     EXPECT(CELL_SPURS_TASK_ERROR_NULL_POINTER, 0x80410911u);
+    EXPECT(CELL_ERROR_BASE_SPURS_JQ,         0x80410A00u);
+    EXPECT(CELL_SPURS_JQ_ERROR_INVAL,        0x80410A02u);
+    EXPECT(CELL_SPURS_JQ_ERROR_NULL_POINTER, 0x80410A11u);
+    EXPECT(CELL_ERROR_BASE_SYNC2,            0x80410C00u);
+    EXPECT(CELL_SYNC2_ERROR_AGAIN,           0x80410C01u);
+    EXPECT(CELL_SYNC2_ERROR_NULL_POINTER,    0x80410C11u);
+    EXPECT(CELL_ERROR_BASE_FIBER,            0x80760000u);
+    EXPECT(CELL_FIBER_ERROR_NULL_POINTER,    0x80760011u);
     EXPECT(CELL_AUDIO_ERROR_ALREADY_INIT,    0x80310701u);
+    EXPECT(CELL_VOICE_ERROR_NOT_INITIALIZED, 0x80310801u);
+    EXPECT(CELL_VOICE_ERROR_ARGUMENT_INVALID, 0x80310805u);
+    EXPECT(CELL_VOICE_ERROR_INVALID_ARGUMENT, 0x80310805u);
+    EXPECT(CELL_MIC_ERROR_ALREADY_INITIALIZED, 0x80140101u);
+    EXPECT(CELL_MIC_ERROR_NOT_INITIALIZED,   0x80140103u);
+    EXPECT(CELL_MIC_ERROR_DEVICE_NOT_FOUND,  0x8014010Eu);
+    EXPECT(CELL_KB_ERROR_FATAL,              0x80121001u);
+    EXPECT(CELL_KB_ERROR_NO_DEVICE,          0x80121007u);
     EXPECT(CELL_PAD_ERROR_FATAL,             0x80121101u);
+    EXPECT(CELL_PAD_ERROR_NO_DEVICE,         0x80121107u);
+    EXPECT(CELL_MOUSE_ERROR_FATAL,           0x80121201u);
+    EXPECT(CELL_MOUSE_ERROR_NO_DEVICE,       0x80121207u);
+    EXPECT(CELL_USBD_ERROR_NOT_INITIALIZED,  0x80110001u);
+    EXPECT(CELL_ERROR_BASE_USBD,             0x80110000u);
+    EXPECT(CELL_SYSUTIL_ERROR_VALUE,         0x8002B102u);
+    EXPECT(CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED,       0x8002B220u);
+    EXPECT(CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION, 0x8002B221u);
+    EXPECT(CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER,     0x8002B222u);
+    EXPECT(CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT, 0x8002B225u);
+    EXPECT(CELL_MSGDIALOG_ERROR_PARAM,             0x8002B301u);
+    EXPECT(CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED, 0x8002B302u);
+    EXPECT(CELL_OSK_ERROR_INVALID_PARAMETER,       0x8002B504u);
+    EXPECT(CELL_USERINFO_ERROR_NOUSER,             0x8002C304u);
+    EXPECT(SCE_NP_BASIC_ERROR_NOT_INITIALIZED,     0x8002A662u);
+    EXPECT(SCE_NP_BASIC_ERROR_NO_EVENT,            0x8002A66Au);
+    EXPECT(CELL_ERROR_BASE_ADEC,             0x80610000u);
+    EXPECT(CELL_ADEC_ERROR_ARG,              0x80610003u);
+    EXPECT(CELL_ERROR_BASE_DMUX,             0x80610200u);
+    EXPECT(CELL_DMUX_ERROR_ARG,              0x80610201u);
+    EXPECT(CELL_VPOST_ERROR_C_ARG_HDL_INVALID, 0x80610471u);
+    EXPECT(CELL_PAMF_ERROR_INVALID_PAMF,     0x80610502u);
+    EXPECT(CELL_PAMF_ERROR_INVALID_ARG,      0x80610503u);
+    EXPECT(CELL_PAMF_ERROR_UNKNOWN_TYPE,     0x80610504u);
+    EXPECT(CELL_JPGDEC_ERROR_ARG,            0x80611103u);
+    EXPECT(CELL_PNGDEC_ERROR_ARG,            0x80611203u);
+    EXPECT(CELL_GIFDEC_ERROR_ARG,            0x80611303u);
+    EXPECT(CELL_FONT_ERROR_UNINITIALIZED,    0x80540003u);
+    EXPECT(CELL_HTTP_ERROR_NOT_INITIALIZED,  0x80710002u);
+    EXPECT(CELL_HTTP_ERROR_NO_CONTENT_LENGTH, 0x80710017u);
+    EXPECT(CELL_SSL_ERROR_NOT_INITIALIZED,   0x80740001u);
+    EXPECT(CELL_SSL_ERROR_INVALID_ARG,       0x80740004u);
+    EXPECT(CELL_RTC_ERROR_INVALID_POINTER,   0x80010602u);
+    EXPECT(CELL_RTC_ERROR_INVALID_YEAR,      0x80010621u);
+    EXPECT(CELL_K2C_ERROR_INVALID_HANDLE,    0x80121302u);
+    EXPECT(CELL_CAMERA_ERROR_NOT_INITIALIZED, 0x80140803u);
+    EXPECT(CELL_CAMERA_ERROR_INVALID_ARGUMENT, 0x80140804u);
+    EXPECT(CELL_JPGENC_ERROR_INVALID_ARGUMENT, 0x80611191u);
+    EXPECT(CELL_PNGENC_ERROR_INVALID_ARGUMENT, 0x80611291u);
+    EXPECT(CELL_PHOTO_IMPORT_ERROR_INVALID_ARGUMENT, 0x8002C703u);
+    EXPECT(SCE_NP_COMMERCE2_ERROR_NOT_INITIALIZED, 0x80023001u);
+    EXPECT(SCE_NP_CLANS_ERROR_NOT_INITIALIZED,     0x80022702u);
+    EXPECT(SCE_NP_TUS_ERROR_NOT_INITIALIZED,       0x8002A102u);
+    EXPECT(CELL_SAVEDATA_ERROR_PARAM,              0x8002B404u);
+    EXPECT(CELL_REC_ERROR_INVALID_VALUE,           0x8002C503u);
+    EXPECT(CELL_REC_ERROR_INVALID_STATE,           0x8002C506u);
+    EXPECT(CELL_GAME_REC_ERROR_INVALID_ARGUMENT,   0x8002C503u);
+    EXPECT(CELL_GAME_REC_ERROR_NOT_INITIALIZED,    0x8002C506u);
+    EXPECT(CELL_MUSIC_EXPORT_ERROR_INVALID_ARGUMENT, 0x8002C603u);
+    EXPECT(CELL_VIDEO_EXPORT_ERROR_INVALID_ARGUMENT, 0x8002CA03u);
+    EXPECT(CELL_SUBDISPLAY_ERROR_NOT_INITIALIZED,  0x80029855u);
+    EXPECT(CELL_SHEAP_ERROR_INVAL,                 0x80410302u);
+    EXPECT(CELL_SHEAP_ERROR_ALIGN,                 0x80410310u);
+    EXPECT(CELL_HTTP_UTIL_ERROR_NO_BUFFER,         0x80711003u);
+    EXPECT(SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED, 0x80022303u);
+    EXPECT(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED, 0x8002A801u);
+    EXPECT(SCE_NP_SNS_ERROR_INVALID_ARGUMENT,      0x80024503u);
+    EXPECT(SCE_NP_SNS_FB_ERROR_NOT_INITIALIZED,    0x80024512u);
+    EXPECT(SCE_NP_SNS_ERROR_NOT_INITIALIZED,       0x80024512u);
+    EXPECT(SCE_NP_UTIL_ERROR_NOT_INITIALIZED,      0x8002AA01u);
+    /* Round 8: Sony firmware 4.93 LLE SPRX returns under stock RPCS3. */
+    EXPECT(CELL_BGDL_ERROR_NO_MEMORY,                 0x8002B006u);
+    EXPECT(CELL_IMEJP_ERROR_CONTEXT,                  0x8002BF11u);
+    EXPECT(CELL_IMEJP_ERROR_PARAM,                    0x8002BF41u);
+    EXPECT(CELL_MUSIC_DECODE_ERROR_PARAM,             0x8002C102u);
+    EXPECT(CELL_MUSIC_DECODE2_ERROR_PARAM,            0x8002C102u);
+    EXPECT(CELL_PHOTO_EXPORT_ERROR_INVALID_ARGUMENT,  0x8002C203u);
+    EXPECT(CELL_PRINT_ERROR_INVALID_PARAM,            0x8002C404u);
+    EXPECT(CELL_VIDEO_UPLOAD_ERROR_PARAM,             0x8002D022u);
+    EXPECT(CELL_GEM_ERROR_NOT_INITIALIZED,            0x80121803u);
+    EXPECT(CELL_GEM_ERROR_INVALID_PARAMETER,          0x80121804u);
+    EXPECT(CELL_HTTPS_ERROR_NOT_INITIALIZED,          0x80710002u);
+    EXPECT(CELL_FONTFT_ERROR_INVALID_PARAMETER,       0x80540002u);
+    EXPECT(CELL_SYNC_ERROR_ALIGN,                     0x80410110u);
+    EXPECT(CELL_SYNC_ERROR_NULL_POINTER,              0x80410111u);
+    EXPECT(CELL_SYNC_ERROR_STAT,                      0x8041010Fu);
     EXPECT(CELL_PAD_ERROR_NO_DEVICE,         0x80121107u);   /* 0x80121105 is RESOURCE_ALLOCATION_FAILED */
     EXPECT(CELL_MAX_PADS,                    127u);
     if (fails) return 1;
-    puts("PASS: GCM, SPURS core and task, audio and pad error bases");
+    puts("PASS: all verified PS3 module error bases match console/RPCS3");
     return 0;
 }

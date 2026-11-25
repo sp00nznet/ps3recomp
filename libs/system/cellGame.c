@@ -405,7 +405,7 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     if (size_ea) {
         vm_write32(size_ea + 0, (u32)content_free_kb_reported());
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
-        vm_write32(size_ea + 8, 0);                           /* sysSizeKB */
+        vm_write32(size_ea + 8, 4);                           /* sysSizeKB (PS3/RPCS3: 4 KB) */
     }
 
     if (dir_ea) {
