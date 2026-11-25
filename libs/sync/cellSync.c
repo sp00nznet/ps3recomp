@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- sync_trace(); pulled in transitively by windows.h, absent on POSIX */
 #include <string.h>
+#include <stddef.h>   /* offsetof */
 #include "ps3emu/log_first.h"
 
 /* Yield hint for spin-wait loops */
@@ -184,207 +185,301 @@ s32 cellSyncMutexUnlock(CellSyncMutex* mutex)
 }
 
 /* =========================================================================
- * Barrier
+ * Barrier (4-byte guest BE state machine: {u16 value, u16 count})
+ *   Bit 15 of value (0x8000) is set when value reaches count (drain/wait phase)
+ *   and cleared when the final waiter decrements the remaining count to 0.
+ *   Verified byte-for-byte against stock RPCS3 libsre.sprx.
  * =====================================================================*/
 
 s32 cellSyncBarrierInitialize(CellSyncBarrier* barrier, u16 totalCount)
 {
-    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
-    if (!barrier)
+    uint32_t ea = (uint32_t)(uintptr_t)barrier;
+    if (!ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
-
-    if (totalCount == 0)
+    if (ea & 3u)
+        return CELL_SYNC_ERROR_ALIGN;
+    if (totalCount == 0 || totalCount > 0x7FFFu)
         return CELL_SYNC_ERROR_INVAL;
 
-    atomic_store(&barrier->arrived, 0);
-    barrier->total = totalCount;
-    atomic_store(&barrier->phase, 0);
-
+    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
+    atomic_store(&barrier->word, sync_bswap32((uint32_t)totalCount));
     return CELL_OK;
 }
 
 s32 cellSyncBarrierNotify(CellSyncBarrier* barrier)
 {
-    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
-    if (!barrier)
+    uint32_t ea = (uint32_t)(uintptr_t)barrier;
+    if (!ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    if (ea & 3u)
+        return CELL_SYNC_ERROR_ALIGN;
 
-    unsigned int old_arrived = atomic_fetch_add(&barrier->arrived, 1);
-
-    /* If we're the last to arrive, advance the phase and reset */
-    if (old_arrived + 1 >= barrier->total) {
-        atomic_store(&barrier->arrived, 0);
-        atomic_fetch_add(&barrier->phase, 1);
+    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
+    int spins = 0;
+    for (;;) {
+        uint32_t raw = atomic_load(&barrier->word);
+        uint32_t g   = sync_bswap32(raw);
+        uint16_t val = (uint16_t)(g >> 16);
+        uint16_t cnt = (uint16_t)(g & 0xFFFFu);
+        if (cnt == 0)
+            return CELL_SYNC_ERROR_INVAL;
+        if (val & 0x8000u) {
+            if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
+            continue;
+        }
+        uint16_t next = (uint16_t)(val + 1u);
+        if (next >= cnt)
+            next = (uint16_t)(0x8000u | cnt);
+        uint32_t ng = ((uint32_t)next << 16) | cnt;
+        if (atomic_compare_exchange_weak(&barrier->word, &raw, sync_bswap32(ng)))
+            return CELL_OK;
     }
-
-    return CELL_OK;
 }
 
 s32 cellSyncBarrierTryNotify(CellSyncBarrier* barrier)
 {
-    /* Same as notify for this implementation. Forward the GUEST pointer as it
-     * arrived -- cellSyncBarrierNotify translates it, and translating here too
-     * added vm_base twice. */
-    return cellSyncBarrierNotify(barrier);
+    uint32_t ea = (uint32_t)(uintptr_t)barrier;
+    if (!ea)
+        return CELL_SYNC_ERROR_NULL_POINTER;
+    if (ea & 3u)
+        return CELL_SYNC_ERROR_ALIGN;
+
+    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
+    for (;;) {
+        uint32_t raw = atomic_load(&barrier->word);
+        uint32_t g   = sync_bswap32(raw);
+        uint16_t val = (uint16_t)(g >> 16);
+        uint16_t cnt = (uint16_t)(g & 0xFFFFu);
+        if (cnt == 0)
+            return CELL_SYNC_ERROR_INVAL;
+        if (val & 0x8000u)
+            return CELL_SYNC_ERROR_BUSY;
+        uint16_t next = (uint16_t)(val + 1u);
+        if (next >= cnt)
+            next = (uint16_t)(0x8000u | cnt);
+        uint32_t ng = ((uint32_t)next << 16) | cnt;
+        if (atomic_compare_exchange_weak(&barrier->word, &raw, sync_bswap32(ng)))
+            return CELL_OK;
+    }
 }
 
 s32 cellSyncBarrierWait(CellSyncBarrier* barrier)
 {
-    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
-    if (!barrier)
+    uint32_t ea = (uint32_t)(uintptr_t)barrier;
+    if (!ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    if (ea & 3u)
+        return CELL_SYNC_ERROR_ALIGN;
 
-    unsigned int phase = atomic_load(&barrier->phase);
+    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
     int spins = 0;
-
-    /* Wait until the phase changes (all have arrived) */
-    while (atomic_load(&barrier->phase) == phase) {
-        if (++spins > 1000) {
-            SYNC_YIELD();
-            spins = 0;
+    for (;;) {
+        uint32_t raw = atomic_load(&barrier->word);
+        uint32_t g   = sync_bswap32(raw);
+        uint16_t val = (uint16_t)(g >> 16);
+        uint16_t cnt = (uint16_t)(g & 0xFFFFu);
+        if (cnt == 0)
+            return CELL_SYNC_ERROR_INVAL;
+        if (!(val & 0x8000u)) {
+            if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
+            continue;
         }
+        uint16_t rem  = (uint16_t)((val & 0x7FFFu) - 1u);
+        uint16_t next = rem ? (uint16_t)(0x8000u | rem) : 0u;
+        uint32_t ng   = ((uint32_t)next << 16) | cnt;
+        if (atomic_compare_exchange_weak(&barrier->word, &raw, sync_bswap32(ng)))
+            return CELL_OK;
     }
-
-    return CELL_OK;
 }
 
 s32 cellSyncBarrierTryWait(CellSyncBarrier* barrier)
 {
-    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
-    if (!barrier)
+    uint32_t ea = (uint32_t)(uintptr_t)barrier;
+    if (!ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
+    if (ea & 3u)
+        return CELL_SYNC_ERROR_ALIGN;
 
-    /* Check if all have arrived (count == 0 means reset happened) */
-    if (atomic_load(&barrier->arrived) != 0)
-        return CELL_SYNC_ERROR_BUSY;
-
-    return CELL_OK;
+    barrier = GUEST_PTR(barrier, CellSyncBarrier*);
+    for (;;) {
+        uint32_t raw = atomic_load(&barrier->word);
+        uint32_t g   = sync_bswap32(raw);
+        uint16_t val = (uint16_t)(g >> 16);
+        uint16_t cnt = (uint16_t)(g & 0xFFFFu);
+        if (cnt == 0)
+            return CELL_SYNC_ERROR_INVAL;
+        if (!(val & 0x8000u))
+            return CELL_SYNC_ERROR_BUSY;
+        uint16_t rem  = (uint16_t)((val & 0x7FFFu) - 1u);
+        uint16_t next = rem ? (uint16_t)(0x8000u | rem) : 0u;
+        uint32_t ng   = ((uint32_t)next << 16) | cnt;
+        if (atomic_compare_exchange_weak(&barrier->word, &raw, sync_bswap32(ng)))
+            return CELL_OK;
+    }
 }
 
 /* =========================================================================
- * Reader-Writer Memory
+ * Reader-Writer Memory (16-byte guest BE layout, verified against RPCS3)
+ *   +0x00: BE u16 readers, BE u16 writers
+ *   +0x04: BE u32 buffer_size (multiple of 128, <= 16384)
+ *   +0x08: BE u64 ea_buffer (32-bit guest EA)
  * =====================================================================*/
+
+static void rwm_release_reader(CellSyncRwm* rwm)
+{
+    for (;;) {
+        uint32_t raw = atomic_load(&rwm->ctrl);
+        uint32_t g   = sync_bswap32(raw);
+        uint16_t rdr = (uint16_t)(g >> 16);
+        uint16_t wrt = (uint16_t)(g & 0xFFFFu);
+        uint32_t ng  = ((uint32_t)(uint16_t)(rdr - 1u) << 16) | wrt;
+        if (atomic_compare_exchange_weak(&rwm->ctrl, &raw, sync_bswap32(ng)))
+            return;
+    }
+}
+
+static void rwm_release_writer(CellSyncRwm* rwm)
+{
+    for (;;) {
+        uint32_t raw = atomic_load(&rwm->ctrl);
+        uint32_t g   = sync_bswap32(raw);
+        uint16_t rdr = (uint16_t)(g >> 16);
+        uint32_t ng  = ((uint32_t)rdr << 16) | 0u;
+        if (atomic_compare_exchange_weak(&rwm->ctrl, &raw, sync_bswap32(ng)))
+            return;
+    }
+}
 
 s32 cellSyncRwmInitialize(CellSyncRwm* rwm, void* buffer, u32 size)
 {
-    rwm = GUEST_PTR(rwm, CellSyncRwm*);
-    buffer = GUEST_PTR(buffer, void*);
-    if (!rwm || !buffer)
+    uint32_t rwm_ea = (uint32_t)(uintptr_t)rwm;
+    uint32_t buf_ea = (uint32_t)(uintptr_t)buffer;
+    if (!rwm_ea || !buf_ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
-
-    if (size == 0)
+    if ((rwm_ea & 15u) || (buf_ea & 127u))
+        return CELL_SYNC_ERROR_ALIGN;
+    if (size == 0 || (size & 127u) != 0 || size > 16384u)
         return CELL_SYNC_ERROR_INVAL;
 
-    atomic_store(&rwm->readers, 0);
-    atomic_store(&rwm->writer, 0);
-    rwm->size = size;
-    rwm->buffer = buffer;
+    rwm = GUEST_PTR(rwm, CellSyncRwm*);
+    atomic_store(&rwm->ctrl, 0u);
+    rwm->size_be      = sync_bswap32(size);
+    rwm->buffer_ea_be = ps3_bswap64((u64)buf_ea);
 
     return CELL_OK;
 }
 
 s32 cellSyncRwmRead(CellSyncRwm* rwm, void* dst)
 {
-    rwm = GUEST_PTR(rwm, CellSyncRwm*);
-    dst = GUEST_PTR(dst, void*);
-    if (!rwm || !dst)
+    uint32_t rwm_ea = (uint32_t)(uintptr_t)rwm;
+    uint32_t dst_ea = (uint32_t)(uintptr_t)dst;
+    if (!rwm_ea || !dst_ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
+    rwm = GUEST_PTR(rwm, CellSyncRwm*);
+    dst = GUEST_PTR(dst, void*);
+
     int spins = 0;
-
-    /* Wait until no writer is active */
-    while (atomic_load(&rwm->writer)) {
-        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
-    }
-
-    atomic_fetch_add(&rwm->readers, 1);
-
-    /* Double-check no writer started */
-    while (atomic_load(&rwm->writer)) {
-        atomic_fetch_sub(&rwm->readers, 1);
-        while (atomic_load(&rwm->writer)) {
+    for (;;) {
+        uint32_t raw = atomic_load(&rwm->ctrl);
+        uint32_t g   = sync_bswap32(raw);
+        uint16_t rdr = (uint16_t)(g >> 16);
+        uint16_t wrt = (uint16_t)(g & 0xFFFFu);
+        if (wrt != 0) {
             if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
+            continue;
         }
-        atomic_fetch_add(&rwm->readers, 1);
+        uint32_t ng = ((uint32_t)(uint16_t)(rdr + 1u) << 16) | 0u;
+        if (atomic_compare_exchange_weak(&rwm->ctrl, &raw, sync_bswap32(ng)))
+            break;
     }
 
-    memcpy(dst, rwm->buffer, rwm->size);
-    atomic_fetch_sub(&rwm->readers, 1);
+    uint32_t buf_ea = (uint32_t)ps3_bswap64(rwm->buffer_ea_be);
+    uint32_t sz     = sync_bswap32(rwm->size_be);
+    memcpy(dst, vm_base + buf_ea, sz);
+    rwm_release_reader(rwm);
 
     return CELL_OK;
 }
 
 s32 cellSyncRwmTryRead(CellSyncRwm* rwm, void* dst)
 {
-    rwm = GUEST_PTR(rwm, CellSyncRwm*);
-    dst = GUEST_PTR(dst, void*);
-    if (!rwm || !dst)
+    uint32_t rwm_ea = (uint32_t)(uintptr_t)rwm;
+    uint32_t dst_ea = (uint32_t)(uintptr_t)dst;
+    if (!rwm_ea || !dst_ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    if (atomic_load(&rwm->writer))
-        return CELL_SYNC_ERROR_BUSY;
+    rwm = GUEST_PTR(rwm, CellSyncRwm*);
+    dst = GUEST_PTR(dst, void*);
 
-    atomic_fetch_add(&rwm->readers, 1);
-
-    if (atomic_load(&rwm->writer)) {
-        atomic_fetch_sub(&rwm->readers, 1);
-        return CELL_SYNC_ERROR_BUSY;
+    for (;;) {
+        uint32_t raw = atomic_load(&rwm->ctrl);
+        uint32_t g   = sync_bswap32(raw);
+        uint16_t rdr = (uint16_t)(g >> 16);
+        uint16_t wrt = (uint16_t)(g & 0xFFFFu);
+        if (wrt != 0)
+            return CELL_SYNC_ERROR_BUSY;
+        uint32_t ng = ((uint32_t)(uint16_t)(rdr + 1u) << 16) | 0u;
+        if (atomic_compare_exchange_weak(&rwm->ctrl, &raw, sync_bswap32(ng)))
+            break;
     }
 
-    memcpy(dst, rwm->buffer, rwm->size);
-    atomic_fetch_sub(&rwm->readers, 1);
+    uint32_t buf_ea = (uint32_t)ps3_bswap64(rwm->buffer_ea_be);
+    uint32_t sz     = sync_bswap32(rwm->size_be);
+    memcpy(dst, vm_base + buf_ea, sz);
+    rwm_release_reader(rwm);
 
     return CELL_OK;
 }
 
 s32 cellSyncRwmWrite(CellSyncRwm* rwm, const void* src)
 {
-    rwm = GUEST_PTR(rwm, CellSyncRwm*);
-    src = GUEST_PTR(src, const void*);
-    if (!rwm || !src)
+    uint32_t rwm_ea = (uint32_t)(uintptr_t)rwm;
+    uint32_t src_ea = (uint32_t)(uintptr_t)src;
+    if (!rwm_ea || !src_ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    unsigned int expected;
+    rwm = GUEST_PTR(rwm, CellSyncRwm*);
+    src = GUEST_PTR(src, const void*);
+
     int spins = 0;
-
-    /* Acquire write lock */
     for (;;) {
-        expected = 0;
-        if (atomic_compare_exchange_weak(&rwm->writer, &expected, 1))
+        uint32_t raw = atomic_load(&rwm->ctrl);
+        uint32_t g   = sync_bswap32(raw);
+        if (g != 0u) {
+            if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
+            continue;
+        }
+        if (atomic_compare_exchange_weak(&rwm->ctrl, &raw, sync_bswap32(1u)))
             break;
-        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
     }
 
-    /* Wait for all readers to finish */
-    spins = 0;
-    while (atomic_load(&rwm->readers) > 0) {
-        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
-    }
-
-    memcpy(rwm->buffer, src, rwm->size);
-    atomic_store(&rwm->writer, 0);
+    uint32_t buf_ea = (uint32_t)ps3_bswap64(rwm->buffer_ea_be);
+    uint32_t sz     = sync_bswap32(rwm->size_be);
+    memcpy(vm_base + buf_ea, src, sz);
+    rwm_release_writer(rwm);
 
     return CELL_OK;
 }
 
 s32 cellSyncRwmTryWrite(CellSyncRwm* rwm, const void* src)
 {
-    rwm = GUEST_PTR(rwm, CellSyncRwm*);
-    src = GUEST_PTR(src, const void*);
-    if (!rwm || !src)
+    uint32_t rwm_ea = (uint32_t)(uintptr_t)rwm;
+    uint32_t src_ea = (uint32_t)(uintptr_t)src;
+    if (!rwm_ea || !src_ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    unsigned int expected = 0;
-    if (!atomic_compare_exchange_strong(&rwm->writer, &expected, 1))
+    rwm = GUEST_PTR(rwm, CellSyncRwm*);
+    src = GUEST_PTR(src, const void*);
+
+    uint32_t expected = 0u;
+    if (!atomic_compare_exchange_strong(&rwm->ctrl, &expected, sync_bswap32(1u)))
         return CELL_SYNC_ERROR_BUSY;
 
-    if (atomic_load(&rwm->readers) > 0) {
-        atomic_store(&rwm->writer, 0);
-        return CELL_SYNC_ERROR_BUSY;
-    }
-
-    memcpy(rwm->buffer, src, rwm->size);
-    atomic_store(&rwm->writer, 0);
+    uint32_t buf_ea = (uint32_t)ps3_bswap64(rwm->buffer_ea_be);
+    uint32_t sz     = sync_bswap32(rwm->size_be);
+    memcpy(vm_base + buf_ea, src, sz);
+    rwm_release_writer(rwm);
 
     return CELL_OK;
 }
@@ -596,29 +691,51 @@ s32 cellSyncQueueClear(CellSyncQueue* queue)
  * A true lock-free implementation would use multi-word CAS.
  * =====================================================================*/
 
+_Static_assert(sizeof(CellSyncLFQueue) == CELL_SYNC_LFQUEUE_SIZE,
+               "CellSyncLFQueue must be one 128-byte line");
+_Static_assert(offsetof(CellSyncLFQueue, size_be) == 0x10 &&
+               offsetof(CellSyncLFQueue, depth_be) == 0x14 &&
+               offsetof(CellSyncLFQueue, buffer_be) == 0x18 &&
+               offsetof(CellSyncLFQueue, direction_be) == 0x24 &&
+               offsetof(CellSyncLFQueue, head) == 0x40 &&
+               offsetof(CellSyncLFQueue, eaSignal_be) == 0x70,
+               "CellSyncLFQueue guest offsets");
+
+static inline u32 lfq_depth(const CellSyncLFQueue* q) { return ps3_bswap32(q->depth_be); }
+static inline u32 lfq_size(const CellSyncLFQueue* q)  { return ps3_bswap32(q->size_be); }
+static inline u32 lfq_buf(const CellSyncLFQueue* q)   { return (u32)ps3_bswap64(q->buffer_be); }
+static inline u32 lfq_direction(const CellSyncLFQueue* q) { return ps3_bswap32(q->direction_be); }
+
 s32 cellSyncLFQueueInitialize(CellSyncLFQueue* queue, void* buffer,
                                u32 size, u32 depth, u32 direction,
                                void* eaSignal)
 {
-    queue = GUEST_PTR(queue, CellSyncLFQueue*);
-    buffer = GUEST_PTR(buffer, void*);
-    eaSignal = GUEST_PTR(eaSignal, void*);
-    (void)eaSignal;
+    const u32 q_ea   = (u32)(uintptr_t)queue;
+    const u32 buf_ea = (u32)(uintptr_t)buffer;
+    const u32 sig_ea = (u32)(uintptr_t)eaSignal;
 
-    if (!queue || !buffer)
+    if (!q_ea || !buf_ea)
         return CELL_SYNC_ERROR_NULL_POINTER;
-
+    /* Sony libsync.sprx (fw 4.93): queue+4 -> CELL_SYNC_ERROR_ALIGN. */
+    if (q_ea & (CELL_SYNC_LFQUEUE_ALIGN - 1u))
+        return CELL_SYNC_ERROR_ALIGN;
     if (size == 0 || depth == 0)
         return CELL_SYNC_ERROR_INVAL;
 
+    queue  = GUEST_PTR(queue, CellSyncLFQueue*);
+    buffer = GUEST_PTR(buffer, void*);
+
+    /* Zeroed line + big-endian header, as Sony leaves it. */
+    memset(queue, 0, CELL_SYNC_LFQUEUE_SIZE);
+    queue->size_be      = ps3_bswap32(size);
+    queue->depth_be     = ps3_bswap32(depth);
+    queue->buffer_be    = ps3_bswap64((u64)buf_ea);
+    queue->direction_be = ps3_bswap32(direction);
+    queue->eaSignal_be  = ps3_bswap64((u64)sig_ea);
     atomic_store(&queue->head, 0);
     atomic_store(&queue->tail, 0);
     atomic_store(&queue->count, 0);
     atomic_store(&queue->lock, 0);
-    queue->depth = depth;
-    queue->elemSize = size;
-    queue->buffer = (u8*)buffer;
-    queue->direction = direction;
 
     memset(buffer, 0, (size_t)size * depth);
 
@@ -634,22 +751,24 @@ s32 cellSyncLFQueuePush(CellSyncLFQueue* queue, const void* data)
     if (!queue || !data)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    int spins = 0;
-    while (atomic_load(&queue->count) >= queue->depth) {
-        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
-    }
+    for (;;) {
+        int spins = 0;
+        while (atomic_load(&queue->count) >= lfq_depth(queue)) {
+            if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
+        }
 
-    queue_spinlock_acquire(&queue->lock);
+        queue_spinlock_acquire(&queue->lock);
 
-    if (atomic_load(&queue->count) >= queue->depth) {
+        if (atomic_load(&queue->count) < lfq_depth(queue))
+            break;
+
         queue_spinlock_release(&queue->lock);
-        return cellSyncLFQueuePush(queue, data);
     }
 
     u32 tail = atomic_load(&queue->tail);
-    memcpy(queue->buffer + (size_t)tail * queue->elemSize,
-           data, queue->elemSize);
-    atomic_store(&queue->tail, (tail + 1) % queue->depth);
+    memcpy(vm_base + lfq_buf(queue) + (size_t)tail * lfq_size(queue),
+           data, lfq_size(queue));
+    atomic_store(&queue->tail, (tail + 1) % lfq_depth(queue));
     atomic_fetch_add(&queue->count, 1);
 
     queue_spinlock_release(&queue->lock);
@@ -663,22 +782,22 @@ s32 cellSyncLFQueueTryPush(CellSyncLFQueue* queue, const void* data)
     if (!queue || !data)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    if (atomic_load(&queue->count) >= queue->depth)
+    if (atomic_load(&queue->count) >= lfq_depth(queue))
         return CELL_SYNC_ERROR_OVERFLOW;
 
     unsigned int expected = 0;
     if (!atomic_compare_exchange_strong(&queue->lock, &expected, 1))
         return CELL_SYNC_ERROR_BUSY;
 
-    if (atomic_load(&queue->count) >= queue->depth) {
+    if (atomic_load(&queue->count) >= lfq_depth(queue)) {
         atomic_store(&queue->lock, 0);
         return CELL_SYNC_ERROR_OVERFLOW;
     }
 
     u32 tail = atomic_load(&queue->tail);
-    memcpy(queue->buffer + (size_t)tail * queue->elemSize,
-           data, queue->elemSize);
-    atomic_store(&queue->tail, (tail + 1) % queue->depth);
+    memcpy(vm_base + lfq_buf(queue) + (size_t)tail * lfq_size(queue),
+           data, lfq_size(queue));
+    atomic_store(&queue->tail, (tail + 1) % lfq_depth(queue));
     atomic_fetch_add(&queue->count, 1);
 
     atomic_store(&queue->lock, 0);
@@ -692,22 +811,24 @@ s32 cellSyncLFQueuePop(CellSyncLFQueue* queue, void* data)
     if (!queue || !data)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    int spins = 0;
-    while (atomic_load(&queue->count) == 0) {
-        if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
-    }
+    for (;;) {
+        int spins = 0;
+        while (atomic_load(&queue->count) == 0) {
+            if (++spins > 1000) { SYNC_YIELD(); spins = 0; }
+        }
 
-    queue_spinlock_acquire(&queue->lock);
+        queue_spinlock_acquire(&queue->lock);
 
-    if (atomic_load(&queue->count) == 0) {
+        if (atomic_load(&queue->count) > 0)
+            break;
+
         queue_spinlock_release(&queue->lock);
-        return cellSyncLFQueuePop(queue, data);
     }
 
     u32 head = atomic_load(&queue->head);
-    memcpy(data, queue->buffer + (size_t)head * queue->elemSize,
-           queue->elemSize);
-    atomic_store(&queue->head, (head + 1) % queue->depth);
+    memcpy(data, vm_base + lfq_buf(queue) + (size_t)head * lfq_size(queue),
+           lfq_size(queue));
+    atomic_store(&queue->head, (head + 1) % lfq_depth(queue));
     atomic_fetch_sub(&queue->count, 1);
 
     queue_spinlock_release(&queue->lock);
@@ -734,9 +855,9 @@ s32 cellSyncLFQueueTryPop(CellSyncLFQueue* queue, void* data)
     }
 
     u32 head = atomic_load(&queue->head);
-    memcpy(data, queue->buffer + (size_t)head * queue->elemSize,
-           queue->elemSize);
-    atomic_store(&queue->head, (head + 1) % queue->depth);
+    memcpy(data, vm_base + lfq_buf(queue) + (size_t)head * lfq_size(queue),
+           lfq_size(queue));
+    atomic_store(&queue->head, (head + 1) % lfq_depth(queue));
     atomic_fetch_sub(&queue->count, 1);
 
     atomic_store(&queue->lock, 0);
@@ -750,7 +871,7 @@ s32 cellSyncLFQueueGetDirection(const CellSyncLFQueue* queue, u32* dir)
     if (!queue || !dir)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    *dir = queue->direction;
+    *dir = ps3_bswap32(lfq_direction(queue));            /* host dir -> BE out-param */
     return CELL_OK;
 }
 
@@ -761,7 +882,7 @@ s32 cellSyncLFQueueDepth(const CellSyncLFQueue* queue, u32* depth)
     if (!queue || !depth)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    *depth = queue->depth;
+    *depth = ps3_bswap32(lfq_depth(queue));              /* host depth -> BE out-param */
     return CELL_OK;
 }
 
@@ -772,7 +893,7 @@ s32 cellSyncLFQueueSize(CellSyncLFQueue* queue, u32* size)
     if (!queue || !size)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
-    *size = atomic_load(&queue->count);
+    *size = ps3_bswap32(atomic_load(&queue->count));
     return CELL_OK;
 }
 
