@@ -1278,6 +1278,21 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
                               funcStat, funcFile, container, userdata);
 }
 
+/* The save direction: funcFixed picks or names the directory from the list,
+ * then funcStat and funcFile write it, with no dialog. It had no entry at all,
+ * so the import answered CELL_OK without running a callback and a title
+ * waiting on its own callbacks to finish the save waited forever. */
+s32 cellSaveDataListAutoSave(u32 version, u32 errDialog,
+                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata)
+{
+    return savedata_list_auto(1, version, errDialog, setList, setBuf, funcFixed,
+                              funcStat, funcFile, container, userdata);
+}
+
 s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            u32 errDialog,
                            CellSaveDataSetBuf* setBuf,
@@ -1619,6 +1634,19 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
         (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
 }
 
+/* ListAutoSave, the same: userdata is its ninth argument. */
+static void hle_cellSaveDataListAutoSave(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoSave(
+        (u32)ctx->gpr[3], (u32)ctx->gpr[4],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[5],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
+}
+
 /* UserListAutoLoad and UserListAutoSave are ListAutoLoad and ListAutoSave with
  * userId inserted after version, which makes them ten-argument entries:
  * errDialog is in r5, setList..funcFile in r6..r10, container and userdata in
@@ -1665,6 +1693,8 @@ void cellSaveData_register_ctx_handlers(void)
                          hle_cellSaveDataUserListAutoLoad);
     ps3_hle_register_ctx(0x0E091C36u, "cellSaveDataUserListAutoSave",
                          hle_cellSaveDataUserListAutoSave);
+    ps3_hle_register_ctx(0x4DD03A4Eu, "cellSaveDataListAutoSave",
+                         hle_cellSaveDataListAutoSave);
 }
 
 s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,

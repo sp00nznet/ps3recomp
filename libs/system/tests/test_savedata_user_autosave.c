@@ -7,6 +7,8 @@
  * cellSaveDataUserListAutoLoad / UserListAutoSave take ten: userId follows
  * version, and container and userdata are the ninth and tenth, at SP+112 and
  * SP+120. Their funcFixed picks the directory, funcStat then runs on it.
+ * cellSaveDataListAutoSave is the nine-argument list form with userdata at
+ * SP+112.
  *
  * This registers cellSaveData's context handlers into a local table, then
  * calls each handler the way the dispatcher does and checks the userdata
@@ -149,6 +151,48 @@ static void run10(const char* name, uint32_t nid, int is_save, uint32_t userdata
     check(param_sfo_exists() == is_save, what);
 }
 
+/* cellSaveDataListAutoSave: the nine-argument list form (no userId), so
+ * errDialog is r4, setList..funcFile r5..r9, container r10 and userdata the
+ * ninth argument on the caller's stack. */
+static void run9_list_save(uint32_t userdata)
+{
+    const char* name = "cellSaveDataListAutoSave";
+    char what[160];
+    void (*fn)(ppu_context*) = find(0x4DD03A4Eu);
+    snprintf(what, sizeof what, "%s (NID 0x4DD03A4E) has a context handler", name);
+    check(fn != NULL, what);
+    if (!fn) return;
+    char path[1100];
+    snprintf(path, sizeof path, "%s/" LISTED_DIR "/PARAM.SFO", s_save_root);
+    remove(path);                 /* left by the user list save above */
+    ppu_context ctx = {0};
+    ctx.gpr[1]  = 0x400;          /* caller SP */
+    ctx.gpr[3]  = 0;              /* version */
+    ctx.gpr[4]  = 0;              /* errDialog */
+    ctx.gpr[5]  = 0x100;          /* setList: prefix at +8 */
+    ctx.gpr[6]  = 0x200;          /* setBuf: dirListMax at +0 */
+    ctx.gpr[7]  = FIXED_OPD;      /* funcFixed */
+    ctx.gpr[8]  = STAT_OPD;       /* funcStat */
+    ctx.gpr[9]  = 0xA00;          /* funcFile */
+    ctx.gpr[10] = 0;              /* container */
+    vm_write64(0x400 + 112, userdata);
+    s_fixed_calls = s_stat_calls = 0;
+    s_fixed_userdata = s_seen_userdata = s_fixed_dir_num = 0;
+    s_stat_sets_param = 1;
+    fn(&ctx);
+    snprintf(what, sizeof what, "%s: returns CELL_OK", name);
+    check((s32)ctx.gpr[3] == CELL_OK, what);
+    snprintf(what, sizeof what, "%s: funcFixed ran once and listed the one matching directory", name);
+    check(s_fixed_calls == 1 && s_fixed_dir_num == 1, what);
+    snprintf(what, sizeof what, "%s: funcStat ran once on the chosen directory", name);
+    check(s_stat_calls == 1, what);
+    snprintf(what, sizeof what, "%s: userdata 0x%08X reached funcFixed (0x%08X) and funcStat (0x%08X)",
+             name, userdata, s_fixed_userdata, s_seen_userdata);
+    check(s_fixed_userdata == userdata && s_seen_userdata == userdata, what);
+    snprintf(what, sizeof what, "%s: PARAM.SFO is written (the save direction)", name);
+    check(param_sfo_exists(), what);
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2 || strlen(argv[1]) >= sizeof s_save_root) {
@@ -180,6 +224,7 @@ int main(int argc, char** argv)
     strcpy((char*)vm_base + PARAM_EA, "Test save");
     run10("cellSaveDataUserListAutoLoad", 0x248BD1D8u, 0, 0x0002CAFEu);
     run10("cellSaveDataUserListAutoSave", 0x0E091C36u, 1, 0x0002BEEFu);
+    run9_list_save(0x0003BEEFu);
 
     free(vm_base);
     if (s_failed) { printf("FAIL (%d failed)\n", s_failed); return 1; }

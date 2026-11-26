@@ -315,6 +315,13 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
                             CellSaveDataFileCallback funcFile,
                             u32 container, void* userdata);
 
+s32 cellSaveDataListAutoSave(u32 version, u32 errDialog,
+                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata);
+
 s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            u32 errDialog,
                            CellSaveDataSetBuf* setBuf,
