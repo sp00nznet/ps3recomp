@@ -1232,6 +1232,18 @@ int main(void)
     CHECK(cause == SPU_GROUP_CAUSE_ALL_THREADS_EXIT);
     CHECK(status == -7);
 
+    /* The join reaped both host threads, including one that had already
+     * finished before the join came in. */
+    CHECK(!spu_find_thread(tid0)->host_live);
+    CHECK(!spu_find_thread(tid1)->host_live);
+
+    /* A join with NULL outputs (libsre's SPURS handler thread joins its group
+     * so) answers CELL_EFAULT and writes nothing to guest address 0. */
+    memset(g_guest_mem, 0xA5, 8);
+    CHECK(call(sys_spu_thread_group_join_handler, gid, 0, 0, 0, 0, 0)
+          == (int64_t)(int32_t)CELL_EFAULT);
+    CHECK(rd_be32(0) == 0xA5A5A5A5u && rd_be32(4) == 0xA5A5A5A5u);
+
     /* And the PPU can read back what the SPU left in local store, which it
      * can only do if the two views of it are the same 256 KB. The syscall
      * writes its result as a big-endian u64 at a guest address. */
