@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "ps3emu/ps3_env_once.h"   /* ps3_env_once: the wait-path switches looked up once */
 
 struct sys_cond_waiter {
     struct sys_cond_waiter* next;
@@ -140,7 +141,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
-    const char* peek = getenv("PS3_COND_PEEK");
+    const char* peek = ps3_env_once("PS3_COND_PEEK");
     if (peek) {
         uint32_t ea = (uint32_t)strtoul(peek, NULL, 16);
         if (ea) {
@@ -152,7 +153,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     }
 #ifdef _WIN32
-    const char* spurious = getenv("PS3_COND_SPURIOUS_MS");
+    const char* spurious = ps3_env_once("PS3_COND_SPURIOUS_MS");
     long probe_ms = spurious ? atol(spurious) : 0;
     if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
 #endif

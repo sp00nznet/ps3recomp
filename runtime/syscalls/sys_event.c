@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>               /* getenv */
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_env_once.h"   /* ps3_env_once: per-call switches looked up once */
 #ifdef PS3_SYNC_TEST_HOOKS
 extern int ps3_sync_test_hook(const char* point, uint32_t id);
 #define EVT_TEST_HOOK(point, id) ((void)ps3_sync_test_hook((point), (id)))
@@ -610,7 +611,7 @@ static int64_t event_queue_receive_pinned(ppu_context* ctx, sys_event_queue_info
     /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
      * advances to content. Dump its guest call chain to identify the frame-loop
      * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
-    if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
+    if ((queue_id == 2 || queue_id == 3) && ps3_env_once("YDKJ_Q23STACK")) {
 #ifdef _WIN32
         static int _gs23 = 0; if (PS3_LOG_FIRST(_gs23, 4)) {
             void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
@@ -1251,7 +1252,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
          * sends; we only fix the port->queue routing our HLE lost. Env YDKJ_PORTROUTE
          * (default ON) can be disabled for A/B. */
         if (port_id <= SYS_EVENT_QUEUE_MAX && g_sys_event_queues[port_id - 1].active
-                && (!getenv("YDKJ_NO_PORTROUTE"))) {
+                && !ps3_env_once("YDKJ_NO_PORTROUTE")) {
             (void)event_queue_pin_locked(port_id);   /* active was just read under the table lock */
             evt_table_unlock();
             sys_event_queue_info* rq = &g_sys_event_queues[port_id - 1];
