@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 
+# python -I (isolated mode) leaves the script's own directory off sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from spu_elf import fnv1a64, scan_spu_candidates
 
 

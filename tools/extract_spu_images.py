@@ -28,6 +28,8 @@ ELF_MAGIC = b"\x7FELF"
 EM_SPU    = 23
 
 
+# python -I (isolated mode) leaves the script's own directory off sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from spu_elf import InvalidSPUELF, scan_spu_candidates, validate_spu_elf
 
 
