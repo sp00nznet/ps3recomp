@@ -1156,7 +1156,18 @@ static void spu_resv_lost_poll(spu_context* ctx)
 {
     if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
     if (!vm_base || ctx->resv_ea == 0) return;
-    if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
+    const uint8_t* line = vm_base + ctx->resv_ea;
+#if defined(__APPLE__) && defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+    /* Most polls see an unchanged line: XOR and OR all eight 16-byte chunks
+     * and reduce once at the end, instead of a byte compare. */
+    uint8x16_t differences = vdupq_n_u8(0);
+    for (size_t i = 0; i < 128; i += 16)
+        differences = vorrq_u8(differences, veorq_u8(vld1q_u8(line + i), vld1q_u8(ctx->resv_line + i)));
+    const int changed = vmaxvq_u8(differences) != 0;
+#else
+    const int changed = memcmp(line, ctx->resv_line, 128) != 0;
+#endif
+    if (changed) {
         ctx->resv_valid = 0;
         SPU_EVENT_SET(ctx, 0x400u);
     }
