@@ -113,14 +113,23 @@ uint64_t ps3_system_time_us(void)
 uint64_t host_monotonic_ns(void)
 {
 #ifdef __APPLE__
-    static uint32_t numer, denom;
-    if (!denom) {                       /* benign race: same values either way */
+    /* numer and denom in one 64-bit word, so a thread reading the clock for
+     * the first time never sees one half from another thread's store. */
+    static uint64_t cached_ratio;
+    uint64_t ratio = __atomic_load_n(&cached_ratio, __ATOMIC_RELAXED);
+    if (!ratio) {
         mach_timebase_info_data_t tb;
         mach_timebase_info(&tb);
-        numer = tb.numer; denom = tb.denom;
+        ratio = ((uint64_t)tb.numer << 32) | tb.denom;
+        __atomic_store_n(&cached_ratio, ratio, __ATOMIC_RELAXED);
     }
     const uint64_t t = mach_absolute_time();
-    /* Split so t * numer cannot overflow (numer is 125 on Apple silicon). */
+    /* Apple silicon's timebase is always 125/3 (24 MHz). With constants the
+     * compiler does the division without a hardware divide. */
+    if (ratio == ((UINT64_C(125) << 32) | 3) && t <= UINT64_MAX / 125)
+        return t * 125 / 3;
+    /* Split so t * numer cannot overflow. */
+    const uint32_t numer = (uint32_t)(ratio >> 32), denom = (uint32_t)ratio;
     return (t / denom) * numer + (t % denom) * numer / denom;
 #else
     struct timespec ts;
