@@ -27,14 +27,14 @@ env = {k: v for k, v in os.environ.items() if k not in ('PS3_PRIO_START', 'PS3_P
 env['PS3_PRIO_TEST_HOST_DELAY_MS'] = str(args.host_delay_ms)
 
 
-def compile_fixture(tmp, fixture, name, runtime=None):
+def compile_fixture(tmp, fixture, name, runtime=None, source=None):
     binary = tmp / name
     defines = ['-DPPU_THREAD_IMPLEMENTATION="' + str(runtime) + '"'] if runtime else []
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-D_GNU_SOURCE', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'runtime'),
                     '-I' + str(root / 'runtime/syscalls'), *defines,
-                    str(root / 'tests' / fixture), *linker, '-o', str(binary)], check=True)
+                    str(source or root / 'tests' / fixture), *linker, '-o', str(binary)], check=True)
     return binary
 
 
@@ -93,4 +93,15 @@ with tempfile.TemporaryDirectory(prefix='ppu-prio-start-') as temporary:
             fixture = 'test_ppu_prio_wait.c' if kind == 'wait' else 'test_ppu_prio_start.c'
             binary = compile_fixture(tmp, fixture, name, runtime)
             run(binary, on=True, reject='FAIL wait' if kind == 'wait' else 'FAIL integration')
-        print('PASS: all 10 PPU priority-start negative controls rejected')
+        # Restore the old out-of-range guest stack offsets. The protection
+        # ownership check must reject this before mprotect can harm host pages.
+        fixture = (root / 'tests/test_ppu_prio_start.c').read_text()
+        before = 'g_vm_stack_alloc.next_addr = 0x10000u; g_vm_stack_alloc.region_end = ppu_vm_size;'
+        after = 'g_vm_stack_alloc.next_addr = 0x10000000u; g_vm_stack_alloc.region_end = 0xA0000000u;'
+        if fixture.count(before) != 1:
+            raise AssertionError('guard-outside-vm: fixture mutation anchor changed')
+        source = tmp / 'guard-outside-vm.c'
+        source.write_text(fixture.replace(before, after).replace('../runtime/', (root / 'runtime').as_posix() + '/'))
+        binary = compile_fixture(tmp, '', 'guard-outside-vm', source=source)
+        run(binary, reject='FAIL integration: guard outside fixture VM')
+        print('PASS: all 11 PPU priority-start negative controls rejected')
