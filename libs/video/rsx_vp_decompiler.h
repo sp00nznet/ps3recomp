@@ -17,14 +17,14 @@
 
 #include "ps3emu/ps3types.h"
 
-/* Point size, Metal only.
+/* Point size for backends defining RSX_POINT_SIZE_BUILTIN.
  *
  * Metal leaves a point's size undefined unless the vertex function writes
  * [[point_size]], and the decompiled VSOutput has no such member. The
- * pieces below add one behind RSX_POINT_SIZE_BUILTIN. Only the HLSL-to-MSL
- * translator defines it (a glslang preamble in rsx_shader_msl.cpp), so the
- * D3D12 and Vulkan paths compile the text exactly as before: no member and
- * no extra constant row.
+ * pieces below add one behind RSX_POINT_SIZE_BUILTIN, used by the Metal
+ * and Vulkan translators. Other paths keep their previous interface.
+ * Vulkan also defines RSX_POINT_SIZE_SCALE for the sample-grid maximum;
+ * its fragment path crops the larger square to the guest pixel aspect.
  *
  * glslang's HLSL front end does not map the PSIZE semantic to the PointSize
  * built-in by itself (checked on glslang 16.6); [[vk::builtin("PointSize")]]
@@ -37,7 +37,7 @@
  *       NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, 0x1FF4: the point-size
  *       output, o[6].x), else 0
  *   .z  largest size drawn, in pixels (RSX_VP_POINT_SIZE_MAX)
- *   .w  unused
+ *   .w  sample-grid maximum for Vulkan (ignored by Metal)
  * The draw engine fills the row; a backend binding the translated MSL
  * supplies it as part of VPConst.
  *
@@ -75,10 +75,11 @@
     "#endif\n"
 #define RSX_VP_HLSL_PSIZE_FUNC \
     "#ifdef RSX_POINT_SIZE_BUILTIN\n" \
+    "#ifndef RSX_POINT_SIZE_SCALE\n#define RSX_POINT_SIZE_SCALE 1.0\n#endif\n" \
     "float vp_point_size(float from_vp) {\n" \
     "    float s = (vp_pointsize.y != 0.0) ? from_vp : vp_pointsize.x;\n" \
     "    s = (s == s) ? s : 1.0;\n" \
-    "    return min(max(s, 1.0), max(vp_pointsize.z, 1.0));\n" \
+    "    return min(max(s, 1.0), max(vp_pointsize.z, 1.0)) * RSX_POINT_SIZE_SCALE;\n" \
     "}\n" \
     "#endif\n"
 /* The assignment; `from_vp` is a string literal for the program's own size. */

@@ -934,6 +934,37 @@ if(UNIX)
                     glslang::glslang-default-resource-limits)
             endif()
             set_target_properties(test_vulkan_direct_present PROPERTIES LINKER_LANGUAGE CXX)
+            add_executable(test_vulkan_point_sprite
+                libs/video/tests/test_vulkan_point_sprite.c
+                libs/video/rsx_shader_spirv.cpp
+                libs/video/rsx_dispatch.c
+                libs/video/rsx_vertex_compact.c
+                libs/video/rsx_vertex_fetch.c
+                libs/video/rsx_texture_layout.c
+                libs/video/rsx_vp_decompiler.c
+                libs/video/rsx_fp_decompiler.c
+                libs/video/rsx_tiling.c
+            )
+            set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_vulkan_point_sprite.c"
+                PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_RSX_VULKAN=1)
+            target_include_directories(test_vulkan_point_sprite PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            )
+            if(TARGET SDL2::SDL2)
+                target_link_libraries(test_vulkan_point_sprite PRIVATE SDL2::SDL2)
+            else()
+                target_include_directories(test_vulkan_point_sprite PRIVATE ${SDL2_INCLUDE_DIRS})
+                target_link_libraries(test_vulkan_point_sprite PRIVATE ${SDL2_LIBRARIES})
+            endif()
+            target_link_libraries(test_vulkan_point_sprite PRIVATE
+                glslang::glslang glslang::SPIRV ${CMAKE_DL_LIBS} Threads::Threads m)
+            if(TARGET glslang::glslang-default-resource-limits)
+                target_link_libraries(test_vulkan_point_sprite PRIVATE
+                    glslang::glslang-default-resource-limits)
+            endif()
+            set_target_properties(test_vulkan_point_sprite PROPERTIES LINKER_LANGUAGE CXX)
         endif()
     endif()
 endif()

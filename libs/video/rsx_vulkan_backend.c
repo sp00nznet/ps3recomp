@@ -237,6 +237,8 @@ typedef struct vk_state {
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              depth_bounds_ok; /* depthBounds enabled                */
+    int              large_points_ok;
+    float            point_size_max;
     int              depth_clamp_ok;  /* depthClamp enabled                 */
     int              indep_blend_ok;  /* independentBlend: per-target MRT state */
     u32              max_dim;         /* maxImageDimension2D of the device  */
@@ -1208,7 +1210,7 @@ static int vk_ensure_vertex_buffer(VkDeviceSize bytes)
 #define VK_FP_MAX_BYTES  4096u              /* bound on a fragment program, as Metal/D3D12 */
 #define VK_HLSL_BYTES    (256u * 1024u)
 #define VK_SPV_WORDS     (256u * 1024u)
-#define VK_VPCONST_BYTES ((RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u)
+#define VK_VPCONST_BYTES ((RSX_MAX_VERTEX_CONSTANTS + 3u) * 16u)
 #define VK_GUEST_ATTRS   16u
 #define VK_GUEST_FLOATS  (VK_GUEST_ATTRS * 4u)   /* per vertex */
 
@@ -1473,6 +1475,8 @@ static int vk_guest_init(void)
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     s_g.max_ubo_range = p.limits.maxUniformBufferRange;
+    s_vk.point_size_max = s_vk.large_points_ok ? p.limits.pointSizeRange[1] : 1.0f;
+    VK_LOG("point sprites: largePoints=%d range_max=%g\n", s_vk.large_points_ok, s_vk.point_size_max);
     VkDeviceSize align = p.limits.minUniformBufferOffsetAlignment;
     if (align == 0) align = 256;
     s_g.ps_off = (VK_VPCONST_BYTES + align - 1u) / align * align;
@@ -1605,6 +1609,9 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
     else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+    float* point = (float*)(vpc + (RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u);
+    point[0] = 1.0f; point[1] = (st->vertex_attrib_output_mask & RSX_VP_OUTPUT_MASK_POINT_SIZE) ? 1.0f : 0.0f;
+    point[2] = s_vk.point_size_max < RSX_VP_POINT_SIZE_MAX ? s_vk.point_size_max : RSX_VP_POINT_SIZE_MAX; point[3] = 1.0f;
     /* PSConstants: inline constants as host-order bit patterns, then fp_alpha. */
     u8* fpc = (u8*)s_g.ubo.ptr + s_g.ps_off;
     memset(fpc, 0, fp_len);
@@ -4045,20 +4052,20 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.vs_bytes = 0; return; }
-    /* The engine's block ends in the Metal translator's vp_pointsize row (one
-     * float4), which this backend's shaders do not declare
-     * (RSX_POINT_SIZE_BUILTIN is not defined for them): never read, so it is
-     * dropped here. A block longer than that is still reported below. */
     if (bytes > VK_VPCONST_BYTES) {
-        if (bytes > VK_VPCONST_BYTES + 16u && !(s_e2.warned & 2u)) {
-            VK_LOG("engine: VS constants truncated\n");
-            s_e2.warned |= 2u;
-        }
         bytes = VK_VPCONST_BYTES;
+        if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; }
     }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
     memcpy(s_e2.ucpu, data, bytes);
+    if (bytes >= VK_VPCONST_BYTES) {
+        float* point = (float*)(s_e2.ucpu + (RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u);
+        const float scale = point[3] > 1.0f ? point[3] : 1.0f;
+        const float ceiling = s_vk.point_size_max / scale;
+        if (point[2] > ceiling) point[2] = ceiling;
+        if (!s_vk.large_points_ok) { point[2] = 1.0f; point[3] = 1.0f; }
+    }
     s_e2.vs_bytes = bytes;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
@@ -4713,6 +4720,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     memset(&want, 0, sizeof want);
     pvkGetPhysicalDeviceFeatures(s_vk.phys, &have);
     want.textureCompressionBC = have.textureCompressionBC;
+    want.largePoints = have.largePoints;
+    s_vk.large_points_ok = have.largePoints ? 1 : 0;
     /* User clip planes (rsx_vp_apply_user_clip) write ClipDistance. */
     want.shaderClipDistance = have.shaderClipDistance;
     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;

@@ -73,6 +73,17 @@ jobs:
           cmake --build build --target test_shader_spirv
           ./build/test_shader_spirv
 
+      - name: Point sprite size and coordinates through the engine
+        env:
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+        run: |
+          python3 tools/test_point_sprite_spirv.py
+          cmake --build build --target test_vulkan_point_sprite
+          rc=0; ./build/test_vulkan_point_sprite > point.log 2>&1 || rc=$?
+          cat point.log
+          [ "$rc" -eq 0 ]
+          ! grep -qE 'VUID|SYNC-HAZARD|SKIP' point.log
+
       # PS3RECOMP_VK_DIRECT_PRESENT: a direct engine present (no read-back, no
       # CPU wait) must leave the same frame a read-back present does, with
       # the validation layer's synchronization checks on, unbatched and
