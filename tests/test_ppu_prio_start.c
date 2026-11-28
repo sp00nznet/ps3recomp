@@ -3,6 +3,9 @@
  * clock separates those contracts from host scheduling latency. The unmodified
  * wait loop's transitions and exact timeout are tested in test_ppu_prio_wait.c. */
 #include "../runtime/platform/win32_compat.h"
+#include <sys/mman.h>
+static int fixture_mprotect(void* address, size_t length, int prot);
+#define mprotect fixture_mprotect
 static ULONGLONG test_tick(void);
 static void test_sleep(DWORD ms);
 static BOOL test_yield(void);
@@ -13,6 +16,7 @@ static BOOL test_yield(void);
 #define PPU_THREAD_IMPLEMENTATION "../runtime/syscalls/sys_ppu_thread.c"
 #endif
 #include PPU_THREAD_IMPLEMENTATION
+#undef mprotect
 #undef GetTickCount64
 #undef Sleep
 #undef SwitchToThread
@@ -21,7 +25,26 @@ static BOOL test_yield(void);
 #include <time.h>
 
 uint8_t* vm_base;
-uint32_t ppu_vm_size = 0x10000;
+uint32_t ppu_vm_size = 0x200000;
+static unsigned guard_protections;
+/* vm_stack_allocate sets real host guard pages. A fabricated guest offset
+ * beyond a small calloc can mprotect unrelated allocator metadata on Darwin.
+ * Keep every protection within our mapping and reject regressions before they
+ * can damage host memory; valid requests still call the real mprotect. */
+static int fixture_mprotect(void* address, size_t length, int prot)
+{
+    uintptr_t start = (uintptr_t)address, base = (uintptr_t)vm_base;
+    if (start < base || length > ppu_vm_size || start - base > ppu_vm_size - length) {
+        fprintf(stderr, "FAIL integration: guard outside fixture VM\n");
+        exit(1);
+    }
+    if (prot != PROT_NONE || mprotect(address, length, prot) != 0) {
+        fprintf(stderr, "FAIL integration: could not protect fixture guard\n");
+        exit(1);
+    }
+    ++guard_protections;
+    return 0;
+}
 void ppu_resv_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
@@ -140,8 +163,10 @@ int main(void)
     const char* delay = getenv("PS3_PRIO_TEST_HOST_DELAY_MS");
     host_delay_ms = delay ? strtol(delay, NULL, 10) : 0;
     assert(host_delay_ms >= 0 && host_delay_ms <= 1000);
-    vm_base = calloc(1, 0x10000); assert(vm_base);
-    g_vm_stack_alloc.next_addr = 0x10000000u; g_vm_stack_alloc.region_end = 0xA0000000u;
+    vm_base = mmap(NULL, ppu_vm_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    assert(vm_base != MAP_FAILED);
+    g_vm_stack_alloc.next_addr = 0x10000u; g_vm_stack_alloc.region_end = ppu_vm_size;
     g_ppu_thread_entry_trampoline = guest_entry;
     ppu_thread_register_main(); set_main_priority(1000);
     create(400, BODY_WRITE_THEN_BLOCK, on); finish_case();
@@ -154,7 +179,8 @@ int main(void)
     set_main_priority(300);
     create(400, BODY_WRITE_THEN_BLOCK, 0); finish_case();
     create(200, BODY_WRITE_THEN_BLOCK, on); finish_case();
-    free(vm_base);
+    EXPECT(guard_protections == 8);
+    EXPECT(munmap(vm_base, ppu_vm_size) == 0);
     if (g_fails) return 1;
     printf("PASS: PS3_PRIO_START %s controlled real-thread integration\n", on ? "on" : "off");
     return 0;
