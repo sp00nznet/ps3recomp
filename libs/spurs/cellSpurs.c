@@ -894,11 +894,17 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
  * instance, not the process. Grow the binding table instead of limiting the
  * entire process to eight (owner, port) pairs. All access holds this lock. */
 #define SPURS_EVENT_PORT 0u
+#include "ps3emu/error_codes.h"
 extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
                                       uint64_t data1, uint64_t data2, uint64_t data3);
 extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
 extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
-struct SpursPortBinding { u32 owner, queue; u8 port; };
+extern uint64_t sys_event_queue_generation(uint32_t queue_id);
+extern uint32_t sys_event_queue_push_generation(uint32_t id, uint64_t generation,
+    uint64_t source, uint64_t data1, uint64_t data2, uint64_t data3);
+extern void sys_event_queue_cancel_generation(uint32_t id, uint64_t generation);
+extern void sys_event_queue_uncancel_generation(uint32_t id, uint64_t generation);
+struct SpursPortBinding { u32 owner, queue; u64 generation; u8 port; };
 static struct SpursPortBinding* s_spurs_ports;
 static size_t s_spurs_event_queue_n, s_spurs_ports_capacity;
 static SRWLOCK s_spurs_queue_lock = SRWLOCK_INIT;
@@ -921,9 +927,11 @@ static void spurs_cancel_attached_queues(u32 owner)
         if (owner && s_spurs_ports[i].owner != owner) continue;
         int surviving = 0;
         for (size_t j = 0; j < s_spurs_event_queue_n; ++j)
-            if (s_spurs_ports[j].queue == s_spurs_ports[i].queue && owner &&
+            if (s_spurs_ports[j].queue == s_spurs_ports[i].queue &&
+                s_spurs_ports[j].generation == s_spurs_ports[i].generation && owner &&
                 s_spurs_ports[j].owner != owner) { surviving = 1; break; }
-        if (!surviving) sys_event_queue_cancel_by_id(s_spurs_ports[i].queue);
+        if (!surviving) sys_event_queue_cancel_generation(s_spurs_ports[i].queue,
+                                                         s_spurs_ports[i].generation);
     }
     size_t keep = 0;
     for (size_t i = 0; i < s_spurs_event_queue_n; ++i)
@@ -943,6 +951,21 @@ uint32_t spurs_port_queue(uint32_t owner, uint32_t port)
     return q;
 }
 
+/* Lock order: SPURS bindings -> LV2 table/queue. LV2 never takes this lock.
+ * Keep the binding stable until delivery finishes; once detach/finalize
+ * returns, no sender admitted through that binding remains in flight. */
+uint32_t spurs_port_send(uint32_t owner, uint32_t port, uint64_t source,
+                          uint64_t data1, uint64_t data2, uint64_t data3)
+{
+    AcquireSRWLockShared(&s_spurs_queue_lock);
+    int i = port_binding(owner, port);
+    uint32_t rc = i < 0 ? CELL_ENOTCONN :
+        sys_event_queue_push_generation(s_spurs_ports[i].queue,
+            s_spurs_ports[i].generation, source, data1, data2, data3);
+    ReleaseSRWLockShared(&s_spurs_queue_lock);
+    return rc;
+}
+
 s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port, s32 isDynamic)
 {
     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
@@ -951,6 +974,11 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port, s32 isDy
     u32 p = *out;
     if (!queue || (!isDynamic && p >= 64)) return CELL_SPURS_CORE_ERROR_INVAL;
     AcquireSRWLockExclusive(&s_spurs_queue_lock);
+    u64 generation = sys_event_queue_generation(queue);
+    if (!generation) {
+        ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+        return (s32)CELL_ESRCH; /* propagate the missing LV2 queue status */
+    }
     if (isDynamic) {
         for (u32 i = 0; i < 64; ++i) {
             p = (16 + i) % 64;
@@ -976,8 +1004,9 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port, s32 isDy
     size_t i = s_spurs_event_queue_n++;
     s_spurs_ports[i].owner = owner;
     s_spurs_ports[i].queue = queue;
+    s_spurs_ports[i].generation = generation;
     s_spurs_ports[i].port = (u8)p;
-    sys_event_queue_uncancel_by_id(queue);
+    sys_event_queue_uncancel_generation(queue, generation);
     *out = (u8)p;
     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
     printf("[cellSpurs] AttachLv2EventQueue(owner=0x%08X queue=%u port=%u)\n", owner, queue, p);
@@ -3198,9 +3227,11 @@ static void jc_signal_done(u32 jc_ea, int job_index)
         int duplicate = 0;
         for (size_t j = 0; j < i; ++j)
             if (s_spurs_ports[j].owner == owner &&
-                s_spurs_ports[j].queue == s_spurs_ports[i].queue) { duplicate = 1; break; }
+                s_spurs_ports[j].queue == s_spurs_ports[i].queue &&
+                s_spurs_ports[j].generation == s_spurs_ports[i].generation) { duplicate = 1; break; }
         if (duplicate) continue;
-        sys_event_queue_push_by_id(s_spurs_ports[i].queue, SPURS_EVENT_PORT, jc_ea, d2,
+        sys_event_queue_push_generation(s_spurs_ports[i].queue, s_spurs_ports[i].generation,
+                                  SPURS_EVENT_PORT, jc_ea, d2,
                                   d3_probe_valid ? spurs_event_data3_probe() :
                                   (answers_a_count ? mbox : 0));
     }

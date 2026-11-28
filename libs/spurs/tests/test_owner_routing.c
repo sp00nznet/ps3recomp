@@ -53,6 +53,29 @@ static int failures;
       ++failures;                                                              \
     }                                                                          \
   } while (0)
+/* Park an admitted operation on its real LV2 pin. Interlocked gates establish
+ * ordering; delays only yield while waiting, never choose the race outcome. */
+static volatile LONG pause_pin, pin_entered, release_pin, destroy_waiting;
+static uint32_t hook_queue;
+static void wait_gate(volatile LONG *gate) {
+  for (unsigned i = 0; i < 10000; ++i) {
+    if (InterlockedCompareExchange(gate, 0, 0)) return;
+    Sleep(1);
+  }
+  fputs("FAIL: lifecycle barrier timeout\n", stderr);
+  abort();
+}
+int ps3_sync_test_hook(const char *point, uint32_t id) {
+  if (id != hook_queue) return 0;
+  if (!strcmp(point, "event.operation.pinned") &&
+      InterlockedCompareExchange(&pause_pin, 0, 1) == 1) {
+    InterlockedExchange(&pin_entered, 1);
+    wait_gate(&release_pin);
+  } else if (!strcmp(point, "event.destroy.waiting_for_operations")) {
+    InterlockedExchange(&destroy_waiting, 1);
+  }
+  return 0;
+}
 static uint32_t be32(uint32_t a) {
   return (uint32_t)vm_base[a] << 24 | (uint32_t)vm_base[a + 1] << 16 |
          (uint32_t)vm_base[a + 2] << 8 | vm_base[a + 3];
@@ -184,6 +207,93 @@ static void concurrent_senders(uint32_t a, uint32_t b, uint32_t q1,
   receive(q1, 16, 0xa1);
   receive(q2, 16, 0xb1);
 }
+typedef struct {
+  uint32_t owner, queue, ack;
+  int action; /* send, destroy, detach, finalize cleanup */
+  volatile LONG started, done;
+} LifecycleOp;
+static void lifecycle_run(LifecycleOp *op) {
+  InterlockedExchange(&op->started, 1);
+  if (op->action == 0) {
+    spu_context c;
+    memset(&c, 0, sizeof c);
+    c.spurs_ea = op->owner;
+    spu_channel_write(&c.ch_out_mbox, 0xa1);
+    if (spu_deliver_user_event(&c, 1u << 24) != 1 || c.ch_in_mbox.count != 1)
+      abort();
+    op->ack = spu_channel_read(&c.ch_in_mbox);
+  } else if (op->action == 1) {
+    destroy(op->queue);
+  } else if (op->action == 2) {
+    CHECK(cellSpursDetachLv2EventQueue((CellSpurs *)(uintptr_t)op->owner, 1) == 0);
+  } else {
+    spurs_cancel_attached_queues(op->owner);
+  }
+  InterlockedExchange(&op->done, 1);
+}
+#ifdef _WIN32
+typedef HANDLE TestThread;
+static DWORD WINAPI lifecycle_entry(void *p) { lifecycle_run(p); return 0; }
+static TestThread start_op(LifecycleOp *op) {
+  HANDLE h = CreateThread(NULL, 1u << 20, lifecycle_entry, op, 0, NULL);
+  if (!h) abort();
+  return h;
+}
+static void join_op(TestThread h) {
+  if (WaitForSingleObject(h, 12000) != WAIT_OBJECT_0) abort();
+  CloseHandle(h);
+}
+#else
+typedef pthread_t TestThread;
+static void *lifecycle_entry(void *p) { lifecycle_run(p); return NULL; }
+static TestThread start_op(LifecycleOp *op) {
+  pthread_t t;
+  if (pthread_create(&t, NULL, lifecycle_entry, op)) abort();
+  return t;
+}
+static void join_op(TestThread t) { if (pthread_join(t, NULL)) abort(); }
+#endif
+static void lifecycle_race(uint32_t owner, uint32_t q, uint32_t q2, int action) {
+  attach(owner, q, 1, 0);
+  hook_queue = q;
+  InterlockedExchange(&pause_pin, 1);
+  LifecycleOp sender = {owner, q, 0, 0, 0, 0};
+  LifecycleOp closer = {owner, q, 0, action, 0, 0};
+  TestThread t1 = start_op(&sender);
+  wait_gate(&pin_entered);
+  TestThread t2 = start_op(&closer);
+  wait_gate(&closer.started);
+  uint32_t extra = 0;
+  if (action == 1) {
+    wait_gate(&destroy_waiting);
+    CHECK(sys_event_queue_generation(q) == 0);
+    extra = newq();
+    CHECK(extra != q); /* a pin prevents premature slot/native-lock reuse */
+  }
+  CHECK(!InterlockedCompareExchange(&closer.done, 0, 0));
+  InterlockedExchange(&release_pin, 1);
+  join_op(t1);
+  join_op(t2);
+  CHECK(sender.ack == (action == 1 ? CELL_ENOTCONN : CELL_OK));
+  if (action == 1) {
+    CHECK(newq() == q);
+    destroy(extra);
+  } else {
+    receive(q, 1, 0xa1);
+  }
+  expected_ack = CELL_ENOTCONN;
+  send(owner, 1, 0xb1, 0);
+  send(owner, 1, 0xb1, 1);
+  receive(q, 0, 0);
+  /* Destroy leaves a stale binding until explicit detach. Rebinding the
+   * same owner and port after cleanup must send only to the new target. */
+  cellSpursDetachLv2EventQueue((CellSpurs *)(uintptr_t)owner, 1);
+  attach(owner, q2, 1, 0);
+  expected_ack = CELL_OK;
+  send(owner, 1, 0xc1, 0);
+  receive(q2, 1, 0xc1);
+  receive(q, 0, 0);
+}
 int main(int argc, char **argv) {
   if (argc != 2)
     return 2;
@@ -262,6 +372,46 @@ int main(int argc, char **argv) {
     expected_ack = CELL_ENOTCONN;
     send(a, 1, 0xa1, 0);
     receive(q2, 0, 0);
+  } else if (!strcmp(mode, "send-destroy") || !strcmp(mode, "send-detach") ||
+             !strcmp(mode, "send-finalize-helper")) {
+    lifecycle_race(a, q1, q2, !strcmp(mode, "send-destroy") ? 1 :
+                            !strcmp(mode, "send-detach") ? 2 : 3);
+  } else if (!strcmp(mode, "invalid-queue")) {
+    vm_base[0x100] = 7;
+    CHECK(cellSpursAttachLv2EventQueue((CellSpurs *)(uintptr_t)a, SYS_EVENT_QUEUE_MAX + 1,
+        (u8 *)(uintptr_t)0x100, 1) == (s32)CELL_ESRCH);
+    CHECK(vm_base[0x100] == 7 && s_spurs_event_queue_n == 0);
+  } else if (!strcmp(mode, "stale-uncancel")) {
+    uint64_t old = sys_event_queue_generation(q1);
+    CHECK(old != 0);
+    destroy(q1);
+    CHECK(newq() == q1);
+    CHECK(sys_event_queue_generation(q1) != old);
+    sys_event_queue_cancel_by_id(q1);
+    sys_event_queue_uncancel_generation(q1, old);
+    CHECK(g_sys_event_queues[q1 - 1].cancelled == 1);
+    sys_event_queue_uncancel_generation(q1, 0);
+    CHECK(g_sys_event_queues[q1 - 1].cancelled == 1);
+    sys_event_queue_uncancel_generation(q1, sys_event_queue_generation(q1));
+    CHECK(g_sys_event_queues[q1 - 1].cancelled == 0);
+  } else if (!strcmp(mode, "stale-shared-finalize")) {
+    attach(a, q1, 1, 0);
+    destroy(q1);
+    CHECK(newq() == q1);
+    attach(b, q1, 1, 0);
+    spurs_cancel_attached_queues(b);
+    /* Stale owner A cannot keep the replacement B queue uncancelled. */
+    CHECK(g_sys_event_queues[q1 - 1].cancelled == 1);
+  } else if (!strcmp(mode, "reuse-without-detach")) {
+    attach(a, q1, 1, 0);
+    destroy(q1);
+    CHECK(newq() == q1);
+    expected_ack = CELL_ENOTCONN;
+    send(a, 1, 0xa1, 0);
+    send(a, 1, 0xa1, 1);
+    receive(q1, 0, 0);
+    spurs_cancel_attached_queues(a);
+    CHECK(g_sys_event_queues[q1 - 1].cancelled == 0);
   } else if (!strcmp(mode, "reuse-with-detach")) {
     attach(a, q1, 1, 0);
     CHECK(cellSpursDetachLv2EventQueue((CellSpurs *)(uintptr_t)a, 1) == 0);

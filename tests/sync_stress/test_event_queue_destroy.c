@@ -148,6 +148,8 @@ static void wait_waiters(uint32_t q, int n)
 static void test_destroy_modes(void)
 {
     uint32_t q = make_queue();
+    const uint64_t generation = sys_event_queue_generation(q);
+    CHECK(generation != 0);
     CHECK_RC(call(sys_event_queue_destroy, 1, q, 7, 0, 0), CELL_EINVAL);
     CHECK(g_sys_event_queues[q - 1].active);
 
@@ -169,6 +171,7 @@ static void test_destroy_modes(void)
     /* A plain destroy refuses and leaves them blocked. */
     CHECK_RC(call(sys_event_queue_destroy, 1, q, 0, 0, 0), CELL_EBUSY);
     CHECK(g_sys_event_queues[q - 1].active);
+    CHECK(sys_event_queue_generation(q) == generation);
     Sleep(50);
     CHECK(r1.rc == -1 && r2.rc == -1);
 
@@ -178,12 +181,15 @@ static void test_destroy_modes(void)
     CHECK(r1.rc == (int32_t)CELL_ECANCELED);
     CHECK(r2.rc == (int32_t)CELL_ECANCELED);
     CHECK(!g_sys_event_queues[q - 1].active);
+    CHECK(sys_event_queue_generation(q) == 0);
 
     /* The port no longer points at the dead queue, and a new queue in that slot
      * does not receive from it. */
     CHECK_RC(call(sys_event_port_send, 1, port, 1, 2, 3), CELL_ENOTCONN);
     const uint32_t q2 = make_queue();
     CHECK(q2 == q);                                  /* the slot is reused */
+    CHECK(sys_event_queue_generation(q2) != generation);
+    CHECK_RC(sys_event_queue_push_generation(q2, generation, 0, 1, 2, 3), CELL_ENOTCONN);
     CHECK_RC(call(sys_event_port_send, 1, port, 1, 2, 3), CELL_ENOTCONN);
     CHECK(g_sys_event_queues[q2 - 1].count == 0);
     CHECK_RC(call(sys_event_queue_receive, 1, q2, 0x300, 1000, 0), CELL_ETIMEDOUT);

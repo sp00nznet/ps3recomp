@@ -214,3 +214,17 @@ int main(void)
          "re-create, re-run of a fixed list and Join start at the entry");
     return 0;
 }
+
+/* Queue lifetime is mocked in this scheduler/table fixture. The routing
+ * fixture links real LV2 queues and checks generation changes on recreation. */
+uint64_t sys_event_queue_generation(uint32_t id) { return id ? 1 : 0; }
+void sys_event_queue_cancel_generation(uint32_t id, uint64_t generation)
+{ if (generation) sys_event_queue_cancel_by_id(id); }
+void sys_event_queue_uncancel_generation(uint32_t id, uint64_t generation)
+{ if (generation) sys_event_queue_uncancel_by_id(id); }
+uint32_t sys_event_queue_push_generation(uint32_t id, uint64_t generation,
+    uint64_t source, uint64_t d1, uint64_t d2, uint64_t d3)
+{
+    (void)generation;
+    return sys_event_queue_push_by_id(id, source, d1, d2, d3) == 0 ? CELL_OK : CELL_EBUSY;
+}

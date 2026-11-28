@@ -26,7 +26,10 @@ uint32_t ppu_vm_size;
 #ifndef _WIN32
 void SetLastError(DWORD e) { (void)e; }
 #endif
-uint32_t spurs_port_queue(uint32_t owner, uint32_t port) { (void)owner; (void)port; return 0; }
+uint32_t spurs_port_send(uint32_t owner, uint32_t port, uint64_t source,
+    uint64_t data1, uint64_t data2, uint64_t data3)
+{ (void)owner; (void)port; (void)source; (void)data1; (void)data2; (void)data3;
+  return CELL_ENOTCONN; }
 int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
 size_t spu_elf_image_size(const uint8_t* image, size_t max_avail) { (void)image; (void)max_avail; return 0; }
 

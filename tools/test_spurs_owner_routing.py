@@ -32,13 +32,13 @@ with tempfile.TemporaryDirectory(prefix='spurs-owner-routing-') as directory:
     obj = temp / 'event.obj'
     binary = temp / ('test.exe' if os.name == 'nt' else 'test')
     if os.name == 'nt':
-        common = [os.environ.get('CC', 'clang-cl'), '/nologo', '/W0', '/O1', '/Gy', '/Gw', '/UNDEBUG',
+        common = [os.environ.get('CC', 'clang-cl'), '/nologo', '/W0', '/O1', '/Gy', '/Gw', '/UNDEBUG', '/DPS3_SYNC_TEST_HOOKS',
                   '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(root), '/I' + str(root / 'include'),
                   '/I' + str(root / 'runtime'), '/I' + str(temp)]
         commands = [common + ['/c', str(event), '/Dsys_event_flag_set=audit_unused_flag_set', '/Fo:' + str(obj)],
                     common + [str(test), str(obj), '/Fe:' + str(binary), '/link', '/OPT:REF']]
     else:
-        common = [os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-ffunction-sections',
+        common = [os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-DPS3_SYNC_TEST_HOOKS', '-ffunction-sections',
                   '-fdata-sections', '-I' + str(root), '-I' + str(root / 'include'),
                   '-I' + str(root / 'runtime'), '-I' + str(temp), '-pthread']
         commands = [common + ['-c', str(event), '-Dsys_event_flag_set=audit_unused_flag_set', '-o', str(obj)],
@@ -47,7 +47,9 @@ with tempfile.TemporaryDirectory(prefix='spurs-owner-routing-') as directory:
         subprocess.run(command, cwd=temp, env=env, check=True)
     cases = ['single', 'distinct-ports', 'same-static', 'same-dynamic', 'reverse-order', 'throw-collision',
              'duplicate-no-mutation', 'detach', 'finalize-helper', 'finalized-sender', 'reuse-with-detach',
-             'shared-queue-finalize', 'capacity', 'unknown-owner', 'full-queue', 'malformed-mailbox', 'concurrent', 'unowned-raw']
+             'shared-queue-finalize', 'capacity', 'unknown-owner', 'full-queue', 'malformed-mailbox', 'concurrent', 'unowned-raw',
+             'reuse-without-detach', 'stale-uncancel', 'stale-shared-finalize', 'invalid-queue',
+             'send-destroy', 'send-detach', 'send-finalize-helper']
     for case in cases:
         subprocess.run([str(binary), case], cwd=temp, env=env, check=True, timeout=15)
     print('PASS: all', len(cases), 'SPURS routing cases')
