@@ -127,7 +127,8 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
         if (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
             ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
             ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) {
-            if (off + 16 <= max_bytes) off += 16;
+            if (off + 16 > max_bytes) return 0;
+            off += 16;
         }
         if (w0 & FP_END) return off;
     }
