@@ -74,6 +74,7 @@ void rsx_state_init(rsx_state* state)
     for (int _i = 0; _i < RSX_MAX_VERTEX_ATTRIBS; _i++)
         state->vertex_data4f[_i][3] = 1.0f;
 
+    state->point_size = 1.0f;
     /* Default viewport */
     state->viewport_w = 1280;
     state->viewport_h = 720;
@@ -813,6 +814,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->shader_dirty = 1;
         return 0;
     }
+
+    if (method == 0x1EE0u) { memcpy(&state->point_size, &data, 4); return 0; }
+    if (method == 0x1EE8u) { state->point_sprite_control = data; return 0; }
 
     if (method == NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) {
         state->vertex_attrib_output_mask = data;
