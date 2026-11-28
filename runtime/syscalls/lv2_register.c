@@ -1702,13 +1702,10 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
     unsigned code = value >> 24;
     /* No lv2 group: SPU code under SPURS. Only its user events route, through
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
-    extern uint32_t spurs_port_queue(uint32_t port);
-    if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
-        if (code < 128) { static int n; if (PS3_LOG_FIRST(n, 16))
-            fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
-                    code & 63, spu->image_id, value); }
-        return 0;
-    }
+    extern uint32_t spurs_port_queue(uint32_t owner, uint32_t port);
+    /* Raw/unowned SPUs use the ordinary interrupt-mailbox hook. Do not
+     * reinterpret their payloads as SPURS send_event requests. */
+    if (!spu->spu_group_id && (!spu->spurs_ea || code >= 128)) return 0;
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
      * 128 acknowledges the result; 192 is the impatient, no-ack form. */
     if (code == 128 || code == 192) {
@@ -1738,7 +1735,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
          * SPU_PORT_BIND_WAIT_MS, before the event is answered with ENOTCONN. Multistream's first request used
          * to fail that way and end its SPU program. */
         if (!spu->spu_group_id) {
-            queue = spurs_port_queue(port);
+            queue = spurs_port_queue(spu->spurs_ea, port);
         } else {
             const ULONGLONG deadline = GetTickCount64() + SPU_PORT_BIND_WAIT_MS;
             AcquireSRWLockExclusive(&s_spu_port_lock);
