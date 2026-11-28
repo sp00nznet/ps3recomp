@@ -62,6 +62,47 @@ bool glslang_ready()
     return true;
 }
 
+/* glslang 15 accepts vk::builtin(PointSize), but leaves PointCoord as
+ * a Location-decorated HLSL field. Lower only the reserved Input variable
+ * emitted by rsx_point_sprite_patch. It is appended after ordinary varyings,
+ * so their locations stay identical to the vertex stage. No resource or
+ * ordinary interpolant decoration is changed. */
+bool lower_point_coord(std::vector<unsigned int>& spv)
+{
+    unsigned int point = 0;
+    for (size_t i = 5; i < spv.size();) {
+        const unsigned int n = spv[i] >> 16, op = spv[i] & 65535u;
+        if (!n || i + n > spv.size()) return false;
+        if (op == 5 && n >= 3) { /* OpName */
+            const char* name = reinterpret_cast<const char*>(&spv[i + 2]);
+            const size_t bytes = (n - 2u) * 4u;
+            if (memchr(name, 0, bytes) && strstr(name, "_rsx_sprite_point")) {
+                const unsigned int candidate = spv[i + 1];
+                for (size_t j = 5; j < spv.size();) {
+                    const unsigned int m = spv[j] >> 16, opcode = spv[j] & 65535u;
+                    if (!m || j + m > spv.size()) return false;
+                    if (opcode == 59 && m >= 4 && spv[j + 2] == candidate && spv[j + 3] == 1u)
+                        point = candidate; /* OpVariable, StorageClass Input */
+                    j += m;
+                }
+            }
+        }
+        i += n;
+    }
+    if (!point) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const unsigned int n = spv[i] >> 16;
+        if ((spv[i] & 65535u) == 71u && n == 4 && spv[i + 1] == point) {
+            if (spv[i + 2] == 11u && spv[i + 3] == 16u) return true; /* already BuiltIn PointCoord */
+            if (spv[i + 2] == 30u) { /* Location -> BuiltIn PointCoord */
+                spv[i + 2] = 11u; spv[i + 3] = 16u; return true;
+            }
+        }
+        i += n;
+    }
+    return false;
+}
+
 int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
               char* log, u32 log_size)
 {
@@ -83,7 +124,10 @@ int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
     /* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
      * decompiler's _rsx_inv_w helper which one it gets. */
-    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n");
+    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n"
+                       "#define RSX_POINT_SIZE_BUILTIN 1\n"
+                       "#define RSX_POINT_COORD_BUILTIN 1\n"
+                       "#define RSX_POINT_SIZE_SCALE max(vp_pointsize.w, 1.0)\n");
     shader.setEntryPoint("main");
     shader.setAutoMapBindings(true);
     shader.setAutoMapLocations(true);
@@ -112,6 +156,10 @@ int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
     glslang::GlslangToSpv(*program.getIntermediate(lang), spirv, &logger, &opts);
     if (spirv.empty()) {
         put_log(log, log_size, "SPIR-V generation", logger.getAllMessages().c_str());
+        return -1;
+    }
+    if (stage == RSX_SHADER_STAGE_FRAGMENT && strstr(hlsl, "_rsx_sprite_point") && !lower_point_coord(spirv)) {
+        put_log(log, log_size, "PointCoord lowering", "reserved Input not found");
         return -1;
     }
     return 0;

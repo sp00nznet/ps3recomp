@@ -15,6 +15,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
+#include "rsx_point_sprite.h"
 #include "rsx_tiling.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
@@ -2409,7 +2410,7 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs,
 
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
-                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
+                            rsx_be_format rt_fmt, u32 rt_count, u32 primitive, int* out_fixed,
                             u32* out_tex_used, u64* out_fp_hash)
 {
     *out_fixed = 1;
@@ -2420,6 +2421,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 vp_instrs = 0, fp_size = 0;
     /* No resident program pair means the built-in one; see kEngFixedVS. */
     const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
+    const u32 point_key = fixed ? 0 : rsx_point_sprite_key(primitive, rsx_dsp_reg(&g.rsx, 0x1EE8u));
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
@@ -2518,6 +2520,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
         if (wpos_scaled) key = eng_fnv1a(wpos_grid, sizeof wpos_grid, key);
     }
+    if (point_key) key = eng_fnv1a(&point_key, sizeof point_key, key);
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
     key = eng_fnv1a(&rt_fmt, sizeof rt_fmt, key);
@@ -2586,6 +2589,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             }
         }
     }
+    if (fi > 0 && point_key && rsx_point_sprite_patch(s_ps_hlsl, sizeof s_ps_hlsl, point_key) < 0) fi = -1;
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
@@ -3697,7 +3701,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     eng_depth_bounds_prepare(zslot, &rs, targets, n_targets);
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
-                                          n_targets, &pipeline_is_fixed, &tex_used,
+                                          n_targets, prim, &pipeline_is_fixed, &tex_used,
                                           &fp_hash);
     if (!pipeline) return;
     if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
@@ -3757,6 +3761,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     {
         float ps[RSX_VP_POINT_SIZE_ROW_FLOATS];
         eng_point_row(ps);
+        ps[3] = (float)(sf.aa_sx > sf.aa_sy ? sf.aa_sx : sf.aa_sy);
         memcpy(g.vp_cb + (RSX_DSP_NUM_CONSTANTS + 2) * 16u, ps, sizeof ps);
     }
 
@@ -3764,7 +3769,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
     const u32 nslots = g.fp_constants.count ? g.fp_constants.count : 1u;
     /* + fp_dbounds after fp_alpha for a depth-bounded draw. */
-    const u32 fp_bytes = (nslots + (s_dbz.unit ? 2u : 1u)) * 16u;
+    const u32 point_key = pipeline_is_fixed ? 0 : rsx_point_sprite_key(prim, rsx_dsp_reg(&g.rsx, 0x1EE8u));
+    const u32 fp_base_rows = nslots + (s_dbz.unit ? 2u : 1u);
+    const u32 fp_bytes = (fp_base_rows + (point_key ? 1u : 0u)) * 16u;
     if (g.fp_cb_cap < fp_bytes) {
         u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
         if (!n) return;
@@ -3784,6 +3791,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
       alpha[2] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
       alpha[3] = 0.0f;
       if (s_dbz.unit) { alpha[4] = s_dbz.mn; alpha[5] = s_dbz.mx; alpha[6] = alpha[7] = 0.0f; } }
+
+    if (point_key) { float* grid = (float*)(g.fp_cb + fp_base_rows * 16u);
+        rsx_point_sprite_grid(sf.aa_sx, sf.aa_sy, grid); grid[2] = grid[3] = 0.0f; }
 
     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
 
