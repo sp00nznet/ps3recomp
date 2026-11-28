@@ -124,7 +124,7 @@ unsigned cellGcm_flip_request_count(void);
  * path anywhere else -- the same selection runtime/host/host_posix.c and the
  * toolkit's boot harness make. All three expose the same three entry points,
  * so the frame clock below is backend-agnostic. */
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(PS3RECOMP_RSX_VULKAN)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
