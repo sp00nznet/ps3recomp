@@ -56,6 +56,13 @@ static s32 load(const char* name)
     return cellSaveDataAutoLoad2(0, name, 0, (void*)0x200,
                                 (void*)0x800, (void*)0x900, 0, (void*)7);
 }
+/* flOw's public bridge imports this legacy entry, not AutoLoad2. */
+static s32 legacy_load(const char* name)
+{
+    loading = 1; step = 0;
+    return cellSaveDataAutoLoad(0, name, 0, (void*)0x200,
+                               (void*)0x800, (void*)0x900, 0, (void*)7);
+}
 int main(int argc, char** argv)
 {
     assert(argc == 2);
@@ -66,20 +73,37 @@ int main(int argc, char** argv)
     strcpy((char*)vm_base + 0x300, "DATA.BIN");
     memcpy(vm_base + 0x400, payload, sizeof(payload));
     g_ps3_guest_caller = callback;
-    compat(""); assert(load("MISSING") == CELL_SAVEDATA_ERROR_NODATA);
-    assert(stat_calls == 1 && file_calls == 0);
-    compat("1"); assert(load("MISSING") == CELL_OK); /* explicit legacy opt-in */
-    force_error = 1; assert(load("MISSING") == CELL_SAVEDATA_ERROR_CBRESULT); force_error = 0;
-    compat("0"); assert(load("MISSING") == CELL_SAVEDATA_ERROR_NODATA);
+    /* Exact opt-in applies only to AutoLoad2. The legacy first-boot
+     * callback and success result remain unchanged for every setting. */
+    const char* settings[] = { "", "0", "1", "true", "01" };
+    for (unsigned i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
+        compat(settings[i]);
+        int before_stat = stat_calls, before_file = file_calls;
+        assert(load("MISSING") == (!strcmp(settings[i], "1") ?
+               CELL_OK : CELL_SAVEDATA_ERROR_NODATA));
+        assert(legacy_load("MISSING") == CELL_OK);
+        assert(stat_calls == before_stat + 2 && file_calls == before_file);
+        force_error = 1;
+        assert(load("MISSING") == CELL_SAVEDATA_ERROR_CBRESULT);
+        assert(legacy_load("MISSING") == CELL_SAVEDATA_ERROR_CBRESULT);
+        force_error = 0;
+    }
     compat(""); loading = 0; step = 0;
     assert(cellSaveDataAutoSave2(0, "PRESENT", 0, (void*)0x200,
                 (void*)0x800, (void*)0x900, 0, (void*)7) == CELL_OK);
     assert(load("PRESENT") == CELL_OK);
     assert(!memcmp(vm_base + 0x500, payload, sizeof(payload)));
+    memset(vm_base + 0x500, 0, sizeof(payload));
+    assert(legacy_load("PRESENT") == CELL_OK);
+    assert(!memcmp(vm_base + 0x500, payload, sizeof(payload)));
     int before = file_calls;
     assert(load("MISSING") == CELL_SAVEDATA_ERROR_NODATA);
     assert(file_calls == before && !memcmp(vm_base + 0x500, payload, sizeof(payload)));
+    assert(legacy_load("MISSING") == CELL_OK);
+    assert(file_calls == before && !memcmp(vm_base + 0x500, payload, sizeof(payload)));
+    /* Calling the legacy entry must not re-enable the override for AutoLoad2. */
+    assert(load("MISSING") == CELL_SAVEDATA_ERROR_NODATA);
     free(vm_base);
-    puts("PASS missing-slot error, stat/file callbacks, explicit compatibility and real save/load round trip");
+    puts("PASS AutoLoad2 missing slots, unchanged legacy AutoLoad, exact opt-in, callbacks and real save/load round trip");
     return 0;
 }
