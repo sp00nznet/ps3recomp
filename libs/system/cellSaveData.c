@@ -1335,17 +1335,16 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
      * Stopping after funcStat (OK_NEXT) left a title with a save on disk
      * waiting for its data forever -- GH3's second boot sat on "Checking HDD".
      *
-     * flОw first-boot: its funcStat returns ERR_NODATA on a new profile
-     * (isNewData=1). The callback already ran and told the game "no save",
-     * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
-     * parked in MODE_AUTO_LOAD (no app loop, no flips).
-     * Per the SDK the correct return here is CELL_SAVEDATA_ERROR_NODATA,
-     * and a real title handles it; that flОw does not is a bug somewhere in
-     * its MODE_AUTO_LOAD state machine we have not tracked down. Keep the
-     * compat return until that is understood -- it was dropped once already
-     * in the fold merge and cost a boot regression. */
+     * The legacy AutoLoad entry below keeps flOw's first-boot workaround.
+     * Do not apply that override globally to AutoLoad2: reporting success for
+     * a missing slot makes Eternal Sonata reuse the previous slot's preview
+     * buffer, displaying phantom saves. Ports relying on the old AutoLoad2
+     * result can explicitly opt in without affecting the legacy entry. */
     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
-    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
+    const char* nodata_ok = getenv("PS3_SAVEDATA_AUTOLOAD_NODATA_OK");
+    if (r == CELL_SAVEDATA_ERROR_NODATA && nodata_ok && !strcmp(nodata_ok, "1"))
+        return CELL_OK;
+    return r;
 }
 
 s32 cellSaveDataDelete2(u32 container)
@@ -1468,8 +1467,8 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
     int is_new = !dir_has_save(save_path);
 
     (void)is_new;
-    /* Same as cellSaveDataAutoLoad2 above, including flОw's first-boot compat
-     * return (it calls this old non-_2 variant). */
+    /* flOw calls this legacy non-_2 entry. Retain its first-boot compatibility
+     * return independently of AutoLoad2 and its opt-in environment variable. */
     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
     return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
 }
