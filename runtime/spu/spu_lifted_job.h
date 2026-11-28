@@ -152,6 +152,7 @@ typedef struct spu_run_opts {
     int      park_on_empty;
     uint32_t spu_id;
     uint32_t group_id;
+    uint32_t spurs_ea; /* explicit owner, independent of guest LS overlays */
 } spu_run_opts;
 
 static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
@@ -173,6 +174,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     if (opts) {
         ctx.spu_id              = opts->spu_id;
         ctx.spu_group_id        = opts->group_id;
+        ctx.spurs_ea            = opts->spurs_ea;
         ctx.park_on_empty_inmbox = opts->park_on_empty;
         if (opts->inmbox_val) spu_channel_write(&ctx.ch_in_mbox, opts->inmbox_val);
         /* Publish the LIVE context for the duration of the run so the PPU side

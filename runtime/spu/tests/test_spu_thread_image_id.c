@@ -20,7 +20,10 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 void SetLastError(DWORD e) { (void)e; }
-uint32_t spurs_port_queue(uint32_t port) { (void)port; return 0; }
+uint32_t spurs_port_send(uint32_t owner, uint32_t port, uint64_t source,
+    uint64_t data1, uint64_t data2, uint64_t data3)
+{ (void)owner; (void)port; (void)source; (void)data1; (void)data2; (void)data3;
+  return CELL_ENOTCONN; }
 int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
 
 /* --- the registry, reduced to what the lookup needs: two images, both with code at 0xD0 --- */

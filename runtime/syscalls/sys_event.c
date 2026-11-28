@@ -73,6 +73,9 @@ static void evt_table_unlock(void)
  * lock. */
 static uint32_t s_evt_queue_pins[SYS_EVENT_QUEUE_MAX];
 static int      s_evt_queue_retiring[SYS_EVENT_QUEUE_MAX];
+/* Slot IDs are reusable. Persistent HLE bindings must also retain this
+ * generation, which survives the queue struct's memset on recreation. */
+static uint64_t s_evt_queue_generation[SYS_EVENT_QUEUE_MAX];
 
 /* Table lock held. */
 static int event_queue_pin_locked(uint32_t queue_id)
@@ -94,6 +97,30 @@ static int event_queue_begin(uint32_t queue_id, sys_event_queue_info** out)
         return 0;
     EVT_TEST_HOOK("event.operation.pinned", queue_id);
     *out = &g_sys_event_queues[queue_id - 1];
+    return 1;
+}
+
+uint64_t sys_event_queue_generation(uint32_t queue_id)
+{
+    evt_table_lock();
+    uint64_t generation = 0;
+    if (queue_id && queue_id <= SYS_EVENT_QUEUE_MAX &&
+        g_sys_event_queues[queue_id - 1].active)
+        generation = s_evt_queue_generation[queue_id - 1];
+    evt_table_unlock();
+    return generation;
+}
+
+static int event_queue_begin_generation(uint32_t id, uint64_t generation,
+                                         sys_event_queue_info** out)
+{
+    evt_table_lock();
+    const int pinned = id && id <= SYS_EVENT_QUEUE_MAX && generation &&
+        s_evt_queue_generation[id - 1] == generation && event_queue_pin_locked(id);
+    evt_table_unlock();
+    if (!pinned) return 0;
+    EVT_TEST_HOOK("event.operation.pinned", id);
+    *out = &g_sys_event_queues[id - 1];
     return 1;
 }
 
@@ -120,6 +147,7 @@ static int event_queue_slot_free(int slot)
 
 static void event_queue_native_init(sys_event_queue_info* q, int slot)
 {
+    if (++s_evt_queue_generation[slot] == 0) ++s_evt_queue_generation[slot];
 #ifdef _WIN32
     InitializeCriticalSection(&q->lock);
     InitializeConditionVariable(&q->not_empty);
@@ -396,10 +424,11 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
 /* A queue has a producer again (SPURS re-attach after a finalize). Without this
  * the cancel is permanent: the flag survives, every later receive fails, and a
  * title that tears its audio down and brings it back never runs again. */
-void sys_event_queue_uncancel_by_id(uint32_t queue_id)
+static void event_queue_uncancel(uint32_t queue_id, uint64_t generation)
 {
     sys_event_queue_info* q;
-    if (!event_queue_begin(queue_id, &q)) return;
+    if (!(generation ? event_queue_begin_generation(queue_id, generation, &q) :
+                      event_queue_begin(queue_id, &q))) return;
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
     const int changed = q->active && q->cancelled;
@@ -416,10 +445,11 @@ void sys_event_queue_uncancel_by_id(uint32_t queue_id)
         fprintf(stderr, "[evt] queue %u un-cancelled (producer attached again)\n", queue_id);
 }
 
-void sys_event_queue_cancel_by_id(uint32_t queue_id)
+static void event_queue_cancel(uint32_t queue_id, uint64_t generation)
 {
     sys_event_queue_info* q;
-    if (!event_queue_begin(queue_id, &q)) return;
+    if (!(generation ? event_queue_begin_generation(queue_id, generation, &q) :
+                      event_queue_begin(queue_id, &q))) return;
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
@@ -442,6 +472,17 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
     if (changed)
         fprintf(stderr, "[evt] queue %u cancelled (producer gone) -- waiters released\n",
                 queue_id);
+}
+
+void sys_event_queue_uncancel_by_id(uint32_t id) { event_queue_uncancel(id, 0); }
+void sys_event_queue_cancel_by_id(uint32_t id) { event_queue_cancel(id, 0); }
+void sys_event_queue_uncancel_generation(uint32_t id, uint64_t generation)
+{
+    if (generation) event_queue_uncancel(id, generation);
+}
+void sys_event_queue_cancel_generation(uint32_t id, uint64_t generation)
+{
+    if (generation) event_queue_cancel(id, generation);
 }
 
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
@@ -1187,6 +1228,22 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
     const int rc = event_queue_push(q, &evt);
     event_queue_end(queue_id);
     return rc;
+}
+
+/* Return a guest status, distinguishing a dead binding from a full queue.
+ * Validation and pinning are atomic with respect to destroy/recreate. */
+uint32_t sys_event_queue_push_generation(uint32_t id, uint64_t generation,
+                                          uint64_t source, uint64_t data1,
+                                          uint64_t data2, uint64_t data3)
+{
+    sys_event_queue_info* q;
+    if (!event_queue_begin_generation(id, generation, &q)) return CELL_ENOTCONN;
+    const sys_event_t evt = {source, data1, data2, data3};
+    const int rc = event_queue_push(q, &evt);
+    const uint32_t result = rc == 0 ? CELL_OK :
+        (event_queue_is_active(id) ? CELL_EBUSY : CELL_ENOTCONN);
+    event_queue_end(id);
+    return result;
 }
 
 /* Periodic timer send. The queue is pinned before the timer's expiration

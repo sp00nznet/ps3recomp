@@ -113,6 +113,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
  * assume 256). Returns 0 if the job ran, negative if it could not be staged. */
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size);
+int spu_run_spurs_job_owned(spu_lifted_entry_fn entry, int image_id,
+                      uint32_t job_ea, uint32_t job_desc_size, uint32_t spurs_ea);
 
 /* Fingerprint `image`, look up its lifted entry, and run it as a SPURS jobchain
  * job via spu_run_spurs_job. Runs SYNCHRONOUSLY on the caller's thread: a job
@@ -122,6 +124,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
  * and ran, 0 if none is registered for this binary. */
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size);
+int spu_workload_dispatch_job_owned(const uint8_t* image, uint32_t image_size,
+                              uint32_t job_ea, uint32_t job_desc_size, uint32_t spurs_ea);
 
 /* Load a 32-bit big-endian SPU ELF image into a 256 KB local store: each PT_LOAD
  * segment is copied to its p_vaddr (BSS zero-filled). Returns 1 on success and
@@ -149,6 +153,9 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 /* Same, but runs the SPU job on its own detached host thread so the PPU caller
  * is not blocked. Required for persistent SPURS service/worker tasks that loop
  * waiting on PPU-side signals (running them inline deadlocks). */
+/* SPURS task identity is captured before handing work to a host worker. */
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 

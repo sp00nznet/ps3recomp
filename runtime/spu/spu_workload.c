@@ -400,6 +400,7 @@ typedef struct {
     int                 image_id;
     uint32_t            r3[4];        /* captured race-free at dispatch time */
     int                 have_r3;
+    uint32_t            spurs_ea;     /* captured owner, never inferred in a worker */
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
 #ifndef _WIN32
@@ -645,7 +646,8 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
-        spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
+        spu_workload_dispatch_task(vm_base + start_elf[i], (uint32_t)start_sz[i],
+                                   start_ctx[i], taskset_ea, start_t[i]);
     }
     s_ts_held = 0; ts_unlock();
 }
@@ -660,6 +662,8 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
 
 static void spu_async_run(spu_async_job* j)
 {
+    spu_run_opts task_opts = {0};
+    task_opts.spurs_ea = j->spurs_ea;
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
@@ -718,10 +722,9 @@ static void spu_async_run(spu_async_job* j)
                  * ptr (LS[0x1C0]) was a hardcoded 0x40009D00 that mismatched the game's
                  * real 0x40009F00 -> policy DMA'd garbage -> null branches. */
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
-                extern uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-                if (g_ydkj_real_taskset_ea)
-                    spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
-                uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009D00u;
+                if (j->taskset_ea)
+                    spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
+                uint32_t inst = j->spurs_ea ? j->spurs_ea : 0x40009D00u;
                 uint8_t* p = ls + 0x1C0;
                 p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
                 p[4]=(uint8_t)(inst>>24); p[5]=(uint8_t)(inst>>16);
@@ -732,7 +735,7 @@ static void spu_async_run(spu_async_job* j)
                  * (Declared by spu_lifted_job.h -- a local extern re-declaration
                  * here conflicts with the header's static inline under clang.) */
                 int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
-                                                     j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0, 0);
+                                                     j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0, &task_opts);
                 fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
                 fflush(stderr);
                 free(ls); free(j); return;
@@ -748,13 +751,12 @@ static void spu_async_run(spu_async_job* j)
              * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
             if (j->image_id == 22 && !ps3_env_once("YDKJ_NO_CRI_CTX")) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
-                extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
-                if (g_ydkj_real_taskset_ea && !ps3_env_once("YDKJ_MINIMAL_CTX")) {
+                if (j->taskset_ea && !ps3_env_once("YDKJ_MINIMAL_CTX")) {
                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
                      * so the cri leaf reads valid data instead of my planted guesses. */
-                    uint64_t elf = spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                    uint64_t elf = spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
                     /* --- Golden-reference context fields for the CRI task, recovered from a
                      * WORKING RPCS3 SPU-LS snapshot via caner's rpcs3-guest-memory-dumper fork
                      * (github.com/canersaka/rpcs3-guest-memory-dumper): YDKJ BLUS30569, SPU0
@@ -790,7 +792,7 @@ static void spu_async_run(spu_async_job* j)
                       if ((_e=ps3_env_once("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
                           LSBE32(0x2798,v); LSBE32(0x279C,v); } }
                     fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
-                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
+                            j->taskset_ea, j->taskid, (unsigned long long)elf);
                 } else {
                     LSBE32(0x27C0, 0x100);     /* kernelMgmtAddr -> SPURS kernel ctx @LS 0x100 */
                     LSBE32(0x27C4, 0xA70);     /* syscallAddr -> HLE PM syscall trampoline (0xA70) */
@@ -907,11 +909,10 @@ static void spu_async_run(spu_async_job* j)
                 if (ps3_env_once("LBP_REAL_POLICY") && j->taskset_ea) {
                     extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
                                                               uint64_t,uint32_t,uint8_t*,uint32_t);
-                    /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
+                    /* The probe uses the same captured owner as the task. */
                     uint32_t ts = j->taskset_ea;
-                    uint32_t spurs_ea = 0;
+                    uint32_t spurs_ea = j->spurs_ea;
                     if (vm_base) { const uint8_t* t = vm_base + ts;
-                        spurs_ea = RDBE32(t, 0x64);
                         /* Why did the policy exit without dispatching? Dump the task
                          * bitsets it reads (task N = bit 127-N; task 2 = bit 125). */
                         fprintf(stderr, "[taskset-bits] RUNNING=%08X%08X READY=%08X%08X ENABLED=%08X%08X SIGNALLED=%08X%08X WAITING=%08X%08X\n",
@@ -946,7 +947,7 @@ static void spu_async_run(spu_async_job* j)
             }
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                                1, j->have_r3 ? j->r3 : 0, 0);
+                                                1, j->have_r3 ? j->r3 : 0, &task_opts);
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
              * the kernel re-enters it when work is signaled. Our HLE runs it once,
              * so it polls the (concurrently PPU-updated) eaContext, finds no work,
@@ -969,7 +970,7 @@ static void spu_async_run(spu_async_job* j)
                     uint32_t e2 = 0;
                     if (!spu_elf_load_to_ls(j->image, j->image_size, ls, &e2)) break;
                     rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                                1, j->have_r3 ? j->r3 : 0, 0);
+                                                1, j->have_r3 ? j->r3 : 0, &task_opts);
                     if (g_cri_video_dma) {
                         fprintf(stderr, "[cri] RESUME: cri task DECODED real video (attempt %d)\n", attempt);
                         break;
@@ -1057,8 +1058,13 @@ static int spu_task_pool_enabled(void)
 static void spu_async_pool_run(void* p) { spu_async_run((spu_async_job*)p); }
 #endif
 
-int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
-                              uint32_t job_ea, uint32_t job_desc_size)
+int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size, uint32_t job_ea, uint32_t job_desc_size)
+{
+    return spu_workload_dispatch_job_owned(image, image_size, job_ea, job_desc_size, 0);
+}
+
+int spu_workload_dispatch_job_owned(const uint8_t* image, uint32_t image_size,
+                              uint32_t job_ea, uint32_t job_desc_size, uint32_t spurs_ea)
 {
     if (!image || image_size == 0) return 0;
 
@@ -1119,7 +1125,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     if (s_prof < 0) { const char* e = ps3_env_once("SPU_JOBPROF"); s_prof = e ? atoi(e) : 0; }
     struct timespec t0, t1;
     if (s_prof) timespec_get(&t0, TIME_UTC);
-    int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
+    int rc = spu_run_spurs_job_owned(fn, image_id, job_ea, job_desc_size, spurs_ea);
     if (s_prof) {
         static double acc[64], last; static unsigned cnt[64];
         timespec_get(&t1, TIME_UTC);
@@ -1606,6 +1612,12 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea)
 {
+    return spu_workload_dispatch_task(image, image_size, args_ea, 0, 0);
+}
+
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
+{
     if (!image || image_size == 0) return 0;
 
     uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
@@ -1645,12 +1657,16 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
-    /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
-     * set the globals for THIS task). Reading them later in the async thread races
-     * the next CreateTask overwriting the single-slot globals -- with two audio
-     * tasks that made both run task 1's descriptor. */
-    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+    j->taskset_ea = taskset_ea; j->taskid = taskid; j->spurs_ea = 0;
+    /* CellSpursTaskset stores its owning instance as BE u64 at +0x60.
+     * Capture it now, not from mutable global task/instance scratch fields. */
+    extern uint32_t ppu_vm_size;
+    if (vm_base && taskset_ea && (uint64_t)taskset_ea + 0x68 <= 0x100000000ull &&
+        (!ppu_vm_size || (uint64_t)taskset_ea + 0x68 <= ppu_vm_size)) {
+        const uint8_t* p = vm_base + taskset_ea + 0x64;
+        j->spurs_ea = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                      (uint32_t)p[2] << 8 | p[3];
+    }
     /* Mark the task running NOW, not when its thread starts: in that gap another
      * task's exit saw it ready-but-not-running and started it a second time
      * (Twisted Metal's level-load inflate tasks each ran twice, concurrently). */

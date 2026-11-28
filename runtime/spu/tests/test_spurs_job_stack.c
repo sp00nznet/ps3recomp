@@ -1,3 +1,4 @@
+#include <assert.h>
 /*
  * A SPURS job's first stack frame must not overlap its cache buffer
  * (runtime/spu/spurs_job.c).
@@ -108,6 +109,7 @@ static uint32_t g_cache_ls, g_sp;
  * frame, then push a frame of its own and store the back chain. */
 static void job_entry(spu_context* ctx)
 {
+    assert(ctx->spurs_ea == 0x123400);
     const uint32_t sp = ctx->gpr[1]._u32[0];
     g_ran = 1;
     g_sp = sp;
@@ -130,7 +132,7 @@ static void run_case(const char* name, uint16_t stack_qw, uint16_t scratch_qw)
     TEST(name);
     build_job(stack_qw, scratch_qw);
     g_ran = g_cache_intact = g_frames_in_stack = 0;
-    spu_run_spurs_job(job_entry, 7, JOB_EA, 256);
+    spu_run_spurs_job_owned(job_entry, 7, JOB_EA, 256, 0x123400);
     CHECK(g_ran);
     CHECK(g_cache_intact);
     CHECK(g_frames_in_stack);

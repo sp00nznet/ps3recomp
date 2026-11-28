@@ -25,6 +25,7 @@ uint64_t spurs_pm_build_context(uint8_t* ls,uint32_t ts,uint32_t id,uint32_t spu
 void spu_thread_publish_ctx(uint32_t tid,void* c){(void)tid;(void)c;}
 void ydkj_wake_all_event_flags(void){}
 static atomic_uint canceled_queues;
+static atomic_uint sent_queue, sent_count;
 void sys_event_queue_cancel_by_id(u32 id) { assert(id==3 || id==4);atomic_fetch_or(&canceled_queues,1u<<id); }
 void sys_event_queue_uncancel_by_id(u32 id) {(void)id;}
 void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c */
@@ -36,6 +37,7 @@ static atomic_uint entered, produced, finished, release_consumer;
 static atomic_uint consumer_lane,producer_lane;
 static void finish(spu_context* c)
 {
+    assert(c->spurs_ea == spu_ls_read32(c,0x1C4));
     u32 ea=spu_ls_read32(c,0x1C4),wid=spu_ls_read32(c,0x1DC);
     /* The manufactured guest removes itself from the runnable set. */
     vm_write8(ea+0x80+wid,3);
@@ -48,6 +50,7 @@ static void consumer(spu_context* c)
     atomic_fetch_add(&entered,1);
     while (!atomic_load(&produced) && !atomic_load(&release_consumer)) Sleep(1);
     assert(atomic_load(&produced));
+    assert(spurs_port_send(c->spurs_ea, 16, 0, 1, 2, 3) == CELL_OK);
     atomic_fetch_add(&finished,1);finish(c);
 }
 static void producer(spu_context* c)
@@ -166,12 +169,19 @@ int main(void)
     assert(atomic_load(&consumer_lane)!=atomic_load(&producer_lane));
     unsigned port3=vm_read8(0x8010);
     finalize(0x1000);assert(atomic_load(&canceled_queues)==(1u<<3));
-    assert(!spurs_port_queue(port3));
+    assert(!spurs_port_queue(0x1000, port3));
+    assert(atomic_load(&sent_count)==1 && atomic_load(&sent_queue)==3);
+    assert(spurs_port_send(0x1000, port3, 0, 1, 2, 3)==CELL_ENOTCONN);
     puts("SPURS runnable producer / blocked consumer / BUSY immutability / join PASS");
 
     /* Reinitialize the same EA after all handles and resident contexts retire. */
     register_pm(0x9200,0x33,held_policy,79);
     assert(cellSpursInitialize((CellSpurs*)0x1000,3,0,0,0)==0);
+    /* Same EA and port in a new, fully joined scheduler lifecycle. */
+    vm_base[0x8010]=(u8)port3;
+    assert(cellSpursAttachLv2EventQueue((CellSpurs*)0x1000,4,(u8*)0x8010,0)==0);
+    assert(spurs_port_send(0x1000, port3, 0, 1, 2, 3)==CELL_OK);
+    assert(atomic_load(&sent_count)==2 && atomic_load(&sent_queue)==4);
     for(unsigned i=0;i<4;i++) {
         assert(cellSpursAddWorkload((CellSpurs*)0x1000,(u32*)0x8000,(void*)0x9200,16,0,NULL,1,1)==0);
         assert(vm_read32(0x8000)==i);
@@ -283,4 +293,20 @@ int main(void)
     spurs_policy_release_instance(0x11000);
     puts("SPURS signal waiting for a context does not survive its instance PASS");
     free(vm_base);return 0;
+}
+
+/* Queue lifetime is mocked in this scheduler/table fixture. The routing
+ * fixture links real LV2 queues and checks generation changes on recreation. */
+uint64_t sys_event_queue_generation(uint32_t id) { return id ? 1 : 0; }
+void sys_event_queue_cancel_generation(uint32_t id, uint64_t generation)
+{ if (generation) sys_event_queue_cancel_by_id(id); }
+void sys_event_queue_uncancel_generation(uint32_t id, uint64_t generation)
+{ if (generation) sys_event_queue_uncancel_by_id(id); }
+uint32_t sys_event_queue_push_generation(uint32_t id, uint64_t generation,
+    uint64_t source, uint64_t d1, uint64_t d2, uint64_t d3)
+{
+    assert(id==3 || id==4); assert(generation==1);
+    (void)source; (void)d1; (void)d2; (void)d3;
+    atomic_store(&sent_queue,id); atomic_fetch_add(&sent_count,1);
+    return CELL_OK;
 }

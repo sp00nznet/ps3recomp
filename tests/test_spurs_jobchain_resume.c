@@ -14,9 +14,9 @@
  * binary dispatch (to count which jobs ran) and the completion-event push (to
  * hold the walker still at a chosen point) are observed; nothing in the walker
  * is replaced. */
-#define spu_workload_dispatch_job fixture_dispatch_job
+#define spu_workload_dispatch_job_owned fixture_dispatch_job
 #include "../libs/spurs/cellSpurs.c"
-#undef spu_workload_dispatch_job
+#undef spu_workload_dispatch_job_owned
 #include <assert.h>
 #include <stdatomic.h>
 
@@ -39,9 +39,10 @@ enum { SPURS = 0x0800, PORT = 0x0900, CHAIN = 0x1000, ROOT = 0x2000,
 
 /* How many times each job descriptor was dispatched. */
 static atomic_uint runs[32];
-int fixture_dispatch_job(const uint8_t* image, uint32_t size, uint32_t job_ea, uint32_t desc)
+int fixture_dispatch_job(const uint8_t* image, uint32_t size, uint32_t job_ea, uint32_t desc, uint32_t owner)
 {
     (void)image; (void)size; (void)desc;
+    assert(owner == SPURS);
     assert(job_ea >= JOBS && (job_ea - JOBS) / 0x80u < 32);
     atomic_fetch_add(&runs[(job_ea - JOBS) / 0x80u], 1);
     return 1;
@@ -56,7 +57,8 @@ static atomic_int hold_mode;              /* 0 off, 1 next push, 2 END push */
 static uint64_t hold_prev;                /* data2 of the last push since arming */
 int sys_event_queue_push_by_id(uint32_t q, uint64_t src, uint64_t d1, uint64_t d2, uint64_t d3)
 {
-    (void)q; (void)src; (void)d1; (void)d3;
+    assert(q == QUEUE);
+    (void)src; (void)d1; (void)d3;
     atomic_fetch_add(&pushes, 1);
     int mode = atomic_load(&hold_mode), stop = mode == 1;
     if (mode == 2) { stop = d2 == hold_prev; hold_prev = d2; }
@@ -131,6 +133,11 @@ int main(void)
 {
     vm_base = calloc(1, ppu_vm_size); assert(vm_base);
     assert(cellSpursAttachLv2EventQueue((CellSpurs*)(uintptr_t)SPURS, QUEUE, (u8*)(uintptr_t)PORT, 1) == CELL_OK);
+    /* Another instance uses the same port; a chain must never notify it.
+     * Two ports on our queue still produce only one completion per job. */
+    assert(cellSpursAttachLv2EventQueue((CellSpurs*)0x3800, QUEUE+1, (u8*)(uintptr_t)PORT, 0)==CELL_OK);
+    vm_base[PORT]=17;
+    assert(cellSpursAttachLv2EventQueue((CellSpurs*)(uintptr_t)SPURS, QUEUE, (u8*)(uintptr_t)PORT, 0)==CELL_OK);
     for (int i = 0; i < 16; i++) vm_write64(ROOT + 8u * i, END);
     assert(cellSpursCreateJobChain(SPURS, CHAIN, ROOT, 256, 16, 0, 1, 0) == CELL_OK);
 
@@ -206,4 +213,18 @@ int main(void)
     puts("PASS: job chain resumes at the END it stopped on; no Run lost while a walk finishes; "
          "re-create, re-run of a fixed list and Join start at the entry");
     return 0;
+}
+
+/* Queue lifetime is mocked in this scheduler/table fixture. The routing
+ * fixture links real LV2 queues and checks generation changes on recreation. */
+uint64_t sys_event_queue_generation(uint32_t id) { return id ? 1 : 0; }
+void sys_event_queue_cancel_generation(uint32_t id, uint64_t generation)
+{ if (generation) sys_event_queue_cancel_by_id(id); }
+void sys_event_queue_uncancel_generation(uint32_t id, uint64_t generation)
+{ if (generation) sys_event_queue_uncancel_by_id(id); }
+uint32_t sys_event_queue_push_generation(uint32_t id, uint64_t generation,
+    uint64_t source, uint64_t d1, uint64_t d2, uint64_t d3)
+{
+    (void)generation;
+    return sys_event_queue_push_by_id(id, source, d1, d2, d3) == 0 ? CELL_OK : CELL_EBUSY;
 }

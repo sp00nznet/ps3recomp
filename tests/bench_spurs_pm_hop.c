@@ -96,12 +96,15 @@ static void pm_run(spu_context* c, uint32_t me)
         const uint64_t t = now_ns();
         const uint32_t h = __atomic_load_n(&g_hops, __ATOMIC_ACQUIRE);
         if (h < (1u << 16)) g_start_ns[h] = t;
+        /* Publish this completion before waking the next worker. Otherwise
+         * it can count its hop first, then our stale store rolls the count
+         * back (and can leave the benchmark waiting after the last request). */
+        __atomic_store_n(&g_hops, h + 1, __ATOMIC_RELEASE);
         if (h + 1 < g_target && !g_ppu_kick) {
             if (h + 1 < (1u << 16)) g_kick_ns[h + 1] = now_ns();
             __atomic_store_n(&g_req[me ^ 1u], 1u, __ATOMIC_RELEASE);
             spu_kick(c, g_wid[me ^ 1u]);
         }
-        __atomic_store_n(&g_hops, h + 1, __ATOMIC_RELEASE);
     }
     c->pc = SPURS_PM_EXIT_TO_KERNEL_LS;          /* return to the kernel */
     spu_indirect_branch(c);
@@ -202,4 +205,18 @@ int main(int argc, char** argv)
     }
     fprintf(stderr, "FAIL: cellSpursFinalize stayed busy\n");
     return 1;
+}
+
+/* Queue lifetime is mocked in this scheduler/table fixture. The routing
+ * fixture links real LV2 queues and checks generation changes on recreation. */
+uint64_t sys_event_queue_generation(uint32_t id) { return id ? 1 : 0; }
+void sys_event_queue_cancel_generation(uint32_t id, uint64_t generation)
+{ if (generation) sys_event_queue_cancel_by_id(id); }
+void sys_event_queue_uncancel_generation(uint32_t id, uint64_t generation)
+{ if (generation) sys_event_queue_uncancel_by_id(id); }
+uint32_t sys_event_queue_push_generation(uint32_t id, uint64_t generation,
+    uint64_t source, uint64_t d1, uint64_t d2, uint64_t d3)
+{
+    (void)id; (void)generation; (void)source; (void)d1; (void)d2; (void)d3;
+    abort(); /* This fixture must not send events. */
 }

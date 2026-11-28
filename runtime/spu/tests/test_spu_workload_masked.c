@@ -17,6 +17,7 @@
 /* The rest of spu_workload.c (dispatch, SPURS jobs, the policy-module runner)
  * is outside this fixture. */
 uint8_t* vm_base;
+uint32_t ppu_vm_size;
 uint32_t g_barrier_sync_watch;
 void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
 uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskid, g_ydkj_real_taskset_ea;
@@ -83,3 +84,5 @@ int main(void)
     printf("test_spu_workload_masked: ok\n");
     return 0;
 }
+int spu_run_spurs_job_owned(spu_lifted_entry_fn e, int id, uint32_t ea, uint32_t sz, uint32_t owner)
+{ (void)owner; return spu_run_spurs_job(e, id, ea, sz); }

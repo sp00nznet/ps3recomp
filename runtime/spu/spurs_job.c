@@ -156,8 +156,13 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
 void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
 
-int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
-                      uint32_t job_ea, uint32_t job_desc_size)
+int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea, uint32_t job_desc_size)
+{
+    return spu_run_spurs_job_owned(entry, image_id, job_ea, job_desc_size, 0);
+}
+
+int spu_run_spurs_job_owned(spu_lifted_entry_fn entry, int image_id,
+                      uint32_t job_ea, uint32_t job_desc_size, uint32_t spurs_ea)
 {
     if (!entry || !job_ea) return -1;
 
@@ -366,6 +371,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     /* ---- enter the job -------------------------------------------------- */
     spu_context ctx;
     spu_context_init(&ctx, 0);
+    ctx.spurs_ea = spurs_ea;
     ctx.image_id = image_id;
     memcpy(ctx.ls, ls, SPU_LS_SIZE);
     /* SPU stack grows down. A function saves its link register in its

@@ -318,6 +318,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     resident->entry = entry; resident->image_id = image_id;
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
+    ctx->spurs_ea = spurs_ea;
 
     /* PM image at its load base (first entry only -- LS persists). */
     if (first)
@@ -721,6 +722,7 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
     spu_context_init(ctx, 0);
     ctx->image_id    = 100;      /* policy's own indirect-branch table */
     ctx->policy_mode = 1;
+    ctx->spurs_ea = spurs_ea;
 
     /* Policy module image at its load base LS 0xA00 (code + data tables). */
     /* size 0 = this port linked the default stub blob (spurs_policy_blob_weak.c),
