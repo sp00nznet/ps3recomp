@@ -15,6 +15,7 @@ import argparse
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -49,6 +50,10 @@ with tempfile.TemporaryDirectory(prefix='spurs-pm-hop-') as tmp:
                 line = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ''
                 print(line or r.stderr[-500:])
                 if r.returncode:
+                    # The last stdout line may just be a PM-resolution trace;
+                    # keep the actual stall/finalize diagnostic on stderr.
+                    print(r.stdout, end='')
+                    print(r.stderr, end='', file=sys.stderr)
                     failed.append(f'lanes={lanes} wake={wake}: exit {r.returncode}')
                     continue
                 fields = dict(f.split('=', 1) for f in line.split() if '=' in f)
@@ -61,6 +66,8 @@ with tempfile.TemporaryDirectory(prefix='spurs-pm-hop-') as tmp:
         line = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ''
         print(f'store_wake={store_wake} ' + (line or r.stderr[-500:]))
         if r.returncode:
+            print(r.stdout, end='')
+            print(r.stderr, end='', file=sys.stderr)
             failed.append(f'store_wake={store_wake} {mode}: exit {r.returncode}')
             return None
         return dict(f.split('=', 1) for f in line.split() if '=' in f)

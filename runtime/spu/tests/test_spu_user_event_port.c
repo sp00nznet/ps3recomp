@@ -22,7 +22,7 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 void SetLastError(DWORD e) { (void)e; }                       /* the POSIX shim's condition variable reports a timeout */
-uint32_t spurs_port_queue(uint32_t port) { (void)port; return 0; }
+uint32_t spurs_port_queue(uint32_t owner, uint32_t port) { (void)owner; (void)port; return 0; }
 int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
 
 /* What the delivery pushes at the queue, recorded instead of sent. */

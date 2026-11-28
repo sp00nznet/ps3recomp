@@ -890,114 +890,97 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
     return CELL_OK;
 }
 
-/* The lv2 event queues the app attached to SPURS, and the port we handed back.
- * A title may attach more than one (Tokyo Jungle attaches two), so keep them
- * all -- storing a single id let the second attach hide the first. */
-#define MAX_SPURS_QUEUES 8
+/* The lv2 event queues attached to each SPURS instance. Ports belong to an
+ * instance, not the process. Grow the binding table instead of limiting the
+ * entire process to eight (owner, port) pairs. All access holds this lock. */
 #define SPURS_EVENT_PORT 0u
 extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
                                       uint64_t data1, uint64_t data2, uint64_t data3);
 extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
 extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
-
-static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
-/* WHICH SPURS instance attached each queue. A title with more than one instance
- * -- Tokyo Jungle boots one for its data install and keeps a second for audio --
- * finalises them separately, and cancelling every queue on any Finalize kills
- * the surviving instance's queues too. That reads to the title as "the SPU
- * stopped answering": its sound engine's receives fail with ECANCELED and it
- * tears itself down. Cancel only the queues the instance being finalised owns. */
-static u32 s_spurs_event_queue_owner[MAX_SPURS_QUEUES];
-static int s_spurs_event_queue_n = 0;
+struct SpursPortBinding { u32 owner, queue; u8 port; };
+static struct SpursPortBinding* s_spurs_ports;
+static size_t s_spurs_event_queue_n, s_spurs_ports_capacity;
 static SRWLOCK s_spurs_queue_lock = SRWLOCK_INIT;
-static u32 s_spurs_port_queue[64];
 
-/* Release anyone blocked on the completion queues SPURS attached; see
- * cellSpursFinalize. */
-static void spurs_cancel_attached_queues(u32 spurs_ea)
+static int port_binding(u32 owner, u32 port)
+{
+    if (!owner || port >= 64) return -1;
+    for (size_t i = 0; i < s_spurs_event_queue_n; ++i)
+        if (s_spurs_ports[i].owner == owner && s_spurs_ports[i].port == port)
+            return (int)i;
+    return -1;
+}
+
+/* Release only queues that have no surviving owner. A shared queue still has
+ * a producer after one of its SPURS instances has stopped. */
+static void spurs_cancel_attached_queues(u32 owner)
 {
     AcquireSRWLockExclusive(&s_spurs_queue_lock);
-    int keep = 0;
-    for (int i = 0; i < s_spurs_event_queue_n; i++) {
-        /* owner 0 means "attached before we tracked owners" -- cancel those on
-         * any finalize, which is the old behaviour and the safe default. */
-        u32 owner = s_spurs_event_queue_owner[i];
-        if (spurs_ea == 0 || owner == 0 || owner == spurs_ea) {
-            u32 q = s_spurs_event_queue[i];
-            for (u32 p = 0; p < 64; p++)
-                if (s_spurs_port_queue[p] == q) s_spurs_port_queue[p] = 0;
-            sys_event_queue_cancel_by_id(q);
-        } else {
-            s_spurs_event_queue[keep]       = s_spurs_event_queue[i];
-            s_spurs_event_queue_owner[keep] = owner;
-            keep++;
-        }
+    for (size_t i = 0; i < s_spurs_event_queue_n; ++i) {
+        if (owner && s_spurs_ports[i].owner != owner) continue;
+        int surviving = 0;
+        for (size_t j = 0; j < s_spurs_event_queue_n; ++j)
+            if (s_spurs_ports[j].queue == s_spurs_ports[i].queue && owner &&
+                s_spurs_ports[j].owner != owner) { surviving = 1; break; }
+        if (!surviving) sys_event_queue_cancel_by_id(s_spurs_ports[i].queue);
     }
+    size_t keep = 0;
+    for (size_t i = 0; i < s_spurs_event_queue_n; ++i)
+        if (owner && s_spurs_ports[i].owner != owner)
+            s_spurs_ports[keep++] = s_spurs_ports[i];
     s_spurs_event_queue_n = keep;
+    if (!keep) { free(s_spurs_ports); s_spurs_ports = NULL; s_spurs_ports_capacity = 0; }
     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
 }
 
-/* SPU user-event port -> lv2 queue, for SPU code running under SPURS.
- *
- * A SPURS task signals the PPU with send_event(port, ...) exactly as a raw SPU
- * thread does, but there is no lv2 SPU thread group to hold the port binding,
- * so the lv2 delivery path had nowhere to look and dropped the event -- and
- * with it the ack the SPU then blocks on in SPU_RdInMbox. Havok's SPU task
- * stalls on the first physics step that way (port 2), and the PPU step waits
- * for it forever. */
-uint32_t spurs_port_queue(uint32_t port)
+uint32_t spurs_port_queue(uint32_t owner, uint32_t port)
 {
     AcquireSRWLockShared(&s_spurs_queue_lock);
-    u32 q = port < 64 ? s_spurs_port_queue[port] : 0;
+    int i = port_binding(owner, port);
+    u32 q = i < 0 ? 0 : s_spurs_ports[i].queue;
     ReleaseSRWLockShared(&s_spurs_queue_lock);
     return q;
 }
 
-s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
-                                 s32 isDynamic)
+s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port, s32 isDynamic)
 {
     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    u32 owner = (u32)(uintptr_t)spurs;
+    u8* out = GUEST_PTR(port, u8*);
+    u32 p = *out;
+    if (!queue || (!isDynamic && p >= 64)) return CELL_SPURS_CORE_ERROR_INVAL;
     AcquireSRWLockExclusive(&s_spurs_queue_lock);
-    /* KEEP the queue id. SPURS signals the application through the queue it
-     * attaches here, and this discarded it -- so nothing SPURS ever did could
-     * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
-     * kicks its job chain and then blocks on exactly that receive. */
-    if (queue && s_spurs_event_queue_n < MAX_SPURS_QUEUES) {
-        /* A previous cellSpursFinalize may have cancelled this queue. Attaching
-         * gives it a producer again, so lift that -- otherwise a title that
-         * tears its audio down and brings it back finds every receive failing. */
-        sys_event_queue_uncancel_by_id(queue);
-        int dup = 0;
-        for (int i = 0; i < s_spurs_event_queue_n; i++)
-            if (s_spurs_event_queue[i] == queue) dup = 1;
-        if (!dup) { s_spurs_event_queue_owner[s_spurs_event_queue_n] = (u32)(uintptr_t)spurs;
-                    s_spurs_event_queue[s_spurs_event_queue_n++] = queue; }
-    }
-
-    u8* port_h = GUEST_PTR(port, u8*);
-
-    /* Static: the caller names the port in *port. Dynamic: pick a free one,
-     * 0x10..0x3F first (the low ports are the ones titles ask for by number),
-     * and hand it back. This used to write 0 either way, so every attach
-     * landed on port 0 and the SPU's real port number routed nowhere. */
-    u32 p = *port_h;
     if (isDynamic) {
-        p = 64;
-        for (u32 i = 0x10; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
-        for (u32 i = 0; i < 0x10 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
-        if (p == 64) { ReleaseSRWLockExclusive(&s_spurs_queue_lock); return CELL_SPURS_CORE_ERROR_BUSY; }
-        *port_h = (u8)p;
-    } else if (p >= 64) {
-        ReleaseSRWLockExclusive(&s_spurs_queue_lock);
-        return CELL_SPURS_CORE_ERROR_INVAL;
-    } else if (s_spurs_port_queue[p]) {
+        for (u32 i = 0; i < 64; ++i) {
+            p = (16 + i) % 64;
+            if (port_binding(owner, p) < 0) break;
+        }
+    }
+    if (port_binding(owner, p) >= 0) {
         ReleaseSRWLockExclusive(&s_spurs_queue_lock);
         return CELL_SPURS_CORE_ERROR_BUSY;
     }
-    s_spurs_port_queue[p] = queue;
-    printf("[cellSpurs] AttachLv2EventQueue(queue=%u) port=%u%s\n", queue, p,
-           isDynamic ? " (dynamic)" : "");
+    if (s_spurs_event_queue_n == s_spurs_ports_capacity) {
+        size_t cap = s_spurs_ports_capacity ? s_spurs_ports_capacity * 2 : 8;
+        struct SpursPortBinding* grown = NULL;
+        if (cap > s_spurs_ports_capacity && cap <= INT32_MAX &&
+            cap <= SIZE_MAX / sizeof(*grown))
+            grown = realloc(s_spurs_ports, cap * sizeof(*grown));
+        if (!grown) {
+            ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+            return CELL_SPURS_CORE_ERROR_NOMEM;
+        }
+        s_spurs_ports = grown; s_spurs_ports_capacity = cap;
+    }
+    size_t i = s_spurs_event_queue_n++;
+    s_spurs_ports[i].owner = owner;
+    s_spurs_ports[i].queue = queue;
+    s_spurs_ports[i].port = (u8)p;
+    sys_event_queue_uncancel_by_id(queue);
+    *out = (u8)p;
     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+    printf("[cellSpurs] AttachLv2EventQueue(owner=0x%08X queue=%u port=%u)\n", owner, queue, p);
     return CELL_OK;
 }
 
@@ -1005,9 +988,9 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     AcquireSRWLockExclusive(&s_spurs_queue_lock);
-    if (port < 64) s_spurs_port_queue[port] = 0;
+    int i = port_binding((u32)(uintptr_t)spurs, port);
+    if (i >= 0) s_spurs_ports[i] = s_spurs_ports[--s_spurs_event_queue_n];
     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
-    printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
     return CELL_OK;
 }
 
@@ -1374,8 +1357,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 if (sz)
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
+                    spu_workload_dispatch_task(host_elf, (uint32_t)sz,
+                                                (uint32_t)(uintptr_t)context, taskset_ea, i);
             }
             return CELL_OK;
         }
@@ -2744,6 +2727,7 @@ static struct {
     u32 entry_ea;     /* first command word EA */
     u16 size_desc;
     u16 max_grab;
+    u32 spurs_ea;             /* owning instance, captured at registration */
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
     /* Where the chain stands between walks (see jc_thread). */
@@ -2809,12 +2793,13 @@ s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea)
 }
 
 /* Register (or re-register) a job chain handle. Shared by both Create forms. */
-static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
+static s32 jc_register(u32 spurs_ea, u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
                        const char* who)
 {
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
             s_jobchains[i].jc_ea     = jc_ea;
+            s_jobchains[i].spurs_ea  = spurs_ea;
             s_jobchains[i].entry_ea  = entry_ea;
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
@@ -2889,7 +2874,7 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
            name_ea ? (const char*)(vm_base + name_ea) : "-");
 
-    s32 rc = jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
+    s32 rc = jc_register((u32)spurs_ea, (u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
                          "CreateJobChainWithAttribute");
     jc_set_priority((u32)jc_ea, (u32)attr_ea + JCATTR_PRIORITY);
     return rc;
@@ -2926,7 +2911,7 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
         if (entry_ea && (u32)entry_ea < 0x10000000u)
             jc_dump_commands("CreateJobChain", (u32)entry_ea, 16);
     }
-    s32 rc = jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
+    s32 rc = jc_register((u32)spurs_ea, (u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
                          (u16)maxGrabbedJob, "CreateJobChain");
     jc_set_priority((u32)jc_ea, (u32)prio_ea);
     return rc;
@@ -2957,7 +2942,7 @@ enum {                              /* CellSpursJobHeader (48 B) */
     JH_SIZE          = 0x30,
 };
 
-static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
+static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc, u32 spurs_ea)
 {
     u64 ea_bin_raw = vm_read64(job_ea + JH_EA_BINARY);
     u32 ea_bin     = (u32)(ea_bin_raw & ~7ull);          /* low 3 bits = flags */
@@ -2990,7 +2975,7 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
      * DMA traffic at all. spu_workload_dispatch_job reproduces jm2's staging.
      * Synchronous by design: a job runs to completion, and the chain's own
      * NEXT/CALL/RET commands are what order them. */
-    spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc);
+    spu_workload_dispatch_job_owned(vm_base + ea_bin, size_bin, job_ea, size_desc, spurs_ea);
 }
 
 /* Walk one chain's command stream. Bounded: a malformed or self-looping stream
@@ -3204,19 +3189,22 @@ static void jc_signal_done(u32 jc_ea, int job_index)
         d3 = g_spurs_job_mbox_intr; (void)d3;
         g_spurs_job_mbox_valid = 0;
     }
-    for (int i = 0; i < s_spurs_event_queue_n; i++) {
-        int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
-                                            SPURS_EVENT_PORT, jc_ea, d2,
-                                            d3_probe_valid
-                                                ? spurs_event_data3_probe()
-                                                : (answers_a_count ? mbox : 0));
-        static int n = 0;
-        if (PS3_LOG_FIRST(n, 8))
-            printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
-                   "(data2=%llu rc=%d)\n",
-                   jc_ea, job_index, s_spurs_event_queue[i],
-                   (unsigned long long)d2, rc);
+    u32 owner = 0;
+    for (int i = 0; i < MAX_JOBCHAINS; ++i)
+        if (s_jobchains[i].jc_ea == jc_ea) { owner = s_jobchains[i].spurs_ea; break; }
+    AcquireSRWLockShared(&s_spurs_queue_lock);
+    for (size_t i = 0; i < s_spurs_event_queue_n; ++i) {
+        if (!owner || s_spurs_ports[i].owner != owner) continue;
+        int duplicate = 0;
+        for (size_t j = 0; j < i; ++j)
+            if (s_spurs_ports[j].owner == owner &&
+                s_spurs_ports[j].queue == s_spurs_ports[i].queue) { duplicate = 1; break; }
+        if (duplicate) continue;
+        sys_event_queue_push_by_id(s_spurs_ports[i].queue, SPURS_EVENT_PORT, jc_ea, d2,
+                                  d3_probe_valid ? spurs_event_data3_probe() :
+                                  (answers_a_count ? mbox : 0));
     }
+    ReleaseSRWLockShared(&s_spurs_queue_lock);
 }
 
 /* Where a walk stopped. halted: on an END/RET/ABORT word (cmd), which the next
@@ -3264,7 +3252,7 @@ static void jc_execute(int slot)
         if (cmd != 0 && op == 0) {                    /* JOB */
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
             int idx = jobs++;
-            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
+            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc, s_jobchains[slot].spurs_ea);
             idle = 0;                    /* real work: the chain is healthy */
             /* Signal per JOB, not per lap. The application waits once for each
              * unit of work it queued -- this title notified the guard 7 times

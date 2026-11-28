@@ -36,6 +36,7 @@ static atomic_uint entered, produced, finished, release_consumer;
 static atomic_uint consumer_lane,producer_lane;
 static void finish(spu_context* c)
 {
+    assert(c->spurs_ea == spu_ls_read32(c,0x1C4));
     u32 ea=spu_ls_read32(c,0x1C4),wid=spu_ls_read32(c,0x1DC);
     /* The manufactured guest removes itself from the runnable set. */
     vm_write8(ea+0x80+wid,3);
@@ -166,7 +167,7 @@ int main(void)
     assert(atomic_load(&consumer_lane)!=atomic_load(&producer_lane));
     unsigned port3=vm_read8(0x8010);
     finalize(0x1000);assert(atomic_load(&canceled_queues)==(1u<<3));
-    assert(!spurs_port_queue(port3));
+    assert(!spurs_port_queue(0x1000, port3));
     puts("SPURS runnable producer / blocked consumer / BUSY immutability / join PASS");
 
     /* Reinitialize the same EA after all handles and resident contexts retire. */
