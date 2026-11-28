@@ -360,6 +360,8 @@ typedef struct rsx_state {
     u32 shader_control;       /* SET_SHADER_CONTROL (0x40 = 32-bit colour exports) */
     u32 fragment_program_addr;
     u32 vertex_attrib_output_mask;
+    float point_size;
+    u32 point_sprite_control;
     u32 vertex_attrib_input_mask;      /* 0x1FF0 */
     u32 transform_branch_bits;         /* 0x1FF8: VP static branch condition bits */
     u32 transform_program_load;

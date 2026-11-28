@@ -24,6 +24,7 @@
 #include "rsx_gpu_wait.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
+#include "rsx_d3d12_point_quad.h"
 #include "rsx_texture_layout.h"
 #include "cellGcmSys.h"   /* cellGcmGetDisplayBufferByFlipIndex: the flipped buffer, for the drop counters */
 #include "rsx_present_thread.h"
@@ -1923,7 +1924,7 @@ static u32 vp_hash_ucode(const u8* p, u32 n)
     return h ? h : 1u;
 }
 
-static int vp_get_vs(const rsx_state* st)
+static int vp_get_vs(const rsx_state* st, int point_quad)
 {
     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
     if (!st || st->vp_ucode_bytes < 16) return -1;
@@ -1940,6 +1941,7 @@ static int vp_get_vs(const rsx_state* st)
     if (vstart >= st->vp_ucode_bytes) vstart = 0;
     const u8* vuc = st->vp_ucode + vstart;
     u32 vlen = st->vp_ucode_bytes - vstart;
+    const u32 sprite_key = point_quad ? rsx_d3d12_point_key(st->primitive_type, st->point_sprite_control) : 0;
     /* Hash the program's own bytes, up to its end bit, not everything behind it in the store (as the Metal
      * backend does). A title that keeps several programs resident and uploads another one behind the program it
      * draws with changed that hash on every upload, so nearly every draw missed the cache and ran D3DCompile. */
@@ -1947,12 +1949,14 @@ static int vp_get_vs(const rsx_state* st)
       const u32 instrs = rsx_vp_program_size_instrs(vuc, vlen);
       if (instrs) vlen = instrs * 16u; }
     u32 hash = vp_hash_ucode(vuc, vlen);
+    if (sprite_key) hash = (hash ^ sprite_key) * 16777619u;
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
         if (s_d3d.vp_vs[i].hash == hash) return i;
 
     static char hlsl[262144];
     int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
     if (ni <= 0) return -1;
+    if (sprite_key && rsx_d3d12_point_quad_patch(hlsl,sizeof hlsl,sprite_key)<0) return -1;
     if (getenv("VP_DUMP")) { static int _d=0; if (PS3_LOG_FIRST(_d, 4)) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
@@ -3609,6 +3613,18 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     float* vpx = (float*)(dst + RSX_MAX_VERTEX_CONSTANTS * 16);
     const float* vs_ = st->viewport_scale;
     const float* vo_ = st->viewport_offset;
+    /* Extra b0 rows are consumed only by the point-expanded VS variant.
+     * This legacy backend renders single-sample clip-sized targets, so map
+     * guest pixel size through its actual viewport, independently on x/y. */
+    vpx[8]=st->point_size; vpx[9]=(st->vertex_attrib_output_mask & 0x20u)?1.0f:0.0f;
+    vpx[10]=64.0f; vpx[11]=0.0f;
+    float pw=(float)(dr && dr->rt_off && dr->rt_w ? dr->rt_w : s_d3d.width);
+    float ph=(float)(dr && dr->rt_off && dr->rt_h ? dr->rt_h : s_d3d.height);
+    if(dr && dr->vp_w>=2 && dr->vp_h>=2 && dr->vp_x+dr->vp_w<=pw && dr->vp_y+dr->vp_h<=ph) {
+        pw=(float)dr->vp_w; ph=(float)dr->vp_h;
+    }
+    vpx[12]=pw>0?1.0f/pw:1.0f; vpx[13]=ph>0?1.0f/ph:1.0f;
+    vpx[14]=0.0f; vpx[15]=0.0f;
     vpx[0] = vpx[1] = vpx[3] = 1.0f;
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (vs_[2] != 0.0f) { vpx[2] = vs_[2]; vpx[6] = vo_[2]; }
@@ -6694,6 +6710,21 @@ static void vp_attrs_dbg(const rsx_state* state)
                   ai, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], nfin, nnan, 10); } } }
 }
 
+static u32 upload_points_vp(const rsx_state* state, u32 first, u32 count)
+{
+    if(!state || !s_d3d.vp_vb_mapped || !state->vertex_attribs[0].enabled) return 0;
+    u32 maxv=(MAX_VERTICES*VP_VERT_STRIDE-s_d3d.vp_vb_offset)/VP_VERT_STRIDE;
+    if(count>maxv/6u) return 0; /* reject a whole packet rather than split a point */
+    VPSlot* out=(VPSlot*)((u8*)s_d3d.vp_vb_mapped+
+        (u64)s_d3d.vp_parity*MAX_VERTICES*VP_VERT_STRIDE+s_d3d.vp_vb_offset);
+    for(u32 p=0;p<count;p++) {
+        VPSlot v[16]; read_vp_vertex(state,first+p,v);
+        for(u32 k=0;k<6;k++) memcpy(&out[(p*6u+k)*16u],v,sizeof v);
+    }
+    s_d3d.vp_vb_offset+=count*6u*VP_VERT_STRIDE;
+    return count*6u;
+}
+
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
@@ -7354,7 +7385,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex_rt[_u]  = -1;
                 }
                 dr->tex_slot = -1;
-                dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
+                dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state, 0);
                 dr->is_clear = 0;
                 dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
                 dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
@@ -7405,14 +7436,16 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * zero pixels (it also uploads to vp_vb, leaving the fixed-function vb empty).
      * Geometry already in clip space with no VP -- flOw's injected scene -- must
      * go down the fixed-function passthrough below instead. */
-    if ((primitive == RSX_PRIMITIVE_TRIANGLES || primitive == RSX_PRIMITIVE_TRIANGLE_STRIP
+    if ((primitive == RSX_PRIMITIVE_POINTS || primitive == RSX_PRIMITIVE_TRIANGLES || primitive == RSX_PRIMITIVE_TRIANGLE_STRIP
          || primitive == RSX_PRIMITIVE_TRIANGLE_FAN || primitive == RSX_PRIMITIVE_POLYGON
          || primitive == RSX_PRIMITIVE_QUAD_STRIP) &&
         s_d3d.vp_vb_mapped && s_d3d.vp_root_sig &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
         u32 rec = s_d3d.vp_vb_offset;
         u32 emitted = 0;
-        if (primitive == RSX_PRIMITIVE_TRIANGLES)
+        if (primitive == RSX_PRIMITIVE_POINTS)
+            emitted = upload_points_vp(s_d3d.current_rsx_state, first, count);
+        else if (primitive == RSX_PRIMITIVE_TRIANGLES)
             emitted = upload_tris_vp(s_d3d.current_rsx_state, first, count);
         else if (primitive == RSX_PRIMITIVE_QUAD_STRIP)
             emitted = upload_quad_strip_vp(s_d3d.current_rsx_state, first, count);
@@ -7456,6 +7489,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state); dr->zs_key = rsx_zs_key(s_d3d.current_rsx_state); dr->stencil_ref = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->stencil_ref : 0;
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+            dr->indexed = 0;
+            if(primitive == RSX_PRIMITIVE_POINTS) dr->cull = 0;
             dr->cmask = 0xF;
             if (s_d3d.current_rsx_state) {
                 u32 _cm = s_d3d.current_rsx_state->color_mask;
@@ -7487,7 +7522,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex_rt[_u]  = -1;
             }
             dr->tex_slot = -1;
-            dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
+            dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state, primitive == RSX_PRIMITIVE_POINTS);
             dr->is_clear = 0;
             dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
             dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
@@ -7663,7 +7698,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex_rt[_u]  = -1;
         }
         dr->tex_slot = -1;
-        dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
+        dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state, 0);
         dr->is_clear = 0;
         dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
         dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
