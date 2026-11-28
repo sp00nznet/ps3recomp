@@ -1339,13 +1339,15 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
      * (isNewData=1). The callback already ran and told the game "no save",
      * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
      * parked in MODE_AUTO_LOAD (no app loop, no flips).
-     * Per the SDK the correct return here is CELL_SAVEDATA_ERROR_NODATA,
-     * and a real title handles it; that flОw does not is a bug somewhere in
-     * its MODE_AUTO_LOAD state machine we have not tracked down. Keep the
-     * compat return until that is understood -- it was dropped once already
-     * in the fold merge and cost a boot regression. */
+     * This compatibility behavior must be opt-in: reporting success for a
+     * missing slot makes Eternal Sonata reuse the previous slot's preview
+     * buffer, displaying phantom saves. Keep the flOw workaround available
+     * without changing the default result observed by other titles. */
     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
-    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
+    const char* nodata_ok = getenv("PS3_SAVEDATA_AUTOLOAD_NODATA_OK");
+    if (r == CELL_SAVEDATA_ERROR_NODATA && nodata_ok && !strcmp(nodata_ok, "1"))
+        return CELL_OK;
+    return r;
 }
 
 s32 cellSaveDataDelete2(u32 container)
